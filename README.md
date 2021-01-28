@@ -56,6 +56,9 @@ The `cudnnFindPlan` in turn
 
 The most common `engineConfig` generation is the built-in heuristics of cuDNN V8. Generally, this is appended with the fallback list. An example of usage can be seen in `run_from_cudnn_find(...)` function in `conv_sample.cpp`.
 
+## Documentation
+Documentation can be found at https://nvidia.github.io/cudnn-frontend/
+
 ## Feedback
 Support, resources, and information about cuDNN can be found online at https://developer.nvidia.com/cudnn. 
 
