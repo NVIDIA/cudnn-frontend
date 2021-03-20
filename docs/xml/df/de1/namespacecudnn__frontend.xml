@@ -1,0 +1,718 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="df/de1/namespacecudnn__frontend" kind="namespace" language="C++">
+    <compoundname>cudnn_frontend</compoundname>
+    <innerclass refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" prot="public">cudnn_frontend::BackendDescriptor</innerclass>
+    <innerclass refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" prot="public">cudnn_frontend::ConvDesc_v8</innerclass>
+    <innerclass refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8" prot="public">cudnn_frontend::ConvDescBuilder_v8</innerclass>
+    <innerclass refid="d9/dca/classcudnn__frontend_1_1cudnnException" prot="public">cudnn_frontend::cudnnException</innerclass>
+    <innerclass refid="dc/d3c/classcudnn__frontend_1_1Engine__v8" prot="public">cudnn_frontend::Engine_v8</innerclass>
+    <innerclass refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8" prot="public">cudnn_frontend::EngineBuilder_v8</innerclass>
+    <innerclass refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8" prot="public">cudnn_frontend::EngineConfig_v8</innerclass>
+    <innerclass refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8" prot="public">cudnn_frontend::EngineConfigBuilder_v8</innerclass>
+    <innerclass refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator" prot="public">cudnn_frontend::EngineConfigGenerator</innerclass>
+    <innerclass refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8" prot="public">cudnn_frontend::EngineFallbackList_v8</innerclass>
+    <innerclass refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8" prot="public">cudnn_frontend::EngineFallbackListBuilder_v8</innerclass>
+    <innerclass refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" prot="public">cudnn_frontend::EngineHeuristics_v8</innerclass>
+    <innerclass refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" prot="public">cudnn_frontend::EngineHeuristicsBuilder_v8</innerclass>
+    <innerclass refid="d6/d1b/structcudnn__frontend_1_1executionOption" prot="public">cudnn_frontend::executionOption</innerclass>
+    <innerclass refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" prot="public">cudnn_frontend::ExecutionPlan_v8</innerclass>
+    <innerclass refid="d1/d74/classcudnn__frontend_1_1ExecutionPlanBuilder__v8" prot="public">cudnn_frontend::ExecutionPlanBuilder_v8</innerclass>
+    <innerclass refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" prot="public">cudnn_frontend::MatMulDesc_v8</innerclass>
+    <innerclass refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" prot="public">cudnn_frontend::MatMulDescBuilder_v8</innerclass>
+    <innerclass refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" prot="public">cudnn_frontend::OpaqueBackendPointer</innerclass>
+    <innerclass refid="d4/d30/classcudnn__frontend_1_1Operation__v8" prot="public">cudnn_frontend::Operation_v8</innerclass>
+    <innerclass refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8" prot="public">cudnn_frontend::OperationBuilder_v8</innerclass>
+    <innerclass refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" prot="public">cudnn_frontend::OperationGraph_v8</innerclass>
+    <innerclass refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" prot="public">cudnn_frontend::OperationGraphBuilder_v8</innerclass>
+    <innerclass refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8" prot="public">cudnn_frontend::PointWiseDesc_v8</innerclass>
+    <innerclass refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8" prot="public">cudnn_frontend::PointWiseDescBuilder_v8</innerclass>
+    <innerclass refid="d6/da7/classcudnn__frontend_1_1Tensor__v8" prot="public">cudnn_frontend::Tensor_v8</innerclass>
+    <innerclass refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8" prot="public">cudnn_frontend::TensorBuilder_v8</innerclass>
+    <innerclass refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" prot="public">cudnn_frontend::VariantPack_v8</innerclass>
+    <innerclass refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8" prot="public">cudnn_frontend::VariantPackBuilder_v8</innerclass>
+      <sectiondef kind="enum">
+      <memberdef kind="enum" id="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3" prot="public" static="no">
+        <name>CudnnFindSamplingTechnique</name>
+        <enumvalue id="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3ac8ab707d81df65503b6b0ecc67675158" prot="public">
+          <name>CUDNN_FIND_SAMPLE_ONCE</name>
+          <briefdescription>
+<para>Sample once quick but may have unstable values. </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3a903bfd2e4d1b8ab2a7197be752c618a6" prot="public">
+          <name>CUDNN_FIND_SAMPLE_MEDIAN_OF_THREE</name>
+          <briefdescription>
+<para>Sample 3 times and take median. </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3a8199dfa6701edb38f52a74d9e229b43d" prot="public">
+          <name>CUDNN_FIND_SAMPLE_TILL_STABLE</name>
+          <briefdescription>
+<para>Sample multiple times till stable. </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" line="41" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="41" bodyend="45"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="typedef">
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" prot="public" static="no">
+        <type>std::shared_ptr&lt; <ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref> &gt;</type>
+        <definition>using cudnn_frontend::ManagedOpaqueDescriptor = typedef std::shared_ptr&lt;OpaqueBackendPointer&gt;</definition>
+        <argsstring></argsstring>
+        <name>ManagedOpaqueDescriptor</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="82" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" bodystart="82" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1aa20fd945a531e0a3a5007e65fe917770" prot="public" static="no">
+        <type><ref refid="d6/da7/classcudnn__frontend_1_1Tensor__v8" kindref="compound">Tensor_v8</ref></type>
+        <definition>using cudnn_frontend::Tensor = typedef Tensor_v8</definition>
+        <argsstring></argsstring>
+        <name>Tensor</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="113" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="113" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a9fea2e22198aaf2ea11a0df46abd0749" prot="public" static="no">
+        <type><ref refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8" kindref="compound">TensorBuilder_v8</ref></type>
+        <definition>using cudnn_frontend::TensorBuilder = typedef TensorBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>TensorBuilder</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="114" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="114" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ae24bc7541c87c642cdef8eaf83c8eacc" prot="public" static="no">
+        <type><ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kindref="compound">ConvDesc_v8</ref></type>
+        <definition>using cudnn_frontend::ConvDesc = typedef ConvDesc_v8</definition>
+        <argsstring></argsstring>
+        <name>ConvDesc</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="115" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="115" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a91b5e4e82a18d2212ad6be6d5398752c" prot="public" static="no">
+        <type><ref refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8" kindref="compound">ConvDescBuilder_v8</ref></type>
+        <definition>using cudnn_frontend::ConvDescBuilder = typedef ConvDescBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>ConvDescBuilder</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="116" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="116" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a7f878662c40c287736343affc43f25dc" prot="public" static="no">
+        <type><ref refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8" kindref="compound">PointWiseDescBuilder_v8</ref></type>
+        <definition>using cudnn_frontend::PointWiseDescBuilder = typedef PointWiseDescBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>PointWiseDescBuilder</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="117" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="117" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ada5353494ce649fc915154ced52dcceb" prot="public" static="no">
+        <type><ref refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8" kindref="compound">PointWiseDesc_v8</ref></type>
+        <definition>using cudnn_frontend::PointWiseDesc = typedef PointWiseDesc_v8</definition>
+        <argsstring></argsstring>
+        <name>PointWiseDesc</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="118" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="118" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ad809552e9ec400bcbfcfc0ea5acd4e56" prot="public" static="no">
+        <type><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref></type>
+        <definition>using cudnn_frontend::MatMulDesc = typedef MatMulDesc_v8</definition>
+        <argsstring></argsstring>
+        <name>MatMulDesc</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="119" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="119" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a0c344e3bc1f332aa9f5b213eb1ae9ee6" prot="public" static="no">
+        <type><ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" kindref="compound">MatMulDescBuilder_v8</ref></type>
+        <definition>using cudnn_frontend::MatMulDescBuilder = typedef MatMulDescBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>MatMulDescBuilder</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="120" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="120" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a2f1497702504947953a0f5a69b6eeb2a" prot="public" static="no">
+        <type><ref refid="d4/d30/classcudnn__frontend_1_1Operation__v8" kindref="compound">Operation_v8</ref></type>
+        <definition>using cudnn_frontend::Operation = typedef Operation_v8</definition>
+        <argsstring></argsstring>
+        <name>Operation</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="121" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="121" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ae6d02ff4c7922673ed3862145a4019d4" prot="public" static="no">
+        <type><ref refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8" kindref="compound">OperationBuilder_v8</ref></type>
+        <definition>using cudnn_frontend::OperationBuilder = typedef OperationBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>OperationBuilder</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="122" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="122" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ac86ce924df5209c4ce1bc25856eea6e6" prot="public" static="no">
+        <type><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref></type>
+        <definition>using cudnn_frontend::OperationGraph = typedef OperationGraph_v8</definition>
+        <argsstring></argsstring>
+        <name>OperationGraph</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="123" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="123" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a0b7ba1175801c56d07d26785bcd8fb70" prot="public" static="no">
+        <type><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref></type>
+        <definition>using cudnn_frontend::OperationGraphBuilder = typedef OperationGraphBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>OperationGraphBuilder</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="124" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="124" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1aae6a627b67858b15afbc5656afa88123" prot="public" static="no">
+        <type><ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref></type>
+        <definition>using cudnn_frontend::EngineHeuristicsBuilder = typedef EngineHeuristicsBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>EngineHeuristicsBuilder</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="125" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="125" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a147bbd62e1c7c6b3fbc6869ab776b125" prot="public" static="no">
+        <type><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref></type>
+        <definition>using cudnn_frontend::EngineHeuristics = typedef EngineHeuristics_v8</definition>
+        <argsstring></argsstring>
+        <name>EngineHeuristics</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="126" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="126" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a4f90ec150d149f8f0751daa3ad625839" prot="public" static="no">
+        <type><ref refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8" kindref="compound">EngineBuilder_v8</ref></type>
+        <definition>using cudnn_frontend::EngineBuilder = typedef EngineBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>EngineBuilder</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="127" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="127" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a1ed8c535fea949a10acd26e279cc28a1" prot="public" static="no">
+        <type><ref refid="dc/d3c/classcudnn__frontend_1_1Engine__v8" kindref="compound">Engine_v8</ref></type>
+        <definition>using cudnn_frontend::Engine = typedef Engine_v8</definition>
+        <argsstring></argsstring>
+        <name>Engine</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="128" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="128" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a2559dec72130bbdc95c02fb0df79fd42" prot="public" static="no">
+        <type><ref refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8" kindref="compound">EngineConfig_v8</ref></type>
+        <definition>using cudnn_frontend::EngineConfig = typedef EngineConfig_v8</definition>
+        <argsstring></argsstring>
+        <name>EngineConfig</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="129" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="129" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ac46e1785757fde7c10e3d527f697fde8" prot="public" static="no">
+        <type><ref refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8" kindref="compound">EngineConfigBuilder_v8</ref></type>
+        <definition>using cudnn_frontend::EngineConfigBuilder = typedef EngineConfigBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>EngineConfigBuilder</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="130" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="130" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a984c10aa29daac796444bda66bdef26e" prot="public" static="no">
+        <type><ref refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" kindref="compound">ExecutionPlan_v8</ref></type>
+        <definition>using cudnn_frontend::ExecutionPlan = typedef ExecutionPlan_v8</definition>
+        <argsstring></argsstring>
+        <name>ExecutionPlan</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="131" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="131" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1aa508b66c4de02f4aacae8029dbe422eb" prot="public" static="no">
+        <type><ref refid="d1/d74/classcudnn__frontend_1_1ExecutionPlanBuilder__v8" kindref="compound">ExecutionPlanBuilder_v8</ref></type>
+        <definition>using cudnn_frontend::ExecutionPlanBuilder = typedef ExecutionPlanBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>ExecutionPlanBuilder</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="132" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="132" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ad6ac8113b406ee2b6f20eff4dd2b4e01" prot="public" static="no">
+        <type><ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">VariantPack_v8</ref></type>
+        <definition>using cudnn_frontend::VariantPack = typedef VariantPack_v8</definition>
+        <argsstring></argsstring>
+        <name>VariantPack</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="133" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="133" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ab5b844f5de8ad3c056f0cb1cd0fb3ac1" prot="public" static="no">
+        <type><ref refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8" kindref="compound">VariantPackBuilder_v8</ref></type>
+        <definition>using cudnn_frontend::VariantPackBuilder = typedef VariantPackBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>VariantPackBuilder</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="134" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="134" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a61fbd4506f1249c686164fb33d858999" prot="public" static="no">
+        <type><ref refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8" kindref="compound">EngineFallbackList_v8</ref></type>
+        <definition>using cudnn_frontend::EngineFallbackList = typedef EngineFallbackList_v8</definition>
+        <argsstring></argsstring>
+        <name>EngineFallbackList</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="135" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="135" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1aeb6699f494fa895d402898dae554f5a9" prot="public" static="no">
+        <type><ref refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8" kindref="compound">EngineFallbackListBuilder_v8</ref></type>
+        <definition>using cudnn_frontend::EngineFallbackListBuilder = typedef EngineFallbackListBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>EngineFallbackListBuilder</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="136" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="136" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a84a5f004bdf17747bf7cf45d6fc754cd" prot="public" static="no">
+        <type>std::vector&lt; <ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref> &gt;</type>
+        <definition>using cudnn_frontend::EngineConfigList = typedef std::vector&lt;ManagedOpaqueDescriptor&gt;</definition>
+        <argsstring></argsstring>
+        <name>EngineConfigList</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para>EngineConfigList class This is a RAII type class that holds naked EngineConfig backendDescriptor. The purpose of this class is to provide an easy interface to store the EngineConfigs generated from various source and apply a filter. </para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" line="242" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" bodystart="242" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ad5f0f0c892b009e34aa59f67de1b5535" prot="public" static="no">
+        <type>std::vector&lt; struct <ref refid="d6/d1b/structcudnn__frontend_1_1executionOption" kindref="compound">executionOption</ref> &gt;</type>
+        <definition>using cudnn_frontend::executionOptions_t = typedef std::vector&lt;struct executionOption&gt;</definition>
+        <argsstring></argsstring>
+        <name>executionOptions_t</name>
+        <briefdescription>
+<para>Variety of renames. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" line="36" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="36" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a560644a5c1e6016c509a379ca6e03f05" prot="public" static="no">
+        <type>std::vector&lt; <ref refid="df/de1/namespacecudnn__frontend_1a984c10aa29daac796444bda66bdef26e" kindref="member">cudnn_frontend::ExecutionPlan</ref> &gt;</type>
+        <definition>using cudnn_frontend::executionPlans_t = typedef std::vector&lt;cudnn_frontend::ExecutionPlan&gt;</definition>
+        <argsstring></argsstring>
+        <name>executionPlans_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" line="37" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="37" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ad31f040777311d1d1a7a2490f23e026e" prot="public" static="no">
+        <type>std::function&lt; bool(<ref refid="df/de1/namespacecudnn__frontend_1a984c10aa29daac796444bda66bdef26e" kindref="member">cudnn_frontend::ExecutionPlan</ref> const &amp;plan)&gt;</type>
+        <definition>using cudnn_frontend::Predicate = typedef std::function&lt;bool(cudnn_frontend::ExecutionPlan const &amp;plan)&gt;</definition>
+        <argsstring></argsstring>
+        <name>Predicate</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" line="38" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="38" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a53716729f10b4064fb41dec9dd32ffd6" prot="public" static="no">
+        <type>std::function&lt; <ref refid="df/de1/namespacecudnn__frontend_1a84a5f004bdf17747bf7cf45d6fc754cd" kindref="member">cudnn_frontend::EngineConfigList</ref>(<ref refid="df/de1/namespacecudnn__frontend_1ac86ce924df5209c4ce1bc25856eea6e6" kindref="member">cudnn_frontend::OperationGraph</ref> &amp;)&gt;</type>
+        <definition>using cudnn_frontend::GeneratorSource = typedef std::function&lt;cudnn_frontend::EngineConfigList(cudnn_frontend::OperationGraph &amp;)&gt;</definition>
+        <argsstring></argsstring>
+        <name>GeneratorSource</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" line="39" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="39" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" prot="public" static="yes" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref></type>
+        <definition>static ManagedOpaqueDescriptor cudnn_frontend::make_shared_backend_pointer</definition>
+        <argsstring>(cudnnBackendDescriptorType_t type)</argsstring>
+        <name>make_shared_backend_pointer</name>
+        <param>
+          <type>cudnnBackendDescriptorType_t</type>
+          <declname>type</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="86" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" bodystart="86" bodyend="88"/>
+        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga8a6517102f5c12e63e4417324a03180b" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="104" endline="196">cudnn_frontend::ExecutionPlan_v8::computeTag</referencedby>
+        <referencedby refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a7609e82ac3dc04b67e9e73beb0f7cdae" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="174" endline="207">cudnn_frontend::Engine_v8::Engine_v8</referencedby>
+        <referencedby refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1ab761cb8a8a38495e913395fa872afb3e" compoundref="d6/d67/cudnn__frontend__EngineConfig_8h" startline="76" endline="89">cudnn_frontend::EngineConfig_v8::EngineConfig_v8</referencedby>
+        <referencedby refid="d6/d46/group__EngineHeuristicsQuery_1ga1171cb5ce50baf0fab19fc458d4565b5" compoundref="db/d66/cudnn__frontend__Heuristics_8h" startline="69" endline="99">cudnn_frontend::EngineHeuristics_v8::getEngineConfig</referencedby>
+        <referencedby refid="df/de1/namespacecudnn__frontend_1a75bb541476d93b039f5fd9f9d29242e6" compoundref="d5/d36/cudnn__frontend__Filters_8h" startline="45" endline="68">hasNumericalNote</referencedby>
+        <referencedby refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" compoundref="dc/d11/cudnn__backend__base_8h" startline="142" endline="145">cudnn_frontend::BackendDescriptor::initialize_managed_backend_pointer</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1a0f52559baeb4e9ee8835d95ea50a875e" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::filter</definition>
+        <argsstring>(Predicate pred, executionPlans_t &amp;plans) -&gt; executionPlans_t</argsstring>
+        <name>filter</name>
+        <param>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1ad31f040777311d1d1a7a2490f23e026e" kindref="member">Predicate</ref></type>
+          <declname>pred</declname>
+        </param>
+        <param>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1a560644a5c1e6016c509a379ca6e03f05" kindref="member">executionPlans_t</ref> &amp;</type>
+          <declname>plans</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para>Filter out the execution plan based on the prerequisite conditions. Goes through vector of execution plans and if the predicate returns not to block, it is inserted into the filtered plans. </para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" line="94" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="94" bodyend="102"/>
+        <references refid="d6/d1b/structcudnn__frontend_1_1executionOption_1ae84235aee01c4556303b39961e1e1c5e" compoundref="de/d1e/cudnn__frontend__EngineConfigGenerator_8h" startline="31">cudnn_frontend::executionOption::plan</references>
+        <referencedby refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1abd7cdd3a218623ffc5dfcbf9343aef85" compoundref="d3/d6b/cudnn__frontend__find__plan_8h" startline="99" endline="118">cudnn_frontend::EngineConfigGenerator::cudnnFindPlan</referencedby>
+        <referencedby refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1ad6ca7e7263ed9b7597f94ca45505642f" compoundref="d2/d3b/cudnn__frontend__get__plan_8h" startline="30" endline="46">cudnn_frontend::EngineConfigGenerator::cudnnGetPlan</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1ad365eee23138df472d716d9dbf119f0e" prot="public" static="yes" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type>auto</type>
+        <definition>static auto cudnn_frontend::get_fallback_engine_list</definition>
+        <argsstring>(cudnnBackendDescriptorType_t mode) -&gt; std::vector&lt; int &gt;</argsstring>
+        <name>get_fallback_engine_list</name>
+        <param>
+          <type>cudnnBackendDescriptorType_t</type>
+          <declname>mode</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" line="30" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" bodystart="30" bodyend="65"/>
+        <referencedby refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1aae1a36ace3278dbedcf0d743a7744d98" compoundref="df/d3e/cudnn__frontend__EngineFallbackList_8h" startline="131" endline="157">cudnn_frontend::EngineFallbackListBuilder_v8::build</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1a4d18e44a57e30f9bf29157f742ba9c65" prot="public" static="yes" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type>void</type>
+        <definition>static void cudnn_frontend::filter</definition>
+        <argsstring>(EngineConfigList &amp;from, EngineConfigList &amp;to, std::function&lt; bool(cudnnBackendDescriptor_t)&gt; filter_fn)</argsstring>
+        <name>filter</name>
+        <param>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1a84a5f004bdf17747bf7cf45d6fc754cd" kindref="member">EngineConfigList</ref> &amp;</type>
+          <declname>from</declname>
+        </param>
+        <param>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1a84a5f004bdf17747bf7cf45d6fc754cd" kindref="member">EngineConfigList</ref> &amp;</type>
+          <declname>to</declname>
+        </param>
+        <param>
+          <type>std::function&lt; bool(cudnnBackendDescriptor_t)&gt;</type>
+          <declname>filter_fn</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Filters.h" line="33" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Filters.h" bodystart="33" bodyend="41"/>
+      </memberdef>
+      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1a75bb541476d93b039f5fd9f9d29242e6" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>cudnnBackendNumericalNote_t</type>
+            <declname>NUMERIC_NOTE</declname>
+            <defname>NUMERIC_NOTE</defname>
+          </param>
+        </templateparamlist>
+        <type>bool</type>
+        <definition>bool cudnn_frontend::hasNumericalNote</definition>
+        <argsstring>(cudnnBackendDescriptor_t engine_config)</argsstring>
+        <name>hasNumericalNote</name>
+        <param>
+          <type>cudnnBackendDescriptor_t</type>
+          <declname>engine_config</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Filters.h" line="45" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Filters.h" bodystart="45" bodyend="68"/>
+        <references refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" compoundref="dc/d11/cudnn__backend__base_8h" startline="86" endline="88">make_shared_backend_pointer</references>
+      </memberdef>
+      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1a148478701949f58a44912cc61dbda1e4" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>CudnnFindSamplingTechnique</type>
+            <declname>samplingTechnique</declname>
+            <defname>samplingTechnique</defname>
+          </param>
+        </templateparamlist>
+        <type>auto</type>
+        <definition>auto cudnn_frontend::time_sorted_plan</definition>
+        <argsstring>(cudnnHandle_t handle, executionPlans_t plans, VariantPack &amp;variantPack) -&gt; executionOptions_t</argsstring>
+        <name>time_sorted_plan</name>
+        <param>
+          <type>cudnnHandle_t</type>
+          <declname>handle</declname>
+        </param>
+        <param>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1a560644a5c1e6016c509a379ca6e03f05" kindref="member">executionPlans_t</ref></type>
+          <declname>plans</declname>
+        </param>
+        <param>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1ad6ac8113b406ee2b6f20eff4dd2b4e01" kindref="member">VariantPack</ref> &amp;</type>
+          <declname>variantPack</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para>Sorts the execution plans by their run time. The run time of plan may not trivial and hence we run it multiple times till we get a stable value. We have an additional dry-run which helps stabilize the time further. </para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_find_plan.h" line="37" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_find_plan.h" bodystart="37" bodyend="95"/>
+        <references refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3a903bfd2e4d1b8ab2a7197be752c618a6">CUDNN_FIND_SAMPLE_MEDIAN_OF_THREE</references>
+        <references refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3ac8ab707d81df65503b6b0ecc67675158">CUDNN_FIND_SAMPLE_ONCE</references>
+        <references refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3a8199dfa6701edb38f52a74d9e229b43d">CUDNN_FIND_SAMPLE_TILL_STABLE</references>
+      </memberdef>
+      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1a1690523b8a133acefaeabc725032e21c" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>void</type>
+        <definition>static void cudnn_frontend::throw_if</definition>
+        <argsstring>(std::function&lt; bool()&gt; expr, const char *message)</argsstring>
+        <name>throw_if</name>
+        <param>
+          <type>std::function&lt; bool()&gt;</type>
+          <declname>expr</declname>
+        </param>
+        <param>
+          <type>const char *</type>
+          <declname>message</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_utils.h" line="43" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_utils.h" bodystart="43" bodyend="49"/>
+        <references refid="d9/dca/classcudnn__frontend_1_1cudnnException_1aa80c45a57ca091770572aaa5a1f7e322" compoundref="df/d17/cudnn__frontend__utils_8h" startline="34" endline="34">cudnn_frontend::cudnnException::cudnnException</references>
+      </memberdef>
+      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1a6b0bb5ee1f6d6491a7d53a01ae947dee" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>void</type>
+        <definition>static void cudnn_frontend::throw_if</definition>
+        <argsstring>(bool expr, const char *message)</argsstring>
+        <name>throw_if</name>
+        <param>
+          <type>bool</type>
+          <declname>expr</declname>
+        </param>
+        <param>
+          <type>const char *</type>
+          <declname>message</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_utils.h" line="51" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_utils.h" bodystart="51" bodyend="57"/>
+        <references refid="d9/dca/classcudnn__frontend_1_1cudnnException_1aa80c45a57ca091770572aaa5a1f7e322" compoundref="df/d17/cudnn__frontend__utils_8h" startline="34" endline="34">cudnn_frontend::cudnnException::cudnnException</references>
+      </memberdef>
+      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>void</type>
+        <definition>static void cudnn_frontend::set_error_and_throw_exception</definition>
+        <argsstring>(BackendDescriptor const *desc, cudnnStatus_t status, const char *message)</argsstring>
+        <name>set_error_and_throw_exception</name>
+        <param>
+          <type><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" kindref="compound">BackendDescriptor</ref> const *</type>
+          <declname>desc</declname>
+        </param>
+        <param>
+          <type>cudnnStatus_t</type>
+          <declname>status</declname>
+        </param>
+        <param>
+          <type>const char *</type>
+          <declname>message</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_utils.h" line="60" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_utils.h" bodystart="60" bodyend="69"/>
+        <references refid="d9/dca/classcudnn__frontend_1_1cudnnException_1aa80c45a57ca091770572aaa5a1f7e322" compoundref="df/d17/cudnn__frontend__utils_8h" startline="34" endline="34">cudnn_frontend::cudnnException::cudnnException</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a1748a5c560905314930c37b2ed1a54d2" compoundref="dc/d11/cudnn__backend__base_8h" startline="124" endline="126">cudnn_frontend::BackendDescriptor::set_error</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3ef02443f20b90223baf5f1922505eab" compoundref="dc/d11/cudnn__backend__base_8h" startline="118" endline="120">cudnn_frontend::BackendDescriptor::set_status</references>
+        <referencedby refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1addc153acf5600781659a1a2ba891e59c" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="93" endline="123">cudnn_frontend::MatMulDescBuilder_v8::build</referencedby>
+        <referencedby refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8_1abf794751941aa252c19e1879306375d3" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="128" endline="184">cudnn_frontend::VariantPackBuilder_v8::build</referencedby>
+        <referencedby refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1aae1a36ace3278dbedcf0d743a7744d98" compoundref="df/d3e/cudnn__frontend__EngineFallbackList_8h" startline="131" endline="157">cudnn_frontend::EngineFallbackListBuilder_v8::build</referencedby>
+        <referencedby refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ac78945f424f254f0060d4c2e1184cf1f" compoundref="db/d7d/cudnn__frontend__OperationGraph_8h" startline="141" endline="211">cudnn_frontend::OperationGraphBuilder_v8::build</referencedby>
+        <referencedby refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8_1a32876941f964b3fad2d123b9081b0af7" compoundref="d3/d98/cudnn__frontend__Tensor_8h" startline="155" endline="273">cudnn_frontend::TensorBuilder_v8::build</referencedby>
+        <referencedby refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a639e1514ea8f283720e49fc18d7ad673" compoundref="d6/d67/cudnn__frontend__EngineConfig_8h" startline="159" endline="221">cudnn_frontend::EngineConfigBuilder_v8::build</referencedby>
+        <referencedby refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1ab3ff1b538521fdea588d8ac155f6e88c" compoundref="db/d66/cudnn__frontend__Heuristics_8h" startline="161" endline="212">cudnn_frontend::EngineHeuristicsBuilder_v8::build</referencedby>
+        <referencedby refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1a01f709a3efafaca70de6565817c43beb" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="172" endline="304">cudnn_frontend::ConvDescBuilder_v8::build</referencedby>
+        <referencedby refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a5de642e4141705f8e06c4bf566f1d332" compoundref="da/d5f/cudnn__frontend__PointWiseDesc_8h" startline="206" endline="346">cudnn_frontend::PointWiseDescBuilder_v8::build</referencedby>
+        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="249" endline="308">cudnn_frontend::ExecutionPlanBuilder_v8::build</referencedby>
+        <referencedby refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a010b99c39d63121be78ec847fff433f8" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="268" endline="326">cudnn_frontend::EngineBuilder_v8::build</referencedby>
+        <referencedby refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1aa0df558c603d8316dd3eb2d5bfd67c9d" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="381" endline="1069">cudnn_frontend::OperationBuilder_v8::build</referencedby>
+        <referencedby refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a0e6d7c12c261ad6c2f08e1249397b696" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="122" endline="162">cudnn_frontend::Engine_v8::buildKnobs</referencedby>
+        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga8a6517102f5c12e63e4417324a03180b" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="104" endline="196">cudnn_frontend::ExecutionPlan_v8::computeTag</referencedby>
+        <referencedby refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a7609e82ac3dc04b67e9e73beb0f7cdae" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="174" endline="207">cudnn_frontend::Engine_v8::Engine_v8</referencedby>
+        <referencedby refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1ab761cb8a8a38495e913395fa872afb3e" compoundref="d6/d67/cudnn__frontend__EngineConfig_8h" startline="76" endline="89">cudnn_frontend::EngineConfig_v8::EngineConfig_v8</referencedby>
+        <referencedby refid="d6/d46/group__EngineHeuristicsQuery_1ga1171cb5ce50baf0fab19fc458d4565b5" compoundref="db/d66/cudnn__frontend__Heuristics_8h" startline="69" endline="99">cudnn_frontend::EngineHeuristics_v8::getEngineConfig</referencedby>
+        <referencedby refid="d6/d46/group__EngineHeuristicsQuery_1ga10121605fc82ed225537210825fa3836" compoundref="db/d66/cudnn__frontend__Heuristics_8h" startline="103" endline="119">cudnn_frontend::EngineHeuristics_v8::getEngineConfigCount</referencedby>
+        <referencedby refid="d1/df7/group__OperationGraphQuery_1ga7a7a8d03f5a3aa54f14b83be4abe2a26" compoundref="db/d7d/cudnn__frontend__OperationGraph_8h" startline="76" endline="91">cudnn_frontend::OperationGraph_v8::getEngineCount</referencedby>
+        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga00d10a076c22e86354a789852c56c22f" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="67" endline="88">cudnn_frontend::ExecutionPlan_v8::getWorkspaceSize</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1ga095c52c8f1b01ebb224265f9000195c0" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="244" endline="253">cudnn_frontend::OperationBuilder_v8::setaMatDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1ga17475846760b10ffdfa536cd92a5b135" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="184" endline="193">cudnn_frontend::OperationBuilder_v8::setbDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1gaa8eed29a0181e044ea0263ba655127ec" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="255" endline="264">cudnn_frontend::OperationBuilder_v8::setbMatDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1gaa82e018b6a9d514ad912b922f43adad2" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="233" endline="242">cudnn_frontend::OperationBuilder_v8::setcDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1gaaf9d7cbc65c7c7526a6f15d4ad2952fa" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="266" endline="275">cudnn_frontend::OperationBuilder_v8::setcMatDesc</referencedby>
+        <referencedby refid="d2/dbb/group__EngineConfigBuilder__v8_1ga9673b31268901dfcb97896958687a42a" compoundref="d6/d67/cudnn__frontend__EngineConfig_8h" startline="111" endline="153">cudnn_frontend::EngineConfigBuilder_v8::setEngine</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1ga3ca1f62832f998566c1b07b4b3c71db4" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="277" endline="286">cudnn_frontend::OperationBuilder_v8::setmatmulDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1gae6b06877b2e675b2a390f0b122100669" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="288" endline="322">cudnn_frontend::OperationBuilder_v8::setpwDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1ga80466e517e980ba4953e085b3d4e3498" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="200" endline="209">cudnn_frontend::OperationBuilder_v8::setwDesc</referencedby>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="27" column="1"/>
+  </compounddef>
+</doxygen>

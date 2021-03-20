@@ -12,6 +12,7 @@ var searchData=
   ['cudnn_5ffrontend_5ffind_5fplan_2eh',['cudnn_frontend_find_plan.h',['../d3/d6b/cudnn__frontend__find__plan_8h.html',1,'']]],
   ['cudnn_5ffrontend_5fget_5fplan_2eh',['cudnn_frontend_get_plan.h',['../d2/d3b/cudnn__frontend__get__plan_8h.html',1,'']]],
   ['cudnn_5ffrontend_5fheuristics_2eh',['cudnn_frontend_Heuristics.h',['../db/d66/cudnn__frontend__Heuristics_8h.html',1,'']]],
+  ['cudnn_5ffrontend_5fmatmuldesc_2eh',['cudnn_frontend_MatMulDesc.h',['../d6/d32/cudnn__frontend__MatMulDesc_8h.html',1,'']]],
   ['cudnn_5ffrontend_5foperation_2eh',['cudnn_frontend_Operation.h',['../da/d5a/cudnn__frontend__Operation_8h.html',1,'']]],
   ['cudnn_5ffrontend_5foperationgraph_2eh',['cudnn_frontend_OperationGraph.h',['../db/d7d/cudnn__frontend__OperationGraph_8h.html',1,'']]],
   ['cudnn_5ffrontend_5fpointwisedesc_2eh',['cudnn_frontend_PointWiseDesc.h',['../da/d5f/cudnn__frontend__PointWiseDesc_8h.html',1,'']]],

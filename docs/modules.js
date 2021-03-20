@@ -7,6 +7,7 @@ var modules =
     [ "ExecutionPlanQuery", "d7/d0d/group__ExecutionPlanQuery.html", "d7/d0d/group__ExecutionPlanQuery" ],
     [ "EngineHeuristicsQuery", "d6/d46/group__EngineHeuristicsQuery.html", "d6/d46/group__EngineHeuristicsQuery" ],
     [ "EngineHeuristicsBuilder_v8", "dc/d99/group__EngineHeuristicsBuilder__v8.html", "dc/d99/group__EngineHeuristicsBuilder__v8" ],
+    [ "MatMulDescBuilder_v8", "d9/d08/group__MatMulDescBuilder__v8.html", "d9/d08/group__MatMulDescBuilder__v8" ],
     [ "OperationBuilder_v8", "d3/d92/group__OperationBuilder__v8.html", "d3/d92/group__OperationBuilder__v8" ],
     [ "OperationGraphQuery", "d1/df7/group__OperationGraphQuery.html", "d1/df7/group__OperationGraphQuery" ],
     [ "OperationGraphBuilder_v8", "d2/df5/group__OperationGraphBuilder__v8.html", "d2/df5/group__OperationGraphBuilder__v8" ],

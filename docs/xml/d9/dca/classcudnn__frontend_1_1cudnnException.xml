@@ -1,0 +1,85 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d9/dca/classcudnn__frontend_1_1cudnnException" kind="class" language="C++" prot="public">
+    <compoundname>cudnn_frontend::cudnnException</compoundname>
+    <basecompoundref prot="public" virt="non-virtual">std::runtime_error</basecompoundref>
+    <includes refid="df/d17/cudnn__frontend__utils_8h" local="no">cudnn_frontend_utils.h</includes>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d9/dca/classcudnn__frontend_1_1cudnnException_1aa80c45a57ca091770572aaa5a1f7e322" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::cudnnException::cudnnException</definition>
+        <argsstring>(const char *message)</argsstring>
+        <name>cudnnException</name>
+        <param>
+          <type>const char *</type>
+          <declname>message</declname>
+        </param>
+        <exceptions> throw ()</exceptions>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_utils.h" line="34" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_utils.h" bodystart="34" bodyend="34"/>
+        <referencedby refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</referencedby>
+        <referencedby refid="df/de1/namespacecudnn__frontend_1a1690523b8a133acefaeabc725032e21c" compoundref="df/d17/cudnn__frontend__utils_8h" startline="43" endline="49">cudnn_frontend::throw_if</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="d9/dca/classcudnn__frontend_1_1cudnnException_1a4f35e3466ff6ce0875631b810364364b" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="virtual">
+        <type>const char *</type>
+        <definition>virtual const char* cudnn_frontend::cudnnException::what</definition>
+        <argsstring>() const</argsstring>
+        <name>what</name>
+        <exceptions> throw ()</exceptions>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_utils.h" line="36" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_utils.h" bodystart="36" bodyend="38"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="41">
+        <label>std::runtime_error</label>
+        <childnode refid="42" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="42">
+        <label>std::exception</label>
+      </node>
+      <node id="40">
+        <label>cudnn_frontend::cudnnException</label>
+        <link refid="d9/dca/classcudnn__frontend_1_1cudnnException"/>
+        <childnode refid="41" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="44">
+        <label>std::runtime_error</label>
+        <childnode refid="45" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="45">
+        <label>std::exception</label>
+      </node>
+      <node id="43">
+        <label>cudnn_frontend::cudnnException</label>
+        <link refid="d9/dca/classcudnn__frontend_1_1cudnnException"/>
+        <childnode refid="44" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_utils.h" line="32" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_utils.h" bodystart="32" bodyend="39"/>
+    <listofallmembers>
+      <member refid="d9/dca/classcudnn__frontend_1_1cudnnException_1aa80c45a57ca091770572aaa5a1f7e322" prot="public" virt="non-virtual"><scope>cudnn_frontend::cudnnException</scope><name>cudnnException</name></member>
+      <member refid="d9/dca/classcudnn__frontend_1_1cudnnException_1a4f35e3466ff6ce0875631b810364364b" prot="public" virt="virtual"><scope>cudnn_frontend::cudnnException</scope><name>what</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

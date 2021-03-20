@@ -1,0 +1,634 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygenindex xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="index.xsd" version="1.8.13">
+  <compound refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" kind="class"><name>cudnn_frontend::BackendDescriptor</name>
+    <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a62312f29dbbc7c11c1da54a2ad41c52f" kind="variable"><name>pointer</name></member>
+    <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kind="variable"><name>status</name></member>
+    <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a0d416655dab2b5a675fecb5df9ea8521" kind="variable"><name>err_msg</name></member>
+    <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1ab652fb3e9a58092fbb137b0e959a9478" kind="function"><name>describe</name></member>
+    <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3aa1ab42ab96471092185f15e22c1e9f" kind="function"><name>get_raw_desc</name></member>
+    <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" kind="function"><name>get_status</name></member>
+    <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3ef02443f20b90223baf5f1922505eab" kind="function"><name>set_status</name></member>
+    <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a1748a5c560905314930c37b2ed1a54d2" kind="function"><name>set_error</name></member>
+    <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1abfde0f34b0bf49c45d3d9c0408284f6f" kind="function"><name>get_error</name></member>
+    <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a57c83e78374bac747b5660fb271b947a" kind="function"><name>get_desc</name></member>
+    <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" kind="function"><name>initialize_managed_backend_pointer</name></member>
+    <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8aa93686ca88410fc048b05155148183" kind="function"><name>BackendDescriptor</name></member>
+    <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a5765369a5739c2ea81c4f39ce2d1c46e" kind="function"><name>BackendDescriptor</name></member>
+  </compound>
+  <compound refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kind="class"><name>cudnn_frontend::ConvDesc_v8</name>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a00c454e18392653a023f75275553a4e7" kind="friend"><name>ConvDescBuilder_v8</name></member>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a4a0249ac1d094f9a70967dd69b824f2e" kind="variable"><name>data_type</name></member>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1adcb7e5f546b83bbdab63773030e3b909" kind="variable"><name>mode</name></member>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a9b478d1207d8241ff67cc931754cd6cf" kind="variable"><name>nDims</name></member>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aff824fb1cf44c188a7400b017458327e" kind="variable"><name>padLower</name></member>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a28e6ad906bf25653c87525f9f8e90a28" kind="variable"><name>padUpper</name></member>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a81e03a2a385d24a2faaf3db249580ac6" kind="variable"><name>dilation</name></member>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac513728c785a54ef86612a0bd6fa0f1a" kind="variable"><name>stride</name></member>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" kind="function"><name>describe</name></member>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" kind="function"><name>ConvDesc_v8</name></member>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d930ada709a855c86b2857a1b155d02" kind="function"><name>~ConvDesc_v8</name></member>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a5c892fb76fbf9e4bfffdb5288f9d60ad" kind="function"><name>ConvDesc_v8</name></member>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a061ef887bdf383d416ee143a35d5c334" kind="function"><name>ConvDesc_v8</name></member>
+    <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aa8ea272eaf26ae7f7ad2d625253ea62f" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8" kind="class"><name>cudnn_frontend::ConvDescBuilder_v8</name>
+    <member refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1a67e82b4d8b94b55ecc50a9151799fff9" kind="variable"><name>m_convDesc</name></member>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1gad8de00b0e7a86bdda61749e7572a35ac" kind="function"><name>setDataType</name></member>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1gab07bf6292e69d19e6324d3073a86d58c" kind="function"><name>setPrePadding</name></member>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1ga44915183cb4dddcf23222faca3f84bba" kind="function"><name>setPostPadding</name></member>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1gaa41e2cbbebc9d2fd19fa990a48b39d08" kind="function"><name>setDilation</name></member>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1ga2c481d46d71fe909247f50ba2772b7ce" kind="function"><name>setStrides</name></member>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1gaacfcf20b0ed61e89bc92970f7bb7a258" kind="function"><name>setNDims</name></member>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1ga3b752afba659c8e92e7ad1ca71d62f2f" kind="function"><name>setMathMode</name></member>
+    <member refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1a01f709a3efafaca70de6565817c43beb" kind="function"><name>build</name></member>
+    <member refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1ae7b3fb50c7866c50ac1a170e137f38af" kind="function"><name>ConvDescBuilder_v8</name></member>
+    <member refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1ae75d5fd1c3fb6b51072f2c9b211477eb" kind="function"><name>~ConvDescBuilder_v8</name></member>
+    <member refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1a314369f1ea702c92d184b3ba66085468" kind="function"><name>ConvDescBuilder_v8</name></member>
+    <member refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1a99c1c90149cee07a26124fe32bdcfe03" kind="function"><name>ConvDescBuilder_v8</name></member>
+    <member refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1a5fba7029429a093b36fd201219315a1f" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d9/dca/classcudnn__frontend_1_1cudnnException" kind="class"><name>cudnn_frontend::cudnnException</name>
+    <member refid="d9/dca/classcudnn__frontend_1_1cudnnException_1aa80c45a57ca091770572aaa5a1f7e322" kind="function"><name>cudnnException</name></member>
+    <member refid="d9/dca/classcudnn__frontend_1_1cudnnException_1a4f35e3466ff6ce0875631b810364364b" kind="function"><name>what</name></member>
+  </compound>
+  <compound refid="dc/d3c/classcudnn__frontend_1_1Engine__v8" kind="class"><name>cudnn_frontend::Engine_v8</name>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a6053f049f393faebc7188bfa1e8c2d38" kind="variable"><name>opGraph</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1aae4b49a84f8ecb114449784e43496521" kind="variable"><name>idx</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1aed64863b9d73b7f6f3a7e16dc6e7eb04" kind="variable"><name>numKnobs</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1ab2d9ce46cd037407a5c9ec655ad0a25d" kind="variable"><name>bKnobs</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1add2d5998a38944fd0dba03fce96fe7aa" kind="variable"><name>knobs</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a620ad17c3560e87d5a859d7f0eb121d4" kind="variable"><name>opGraphTag</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1ae5d0c105971ce443fe6fb62884d7b2d2" kind="friend"><name>EngineBuilder_v8</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1afc5da140bcc7be57dc81f7fc5a589744" kind="function"><name>Engine_v8</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a63620960db3192066b7eb5f563841f1b" kind="function"><name>Engine_v8</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1ad3966b20d080c0fb9930b8a2018da2f8" kind="function"><name>operator=</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a0e6d7c12c261ad6c2f08e1249397b696" kind="function"><name>buildKnobs</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a052463f45fef3bb98e2822ba0fccdb8e" kind="function"><name>describe</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a7609e82ac3dc04b67e9e73beb0f7cdae" kind="function"><name>Engine_v8</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1af58a8aa09f22e048d51e619e36b4cbef" kind="function"><name>~Engine_v8</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1af299a1692584215c649b3563fdb3abae" kind="function"><name>getTag</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a6804e842fb698ebc12fccfece3f33b01" kind="function"><name>getSupportedKnobs</name></member>
+    <member refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a837d8adc86f08ca31f42437512a30752" kind="function"><name>getFinalizedKnobs</name></member>
+  </compound>
+  <compound refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8" kind="class"><name>cudnn_frontend::EngineBuilder_v8</name>
+    <member refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1adc25c468425d9b6b71b9592b80ea715d" kind="variable"><name>m_engine</name></member>
+    <member refid="d3/d09/group__EngineBuilder__v8_1ga0ceef322363405504dbdc4d1f3c9949a" kind="function"><name>setOperationGraph</name></member>
+    <member refid="d3/d09/group__EngineBuilder__v8_1ga27466cecb45496d001cfbe4de4b5c5a9" kind="function"><name>setOperationGraph</name></member>
+    <member refid="d3/d09/group__EngineBuilder__v8_1ga7220dab88f9fed1704c9d78d9771be5f" kind="function"><name>setOperationGraph</name></member>
+    <member refid="d3/d09/group__EngineBuilder__v8_1ga2b171d44da46865d536236bb01103005" kind="function"><name>setGlobalEngineIdx</name></member>
+    <member refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a010b99c39d63121be78ec847fff433f8" kind="function"><name>build</name></member>
+    <member refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a21b687e5455f4bc727210ac2da46d7b3" kind="function"><name>EngineBuilder_v8</name></member>
+    <member refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a8a300ec39fc764b86058acf8a9406d89" kind="function"><name>~EngineBuilder_v8</name></member>
+    <member refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a033fb0022860f23e76ca1529da165bfc" kind="function"><name>EngineBuilder_v8</name></member>
+    <member refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a7f5a24e27ff497bd44fd93fb700d5424" kind="function"><name>EngineBuilder_v8</name></member>
+    <member refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a9d29a91186f6baa215b61340a386ec6d" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8" kind="class"><name>cudnn_frontend::EngineConfig_v8</name>
+    <member refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1a9b1cd07d3023dc3130d5eae560558cdb" kind="friend"><name>EngineConfigBuilder_v8</name></member>
+    <member refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1ac102dce4f496c358a15ca753362fc4b7" kind="variable"><name>engine</name></member>
+    <member refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1a9365e32afd0eae60e3d87a853dd24e33" kind="variable"><name>numKnobs</name></member>
+    <member refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1a37695c0659b489b06ff3b83194be59bb" kind="variable"><name>opGraphTag</name></member>
+    <member refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1a04aedaff21f829caa98aacb68b51dcf1" kind="variable"><name>bChoices</name></member>
+    <member refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1aefd7d8d3da71ce0dddca0f6a85fd1c80" kind="function"><name>describe</name></member>
+    <member refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1a16d46ab109f54fe4ef0863fddcc66e42" kind="function"><name>EngineConfig_v8</name></member>
+    <member refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1a058e432452f5cd570cbf4e69d7d53eea" kind="function"><name>~EngineConfig_v8</name></member>
+    <member refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1a1c7175f7d3cc7224496f276df36036aa" kind="function"><name>getTag</name></member>
+    <member refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1ab761cb8a8a38495e913395fa872afb3e" kind="function"><name>EngineConfig_v8</name></member>
+    <member refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1acf7eccfed045156beab03a2db0c31dd8" kind="function"><name>EngineConfig_v8</name></member>
+    <member refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1ad79aab6d69a2b4400259abd72af73c84" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8" kind="class"><name>cudnn_frontend::EngineConfigBuilder_v8</name>
+    <member refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a8dc6947bf5dac837ea233bfaec4bf03f" kind="variable"><name>m_engine_config</name></member>
+    <member refid="d2/dbb/group__EngineConfigBuilder__v8_1ga9673b31268901dfcb97896958687a42a" kind="function"><name>setEngine</name></member>
+    <member refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a639e1514ea8f283720e49fc18d7ad673" kind="function"><name>build</name></member>
+    <member refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a49a8a25759e78e7a2c77c55f0b54696b" kind="function"><name>EngineConfigBuilder_v8</name></member>
+    <member refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a49eedc731d95df1f21e353a9a9511cfd" kind="function"><name>~EngineConfigBuilder_v8</name></member>
+    <member refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a3deb5e1f20c028b8bb39406cca743e43" kind="function"><name>EngineConfigBuilder_v8</name></member>
+    <member refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a17fca0597527c1f6acffa73ddaeedc03" kind="function"><name>EngineConfigBuilder_v8</name></member>
+    <member refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a8d4cb5ab44b076c71afd5f49e6df94f7" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator" kind="class"><name>cudnn_frontend::EngineConfigGenerator</name>
+    <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a1a06febdf947e151276bf09947c62436" kind="variable"><name>engine_config_generators</name></member>
+    <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a322221ec9a28f1f48c5a3edf60adff1d" kind="function"><name>EngineConfigGenerator</name></member>
+    <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a4b07b958f03daf033c30b9182fee372b" kind="function"><name>generate_engine_config</name></member>
+    <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1ad6ca7e7263ed9b7597f94ca45505642f" kind="function"><name>cudnnGetPlan</name></member>
+    <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1abd7cdd3a218623ffc5dfcbf9343aef85" kind="function"><name>cudnnFindPlan</name></member>
+  </compound>
+  <compound refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8" kind="class"><name>cudnn_frontend::EngineFallbackList_v8</name>
+    <member refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1ae2c71646b56855f59ed1a267f06d5a7c" kind="friend"><name>EngineFallbackListBuilder_v8</name></member>
+    <member refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1ae8995303eac50633f6320f5949a045bb" kind="variable"><name>opGraph</name></member>
+    <member refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1a9a557db46e3559fcaa0e800d976d6238" kind="variable"><name>mode</name></member>
+    <member refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1a71e6146b18a0aa4de8fbc6ba457efbb9" kind="variable"><name>m_engine_configs</name></member>
+    <member refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1a9f8070f063b1c0564297260ebe812506" kind="variable"><name>opGraphTag</name></member>
+    <member refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1a3509dd7589fed7a699874170cec6dd9f" kind="function"><name>describe</name></member>
+    <member refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1a56ad23cee30cbe70209ce6399a69d541" kind="function"><name>getFallbackList</name></member>
+    <member refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1a62dd89e142b11917507a48b2ac3dd047" kind="function"><name>~EngineFallbackList_v8</name></member>
+    <member refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1adfa074bcaaf2b0297a9c740a3e3706b7" kind="function"><name>EngineFallbackList_v8</name></member>
+    <member refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1abb40ba38f035c1e9bd20304f32f90256" kind="function"><name>EngineFallbackList_v8</name></member>
+    <member refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1a9c9a8cc39a38b449b1f044d407168905" kind="function"><name>EngineFallbackList_v8</name></member>
+    <member refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1a22ef505758a33415d01e3a9a8843fe22" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8" kind="class"><name>cudnn_frontend::EngineFallbackListBuilder_v8</name>
+    <member refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1a56f2014918d259c53a2ebb3e815073e9" kind="variable"><name>m_fallback_list</name></member>
+    <member refid="d4/d6b/group__EngineFallbackListBuilder__v8_1ga45c7c761a47a7731055ad0f943449610" kind="function"><name>setOperationGraph</name></member>
+    <member refid="d4/d6b/group__EngineFallbackListBuilder__v8_1gaf66485fe1a0faccab971edd0c70f04b4" kind="function"><name>setOperation</name></member>
+    <member refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1aae1a36ace3278dbedcf0d743a7744d98" kind="function"><name>build</name></member>
+    <member refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1ae955fa571b31ffc3da0ca6293d089642" kind="function"><name>EngineFallbackListBuilder_v8</name></member>
+    <member refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1a28651c04cd22f3ebe037b99627ddbd62" kind="function"><name>~EngineFallbackListBuilder_v8</name></member>
+    <member refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1a3dda7b1b97beb027718b7809702967b5" kind="function"><name>EngineFallbackListBuilder_v8</name></member>
+    <member refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1ad3e10ca860311b1b554507615c46b9ad" kind="function"><name>EngineFallbackListBuilder_v8</name></member>
+    <member refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1a1effb794c90cbe7ad2e7649d400cb2dd" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kind="class"><name>cudnn_frontend::EngineHeuristics_v8</name>
+    <member refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a44df29e58afe4b8fdc894574eb5efb9e" kind="friend"><name>EngineHeuristicsBuilder_v8</name></member>
+    <member refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a71e7822002502874f6b2dfec4ede7e01" kind="variable"><name>mode</name></member>
+    <member refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a081860775bfc5626bd57066066eb4299" kind="variable"><name>opGraph</name></member>
+    <member refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a7a1e931b0f7910db6e6f5d5bfbfe3511" kind="variable"><name>m_heuristic_results</name></member>
+    <member refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a7c958bd4b97b4a77694d2bee01acec4c" kind="variable"><name>opGraphTag</name></member>
+    <member refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1ac223cc9438a0442bd3b48881f71a4b40" kind="function"><name>describe</name></member>
+    <member refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a298d4a89c8e9ed80526a6cccf33d716c" kind="function"><name>EngineHeuristics_v8</name></member>
+    <member refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a2261e27dacfdad755d625692aa20f290" kind="function"><name>~EngineHeuristics_v8</name></member>
+    <member refid="d6/d46/group__EngineHeuristicsQuery_1ga1171cb5ce50baf0fab19fc458d4565b5" kind="function"><name>getEngineConfig</name></member>
+    <member refid="d6/d46/group__EngineHeuristicsQuery_1ga10121605fc82ed225537210825fa3836" kind="function"><name>getEngineConfigCount</name></member>
+    <member refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1aaa983e31e1a22bfebb639865e4514d82" kind="function"><name>EngineHeuristics_v8</name></member>
+    <member refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a496a7e3160046bdf73289fbec51423a3" kind="function"><name>EngineHeuristics_v8</name></member>
+    <member refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a2301c5b006fa6e341bc88ece066f8ea2" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kind="class"><name>cudnn_frontend::EngineHeuristicsBuilder_v8</name>
+    <member refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1aa046a778075f260f7950ee5a51c2addb" kind="variable"><name>m_heuristics</name></member>
+    <member refid="dc/d99/group__EngineHeuristicsBuilder__v8_1ga0554ac9347b7409e46f960b30f18dc68" kind="function"><name>setOperationGraph</name></member>
+    <member refid="dc/d99/group__EngineHeuristicsBuilder__v8_1gaf2d783ca6a663aa50ffed2ccbc164812" kind="function"><name>setHeurMode</name></member>
+    <member refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1ab3ff1b538521fdea588d8ac155f6e88c" kind="function"><name>build</name></member>
+    <member refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1a5667e4567520189eaa96fcd6e934cb29" kind="function"><name>EngineHeuristicsBuilder_v8</name></member>
+    <member refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1a8740e967b981abf94dc2c53eb8786ceb" kind="function"><name>~EngineHeuristicsBuilder_v8</name></member>
+    <member refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1af5318bb3e2700f53e299f8526e7a524f" kind="function"><name>EngineHeuristicsBuilder_v8</name></member>
+    <member refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1a19d632b9f96c91bad2b18446cf32f491" kind="function"><name>EngineHeuristicsBuilder_v8</name></member>
+    <member refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1a5228a4a3af391fad0141f30a24be730b" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d6/d1b/structcudnn__frontend_1_1executionOption" kind="struct"><name>cudnn_frontend::executionOption</name>
+    <member refid="d6/d1b/structcudnn__frontend_1_1executionOption_1ae84235aee01c4556303b39961e1e1c5e" kind="variable"><name>plan</name></member>
+    <member refid="d6/d1b/structcudnn__frontend_1_1executionOption_1a56b496b09272c352b557d793adc3acf1" kind="variable"><name>time_ms</name></member>
+  </compound>
+  <compound refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" kind="class"><name>cudnn_frontend::ExecutionPlan_v8</name>
+    <member refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8_1a00c29ad02430927df9260c7e57ae7c7a" kind="friend"><name>ExecutionPlanBuilder_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga5e3dd6d441474ac5ab94aaaf9c45bc5b" kind="variable"><name>engine_config</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga4c36108c6511420d81fcda5292761726" kind="variable"><name>handle</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1gaf732b37c9c05a2a8bd1a76289c740c4a" kind="variable"><name>planTag</name></member>
+    <member refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8_1ac388ed7f6911f704ed2618a3867fad72" kind="function"><name>ExecutionPlan_v8</name></member>
+    <member refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8_1a8a8ac13b1c639dd9b87c280a598446af" kind="function"><name>~ExecutionPlan_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga00d10a076c22e86354a789852c56c22f" kind="function"><name>getWorkspaceSize</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1gad80aa2980d915449d05db4c71041e2e0" kind="function"><name>describe</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga2ff1340409f8834fe9ae68ff4c00281a" kind="function"><name>getTag</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga8a6517102f5c12e63e4417324a03180b" kind="function"><name>computeTag</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga2c011aa14563ef96417ce599f0c83d89" kind="function"><name>ExecutionPlan_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga51c4b75729ab066f0686729896741c5d" kind="function"><name>ExecutionPlan_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga0705e60cee62d3d196751517d545a7b0" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d1/d74/classcudnn__frontend_1_1ExecutionPlanBuilder__v8" kind="class"><name>cudnn_frontend::ExecutionPlanBuilder_v8</name>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1gae1a2e3dd89dbe455e7067531ec5b5562" kind="variable"><name>m_execution_plan</name></member>
+    <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1ga4166679391fc2df54e25964c03ae6e8e" kind="function"><name>setHandle</name></member>
+    <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1gac5c23cff8c1424f71ef2cee2dc66cd3c" kind="function"><name>setEngineConfig</name></member>
+    <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1gaf7010781cc8c0583a2d841ac6d9ed521" kind="function"><name>setEngineConfig</name></member>
+    <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1gae0f92d5445da53253ff3460ac6aefffa" kind="function"><name>setEngineConfig</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" kind="function"><name>build</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga8e48fb375271599c83f57922d9f8c89e" kind="function"><name>ExecutionPlanBuilder_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1gae3f841de1b6461b31bf7967734a70a8a" kind="function"><name>~ExecutionPlanBuilder_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga60147aa715352906e32cbb87558cb0ae" kind="function"><name>ExecutionPlanBuilder_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga2b84d3619b5bd9ca0faa30c126deb43c" kind="function"><name>ExecutionPlanBuilder_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga5f757c2da8c90645c34637dde4aed8f8" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob" kind="class"><name>cudnn_frontend::Engine_v8::Knob</name>
+    <member refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1adc13c98616305cd23d86dc5dc1dfe86e" kind="variable"><name>knobType</name></member>
+    <member refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1aecda8659b5a5d1dbb21b540a73141fb9" kind="variable"><name>maxValue</name></member>
+    <member refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1a2403145dcb4bc55f970c6d07c1ed796e" kind="variable"><name>minValue</name></member>
+    <member refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1a8342ab30dbe0e86d8d060983f14aba87" kind="variable"><name>stride</name></member>
+    <member refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1aee3bbc2a558893309d6882a0e30d439a" kind="variable"><name>choice</name></member>
+    <member refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1aaf0d313c5491b599537422694eb83b82" kind="function"><name>Knob</name></member>
+    <member refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1a3f60f9ba0e35cb0bccbf3524def69db2" kind="function"><name>describe</name></member>
+    <member refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1a542f95d42a6d118e3de1726720c12278" kind="function"><name>setChoice</name></member>
+    <member refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1a4c0a920d14a719e99fce3d64a6eb0980" kind="function"><name>getChoice</name></member>
+    <member refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1a75ea7ec76b08688da99e6bd3664083c8" kind="function"><name>getKnobType</name></member>
+    <member refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1af3fdf6b0da493544a003913bdf524449" kind="function"><name>getMinValue</name></member>
+    <member refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1a4fe794b42a0ee5ba71b8ca8c797d1dbe" kind="function"><name>getMaxValue</name></member>
+    <member refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1adc0dd9d11771a040a8f5191bef00cdb5" kind="function"><name>getStride</name></member>
+  </compound>
+  <compound refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kind="class"><name>cudnn_frontend::MatMulDesc_v8</name>
+    <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1aa99cc0548322d7298b9ca664a976281f" kind="friend"><name>MatMulDescBuilder_v8</name></member>
+    <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a1dd13143c85b67f2c0da90f02884fab1" kind="variable"><name>math_precision</name></member>
+    <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a2931e4d0b21e6986a3f5a1697ca4bae0" kind="function"><name>describe</name></member>
+    <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ab725a8e47331aca6310155f6d55c0a02" kind="function"><name>MatMulDesc_v8</name></member>
+    <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ad27b038b19b218067bd30e60d94fd672" kind="function"><name>~MatMulDesc_v8</name></member>
+    <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a5e060b83ea1e1ed59a66e15fdba91227" kind="function"><name>MatMulDesc_v8</name></member>
+    <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a48aa29d5df9a717e63c5146ac48c4543" kind="function"><name>MatMulDesc_v8</name></member>
+    <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ac1257a1ca1261961fc99123988552911" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" kind="class"><name>cudnn_frontend::MatMulDescBuilder_v8</name>
+    <member refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1aa71bc8242df4035ff5d6b4d54083db4b" kind="variable"><name>m_matMulDesc</name></member>
+    <member refid="d9/d08/group__MatMulDescBuilder__v8_1ga5885f3eb7580cbe0cbe7243c4711c0f2" kind="function"><name>setMathPrecision</name></member>
+    <member refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1addc153acf5600781659a1a2ba891e59c" kind="function"><name>build</name></member>
+    <member refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1afea76414fa5c0c5f38a551afcf11391c" kind="function"><name>MatMulDescBuilder_v8</name></member>
+    <member refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1a3f5790e5ada9a1785d9daf4246ea8de3" kind="function"><name>~MatMulDescBuilder_v8</name></member>
+    <member refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1a75af51fa2937a7df6787d3181ef22cf2" kind="function"><name>MatMulDescBuilder_v8</name></member>
+    <member refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1a287154397d78c528465a949ab0242068" kind="function"><name>MatMulDescBuilder_v8</name></member>
+    <member refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1a02ee327bae65fc44c140d7bb6a0b4991" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kind="class"><name>cudnn_frontend::OpaqueBackendPointer</name>
+    <member refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a47968d641c0da8d33882f86d8afa30b4" kind="variable"><name>m_desc</name></member>
+    <member refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" kind="variable"><name>status</name></member>
+    <member refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a42a928eb5b2524d1c3f67b7200dd53c9" kind="function"><name>OpaqueBackendPointer</name></member>
+    <member refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1adf5bf20f5bdfbfdecd05360830b34b89" kind="function"><name>operator=</name></member>
+    <member refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a997d733607e747516eb2334c51c48f29" kind="function"><name>OpaqueBackendPointer</name></member>
+    <member refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aadf0c53d7aedb1c6c121b2736e98b2dd" kind="function"><name>OpaqueBackendPointer</name></member>
+    <member refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a9f549dd95873ac3a02689ef97f4a6c75" kind="function"><name>~OpaqueBackendPointer</name></member>
+    <member refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1ac1700c7d96af0250e5721f5e5f9d95bc" kind="function"><name>get_backend_descriptor</name></member>
+    <member refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1abd4f69554da364008f3780e9dc3a5bfc" kind="function"><name>get_status</name></member>
+    <member refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aa9059097bb9161d454c6e17b03ca236c" kind="function"><name>is_good</name></member>
+  </compound>
+  <compound refid="d4/d30/classcudnn__frontend_1_1Operation__v8" kind="class"><name>cudnn_frontend::Operation_v8</name>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1ac708bb46683440effd2f46b3888e378f" kind="friend"><name>OperationBuilder_v8</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a43cbfcab995a238e2001c4ec6543ae50" kind="variable"><name>op_mode</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a01d1997ae84b86c0565351910bba3416" kind="variable"><name>xdesc</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a81e9b10c7231ba9ffba37f7fab531a69" kind="variable"><name>ydesc</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1ad26bd872d417f6a9bff65768bb02e05f" kind="variable"><name>wdesc</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a1305e0cdaeb029fd52eb189254afe18c" kind="variable"><name>bdesc</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1adf6b55205eac4c52c0ab70e4758e33da" kind="variable"><name>dydesc</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a4f30409838436d0c4dea5271af86f9b7" kind="variable"><name>dxdesc</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a4f565db1b8b85ea43d60631cd3414f47" kind="variable"><name>dwdesc</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a19856fbb973574342efedc43134af3a7" kind="variable"><name>cdesc</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1ae0e0256b292acd560accc1c02a6e393b" kind="variable"><name>amatdesc</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a0945c6296efc14ffc41122aaae3946b8" kind="variable"><name>bmatdesc</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1adea4f5ef82e61fc375fd2c3ee8e92147" kind="variable"><name>cmatdesc</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1aac54965185417e264093156b143a3751" kind="variable"><name>pwdesc</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1ac4b85cbb9ba522c98eb524a7712721af" kind="variable"><name>matmuldesc</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a0414d5eb022c25584d60491f416e6449" kind="variable"><name>alphabetaType</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a4a71d73a1231c39e51a74f750586a733" kind="variable"><name>alpha_s</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a0f14ddfbaae6e62375c46dd0d5ed993d" kind="variable"><name>beta_s</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a4003061754cc4b0003a72cc474fca8d9" kind="variable"><name>alpha2_s</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1aee00f6897786ce0f16963a7d2f57a2f8" kind="variable"><name>alpha_d</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a1118f19807c9f58cc1d0892bdb1f8c94" kind="variable"><name>beta_d</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a4f533db7bc67978d1ec1a475f4ab9e1c" kind="variable"><name>alpha2_d</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a5c6b2986d2d703c672b5fc461f2eee05" kind="variable"><name>pointwise_port_count</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a09f5151a90f805d81550a30617bcec0c" kind="variable"><name>pointwise_mode</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a12d0d0fa40152f5205570f40e681795f" kind="variable"><name>is_pointwise_activation_fwd_op</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1ab8c4c8c81e8cebc44cb725f4a4b4add9" kind="variable"><name>is_pointwise_activation_bwd_op</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a2e1e0fb15b7df300945cae2347db635a" kind="variable"><name>is_pointwise_math_op</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a736317246d52e774170bc60511870932" kind="variable"><name>operationTag</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a3425a8550eb9f622dc4101d3d5d2c0e1" kind="function"><name>describe</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1ad45e7200660f993615e34ceeb9ec49c6" kind="function"><name>Operation_v8</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1ae5cba10d789e4d08b45339a702ba75f3" kind="function"><name>getOutputTensor</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1ab2692d9f28861a73d590a53f979d26fa" kind="function"><name>getTag</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a67d82f53ecbdfe2416d2a26410138d78" kind="function"><name>~Operation_v8</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a810b2f50d53d6655c2048d3c3afbcfc4" kind="function"><name>Operation_v8</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a091bf74144eaec6149d610faa289160e" kind="function"><name>Operation_v8</name></member>
+    <member refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a5012e920483271f655bc04d6f52dc41f" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8" kind="class"><name>cudnn_frontend::OperationBuilder_v8</name>
+    <member refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1a8724628060c71b17e7458c01338b234a" kind="variable"><name>m_operation</name></member>
+    <member refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1ad82e287889be2ebef348a00479ce3bc0" kind="variable"><name>is_convolution_op</name></member>
+    <member refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1a98044359c005b796e35fba1a5b689f3d" kind="variable"><name>is_pointwise_op</name></member>
+    <member refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1ac806a488b58cc78e338ba96eccee70fd" kind="variable"><name>is_matmul_op</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1gaefa06fdaae3b28c6ef08a0189e2a3d3a" kind="function"><name>setxDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga04c2492a5376f1a74a57fb49fa7b3599" kind="function"><name>setxDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga17475846760b10ffdfa536cd92a5b135" kind="function"><name>setbDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga5910bc2209e1b648c1aa0edce7f11e01" kind="function"><name>setyDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga80466e517e980ba4953e085b3d4e3498" kind="function"><name>setwDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga08f3d4cb5138174127d0f6899f7bc53b" kind="function"><name>setdyDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga9e4a1e9a233b44cca5b65f0af172b001" kind="function"><name>setdyDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga35fa5c453a6cd989f35e47c29e6ec665" kind="function"><name>setdxDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga5e5d463d5531a9378280fa4b1aee6f63" kind="function"><name>setdwDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1gaa82e018b6a9d514ad912b922f43adad2" kind="function"><name>setcDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga095c52c8f1b01ebb224265f9000195c0" kind="function"><name>setaMatDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1gaa8eed29a0181e044ea0263ba655127ec" kind="function"><name>setbMatDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1gaaf9d7cbc65c7c7526a6f15d4ad2952fa" kind="function"><name>setcMatDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga3ca1f62832f998566c1b07b4b3c71db4" kind="function"><name>setmatmulDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1gae6b06877b2e675b2a390f0b122100669" kind="function"><name>setpwDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1gab4241b96e7374d821681e97259d39d83" kind="function"><name>setAlpha</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga3c63744504f65383ce0b847bea804e3f" kind="function"><name>setAlpha</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga06cdcfeda1b702412be41addd73bb947" kind="function"><name>setAlpha2</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga459671e9d26640528fcf683aaeef05df" kind="function"><name>setAlpha2</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga65a9ad73912ff46becc93ee451da6af5" kind="function"><name>setBeta</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga29752062b7308c8da0e625eb35431652" kind="function"><name>setBeta</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga425dd00708eaaadffe1c83ef356dc333" kind="function"><name>OperationBuilder_v8</name></member>
+    <member refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1aa0df558c603d8316dd3eb2d5bfd67c9d" kind="function"><name>build</name></member>
+  </compound>
+  <compound refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kind="class"><name>cudnn_frontend::OperationGraph_v8</name>
+    <member refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5af59a099cc90eda429563e285b2907f" kind="friend"><name>OperationGraphBuilder_v8</name></member>
+    <member refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1abd35d4e84bb6ee70e8df38de093fc376" kind="variable"><name>handle</name></member>
+    <member refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1ab2570d81fc01c1b6b9a76220b0abd717" kind="variable"><name>ops</name></member>
+    <member refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a52c12bb0014a899c4c5201fb66301eb2" kind="variable"><name>numOps</name></member>
+    <member refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1ac8ca1ba29ac3f8e68ba1bf3e5e500338" kind="variable"><name>opGraphTag</name></member>
+    <member refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1acd0b5f47407184b0b26bf4d4b5d0ce32" kind="function"><name>describe</name></member>
+    <member refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a85e65daf5a2db5aba0207ccad367457d" kind="function"><name>OperationGraph_v8</name></member>
+    <member refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1aeb42611a38c4951e66cd23108d53353c" kind="function"><name>~OperationGraph_v8</name></member>
+    <member refid="d1/df7/group__OperationGraphQuery_1ga7a7a8d03f5a3aa54f14b83be4abe2a26" kind="function"><name>getEngineCount</name></member>
+    <member refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a19fd5ed99ab4053c8a178bd33843460a" kind="function"><name>getTag</name></member>
+    <member refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5c029cff12e0e91406a8f88fd8a830f4" kind="function"><name>OperationGraph_v8</name></member>
+    <member refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a0b3b76a619160671c45c733eb1a13455" kind="function"><name>OperationGraph_v8</name></member>
+    <member refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a87704bb46bb12bba977a21ed579a4ef3" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kind="class"><name>cudnn_frontend::OperationGraphBuilder_v8</name>
+    <member refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ad9cb3e166ab001b3b0c60ed2198cd6d9" kind="variable"><name>m_operationGraph</name></member>
+    <member refid="d2/df5/group__OperationGraphBuilder__v8_1ga5b5d8a3121e92a8a7d47341b424298f8" kind="function"><name>setHandle</name></member>
+    <member refid="d2/df5/group__OperationGraphBuilder__v8_1ga4e4cee8d631471478d5de420077a2182" kind="function"><name>setOperationGraph</name></member>
+    <member refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ac78945f424f254f0060d4c2e1184cf1f" kind="function"><name>build</name></member>
+    <member refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1a101b6c9515fdb333cdd3499f08774cf4" kind="function"><name>OperationGraphBuilder_v8</name></member>
+    <member refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1a45e8a324d62146f592b049f51d2e4552" kind="function"><name>~OperationGraphBuilder_v8</name></member>
+    <member refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1a40e8f7825f75c35c40d9938532a81d02" kind="function"><name>OperationGraphBuilder_v8</name></member>
+    <member refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1a589dedb418679abda7f64e6b9e2800a1" kind="function"><name>OperationGraphBuilder_v8</name></member>
+    <member refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1a75dae8a911e005b960565d4a1a0024ba" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8" kind="class"><name>cudnn_frontend::PointWiseDesc_v8</name>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1a1407b6ad40df9af7b191fdf636c2c508" kind="friend"><name>PointWiseDescBuilder_v8</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1a7f1bee44a57b6dad1ce493cd18ffbc18" kind="variable"><name>math_precision</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1ad6d99d57f2a5b345fe5af5bc777b8d1c" kind="variable"><name>mode</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1a740aed43da4ed8ab351d926cee6bfc6a" kind="variable"><name>nan_propagation</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1afcb75336d3b99afcec3bb947c1f1a0e8" kind="variable"><name>upper_clip</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1a26f1b0f84dc331ca9f1330cf6f425d36" kind="variable"><name>lower_clip</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1ad8731460bbcf7cb2804dd3a9840f276e" kind="variable"><name>lower_clip_slope</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1a246795e9bc43f846f701ae4214953412" kind="variable"><name>elu_alpha</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1a346bf4a4ca5e45b0f19dc8f2fb6b6148" kind="variable"><name>softplus_beta</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1aff19ca9077ac2dca8a9f78df586e11db" kind="variable"><name>swish_beta</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1a66ada0a9313ced7ed2801097ef523de8" kind="function"><name>describe</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1a81b0fa4b9ff8bfd2c23ae704f7211962" kind="function"><name>getPortCount</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1a963d8bd60aa5d7c5385d5d41595c2cf3" kind="function"><name>getPointWiseMode</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1ac2e07a514ec114222b65948960ba76a3" kind="function"><name>PointWiseDesc_v8</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1a44917fdd66ea262687c0f0af3ef3b424" kind="function"><name>~PointWiseDesc_v8</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1ac00ed56ba83a04edca3f55125332646b" kind="function"><name>PointWiseDesc_v8</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1ae4f638eb928772c13c314f4a022d4978" kind="function"><name>PointWiseDesc_v8</name></member>
+    <member refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1ae3cd0c0051c7e29a9ad86b80308429f3" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8" kind="class"><name>cudnn_frontend::PointWiseDescBuilder_v8</name>
+    <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a804a2b5438f464185b16a4652fc14cf5" kind="variable"><name>m_pointWiseDesc</name></member>
+    <member refid="d2/db5/group__PointWiseDescBuilder__v8_1ga3efa065fc125c5af06bd0a9c543bdb9f" kind="function"><name>setMathPrecision</name></member>
+    <member refid="d2/db5/group__PointWiseDescBuilder__v8_1ga124ebb4a416c645cd0b68f59545c62a8" kind="function"><name>setClipping</name></member>
+    <member refid="d2/db5/group__PointWiseDescBuilder__v8_1ga48264536e68f952e92a0bdbaa84d9363" kind="function"><name>setMode</name></member>
+    <member refid="d2/db5/group__PointWiseDescBuilder__v8_1gae5240136e19e0a4094036d48c6b1a3b7" kind="function"><name>setMode</name></member>
+    <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1afdbe0ce3f7fb2f0d23251ccb7507bc69" kind="function"><name>setReluLowerClip</name></member>
+    <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a0514e70d05a21a9c46bc66d1e61c28f5" kind="function"><name>setReluUpperClip</name></member>
+    <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1aa93615adf69e7a87a06d0cea687794a6" kind="function"><name>setReluLowerClipSlope</name></member>
+    <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a8bdbf27c37334f5b61a65eb1bd4b6a98" kind="function"><name>setEluAlpha</name></member>
+    <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1ab692e5a2b3970346f68af33530ef98e8" kind="function"><name>setSoftplusBeta</name></member>
+    <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1aad41d0f7b6667383fd9012bc492a13c3" kind="function"><name>setSwishBeta</name></member>
+    <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a5de642e4141705f8e06c4bf566f1d332" kind="function"><name>build</name></member>
+    <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a6f5605f25897bba7afc6baf76228828c" kind="function"><name>PointWiseDescBuilder_v8</name></member>
+    <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1af976fab4a7726609a1b10dc2a8bcdf65" kind="function"><name>~PointWiseDescBuilder_v8</name></member>
+    <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1ad6a7549d62410d3de87040586b49b815" kind="function"><name>PointWiseDescBuilder_v8</name></member>
+    <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1aeccd727adb1d3b0b8d9d95b7f6e1b9ce" kind="function"><name>PointWiseDescBuilder_v8</name></member>
+    <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1ac0d140493e21b164bc21dd0bcbeeaa65" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d6/da7/classcudnn__frontend_1_1Tensor__v8" kind="class"><name>cudnn_frontend::Tensor_v8</name>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a14f9c4498f4be5b3c2b0a94c708891fb" kind="friend"><name>TensorBuilder_v8</name></member>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1ae9a3d128db54fa92d392e77044f30ca9" kind="variable"><name>data_type</name></member>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a7419041bb3bf934f8e9f851fa63acabd" kind="variable"><name>btensor_dimA</name></member>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1ae4842fc7fcb87f5b60228fb6fa391b61" kind="variable"><name>btensor_strA</name></member>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a062e54efdec89943fcb0602cc06dfd28" kind="variable"><name>id</name></member>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a1f41a9f80b8a3b35aed7948e264b0d79" kind="variable"><name>alignment</name></member>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a1370de050fc91e9d992995fae5f22011" kind="variable"><name>nDims</name></member>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a611fc05f3c7b6ca90d0e3c0f6ef07d84" kind="variable"><name>isVirtual</name></member>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a79cc1a752e6df2001b853f8c189b1f1f" kind="function"><name>describe</name></member>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a9df78edb662e32a63680281eb33a14a8" kind="function"><name>Tensor_v8</name></member>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a5a402bf5c68021711d9d9ec8fd4c1001" kind="function"><name>~Tensor_v8</name></member>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1ab48b1728d6978407f0bdbf0227de6f82" kind="function"><name>Tensor_v8</name></member>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a5f2703668235c18d063174ccca285457" kind="function"><name>Tensor_v8</name></member>
+    <member refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a4f5c1e95de9419cb1904e0cbad570c63" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8" kind="class"><name>cudnn_frontend::TensorBuilder_v8</name>
+    <member refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8_1a87c53bd36c748fe2327743bd852fb144" kind="variable"><name>m_tensor</name></member>
+    <member refid="d3/d3c/group__TensorBuilder__v8_1ga98275e4d36e37ef5d73f13bd80f164a3" kind="function"><name>setDataType</name></member>
+    <member refid="d3/d3c/group__TensorBuilder__v8_1gae828806e2d76ca3eb6c4e289f2e93a96" kind="function"><name>setDim</name></member>
+    <member refid="d3/d3c/group__TensorBuilder__v8_1ga3de3d95beb2234dc2a741d23703f8ed2" kind="function"><name>setStrides</name></member>
+    <member refid="d3/d3c/group__TensorBuilder__v8_1ga6bdaeab1bff548d375e57936b64fb05a" kind="function"><name>setId</name></member>
+    <member refid="d3/d3c/group__TensorBuilder__v8_1ga385ec2c39e6386af7421f27330ed128b" kind="function"><name>setAlignment</name></member>
+    <member refid="d3/d3c/group__TensorBuilder__v8_1ga7d5d978de243e47938eb1f224a38d02d" kind="function"><name>setVirtual</name></member>
+    <member refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8_1a32876941f964b3fad2d123b9081b0af7" kind="function"><name>build</name></member>
+    <member refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8_1a9d57810fb6d58f5152e5a1bbc55fc5dd" kind="function"><name>TensorBuilder_v8</name></member>
+    <member refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8_1a2c9dcbe8acfe079ad14801c7cda0fe29" kind="function"><name>~TensorBuilder_v8</name></member>
+    <member refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8_1a8f8b7d7da3675d69e7f09bec21735656" kind="function"><name>TensorBuilder_v8</name></member>
+    <member refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8_1abcc771bbe9e1791afc10c686f90c2188" kind="function"><name>TensorBuilder_v8</name></member>
+    <member refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8_1a3a33c9ba58f393d231e05a1bcc5706d8" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kind="class"><name>cudnn_frontend::VariantPack_v8</name>
+    <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a8fcb5ec8a09de5a6f1f326f2e623cbdf" kind="friend"><name>VariantPackBuilder_v8</name></member>
+    <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a0f8d91939842bb9003fe71280f0b230c" kind="variable"><name>workspace</name></member>
+    <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a3a03ddd893f41a9ce6ca674bbfae7434" kind="variable"><name>data_pointers</name></member>
+    <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a5c3371913fd88b20557bcc4d8ef93219" kind="variable"><name>uid</name></member>
+    <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1afeaea07e176fa0c943704285f258ba28" kind="variable"><name>num_ptrs</name></member>
+    <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a7ba1c4736d3b0f187dc06344ca4e2032" kind="function"><name>describe</name></member>
+    <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1aa9ce6c30e5e3c2df4d1e9fe2fb4cd6f5" kind="function"><name>VariantPack_v8</name></member>
+    <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a55a7b12efe39ed7a24631ed05630721d" kind="function"><name>~VariantPack_v8</name></member>
+    <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1ab2712c9ad5eeaf561408d7245938d0c6" kind="function"><name>VariantPack_v8</name></member>
+    <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a7d3416a4e2f6a67e1988e3b3cb77e88b" kind="function"><name>VariantPack_v8</name></member>
+    <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a3f85d13ac1341b67d85f18761f8dcb35" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8" kind="class"><name>cudnn_frontend::VariantPackBuilder_v8</name>
+    <member refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8_1a41a6e8afb46228fea2310f5cad75badc" kind="variable"><name>m_variant_pack</name></member>
+    <member refid="d5/def/group__VariantPackBuilder__v8_1ga79c6def790139cb04aff8c600559b802" kind="function"><name>setDataPointers</name></member>
+    <member refid="d5/def/group__VariantPackBuilder__v8_1gad6dc5c5087c2724ca88cc2668d7f829d" kind="function"><name>setUids</name></member>
+    <member refid="d5/def/group__VariantPackBuilder__v8_1ga14d3ac479fd01c48a97583adfb567090" kind="function"><name>setDataPointers</name></member>
+    <member refid="d5/def/group__VariantPackBuilder__v8_1ga3a7b9ac8c714db202a8f89a6110675b6" kind="function"><name>setWorkspacePointer</name></member>
+    <member refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8_1abf794751941aa252c19e1879306375d3" kind="function"><name>build</name></member>
+    <member refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8_1a7690f854d9e6fc2d4df059fca0e91c6a" kind="function"><name>VariantPackBuilder_v8</name></member>
+    <member refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8_1a27a6e5a2602262c35a8ea8533ef5a635" kind="function"><name>~VariantPackBuilder_v8</name></member>
+    <member refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8_1a16d853685d603472bf260e500f55c145" kind="function"><name>VariantPackBuilder_v8</name></member>
+    <member refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8_1ac7a523746975d15fd8dc54af0764dcb0" kind="function"><name>VariantPackBuilder_v8</name></member>
+    <member refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8_1acee84ffc33b41807cdcb18425e9fced1" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="df/de1/namespacecudnn__frontend" kind="namespace"><name>cudnn_frontend</name>
+    <member refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3" kind="enum"><name>CudnnFindSamplingTechnique</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3ac8ab707d81df65503b6b0ecc67675158" kind="enumvalue"><name>CUDNN_FIND_SAMPLE_ONCE</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3a903bfd2e4d1b8ab2a7197be752c618a6" kind="enumvalue"><name>CUDNN_FIND_SAMPLE_MEDIAN_OF_THREE</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3a8199dfa6701edb38f52a74d9e229b43d" kind="enumvalue"><name>CUDNN_FIND_SAMPLE_TILL_STABLE</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kind="typedef"><name>ManagedOpaqueDescriptor</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1aa20fd945a531e0a3a5007e65fe917770" kind="typedef"><name>Tensor</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a9fea2e22198aaf2ea11a0df46abd0749" kind="typedef"><name>TensorBuilder</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ae24bc7541c87c642cdef8eaf83c8eacc" kind="typedef"><name>ConvDesc</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a91b5e4e82a18d2212ad6be6d5398752c" kind="typedef"><name>ConvDescBuilder</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a7f878662c40c287736343affc43f25dc" kind="typedef"><name>PointWiseDescBuilder</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ada5353494ce649fc915154ced52dcceb" kind="typedef"><name>PointWiseDesc</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ad809552e9ec400bcbfcfc0ea5acd4e56" kind="typedef"><name>MatMulDesc</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a0c344e3bc1f332aa9f5b213eb1ae9ee6" kind="typedef"><name>MatMulDescBuilder</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a2f1497702504947953a0f5a69b6eeb2a" kind="typedef"><name>Operation</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ae6d02ff4c7922673ed3862145a4019d4" kind="typedef"><name>OperationBuilder</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ac86ce924df5209c4ce1bc25856eea6e6" kind="typedef"><name>OperationGraph</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a0b7ba1175801c56d07d26785bcd8fb70" kind="typedef"><name>OperationGraphBuilder</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1aae6a627b67858b15afbc5656afa88123" kind="typedef"><name>EngineHeuristicsBuilder</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a147bbd62e1c7c6b3fbc6869ab776b125" kind="typedef"><name>EngineHeuristics</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a4f90ec150d149f8f0751daa3ad625839" kind="typedef"><name>EngineBuilder</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a1ed8c535fea949a10acd26e279cc28a1" kind="typedef"><name>Engine</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a2559dec72130bbdc95c02fb0df79fd42" kind="typedef"><name>EngineConfig</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ac46e1785757fde7c10e3d527f697fde8" kind="typedef"><name>EngineConfigBuilder</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a984c10aa29daac796444bda66bdef26e" kind="typedef"><name>ExecutionPlan</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1aa508b66c4de02f4aacae8029dbe422eb" kind="typedef"><name>ExecutionPlanBuilder</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ad6ac8113b406ee2b6f20eff4dd2b4e01" kind="typedef"><name>VariantPack</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ab5b844f5de8ad3c056f0cb1cd0fb3ac1" kind="typedef"><name>VariantPackBuilder</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a61fbd4506f1249c686164fb33d858999" kind="typedef"><name>EngineFallbackList</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1aeb6699f494fa895d402898dae554f5a9" kind="typedef"><name>EngineFallbackListBuilder</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a84a5f004bdf17747bf7cf45d6fc754cd" kind="typedef"><name>EngineConfigList</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ad5f0f0c892b009e34aa59f67de1b5535" kind="typedef"><name>executionOptions_t</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a560644a5c1e6016c509a379ca6e03f05" kind="typedef"><name>executionPlans_t</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ad31f040777311d1d1a7a2490f23e026e" kind="typedef"><name>Predicate</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a53716729f10b4064fb41dec9dd32ffd6" kind="typedef"><name>GeneratorSource</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" kind="function"><name>make_shared_backend_pointer</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a0f52559baeb4e9ee8835d95ea50a875e" kind="function"><name>filter</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1ad365eee23138df472d716d9dbf119f0e" kind="function"><name>get_fallback_engine_list</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a4d18e44a57e30f9bf29157f742ba9c65" kind="function"><name>filter</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a75bb541476d93b039f5fd9f9d29242e6" kind="function"><name>hasNumericalNote</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a148478701949f58a44912cc61dbda1e4" kind="function"><name>time_sorted_plan</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a1690523b8a133acefaeabc725032e21c" kind="function"><name>throw_if</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a6b0bb5ee1f6d6491a7d53a01ae947dee" kind="function"><name>throw_if</name></member>
+    <member refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kind="function"><name>set_error_and_throw_exception</name></member>
+  </compound>
+  <compound refid="d8/dcc/namespacestd" kind="namespace"><name>std</name>
+  </compound>
+  <compound refid="dc/d11/cudnn__backend__base_8h" kind="file"><name>cudnn_backend_base.h</name>
+  </compound>
+  <compound refid="de/d0c/cudnn__frontend_8h" kind="file"><name>cudnn_frontend.h</name>
+  </compound>
+  <compound refid="d1/de7/cudnn__frontend__ConvDesc_8h" kind="file"><name>cudnn_frontend_ConvDesc.h</name>
+  </compound>
+  <compound refid="de/d6d/cudnn__frontend__Engine_8h" kind="file"><name>cudnn_frontend_Engine.h</name>
+  </compound>
+  <compound refid="d6/d67/cudnn__frontend__EngineConfig_8h" kind="file"><name>cudnn_frontend_EngineConfig.h</name>
+  </compound>
+  <compound refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h" kind="file"><name>cudnn_frontend_EngineConfigGenerator.h</name>
+  </compound>
+  <compound refid="df/d3e/cudnn__frontend__EngineFallbackList_8h" kind="file"><name>cudnn_frontend_EngineFallbackList.h</name>
+  </compound>
+  <compound refid="d6/d51/cudnn__frontend__ExecutionPlan_8h" kind="file"><name>cudnn_frontend_ExecutionPlan.h</name>
+  </compound>
+  <compound refid="d5/d36/cudnn__frontend__Filters_8h" kind="file"><name>cudnn_frontend_Filters.h</name>
+  </compound>
+  <compound refid="d3/d6b/cudnn__frontend__find__plan_8h" kind="file"><name>cudnn_frontend_find_plan.h</name>
+  </compound>
+  <compound refid="d2/d3b/cudnn__frontend__get__plan_8h" kind="file"><name>cudnn_frontend_get_plan.h</name>
+  </compound>
+  <compound refid="db/d66/cudnn__frontend__Heuristics_8h" kind="file"><name>cudnn_frontend_Heuristics.h</name>
+  </compound>
+  <compound refid="d6/d32/cudnn__frontend__MatMulDesc_8h" kind="file"><name>cudnn_frontend_MatMulDesc.h</name>
+  </compound>
+  <compound refid="da/d5a/cudnn__frontend__Operation_8h" kind="file"><name>cudnn_frontend_Operation.h</name>
+  </compound>
+  <compound refid="db/d7d/cudnn__frontend__OperationGraph_8h" kind="file"><name>cudnn_frontend_OperationGraph.h</name>
+  </compound>
+  <compound refid="da/d5f/cudnn__frontend__PointWiseDesc_8h" kind="file"><name>cudnn_frontend_PointWiseDesc.h</name>
+  </compound>
+  <compound refid="d3/d98/cudnn__frontend__Tensor_8h" kind="file"><name>cudnn_frontend_Tensor.h</name>
+  </compound>
+  <compound refid="df/d17/cudnn__frontend__utils_8h" kind="file"><name>cudnn_frontend_utils.h</name>
+  </compound>
+  <compound refid="df/dc0/cudnn__frontend__VariantPack_8h" kind="file"><name>cudnn_frontend_VariantPack.h</name>
+  </compound>
+  <compound refid="d3/ddd/group__ConvDescBuilder__v8" kind="group"><name>ConvDescBuilder_v8</name>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1gad8de00b0e7a86bdda61749e7572a35ac" kind="function"><name>setDataType</name></member>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1gab07bf6292e69d19e6324d3073a86d58c" kind="function"><name>setPrePadding</name></member>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1ga44915183cb4dddcf23222faca3f84bba" kind="function"><name>setPostPadding</name></member>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1gaa41e2cbbebc9d2fd19fa990a48b39d08" kind="function"><name>setDilation</name></member>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1ga2c481d46d71fe909247f50ba2772b7ce" kind="function"><name>setStrides</name></member>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1gaacfcf20b0ed61e89bc92970f7bb7a258" kind="function"><name>setNDims</name></member>
+    <member refid="d3/ddd/group__ConvDescBuilder__v8_1ga3b752afba659c8e92e7ad1ca71d62f2f" kind="function"><name>setMathMode</name></member>
+  </compound>
+  <compound refid="d3/d09/group__EngineBuilder__v8" kind="group"><name>EngineBuilder_v8</name>
+    <member refid="d3/d09/group__EngineBuilder__v8_1ga0ceef322363405504dbdc4d1f3c9949a" kind="function"><name>setOperationGraph</name></member>
+    <member refid="d3/d09/group__EngineBuilder__v8_1ga27466cecb45496d001cfbe4de4b5c5a9" kind="function"><name>setOperationGraph</name></member>
+    <member refid="d3/d09/group__EngineBuilder__v8_1ga7220dab88f9fed1704c9d78d9771be5f" kind="function"><name>setOperationGraph</name></member>
+    <member refid="d3/d09/group__EngineBuilder__v8_1ga2b171d44da46865d536236bb01103005" kind="function"><name>setGlobalEngineIdx</name></member>
+  </compound>
+  <compound refid="d2/dbb/group__EngineConfigBuilder__v8" kind="group"><name>EngineConfigBuilder_v8</name>
+    <member refid="d2/dbb/group__EngineConfigBuilder__v8_1ga9673b31268901dfcb97896958687a42a" kind="function"><name>setEngine</name></member>
+  </compound>
+  <compound refid="d4/d6b/group__EngineFallbackListBuilder__v8" kind="group"><name>EngineFallbackListBuilder_v8</name>
+    <member refid="d4/d6b/group__EngineFallbackListBuilder__v8_1ga45c7c761a47a7731055ad0f943449610" kind="function"><name>setOperationGraph</name></member>
+    <member refid="d4/d6b/group__EngineFallbackListBuilder__v8_1gaf66485fe1a0faccab971edd0c70f04b4" kind="function"><name>setOperation</name></member>
+  </compound>
+  <compound refid="d7/d0d/group__ExecutionPlanQuery" kind="group"><name>ExecutionPlanQuery</name>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga5e3dd6d441474ac5ab94aaaf9c45bc5b" kind="variable"><name>engine_config</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga4c36108c6511420d81fcda5292761726" kind="variable"><name>handle</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1gaf732b37c9c05a2a8bd1a76289c740c4a" kind="variable"><name>planTag</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1gae1a2e3dd89dbe455e7067531ec5b5562" kind="variable"><name>m_execution_plan</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga00d10a076c22e86354a789852c56c22f" kind="function"><name>getWorkspaceSize</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1gad80aa2980d915449d05db4c71041e2e0" kind="function"><name>describe</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga2ff1340409f8834fe9ae68ff4c00281a" kind="function"><name>getTag</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga8a6517102f5c12e63e4417324a03180b" kind="function"><name>computeTag</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga2c011aa14563ef96417ce599f0c83d89" kind="function"><name>ExecutionPlan_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga51c4b75729ab066f0686729896741c5d" kind="function"><name>ExecutionPlan_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga0705e60cee62d3d196751517d545a7b0" kind="function"><name>operator=</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" kind="function"><name>build</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga8e48fb375271599c83f57922d9f8c89e" kind="function"><name>ExecutionPlanBuilder_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1gae3f841de1b6461b31bf7967734a70a8a" kind="function"><name>~ExecutionPlanBuilder_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga60147aa715352906e32cbb87558cb0ae" kind="function"><name>ExecutionPlanBuilder_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga2b84d3619b5bd9ca0faa30c126deb43c" kind="function"><name>ExecutionPlanBuilder_v8</name></member>
+    <member refid="d7/d0d/group__ExecutionPlanQuery_1ga5f757c2da8c90645c34637dde4aed8f8" kind="function"><name>operator=</name></member>
+  </compound>
+  <compound refid="d4/de1/group__ExecutionPlanBuilder__v8" kind="group"><name>ExecutionPlanBuilder_v8</name>
+    <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1ga4166679391fc2df54e25964c03ae6e8e" kind="function"><name>setHandle</name></member>
+    <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1gac5c23cff8c1424f71ef2cee2dc66cd3c" kind="function"><name>setEngineConfig</name></member>
+    <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1gaf7010781cc8c0583a2d841ac6d9ed521" kind="function"><name>setEngineConfig</name></member>
+    <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1gae0f92d5445da53253ff3460ac6aefffa" kind="function"><name>setEngineConfig</name></member>
+  </compound>
+  <compound refid="d6/d46/group__EngineHeuristicsQuery" kind="group"><name>EngineHeuristicsQuery</name>
+    <member refid="d6/d46/group__EngineHeuristicsQuery_1ga1171cb5ce50baf0fab19fc458d4565b5" kind="function"><name>getEngineConfig</name></member>
+    <member refid="d6/d46/group__EngineHeuristicsQuery_1ga10121605fc82ed225537210825fa3836" kind="function"><name>getEngineConfigCount</name></member>
+  </compound>
+  <compound refid="dc/d99/group__EngineHeuristicsBuilder__v8" kind="group"><name>EngineHeuristicsBuilder_v8</name>
+    <member refid="dc/d99/group__EngineHeuristicsBuilder__v8_1ga0554ac9347b7409e46f960b30f18dc68" kind="function"><name>setOperationGraph</name></member>
+    <member refid="dc/d99/group__EngineHeuristicsBuilder__v8_1gaf2d783ca6a663aa50ffed2ccbc164812" kind="function"><name>setHeurMode</name></member>
+  </compound>
+  <compound refid="d9/d08/group__MatMulDescBuilder__v8" kind="group"><name>MatMulDescBuilder_v8</name>
+    <member refid="d9/d08/group__MatMulDescBuilder__v8_1ga5885f3eb7580cbe0cbe7243c4711c0f2" kind="function"><name>setMathPrecision</name></member>
+  </compound>
+  <compound refid="d3/d92/group__OperationBuilder__v8" kind="group"><name>OperationBuilder_v8</name>
+    <member refid="d3/d92/group__OperationBuilder__v8_1gaefa06fdaae3b28c6ef08a0189e2a3d3a" kind="function"><name>setxDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga04c2492a5376f1a74a57fb49fa7b3599" kind="function"><name>setxDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga17475846760b10ffdfa536cd92a5b135" kind="function"><name>setbDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga5910bc2209e1b648c1aa0edce7f11e01" kind="function"><name>setyDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga80466e517e980ba4953e085b3d4e3498" kind="function"><name>setwDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga08f3d4cb5138174127d0f6899f7bc53b" kind="function"><name>setdyDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga9e4a1e9a233b44cca5b65f0af172b001" kind="function"><name>setdyDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga35fa5c453a6cd989f35e47c29e6ec665" kind="function"><name>setdxDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga5e5d463d5531a9378280fa4b1aee6f63" kind="function"><name>setdwDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1gaa82e018b6a9d514ad912b922f43adad2" kind="function"><name>setcDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga095c52c8f1b01ebb224265f9000195c0" kind="function"><name>setaMatDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1gaa8eed29a0181e044ea0263ba655127ec" kind="function"><name>setbMatDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1gaaf9d7cbc65c7c7526a6f15d4ad2952fa" kind="function"><name>setcMatDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga3ca1f62832f998566c1b07b4b3c71db4" kind="function"><name>setmatmulDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1gae6b06877b2e675b2a390f0b122100669" kind="function"><name>setpwDesc</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1gab4241b96e7374d821681e97259d39d83" kind="function"><name>setAlpha</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga3c63744504f65383ce0b847bea804e3f" kind="function"><name>setAlpha</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga06cdcfeda1b702412be41addd73bb947" kind="function"><name>setAlpha2</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga459671e9d26640528fcf683aaeef05df" kind="function"><name>setAlpha2</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga65a9ad73912ff46becc93ee451da6af5" kind="function"><name>setBeta</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga29752062b7308c8da0e625eb35431652" kind="function"><name>setBeta</name></member>
+    <member refid="d3/d92/group__OperationBuilder__v8_1ga425dd00708eaaadffe1c83ef356dc333" kind="function"><name>OperationBuilder_v8</name></member>
+  </compound>
+  <compound refid="d1/df7/group__OperationGraphQuery" kind="group"><name>OperationGraphQuery</name>
+    <member refid="d1/df7/group__OperationGraphQuery_1ga7a7a8d03f5a3aa54f14b83be4abe2a26" kind="function"><name>getEngineCount</name></member>
+  </compound>
+  <compound refid="d2/df5/group__OperationGraphBuilder__v8" kind="group"><name>OperationGraphBuilder_v8</name>
+    <member refid="d2/df5/group__OperationGraphBuilder__v8_1ga5b5d8a3121e92a8a7d47341b424298f8" kind="function"><name>setHandle</name></member>
+    <member refid="d2/df5/group__OperationGraphBuilder__v8_1ga4e4cee8d631471478d5de420077a2182" kind="function"><name>setOperationGraph</name></member>
+  </compound>
+  <compound refid="d2/db5/group__PointWiseDescBuilder__v8" kind="group"><name>PointWiseDescBuilder_v8</name>
+    <member refid="d2/db5/group__PointWiseDescBuilder__v8_1ga3efa065fc125c5af06bd0a9c543bdb9f" kind="function"><name>setMathPrecision</name></member>
+    <member refid="d2/db5/group__PointWiseDescBuilder__v8_1ga124ebb4a416c645cd0b68f59545c62a8" kind="function"><name>setClipping</name></member>
+    <member refid="d2/db5/group__PointWiseDescBuilder__v8_1ga48264536e68f952e92a0bdbaa84d9363" kind="function"><name>setMode</name></member>
+    <member refid="d2/db5/group__PointWiseDescBuilder__v8_1gae5240136e19e0a4094036d48c6b1a3b7" kind="function"><name>setMode</name></member>
+  </compound>
+  <compound refid="d3/d3c/group__TensorBuilder__v8" kind="group"><name>TensorBuilder_v8</name>
+    <member refid="d3/d3c/group__TensorBuilder__v8_1ga98275e4d36e37ef5d73f13bd80f164a3" kind="function"><name>setDataType</name></member>
+    <member refid="d3/d3c/group__TensorBuilder__v8_1gae828806e2d76ca3eb6c4e289f2e93a96" kind="function"><name>setDim</name></member>
+    <member refid="d3/d3c/group__TensorBuilder__v8_1ga3de3d95beb2234dc2a741d23703f8ed2" kind="function"><name>setStrides</name></member>
+    <member refid="d3/d3c/group__TensorBuilder__v8_1ga6bdaeab1bff548d375e57936b64fb05a" kind="function"><name>setId</name></member>
+    <member refid="d3/d3c/group__TensorBuilder__v8_1ga385ec2c39e6386af7421f27330ed128b" kind="function"><name>setAlignment</name></member>
+    <member refid="d3/d3c/group__TensorBuilder__v8_1ga7d5d978de243e47938eb1f224a38d02d" kind="function"><name>setVirtual</name></member>
+  </compound>
+  <compound refid="d5/def/group__VariantPackBuilder__v8" kind="group"><name>VariantPackBuilder_v8</name>
+    <member refid="d5/def/group__VariantPackBuilder__v8_1ga79c6def790139cb04aff8c600559b802" kind="function"><name>setDataPointers</name></member>
+    <member refid="d5/def/group__VariantPackBuilder__v8_1gad6dc5c5087c2724ca88cc2668d7f829d" kind="function"><name>setUids</name></member>
+    <member refid="d5/def/group__VariantPackBuilder__v8_1ga14d3ac479fd01c48a97583adfb567090" kind="function"><name>setDataPointers</name></member>
+    <member refid="d5/def/group__VariantPackBuilder__v8_1ga3a7b9ac8c714db202a8f89a6110675b6" kind="function"><name>setWorkspacePointer</name></member>
+  </compound>
+  <compound refid="dir_d44c64559bbebec7f509842c48db8b23" kind="dir"><name>include</name>
+  </compound>
+  <compound refid="indexpage" kind="page"><name>index</name>
+  </compound>
+</doxygenindex>

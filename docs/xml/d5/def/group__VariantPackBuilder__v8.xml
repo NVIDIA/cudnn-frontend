@@ -1,0 +1,91 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d5/def/group__VariantPackBuilder__v8" kind="group">
+    <compoundname>VariantPackBuilder_v8</compoundname>
+    <title>VariantPackBuilder_v8</title>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d5/def/group__VariantPackBuilder__v8_1ga79c6def790139cb04aff8c600559b802" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::VariantPackBuilder_v8::setDataPointers</definition>
+        <argsstring>(int64_t num_ptr, void **ptrs) -&gt; VariantPackBuilder_v8 &amp;</argsstring>
+        <name>setDataPointers</name>
+        <param>
+          <type>int64_t</type>
+          <declname>num_ptr</declname>
+        </param>
+        <param>
+          <type>void **</type>
+          <declname>ptrs</declname>
+        </param>
+        <briefdescription>
+<para>Set dataPointers for the <ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">VariantPack_v8</ref>. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="94" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="94" bodyend="98"/>
+      </memberdef>
+      <memberdef kind="function" id="d5/def/group__VariantPackBuilder__v8_1gad6dc5c5087c2724ca88cc2668d7f829d" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::VariantPackBuilder_v8::setUids</definition>
+        <argsstring>(int64_t num_uids, int64_t *uid) -&gt; VariantPackBuilder_v8 &amp;</argsstring>
+        <name>setUids</name>
+        <param>
+          <type>int64_t</type>
+          <declname>num_uids</declname>
+        </param>
+        <param>
+          <type>int64_t *</type>
+          <declname>uid</declname>
+        </param>
+        <briefdescription>
+<para>Set Uids for the <ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">VariantPack_v8</ref>. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="101" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="101" bodyend="104"/>
+        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a5c3371913fd88b20557bcc4d8ef93219" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="79">cudnn_frontend::VariantPack_v8::uid</references>
+      </memberdef>
+      <memberdef kind="function" id="d5/def/group__VariantPackBuilder__v8_1ga14d3ac479fd01c48a97583adfb567090" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::VariantPackBuilder_v8::setDataPointers</definition>
+        <argsstring>(std::set&lt; std::pair&lt; uint64_t, void *&gt;&gt; const &amp;data_pointers) -&gt; VariantPackBuilder_v8 &amp;</argsstring>
+        <name>setDataPointers</name>
+        <param>
+          <type>std::set&lt; std::pair&lt; uint64_t, void *&gt;&gt; const &amp;</type>
+          <declname>data_pointers</declname>
+        </param>
+        <briefdescription>
+<para>Initialize a set of pairs containing uid and data pointer. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="107" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="107" bodyend="116"/>
+        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a3a03ddd893f41a9ce6ca674bbfae7434" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="78">cudnn_frontend::VariantPack_v8::data_pointers</references>
+      </memberdef>
+      <memberdef kind="function" id="d5/def/group__VariantPackBuilder__v8_1ga3a7b9ac8c714db202a8f89a6110675b6" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::VariantPackBuilder_v8::setWorkspacePointer</definition>
+        <argsstring>(void *ws) -&gt; VariantPackBuilder_v8 &amp;</argsstring>
+        <name>setWorkspacePointer</name>
+        <param>
+          <type>void *</type>
+          <declname>ws</declname>
+        </param>
+        <briefdescription>
+<para>Set Workspace. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="119" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="119" bodyend="122"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Set individual property of <ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">VariantPack_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>

@@ -1,6 +1,8 @@
 var NAVTREE =
 [
-  [ "CUDNN API", "index.html", [
+  [ "CUDNN Frontend API", "index.html", [
+    [ "Introduction", "index.html#Introduction", null ],
+    [ "Why use Frontend API", "index.html#Need", null ],
     [ "Modules", "modules.html", "modules" ],
     [ "Namespaces", null, [
       [ "Namespace List", "namespaces.html", "namespaces" ],
@@ -31,8 +33,8 @@ var NAVTREE =
 var NAVTREEINDEX =
 [
 "annotated.html",
-"d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html#a592e3a28fd7a8b2553789801d9bd276c",
-"df/d3e/cudnn__frontend__EngineFallbackList_8h.html"
+"d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer.html#aa9059097bb9161d454c6e17b03ca236c",
+"de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8.html#a3f5790e5ada9a1785d9daf4246ea8de3"
 ];
 
 var SYNCONMSG = 'click to disable panel synchronisation';
