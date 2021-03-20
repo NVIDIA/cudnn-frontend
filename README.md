@@ -11,6 +11,7 @@ Each `cudnnBackendDescriptorType_t` documented in the enum is organized into its
 - cudnn_frontend_Tensor.h         -> CUDNN_BACKEND_TENSOR_DESCRIPTOR
 - cudnn_frontend_ConvDesc.h       -> CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR
 - cudnn_frontend_PointWiseDesc.h  -> CUDNN_BACKEND_POINTWISE_DESCRIPTOR
+- cudnn_frontend_MatMulDesc.h     -> CUDNN_BACKEND_MATMUL_DESCRIPTOR
 - cudnn_frontend_Operation.h      -> CUDNN_BACKEND_OPERATION_*_DESCRIPTOR
 - cudnn_frontend_OperationGraph.h -> CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR
 - cudnn_frontend_Heuristics.h     -> CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR
@@ -32,6 +33,7 @@ Each `cudnnBackendDescriptorType_t` documented in the enum is organized into its
 
 ## Samples
 Multiple samples of convolution, dgrad, wgrad and convBiasAct are added in `samples/test_list.cpp` and `samples/conv_sample.cpp`.  
+Samples of runtime fusion are added in `samples/test_list.cpp` and `samples/fusion_sample.cpp`.  
 
 Sample tests are written using the [Catch2](https://github.com/catchorg/Catch2) C++ test framework.
 
@@ -55,9 +57,6 @@ The `cudnnFindPlan` in turn
 - Execute each filtered plan and ranks them in order of the execution plan runtime
 
 The most common `engineConfig` generation is the built-in heuristics of cuDNN V8. Generally, this is appended with the fallback list. An example of usage can be seen in `run_from_cudnn_find(...)` function in `conv_sample.cpp`.
-
-## Documentation
-Documentation can be found at https://nvidia.github.io/cudnn-frontend/
 
 ## Feedback
 Support, resources, and information about cuDNN can be found online at https://developer.nvidia.com/cudnn. 

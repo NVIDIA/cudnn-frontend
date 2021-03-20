@@ -84,8 +84,8 @@ class EngineFallbackList_v8 : public BackendDescriptor {
 
     EngineFallbackList_v8(EngineFallbackList_v8 &&from)
         : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
-          mode(from.mode),
           opGraph(from.opGraph),
+          mode(from.mode),
           opGraphTag(from.opGraphTag) {
         m_engine_configs.swap(from.m_engine_configs);
     }
@@ -137,7 +137,7 @@ class EngineFallbackListBuilder_v8 {
             return std::move(m_fallback_list);
         };
         auto fallback_engine_list = get_fallback_engine_list(m_fallback_list.mode);
-        for (auto i = 0; i < fallback_engine_list.size(); i++) {
+        for (std::uint32_t i = 0; i < fallback_engine_list.size(); i++) {
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
             try {
 #endif

@@ -33,7 +33,12 @@
 #include <tuple>
 #include <functional>
 
+#include <cudnn.h>
+#include <cudnn_backend.h>
+
 #include <cudnn_frontend.h>
+
+
 #include "fp16_dev.h"
 #include "fp16_emu.h"
 #include "helpers.h"
@@ -63,7 +68,8 @@ void run_from_heuristics(
     cudnnConvolutionMode_t mode,
     float * devPtrI,
     float * devPtrF,
-    float * devPtrO);
+    float * devPtrO,
+    cudnnBackendHeurMode_t heur_mode);
 
 void run_with_external_config(
     int64_t* dimA_padded,
@@ -79,7 +85,7 @@ void run_with_external_config(
     float * devPtrO);
 
 void
-run_conv_bias_add_activation(
+run_conv_add_bias_activation(
     int64_t* x_dim_padded,
     int64_t* pad,
     int64_t* convstride,
@@ -106,7 +112,7 @@ void run_from_cudnn_find(
     float * devPtrF,
     float * devPtrO);
 
-void run_conv_bias_add_activation_with_cudnn_find(
+void run_conv_add_bias_activation_with_cudnn_find(
     int64_t* x_dim_padded,
     int64_t* pad,
     int64_t* convstride,

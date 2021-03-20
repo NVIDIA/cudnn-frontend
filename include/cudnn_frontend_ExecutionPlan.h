@@ -54,8 +54,8 @@ class ExecutionPlan_v8 : public BackendDescriptor {
 
     ExecutionPlan_v8(ExecutionPlan_v8 &&from)
         : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
-          handle(from.handle),
           engine_config(from.engine_config),
+          handle(from.handle),
           planTag(from.planTag) {}
     ~ExecutionPlan_v8() = default;
     /** @defgroup ExecutionPlanQuery
@@ -65,7 +65,7 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     //! Query the workspace requirement for the given plan
     auto
     getWorkspaceSize(void) const -> int64_t {
-        uint64_t workSpaceSize = 0;
+        std::int64_t workSpaceSize = 0;
         auto status            = cudnnBackendGetAttribute(pointer->get_backend_descriptor(),
                                                CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
                                                CUDNN_TYPE_INT64,
@@ -126,7 +126,7 @@ class ExecutionPlan_v8 : public BackendDescriptor {
 
         cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
         std::array<cudnnBackendDescriptor_t, CUDNN_KNOB_TYPE_COUNTS> extractedKnobs_{{nullptr}};
-        for (auto i = 0; i < extractedKnobs.size(); i++) {
+        for (std::uint32_t i = 0; i < extractedKnobs.size(); i++) {
             extractedKnobs_[i] = extractedKnobs[i]->get_backend_descriptor();
         }
 
@@ -230,6 +230,8 @@ class ExecutionPlanBuilder_v8 {
     auto
     setEngineConfig(cudnnBackendDescriptor_t &desc, std::string const &opGraphTag_ = "") -> ExecutionPlanBuilder_v8 & {
         // TBD
+        (void)desc;
+        (void)opGraphTag_;
         return *this;
     }
     //! Set engine Config for the Plan

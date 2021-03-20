@@ -81,7 +81,7 @@ class EngineHeuristics_v8 : public BackendDescriptor {
             m_heuristic_results.emplace_back(engConfig);
         }
         std::vector<cudnnBackendDescriptor_t> heuristic_results_;
-        for (auto i = 0; i < m_heuristic_results.size(); i++) {
+        for (std::uint32_t i = 0; i < m_heuristic_results.size(); i++) {
             heuristic_results_.emplace_back(m_heuristic_results[i]->get_backend_descriptor());
         }
         int64_t result = -1;
