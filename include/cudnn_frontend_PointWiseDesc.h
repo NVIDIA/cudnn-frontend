@@ -266,11 +266,22 @@ class PointWiseDescBuilder_v8 {
                 return std::move(m_pointWiseDesc);
             }
 
-            status = cudnnBackendSetAttribute(m_pointWiseDesc.pointer->get_backend_descriptor(),
-                                              CUDNN_ATTR_POINTWISE_RELU_UPPER_CLIP,
-                                              CUDNN_TYPE_DOUBLE,
-                                              1,
-                                              &m_pointWiseDesc.upper_clip);
+            if (m_pointWiseDesc.math_precision == CUDNN_DATA_FLOAT) {
+                double clamped_upper_clip =
+                    std::min<double>(m_pointWiseDesc.upper_clip, std::numeric_limits<float>::max());
+                status = cudnnBackendSetAttribute(m_pointWiseDesc.pointer->get_backend_descriptor(),
+                                                  CUDNN_ATTR_POINTWISE_RELU_UPPER_CLIP,
+                                                  CUDNN_TYPE_DOUBLE,
+                                                  1,
+                                                  &clamped_upper_clip);
+
+            } else {
+                status = cudnnBackendSetAttribute(m_pointWiseDesc.pointer->get_backend_descriptor(),
+                                                  CUDNN_ATTR_POINTWISE_RELU_UPPER_CLIP,
+                                                  CUDNN_TYPE_DOUBLE,
+                                                  1,
+                                                  &m_pointWiseDesc.upper_clip);
+            }
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_pointWiseDesc,

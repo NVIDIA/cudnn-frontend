@@ -42,7 +42,7 @@ auto static get_fallback_engine_list(cudnnBackendDescriptorType_t mode) -> std::
             } else {
                 return {};
             }
-        } else if (minor_version == 1) {
+        } else if (minor_version <= 2) {
             if (mode == CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR) {
                 std::vector<int> engine_list(50);
                 std::iota(engine_list.begin(), engine_list.end(), 0);

@@ -490,15 +490,15 @@ TEST_CASE("ConvScaleBiasAddAct sample", "[frontend][fusion][ConvScaleBiasAddAct]
 
     int Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
 
-    Surface<float> X(xTensorDim[0] * xTensorDim[1] * xTensorDim[2] * xTensorDim[3], false);
-    Surface<float> W(wTensorDim[0] * wTensorDim[1] * wTensorDim[2] * wTensorDim[3], false);
-    Surface<float> Y(Ysize, true);
+    Surface<half> X(xTensorDim[0] * xTensorDim[1] * xTensorDim[2] * xTensorDim[3], false);
+    Surface<half> W(wTensorDim[0] * wTensorDim[1] * wTensorDim[2] * wTensorDim[3], false);
+    Surface<half> Y(Ysize, true);
 
-    Surface<float> S(sTensorDim[0] * sTensorDim[1] * sTensorDim[2] * sTensorDim[3], false);
-    Surface<float> B(bTensorDim[0] * bTensorDim[1] * bTensorDim[2] * bTensorDim[3], false);
-    Surface<float> A(aTensorDim[0] * aTensorDim[1] * aTensorDim[2] * aTensorDim[3], false);
+    Surface<half> S(sTensorDim[0] * sTensorDim[1] * sTensorDim[2] * sTensorDim[3], false);
+    Surface<half> B(bTensorDim[0] * bTensorDim[1] * bTensorDim[2] * bTensorDim[3], false);
+    Surface<half> A(aTensorDim[0] * aTensorDim[1] * aTensorDim[2] * aTensorDim[3], false);
 
-    run_conv_scale_bias_add_relu(xTensorDim, wTensorDim, yTensorDim, sTensorDim, bTensorDim, aTensorDim, CUDNN_DATA_FLOAT, 
+    run_conv_scale_bias_add_relu(xTensorDim, wTensorDim, yTensorDim, sTensorDim, bTensorDim, aTensorDim, CUDNN_DATA_HALF, 
                                 2, conv_padA, conv_dilationA, conv_strideA, 
                                 X.devPtr, W.devPtr, Y.devPtr, S.devPtr, B.devPtr, A.devPtr);
 
@@ -524,13 +524,13 @@ TEST_CASE("MatmulBiasAct sample", "[frontend][fusion][MatmulBiasAct]") {
 
     int Csize = cTensorDim[0] * cTensorDim[1] * cTensorDim[2];
 
-    Surface<float> A(aTensorDim[0] * aTensorDim[1] * aTensorDim[2], false);
-    Surface<float> B(bTensorDim[0] * bTensorDim[1] * bTensorDim[2], false);
-    Surface<float> C(Csize, true);
+    Surface<half> A(aTensorDim[0] * aTensorDim[1] * aTensorDim[2], false);
+    Surface<half> B(bTensorDim[0] * bTensorDim[1] * bTensorDim[2], false);
+    Surface<half> C(Csize, true);
 
-    Surface<float> Z(zTensorDim[0] * zTensorDim[1] * zTensorDim[2], false);
+    Surface<half> Z(zTensorDim[0] * zTensorDim[1] * zTensorDim[2], false);
 
-    run_matmul_bias_gelu(aTensorDim, bTensorDim, cTensorDim, zTensorDim, CUDNN_DATA_FLOAT, A.devPtr, B.devPtr, C.devPtr, Z.devPtr);
+    run_matmul_bias_gelu(aTensorDim, bTensorDim, cTensorDim, zTensorDim, CUDNN_DATA_HALF, A.devPtr, B.devPtr, C.devPtr, Z.devPtr);
 
     checkCudaErr(cudaDeviceSynchronize());
     checkCudaErr(cudaMemcpy(C.hostPtr, C.devPtr, sizeof(C.hostPtr[0]) * Csize, cudaMemcpyDeviceToHost));
@@ -584,10 +584,10 @@ TEST_CASE("ConvDrelu sample", "[frontend][convDrelu][drelu]") {
     int Ysize = yTensorDim_padded[0] * yTensorDim_padded[1] * yTensorDim_padded[2] * yTensorDim_padded[3];
     int Wsize = wTensorDim_padded[0] * wTensorDim_padded[1] * wTensorDim_padded[2] * wTensorDim_padded[3];
 
-    Surface<float> x_mem(Xsize, false);
-    Surface<float> w_mem(Wsize, false);
-    Surface<float> y_mem(Ysize, false);
-    Surface<float> extra_x_mem(Xsize, false);
+    Surface<half> x_mem(Xsize, false);
+    Surface<half> w_mem(Wsize, false);
+    Surface<half> y_mem(Ysize, false);
+    Surface<half> extra_x_mem(Xsize, false);
 
     run_conv_drelu(xTensorDim_padded,
                    padding,
@@ -595,7 +595,7 @@ TEST_CASE("ConvDrelu sample", "[frontend][convDrelu][drelu]") {
                    dilation,
                    wTensorDim_padded,
                    yTensorDim_padded,
-                   CUDNN_DATA_FLOAT,
+                   CUDNN_DATA_HALF,
                    x_mem.devPtr,
                    w_mem.devPtr,
                    y_mem.devPtr,
@@ -653,10 +653,10 @@ TEST_CASE("DgradDrelu sample", "[frontend][dgradDrelu][drelu]") {
     int Ysize = yTensorDim_padded[0] * yTensorDim_padded[1] * yTensorDim_padded[2] * yTensorDim_padded[3];
     int Wsize = wTensorDim_padded[0] * wTensorDim_padded[1] * wTensorDim_padded[2] * wTensorDim_padded[3];
 
-    Surface<float> x_mem(Xsize, false);
-    Surface<float> w_mem(Wsize, false);
-    Surface<float> y_mem(Ysize, false);
-    Surface<float> extra_x_mem(Xsize, false);
+    Surface<half> x_mem(Xsize, false);
+    Surface<half> w_mem(Wsize, false);
+    Surface<half> y_mem(Ysize, false);
+    Surface<half> extra_x_mem(Xsize, false);
 
     run_dgrad_drelu(xTensorDim_padded,
                     padding,
@@ -664,7 +664,7 @@ TEST_CASE("DgradDrelu sample", "[frontend][dgradDrelu][drelu]") {
                     dilation,
                     wTensorDim_padded,
                     yTensorDim_padded,
-                    CUDNN_DATA_FLOAT,
+                    CUDNN_DATA_HALF,
                     x_mem.devPtr,
                     w_mem.devPtr,
                     y_mem.devPtr,

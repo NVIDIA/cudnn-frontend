@@ -49,12 +49,12 @@ run_conv_scale_bias_add_relu(int64_t* x_dim,
                              int64_t* conv_padA,
                              int64_t* conv_dilationA,
                              int64_t* conv_strideA,
-                             float* devPtrX,
-                             float* devPtrW,
-                             float* devPtrY,
-                             float* devPtrS,
-                             float* devPtrB,
-                             float* devPtrA);
+                             void* devPtrX,
+                             void* devPtrW,
+                             void* devPtrY,
+                             void* devPtrS,
+                             void* devPtrB,
+                             void* devPtrA);
 
 void
 run_matmul_bias_gelu(int64_t* a_dim,
@@ -62,10 +62,10 @@ run_matmul_bias_gelu(int64_t* a_dim,
                      int64_t* c_dim,
                      int64_t* z_dim,
                      cudnnDataType_t dataType,
-                     float* devPtrA,
-                     float* devPtrB,
-                     float* devPtrC,
-                     float* devPtrZ);
+                     void* devPtrA,
+                     void* devPtrB,
+                     void* devPtrC,
+                     void* devPtrZ);
 
 void
 run_conv_drelu(int64_t* x,
@@ -75,10 +75,10 @@ run_conv_drelu(int64_t* x,
                int64_t* w,
                int64_t* y,
                cudnnDataType_t dataType,
-               float* devPtrX,
-               float* devPtrW,
-               float* devPtrY,
-               float* devPtrExtra_X);
+               void* devPtrX,
+               void* devPtrW,
+               void* devPtrY,
+               void* devPtrExtra_X);
 
 void
 run_dgrad_drelu(int64_t* x,
@@ -88,7 +88,7 @@ run_dgrad_drelu(int64_t* x,
                 int64_t* w,
                 int64_t* y,
                 cudnnDataType_t dataType,
-                float* devPtrX,
-                float* devPtrW,
-                float* devPtrY,
-                float* devPtrExtra_X);
+                void* devPtrX,
+                void* devPtrW,
+                void* devPtrY,
+                void* devPtrExtra_X);

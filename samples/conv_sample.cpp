@@ -329,6 +329,7 @@ run_from_heuristics(int64_t* x_dim_padded,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 
     if (handle_) cudnnDestroy(handle_);
@@ -399,6 +400,7 @@ run_from_global_index(int64_t* x_dim_padded,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 
     if (handle_) cudnnDestroy(handle_);
@@ -474,6 +476,7 @@ run_with_external_config(int64_t* x_dim_padded,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 
     if (handle_) cudnnDestroy(handle_);
@@ -645,6 +648,7 @@ run_conv_add_bias_activation(int64_t* x_dim_padded,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 }
 
@@ -702,6 +706,7 @@ run_from_cudnn_find(int64_t* x_dim_padded,
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error");
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 
     if (handle_) cudnnDestroy(handle_);
@@ -859,6 +864,7 @@ run_conv_add_bias_activation_with_cudnn_find(int64_t* x_dim_padded,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 }
 
@@ -914,6 +920,7 @@ run_from_cudnn_get(int64_t* x_dim_padded,
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error");
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 
     if (handle_) cudnnDestroy(handle_);

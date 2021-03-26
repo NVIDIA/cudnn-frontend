@@ -241,13 +241,7 @@ class EngineBuilder_v8 {
         m_engine.opGraphTag = opGraph_.getTag();
         return *this;
     }
-    //! Set operationGraph for the engine
-    auto
-    setOperationGraph(cudnnBackendDescriptor_t desc_) -> EngineBuilder_v8 & {
-        // TBD
-        (void)desc_;
-        return *this;
-    }
+
     //! Set operationGraph for the engine
     auto
     setOperationGraph(ManagedOpaqueDescriptor desc_) -> EngineBuilder_v8 & {

@@ -35,12 +35,12 @@ run_conv_scale_bias_add_relu(int64_t* x_dim,
                              int64_t* conv_padA,
                              int64_t* conv_dilationA,
                              int64_t* conv_strideA,
-                             float* devPtrX,
-                             float* devPtrW,
-                             float* devPtrY,
-                             float* devPtrS,
-                             float* devPtrB,
-                             float* devPtrA) {
+                             void* devPtrX,
+                             void* devPtrW,
+                             void* devPtrY,
+                             void* devPtrS,
+                             void* devPtrB,
+                             void* devPtrA) {
     cudnnHandle_t handle_;
     try {
         // Create cudnn handle
@@ -280,6 +280,7 @@ run_conv_scale_bias_add_relu(int64_t* x_dim,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 }
 
@@ -289,10 +290,10 @@ run_matmul_bias_gelu(int64_t* a_dim,
                      int64_t* c_dim,
                      int64_t* z_dim,
                      cudnnDataType_t dataType,
-                     float* devPtrA,
-                     float* devPtrB,
-                     float* devPtrC,
-                     float* devPtrZ) {
+                     void* devPtrA,
+                     void* devPtrB,
+                     void* devPtrC,
+                     void* devPtrZ) {
     cudnnHandle_t handle_;
     try {
         // Create cudnn handle
@@ -453,6 +454,7 @@ run_matmul_bias_gelu(int64_t* a_dim,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 }
 
@@ -464,10 +466,10 @@ run_conv_drelu(int64_t* x_dim,
                int64_t* w_dim,
                int64_t* y_dim,
                cudnnDataType_t dataType,
-               float* dev_ptr_x,
-               float* dev_ptr_w,
-               float* dev_ptr_y,
-               float* dev_ptr_bwd_act_x) {
+               void* dev_ptr_x,
+               void* dev_ptr_w,
+               void* dev_ptr_y,
+               void* dev_ptr_bwd_act_x) {
     cudnnHandle_t handle_;
     try {
         int convDim = 2;
@@ -537,7 +539,7 @@ run_conv_drelu(int64_t* x_dim,
         std::cout << after_activation_tensor.describe() << std::endl;
 
         auto convDesc = cudnn_frontend::ConvDescBuilder()
-                            .setDataType(dataType)
+                            .setDataType(CUDNN_DATA_FLOAT)
                             .setMathMode(CUDNN_CROSS_CORRELATION)
                             .setNDims(convDim)
                             .setStrides(convDim, convstride)
@@ -629,6 +631,7 @@ run_conv_drelu(int64_t* x_dim,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 }
 
@@ -640,10 +643,10 @@ run_dgrad_drelu(int64_t* dx_dim,
                 int64_t* w_dim,
                 int64_t* dy_dim,
                 cudnnDataType_t dataType,
-                float* dev_ptr_dx,
-                float* dev_ptr_w,
-                float* dev_ptr_dy,
-                float* dev_ptr_bwd_act_x) {
+                void* dev_ptr_dx,
+                void* dev_ptr_w,
+                void* dev_ptr_dy,
+                void* dev_ptr_bwd_act_x) {
     cudnnHandle_t handle_;
     try {
         int convDim = 2;
@@ -713,7 +716,7 @@ run_dgrad_drelu(int64_t* dx_dim,
         std::cout << after_bwd_activation_dx_tensor.describe() << std::endl;
 
         auto convDesc = cudnn_frontend::ConvDescBuilder()
-                            .setDataType(dataType)
+                            .setDataType(CUDNN_DATA_FLOAT)
                             .setMathMode(CUDNN_CROSS_CORRELATION)
                             .setNDims(convDim)
                             .setStrides(convDim, convstride)
@@ -807,5 +810,6 @@ run_dgrad_drelu(int64_t* dx_dim,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 }

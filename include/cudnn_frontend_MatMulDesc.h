@@ -79,7 +79,7 @@ class MatMulDescBuilder_v8 {
      *  Set individual property of MatMulDesc_v8 class
      *  @{
      */
-    //! Set Math Precision Data Type for the Convolution Operation
+    //! Set Math Precision Data Type for the Matmul Operation
     auto
     setMathPrecision(cudnnDataType_t data_type_) -> MatMulDescBuilder_v8 & {
         m_matMulDesc.math_precision = data_type_;

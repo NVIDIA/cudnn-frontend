@@ -29,6 +29,8 @@
 #include <cuda_runtime.h>
 #include <assert.h>
 
+#include "catch.hpp"
+
 #include <cudnn.h>
 
 #include "fp16_dev.h"

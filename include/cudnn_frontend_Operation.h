@@ -50,8 +50,14 @@ namespace cudnn_frontend {
 ///    - dydesc
 ///    - dxdesc
 ///    - cdesc
+///    - amatdesc
+///    - bmatdesc
+///    - cmatdesc
+///    - pwdesc
+///    - matmuldesc
 ///    - alpha
 ///    - beta
+///    - alpha2
 ///
 /// Use OperationBuilder_v8 to build this class.
 /// Describe returns a string describing the convolution operation
@@ -68,6 +74,7 @@ class Operation_v8 : public BackendDescriptor {
         ss << std::hex << " Y " << ydesc;
         ss << std::hex << " W " << wdesc;
         ss << std::hex << " B " << bdesc;
+        ss << std::hex << " DW " << dwdesc;
         ss << std::hex << " DY " << dydesc;
         ss << std::hex << " DX " << dxdesc;
         ss << std::hex << " C " << cdesc;
@@ -91,6 +98,7 @@ class Operation_v8 : public BackendDescriptor {
           bdesc(from.bdesc),
           dydesc(from.dydesc),
           dxdesc(from.dxdesc),
+          dwdesc(from.dwdesc),
           cdesc(from.cdesc),
           amatdesc(from.amatdesc),
           bmatdesc(from.bmatdesc),
@@ -551,6 +559,13 @@ class OperationBuilder_v8 {
             }
 
         } else if (is_matmul_op) {
+            if (m_operation.matmuldesc == nullptr) {
+                set_error_and_throw_exception(
+                    &m_operation,
+                    CUDNN_STATUS_BAD_PARAM,
+                    "CUDNN_BACKEND_OPERATION: Check and Set the CUDNN_ATTR_OPERATION_MATMUL_DESC");
+                return std::move(m_operation);
+            }
             if (m_operation.amatdesc == nullptr) {
                 set_error_and_throw_exception(
                     &m_operation,
