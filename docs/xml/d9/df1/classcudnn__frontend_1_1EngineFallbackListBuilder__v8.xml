@@ -71,7 +71,7 @@
         <references refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1a22ef505758a33415d01e3a9a8843fe22">cudnn_frontend::EngineFallbackList_v8::operator=</references>
         <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
         <references refid="d2/dbb/group__EngineConfigBuilder__v8_1ga9673b31268901dfcb97896958687a42a" compoundref="d6/d67/cudnn__frontend__EngineConfig_8h" startline="111" endline="153">cudnn_frontend::EngineConfigBuilder_v8::setEngine</references>
-        <references refid="d3/d09/group__EngineBuilder__v8_1ga2b171d44da46865d536236bb01103005" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="259" endline="262">cudnn_frontend::EngineBuilder_v8::setGlobalEngineIdx</references>
+        <references refid="d3/d09/group__EngineBuilder__v8_1ga2b171d44da46865d536236bb01103005" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="253" endline="256">cudnn_frontend::EngineBuilder_v8::setGlobalEngineIdx</references>
       </memberdef>
       <memberdef kind="function" id="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1ae955fa571b31ffc3da0ca6293d089642" prot="public" static="no" const="no" explicit="yes" inline="no" virt="non-virtual">
         <type></type>

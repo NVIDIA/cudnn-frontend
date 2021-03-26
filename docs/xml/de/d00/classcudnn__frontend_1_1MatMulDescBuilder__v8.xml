@@ -29,7 +29,7 @@
           <declname>data_type_</declname>
         </param>
         <briefdescription>
-<para>Set Math Precision Data Type for the Convolution Operation. </para>        </briefdescription>
+<para>Set Math Precision Data Type for the Matmul Operation. </para>        </briefdescription>
         <detaileddescription>
         </detaileddescription>
         <inbodydescription>

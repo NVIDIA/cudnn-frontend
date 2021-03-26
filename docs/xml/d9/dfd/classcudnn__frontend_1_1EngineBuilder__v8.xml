@@ -15,7 +15,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="336" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="336" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="330" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="330" bodyend="-1"/>
       </memberdef>
       </sectiondef>
       <sectiondef kind="public-func">
@@ -36,23 +36,6 @@
         </inbodydescription>
         <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="239" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="239" bodyend="243"/>
       </memberdef>
-      <memberdef kind="function" id="d3/d09/group__EngineBuilder__v8_1ga27466cecb45496d001cfbe4de4b5c5a9" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
-        <type>auto</type>
-        <definition>auto cudnn_frontend::EngineBuilder_v8::setOperationGraph</definition>
-        <argsstring>(cudnnBackendDescriptor_t desc_) -&gt; EngineBuilder_v8 &amp;</argsstring>
-        <name>setOperationGraph</name>
-        <param>
-          <type>cudnnBackendDescriptor_t</type>
-          <declname>desc_</declname>
-        </param>
-        <briefdescription>
-<para>Set operationGraph for the engine. </para>        </briefdescription>
-        <detaileddescription>
-        </detaileddescription>
-        <inbodydescription>
-        </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="246" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="246" bodyend="250"/>
-      </memberdef>
       <memberdef kind="function" id="d3/d09/group__EngineBuilder__v8_1ga7220dab88f9fed1704c9d78d9771be5f" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
         <definition>auto cudnn_frontend::EngineBuilder_v8::setOperationGraph</definition>
@@ -68,7 +51,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="253" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="253" bodyend="256"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="247" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="247" bodyend="250"/>
       </memberdef>
       <memberdef kind="function" id="d3/d09/group__EngineBuilder__v8_1ga2b171d44da46865d536236bb01103005" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -85,7 +68,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="259" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="259" bodyend="262"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="253" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="253" bodyend="256"/>
         <referencedby refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1aae1a36ace3278dbedcf0d743a7744d98" compoundref="df/d3e/cudnn__frontend__EngineFallbackList_8h" startline="131" endline="157">cudnn_frontend::EngineFallbackListBuilder_v8::build</referencedby>
       </memberdef>
       <memberdef kind="function" id="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a010b99c39d63121be78ec847fff433f8" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
@@ -99,7 +82,7 @@
 <para>constructs the <ref refid="dc/d3c/classcudnn__frontend_1_1Engine__v8" kindref="compound">Engine_v8</ref> by calling the cudnn API Throws the appropriate error message </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="268" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="268" bodyend="326"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="262" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="262" bodyend="320"/>
         <references refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1ae5d0c105971ce443fe6fb62884d7b2d2" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="165">cudnn_frontend::Engine_v8::EngineBuilder_v8</references>
         <references refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1ad3966b20d080c0fb9930b8a2018da2f8">cudnn_frontend::Engine_v8::operator=</references>
         <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
@@ -116,7 +99,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="328" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="322" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a8a300ec39fc764b86058acf8a9406d89" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -129,7 +112,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="329" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="323" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a033fb0022860f23e76ca1529da165bfc" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -145,7 +128,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="330" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="324" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a7f5a24e27ff497bd44fd93fb700d5424" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -161,7 +144,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="331" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="325" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a9d29a91186f6baa215b61340a386ec6d" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type><ref refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8" kindref="compound">EngineBuilder_v8</ref> &amp;</type>
@@ -177,7 +160,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="333" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="327" column="1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -297,7 +280,7 @@
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="231" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="231" bodyend="337"/>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="231" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="231" bodyend="331"/>
     <listofallmembers>
       <member refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a010b99c39d63121be78ec847fff433f8" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineBuilder_v8</scope><name>build</name></member>
       <member refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a21b687e5455f4bc727210ac2da46d7b3" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineBuilder_v8</scope><name>EngineBuilder_v8</name></member>
@@ -307,7 +290,6 @@
       <member refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a9d29a91186f6baa215b61340a386ec6d" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineBuilder_v8</scope><name>operator=</name></member>
       <member refid="d3/d09/group__EngineBuilder__v8_1ga2b171d44da46865d536236bb01103005" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineBuilder_v8</scope><name>setGlobalEngineIdx</name></member>
       <member refid="d3/d09/group__EngineBuilder__v8_1ga0ceef322363405504dbdc4d1f3c9949a" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineBuilder_v8</scope><name>setOperationGraph</name></member>
-      <member refid="d3/d09/group__EngineBuilder__v8_1ga27466cecb45496d001cfbe4de4b5c5a9" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineBuilder_v8</scope><name>setOperationGraph</name></member>
       <member refid="d3/d09/group__EngineBuilder__v8_1ga7220dab88f9fed1704c9d78d9771be5f" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineBuilder_v8</scope><name>setOperationGraph</name></member>
       <member refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a8a300ec39fc764b86058acf8a9406d89" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineBuilder_v8</scope><name>~EngineBuilder_v8</name></member>
     </listofallmembers>

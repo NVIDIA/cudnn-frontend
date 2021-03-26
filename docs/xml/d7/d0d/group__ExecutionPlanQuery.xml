@@ -60,7 +60,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="318" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="318" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="312" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="312" bodyend="-1"/>
       </memberdef>
       </sectiondef>
       <sectiondef kind="func">
@@ -176,7 +176,7 @@
         <inbodydescription>
         </inbodydescription>
         <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="201" column="1"/>
-        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="249" endline="308">cudnn_frontend::ExecutionPlanBuilder_v8::build</referencedby>
+        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="243" endline="302">cudnn_frontend::ExecutionPlanBuilder_v8::build</referencedby>
         <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga8a6517102f5c12e63e4417324a03180b" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="104" endline="196">cudnn_frontend::ExecutionPlan_v8::computeTag</referencedby>
       </memberdef>
       <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
@@ -190,7 +190,7 @@
 <para>constructs the Engine Config by calling the cudnn API Throws the appropriate error message </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="249" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="249" bodyend="308"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="243" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="243" bodyend="302"/>
         <references refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8_1a00c29ad02430927df9260c7e57ae7c7a" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="53">cudnn_frontend::ExecutionPlan_v8::ExecutionPlanBuilder_v8</references>
         <references refid="d7/d0d/group__ExecutionPlanQuery_1ga0705e60cee62d3d196751517d545a7b0">cudnn_frontend::ExecutionPlan_v8::operator=</references>
         <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
@@ -207,7 +207,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="310" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="304" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1gae3f841de1b6461b31bf7967734a70a8a" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -220,7 +220,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="311" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="305" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga60147aa715352906e32cbb87558cb0ae" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -236,7 +236,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="312" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="306" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga2b84d3619b5bd9ca0faa30c126deb43c" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -252,7 +252,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="313" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="307" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga5f757c2da8c90645c34637dde4aed8f8" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type>ExecutionPlanBuilder_v8 &amp;</type>
@@ -268,7 +268,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="315" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="309" column="1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>

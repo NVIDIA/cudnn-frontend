@@ -21,23 +21,6 @@
         </inbodydescription>
         <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="239" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="239" bodyend="243"/>
       </memberdef>
-      <memberdef kind="function" id="d3/d09/group__EngineBuilder__v8_1ga27466cecb45496d001cfbe4de4b5c5a9" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
-        <type>auto</type>
-        <definition>auto cudnn_frontend::EngineBuilder_v8::setOperationGraph</definition>
-        <argsstring>(cudnnBackendDescriptor_t desc_) -&gt; EngineBuilder_v8 &amp;</argsstring>
-        <name>setOperationGraph</name>
-        <param>
-          <type>cudnnBackendDescriptor_t</type>
-          <declname>desc_</declname>
-        </param>
-        <briefdescription>
-<para>Set operationGraph for the engine. </para>        </briefdescription>
-        <detaileddescription>
-        </detaileddescription>
-        <inbodydescription>
-        </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="246" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="246" bodyend="250"/>
-      </memberdef>
       <memberdef kind="function" id="d3/d09/group__EngineBuilder__v8_1ga7220dab88f9fed1704c9d78d9771be5f" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
         <definition>auto cudnn_frontend::EngineBuilder_v8::setOperationGraph</definition>
@@ -53,7 +36,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="253" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="253" bodyend="256"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="247" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="247" bodyend="250"/>
       </memberdef>
       <memberdef kind="function" id="d3/d09/group__EngineBuilder__v8_1ga2b171d44da46865d536236bb01103005" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -70,7 +53,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="259" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="259" bodyend="262"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="253" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="253" bodyend="256"/>
         <referencedby refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1aae1a36ace3278dbedcf0d743a7744d98" compoundref="df/d3e/cudnn__frontend__EngineFallbackList_8h" startline="131" endline="157">cudnn_frontend::EngineFallbackListBuilder_v8::build</referencedby>
       </memberdef>
       </sectiondef>

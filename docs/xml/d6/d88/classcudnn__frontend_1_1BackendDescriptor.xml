@@ -28,7 +28,7 @@
         <inbodydescription>
         </inbodydescription>
         <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="156" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" bodystart="156" bodyend="-1"/>
-        <referencedby refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1aa0df558c603d8316dd3eb2d5bfd67c9d" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="381" endline="1069">cudnn_frontend::OperationBuilder_v8::build</referencedby>
+        <referencedby refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1aa0df558c603d8316dd3eb2d5bfd67c9d" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="389" endline="1084">cudnn_frontend::OperationBuilder_v8::build</referencedby>
         <referencedby refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a7609e82ac3dc04b67e9e73beb0f7cdae" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="174" endline="207">cudnn_frontend::Engine_v8::Engine_v8</referencedby>
         <referencedby refid="d6/d46/group__EngineHeuristicsQuery_1ga1171cb5ce50baf0fab19fc458d4565b5" compoundref="db/d66/cudnn__frontend__Heuristics_8h" startline="69" endline="99">cudnn_frontend::EngineHeuristics_v8::getEngineConfig</referencedby>
         <referencedby refid="d6/d46/group__EngineHeuristicsQuery_1ga10121605fc82ed225537210825fa3836" compoundref="db/d66/cudnn__frontend__Heuristics_8h" startline="103" endline="119">cudnn_frontend::EngineHeuristics_v8::getEngineConfigCount</referencedby>
@@ -55,10 +55,10 @@
         <referencedby refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a639e1514ea8f283720e49fc18d7ad673" compoundref="d6/d67/cudnn__frontend__EngineConfig_8h" startline="159" endline="221">cudnn_frontend::EngineConfigBuilder_v8::build</referencedby>
         <referencedby refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1ab3ff1b538521fdea588d8ac155f6e88c" compoundref="db/d66/cudnn__frontend__Heuristics_8h" startline="161" endline="212">cudnn_frontend::EngineHeuristicsBuilder_v8::build</referencedby>
         <referencedby refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1a01f709a3efafaca70de6565817c43beb" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="172" endline="304">cudnn_frontend::ConvDescBuilder_v8::build</referencedby>
-        <referencedby refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a5de642e4141705f8e06c4bf566f1d332" compoundref="da/d5f/cudnn__frontend__PointWiseDesc_8h" startline="206" endline="346">cudnn_frontend::PointWiseDescBuilder_v8::build</referencedby>
-        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="249" endline="308">cudnn_frontend::ExecutionPlanBuilder_v8::build</referencedby>
-        <referencedby refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a010b99c39d63121be78ec847fff433f8" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="268" endline="326">cudnn_frontend::EngineBuilder_v8::build</referencedby>
-        <referencedby refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1aa0df558c603d8316dd3eb2d5bfd67c9d" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="381" endline="1069">cudnn_frontend::OperationBuilder_v8::build</referencedby>
+        <referencedby refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a5de642e4141705f8e06c4bf566f1d332" compoundref="da/d5f/cudnn__frontend__PointWiseDesc_8h" startline="206" endline="357">cudnn_frontend::PointWiseDescBuilder_v8::build</referencedby>
+        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="243" endline="302">cudnn_frontend::ExecutionPlanBuilder_v8::build</referencedby>
+        <referencedby refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a010b99c39d63121be78ec847fff433f8" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="262" endline="320">cudnn_frontend::EngineBuilder_v8::build</referencedby>
+        <referencedby refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1aa0df558c603d8316dd3eb2d5bfd67c9d" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="389" endline="1084">cudnn_frontend::OperationBuilder_v8::build</referencedby>
         <referencedby refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a0e6d7c12c261ad6c2f08e1249397b696" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="122" endline="162">cudnn_frontend::Engine_v8::buildKnobs</referencedby>
         <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga8a6517102f5c12e63e4417324a03180b" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="104" endline="196">cudnn_frontend::ExecutionPlan_v8::computeTag</referencedby>
         <referencedby refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a7609e82ac3dc04b67e9e73beb0f7cdae" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="174" endline="207">cudnn_frontend::Engine_v8::Engine_v8</referencedby>
@@ -216,7 +216,7 @@
         </inbodydescription>
         <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="142" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" bodystart="142" bodyend="145"/>
         <references refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" compoundref="dc/d11/cudnn__backend__base_8h" startline="86" endline="88">cudnn_frontend::make_shared_backend_pointer</references>
-        <referencedby refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1aa0df558c603d8316dd3eb2d5bfd67c9d" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="381" endline="1069">cudnn_frontend::OperationBuilder_v8::build</referencedby>
+        <referencedby refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1aa0df558c603d8316dd3eb2d5bfd67c9d" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="389" endline="1084">cudnn_frontend::OperationBuilder_v8::build</referencedby>
       </memberdef>
       </sectiondef>
       <sectiondef kind="protected-func">

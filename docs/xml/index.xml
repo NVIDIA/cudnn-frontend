@@ -73,7 +73,6 @@
   <compound refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8" kind="class"><name>cudnn_frontend::EngineBuilder_v8</name>
     <member refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1adc25c468425d9b6b71b9592b80ea715d" kind="variable"><name>m_engine</name></member>
     <member refid="d3/d09/group__EngineBuilder__v8_1ga0ceef322363405504dbdc4d1f3c9949a" kind="function"><name>setOperationGraph</name></member>
-    <member refid="d3/d09/group__EngineBuilder__v8_1ga27466cecb45496d001cfbe4de4b5c5a9" kind="function"><name>setOperationGraph</name></member>
     <member refid="d3/d09/group__EngineBuilder__v8_1ga7220dab88f9fed1704c9d78d9771be5f" kind="function"><name>setOperationGraph</name></member>
     <member refid="d3/d09/group__EngineBuilder__v8_1ga2b171d44da46865d536236bb01103005" kind="function"><name>setGlobalEngineIdx</name></member>
     <member refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a010b99c39d63121be78ec847fff433f8" kind="function"><name>build</name></member>
@@ -188,7 +187,6 @@
     <member refid="d7/d0d/group__ExecutionPlanQuery_1gae1a2e3dd89dbe455e7067531ec5b5562" kind="variable"><name>m_execution_plan</name></member>
     <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1ga4166679391fc2df54e25964c03ae6e8e" kind="function"><name>setHandle</name></member>
     <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1gac5c23cff8c1424f71ef2cee2dc66cd3c" kind="function"><name>setEngineConfig</name></member>
-    <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1gaf7010781cc8c0583a2d841ac6d9ed521" kind="function"><name>setEngineConfig</name></member>
     <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1gae0f92d5445da53253ff3460ac6aefffa" kind="function"><name>setEngineConfig</name></member>
     <member refid="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" kind="function"><name>build</name></member>
     <member refid="d7/d0d/group__ExecutionPlanQuery_1ga8e48fb375271599c83f57922d9f8c89e" kind="function"><name>ExecutionPlanBuilder_v8</name></member>
@@ -529,7 +527,6 @@
   </compound>
   <compound refid="d3/d09/group__EngineBuilder__v8" kind="group"><name>EngineBuilder_v8</name>
     <member refid="d3/d09/group__EngineBuilder__v8_1ga0ceef322363405504dbdc4d1f3c9949a" kind="function"><name>setOperationGraph</name></member>
-    <member refid="d3/d09/group__EngineBuilder__v8_1ga27466cecb45496d001cfbe4de4b5c5a9" kind="function"><name>setOperationGraph</name></member>
     <member refid="d3/d09/group__EngineBuilder__v8_1ga7220dab88f9fed1704c9d78d9771be5f" kind="function"><name>setOperationGraph</name></member>
     <member refid="d3/d09/group__EngineBuilder__v8_1ga2b171d44da46865d536236bb01103005" kind="function"><name>setGlobalEngineIdx</name></member>
   </compound>
@@ -562,7 +559,6 @@
   <compound refid="d4/de1/group__ExecutionPlanBuilder__v8" kind="group"><name>ExecutionPlanBuilder_v8</name>
     <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1ga4166679391fc2df54e25964c03ae6e8e" kind="function"><name>setHandle</name></member>
     <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1gac5c23cff8c1424f71ef2cee2dc66cd3c" kind="function"><name>setEngineConfig</name></member>
-    <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1gaf7010781cc8c0583a2d841ac6d9ed521" kind="function"><name>setEngineConfig</name></member>
     <member refid="d4/de1/group__ExecutionPlanBuilder__v8_1gae0f92d5445da53253ff3460ac6aefffa" kind="function"><name>setEngineConfig</name></member>
   </compound>
   <compound refid="d6/d46/group__EngineHeuristicsQuery" kind="group"><name>EngineHeuristicsQuery</name>

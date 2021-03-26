@@ -1,9 +1,5 @@
 var NAVTREEINDEX2 =
 {
-"de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8.html#a3f5790e5ada9a1785d9daf4246ea8de3":[4,0,0,17,1],
-"de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8.html#a75af51fa2937a7df6787d3181ef22cf2":[4,0,0,17,2],
-"de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8.html#aa71bc8242df4035ff5d6b4d54083db4b":[4,0,0,17,7],
-"de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8.html#addc153acf5600781659a1a2ba891e59c":[4,0,0,17,4],
 "de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8.html#afea76414fa5c0c5f38a551afcf11391c":[4,0,0,17,0],
 "de/d0c/cudnn__frontend_8h.html":[5,0,1],
 "de/d0c/cudnn__frontend_8h.html#a0b7ba1175801c56d07d26785bcd8fb70":[5,0,1,17],
@@ -80,11 +76,11 @@ var NAVTREEINDEX2 =
 "df/d83/classcudnn__frontend_1_1EngineConfig__v8.html#aefd7d8d3da71ce0dddca0f6a85fd1c80":[4,0,0,6,4],
 "df/dc0/cudnn__frontend__VariantPack_8h.html":[5,0,18],
 "df/dc0/cudnn__frontend__VariantPack_8h_source.html":[5,0,18],
-"df/de1/namespacecudnn__frontend.html":[4,0,0],
 "df/de1/namespacecudnn__frontend.html":[3,0,0],
+"df/de1/namespacecudnn__frontend.html":[4,0,0],
 "files.html":[5,0],
-"functions.html":[4,3,0],
 "functions.html":[4,3,0,0],
+"functions.html":[4,3,0],
 "functions_0x7e.html":[4,3,0,21],
 "functions_b.html":[4,3,0,1],
 "functions_c.html":[4,3,0,2],

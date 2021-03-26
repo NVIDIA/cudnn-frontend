@@ -15,7 +15,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="356" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="356" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="367" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="367" bodyend="-1"/>
       </memberdef>
       </sectiondef>
       <sectiondef kind="public-func">
@@ -204,7 +204,7 @@
 <para>constructs the <ref refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8" kindref="compound">PointWiseDesc_v8</ref> by calling the cudnn API Throws the appropriate error message </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="206" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="206" bodyend="346"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="206" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="206" bodyend="357"/>
         <references refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1ae3cd0c0051c7e29a9ad86b80308429f3">cudnn_frontend::PointWiseDesc_v8::operator=</references>
         <references refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1a1407b6ad40df9af7b191fdf636c2c508" compoundref="da/d5f/cudnn__frontend__PointWiseDesc_8h" startline="57">cudnn_frontend::PointWiseDesc_v8::PointWiseDescBuilder_v8</references>
         <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
@@ -221,7 +221,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="348" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="359" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1af976fab4a7726609a1b10dc2a8bcdf65" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -234,7 +234,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="349" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="360" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1ad6a7549d62410d3de87040586b49b815" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -250,7 +250,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="350" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="361" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1aeccd727adb1d3b0b8d9d95b7f6e1b9ce" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -266,7 +266,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="351" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="362" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1ac0d140493e21b164bc21dd0bcbeeaa65" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type><ref refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8" kindref="compound">PointWiseDescBuilder_v8</ref> &amp;</type>
@@ -282,7 +282,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="353" column="1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="364" column="1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -360,7 +360,7 @@
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="134" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="134" bodyend="357"/>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="134" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="134" bodyend="368"/>
     <listofallmembers>
       <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a5de642e4141705f8e06c4bf566f1d332" prot="public" virt="non-virtual"><scope>cudnn_frontend::PointWiseDescBuilder_v8</scope><name>build</name></member>
       <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a804a2b5438f464185b16a4652fc14cf5" prot="private" virt="non-virtual"><scope>cudnn_frontend::PointWiseDescBuilder_v8</scope><name>m_pointWiseDesc</name></member>
