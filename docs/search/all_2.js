@@ -2,6 +2,7 @@ var searchData=
 [
   ['cdesc',['cdesc',['../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a19856fbb973574342efedc43134af3a7',1,'cudnn_frontend::Operation_v8']]],
   ['choice',['choice',['../dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob.html#aee3bbc2a558893309d6882a0e30d439a',1,'cudnn_frontend::Engine_v8::Knob']]],
+  ['cmatdesc',['cmatdesc',['../d4/d30/classcudnn__frontend_1_1Operation__v8.html#adea4f5ef82e61fc375fd2c3ee8e92147',1,'cudnn_frontend::Operation_v8']]],
   ['computetag',['computeTag',['../d7/d0d/group__ExecutionPlanQuery.html#ga8a6517102f5c12e63e4417324a03180b',1,'cudnn_frontend::ExecutionPlan_v8']]],
   ['convdesc',['ConvDesc',['../df/de1/namespacecudnn__frontend.html#ae24bc7541c87c642cdef8eaf83c8eacc',1,'cudnn_frontend']]],
   ['convdesc_5fv8',['ConvDesc_v8',['../d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html',1,'cudnn_frontend::ConvDesc_v8'],['../d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html#a592e3a28fd7a8b2553789801d9bd276c',1,'cudnn_frontend::ConvDesc_v8::ConvDesc_v8(ConvDesc_v8 &amp;&amp;from)'],['../d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html#a5c892fb76fbf9e4bfffdb5288f9d60ad',1,'cudnn_frontend::ConvDesc_v8::ConvDesc_v8()=default'],['../d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html#a061ef887bdf383d416ee143a35d5c334',1,'cudnn_frontend::ConvDesc_v8::ConvDesc_v8(ConvDesc_v8 const &amp;)=delete']]],
@@ -23,6 +24,7 @@ var searchData=
   ['cudnn_5ffrontend_5ffind_5fplan_2eh',['cudnn_frontend_find_plan.h',['../d3/d6b/cudnn__frontend__find__plan_8h.html',1,'']]],
   ['cudnn_5ffrontend_5fget_5fplan_2eh',['cudnn_frontend_get_plan.h',['../d2/d3b/cudnn__frontend__get__plan_8h.html',1,'']]],
   ['cudnn_5ffrontend_5fheuristics_2eh',['cudnn_frontend_Heuristics.h',['../db/d66/cudnn__frontend__Heuristics_8h.html',1,'']]],
+  ['cudnn_5ffrontend_5fmatmuldesc_2eh',['cudnn_frontend_MatMulDesc.h',['../d6/d32/cudnn__frontend__MatMulDesc_8h.html',1,'']]],
   ['cudnn_5ffrontend_5foperation_2eh',['cudnn_frontend_Operation.h',['../da/d5a/cudnn__frontend__Operation_8h.html',1,'']]],
   ['cudnn_5ffrontend_5foperationgraph_2eh',['cudnn_frontend_OperationGraph.h',['../db/d7d/cudnn__frontend__OperationGraph_8h.html',1,'']]],
   ['cudnn_5ffrontend_5fpointwisedesc_2eh',['cudnn_frontend_PointWiseDesc.h',['../da/d5f/cudnn__frontend__PointWiseDesc_8h.html',1,'']]],
@@ -32,5 +34,6 @@ var searchData=
   ['cudnnexception',['cudnnException',['../d9/dca/classcudnn__frontend_1_1cudnnException.html',1,'cudnn_frontend::cudnnException'],['../d9/dca/classcudnn__frontend_1_1cudnnException.html#aa80c45a57ca091770572aaa5a1f7e322',1,'cudnn_frontend::cudnnException::cudnnException()']]],
   ['cudnnfindplan',['cudnnFindPlan',['../dc/da3/classcudnn__frontend_1_1EngineConfigGenerator.html#abd7cdd3a218623ffc5dfcbf9343aef85',1,'cudnn_frontend::EngineConfigGenerator']]],
   ['cudnnfindsamplingtechnique',['CudnnFindSamplingTechnique',['../df/de1/namespacecudnn__frontend.html#ab3748fa00b36beec790db7201fdd2ef3',1,'cudnn_frontend']]],
-  ['cudnngetplan',['cudnnGetPlan',['../dc/da3/classcudnn__frontend_1_1EngineConfigGenerator.html#ad6ca7e7263ed9b7597f94ca45505642f',1,'cudnn_frontend::EngineConfigGenerator']]]
+  ['cudnngetplan',['cudnnGetPlan',['../dc/da3/classcudnn__frontend_1_1EngineConfigGenerator.html#ad6ca7e7263ed9b7597f94ca45505642f',1,'cudnn_frontend::EngineConfigGenerator']]],
+  ['cudnn_20frontend_20api',['CUDNN FRONTEND API',['../index.html',1,'']]]
 ];

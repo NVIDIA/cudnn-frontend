@@ -1,5 +1,5 @@
 var searchData=
 [
-  ['tensor_5fv8',['Tensor_v8',['../d6/da7/classcudnn__frontend_1_1Tensor__v8.html',1,'cudnn_frontend']]],
-  ['tensorbuilder_5fv8',['TensorBuilder_v8',['../db/dae/classcudnn__frontend_1_1TensorBuilder__v8.html',1,'cudnn_frontend']]]
+  ['pointwisedesc_5fv8',['PointWiseDesc_v8',['../d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html',1,'cudnn_frontend']]],
+  ['pointwisedescbuilder_5fv8',['PointWiseDescBuilder_v8',['../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html',1,'cudnn_frontend']]]
 ];

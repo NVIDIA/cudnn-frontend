@@ -29,7 +29,7 @@ endif #ifneq ($(TARGET_ARCH), ppc64le)
 endif #ifeq ($(CUDA_VERSION),8000 )
 
 SMS_A100 =
-ifeq ($(CUDA_VERSION), 11000)
+ifeq ($(shell test $(CUDA_VERSION) -ge 11000; echo $$?),0)
 SMS_A100 = 80
 endif
 

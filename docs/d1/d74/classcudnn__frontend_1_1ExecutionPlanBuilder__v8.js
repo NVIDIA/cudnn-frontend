@@ -7,7 +7,6 @@ var classcudnn__frontend_1_1ExecutionPlanBuilder__v8 =
     [ "build", "d7/d0d/group__ExecutionPlanQuery.html#ga5ff39f2019a5a3fe8062bf887707877c", null ],
     [ "operator=", "d7/d0d/group__ExecutionPlanQuery.html#ga5f757c2da8c90645c34637dde4aed8f8", null ],
     [ "setEngineConfig", "d4/de1/group__ExecutionPlanBuilder__v8.html#gac5c23cff8c1424f71ef2cee2dc66cd3c", null ],
-    [ "setEngineConfig", "d4/de1/group__ExecutionPlanBuilder__v8.html#gaf7010781cc8c0583a2d841ac6d9ed521", null ],
     [ "setEngineConfig", "d4/de1/group__ExecutionPlanBuilder__v8.html#gae0f92d5445da53253ff3460ac6aefffa", null ],
     [ "setHandle", "d4/de1/group__ExecutionPlanBuilder__v8.html#ga4166679391fc2df54e25964c03ae6e8e", null ],
     [ "m_execution_plan", "d7/d0d/group__ExecutionPlanQuery.html#gae1a2e3dd89dbe455e7067531ec5b5562", null ]

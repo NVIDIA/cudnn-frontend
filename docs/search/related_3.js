@@ -1,4 +1,5 @@
 var searchData=
 [
-  ['pointwisedescbuilder_5fv8',['PointWiseDescBuilder_v8',['../d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#a1407b6ad40df9af7b191fdf636c2c508',1,'cudnn_frontend::PointWiseDesc_v8']]]
+  ['operationbuilder_5fv8',['OperationBuilder_v8',['../d4/d30/classcudnn__frontend_1_1Operation__v8.html#ac708bb46683440effd2f46b3888e378f',1,'cudnn_frontend::Operation_v8']]],
+  ['operationgraphbuilder_5fv8',['OperationGraphBuilder_v8',['../de/dd9/classcudnn__frontend_1_1OperationGraph__v8.html#a5af59a099cc90eda429563e285b2907f',1,'cudnn_frontend::OperationGraph_v8']]]
 ];

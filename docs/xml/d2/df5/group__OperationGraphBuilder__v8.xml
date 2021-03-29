@@ -1,0 +1,51 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d2/df5/group__OperationGraphBuilder__v8" kind="group">
+    <compoundname>OperationGraphBuilder_v8</compoundname>
+    <title>OperationGraphBuilder_v8</title>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d2/df5/group__OperationGraphBuilder__v8_1ga5b5d8a3121e92a8a7d47341b424298f8" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationGraphBuilder_v8::setHandle</definition>
+        <argsstring>(cudnnHandle_t handle_) -&gt; OperationGraphBuilder_v8 &amp;</argsstring>
+        <name>setHandle</name>
+        <param>
+          <type>cudnnHandle_t</type>
+          <declname>handle_</declname>
+        </param>
+        <briefdescription>
+<para>Set cudnnHandle for the operations. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" line="122" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" bodystart="122" bodyend="125"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/df5/group__OperationGraphBuilder__v8_1ga4e4cee8d631471478d5de420077a2182" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationGraphBuilder_v8::setOperationGraph</definition>
+        <argsstring>(int64_t numOps_, Operation_v8 const **ops_) -&gt; OperationGraphBuilder_v8 &amp;</argsstring>
+        <name>setOperationGraph</name>
+        <param>
+          <type>int64_t</type>
+          <declname>numOps_</declname>
+        </param>
+        <param>
+          <type>Operation_v8 const **</type>
+          <declname>ops_</declname>
+        </param>
+        <briefdescription>
+<para>Set numoperations and the operations. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" line="128" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" bodystart="128" bodyend="135"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Set individual property of <ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>

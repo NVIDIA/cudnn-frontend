@@ -1,0 +1,434 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d3/d92/group__OperationBuilder__v8" kind="group">
+    <compoundname>OperationBuilder_v8</compoundname>
+    <title>OperationBuilder_v8</title>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1gaefa06fdaae3b28c6ef08a0189e2a3d3a" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setxDesc</definition>
+        <argsstring>(ManagedOpaqueDescriptor const &amp;raw_tensor) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setxDesc</name>
+        <param>
+          <type>ManagedOpaqueDescriptor const &amp;</type>
+          <declname>raw_tensor</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="181" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="181" bodyend="184"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a01d1997ae84b86c0565351910bba3416" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="139">cudnn_frontend::Operation_v8::xdesc</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga04c2492a5376f1a74a57fb49fa7b3599" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setxDesc</definition>
+        <argsstring>(Tensor_v8 const &amp;tensor) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setxDesc</name>
+        <param>
+          <type>Tensor_v8 const &amp;</type>
+          <declname>tensor</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="187" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="187" bodyend="190"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a01d1997ae84b86c0565351910bba3416" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="139">cudnn_frontend::Operation_v8::xdesc</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga17475846760b10ffdfa536cd92a5b135" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setbDesc</definition>
+        <argsstring>(Tensor_v8 const &amp;tensor) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setbDesc</name>
+        <param>
+          <type>Tensor_v8 const &amp;</type>
+          <declname>tensor</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="192" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="192" bodyend="201"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a1305e0cdaeb029fd52eb189254afe18c" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="142">cudnn_frontend::Operation_v8::bdesc</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga5910bc2209e1b648c1aa0edce7f11e01" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setyDesc</definition>
+        <argsstring>(Tensor_v8 const &amp;tensor) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setyDesc</name>
+        <param>
+          <type>Tensor_v8 const &amp;</type>
+          <declname>tensor</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="203" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="203" bodyend="206"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a81e9b10c7231ba9ffba37f7fab531a69" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="140">cudnn_frontend::Operation_v8::ydesc</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga80466e517e980ba4953e085b3d4e3498" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setwDesc</definition>
+        <argsstring>(Tensor_v8 const &amp;tensor) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setwDesc</name>
+        <param>
+          <type>Tensor_v8 const &amp;</type>
+          <declname>tensor</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="208" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="208" bodyend="217"/>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1ad26bd872d417f6a9bff65768bb02e05f" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="141">cudnn_frontend::Operation_v8::wdesc</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga08f3d4cb5138174127d0f6899f7bc53b" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setdyDesc</definition>
+        <argsstring>(ManagedOpaqueDescriptor const &amp;raw_tensor) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setdyDesc</name>
+        <param>
+          <type>ManagedOpaqueDescriptor const &amp;</type>
+          <declname>raw_tensor</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="220" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="220" bodyend="223"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1adf6b55205eac4c52c0ab70e4758e33da" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="143">cudnn_frontend::Operation_v8::dydesc</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga9e4a1e9a233b44cca5b65f0af172b001" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setdyDesc</definition>
+        <argsstring>(Tensor_v8 const &amp;tensor) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setdyDesc</name>
+        <param>
+          <type>Tensor_v8 const &amp;</type>
+          <declname>tensor</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="225" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="225" bodyend="228"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1adf6b55205eac4c52c0ab70e4758e33da" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="143">cudnn_frontend::Operation_v8::dydesc</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga35fa5c453a6cd989f35e47c29e6ec665" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setdxDesc</definition>
+        <argsstring>(Tensor_v8 const &amp;tensor) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setdxDesc</name>
+        <param>
+          <type>Tensor_v8 const &amp;</type>
+          <declname>tensor</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="230" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="230" bodyend="233"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a4f30409838436d0c4dea5271af86f9b7" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="144">cudnn_frontend::Operation_v8::dxdesc</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga5e5d463d5531a9378280fa4b1aee6f63" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setdwDesc</definition>
+        <argsstring>(Tensor_v8 const &amp;tensor) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setdwDesc</name>
+        <param>
+          <type>Tensor_v8 const &amp;</type>
+          <declname>tensor</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="235" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="235" bodyend="238"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a4f565db1b8b85ea43d60631cd3414f47" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="145">cudnn_frontend::Operation_v8::dwdesc</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1gaa82e018b6a9d514ad912b922f43adad2" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setcDesc</definition>
+        <argsstring>(ConvDesc_v8 const &amp;conv) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setcDesc</name>
+        <param>
+          <type>ConvDesc_v8 const &amp;</type>
+          <declname>conv</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="241" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="241" bodyend="250"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a19856fbb973574342efedc43134af3a7" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="146">cudnn_frontend::Operation_v8::cdesc</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga095c52c8f1b01ebb224265f9000195c0" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setaMatDesc</definition>
+        <argsstring>(Tensor_v8 const &amp;tensor) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setaMatDesc</name>
+        <param>
+          <type>Tensor_v8 const &amp;</type>
+          <declname>tensor</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="252" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="252" bodyend="261"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1ae0e0256b292acd560accc1c02a6e393b" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="147">cudnn_frontend::Operation_v8::amatdesc</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1gaa8eed29a0181e044ea0263ba655127ec" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setbMatDesc</definition>
+        <argsstring>(Tensor_v8 const &amp;tensor) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setbMatDesc</name>
+        <param>
+          <type>Tensor_v8 const &amp;</type>
+          <declname>tensor</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="263" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="263" bodyend="272"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a0945c6296efc14ffc41122aaae3946b8" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="148">cudnn_frontend::Operation_v8::bmatdesc</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1gaaf9d7cbc65c7c7526a6f15d4ad2952fa" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setcMatDesc</definition>
+        <argsstring>(Tensor_v8 const &amp;tensor) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setcMatDesc</name>
+        <param>
+          <type>Tensor_v8 const &amp;</type>
+          <declname>tensor</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="274" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="274" bodyend="283"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1adea4f5ef82e61fc375fd2c3ee8e92147" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="149">cudnn_frontend::Operation_v8::cmatdesc</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga3ca1f62832f998566c1b07b4b3c71db4" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setmatmulDesc</definition>
+        <argsstring>(MatMulDesc_v8 const &amp;matmulDesc) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setmatmulDesc</name>
+        <param>
+          <type>MatMulDesc_v8 const &amp;</type>
+          <declname>matmulDesc</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="285" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="285" bodyend="294"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1ac4b85cbb9ba522c98eb524a7712721af" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="151">cudnn_frontend::Operation_v8::matmuldesc</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1gae6b06877b2e675b2a390f0b122100669" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setpwDesc</definition>
+        <argsstring>(PointWiseDesc_v8 const &amp;pointWiseDesc) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setpwDesc</name>
+        <param>
+          <type>PointWiseDesc_v8 const &amp;</type>
+          <declname>pointWiseDesc</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="296" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="296" bodyend="330"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1ab8c4c8c81e8cebc44cb725f4a4b4add9" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="159">cudnn_frontend::Operation_v8::is_pointwise_activation_bwd_op</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a12d0d0fa40152f5205570f40e681795f" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="158">cudnn_frontend::Operation_v8::is_pointwise_activation_fwd_op</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a2e1e0fb15b7df300945cae2347db635a" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="160">cudnn_frontend::Operation_v8::is_pointwise_math_op</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a09f5151a90f805d81550a30617bcec0c" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="157">cudnn_frontend::Operation_v8::pointwise_mode</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a5c6b2986d2d703c672b5fc461f2eee05" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="156">cudnn_frontend::Operation_v8::pointwise_port_count</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1aac54965185417e264093156b143a3751" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="150">cudnn_frontend::Operation_v8::pwdesc</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1gab4241b96e7374d821681e97259d39d83" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setAlpha</definition>
+        <argsstring>(float alpha) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setAlpha</name>
+        <param>
+          <type>float</type>
+          <declname>alpha</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="333" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="333" bodyend="338"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1aee00f6897786ce0f16963a7d2f57a2f8" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="155">cudnn_frontend::Operation_v8::alpha_d</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a4a71d73a1231c39e51a74f750586a733" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="154">cudnn_frontend::Operation_v8::alpha_s</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a0414d5eb022c25584d60491f416e6449" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="153">cudnn_frontend::Operation_v8::alphabetaType</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga3c63744504f65383ce0b847bea804e3f" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setAlpha</definition>
+        <argsstring>(double alpha) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setAlpha</name>
+        <param>
+          <type>double</type>
+          <declname>alpha</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="340" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="340" bodyend="345"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1aee00f6897786ce0f16963a7d2f57a2f8" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="155">cudnn_frontend::Operation_v8::alpha_d</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a4a71d73a1231c39e51a74f750586a733" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="154">cudnn_frontend::Operation_v8::alpha_s</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a0414d5eb022c25584d60491f416e6449" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="153">cudnn_frontend::Operation_v8::alphabetaType</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga06cdcfeda1b702412be41addd73bb947" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setAlpha2</definition>
+        <argsstring>(float alpha) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setAlpha2</name>
+        <param>
+          <type>float</type>
+          <declname>alpha</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="347" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="347" bodyend="352"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a4f533db7bc67978d1ec1a475f4ab9e1c" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="155">cudnn_frontend::Operation_v8::alpha2_d</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a4003061754cc4b0003a72cc474fca8d9" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="154">cudnn_frontend::Operation_v8::alpha2_s</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a0414d5eb022c25584d60491f416e6449" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="153">cudnn_frontend::Operation_v8::alphabetaType</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga459671e9d26640528fcf683aaeef05df" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setAlpha2</definition>
+        <argsstring>(double alpha) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setAlpha2</name>
+        <param>
+          <type>double</type>
+          <declname>alpha</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="354" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="354" bodyend="359"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a4f533db7bc67978d1ec1a475f4ab9e1c" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="155">cudnn_frontend::Operation_v8::alpha2_d</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a4003061754cc4b0003a72cc474fca8d9" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="154">cudnn_frontend::Operation_v8::alpha2_s</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a0414d5eb022c25584d60491f416e6449" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="153">cudnn_frontend::Operation_v8::alphabetaType</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga65a9ad73912ff46becc93ee451da6af5" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setBeta</definition>
+        <argsstring>(float beta) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setBeta</name>
+        <param>
+          <type>float</type>
+          <declname>beta</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="361" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="361" bodyend="366"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a0414d5eb022c25584d60491f416e6449" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="153">cudnn_frontend::Operation_v8::alphabetaType</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a1118f19807c9f58cc1d0892bdb1f8c94" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="155">cudnn_frontend::Operation_v8::beta_d</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a0f14ddfbaae6e62375c46dd0d5ed993d" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="154">cudnn_frontend::Operation_v8::beta_s</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga29752062b7308c8da0e625eb35431652" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationBuilder_v8::setBeta</definition>
+        <argsstring>(double beta) -&gt; OperationBuilder_v8 &amp;</argsstring>
+        <name>setBeta</name>
+        <param>
+          <type>double</type>
+          <declname>beta</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="368" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="368" bodyend="373"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a0414d5eb022c25584d60491f416e6449" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="153">cudnn_frontend::Operation_v8::alphabetaType</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a1118f19807c9f58cc1d0892bdb1f8c94" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="155">cudnn_frontend::Operation_v8::beta_d</references>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a0f14ddfbaae6e62375c46dd0d5ed993d" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="154">cudnn_frontend::Operation_v8::beta_s</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/d92/group__OperationBuilder__v8_1ga425dd00708eaaadffe1c83ef356dc333" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::OperationBuilder_v8::OperationBuilder_v8</definition>
+        <argsstring>(cudnnBackendDescriptorType_t mode)</argsstring>
+        <name>OperationBuilder_v8</name>
+        <param>
+          <type>cudnnBackendDescriptorType_t</type>
+          <declname>mode</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" line="375" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Operation.h" bodystart="375" bodyend="383"/>
+        <references refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a43cbfcab995a238e2001c4ec6543ae50" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="137">cudnn_frontend::Operation_v8::op_mode</references>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Set individual property of <ref refid="d4/d30/classcudnn__frontend_1_1Operation__v8" kindref="compound">Operation_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>

@@ -113,7 +113,7 @@ class EngineConfigBuilder_v8 {
         m_engine_config.opGraphTag = engine_.getTag();
         auto &knobs                = engine_.getFinalizedKnobs();
         m_engine_config.numKnobs   = knobs.size();
-        for (auto i = 0; i < knobs.size(); i++) {
+        for (std::uint32_t i = 0; i < knobs.size(); i++) {
             cudnnStatus_t status;
             cudnnBackendKnobType_t type = knobs[i].getKnobType();
             int64_t value               = knobs[i].getChoice();

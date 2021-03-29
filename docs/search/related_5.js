@@ -1,4 +1,4 @@
 var searchData=
 [
-  ['variantpackbuilder_5fv8',['VariantPackBuilder_v8',['../d0/d20/classcudnn__frontend_1_1VariantPack__v8.html#a8fcb5ec8a09de5a6f1f326f2e623cbdf',1,'cudnn_frontend::VariantPack_v8']]]
+  ['tensorbuilder_5fv8',['TensorBuilder_v8',['../d6/da7/classcudnn__frontend_1_1Tensor__v8.html#a14f9c4498f4be5b3c2b0a94c708891fb',1,'cudnn_frontend::Tensor_v8']]]
 ];

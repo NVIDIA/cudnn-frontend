@@ -16,6 +16,8 @@ var namespacecudnn__frontend =
     [ "executionOption", "d6/d1b/structcudnn__frontend_1_1executionOption.html", "d6/d1b/structcudnn__frontend_1_1executionOption" ],
     [ "ExecutionPlan_v8", "d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html", "d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" ],
     [ "ExecutionPlanBuilder_v8", "d1/d74/classcudnn__frontend_1_1ExecutionPlanBuilder__v8.html", "d1/d74/classcudnn__frontend_1_1ExecutionPlanBuilder__v8" ],
+    [ "MatMulDesc_v8", "d6/db7/classcudnn__frontend_1_1MatMulDesc__v8.html", "d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" ],
+    [ "MatMulDescBuilder_v8", "de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8.html", "de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" ],
     [ "OpaqueBackendPointer", "d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer.html", "d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" ],
     [ "Operation_v8", "d4/d30/classcudnn__frontend_1_1Operation__v8.html", "d4/d30/classcudnn__frontend_1_1Operation__v8" ],
     [ "OperationBuilder_v8", "d1/d29/classcudnn__frontend_1_1OperationBuilder__v8.html", "d1/d29/classcudnn__frontend_1_1OperationBuilder__v8" ],

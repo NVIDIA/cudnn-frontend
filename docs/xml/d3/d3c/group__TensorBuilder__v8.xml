@@ -1,0 +1,124 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d3/d3c/group__TensorBuilder__v8" kind="group">
+    <compoundname>TensorBuilder_v8</compoundname>
+    <title>TensorBuilder_v8</title>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d3/d3c/group__TensorBuilder__v8_1ga98275e4d36e37ef5d73f13bd80f164a3" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::TensorBuilder_v8::setDataType</definition>
+        <argsstring>(cudnnDataType_t data_type_) -&gt; TensorBuilder_v8 &amp;</argsstring>
+        <name>setDataType</name>
+        <param>
+          <type>cudnnDataType_t</type>
+          <declname>data_type_</declname>
+        </param>
+        <briefdescription>
+<para>Set Datatype for the <ref refid="d6/da7/classcudnn__frontend_1_1Tensor__v8" kindref="compound">Tensor_v8</ref>. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Tensor.h" line="115" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Tensor.h" bodystart="115" bodyend="118"/>
+      </memberdef>
+      <memberdef kind="function" id="d3/d3c/group__TensorBuilder__v8_1gae828806e2d76ca3eb6c4e289f2e93a96" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::TensorBuilder_v8::setDim</definition>
+        <argsstring>(int64_t ndim, int64_t const *dim) -&gt; TensorBuilder_v8 &amp;</argsstring>
+        <name>setDim</name>
+        <param>
+          <type>int64_t</type>
+          <declname>ndim</declname>
+        </param>
+        <param>
+          <type>int64_t const *</type>
+          <declname>dim</declname>
+        </param>
+        <briefdescription>
+<para>Set Dimensions of the tensor. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Tensor.h" line="121" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Tensor.h" bodystart="121" bodyend="125"/>
+      </memberdef>
+      <memberdef kind="function" id="d3/d3c/group__TensorBuilder__v8_1ga3de3d95beb2234dc2a741d23703f8ed2" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::TensorBuilder_v8::setStrides</definition>
+        <argsstring>(int64_t ndim, int64_t const *strides) -&gt; TensorBuilder_v8 &amp;</argsstring>
+        <name>setStrides</name>
+        <param>
+          <type>int64_t</type>
+          <declname>ndim</declname>
+        </param>
+        <param>
+          <type>int64_t const *</type>
+          <declname>strides</declname>
+        </param>
+        <briefdescription>
+<para>Set Strides of the tensor. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Tensor.h" line="128" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Tensor.h" bodystart="128" bodyend="131"/>
+      </memberdef>
+      <memberdef kind="function" id="d3/d3c/group__TensorBuilder__v8_1ga6bdaeab1bff548d375e57936b64fb05a" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::TensorBuilder_v8::setId</definition>
+        <argsstring>(int64_t id_) -&gt; TensorBuilder_v8 &amp;</argsstring>
+        <name>setId</name>
+        <param>
+          <type>int64_t</type>
+          <declname>id_</declname>
+        </param>
+        <briefdescription>
+<para>Set Unique Id of the tensor. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Tensor.h" line="134" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Tensor.h" bodystart="134" bodyend="137"/>
+      </memberdef>
+      <memberdef kind="function" id="d3/d3c/group__TensorBuilder__v8_1ga385ec2c39e6386af7421f27330ed128b" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::TensorBuilder_v8::setAlignment</definition>
+        <argsstring>(int64_t alignment_) -&gt; TensorBuilder_v8 &amp;</argsstring>
+        <name>setAlignment</name>
+        <param>
+          <type>int64_t</type>
+          <declname>alignment_</declname>
+        </param>
+        <briefdescription>
+<para>Set Alignment of the tensor. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Tensor.h" line="140" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Tensor.h" bodystart="140" bodyend="143"/>
+      </memberdef>
+      <memberdef kind="function" id="d3/d3c/group__TensorBuilder__v8_1ga7d5d978de243e47938eb1f224a38d02d" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::TensorBuilder_v8::setVirtual</definition>
+        <argsstring>(bool virtual_=true) -&gt; TensorBuilder_v8 &amp;</argsstring>
+        <name>setVirtual</name>
+        <param>
+          <type>bool</type>
+          <declname>virtual_</declname>
+          <defval>true</defval>
+        </param>
+        <briefdescription>
+<para>Set Alignment of the tensor. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Tensor.h" line="146" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Tensor.h" bodystart="146" bodyend="149"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Set individual property of <ref refid="d6/da7/classcudnn__frontend_1_1Tensor__v8" kindref="compound">Tensor_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>

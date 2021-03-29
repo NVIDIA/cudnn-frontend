@@ -1,0 +1,65 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d3/d09/group__EngineBuilder__v8" kind="group">
+    <compoundname>EngineBuilder_v8</compoundname>
+    <title>EngineBuilder_v8</title>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d3/d09/group__EngineBuilder__v8_1ga0ceef322363405504dbdc4d1f3c9949a" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::EngineBuilder_v8::setOperationGraph</definition>
+        <argsstring>(OperationGraph_v8 const &amp;opGraph_) -&gt; EngineBuilder_v8 &amp;</argsstring>
+        <name>setOperationGraph</name>
+        <param>
+          <type>OperationGraph_v8 const &amp;</type>
+          <declname>opGraph_</declname>
+        </param>
+        <briefdescription>
+<para>Set operationGraph for the engine. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="239" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="239" bodyend="243"/>
+      </memberdef>
+      <memberdef kind="function" id="d3/d09/group__EngineBuilder__v8_1ga7220dab88f9fed1704c9d78d9771be5f" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::EngineBuilder_v8::setOperationGraph</definition>
+        <argsstring>(ManagedOpaqueDescriptor desc_) -&gt; EngineBuilder_v8 &amp;</argsstring>
+        <name>setOperationGraph</name>
+        <param>
+          <type>ManagedOpaqueDescriptor</type>
+          <declname>desc_</declname>
+        </param>
+        <briefdescription>
+<para>Set operationGraph for the engine. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="247" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="247" bodyend="250"/>
+      </memberdef>
+      <memberdef kind="function" id="d3/d09/group__EngineBuilder__v8_1ga2b171d44da46865d536236bb01103005" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::EngineBuilder_v8::setGlobalEngineIdx</definition>
+        <argsstring>(int64_t idx_) -&gt; EngineBuilder_v8 &amp;</argsstring>
+        <name>setGlobalEngineIdx</name>
+        <param>
+          <type>int64_t</type>
+          <declname>idx_</declname>
+        </param>
+        <briefdescription>
+<para>Set engine index for the engine. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" line="253" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Engine.h" bodystart="253" bodyend="256"/>
+        <referencedby refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1aae1a36ace3278dbedcf0d743a7744d98" compoundref="df/d3e/cudnn__frontend__EngineFallbackList_8h" startline="131" endline="157">cudnn_frontend::EngineFallbackListBuilder_v8::build</referencedby>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Set individual property of <ref refid="dc/d3c/classcudnn__frontend_1_1Engine__v8" kindref="compound">Engine_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>

@@ -12,6 +12,8 @@ var searchData=
   ['_7eengineheuristicsbuilder_5fv8',['~EngineHeuristicsBuilder_v8',['../d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8.html#a8740e967b981abf94dc2c53eb8786ceb',1,'cudnn_frontend::EngineHeuristicsBuilder_v8']]],
   ['_7eexecutionplan_5fv8',['~ExecutionPlan_v8',['../d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html#a8a8ac13b1c639dd9b87c280a598446af',1,'cudnn_frontend::ExecutionPlan_v8']]],
   ['_7eexecutionplanbuilder_5fv8',['~ExecutionPlanBuilder_v8',['../d7/d0d/group__ExecutionPlanQuery.html#gae3f841de1b6461b31bf7967734a70a8a',1,'cudnn_frontend::ExecutionPlanBuilder_v8']]],
+  ['_7ematmuldesc_5fv8',['~MatMulDesc_v8',['../d6/db7/classcudnn__frontend_1_1MatMulDesc__v8.html#ad27b038b19b218067bd30e60d94fd672',1,'cudnn_frontend::MatMulDesc_v8']]],
+  ['_7ematmuldescbuilder_5fv8',['~MatMulDescBuilder_v8',['../de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8.html#a3f5790e5ada9a1785d9daf4246ea8de3',1,'cudnn_frontend::MatMulDescBuilder_v8']]],
   ['_7eopaquebackendpointer',['~OpaqueBackendPointer',['../d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer.html#a9f549dd95873ac3a02689ef97f4a6c75',1,'cudnn_frontend::OpaqueBackendPointer']]],
   ['_7eoperation_5fv8',['~Operation_v8',['../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a67d82f53ecbdfe2416d2a26410138d78',1,'cudnn_frontend::Operation_v8']]],
   ['_7eoperationgraph_5fv8',['~OperationGraph_v8',['../de/dd9/classcudnn__frontend_1_1OperationGraph__v8.html#aeb42611a38c4951e66cd23108d53353c',1,'cudnn_frontend::OperationGraph_v8']]],

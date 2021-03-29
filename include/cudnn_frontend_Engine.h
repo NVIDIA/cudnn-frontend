@@ -79,27 +79,27 @@ class Engine_v8 : public BackendDescriptor {
             choice = val_;
         }
 
-        const int64_t
+        int64_t
         getChoice() const {
             return choice;
         }
 
-        const cudnnBackendKnobType_t
+        cudnnBackendKnobType_t
         getKnobType() const {
             return knobType;
         }
 
-        const int64_t
+        int64_t
         getMinValue() const {
             return minValue;
         }
 
-        const int64_t
+        int64_t
         getMaxValue() const {
             return minValue;
         }
 
-        const int64_t
+        int64_t
         getStride() const {
             return stride;
         }
@@ -190,7 +190,7 @@ class Engine_v8 : public BackendDescriptor {
 
         std::array<cudnnBackendDescriptor_t, CUDNN_KNOB_TYPE_COUNTS> bKnobs_ =
             {};  //!< Opaque pointer to the backend knobs
-        for (auto i = 0; i < bKnobs.size(); i++) {
+        for (std::uint32_t i = 0; i < bKnobs.size(); i++) {
             bKnobs_[i] = bKnobs[i]->get_backend_descriptor();
         }
         status = cudnnBackendGetAttribute(pointer->get_backend_descriptor(),
@@ -241,12 +241,7 @@ class EngineBuilder_v8 {
         m_engine.opGraphTag = opGraph_.getTag();
         return *this;
     }
-    //! Set operationGraph for the engine
-    auto
-    setOperationGraph(cudnnBackendDescriptor_t desc_) -> EngineBuilder_v8 & {
-        // TBD
-        return *this;
-    }
+
     //! Set operationGraph for the engine
     auto
     setOperationGraph(ManagedOpaqueDescriptor desc_) -> EngineBuilder_v8 & {

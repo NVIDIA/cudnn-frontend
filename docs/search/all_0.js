@@ -5,5 +5,6 @@ var searchData=
   ['alpha2_5fs',['alpha2_s',['../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a4003061754cc4b0003a72cc474fca8d9',1,'cudnn_frontend::Operation_v8']]],
   ['alpha_5fd',['alpha_d',['../d4/d30/classcudnn__frontend_1_1Operation__v8.html#aee00f6897786ce0f16963a7d2f57a2f8',1,'cudnn_frontend::Operation_v8']]],
   ['alpha_5fs',['alpha_s',['../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a4a71d73a1231c39e51a74f750586a733',1,'cudnn_frontend::Operation_v8']]],
-  ['alphabetatype',['alphabetaType',['../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a0414d5eb022c25584d60491f416e6449',1,'cudnn_frontend::Operation_v8']]]
+  ['alphabetatype',['alphabetaType',['../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a0414d5eb022c25584d60491f416e6449',1,'cudnn_frontend::Operation_v8']]],
+  ['amatdesc',['amatdesc',['../d4/d30/classcudnn__frontend_1_1Operation__v8.html#ae0e0256b292acd560accc1c02a6e393b',1,'cudnn_frontend::Operation_v8']]]
 ];

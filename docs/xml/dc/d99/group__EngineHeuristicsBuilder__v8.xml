@@ -1,0 +1,47 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="dc/d99/group__EngineHeuristicsBuilder__v8" kind="group">
+    <compoundname>EngineHeuristicsBuilder_v8</compoundname>
+    <title>EngineHeuristicsBuilder_v8</title>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="dc/d99/group__EngineHeuristicsBuilder__v8_1ga0554ac9347b7409e46f960b30f18dc68" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::EngineHeuristicsBuilder_v8::setOperationGraph</definition>
+        <argsstring>(OperationGraph_v8 &amp;opGraph_) -&gt; EngineHeuristicsBuilder_v8 &amp;</argsstring>
+        <name>setOperationGraph</name>
+        <param>
+          <type>OperationGraph_v8 &amp;</type>
+          <declname>opGraph_</declname>
+        </param>
+        <briefdescription>
+<para>Set operationGraph for the engine (opGraph is not destroyed) </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="145" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" bodystart="145" bodyend="149"/>
+      </memberdef>
+      <memberdef kind="function" id="dc/d99/group__EngineHeuristicsBuilder__v8_1gaf2d783ca6a663aa50ffed2ccbc164812" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::EngineHeuristicsBuilder_v8::setHeurMode</definition>
+        <argsstring>(cudnnBackendHeurMode_t mode_) -&gt; EngineHeuristicsBuilder_v8 &amp;</argsstring>
+        <name>setHeurMode</name>
+        <param>
+          <type>cudnnBackendHeurMode_t</type>
+          <declname>mode_</declname>
+        </param>
+        <briefdescription>
+<para>Set cudnnHandle for the operations. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="152" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" bodystart="152" bodyend="155"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Set individual property of <ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>

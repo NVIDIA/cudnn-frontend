@@ -1,0 +1,351 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kind="class" language="C++" prot="public">
+    <compoundname>cudnn_frontend::ConvDesc_v8</compoundname>
+    <basecompoundref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" prot="public" virt="non-virtual">cudnn_frontend::BackendDescriptor</basecompoundref>
+    <includes refid="d1/de7/cudnn__frontend__ConvDesc_8h" local="no">cudnn_frontend_ConvDesc.h</includes>
+      <sectiondef kind="friend">
+      <memberdef kind="friend" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a00c454e18392653a023f75275553a4e7" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type>friend class</type>
+        <definition>friend class ConvDescBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>ConvDescBuilder_v8</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="56" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="56" bodyend="-1"/>
+        <referencedby refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1a01f709a3efafaca70de6565817c43beb" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="172" endline="304">cudnn_frontend::ConvDescBuilder_v8::build</referencedby>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a4a0249ac1d094f9a70967dd69b824f2e" prot="private" static="no" mutable="no">
+        <type>cudnnDataType_t</type>
+        <definition>cudnnDataType_t cudnn_frontend::ConvDesc_v8::data_type</definition>
+        <argsstring></argsstring>
+        <name>data_type</name>
+        <initializer>= CUDNN_DATA_FLOAT</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="107" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="107" bodyend="-1"/>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1adcb7e5f546b83bbdab63773030e3b909" prot="private" static="no" mutable="no">
+        <type>cudnnConvolutionMode_t</type>
+        <definition>cudnnConvolutionMode_t cudnn_frontend::ConvDesc_v8::mode</definition>
+        <argsstring></argsstring>
+        <name>mode</name>
+        <initializer>= CUDNN_CONVOLUTION</initializer>
+        <briefdescription>
+<para>Convolution operation data type. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="108" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="108" bodyend="-1"/>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a9b478d1207d8241ff67cc931754cd6cf" prot="private" static="no" mutable="no">
+        <type>int64_t</type>
+        <definition>int64_t cudnn_frontend::ConvDesc_v8::nDims</definition>
+        <argsstring></argsstring>
+        <name>nDims</name>
+        <initializer>= -1</initializer>
+        <briefdescription>
+<para>Convolution vs cross correlation. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="109" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="109" bodyend="-1"/>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aff824fb1cf44c188a7400b017458327e" prot="private" static="no" mutable="no">
+        <type>int64_t</type>
+        <definition>int64_t cudnn_frontend::ConvDesc_v8::padLower[CUDNN_DIM_MAX+1]</definition>
+        <argsstring>[CUDNN_DIM_MAX+1]</argsstring>
+        <name>padLower</name>
+        <initializer>= {0}</initializer>
+        <briefdescription>
+<para>number of dimensions </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="110" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="110" bodyend="-1"/>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a28e6ad906bf25653c87525f9f8e90a28" prot="private" static="no" mutable="no">
+        <type>int64_t</type>
+        <definition>int64_t cudnn_frontend::ConvDesc_v8::padUpper[CUDNN_DIM_MAX+1]</definition>
+        <argsstring>[CUDNN_DIM_MAX+1]</argsstring>
+        <name>padUpper</name>
+        <initializer>= {0}</initializer>
+        <briefdescription>
+<para>n, g, c, d, h, w </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="111" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="111" bodyend="-1"/>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a81e03a2a385d24a2faaf3db249580ac6" prot="private" static="no" mutable="no">
+        <type>int64_t</type>
+        <definition>int64_t cudnn_frontend::ConvDesc_v8::dilation[CUDNN_DIM_MAX+1]</definition>
+        <argsstring>[CUDNN_DIM_MAX+1]</argsstring>
+        <name>dilation</name>
+        <initializer>= {0}</initializer>
+        <briefdescription>
+<para>n, g, c, d, h, w </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="112" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="112" bodyend="-1"/>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+        <referencedby refid="d3/ddd/group__ConvDescBuilder__v8_1gaa41e2cbbebc9d2fd19fa990a48b39d08" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="145" endline="148">cudnn_frontend::ConvDescBuilder_v8::setDilation</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac513728c785a54ef86612a0bd6fa0f1a" prot="private" static="no" mutable="no">
+        <type>int64_t</type>
+        <definition>int64_t cudnn_frontend::ConvDesc_v8::stride[CUDNN_DIM_MAX+1]</definition>
+        <argsstring>[CUDNN_DIM_MAX+1]</argsstring>
+        <name>stride</name>
+        <initializer>= {-1}</initializer>
+        <briefdescription>
+<para>n, g, c, d, h, w </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="113" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="113" bodyend="-1"/>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="virtual">
+        <type>std::string</type>
+        <definition>std::string cudnn_frontend::ConvDesc_v8::describe</definition>
+        <argsstring>() const override</argsstring>
+        <name>describe</name>
+        <reimplements refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1ab652fb3e9a58092fbb137b0e959a9478">describe</reimplements>
+        <briefdescription>
+<para>Return a string describing the backend Descriptor. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="58" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="58" bodyend="86"/>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a4a0249ac1d094f9a70967dd69b824f2e" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="107">data_type</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a81e03a2a385d24a2faaf3db249580ac6" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="112">dilation</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1adcb7e5f546b83bbdab63773030e3b909" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="108">mode</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a9b478d1207d8241ff67cc931754cd6cf" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="109">nDims</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aff824fb1cf44c188a7400b017458327e" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="110">padLower</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a28e6ad906bf25653c87525f9f8e90a28" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="111">padUpper</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac513728c785a54ef86612a0bd6fa0f1a" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="113">stride</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::ConvDesc_v8::ConvDesc_v8</definition>
+        <argsstring>(ConvDesc_v8 &amp;&amp;from)</argsstring>
+        <name>ConvDesc_v8</name>
+        <param>
+          <type><ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kindref="compound">ConvDesc_v8</ref> &amp;&amp;</type>
+          <declname>from</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="88" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="88" bodyend="97"/>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a5c892fb76fbf9e4bfffdb5288f9d60ad">ConvDesc_v8</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a81e03a2a385d24a2faaf3db249580ac6" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="112">dilation</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aa8ea272eaf26ae7f7ad2d625253ea62f">operator=</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aff824fb1cf44c188a7400b017458327e" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="110">padLower</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a28e6ad906bf25653c87525f9f8e90a28" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="111">padUpper</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac513728c785a54ef86612a0bd6fa0f1a" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="113">stride</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d930ada709a855c86b2857a1b155d02">~ConvDesc_v8</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d930ada709a855c86b2857a1b155d02" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::ConvDesc_v8::~ConvDesc_v8</definition>
+        <argsstring>()=default</argsstring>
+        <name>~ConvDesc_v8</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="99" column="1"/>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-func">
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a5c892fb76fbf9e4bfffdb5288f9d60ad" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::ConvDesc_v8::ConvDesc_v8</definition>
+        <argsstring>()=default</argsstring>
+        <name>ConvDesc_v8</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="102" column="1"/>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a061ef887bdf383d416ee143a35d5c334" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::ConvDesc_v8::ConvDesc_v8</definition>
+        <argsstring>(ConvDesc_v8 const &amp;)=delete</argsstring>
+        <name>ConvDesc_v8</name>
+        <param>
+          <type><ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kindref="compound">ConvDesc_v8</ref> const &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="103" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aa8ea272eaf26ae7f7ad2d625253ea62f" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kindref="compound">ConvDesc_v8</ref> &amp;</type>
+        <definition>ConvDesc_v8&amp; cudnn_frontend::ConvDesc_v8::operator=</definition>
+        <argsstring>(ConvDesc_v8 const &amp;)=delete</argsstring>
+        <name>operator=</name>
+        <param>
+          <type><ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kindref="compound">ConvDesc_v8</ref> const &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="105" column="1"/>
+        <referencedby refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1a01f709a3efafaca70de6565817c43beb" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="172" endline="304">cudnn_frontend::ConvDescBuilder_v8::build</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Convolution Descriptor Class This class tells the properties of the Convolution operation Properties:<itemizedlist>
+<listitem><para>padLower</para></listitem><listitem><para>padUpper</para></listitem><listitem><para>Dilation</para></listitem><listitem><para>Stride</para></listitem><listitem><para>Math Operation Data Type</para></listitem><listitem><para>Convolution Mode</para></listitem><listitem><para>Convolution spatial dimensions</para></listitem></itemizedlist>
+</para><para>Use <ref refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8" kindref="compound">ConvDescBuilder_v8</ref> to build this class. Describe returns a string describing the convolution operation </para>    </detaileddescription>
+    <inheritancegraph>
+      <node id="18">
+        <label>cudnn_frontend::ConvDesc_v8</label>
+        <link refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8"/>
+        <childnode refid="19" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="19">
+        <label>cudnn_frontend::BackendDescriptor</label>
+        <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="24">
+        <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
+      </node>
+      <node id="27">
+        <label>cudnnConvolutionMode_t</label>
+      </node>
+      <node id="20">
+        <label>cudnn_frontend::ConvDesc_v8</label>
+        <link refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8"/>
+        <childnode refid="21" relation="public-inheritance">
+        </childnode>
+        <childnode refid="26" relation="usage">
+          <edgelabel>-padUpper</edgelabel>
+          <edgelabel>-nDims</edgelabel>
+          <edgelabel>-stride</edgelabel>
+          <edgelabel>-dilation</edgelabel>
+          <edgelabel>-padLower</edgelabel>
+        </childnode>
+        <childnode refid="27" relation="usage">
+          <edgelabel>-mode</edgelabel>
+        </childnode>
+        <childnode refid="28" relation="usage">
+          <edgelabel>-data_type</edgelabel>
+        </childnode>
+      </node>
+      <node id="25">
+        <label>cudnnStatus_t</label>
+      </node>
+      <node id="23">
+        <label>std::basic_string&lt; char &gt;</label>
+      </node>
+      <node id="28">
+        <label>cudnnDataType_t</label>
+      </node>
+      <node id="26">
+        <label>int64_t</label>
+      </node>
+      <node id="21">
+        <label>cudnn_frontend::BackendDescriptor</label>
+        <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
+        <childnode refid="22" relation="usage">
+          <edgelabel>#err_msg</edgelabel>
+        </childnode>
+        <childnode refid="24" relation="usage">
+          <edgelabel>#pointer</edgelabel>
+        </childnode>
+        <childnode refid="25" relation="usage">
+          <edgelabel>#status</edgelabel>
+        </childnode>
+      </node>
+      <node id="22">
+        <label>std::string</label>
+        <childnode refid="23" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="54" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="54" bodyend="114"/>
+    <listofallmembers>
+      <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8aa93686ca88410fc048b05155148183" prot="protected" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>BackendDescriptor</name></member>
+      <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a5765369a5739c2ea81c4f39ce2d1c46e" prot="protected" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>BackendDescriptor</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>ConvDesc_v8</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a5c892fb76fbf9e4bfffdb5288f9d60ad" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>ConvDesc_v8</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a061ef887bdf383d416ee143a35d5c334" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>ConvDesc_v8</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a00c454e18392653a023f75275553a4e7" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>ConvDescBuilder_v8</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a4a0249ac1d094f9a70967dd69b824f2e" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>data_type</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" prot="public" virt="virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>describe</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a81e03a2a385d24a2faaf3db249580ac6" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>dilation</name></member>
+      <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a0d416655dab2b5a675fecb5df9ea8521" prot="protected" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>err_msg</name></member>
+      <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a57c83e78374bac747b5660fb271b947a" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>get_desc</name></member>
+      <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1abfde0f34b0bf49c45d3d9c0408284f6f" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>get_error</name></member>
+      <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3aa1ab42ab96471092185f15e22c1e9f" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>get_raw_desc</name></member>
+      <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>get_status</name></member>
+      <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>initialize_managed_backend_pointer</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1adcb7e5f546b83bbdab63773030e3b909" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>mode</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a9b478d1207d8241ff67cc931754cd6cf" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>nDims</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aa8ea272eaf26ae7f7ad2d625253ea62f" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>operator=</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aff824fb1cf44c188a7400b017458327e" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>padLower</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a28e6ad906bf25653c87525f9f8e90a28" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>padUpper</name></member>
+      <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a62312f29dbbc7c11c1da54a2ad41c52f" prot="protected" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>pointer</name></member>
+      <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a1748a5c560905314930c37b2ed1a54d2" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>set_error</name></member>
+      <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3ef02443f20b90223baf5f1922505eab" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>set_status</name></member>
+      <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" prot="protected" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>status</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac513728c785a54ef86612a0bd6fa0f1a" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>stride</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d930ada709a855c86b2857a1b155d02" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>~ConvDesc_v8</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

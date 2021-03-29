@@ -1,0 +1,30 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d9/d08/group__MatMulDescBuilder__v8" kind="group">
+    <compoundname>MatMulDescBuilder_v8</compoundname>
+    <title>MatMulDescBuilder_v8</title>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d9/d08/group__MatMulDescBuilder__v8_1ga5885f3eb7580cbe0cbe7243c4711c0f2" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::MatMulDescBuilder_v8::setMathPrecision</definition>
+        <argsstring>(cudnnDataType_t data_type_) -&gt; MatMulDescBuilder_v8 &amp;</argsstring>
+        <name>setMathPrecision</name>
+        <param>
+          <type>cudnnDataType_t</type>
+          <declname>data_type_</declname>
+        </param>
+        <briefdescription>
+<para>Set Math Precision Data Type for the Matmul Operation. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" line="84" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" bodystart="84" bodyend="87"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Set individual property of <ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>

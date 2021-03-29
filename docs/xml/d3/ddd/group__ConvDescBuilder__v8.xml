@@ -1,0 +1,149 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d3/ddd/group__ConvDescBuilder__v8" kind="group">
+    <compoundname>ConvDescBuilder_v8</compoundname>
+    <title>ConvDescBuilder_v8</title>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d3/ddd/group__ConvDescBuilder__v8_1gad8de00b0e7a86bdda61749e7572a35ac" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::ConvDescBuilder_v8::setDataType</definition>
+        <argsstring>(cudnnDataType_t data_type_) -&gt; ConvDescBuilder_v8 &amp;</argsstring>
+        <name>setDataType</name>
+        <param>
+          <type>cudnnDataType_t</type>
+          <declname>data_type_</declname>
+        </param>
+        <briefdescription>
+<para>Set Datatype for the Convolution Operation. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="127" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="127" bodyend="130"/>
+      </memberdef>
+      <memberdef kind="function" id="d3/ddd/group__ConvDescBuilder__v8_1gab07bf6292e69d19e6324d3073a86d58c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::ConvDescBuilder_v8::setPrePadding</definition>
+        <argsstring>(int64_t ndims, int64_t const *padding) -&gt; ConvDescBuilder_v8 &amp;</argsstring>
+        <name>setPrePadding</name>
+        <param>
+          <type>int64_t</type>
+          <declname>ndims</declname>
+        </param>
+        <param>
+          <type>int64_t const *</type>
+          <declname>padding</declname>
+        </param>
+        <briefdescription>
+<para>Set Padding Lower of the convDesc. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="133" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="133" bodyend="136"/>
+      </memberdef>
+      <memberdef kind="function" id="d3/ddd/group__ConvDescBuilder__v8_1ga44915183cb4dddcf23222faca3f84bba" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::ConvDescBuilder_v8::setPostPadding</definition>
+        <argsstring>(int64_t ndims, int64_t const *padding) -&gt; ConvDescBuilder_v8 &amp;</argsstring>
+        <name>setPostPadding</name>
+        <param>
+          <type>int64_t</type>
+          <declname>ndims</declname>
+        </param>
+        <param>
+          <type>int64_t const *</type>
+          <declname>padding</declname>
+        </param>
+        <briefdescription>
+<para>Set Padding Upper of the convDesc. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="139" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="139" bodyend="142"/>
+      </memberdef>
+      <memberdef kind="function" id="d3/ddd/group__ConvDescBuilder__v8_1gaa41e2cbbebc9d2fd19fa990a48b39d08" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::ConvDescBuilder_v8::setDilation</definition>
+        <argsstring>(int64_t ndims, int64_t const *dilation) -&gt; ConvDescBuilder_v8 &amp;</argsstring>
+        <name>setDilation</name>
+        <param>
+          <type>int64_t</type>
+          <declname>ndims</declname>
+        </param>
+        <param>
+          <type>int64_t const *</type>
+          <declname>dilation</declname>
+        </param>
+        <briefdescription>
+<para>Set Dilation of the convDesc. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="145" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="145" bodyend="148"/>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a81e03a2a385d24a2faaf3db249580ac6" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="112">cudnn_frontend::ConvDesc_v8::dilation</references>
+      </memberdef>
+      <memberdef kind="function" id="d3/ddd/group__ConvDescBuilder__v8_1ga2c481d46d71fe909247f50ba2772b7ce" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::ConvDescBuilder_v8::setStrides</definition>
+        <argsstring>(int64_t ndims, int64_t const *strides) -&gt; ConvDescBuilder_v8 &amp;</argsstring>
+        <name>setStrides</name>
+        <param>
+          <type>int64_t</type>
+          <declname>ndims</declname>
+        </param>
+        <param>
+          <type>int64_t const *</type>
+          <declname>strides</declname>
+        </param>
+        <briefdescription>
+<para>Set Strides of the convDesc. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="151" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="151" bodyend="154"/>
+      </memberdef>
+      <memberdef kind="function" id="d3/ddd/group__ConvDescBuilder__v8_1gaacfcf20b0ed61e89bc92970f7bb7a258" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::ConvDescBuilder_v8::setNDims</definition>
+        <argsstring>(int64_t nDims_) -&gt; ConvDescBuilder_v8 &amp;</argsstring>
+        <name>setNDims</name>
+        <param>
+          <type>int64_t</type>
+          <declname>nDims_</declname>
+        </param>
+        <briefdescription>
+<para>Set Num Spatial Dimensions of the convolution Operation. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="157" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="157" bodyend="160"/>
+      </memberdef>
+      <memberdef kind="function" id="d3/ddd/group__ConvDescBuilder__v8_1ga3b752afba659c8e92e7ad1ca71d62f2f" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::ConvDescBuilder_v8::setMathMode</definition>
+        <argsstring>(cudnnConvolutionMode_t mode_) -&gt; ConvDescBuilder_v8 &amp;</argsstring>
+        <name>setMathMode</name>
+        <param>
+          <type>cudnnConvolutionMode_t</type>
+          <declname>mode_</declname>
+        </param>
+        <briefdescription>
+<para>Set Convolution Mode of the convolution Operation. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="163" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="163" bodyend="166"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Set individual property of <ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kindref="compound">ConvDesc_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>

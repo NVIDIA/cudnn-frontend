@@ -5,7 +5,7 @@
 <meta http-equiv="X-UA-Compatible" content="IE=9"/>
 <meta name="generator" content="Doxygen 1.8.13"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>CUDNN API: Main Page</title>
+<title>CUDNN Frontend API: CUDNN FRONTEND API</title>
 <link href="tabs.css" rel="stylesheet" type="text/css"/>
 <script type="text/javascript" src="jquery.js"></script>
 <script type="text/javascript" src="dynsections.js"></script>
@@ -28,8 +28,8 @@
  <tbody>
  <tr style="height: 56px;">
   <td id="projectalign" style="padding-left: 0.5em;">
-   <div id="projectname">CUDNN API
-   &#160;<span id="projectnumber">8</span>
+   <div id="projectname">CUDNN Frontend API
+   &#160;<span id="projectnumber">8.2.0</span>
    </div>
   </td>
  </tr>
@@ -81,10 +81,30 @@ $(document).ready(function(){initNavTree('index.html','');});
 
 <div class="header">
   <div class="headertitle">
-<div class="title">CUDNN API Documentation</div>  </div>
+<div class="title">CUDNN FRONTEND API </div>  </div>
 </div><!--header-->
 <div class="contents">
-</div><!-- contents -->
+<div class="textblock"><h1><a class="anchor" id="Introduction"></a>
+Introduction</h1>
+<p>The cuDNN Frontend API is a C++ header-only library that demonstrates how to use the cuDNN C backend API. The cuDNN C backend API is documented in the cuDNN developer guide.</p>
+<h1><a class="anchor" id="Need"></a>
+Why use Frontend API</h1>
+<p>Consider the following code snippet which showcases cudnnBackendTensor creation using the backend API and its equivalent front-end API code. Many among the backend constructs follow similar pattern.</p>
+<div class="fragment"><div class="line">===========================================================================================</div><div class="line"><span class="keyword">auto</span> check_status = [](cudnnStatus_t status) { assert (status == CUDNN_STATUS_SUCCESS); };</div><div class="line">===========================================================================================</div><div class="line"><span class="comment">// Backend code for Tensor Creation. </span></div><div class="line">cudnnBackendDescriptor_t tensor;</div><div class="line"></div><div class="line">check_status (cudnnBackendCreateDescriptor(CUDNN_BACKEND_TENSOR_DESCRIPTOR, &amp;tensor));</div><div class="line"></div><div class="line">check_status (cudnnBackendSetAttribute(tensor,</div><div class="line">                                       CUDNN_ATTR_TENSOR_DATA_TYPE,</div><div class="line">                                       CUDNN_TYPE_DATA_TYPE,</div><div class="line">                                       1,</div><div class="line">                                       &amp;data_type));</div><div class="line">check_status (cudnnBackendSetAttribute(tensor,</div><div class="line">                                       CUDNN_ATTR_TENSOR_DIMENSIONS,</div><div class="line">                                       CUDNN_TYPE_INT64,</div><div class="line">                                       tensor_dim.size(),</div><div class="line">                                       tensor_dim.data()));</div><div class="line">check_status (cudnnBackendSetAttribute(tensor,</div><div class="line">                                       CUDNN_ATTR_TENSOR_STRIDES,</div><div class="line">                                       CUDNN_TYPE_INT64,</div><div class="line">                                       tensor_str.size(),</div><div class="line">                                       tensor_str.data()));</div><div class="line">check_status (cudnnBackendSetAttribute(tensor,</div><div class="line">                                       CUDNN_ATTR_TENSOR_UNIQUE_ID,</div><div class="line">                                       CUDNN_TYPE_INT64,</div><div class="line">                                       1,</div><div class="line">                                       &amp;<span class="keywordtype">id</span>));</div><div class="line">check_status (cudnnBackendSetAttribute(tensor,</div><div class="line">                                       CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT,</div><div class="line">                                       CUDNN_TYPE_INT64,</div><div class="line">                                       1,</div><div class="line">                                       &amp;alignment));</div><div class="line">check_status (cudnnBackendFinalize(tensor));</div><div class="line"></div><div class="line">check_status (cudnnBackendDestroyDescriptor(tensor));</div><div class="line">===========================================================================================</div><div class="line"><span class="comment">// FrontEnd equivalent code. </span></div><div class="line"><span class="keyword">auto</span> tensor =  <a class="code" href="df/de1/namespacecudnn__frontend.html#a9fea2e22198aaf2ea11a0df46abd0749">cudnn_frontend::TensorBuilder</a>()</div><div class="line">                   .<a class="code" href="d3/d3c/group__TensorBuilder__v8.html#gae828806e2d76ca3eb6c4e289f2e93a96">setDim</a>(tensor_dim.size(), tensor_dim.data())</div><div class="line">                   .setStrides(tensor_str.size(), tensor_str.data())</div><div class="line">                   .setId(<span class="keywordtype">id</span>)</div><div class="line">                   .setAlignment(alignment)</div><div class="line">                   .setDataType(data_type)</div><div class="line">                   .build();</div><div class="line">check_status(tensor.get_status());</div><div class="line">===========================================================================================</div></div><!-- fragment --><p>Frontend API serves two major purpose as a companion to the backend API.</p><ul>
+<li>Functional additions:<ul>
+<li>Support for auto-tuning. (cudnnGet and cudnnFind)</li>
+<li>Errata filters.</li>
+</ul>
+</li>
+<li>Programmatic ease:<ul>
+<li>Easy memory management for the cudnnBackendDescriptor_t (RAII based classes).</li>
+<li>Error handling with optional exception support. Better error messages.</li>
+<li>Fewer lines of code (5-10x reduction in LOC).</li>
+<li>Simpler samples on how to use the new API. </li>
+</ul>
+</li>
+</ul>
+</div></div><!-- contents -->
 </div><!-- doc-content -->
 <!-- start footer part -->
 <div id="nav-path" class="navpath"><!-- id is needed for treeview function! -->

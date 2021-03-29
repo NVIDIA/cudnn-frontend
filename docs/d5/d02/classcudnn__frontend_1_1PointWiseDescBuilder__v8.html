@@ -5,7 +5,7 @@
 <meta http-equiv="X-UA-Compatible" content="IE=9"/>
 <meta name="generator" content="Doxygen 1.8.13"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>CUDNN API: cudnn_frontend::PointWiseDescBuilder_v8 Class Reference</title>
+<title>CUDNN Frontend API: cudnn_frontend::PointWiseDescBuilder_v8 Class Reference</title>
 <link href="../../tabs.css" rel="stylesheet" type="text/css"/>
 <script type="text/javascript" src="../../jquery.js"></script>
 <script type="text/javascript" src="../../dynsections.js"></script>
@@ -28,8 +28,8 @@
  <tbody>
  <tr style="height: 56px;">
   <td id="projectalign" style="padding-left: 0.5em;">
-   <div id="projectname">CUDNN API
-   &#160;<span id="projectnumber">8</span>
+   <div id="projectname">CUDNN Frontend API
+   &#160;<span id="projectnumber">8.2.0</span>
    </div>
   </td>
  </tr>
@@ -95,7 +95,7 @@ Collaboration diagram for cudnn_frontend::PointWiseDescBuilder_v8:</div>
 <div class="dyncontent">
 <div class="center"><img src="../../d4/d9b/classcudnn__frontend_1_1PointWiseDescBuilder__v8__coll__graph.png" border="0" usemap="#cudnn__frontend_1_1PointWiseDescBuilder__v8_coll__map" alt="Collaboration graph"/></div>
 <map name="cudnn__frontend_1_1PointWiseDescBuilder__v8_coll__map" id="cudnn__frontend_1_1PointWiseDescBuilder__v8_coll__map">
-<area shape="rect" id="node2" href="../../d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html" title="{cudnn_frontend::PointWise\lDesc_v8\n||+ describe()\l+ getPortCount()\l+ getPointWiseMode()\l+ PointWiseDesc_v8()\l+ ~PointWiseDesc_v8()\l&#45; PointWiseDesc_v8()\l&#45; PointWiseDesc_v8()\l&#45; operator=()\l}" alt="" coords="443,603,622,797"/>
+<area shape="rect" id="node2" href="../../d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html" title="{cudnn_frontend::PointWise\lDesc_v8\n||+ describe()\l+ getPortCount()\l+ getPointWiseMode()\l+ PointWiseDesc_v8()\l+ ~PointWiseDesc_v8()\l&#45; PointWiseDesc_v8()\l&#45; PointWiseDesc_v8()\l&#45; operator=()\l}" alt="" coords="443,661,622,856"/>
 <area shape="rect" id="node3" href="../../d6/d88/classcudnn__frontend_1_1BackendDescriptor.html" title="{cudnn_frontend::BackendDescriptor\n||+ describe()\l+ get_raw_desc()\l+ get_status()\l+ set_status()\l+ set_error()\l+ get_error()\l+ get_desc()\l+ initialize_managed\l_backend_pointer()\l# BackendDescriptor()\l# BackendDescriptor()\l}" alt="" coords="113,301,344,525"/>
 <area shape="rect" id="node4" title="STL class. " alt="" coords="29,154,109,231"/>
 <area shape="rect" id="node5" title="STL class. " alt="" coords="5,5,132,97"/>
@@ -116,6 +116,18 @@ Public Member Functions</h2></td></tr>
 <tr class="memitem:gae5240136e19e0a4094036d48c6b1a3b7"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d2/db5/group__PointWiseDescBuilder__v8.html#gae5240136e19e0a4094036d48c6b1a3b7">setMode</a> (cudnnNanPropagation_t nan_mode_) -&gt; <a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> &amp;</td></tr>
 <tr class="memdesc:gae5240136e19e0a4094036d48c6b1a3b7"><td class="mdescLeft">&#160;</td><td class="mdescRight">Set NaN propagation mode.  <a href="../../d2/db5/group__PointWiseDescBuilder__v8.html#gae5240136e19e0a4094036d48c6b1a3b7">More...</a><br /></td></tr>
 <tr class="separator:gae5240136e19e0a4094036d48c6b1a3b7"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:afdbe0ce3f7fb2f0d23251ccb7507bc69"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html#afdbe0ce3f7fb2f0d23251ccb7507bc69">setReluLowerClip</a> (double lower_clip_) -&gt; <a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> &amp;</td></tr>
+<tr class="separator:afdbe0ce3f7fb2f0d23251ccb7507bc69"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:a0514e70d05a21a9c46bc66d1e61c28f5"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html#a0514e70d05a21a9c46bc66d1e61c28f5">setReluUpperClip</a> (double upper_clip_) -&gt; <a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> &amp;</td></tr>
+<tr class="separator:a0514e70d05a21a9c46bc66d1e61c28f5"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:aa93615adf69e7a87a06d0cea687794a6"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html#aa93615adf69e7a87a06d0cea687794a6">setReluLowerClipSlope</a> (double lower_clip_slope_) -&gt; <a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> &amp;</td></tr>
+<tr class="separator:aa93615adf69e7a87a06d0cea687794a6"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:a8bdbf27c37334f5b61a65eb1bd4b6a98"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html#a8bdbf27c37334f5b61a65eb1bd4b6a98">setEluAlpha</a> (double elu_alpha_) -&gt; <a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> &amp;</td></tr>
+<tr class="separator:a8bdbf27c37334f5b61a65eb1bd4b6a98"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ab692e5a2b3970346f68af33530ef98e8"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html#ab692e5a2b3970346f68af33530ef98e8">setSoftplusBeta</a> (double softplus_beta_) -&gt; <a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> &amp;</td></tr>
+<tr class="separator:ab692e5a2b3970346f68af33530ef98e8"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:aad41d0f7b6667383fd9012bc492a13c3"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html#aad41d0f7b6667383fd9012bc492a13c3">setSwishBeta</a> (double swish_beta_) -&gt; <a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> &amp;</td></tr>
+<tr class="separator:aad41d0f7b6667383fd9012bc492a13c3"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a5de642e4141705f8e06c4bf566f1d332"><td class="memItemLeft" align="right" valign="top"><a class="el" href="../../d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html">PointWiseDesc_v8</a> &amp;&amp;&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html#a5de642e4141705f8e06c4bf566f1d332">build</a> ()</td></tr>
 <tr class="separator:a5de642e4141705f8e06c4bf566f1d332"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a6f5605f25897bba7afc6baf76228828c"><td class="memItemLeft" align="right" valign="top">&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html#a6f5605f25897bba7afc6baf76228828c">PointWiseDescBuilder_v8</a> ()=default</td></tr>
@@ -137,7 +149,7 @@ Private Attributes</h2></td></tr>
 <a name="details" id="details"></a><h2 class="groupheader">Detailed Description</h2>
 <div class="textblock"><p><a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> Class Helper class used to build <a class="el" href="../../d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html">PointWiseDesc_v8</a> class </p>
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00113">113</a> of file <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html">cudnn_frontend_PointWiseDesc.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00134">134</a> of file <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html">cudnn_frontend_PointWiseDesc.h</a>.</p>
 </div><h2 class="groupheader">Constructor &amp; Destructor Documentation</h2>
 <a id="a6f5605f25897bba7afc6baf76228828c"></a>
 <h2 class="memtitle"><span class="permalink"><a href="#a6f5605f25897bba7afc6baf76228828c">&#9670;&nbsp;</a></span>PointWiseDescBuilder_v8() <span class="overload">[1/3]</span></h2>
@@ -266,9 +278,9 @@ Private Attributes</h2></td></tr>
 </div><div class="memdoc">
 <p>constructs the <a class="el" href="../../d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html">PointWiseDesc_v8</a> by calling the cudnn API Throws the appropriate error message </p>
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00149">149</a> of file <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html">cudnn_frontend_PointWiseDesc.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00206">206</a> of file <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html">cudnn_frontend_PointWiseDesc.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#ae3cd0c0051c7e29a9ad86b80308429f3">cudnn_frontend::PointWiseDesc_v8::operator=()</a>, <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00053">cudnn_frontend::PointWiseDesc_v8::PointWiseDescBuilder_v8</a>, <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00060">cudnn_frontend::set_error_and_throw_exception()</a>, and <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00158">cudnn_frontend::BackendDescriptor::status</a>.</p>
+<p class="reference">References <a class="el" href="../../d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#ae3cd0c0051c7e29a9ad86b80308429f3">cudnn_frontend::PointWiseDesc_v8::operator=()</a>, <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00057">cudnn_frontend::PointWiseDesc_v8::PointWiseDescBuilder_v8</a>, <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00060">cudnn_frontend::set_error_and_throw_exception()</a>, and <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00158">cudnn_frontend::BackendDescriptor::status</a>.</p>
 
 </div>
 </div>
@@ -298,6 +310,174 @@ Private Attributes</h2></td></tr>
 
 </div>
 </div>
+<a id="a8bdbf27c37334f5b61a65eb1bd4b6a98"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#a8bdbf27c37334f5b61a65eb1bd4b6a98">&#9670;&nbsp;</a></span>setEluAlpha()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">auto cudnn_frontend::PointWiseDescBuilder_v8::setEluAlpha </td>
+          <td>(</td>
+          <td class="paramtype">double&#160;</td>
+          <td class="paramname"><em>elu_alpha_</em></td><td>)</td>
+          <td> -&gt; <a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> &amp; </td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">inline</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00186">186</a> of file <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html">cudnn_frontend_PointWiseDesc.h</a>.</p>
+
+</div>
+</div>
+<a id="afdbe0ce3f7fb2f0d23251ccb7507bc69"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#afdbe0ce3f7fb2f0d23251ccb7507bc69">&#9670;&nbsp;</a></span>setReluLowerClip()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">auto cudnn_frontend::PointWiseDescBuilder_v8::setReluLowerClip </td>
+          <td>(</td>
+          <td class="paramtype">double&#160;</td>
+          <td class="paramname"><em>lower_clip_</em></td><td>)</td>
+          <td> -&gt; <a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> &amp; </td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">inline</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00168">168</a> of file <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html">cudnn_frontend_PointWiseDesc.h</a>.</p>
+
+</div>
+</div>
+<a id="aa93615adf69e7a87a06d0cea687794a6"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#aa93615adf69e7a87a06d0cea687794a6">&#9670;&nbsp;</a></span>setReluLowerClipSlope()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">auto cudnn_frontend::PointWiseDescBuilder_v8::setReluLowerClipSlope </td>
+          <td>(</td>
+          <td class="paramtype">double&#160;</td>
+          <td class="paramname"><em>lower_clip_slope_</em></td><td>)</td>
+          <td> -&gt; <a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> &amp; </td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">inline</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00180">180</a> of file <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html">cudnn_frontend_PointWiseDesc.h</a>.</p>
+
+</div>
+</div>
+<a id="a0514e70d05a21a9c46bc66d1e61c28f5"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#a0514e70d05a21a9c46bc66d1e61c28f5">&#9670;&nbsp;</a></span>setReluUpperClip()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">auto cudnn_frontend::PointWiseDescBuilder_v8::setReluUpperClip </td>
+          <td>(</td>
+          <td class="paramtype">double&#160;</td>
+          <td class="paramname"><em>upper_clip_</em></td><td>)</td>
+          <td> -&gt; <a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> &amp; </td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">inline</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00174">174</a> of file <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html">cudnn_frontend_PointWiseDesc.h</a>.</p>
+
+</div>
+</div>
+<a id="ab692e5a2b3970346f68af33530ef98e8"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#ab692e5a2b3970346f68af33530ef98e8">&#9670;&nbsp;</a></span>setSoftplusBeta()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">auto cudnn_frontend::PointWiseDescBuilder_v8::setSoftplusBeta </td>
+          <td>(</td>
+          <td class="paramtype">double&#160;</td>
+          <td class="paramname"><em>softplus_beta_</em></td><td>)</td>
+          <td> -&gt; <a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> &amp; </td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">inline</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00192">192</a> of file <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html">cudnn_frontend_PointWiseDesc.h</a>.</p>
+
+</div>
+</div>
+<a id="aad41d0f7b6667383fd9012bc492a13c3"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#aad41d0f7b6667383fd9012bc492a13c3">&#9670;&nbsp;</a></span>setSwishBeta()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">auto cudnn_frontend::PointWiseDescBuilder_v8::setSwishBeta </td>
+          <td>(</td>
+          <td class="paramtype">double&#160;</td>
+          <td class="paramname"><em>swish_beta_</em></td><td>)</td>
+          <td> -&gt; <a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a> &amp; </td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">inline</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00198">198</a> of file <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html">cudnn_frontend_PointWiseDesc.h</a>.</p>
+
+</div>
+</div>
 <h2 class="groupheader">Member Data Documentation</h2>
 <a id="a804a2b5438f464185b16a4652fc14cf5"></a>
 <h2 class="memtitle"><span class="permalink"><a href="#a804a2b5438f464185b16a4652fc14cf5">&#9670;&nbsp;</a></span>m_pointWiseDesc</h2>
@@ -319,7 +499,7 @@ Private Attributes</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00245">245</a> of file <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html">cudnn_frontend_PointWiseDesc.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00367">367</a> of file <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html">cudnn_frontend_PointWiseDesc.h</a>.</p>
 
 </div>
 </div>

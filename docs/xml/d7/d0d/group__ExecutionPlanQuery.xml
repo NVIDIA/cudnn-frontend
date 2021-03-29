@@ -1,0 +1,279 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d7/d0d/group__ExecutionPlanQuery" kind="group">
+    <compoundname>ExecutionPlanQuery</compoundname>
+    <title>ExecutionPlanQuery</title>
+    <innergroup refid="d4/de1/group__ExecutionPlanBuilder__v8">ExecutionPlanBuilder_v8</innergroup>
+      <sectiondef kind="var">
+      <memberdef kind="variable" id="d7/d0d/group__ExecutionPlanQuery_1ga5e3dd6d441474ac5ab94aaaf9c45bc5b" prot="private" static="no" mutable="no">
+        <type>ManagedOpaqueDescriptor</type>
+        <definition>ManagedOpaqueDescriptor cudnn_frontend::ExecutionPlan_v8::engine_config</definition>
+        <argsstring></argsstring>
+        <name>engine_config</name>
+        <initializer>= nullptr</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="203" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="203" bodyend="-1"/>
+        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga8a6517102f5c12e63e4417324a03180b" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="104" endline="196">cudnn_frontend::ExecutionPlan_v8::computeTag</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="d7/d0d/group__ExecutionPlanQuery_1ga4c36108c6511420d81fcda5292761726" prot="private" static="no" mutable="no">
+        <type>cudnnHandle_t</type>
+        <definition>cudnnHandle_t cudnn_frontend::ExecutionPlan_v8::handle</definition>
+        <argsstring></argsstring>
+        <name>handle</name>
+        <initializer>= nullptr</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="204" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="204" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d7/d0d/group__ExecutionPlanQuery_1gaf732b37c9c05a2a8bd1a76289c740c4a" prot="private" static="no" mutable="no">
+        <type>std::string</type>
+        <definition>std::string cudnn_frontend::ExecutionPlan_v8::planTag</definition>
+        <argsstring></argsstring>
+        <name>planTag</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="205" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="205" bodyend="-1"/>
+        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga8a6517102f5c12e63e4417324a03180b" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="104" endline="196">cudnn_frontend::ExecutionPlan_v8::computeTag</referencedby>
+        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga2ff1340409f8834fe9ae68ff4c00281a" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="98" endline="100">cudnn_frontend::ExecutionPlan_v8::getTag</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="d7/d0d/group__ExecutionPlanQuery_1gae1a2e3dd89dbe455e7067531ec5b5562" prot="private" static="no" mutable="no">
+        <type>ExecutionPlan_v8</type>
+        <definition>ExecutionPlan_v8 cudnn_frontend::ExecutionPlanBuilder_v8::m_execution_plan</definition>
+        <argsstring></argsstring>
+        <name>m_execution_plan</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="312" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="312" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga00d10a076c22e86354a789852c56c22f" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::ExecutionPlan_v8::getWorkspaceSize</definition>
+        <argsstring>(void) const -&gt; int64_t</argsstring>
+        <name>getWorkspaceSize</name>
+        <param>
+          <type>void</type>
+        </param>
+        <briefdescription>
+<para>Query the workspace requirement for the given plan. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="67" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="67" bodyend="88"/>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a62312f29dbbc7c11c1da54a2ad41c52f" compoundref="dc/d11/cudnn__backend__base_8h" startline="156">cudnn_frontend::BackendDescriptor::pointer</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="158">cudnn_frontend::BackendDescriptor::status</references>
+      </memberdef>
+      <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1gad80aa2980d915449d05db4c71041e2e0" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="virtual">
+        <type>std::string</type>
+        <definition>std::string cudnn_frontend::ExecutionPlan_v8::describe</definition>
+        <argsstring>() const override</argsstring>
+        <name>describe</name>
+        <reimplements refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1ab652fb3e9a58092fbb137b0e959a9478">describe</reimplements>
+        <briefdescription>
+<para>Return a string describing the backend Descriptor. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="91" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="91" bodyend="95"/>
+      </memberdef>
+      <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga2ff1340409f8834fe9ae68ff4c00281a" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::string const  &amp;</type>
+        <definition>std::string const&amp; cudnn_frontend::ExecutionPlan_v8::getTag</definition>
+        <argsstring>() const</argsstring>
+        <name>getTag</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="98" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="98" bodyend="100"/>
+        <references refid="d7/d0d/group__ExecutionPlanQuery_1gaf732b37c9c05a2a8bd1a76289c740c4a" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="205">cudnn_frontend::ExecutionPlan_v8::planTag</references>
+      </memberdef>
+      <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga8a6517102f5c12e63e4417324a03180b" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>void</type>
+        <definition>void cudnn_frontend::ExecutionPlan_v8::computeTag</definition>
+        <argsstring>()</argsstring>
+        <name>computeTag</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="104" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="104" bodyend="196"/>
+        <references refid="d7/d0d/group__ExecutionPlanQuery_1ga5e3dd6d441474ac5ab94aaaf9c45bc5b" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="203">cudnn_frontend::ExecutionPlan_v8::engine_config</references>
+        <references refid="d7/d0d/group__ExecutionPlanQuery_1ga2c011aa14563ef96417ce599f0c83d89">cudnn_frontend::ExecutionPlan_v8::ExecutionPlan_v8</references>
+        <references refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" compoundref="dc/d11/cudnn__backend__base_8h" startline="86" endline="88">cudnn_frontend::make_shared_backend_pointer</references>
+        <references refid="d7/d0d/group__ExecutionPlanQuery_1ga0705e60cee62d3d196751517d545a7b0">cudnn_frontend::ExecutionPlan_v8::operator=</references>
+        <references refid="d7/d0d/group__ExecutionPlanQuery_1gaf732b37c9c05a2a8bd1a76289c740c4a" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="205">cudnn_frontend::ExecutionPlan_v8::planTag</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="158">cudnn_frontend::BackendDescriptor::status</references>
+      </memberdef>
+      <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga2c011aa14563ef96417ce599f0c83d89" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::ExecutionPlan_v8::ExecutionPlan_v8</definition>
+        <argsstring>()=default</argsstring>
+        <name>ExecutionPlan_v8</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="198" column="1"/>
+        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga8a6517102f5c12e63e4417324a03180b" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="104" endline="196">cudnn_frontend::ExecutionPlan_v8::computeTag</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga51c4b75729ab066f0686729896741c5d" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::ExecutionPlan_v8::ExecutionPlan_v8</definition>
+        <argsstring>(ExecutionPlan_v8 const &amp;)=delete</argsstring>
+        <name>ExecutionPlan_v8</name>
+        <param>
+          <type>ExecutionPlan_v8 const &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="199" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga0705e60cee62d3d196751517d545a7b0" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type>ExecutionPlan_v8 &amp;</type>
+        <definition>ExecutionPlan_v8&amp; cudnn_frontend::ExecutionPlan_v8::operator=</definition>
+        <argsstring>(ExecutionPlan_v8 const &amp;)=delete</argsstring>
+        <name>operator=</name>
+        <param>
+          <type>ExecutionPlan_v8 const &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="201" column="1"/>
+        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="243" endline="302">cudnn_frontend::ExecutionPlanBuilder_v8::build</referencedby>
+        <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga8a6517102f5c12e63e4417324a03180b" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="104" endline="196">cudnn_frontend::ExecutionPlan_v8::computeTag</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>ExecutionPlan_v8 &amp;&amp;</type>
+        <definition>ExecutionPlan_v8&amp;&amp; cudnn_frontend::ExecutionPlanBuilder_v8::build</definition>
+        <argsstring>()</argsstring>
+        <name>build</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para>constructs the Engine Config by calling the cudnn API Throws the appropriate error message </para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="243" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="243" bodyend="302"/>
+        <references refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8_1a00c29ad02430927df9260c7e57ae7c7a" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="53">cudnn_frontend::ExecutionPlan_v8::ExecutionPlanBuilder_v8</references>
+        <references refid="d7/d0d/group__ExecutionPlanQuery_1ga0705e60cee62d3d196751517d545a7b0">cudnn_frontend::ExecutionPlan_v8::operator=</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="158">cudnn_frontend::BackendDescriptor::status</references>
+      </memberdef>
+      <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga8e48fb375271599c83f57922d9f8c89e" prot="public" static="no" const="no" explicit="yes" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::ExecutionPlanBuilder_v8::ExecutionPlanBuilder_v8</definition>
+        <argsstring>()=default</argsstring>
+        <name>ExecutionPlanBuilder_v8</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="304" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1gae3f841de1b6461b31bf7967734a70a8a" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::ExecutionPlanBuilder_v8::~ExecutionPlanBuilder_v8</definition>
+        <argsstring>()=default</argsstring>
+        <name>~ExecutionPlanBuilder_v8</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="305" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga60147aa715352906e32cbb87558cb0ae" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::ExecutionPlanBuilder_v8::ExecutionPlanBuilder_v8</definition>
+        <argsstring>(ExecutionPlanBuilder_v8 &amp;&amp;)=delete</argsstring>
+        <name>ExecutionPlanBuilder_v8</name>
+        <param>
+          <type>ExecutionPlanBuilder_v8 &amp;&amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="306" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga2b84d3619b5bd9ca0faa30c126deb43c" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::ExecutionPlanBuilder_v8::ExecutionPlanBuilder_v8</definition>
+        <argsstring>(ExecutionPlanBuilder_v8 const &amp;)=delete</argsstring>
+        <name>ExecutionPlanBuilder_v8</name>
+        <param>
+          <type>ExecutionPlanBuilder_v8 const &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="307" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga5f757c2da8c90645c34637dde4aed8f8" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type>ExecutionPlanBuilder_v8 &amp;</type>
+        <definition>ExecutionPlanBuilder_v8&amp; cudnn_frontend::ExecutionPlanBuilder_v8::operator=</definition>
+        <argsstring>(ExecutionPlanBuilder_v8 const &amp;)=delete</argsstring>
+        <name>operator=</name>
+        <param>
+          <type>ExecutionPlanBuilder_v8 const &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="309" column="1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Query individual property of <ref refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" kindref="compound">ExecutionPlan_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>

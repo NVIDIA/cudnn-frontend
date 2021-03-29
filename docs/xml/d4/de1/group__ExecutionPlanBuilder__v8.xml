@@ -1,0 +1,69 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d4/de1/group__ExecutionPlanBuilder__v8" kind="group">
+    <compoundname>ExecutionPlanBuilder_v8</compoundname>
+    <title>ExecutionPlanBuilder_v8</title>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d4/de1/group__ExecutionPlanBuilder__v8_1ga4166679391fc2df54e25964c03ae6e8e" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::ExecutionPlanBuilder_v8::setHandle</definition>
+        <argsstring>(cudnnHandle_t handle_) -&gt; ExecutionPlanBuilder_v8 &amp;</argsstring>
+        <name>setHandle</name>
+        <param>
+          <type>cudnnHandle_t</type>
+          <declname>handle_</declname>
+        </param>
+        <briefdescription>
+<para>Set engine for the <ref refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" kindref="compound">ExecutionPlan_v8</ref>. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="219" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="219" bodyend="222"/>
+      </memberdef>
+      <memberdef kind="function" id="d4/de1/group__ExecutionPlanBuilder__v8_1gac5c23cff8c1424f71ef2cee2dc66cd3c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::ExecutionPlanBuilder_v8::setEngineConfig</definition>
+        <argsstring>(EngineConfig_v8 const &amp;engine_config_) -&gt; ExecutionPlanBuilder_v8 &amp;</argsstring>
+        <name>setEngineConfig</name>
+        <param>
+          <type>EngineConfig_v8 const &amp;</type>
+          <declname>engine_config_</declname>
+        </param>
+        <briefdescription>
+<para>Set engine Config for the Plan. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="225" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="225" bodyend="229"/>
+      </memberdef>
+      <memberdef kind="function" id="d4/de1/group__ExecutionPlanBuilder__v8_1gae0f92d5445da53253ff3460ac6aefffa" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::ExecutionPlanBuilder_v8::setEngineConfig</definition>
+        <argsstring>(ManagedOpaqueDescriptor &amp;desc, std::string const &amp;opGraphTag_=&quot;&quot;) -&gt; ExecutionPlanBuilder_v8 &amp;</argsstring>
+        <name>setEngineConfig</name>
+        <param>
+          <type>ManagedOpaqueDescriptor &amp;</type>
+          <declname>desc</declname>
+        </param>
+        <param>
+          <type>std::string const &amp;</type>
+          <declname>opGraphTag_</declname>
+          <defval>&quot;&quot;</defval>
+        </param>
+        <briefdescription>
+<para>Set engine Config for the Plan. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="233" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="233" bodyend="237"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Set individual property of <ref refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" kindref="compound">ExecutionPlan_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>

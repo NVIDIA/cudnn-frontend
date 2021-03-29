@@ -29,7 +29,9 @@
 #include <cuda_runtime.h>
 #include <assert.h>
 
-#include "cudnn_frontend.h"
+#include "catch.hpp"
+
+#include <cudnn.h>
 
 #include "fp16_dev.h"
 #include "fp16_emu.h"
@@ -77,19 +79,27 @@ static int32_t doFma(int8_t fval, int8_t ival, int32_t tmp) {
 
 // Garbage function, resolves overloaded function ambiguity for an invalid type combination
 static int32_t doFma(float fval, float ival, int32_t tmp) {
+    (void)fval;
+    (void)ival;
+    (void)tmp;
     return 0;
 }
 
 // Garbage function, resolves overloaded function ambiguity for an invalid type combination
 static int32_t doFma(half1 fval, half1 ival, int32_t tmp) {
+    (void)fval;
+    (void)ival;
+    (void)tmp;
     return 0;
 }
 
 // Garbage function, resolves overloaded function ambiguity for an invalid type combination
 static float doFma(int8_t fval, int8_t ival, float tmp) {
+    (void)fval;
+    (void)ival;
+    (void)tmp;
     return 0;
 }
-
 
 #define checkCudaErr(...)                                                        \
     do {                                                                         \
@@ -154,6 +164,8 @@ explicit SurfaceManager(int64_t Xsize, int64_t Wsize, int64_t Ysize, int ref_siz
 }
 
 explicit SurfaceManager(int64_t Xsize, int64_t Wsize, int64_t Ysize, int64_t Bsize, bool isConvBiasAdd) {
+    (void)isConvBiasAdd;
+
     checkCudaErr(cudaMalloc((void**)&(devPtrX), (Xsize) * sizeof(devPtrX[0])));
     checkCudaErr(cudaMalloc((void**)&(devPtrW), (Wsize) * sizeof(devPtrW[0])));
     checkCudaErr(cudaMalloc((void**)&(devPtrY), (Ysize) * sizeof(devPtrY[0])));
@@ -214,5 +226,32 @@ explicit SurfaceManager(int64_t Xsize, int64_t Wsize, int64_t Ysize, int64_t Bsi
     if (hostAfterConv) free(hostAfterConv);
     if (host_ref) free(host_ref);
 }
+
+};
+
+
+
+template <typename T_ELEM>
+struct Surface {
+    T_ELEM* devPtr = NULL;
+    T_ELEM* hostPtr = NULL;
+    T_ELEM* hostRefPtr = NULL;
+
+    explicit Surface(int64_t size, bool hasRef) {
+        checkCudaErr(cudaMalloc((void**)&(devPtr), (size) * sizeof(devPtr[0])));
+        hostPtr = (T_ELEM*) calloc(size, sizeof(hostPtr[0]));
+        if(hasRef) {
+            hostRefPtr = (T_ELEM*) calloc(size, sizeof(hostRefPtr[0]));
+        }
+        initImage(hostPtr, size);
+        checkCudaErr(cudaMemcpy(devPtr, hostPtr, sizeof(hostPtr[0]) * size, cudaMemcpyHostToDevice));
+        checkCudaErr(cudaDeviceSynchronize());
+    }
+
+    ~Surface() {
+        if (devPtr) cudaFree(devPtr);
+        if (hostPtr) free(hostPtr);
+        if (hostRefPtr) free(hostRefPtr);
+    }
 
 };

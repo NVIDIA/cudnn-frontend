@@ -25,6 +25,7 @@
 #include <cudnn_frontend_get_plan.h>
 
 namespace {
+
 bool
 isNonDeterministic(cudnnBackendDescriptor_t engine_config) {
     return cudnn_frontend::hasNumericalNote<CUDNN_NUMERICAL_NOTE_NONDETERMINISTIC>(engine_config);
@@ -47,8 +48,10 @@ isNonDeterministicOrisDownConverting(cudnnBackendDescriptor_t engine_config) {
 
 bool
 allowAll(cudnnBackendDescriptor_t engine_config) {
+    (void)engine_config;
     return false;
 }
+
 }
 enum {
     X_TENSOR,
@@ -74,15 +77,16 @@ using common_convbias_descriptors = std::tuple<cudnn_frontend::Tensor,
                                                cudnn_frontend::Tensor>;
 
 common_convbias_descriptors
-create_conv_bias_add_act_descriptors(int64_t* x_dim_padded,
+create_conv_add_bias_act_descriptors(int64_t* x_dim_padded,
                                      int64_t* padA,
                                      int64_t* convstrideA,
                                      int64_t* dilationA,
                                      int64_t* w_dim_padded,
                                      int64_t* y_dim_padded,
                                      cudnnDataType_t dataType) {
-    const int convDim = 2;
-
+    (void)padA;
+    (void)convstrideA;
+    (void)dilationA;
     int64_t b_dim_padded[4];
     b_dim_padded[0] = y_dim_padded[0];
     b_dim_padded[1] = y_dim_padded[1];
@@ -273,7 +277,8 @@ run_from_heuristics(int64_t* x_dim_padded,
                     cudnnConvolutionMode_t mode,
                     float* devPtrX,
                     float* devPtrW,
-                    float* devPtrY) {
+                    float* devPtrY,
+                    cudnnBackendHeurMode_t heur_mode) {
     cudnnHandle_t handle_;
 
     try {
@@ -292,7 +297,7 @@ run_from_heuristics(int64_t* x_dim_padded,
 
         auto heuristics = cudnn_frontend::EngineHeuristicsBuilder()
                               .setOperationGraph(opGraph)
-                              .setHeurMode(CUDNN_HEUR_MODE_INSTANT)
+                              .setHeurMode(heur_mode)
                               .build();
 
         std::cout << "Heuristic has " << heuristics.getEngineConfigCount() << " configurations " << std::endl;
@@ -324,6 +329,7 @@ run_from_heuristics(int64_t* x_dim_padded,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 
     if (handle_) cudnnDestroy(handle_);
@@ -358,7 +364,6 @@ run_from_global_index(int64_t* x_dim_padded,
             descriptors, CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR, handle_);
         std::cout << opGraph.describe() << std::endl;
 
-        auto total_engines = opGraph.getEngineCount();
         // We have to randomly pick one engine from [0, total_engines)
         // Selecting "0" by default
         auto engine = cudnn_frontend::EngineBuilder().setGlobalEngineIdx(0).setOperationGraph(opGraph).build();
@@ -395,6 +400,7 @@ run_from_global_index(int64_t* x_dim_padded,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 
     if (handle_) cudnnDestroy(handle_);
@@ -457,7 +463,6 @@ run_with_external_config(int64_t* x_dim_padded,
         std::cout << "Plan tag: " << plan.getTag() << std::endl;
 
         std::cout << plan.describe() << std::endl;
-        auto workspace_size = plan.getWorkspaceSize();
         void* data_ptrs[]   = {devPtrX, devPtrY, devPtrW};
         int64_t uids[]      = {'x', 'y', 'w'};
         auto variantPack    = cudnn_frontend::VariantPackBuilder()
@@ -471,6 +476,7 @@ run_with_external_config(int64_t* x_dim_padded,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 
     if (handle_) cudnnDestroy(handle_);
@@ -480,7 +486,7 @@ run_with_external_config(int64_t* x_dim_padded,
 
 // create_plan(std::vector<cudnnBackendDescriptor_t> &)
 void
-run_conv_bias_add_activation(int64_t* x_dim_padded,
+run_conv_add_bias_activation(int64_t* x_dim_padded,
                              int64_t* pad,
                              int64_t* convstride,
                              int64_t* dilation,
@@ -499,7 +505,7 @@ run_conv_bias_add_activation(int64_t* x_dim_padded,
         checkCudnnErr(cudnnCreate(&handle_));
 
         // Creates the necessary tensor descriptors
-        common_convbias_descriptors tensors = create_conv_bias_add_act_descriptors(
+        common_convbias_descriptors tensors = create_conv_add_bias_act_descriptors(
             x_dim_padded, pad, convstride, dilation, w_dim_padded, y_dim_padded, dataType);
         std::cout << std::get<X_TENSOR>(tensors).describe() << std::endl;
         std::cout << std::get<Y_TENSOR>(tensors).describe() << std::endl;
@@ -642,6 +648,7 @@ run_conv_bias_add_activation(int64_t* x_dim_padded,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 }
 
@@ -699,6 +706,7 @@ run_from_cudnn_find(int64_t* x_dim_padded,
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error");
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 
     if (handle_) cudnnDestroy(handle_);
@@ -706,7 +714,7 @@ run_from_cudnn_find(int64_t* x_dim_padded,
 }
 
 void
-run_conv_bias_add_activation_with_cudnn_find(int64_t* x_dim_padded,
+run_conv_add_bias_activation_with_cudnn_find(int64_t* x_dim_padded,
                                              int64_t* pad,
                                              int64_t* convstride,
                                              int64_t* dilation,
@@ -725,7 +733,7 @@ run_conv_bias_add_activation_with_cudnn_find(int64_t* x_dim_padded,
         checkCudnnErr(cudnnCreate(&handle_));
 
         // Creates the necessary tensor descriptors
-        common_convbias_descriptors tensors = create_conv_bias_add_act_descriptors(
+        common_convbias_descriptors tensors = create_conv_add_bias_act_descriptors(
             x_dim_padded, pad, convstride, dilation, w_dim_padded, y_dim_padded, dataType);
         std::cout << std::get<X_TENSOR>(tensors).describe() << std::endl;
         std::cout << std::get<Y_TENSOR>(tensors).describe() << std::endl;
@@ -856,6 +864,7 @@ run_conv_bias_add_activation_with_cudnn_find(int64_t* x_dim_padded,
 
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 }
 
@@ -911,6 +920,7 @@ run_from_cudnn_get(int64_t* x_dim_padded,
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error");
     } catch (cudnn_frontend::cudnnException e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
     }
 
     if (handle_) cudnnDestroy(handle_);

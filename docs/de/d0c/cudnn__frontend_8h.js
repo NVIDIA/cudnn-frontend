@@ -12,6 +12,8 @@ var cudnn__frontend_8h =
     [ "EngineHeuristicsBuilder", "de/d0c/cudnn__frontend_8h.html#aae6a627b67858b15afbc5656afa88123", null ],
     [ "ExecutionPlan", "de/d0c/cudnn__frontend_8h.html#a984c10aa29daac796444bda66bdef26e", null ],
     [ "ExecutionPlanBuilder", "de/d0c/cudnn__frontend_8h.html#aa508b66c4de02f4aacae8029dbe422eb", null ],
+    [ "MatMulDesc", "de/d0c/cudnn__frontend_8h.html#ad809552e9ec400bcbfcfc0ea5acd4e56", null ],
+    [ "MatMulDescBuilder", "de/d0c/cudnn__frontend_8h.html#a0c344e3bc1f332aa9f5b213eb1ae9ee6", null ],
     [ "Operation", "de/d0c/cudnn__frontend_8h.html#a2f1497702504947953a0f5a69b6eeb2a", null ],
     [ "OperationBuilder", "de/d0c/cudnn__frontend_8h.html#ae6d02ff4c7922673ed3862145a4019d4", null ],
     [ "OperationGraph", "de/d0c/cudnn__frontend_8h.html#ac86ce924df5209c4ce1bc25856eea6e6", null ],

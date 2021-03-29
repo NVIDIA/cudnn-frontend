@@ -1,0 +1,85 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d2/db5/group__PointWiseDescBuilder__v8" kind="group">
+    <compoundname>PointWiseDescBuilder_v8</compoundname>
+    <title>PointWiseDescBuilder_v8</title>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d2/db5/group__PointWiseDescBuilder__v8_1ga3efa065fc125c5af06bd0a9c543bdb9f" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::PointWiseDescBuilder_v8::setMathPrecision</definition>
+        <argsstring>(cudnnDataType_t data_type_) -&gt; PointWiseDescBuilder_v8 &amp;</argsstring>
+        <name>setMathPrecision</name>
+        <param>
+          <type>cudnnDataType_t</type>
+          <declname>data_type_</declname>
+        </param>
+        <briefdescription>
+<para>Set Math Precision Data Type for the Convolution Operation. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="142" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="142" bodyend="145"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/db5/group__PointWiseDescBuilder__v8_1ga124ebb4a416c645cd0b68f59545c62a8" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::PointWiseDescBuilder_v8::setClipping</definition>
+        <argsstring>(double l, double u) -&gt; PointWiseDescBuilder_v8 &amp;</argsstring>
+        <name>setClipping</name>
+        <param>
+          <type>double</type>
+          <declname>l</declname>
+        </param>
+        <param>
+          <type>double</type>
+          <declname>u</declname>
+        </param>
+        <briefdescription>
+<para>Set upper and lower limits for the RELU activation. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="148" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="148" bodyend="152"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/db5/group__PointWiseDescBuilder__v8_1ga48264536e68f952e92a0bdbaa84d9363" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::PointWiseDescBuilder_v8::setMode</definition>
+        <argsstring>(cudnnPointwiseMode_t mode_) -&gt; PointWiseDescBuilder_v8 &amp;</argsstring>
+        <name>setMode</name>
+        <param>
+          <type>cudnnPointwiseMode_t</type>
+          <declname>mode_</declname>
+        </param>
+        <briefdescription>
+<para>Set upper and lower limits for the RELU activation. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="155" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="155" bodyend="158"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/db5/group__PointWiseDescBuilder__v8_1gae5240136e19e0a4094036d48c6b1a3b7" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::PointWiseDescBuilder_v8::setMode</definition>
+        <argsstring>(cudnnNanPropagation_t nan_mode_) -&gt; PointWiseDescBuilder_v8 &amp;</argsstring>
+        <name>setMode</name>
+        <param>
+          <type>cudnnNanPropagation_t</type>
+          <declname>nan_mode_</declname>
+        </param>
+        <briefdescription>
+<para>Set NaN propagation mode. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="161" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="161" bodyend="164"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Set individual property of <ref refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8" kindref="compound">PointWiseDesc_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>

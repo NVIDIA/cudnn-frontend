@@ -25,6 +25,10 @@ var files =
       [ "EngineHeuristics_v8", "db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8.html", "db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" ],
       [ "EngineHeuristicsBuilder_v8", "d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8.html", "d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" ]
     ] ],
+    [ "cudnn_frontend_MatMulDesc.h", "d6/d32/cudnn__frontend__MatMulDesc_8h.html", [
+      [ "MatMulDesc_v8", "d6/db7/classcudnn__frontend_1_1MatMulDesc__v8.html", "d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" ],
+      [ "MatMulDescBuilder_v8", "de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8.html", "de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" ]
+    ] ],
     [ "cudnn_frontend_Operation.h", "da/d5a/cudnn__frontend__Operation_8h.html", [
       [ "Operation_v8", "d4/d30/classcudnn__frontend_1_1Operation__v8.html", "d4/d30/classcudnn__frontend_1_1Operation__v8" ],
       [ "OperationBuilder_v8", "d1/d29/classcudnn__frontend_1_1OperationBuilder__v8.html", "d1/d29/classcudnn__frontend_1_1OperationBuilder__v8" ]

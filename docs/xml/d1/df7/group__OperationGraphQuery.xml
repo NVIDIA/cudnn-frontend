@@ -1,0 +1,32 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d1/df7/group__OperationGraphQuery" kind="group">
+    <compoundname>OperationGraphQuery</compoundname>
+    <title>OperationGraphQuery</title>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d1/df7/group__OperationGraphQuery_1ga7a7a8d03f5a3aa54f14b83be4abe2a26" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::OperationGraph_v8::getEngineCount</definition>
+        <argsstring>(void) const -&gt; int64_t</argsstring>
+        <name>getEngineCount</name>
+        <param>
+          <type>void</type>
+        </param>
+        <briefdescription>
+<para>Query the total count of the engines for the Operation Set. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" line="76" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" bodystart="76" bodyend="91"/>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a62312f29dbbc7c11c1da54a2ad41c52f" compoundref="dc/d11/cudnn__backend__base_8h" startline="156">cudnn_frontend::BackendDescriptor::pointer</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="158">cudnn_frontend::BackendDescriptor::status</references>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Query individual property of <ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>

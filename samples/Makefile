@@ -82,7 +82,7 @@ NVCC          ?= $(CUDA_PATH)/bin/nvcc -ccbin $(HOST_COMPILER)
 
 # internal flags
 NVCCFLAGS   := -m${TARGET_SIZE}
-CCFLAGS     := -g -O0 -std=c++11 -D__CORRECT_ISO_CPP11_MATH_H_PROTO
+CCFLAGS     := -g -O0 -std=c++11 -Wall -Wextra -Werror -Wno-unused-function
 LDFLAGS     :=
 
 # build flags
@@ -184,7 +184,7 @@ endif
 # Target rules
 all: build
 
-build: conv_sample
+build: samples
 
 check.deps:
 ifeq ($(SAMPLE_ENABLED),0)
@@ -193,10 +193,10 @@ else
 	@echo "Sample is ready - all dependencies have been met"
 endif
 
-OBJ = fp16_dev.o fp16_emu.o conv_sample.o test_list.o catch.o helpers.o
+OBJ = fp16_dev.o fp16_emu.o conv_sample.o fusion_sample.o test_list.o catch.o helpers.o
 INC = $(wildcard *.h)
 
-conv_sample: $(OBJ)
+samples: $(OBJ)
 	$(EXEC) $(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(INCLUDES) $(LIBRARIES)
 
 %.o: %.cpp $(INC)
@@ -207,10 +207,10 @@ conv_sample: $(OBJ)
 	$(EXEC) $(NVCC) $(CXX_STD) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
 run: build
-	$(EXEC) ./conv_sample
+	$(EXEC) ./samples
 
 clean:
 	rm -rf *.o
-	rm -rf conv_sample
+	rm -rf samples
 
 clobber: clean

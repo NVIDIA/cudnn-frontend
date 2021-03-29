@@ -1,0 +1,57 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d6/d46/group__EngineHeuristicsQuery" kind="group">
+    <compoundname>EngineHeuristicsQuery</compoundname>
+    <title>EngineHeuristicsQuery</title>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d6/d46/group__EngineHeuristicsQuery_1ga1171cb5ce50baf0fab19fc458d4565b5" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::EngineHeuristics_v8::getEngineConfig</definition>
+        <argsstring>(int64_t count=1) -&gt; std::vector&lt; ManagedOpaqueDescriptor &gt; &amp;</argsstring>
+        <name>getEngineConfig</name>
+        <param>
+          <type>int64_t</type>
+          <declname>count</declname>
+          <defval>1</defval>
+        </param>
+        <briefdescription>
+<para>Query the total count of the engines for the Operation Set. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="69" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" bodystart="69" bodyend="99"/>
+        <references refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a7a1e931b0f7910db6e6f5d5bfbfe3511" compoundref="db/d66/cudnn__frontend__Heuristics_8h" startline="130">cudnn_frontend::EngineHeuristics_v8::m_heuristic_results</references>
+        <references refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" compoundref="dc/d11/cudnn__backend__base_8h" startline="86" endline="88">cudnn_frontend::make_shared_backend_pointer</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a62312f29dbbc7c11c1da54a2ad41c52f" compoundref="dc/d11/cudnn__backend__base_8h" startline="156">cudnn_frontend::BackendDescriptor::pointer</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="158">cudnn_frontend::BackendDescriptor::status</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d46/group__EngineHeuristicsQuery_1ga10121605fc82ed225537210825fa3836" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::EngineHeuristics_v8::getEngineConfigCount</definition>
+        <argsstring>(void) const -&gt; int64_t</argsstring>
+        <name>getEngineConfigCount</name>
+        <param>
+          <type>void</type>
+        </param>
+        <briefdescription>
+<para>Query the total count of the engine config for the Operation Set. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="103" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" bodystart="103" bodyend="119"/>
+        <references refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1aaa983e31e1a22bfebb639865e4514d82">cudnn_frontend::EngineHeuristics_v8::EngineHeuristics_v8</references>
+        <references refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a2301c5b006fa6e341bc88ece066f8ea2">cudnn_frontend::EngineHeuristics_v8::operator=</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a62312f29dbbc7c11c1da54a2ad41c52f" compoundref="dc/d11/cudnn__backend__base_8h" startline="156">cudnn_frontend::BackendDescriptor::pointer</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="158">cudnn_frontend::BackendDescriptor::status</references>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Query individual property of <ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>
