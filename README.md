@@ -68,7 +68,7 @@ Errata filter gives the cuDNN team an opportunity to block certain faulty kernel
     rule_id             : ""   - Optional.  Used to uniquely identify a rule. Has no purpose other than being easy to debug.
     operation           : ""   - Mandatory. Stringified version of the operation graph.
     engine              : ""   - Mandatory. Stringified version of the engine ID.
-    knob                : ""   - Optional.  Stringified version of the knob. If specified only the engineConfig for the engine matching the knobs will be blocked. Else, all possible combination of knobs for the engine will be blocked.
+    knob                : [""] - Optional.  Stringified version of the knob. If specified only the engineConfig for the engine matching the knobs will be blocked. Else, all possible combination of knobs for the engine will be blocked.
     cudnn_version_start : 0    - Optional. Denotes the cudnn version after which the engine started having issues.
     cudnn_version_end   : -1   - Optional. Denotes the cudnn_version when the issue was fixed. "-1" denotes its an ongoing issue.
     arch                : ""   - Optional. Architectures where this kernel might be faulty.
