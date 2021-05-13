@@ -150,7 +150,7 @@ class PointWiseDescBuilder_v8 {
         m_pointWiseDesc.lower_clip = l;
         return *this;
     }
-    //! Set upper and lower limits for the RELU activation
+    //! Set pointwise mode for the activation
     auto
     setMode(cudnnPointwiseMode_t mode_) -> PointWiseDescBuilder_v8 & {
         m_pointWiseDesc.mode = mode_;

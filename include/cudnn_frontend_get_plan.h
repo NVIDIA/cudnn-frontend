@@ -35,9 +35,9 @@ EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph&& opGra
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         try {
 #endif
-            plans.push_back(ExecutionPlanBuilder().setHandle(handle).setEngineConfig(engine_config).build());
+            plans.push_back(ExecutionPlanBuilder().setHandle(handle).setEngineConfig(engine_config, opGraph.getTag()).build());
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
-        } catch (cudnnException e) {
+        } catch (cudnnException &e) {
             continue;
         }
 #endif

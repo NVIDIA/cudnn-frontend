@@ -31,6 +31,7 @@
 TEST_CASE("Tensor creation comparison", "[frontend][comparison][backend]") {
     // Consider creation of a 2d Tensor
     // n,c,h,w as 4,32,32,32
+    std::cout << "Tensor creation comparison" << std::endl;
     std::array<int64_t,4> tensor_dim = {4, 32, 32, 32};
     std::array<int64_t,4> tensor_str = {32768, 1024, 32, 1}; // NCHW format
     cudnnDataType_t data_type        = CUDNN_DATA_FLOAT;
@@ -49,7 +50,7 @@ TEST_CASE("Tensor creation comparison", "[frontend][comparison][backend]") {
                                     .build();
     
         std::cout << "Created Tensor" << tensor.describe() << std::endl;
-    } catch (cudnn_frontend::cudnnException e) {
+    } catch (cudnn_frontend::cudnnException &e) {
         std::cout << "Exception in tensor creation " << e.what() << std::endl;
     }
 
@@ -105,6 +106,7 @@ TEST_CASE("Tensor creation comparison", "[frontend][comparison][backend]") {
 }
 
 TEST_CASE("Use global(index) for execution", "[frontend][global_index][wgrad]" ) {
+    std::cout << "TEST_CASE :: Use  global index for engine generation" << std::endl;
     INFO("TEST_CASE :: Use  global index for engine generation");
     int64_t dimA[]        = {1, 32, 4, 4};
     int64_t filterdimA[]  = {32, 32, 1, 1};
@@ -154,6 +156,7 @@ TEST_CASE("Use global(index) for execution", "[frontend][global_index][wgrad]" )
 }
 
 TEST_CASE("Use heuristics for execution", "[frontend][heuristics][conv]" ) {
+    std::cout << "TEST_CASE :: Use heuristics for engine generation" << std::endl;
     INFO("TEST_CASE :: Use heuristics for engine generation");
     int64_t dimA[]        = {8, 32, 4, 4};
     int64_t filterdimA[]  = {32, 32, 1, 1};
@@ -202,6 +205,7 @@ TEST_CASE("Use heuristics for execution", "[frontend][heuristics][conv]" ) {
 }
 
 TEST_CASE("Use DNN based heuristics for execution", "[frontend][dnn_heuristics][conv]" ) {
+    std::cout << "Use DNN based heuristics for execution" << std::endl;
     INFO("TEST_CASE :: Use DNN based heuristics for engine generation");
     int64_t dimA[]        = {8, 32, 4, 4};
     int64_t filterdimA[]  = {32, 32, 1, 1};
@@ -250,7 +254,8 @@ TEST_CASE("Use DNN based heuristics for execution", "[frontend][dnn_heuristics][
 }
 
 TEST_CASE("Use fallback for execution", "[frontend][global_index][dgrad]" ) {
-        INFO("TEST_CASE :: Use  fallback index for engine generation");
+    std::cout << "TEST_CASE :: Use  fallback index for engine generation" << std::endl;
+    INFO("TEST_CASE :: Use  fallback index for engine generation");
     int64_t dimA[]        = {1, 32, 4, 4};
     int64_t filterdimA[]  = {32, 32, 1, 1};
     int64_t outdimA[]     = {0, 0, 0, 0}; // Computed Below
@@ -298,6 +303,7 @@ TEST_CASE("Use fallback for execution", "[frontend][global_index][dgrad]" ) {
 }
 
 TEST_CASE("ConvBiasAct sample", "[frontend][convAddBiasAct]") {
+    std::cout << "TEST_CASE :: Sample multi Operation code with backend API" << std::endl;
     INFO("TEST_CASE :: Sample multi Operation code with backend API");
     int64_t xTensorDim[]      = {1, 32, 4, 4};
     int64_t wTensorDim[]      = {32, 32, 1, 1};
@@ -334,6 +340,7 @@ TEST_CASE("ConvBiasAct sample", "[frontend][convAddBiasAct]") {
 }
 
 TEST_CASE("Use cudnnFindPlan for execution", "[frontend][cudnnFindPlan][conv]" ) {
+    std::cout << "TEST_CASE :: Use cudnnFindPlan for plan generation" << std::endl;
     INFO("TEST_CASE :: Use cudnnFindPlan for plan generation");
     int64_t dimA[]        = {8, 32, 4, 4};
     int64_t filterdimA[]  = {32, 32, 1, 1};
@@ -382,6 +389,7 @@ TEST_CASE("Use cudnnFindPlan for execution", "[frontend][cudnnFindPlan][conv]" )
 }
 
 TEST_CASE("ConvBiasAct sample with cudnnFindPlan", "[frontend][cudnnFindPlan][convAddBiasAct]") {
+    std::cout << "TEST_CASE :: Sample multi Operation code with backend API" << std::endl;
     INFO("TEST_CASE :: Sample multi Operation code with backend API");
     int64_t xTensorDim[]      = {1, 32, 4, 4};
     int64_t wTensorDim[]      = {32, 32, 1, 1};
@@ -418,6 +426,7 @@ TEST_CASE("ConvBiasAct sample with cudnnFindPlan", "[frontend][cudnnFindPlan][co
 }
 
 TEST_CASE("Use cudnnGetPlan for execution", "[frontend][cudnnGetPlan][conv]" ) {
+    std::cout << "TEST_CASE :: Use cudnnGetPlan for plan generation" << std::endl;
     INFO("TEST_CASE :: Use cudnnGetPlan for plan generation");
     int64_t dimA[]        = {8, 32, 4, 4};
     int64_t filterdimA[]  = {32, 32, 1, 1};
@@ -468,6 +477,7 @@ TEST_CASE("Use cudnnGetPlan for execution", "[frontend][cudnnGetPlan][conv]" ) {
 
 
 TEST_CASE("ConvScaleBiasAddAct sample", "[frontend][fusion][ConvScaleBiasAddAct]") {
+    std::cout << "TEST_CASE :: Sample runtime fusion code with backend API" << std::endl;
     INFO("TEST_CASE :: Sample runtime fusion code with backend API");
     int64_t xTensorDim[]      = { 4, 24, 31, 31};
     int64_t wTensorDim[]      = {32, 24,  9,  9};
@@ -509,6 +519,7 @@ TEST_CASE("ConvScaleBiasAddAct sample", "[frontend][fusion][ConvScaleBiasAddAct]
 
 
 TEST_CASE("MatmulBiasAct sample", "[frontend][fusion][MatmulBiasAct]") {
+    std::cout << "TEST_CASE :: Sample matmul runtime fusion code with backend API" << std::endl;
     INFO("TEST_CASE :: Sample matmul runtime fusion code with backend API");
     int64_t aTensorDim[]      = {1, 64, 32}; //batch M K
     int64_t bTensorDim[]      = {1, 32, 64}; //batch K N
@@ -538,6 +549,7 @@ TEST_CASE("MatmulBiasAct sample", "[frontend][fusion][MatmulBiasAct]") {
 }
 
 TEST_CASE("ConvDrelu sample", "[frontend][convDrelu][drelu]") {
+    std::cout << "TEST_CASE :: Sample conv drelu" << std::endl;
     INFO("TEST_CASE :: Sample conv drelu");
     int64_t xTensorDim[] = {4, 24, 31, 31};
     int64_t wTensorDim[] = {32, 24, 9, 9};
@@ -607,6 +619,7 @@ TEST_CASE("ConvDrelu sample", "[frontend][convDrelu][drelu]") {
 }
 
 TEST_CASE("DgradDrelu sample", "[frontend][dgradDrelu][drelu]") {
+    std::cout << "TEST_CASE :: Sample dgrad drelu" << std::endl;
     INFO("TEST_CASE :: Sample dgrad drelu");
     int64_t xTensorDim[] = {4, 32, 32, 32};
     int64_t wTensorDim[] = {32, 32, 3, 3};
@@ -673,4 +686,80 @@ TEST_CASE("DgradDrelu sample", "[frontend][dgradDrelu][drelu]") {
     checkCudaErr(cudaDeviceSynchronize());
     checkCudaErr(cudaMemcpy(x_mem.hostPtr, x_mem.devPtr, sizeof(x_mem.hostPtr[0]) * Xsize, cudaMemcpyDeviceToHost));
     checkCudaErr(cudaDeviceSynchronize());
+}
+
+TEST_CASE("ConvColReduction sample", "[frontend][fusion][ConvColReduction]") {
+    std::cout << "TEST_CASE :: Sample conv column reductin add code with backend API" << std::endl;
+    INFO("TEST_CASE :: Sample conv column reductin add code with backend API");
+    int64_t xTensorDim[]      = { 32,  32, 7, 7};
+    int64_t wTensorDim[]      = {256,  32, 1, 1};
+    int64_t yTensorDim[]      = { 32, 256, 7, 7}; 
+    
+    int64_t conv_padA[]       = {0, 0};
+    int64_t conv_dilationA[]  = {1, 1};
+    int64_t conv_strideA[]    = {1, 1};
+
+    int64_t reducedTensorDim[] = {1, 256, 1, 1}; // output is NPQ * C reduced to C column
+
+    
+    printf("====DIMENSIONS====\n");
+    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", xTensorDim[0], xTensorDim[1], xTensorDim[2], xTensorDim[3]);
+    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", wTensorDim[0], wTensorDim[1], wTensorDim[2], wTensorDim[3]);
+    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", reducedTensorDim[0], reducedTensorDim[1], reducedTensorDim[2], reducedTensorDim[3]);
+
+    int outputSize = reducedTensorDim[0] * reducedTensorDim[1] * reducedTensorDim[2] * reducedTensorDim[3];
+
+    Surface<half> X(xTensorDim[0] * xTensorDim[1] * xTensorDim[2] * xTensorDim[3], false);
+    Surface<half> W(wTensorDim[0] * wTensorDim[1] * wTensorDim[2] * wTensorDim[3], false);
+    Surface<half> Y(yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3], false);
+
+
+    Surface<float> Reduced(outputSize, true);
+
+    run_conv_reduction(xTensorDim, wTensorDim, yTensorDim, reducedTensorDim, CUDNN_DATA_HALF, 
+                        2, conv_padA, conv_dilationA, conv_strideA, 
+                        X.devPtr, W.devPtr, Reduced.devPtr);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(Reduced.hostPtr, Reduced.devPtr, sizeof(Reduced.hostPtr[0]) * outputSize, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+}
+
+TEST_CASE("Use errata to block global(index) for execution", "[frontend][errata][wgrad]" ) {
+    std::cout << "TEST_CASE :: Use  errata to block a global index for engine generation" << std::endl;
+    INFO("TEST_CASE :: Use  errata to block global index for engine generation");
+    int64_t dimA[]        = {1, 32, 4, 4};
+    int64_t filterdimA[]  = {32, 32, 1, 1};
+    int64_t outdimA[]     = {0, 0, 0, 0}; // Computed Below
+    int64_t padA[]        = {0, 0};
+    int64_t dilationA[] = {1, 1};
+    int64_t convstrideA[] = {1, 1};
+
+
+    int numErrors = 0;
+
+    outdimA[0] = dimA[0];
+    outdimA[1] = filterdimA[0];
+    for (int dim = 0; dim < 2; dim++) {
+        outdimA[dim + 2] = getFwdConvOutputDim(dimA[dim + 2], padA[dim], filterdimA[dim + 2], convstrideA[dim], dilationA[dim]);
+    }
+
+
+    cudnnConvolutionMode_t mode      = CUDNN_CONVOLUTION;
+
+    printf("====DIMENSIONS====\n");
+    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dimA[0], dimA[1], dimA[2], dimA[3]);
+    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", filterdimA[0], filterdimA[1], filterdimA[2], filterdimA[3]);
+    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", outdimA[0], outdimA[1], outdimA[2], outdimA[3]);
+
+
+    int Xsize = dimA[0] * dimA[1] * dimA[2] * dimA[3];
+    int Wsize = filterdimA[0] * filterdimA[1] * filterdimA[2] * filterdimA[3];
+    int Ysize = outdimA[0] * outdimA[1] * outdimA[2] * outdimA[3];
+
+    SurfaceManager<float> sm(Xsize, Wsize, Ysize, Wsize);
+
+    block_using_errata(dimA, padA, convstrideA, dilationA, filterdimA, outdimA, CUDNN_DATA_FLOAT, mode, sm.devPtrX, sm.devPtrW, sm.devPtrY);
+
+    REQUIRE(numErrors == 0);
 }
