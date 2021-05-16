@@ -190,7 +190,7 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                               "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
                                               "CUDNN_ATTR_KNOB_CHOICE_KNOB_VALUE Failed");
             }
-            tag << "_k" << type << "(" << choice << ")";
+            tag << "_k" << type << "=" << choice;
         }
         planTag += tag.str();
     }

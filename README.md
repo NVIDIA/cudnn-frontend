@@ -12,6 +12,7 @@ Each `cudnnBackendDescriptorType_t` documented in the enum is organized into its
 - cudnn_frontend_ConvDesc.h       -> CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR
 - cudnn_frontend_PointWiseDesc.h  -> CUDNN_BACKEND_POINTWISE_DESCRIPTOR
 - cudnn_frontend_MatMulDesc.h     -> CUDNN_BACKEND_MATMUL_DESCRIPTOR
+- cudnn_frontend_ReductionDesc.h  -> CUDNN_BACKEND_REDUCTION_DESCRIPTOR
 - cudnn_frontend_Operation.h      -> CUDNN_BACKEND_OPERATION_*_DESCRIPTOR
 - cudnn_frontend_OperationGraph.h -> CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR
 - cudnn_frontend_Heuristics.h     -> CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR
@@ -57,6 +58,25 @@ The `cudnnFindPlan` in turn
 - Execute each filtered plan and ranks them in order of the execution plan runtime
 
 The most common `engineConfig` generation is the built-in heuristics of cuDNN V8. Generally, this is appended with the fallback list. An example of usage can be seen in `run_from_cudnn_find(...)` function in `conv_sample.cpp`.
+
+## Errata Filter:
+Errata filter gives the cuDNN team an opportunity to block certain faulty kernels from being executed. cuDNN team can eitherprovide a json file which blocks certain engine configs from being executed. The users can augment to this list if they find certain characteristics to be undesirable (Eg. Bad memory access, Execution plan failure). Users can either declare the json file statically or load from a file during runtime using the environment variable "CUDNN_ERRATA_JSON_FILE".
+
+#### Json format
+    version             : 1    - Mandatory. Tells the format version of the json.
+    rules               : []   - Mandatory. Array of rule object which identifies the engine config
+        rule_id             : ""   - Optional.  Used to uniquely identify a rule. Has no purpose other than being easy to debug.
+        operation           : ""   - Mandatory. Stringified version of the operation graph.
+        engine              : ""   - Mandatory. Stringified version of the engine ID.
+        knob                : [""] - Optional.  Stringified version of the knob. If specified only the engineConfig for the engine matching the knobs will be blocked. Else, all possible combination of knobs for the engine will be blocked.
+        cudnn_version_start : 0    - Optional. Denotes the cudnn version after which the engine started having issues.
+        cudnn_version_end   : -1   - Optional. Denotes the cudnn_version when the issue was fixed. "-1" denotes its an ongoing issue.
+        arch                : ""   - Optional. Architectures where this kernel might be faulty.
+
+PS: The errata filter note is still in beta version. We may add/modify certain features as necessary.
+
+## Documentation
+Documentation can be found at https://nvidia.github.io/cudnn-frontend/
 
 ## Feedback
 Support, resources, and information about cuDNN can be found online at https://developer.nvidia.com/cudnn. 

@@ -23,6 +23,13 @@
 #include "fusion_sample.h"
 #include <cudnn_frontend.h>
 
+#if (CUDNN_VERSION >= 8200)
+bool
+isRuntimeCompilation(cudnnBackendDescriptor_t engine_config) {
+    return cudnn_frontend::hasBehaviorNote<CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION>(engine_config);
+}
+#endif
+
 void
 run_conv_scale_bias_add_relu(int64_t* x_dim,
                              int64_t* w_dim,
@@ -252,6 +259,13 @@ run_conv_scale_bias_add_relu(int64_t* x_dim,
         // Create the requisite engine config
         auto engine_config = cudnn_frontend::EngineConfigBuilder().setEngine(engine).build();
         std::cout << engine_config.describe() << std::endl;
+#if (CUDNN_VERSION >= 8200)
+        if (isRuntimeCompilation(engine_config.get_raw_desc())) {
+            std::cout << "The engine is runtime compilation" << std::endl;
+        } else {
+            std::cout << "The engine is not runtime compilation" << std::endl;
+        }
+#endif
 
         auto plan = cudnn_frontend::ExecutionPlanBuilder().setHandle(handle_).setEngineConfig(engine_config).build();
 
@@ -278,7 +292,7 @@ run_conv_scale_bias_add_relu(int64_t* x_dim,
         }
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error");
 
-    } catch (cudnn_frontend::cudnnException e) {
+    } catch (cudnn_frontend::cudnnException &e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
         CHECK(false);
     }
@@ -452,7 +466,7 @@ run_matmul_bias_gelu(int64_t* a_dim,
         }
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error");
 
-    } catch (cudnn_frontend::cudnnException e) {
+    } catch (cudnn_frontend::cudnnException &e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
         CHECK(false);
     }
@@ -629,7 +643,7 @@ run_conv_drelu(int64_t* x_dim,
 
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error");
 
-    } catch (cudnn_frontend::cudnnException e) {
+    } catch (cudnn_frontend::cudnnException &e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
         CHECK(false);
     }
@@ -808,7 +822,163 @@ run_dgrad_drelu(int64_t* dx_dim,
 
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error");
 
-    } catch (cudnn_frontend::cudnnException e) {
+    } catch (cudnn_frontend::cudnnException &e) {
+        std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
+    }
+}
+
+void
+run_conv_reduction(int64_t* x_dim,
+                   int64_t* w_dim,
+                   int64_t* y_dim,
+                   int64_t* r_dim,
+                   cudnnDataType_t dataType,
+                   int convDim,
+                   int64_t* conv_padA,
+                   int64_t* conv_dilationA,
+                   int64_t* conv_strideA,
+                   void* devPtrX,
+                   void* devPtrW,
+                   void* devPtrR) {
+    cudnnHandle_t handle_;
+    try {
+        // Create cudnn handle
+        checkCudnnErr(cudnnCreate(&handle_));
+
+        // Creates the necessary tensor descriptors
+        int64_t stride[4];
+        generateStrides(x_dim, stride, 4, CUDNN_TENSOR_NHWC);
+        auto xTensor = cudnn_frontend::TensorBuilder()
+                           .setDim(4, x_dim)
+                           .setStrides(4, stride)
+                           .setId('x')
+                           .setAlignment(16)  // 16B alignment is needed to run a tensor core engine
+                           .setDataType(dataType)
+                           .build();
+        generateStrides(w_dim, stride, 4, CUDNN_TENSOR_NHWC);
+        auto wTensor = cudnn_frontend::TensorBuilder()
+                           .setDim(4, w_dim)
+                           .setStrides(4, stride)
+                           .setId('w')
+                           .setAlignment(16)
+                           .setDataType(dataType)
+                           .build();
+
+        generateStrides(r_dim, stride, 4, CUDNN_TENSOR_NHWC);
+        auto rTensor = cudnn_frontend::TensorBuilder()
+                           .setDim(4, r_dim)
+                           .setStrides(4, stride)
+                           .setId('r')  // output
+                           .setAlignment(16)
+                           .setDataType(CUDNN_DATA_FLOAT)
+                           .build();
+
+        generateStrides(y_dim, stride, 4, CUDNN_TENSOR_NHWC);
+        auto afterConvTensor = cudnn_frontend::TensorBuilder()
+                                   .setDim(4, y_dim)
+                                   .setStrides(4, stride)
+                                   .setId('y')  // after conv
+                                   .setAlignment(16)
+                                   .setVirtual()
+                                   .setDataType(dataType)
+                                   .build();
+
+        std::cout << xTensor.describe() << std::endl;
+        std::cout << wTensor.describe() << std::endl;
+        std::cout << rTensor.describe() << std::endl;
+
+        std::cout << afterConvTensor.describe() << std::endl;
+
+        // Define the reduction descriptor
+        auto redunctionDesc = cudnn_frontend::ReductionDescBuilder()
+                                  .setMathPrecision(CUDNN_DATA_FLOAT)
+                                  .setReductionOp(CUDNN_REDUCE_TENSOR_ADD)
+                                  .build();
+        std::cout << redunctionDesc.describe() << std::endl;
+
+        // Define the convolution problem
+        auto convDesc = cudnn_frontend::ConvDescBuilder()
+                            .setDataType(CUDNN_DATA_FLOAT)
+                            .setMathMode(CUDNN_CROSS_CORRELATION)
+                            .setNDims(convDim)
+                            .setStrides(convDim, conv_strideA)
+                            .setPrePadding(convDim, conv_padA)
+                            .setPostPadding(convDim, conv_padA)
+                            .setDilation(convDim, conv_dilationA)
+                            .build();
+        std::cout << convDesc.describe() << std::endl;
+
+        float alpha = 1.0f;
+        float beta  = 0.0f;
+
+        // Create a convolution Node
+        auto conv_op = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR)
+                           .setxDesc(xTensor)
+                           .setwDesc(wTensor)
+                           .setyDesc(afterConvTensor)
+                           .setcDesc(convDesc)
+                           .setAlpha(alpha)
+                           .setBeta(beta)
+                           .build();
+        std::cout << conv_op.describe() << std::endl;
+
+        // Create a reduction add Node.
+        auto reduction_op = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR)
+                                .setxDesc(conv_op.getOutputTensor())
+                                .setyDesc(rTensor)
+                                .setreductionDesc(redunctionDesc)
+                                .build();
+        std::cout << reduction_op.describe() << std::endl;
+
+        // Create an Operation Graph. In this case it is convolution reduction add
+        std::array<cudnn_frontend::Operation const*, 2> ops = {&conv_op, &reduction_op};
+
+        auto opGraph = cudnn_frontend::OperationGraphBuilder()
+                           .setHandle(handle_)
+                           .setOperationGraph(ops.size(), ops.data())
+                           .build();
+
+        // How many engines support this operation graph ?
+        auto total_engines = opGraph.getEngineCount();
+        std::cout << opGraph.describe() << " has " << total_engines << " engines." << std::endl;
+        auto engine = cudnn_frontend::EngineBuilder().setGlobalEngineIdx(0).setOperationGraph(opGraph).build();
+        std::cout << engine.describe() << std::endl;
+        auto& knobs = engine.getSupportedKnobs();
+        for (auto it = std::begin(knobs); it != std::end(knobs); ++it) {
+            std::cout << it->describe() << std::endl;
+        }
+
+        // Create the requisite engine config
+        auto engine_config = cudnn_frontend::EngineConfigBuilder().setEngine(engine).build();
+        std::cout << engine_config.describe() << std::endl;
+
+        auto plan = cudnn_frontend::ExecutionPlanBuilder().setHandle(handle_).setEngineConfig(engine_config).build();
+
+        std::cout << "Plan tag: " << plan.getTag() << std::endl;
+
+        auto workspace_size = plan.getWorkspaceSize();
+        std::cout << plan.describe() << " requires workspace " << workspace_size << std::endl;
+
+        void* workspace_ptr = nullptr;
+        if (workspace_size > 0) {
+            checkCudaErr(cudaMalloc(&workspace_ptr, workspace_size));
+        }
+        void* data_ptrs[] = {devPtrX, devPtrW, devPtrR};
+        int64_t uids[]    = {'x', 'w', 'r'};
+        auto variantPack  = cudnn_frontend::VariantPackBuilder()
+                               .setWorkspacePointer(workspace_ptr)
+                               .setDataPointers(3, data_ptrs)
+                               .setUids(3, uids)
+                               .build();
+        std::cout << "variantPack " << variantPack.describe() << std::endl;
+        cudnnStatus_t status = cudnnBackendExecute(handle_, plan.get_raw_desc(), variantPack.get_raw_desc());
+        if (workspace_size > 0) {
+            checkCudaErr(cudaFree(workspace_ptr));
+        }
+        cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error");
+
+    } catch (cudnn_frontend::cudnnException &e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
         CHECK(false);
     }

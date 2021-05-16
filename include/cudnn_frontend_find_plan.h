@@ -107,9 +107,9 @@ EngineConfigGenerator::cudnnFindPlan(cudnnHandle_t handle,
         try {
 #endif
             plans.push_back(
-                cudnn_frontend::ExecutionPlanBuilder().setHandle(handle).setEngineConfig(engine_config).build());
+                cudnn_frontend::ExecutionPlanBuilder().setHandle(handle).setEngineConfig(engine_config, opGraph.getTag()).build());
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
-        } catch (cudnnException e) {
+        } catch (cudnnException &e) {
             continue;
         }
 #endif

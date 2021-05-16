@@ -91,6 +91,11 @@ class OperationGraph_v8 : public BackendDescriptor {
     }
     /** @} */
 
+    uint64_t
+    getOpCount() const {
+        return numOps;
+    }
+
     std::string const &
     getTag() const {
         return opGraphTag;

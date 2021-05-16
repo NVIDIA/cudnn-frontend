@@ -35,6 +35,7 @@
 #include "cudnn_frontend_ConvDesc.h"
 #include "cudnn_frontend_PointWiseDesc.h"
 #include "cudnn_frontend_MatMulDesc.h"
+#include "cudnn_frontend_ReductionDesc.h"
 #include "cudnn_frontend_Tensor.h"
 #include "cudnn_frontend_utils.h"
 
@@ -55,6 +56,7 @@ namespace cudnn_frontend {
 ///    - cmatdesc
 ///    - pwdesc
 ///    - matmuldesc
+///    - reductiondesc
 ///    - alpha
 ///    - beta
 ///    - alpha2
@@ -83,6 +85,7 @@ class Operation_v8 : public BackendDescriptor {
         ss << std::hex << " C Mtrix " << cmatdesc;
         ss << std::hex << " P " << pwdesc;
         ss << std::hex << " MatMul " << matmuldesc;
+        ss << std::hex << " Reduction " << reductiondesc;
         ss << std::dec << " alphabetaType " << alphabetaType;
         ss << " Alpha: " << alpha_s << " " << alpha_d;
         ss << " Alpha2: " << alpha2_s << " " << alpha2_d;
@@ -105,6 +108,7 @@ class Operation_v8 : public BackendDescriptor {
           cmatdesc(from.cmatdesc),
           pwdesc(from.pwdesc),
           matmuldesc(from.matmuldesc),
+          reductiondesc(from.reductiondesc),
           alphabetaType(from.alphabetaType),
           alpha_s(from.alpha_s),
           beta_s(from.beta_s),
@@ -136,19 +140,20 @@ class Operation_v8 : public BackendDescriptor {
 
     cudnnBackendDescriptorType_t op_mode = CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR;
 
-    ManagedOpaqueDescriptor xdesc      = nullptr;
-    ManagedOpaqueDescriptor ydesc      = nullptr;
-    ManagedOpaqueDescriptor wdesc      = nullptr;
-    ManagedOpaqueDescriptor bdesc      = nullptr;
-    ManagedOpaqueDescriptor dydesc     = nullptr;
-    ManagedOpaqueDescriptor dxdesc     = nullptr;
-    ManagedOpaqueDescriptor dwdesc     = nullptr;
-    ManagedOpaqueDescriptor cdesc      = nullptr;
-    ManagedOpaqueDescriptor amatdesc   = nullptr;
-    ManagedOpaqueDescriptor bmatdesc   = nullptr;
-    ManagedOpaqueDescriptor cmatdesc   = nullptr;
-    ManagedOpaqueDescriptor pwdesc     = nullptr;
-    ManagedOpaqueDescriptor matmuldesc = nullptr;
+    ManagedOpaqueDescriptor xdesc         = nullptr;
+    ManagedOpaqueDescriptor ydesc         = nullptr;
+    ManagedOpaqueDescriptor wdesc         = nullptr;
+    ManagedOpaqueDescriptor bdesc         = nullptr;
+    ManagedOpaqueDescriptor dydesc        = nullptr;
+    ManagedOpaqueDescriptor dxdesc        = nullptr;
+    ManagedOpaqueDescriptor dwdesc        = nullptr;
+    ManagedOpaqueDescriptor cdesc         = nullptr;
+    ManagedOpaqueDescriptor amatdesc      = nullptr;
+    ManagedOpaqueDescriptor bmatdesc      = nullptr;
+    ManagedOpaqueDescriptor cmatdesc      = nullptr;
+    ManagedOpaqueDescriptor pwdesc        = nullptr;
+    ManagedOpaqueDescriptor matmuldesc    = nullptr;
+    ManagedOpaqueDescriptor reductiondesc = nullptr;
 
     cudnnBackendAttributeType_t alphabetaType = CUDNN_TYPE_FLOAT;
     float alpha_s = 1.0f, beta_s = .0f, alpha2_s = 1.0f;
@@ -171,6 +176,7 @@ class OperationBuilder_v8 {
     bool is_convolution_op = false;
     bool is_pointwise_op   = false;
     bool is_matmul_op      = false;
+    bool is_reduction_op   = false;
 
    public:
     /** @defgroup OperationBuilder_v8
@@ -293,6 +299,17 @@ class OperationBuilder_v8 {
         return *this;
     }
     auto
+    setreductionDesc(ReductionDesc_v8 const &reductionDesc) -> OperationBuilder_v8 & {
+        if (is_reduction_op == false) {
+            set_error_and_throw_exception(
+                &m_operation,
+                CUDNN_STATUS_BAD_PARAM,
+                "CUDNN_BACKEND_OPERATION_*_DESCRIPTOR: Non Reduction operation does not need REDUCTION DESCRIPTOR");
+        }
+        m_operation.reductiondesc = reductionDesc.get_desc();
+        return *this;
+    }
+    auto
     setpwDesc(PointWiseDesc_v8 const &pointWiseDesc) -> OperationBuilder_v8 & {
         if (is_pointwise_op == false) {
             set_error_and_throw_exception(
@@ -380,6 +397,7 @@ class OperationBuilder_v8 {
 
         is_pointwise_op = (m_operation.op_mode == CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR);
         is_matmul_op    = (m_operation.op_mode == CUDNN_BACKEND_OPERATION_MATMUL_DESCRIPTOR);
+        is_reduction_op = (m_operation.op_mode == CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR);
     }
     /** @} */
 
@@ -587,6 +605,28 @@ class OperationBuilder_v8 {
                     "CUDNN_BACKEND_OPERATION: Check and Set the CUDNN_ATTR_OPERATION_MATMUL_CDESC");
                 return std::move(m_operation);
             }
+        } else if (is_reduction_op) {
+            if (m_operation.reductiondesc == nullptr) {
+                set_error_and_throw_exception(
+                    &m_operation,
+                    CUDNN_STATUS_BAD_PARAM,
+                    "CUDNN_BACKEND_OPERATION: Check and Set the CUDNN_ATTR_OPERATION_REDUCTION_DESC");
+                return std::move(m_operation);
+            }
+            if (m_operation.xdesc == nullptr) {
+                set_error_and_throw_exception(
+                    &m_operation,
+                    CUDNN_STATUS_BAD_PARAM,
+                    "CUDNN_BACKEND_OPERATION: Check and Set the CUDNN_ATTR_OPERATION_REDUCTION_XDESC");
+                return std::move(m_operation);
+            }
+            if (m_operation.ydesc == nullptr) {
+                set_error_and_throw_exception(
+                    &m_operation,
+                    CUDNN_STATUS_BAD_PARAM,
+                    "CUDNN_BACKEND_OPERATION: Check and Set the CUDNN_ATTR_OPERATION_REDUCTION_YDESC");
+                return std::move(m_operation);
+            }
         } else {
             set_error_and_throw_exception(&m_operation,
                                           CUDNN_STATUS_BAD_PARAM,
@@ -698,7 +738,7 @@ class OperationBuilder_v8 {
             }
 
             auto dwdesc_ = m_operation.dwdesc != nullptr ? m_operation.dwdesc : m_operation.wdesc;
-            status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+            status       = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DW,
                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                               1,
@@ -712,7 +752,7 @@ class OperationBuilder_v8 {
             }
 
             auto dydesc_ = m_operation.dydesc != nullptr ? m_operation.dydesc : m_operation.ydesc;
-            status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+            status       = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DY,
                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                               1,
@@ -769,7 +809,7 @@ class OperationBuilder_v8 {
             m_operation.operationTag = "ConvBwdData";
 
             auto dxdesc_ = m_operation.dxdesc != nullptr ? m_operation.dxdesc : m_operation.xdesc;
-            status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+            status       = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX,
                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                               1,
@@ -796,7 +836,7 @@ class OperationBuilder_v8 {
             }
 
             auto dydesc_ = m_operation.dydesc != nullptr ? m_operation.dydesc : m_operation.ydesc;
-            status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+            status       = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY,
                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                               1,
@@ -1072,6 +1112,52 @@ class OperationBuilder_v8 {
                     &m_operation,
                     status,
                     "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_MATMUL_DESC Failed");
+                return std::move(m_operation);
+            }
+        } else if (m_operation.op_mode == CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR) {
+            m_operation.operationTag = "Reduction";
+            if ((cudnnGetVersion() / 100) == 81) {  // workaround for cudnn 8.1
+                status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+                                                  CUDNN_ATTR_REDUCTION_OPERATOR,
+                                                  CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                  1,
+                                                  &(m_operation.reductiondesc->get_backend_descriptor()));
+            } else {
+                status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+                                                  CUDNN_ATTR_OPERATION_REDUCTION_DESC,
+                                                  CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                  1,
+                                                  &(m_operation.reductiondesc->get_backend_descriptor()));
+            }
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_operation,
+                    status,
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_REDUCTION_DESC Failed");
+                return std::move(m_operation);
+            }
+            status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+                                              CUDNN_ATTR_OPERATION_REDUCTION_XDESC,
+                                              CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                              1,
+                                              &(m_operation.xdesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_operation,
+                    status,
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_REDUCTION_XDESC Failed");
+                return std::move(m_operation);
+            }
+            status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+                                              CUDNN_ATTR_OPERATION_REDUCTION_YDESC,
+                                              CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                              1,
+                                              &(m_operation.ydesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_operation,
+                    status,
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_REDUCTION_YDESC Failed");
                 return std::move(m_operation);
             }
         }

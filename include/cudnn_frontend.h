@@ -26,18 +26,20 @@
  *
  * \section Introduction
  *
- * The cuDNN Frontend API is a C++ header-only library that demonstrates how to use the cuDNN C backend API. The cuDNN C backend API is documented in the cuDNN developer guide.
+ * The cuDNN Frontend API is a C++ header-only library that demonstrates how to use the cuDNN C backend API. The cuDNN C
+ * backend API is documented in the cuDNN developer guide.
  *
  * \section Need Why use Frontend API
  *
- * Consider the following code snippet which showcases cudnnBackendTensor creation using the backend API and its equivalent front-end API code. Many among the backend constructs follow similar pattern.
+ * Consider the following code snippet which showcases cudnnBackendTensor creation using the backend API and its
+ * equivalent front-end API code. Many among the backend constructs follow similar pattern.
  *
  *  ~~~~~~~~~~~~~~~{.cpp}
  *
  *  ===========================================================================================
  *  auto check_status = [](cudnnStatus_t status) { assert (status == CUDNN_STATUS_SUCCESS); };
  *  ===========================================================================================
- *  // Backend code for Tensor Creation. 
+ *  // Backend code for Tensor Creation.
  *  cudnnBackendDescriptor_t tensor;
  *
  *  check_status (cudnnBackendCreateDescriptor(CUDNN_BACKEND_TENSOR_DESCRIPTOR, &tensor));
@@ -71,7 +73,7 @@
  *
  *  check_status (cudnnBackendDestroyDescriptor(tensor));
  *  ===========================================================================================
- *  // FrontEnd equivalent code. 
+ *  // FrontEnd equivalent code.
  *  auto tensor =  cudnn_frontend::TensorBuilder()
  *                     .setDim(tensor_dim.size(), tensor_dim.data())
  *                     .setStrides(tensor_str.size(), tensor_str.data())
@@ -83,7 +85,7 @@
  *  ===========================================================================================
  *
  *  ~~~~~~~~~~~~~~~
- *  
+ *
  *  Frontend API serves two major purpose as a companion to the backend API.
  *  - Functional additions:
  *      - Support for auto-tuning. (cudnnGet and cudnnFind)
@@ -100,6 +102,7 @@
 #include "cudnn_frontend_Engine.h"
 #include "cudnn_frontend_EngineConfig.h"
 #include "cudnn_frontend_EngineFallbackList.h"
+#include "cudnn_frontend_Errata.h"
 #include "cudnn_frontend_ExecutionPlan.h"
 #include "cudnn_frontend_Filters.h"
 #include "cudnn_frontend_Operation.h"
@@ -118,6 +121,8 @@ using PointWiseDescBuilder      = PointWiseDescBuilder_v8;
 using PointWiseDesc             = PointWiseDesc_v8;
 using MatMulDesc                = MatMulDesc_v8;
 using MatMulDescBuilder         = MatMulDescBuilder_v8;
+using ReductionDesc             = ReductionDesc_v8;
+using ReductionDescBuilder      = ReductionDescBuilder_v8;
 using Operation                 = Operation_v8;
 using OperationBuilder          = OperationBuilder_v8;
 using OperationGraph            = OperationGraph_v8;
