@@ -1,0 +1,81 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d3/d84/structnlohmann_1_1detail_1_1is__constructible__string__type" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_constructible_string_type</compoundname>
+    <basecompoundref refid="de/df0/structnlohmann_1_1detail_1_1is__constructible__string__type__impl" prot="public" virt="non-virtual">nlohmann::detail::is_constructible_string_type_impl&lt; BasicJsonType, ConstructibleStringType &gt;</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+      <param>
+        <type>typename ConstructibleStringType</type>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="561">
+        <label>nlohmann::detail::is_constructible_string_type&lt; BasicJsonType, ConstructibleStringType &gt;</label>
+        <link refid="d3/d84/structnlohmann_1_1detail_1_1is__constructible__string__type"/>
+        <childnode refid="562" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="565">
+        <label>false_type</label>
+      </node>
+      <node id="564">
+        <label>nlohmann::detail::is_constructible_string_type_impl&lt; BasicJsonType, ConstructibleStringType, typename &gt;</label>
+        <link refid="de/df0/structnlohmann_1_1detail_1_1is__constructible__string__type__impl"/>
+        <childnode refid="565" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="563">
+        <label>std::false_type</label>
+      </node>
+      <node id="562">
+        <label>nlohmann::detail::is_constructible_string_type_impl&lt; BasicJsonType, ConstructibleStringType &gt;</label>
+        <link refid="de/df0/structnlohmann_1_1detail_1_1is__constructible__string__type__impl"/>
+        <childnode refid="563" relation="public-inheritance">
+        </childnode>
+        <childnode refid="564" relation="template-instance">
+          <edgelabel>&lt; BasicJsonType, ConstructibleStringType &gt;</edgelabel>
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="566">
+        <label>nlohmann::detail::is_constructible_string_type&lt; BasicJsonType, ConstructibleStringType &gt;</label>
+        <link refid="d3/d84/structnlohmann_1_1detail_1_1is__constructible__string__type"/>
+        <childnode refid="567" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="570">
+        <label>false_type</label>
+      </node>
+      <node id="569">
+        <label>nlohmann::detail::is_constructible_string_type_impl&lt; BasicJsonType, ConstructibleStringType, typename &gt;</label>
+        <link refid="de/df0/structnlohmann_1_1detail_1_1is__constructible__string__type__impl"/>
+        <childnode refid="570" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="568">
+        <label>std::false_type</label>
+      </node>
+      <node id="567">
+        <label>nlohmann::detail::is_constructible_string_type_impl&lt; BasicJsonType, ConstructibleStringType &gt;</label>
+        <link refid="de/df0/structnlohmann_1_1detail_1_1is__constructible__string__type__impl"/>
+        <childnode refid="568" relation="public-inheritance">
+        </childnode>
+        <childnode refid="569" relation="template-instance">
+          <edgelabel>&lt; BasicJsonType, ConstructibleStringType &gt;</edgelabel>
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3714" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3713" bodyend="3714"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

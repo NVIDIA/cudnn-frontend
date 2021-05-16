@@ -226,85 +226,85 @@
 <listitem><para>heuristic mode</para></listitem><listitem><para>operation graph</para></listitem></itemizedlist>
 </para><para>Use <ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref> to build this class. Describe returns a string describing the <ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref> class </para>    </detaileddescription>
     <inheritancegraph>
-      <node id="138">
+      <node id="227">
         <label>cudnn_frontend::EngineHeuristics_v8</label>
         <link refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8"/>
-        <childnode refid="139" relation="public-inheritance">
+        <childnode refid="228" relation="public-inheritance">
         </childnode>
       </node>
-      <node id="139">
+      <node id="228">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
       </node>
     </inheritancegraph>
     <collaborationgraph>
-      <node id="144">
+      <node id="233">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="149">
+      <node id="238">
         <label>T</label>
       </node>
-      <node id="148">
+      <node id="237">
         <label>std::vector&lt; T &gt;</label>
-        <childnode refid="149" relation="usage">
+        <childnode refid="238" relation="usage">
           <edgelabel>+elements</edgelabel>
         </childnode>
       </node>
-      <node id="145">
+      <node id="234">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="146">
+      <node id="235">
         <label>std::vector&lt; ManagedOpaqueDescriptor &gt;</label>
-        <childnode refid="147" relation="usage">
+        <childnode refid="236" relation="usage">
           <edgelabel>+elements</edgelabel>
         </childnode>
-        <childnode refid="148" relation="template-instance">
+        <childnode refid="237" relation="template-instance">
           <edgelabel>&lt; ManagedOpaqueDescriptor &gt;</edgelabel>
         </childnode>
       </node>
-      <node id="143">
+      <node id="232">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="140">
+      <node id="229">
         <label>cudnn_frontend::EngineHeuristics_v8</label>
         <link refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8"/>
-        <childnode refid="141" relation="public-inheritance">
+        <childnode refid="230" relation="public-inheritance">
         </childnode>
-        <childnode refid="146" relation="usage">
+        <childnode refid="235" relation="usage">
           <edgelabel>-m_heuristic_results</edgelabel>
         </childnode>
-        <childnode refid="150" relation="usage">
+        <childnode refid="239" relation="usage">
           <edgelabel>-mode</edgelabel>
         </childnode>
-        <childnode refid="142" relation="usage">
+        <childnode refid="231" relation="usage">
           <edgelabel>-opGraphTag</edgelabel>
         </childnode>
-        <childnode refid="144" relation="usage">
+        <childnode refid="233" relation="usage">
           <edgelabel>-opGraph</edgelabel>
         </childnode>
       </node>
-      <node id="147">
+      <node id="236">
         <label>ManagedOpaqueDescriptor</label>
       </node>
-      <node id="141">
+      <node id="230">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="142" relation="usage">
+        <childnode refid="231" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="144" relation="usage">
+        <childnode refid="233" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="145" relation="usage">
+        <childnode refid="234" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="150">
+      <node id="239">
         <label>cudnnBackendHeurMode_t</label>
       </node>
-      <node id="142">
+      <node id="231">
         <label>std::string</label>
-        <childnode refid="143" relation="public-inheritance">
+        <childnode refid="232" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>

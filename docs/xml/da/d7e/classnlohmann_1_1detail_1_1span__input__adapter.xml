@@ -1,0 +1,121 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="da/d7e/classnlohmann_1_1detail_1_1span__input__adapter" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::span_input_adapter</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="da/d7e/classnlohmann_1_1detail_1_1span__input__adapter_1a3e223a7784502be20ace441e84f8cf43" prot="private" static="no" mutable="no">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1abc51edd46a1d1a0ff06a19f08ceff563" kindref="member">contiguous_bytes_input_adapter</ref></type>
+        <definition>contiguous_bytes_input_adapter nlohmann::detail::span_input_adapter::ia</definition>
+        <argsstring></argsstring>
+        <name>ia</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5700" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5700" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="da/d7e/classnlohmann_1_1detail_1_1span__input__adapter_1a3a328a45b2c2c87145106ce4b2d02365" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename CharT</type>
+          </param>
+          <param>
+            <type>typename std::enable_if&lt; std::is_pointer&lt; CharT &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref> &amp;&amp;std::is_integral&lt; typename std::remove_pointer&lt; CharT &gt;::<ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref> &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref> &amp;&amp;sizeof(typename std::remove_pointer&lt; CharT &gt;::<ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref>)==1, int &gt;::<ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref></type>
+            <defval>0</defval>
+          </param>
+        </templateparamlist>
+        <type></type>
+        <definition>nlohmann::detail::span_input_adapter::span_input_adapter</definition>
+        <argsstring>(CharT b, std::size_t l)</argsstring>
+        <name>span_input_adapter</name>
+        <param>
+          <type>CharT</type>
+          <declname>b</declname>
+        </param>
+        <param>
+          <type>std::size_t</type>
+          <declname>l</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5684" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5684" bodyend="5685"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804">nlohmann::detail::value</references>
+      </memberdef>
+      <memberdef kind="function" id="da/d7e/classnlohmann_1_1detail_1_1span__input__adapter_1a714c6cf8e15b9af4e1723d9f7f92d4c8" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>class IteratorType</type>
+          </param>
+          <param>
+            <type>typename std::enable_if&lt; std::is_same&lt; typename <ref refid="d8/db6/structnlohmann_1_1detail_1_1iterator__traits" kindref="compound">iterator_traits</ref>&lt; IteratorType &gt;::iterator_category, std::random_access_iterator_tag &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref>, int &gt;::<ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref></type>
+            <defval>0</defval>
+          </param>
+        </templateparamlist>
+        <type></type>
+        <definition>nlohmann::detail::span_input_adapter::span_input_adapter</definition>
+        <argsstring>(IteratorType first, IteratorType last)</argsstring>
+        <name>span_input_adapter</name>
+        <param>
+          <type>IteratorType</type>
+          <declname>first</declname>
+        </param>
+        <param>
+          <type>IteratorType</type>
+          <declname>last</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5691" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5691" bodyend="5692"/>
+      </memberdef>
+      <memberdef kind="function" id="da/d7e/classnlohmann_1_1detail_1_1span__input__adapter_1a478dfb78d0bf28d2665a19fccf221f02" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1abc51edd46a1d1a0ff06a19f08ceff563" kindref="member">contiguous_bytes_input_adapter</ref> &amp;&amp;</type>
+        <definition>contiguous_bytes_input_adapter&amp;&amp; nlohmann::detail::span_input_adapter::get</definition>
+        <argsstring>()</argsstring>
+        <name>get</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5694" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5694" bodyend="5697"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="990">
+        <label>nlohmann::detail::span_input_adapter</label>
+        <link refid="da/d7e/classnlohmann_1_1detail_1_1span__input__adapter"/>
+        <childnode refid="991" relation="usage">
+          <edgelabel>-ia</edgelabel>
+        </childnode>
+      </node>
+      <node id="991">
+        <label>declval&lt; const char *&gt;()))</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5676" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5675" bodyend="5701"/>
+    <listofallmembers>
+      <member refid="da/d7e/classnlohmann_1_1detail_1_1span__input__adapter_1a478dfb78d0bf28d2665a19fccf221f02" prot="public" virt="non-virtual"><scope>nlohmann::detail::span_input_adapter</scope><name>get</name></member>
+      <member refid="da/d7e/classnlohmann_1_1detail_1_1span__input__adapter_1a3e223a7784502be20ace441e84f8cf43" prot="private" virt="non-virtual"><scope>nlohmann::detail::span_input_adapter</scope><name>ia</name></member>
+      <member refid="da/d7e/classnlohmann_1_1detail_1_1span__input__adapter_1a3a328a45b2c2c87145106ce4b2d02365" prot="public" virt="non-virtual"><scope>nlohmann::detail::span_input_adapter</scope><name>span_input_adapter</name></member>
+      <member refid="da/d7e/classnlohmann_1_1detail_1_1span__input__adapter_1a714c6cf8e15b9af4e1723d9f7f92d4c8" prot="public" virt="non-virtual"><scope>nlohmann::detail::span_input_adapter</scope><name>span_input_adapter</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

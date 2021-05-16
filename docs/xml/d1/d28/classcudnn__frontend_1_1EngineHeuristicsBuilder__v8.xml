@@ -150,80 +150,80 @@
     <detaileddescription>
 <para><ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref> Class Helper class used to build <ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref> class </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="157">
+      <node id="246">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="162">
+      <node id="251">
         <label>T</label>
       </node>
-      <node id="161">
+      <node id="250">
         <label>std::vector&lt; T &gt;</label>
-        <childnode refid="162" relation="usage">
+        <childnode refid="251" relation="usage">
           <edgelabel>+elements</edgelabel>
         </childnode>
       </node>
-      <node id="152">
+      <node id="241">
         <label>cudnn_frontend::EngineHeuristicsBuilder_v8</label>
         <link refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8"/>
-        <childnode refid="153" relation="usage">
+        <childnode refid="242" relation="usage">
           <edgelabel>-m_heuristics</edgelabel>
         </childnode>
       </node>
-      <node id="158">
+      <node id="247">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="159">
+      <node id="248">
         <label>std::vector&lt; ManagedOpaqueDescriptor &gt;</label>
-        <childnode refid="160" relation="usage">
+        <childnode refid="249" relation="usage">
           <edgelabel>+elements</edgelabel>
         </childnode>
-        <childnode refid="161" relation="template-instance">
+        <childnode refid="250" relation="template-instance">
           <edgelabel>&lt; ManagedOpaqueDescriptor &gt;</edgelabel>
         </childnode>
       </node>
-      <node id="156">
+      <node id="245">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="153">
+      <node id="242">
         <label>cudnn_frontend::EngineHeuristics_v8</label>
         <link refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8"/>
-        <childnode refid="154" relation="public-inheritance">
+        <childnode refid="243" relation="public-inheritance">
         </childnode>
-        <childnode refid="159" relation="usage">
+        <childnode refid="248" relation="usage">
           <edgelabel>-m_heuristic_results</edgelabel>
         </childnode>
-        <childnode refid="163" relation="usage">
+        <childnode refid="252" relation="usage">
           <edgelabel>-mode</edgelabel>
         </childnode>
-        <childnode refid="155" relation="usage">
+        <childnode refid="244" relation="usage">
           <edgelabel>-opGraphTag</edgelabel>
         </childnode>
-        <childnode refid="157" relation="usage">
+        <childnode refid="246" relation="usage">
           <edgelabel>-opGraph</edgelabel>
         </childnode>
       </node>
-      <node id="160">
+      <node id="249">
         <label>ManagedOpaqueDescriptor</label>
       </node>
-      <node id="154">
+      <node id="243">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="155" relation="usage">
+        <childnode refid="244" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="157" relation="usage">
+        <childnode refid="246" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="158" relation="usage">
+        <childnode refid="247" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="163">
+      <node id="252">
         <label>cudnnBackendHeurMode_t</label>
       </node>
-      <node id="155">
+      <node id="244">
         <label>std::string</label>
-        <childnode refid="156" relation="public-inheritance">
+        <childnode refid="245" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>

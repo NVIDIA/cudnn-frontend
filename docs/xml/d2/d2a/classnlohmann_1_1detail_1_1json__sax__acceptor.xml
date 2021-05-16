@@ -1,0 +1,324 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::json_sax_acceptor</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename</type>
+        <declname>BasicJsonType</declname>
+        <defname>BasicJsonType</defname>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a41876b17c0e8bdb55580eaf5e4e2ded8" prot="public" static="no">
+        <type>typename BasicJsonType::number_integer_t</type>
+        <definition>using nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::number_integer_t =  typename BasicJsonType::number_integer_t</definition>
+        <argsstring></argsstring>
+        <name>number_integer_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6345" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6345" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1ae07454608ea6f3cfb765f95e3c850043" prot="public" static="no">
+        <type>typename BasicJsonType::number_unsigned_t</type>
+        <definition>using nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::number_unsigned_t =  typename BasicJsonType::number_unsigned_t</definition>
+        <argsstring></argsstring>
+        <name>number_unsigned_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6346" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6346" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a5502f483fc60a1bcd73e0e46b6ab36e4" prot="public" static="no">
+        <type>typename BasicJsonType::number_float_t</type>
+        <definition>using nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::number_float_t =  typename BasicJsonType::number_float_t</definition>
+        <argsstring></argsstring>
+        <name>number_float_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6347" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6347" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a3a8078bbf865ec355106f6048241609a" prot="public" static="no">
+        <type>typename BasicJsonType::string_t</type>
+        <definition>using nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::string_t =  typename BasicJsonType::string_t</definition>
+        <argsstring></argsstring>
+        <name>string_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6348" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6348" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a56346d95ee4e539eaded2e6826fecf66" prot="public" static="no">
+        <type>typename BasicJsonType::binary_t</type>
+        <definition>using nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::binary_t =  typename BasicJsonType::binary_t</definition>
+        <argsstring></argsstring>
+        <name>binary_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6349" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6349" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1ad7ad55168af6e03ed8b844c94a17b9ce" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::null</definition>
+        <argsstring>()</argsstring>
+        <name>null</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6351" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6351" bodyend="6354"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a3f5fe42a9b195de8d251d6d98d5ee92c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::boolean</definition>
+        <argsstring>(bool)</argsstring>
+        <name>boolean</name>
+        <param>
+          <type>bool</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6356" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6356" bodyend="6359"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a976bf4ce6e9a2ffe48f683ddff80af00" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::number_integer</definition>
+        <argsstring>(number_integer_t)</argsstring>
+        <name>number_integer</name>
+        <param>
+          <type><ref refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a41876b17c0e8bdb55580eaf5e4e2ded8" kindref="member">number_integer_t</ref></type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6361" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6361" bodyend="6364"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1ad15b288f3351287edbe289502f595491" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::number_unsigned</definition>
+        <argsstring>(number_unsigned_t)</argsstring>
+        <name>number_unsigned</name>
+        <param>
+          <type><ref refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1ae07454608ea6f3cfb765f95e3c850043" kindref="member">number_unsigned_t</ref></type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6366" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6366" bodyend="6369"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1aebf8800023eb20d472f111f86b189e60" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::number_float</definition>
+        <argsstring>(number_float_t, const string_t &amp;)</argsstring>
+        <name>number_float</name>
+        <param>
+          <type><ref refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a5502f483fc60a1bcd73e0e46b6ab36e4" kindref="member">number_float_t</ref></type>
+        </param>
+        <param>
+          <type>const <ref refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a3a8078bbf865ec355106f6048241609a" kindref="member">string_t</ref> &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6371" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6371" bodyend="6374"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1aaa69255e757a6ecc4403a2aa4931fc60" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::string</definition>
+        <argsstring>(string_t &amp;)</argsstring>
+        <name>string</name>
+        <param>
+          <type><ref refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a3a8078bbf865ec355106f6048241609a" kindref="member">string_t</ref> &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6376" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6376" bodyend="6379"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a3d193985aac764f99398e3ae8ba0c5db" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::binary</definition>
+        <argsstring>(binary_t &amp;)</argsstring>
+        <name>binary</name>
+        <param>
+          <type><ref refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a56346d95ee4e539eaded2e6826fecf66" kindref="member">binary_t</ref> &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6381" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6381" bodyend="6384"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a822bbca11a9fea0aa337018e351755f5" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::start_object</definition>
+        <argsstring>(std::size_t=std::size_t(-1))</argsstring>
+        <name>start_object</name>
+        <param>
+          <type>std::size_t</type>
+          <defval>std::size_t(-1)</defval>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6386" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6386" bodyend="6389"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a59e1ea5e9c8d25346a564bf9287a5c2a" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::key</definition>
+        <argsstring>(string_t &amp;)</argsstring>
+        <name>key</name>
+        <param>
+          <type><ref refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a3a8078bbf865ec355106f6048241609a" kindref="member">string_t</ref> &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6391" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6391" bodyend="6394"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a919645fd1827a561a994d70a435e3f19" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::end_object</definition>
+        <argsstring>()</argsstring>
+        <name>end_object</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6396" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6396" bodyend="6399"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a8238e8090cbb4ed8a22cbc97bfb833a5" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::start_array</definition>
+        <argsstring>(std::size_t=std::size_t(-1))</argsstring>
+        <name>start_array</name>
+        <param>
+          <type>std::size_t</type>
+          <defval>std::size_t(-1)</defval>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6401" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6401" bodyend="6404"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a22ef94ca5476a9563dcaca15b7d6e654" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::end_array</definition>
+        <argsstring>()</argsstring>
+        <name>end_array</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6406" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6406" bodyend="6409"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a95bb3e8b6feaa523ecda8106fb5e38e3" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;::parse_error</definition>
+        <argsstring>(std::size_t, const std::string &amp;, const detail::exception &amp;)</argsstring>
+        <name>parse_error</name>
+        <param>
+          <type>std::size_t</type>
+        </param>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21" kindref="member">std::string</ref> &amp;</type>
+        </param>
+        <param>
+          <type>const <ref refid="de/df2/classnlohmann_1_1detail_1_1exception" kindref="compound">detail::exception</ref> &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6411" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6411" bodyend="6414"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="723">
+        <label>nlohmann::detail::json_sax_acceptor&lt; BasicJsonType &gt;</label>
+        <link refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6343" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6342" bodyend="6415"/>
+    <listofallmembers>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a3d193985aac764f99398e3ae8ba0c5db" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>binary</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a56346d95ee4e539eaded2e6826fecf66" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>binary_t</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a3f5fe42a9b195de8d251d6d98d5ee92c" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>boolean</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a22ef94ca5476a9563dcaca15b7d6e654" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>end_array</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a919645fd1827a561a994d70a435e3f19" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>end_object</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a59e1ea5e9c8d25346a564bf9287a5c2a" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>key</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1ad7ad55168af6e03ed8b844c94a17b9ce" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>null</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1aebf8800023eb20d472f111f86b189e60" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>number_float</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a5502f483fc60a1bcd73e0e46b6ab36e4" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>number_float_t</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a976bf4ce6e9a2ffe48f683ddff80af00" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>number_integer</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a41876b17c0e8bdb55580eaf5e4e2ded8" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>number_integer_t</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1ad15b288f3351287edbe289502f595491" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>number_unsigned</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1ae07454608ea6f3cfb765f95e3c850043" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>number_unsigned_t</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a95bb3e8b6feaa523ecda8106fb5e38e3" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>parse_error</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a8238e8090cbb4ed8a22cbc97bfb833a5" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>start_array</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a822bbca11a9fea0aa337018e351755f5" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>start_object</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1aaa69255e757a6ecc4403a2aa4931fc60" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>string</name></member>
+      <member refid="d2/d2a/classnlohmann_1_1detail_1_1json__sax__acceptor_1a3a8078bbf865ec355106f6048241609a" prot="public" virt="non-virtual"><scope>nlohmann::detail::json_sax_acceptor</scope><name>string_t</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

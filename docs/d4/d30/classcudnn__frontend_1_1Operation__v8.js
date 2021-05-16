@@ -33,6 +33,7 @@ var classcudnn__frontend_1_1Operation__v8 =
     [ "pointwise_mode", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a09f5151a90f805d81550a30617bcec0c", null ],
     [ "pointwise_port_count", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a5c6b2986d2d703c672b5fc461f2eee05", null ],
     [ "pwdesc", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#aac54965185417e264093156b143a3751", null ],
+    [ "reductiondesc", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a99735bf6f673f0e3346e9be611125e2f", null ],
     [ "wdesc", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#ad26bd872d417f6a9bff65768bb02e05f", null ],
     [ "xdesc", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a01d1997ae84b86c0565351910bba3416", null ],
     [ "ydesc", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a81e9b10c7231ba9ffba37f7fab531a69", null ]

@@ -1,0 +1,354 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::primitive_iterator_t</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+      <sectiondef kind="private-type">
+      <memberdef kind="typedef" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1af3db0d5c90de427d51645fe73a015553" prot="private" static="no">
+        <type>std::ptrdiff_t</type>
+        <definition>using nlohmann::detail::primitive_iterator_t::difference_type =  std::ptrdiff_t</definition>
+        <argsstring></argsstring>
+        <name>difference_type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11178" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11178" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-static-attrib">
+      <memberdef kind="variable" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1afcb3bcf9da8aa95bd82067d1a67c2326" prot="private" static="yes" mutable="no">
+        <type>constexpr <ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1af3db0d5c90de427d51645fe73a015553" kindref="member">difference_type</ref></type>
+        <definition>constexpr difference_type nlohmann::detail::primitive_iterator_t::begin_value</definition>
+        <argsstring></argsstring>
+        <name>begin_value</name>
+        <initializer>= 0</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11179" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11179" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1aa37c37da44f19e6ec1d7d4a9910511c7" prot="private" static="yes" mutable="no">
+        <type>constexpr <ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1af3db0d5c90de427d51645fe73a015553" kindref="member">difference_type</ref></type>
+        <definition>constexpr difference_type nlohmann::detail::primitive_iterator_t::end_value</definition>
+        <argsstring></argsstring>
+        <name>end_value</name>
+        <initializer>= <ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1afcb3bcf9da8aa95bd82067d1a67c2326" kindref="member">begin_value</ref> + 1</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11180" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11180" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1adc7b6ab7810f58afa4d6a5133995c9ba" prot="private" static="no" mutable="no">
+        <type><ref refid="d5/db8/json_8hpp_1a2cf645f34610e7f7d6e09ab88a2ab917" kindref="member">JSON_PRIVATE_UNLESS_TESTED</ref></type>
+        <definition>JSON_PRIVATE_UNLESS_TESTED nlohmann::detail::primitive_iterator_t::__pad0__</definition>
+        <argsstring></argsstring>
+        <name>__pad0__</name>
+        <bitfield> difference_type m_it = (std::numeric_limits&lt;std::ptrdiff_t&gt;::min)()</bitfield>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11182" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11184" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1ae952990886ca1756229f916661a8af81" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr <ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1af3db0d5c90de427d51645fe73a015553" kindref="member">difference_type</ref></type>
+        <definition>constexpr difference_type nlohmann::detail::primitive_iterator_t::get_value</definition>
+        <argsstring>() const noexcept</argsstring>
+        <name>get_value</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11187" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11187" bodyend="11190"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1a9d9b005906106e12aed738f97d7fee42" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::primitive_iterator_t::set_begin</definition>
+        <argsstring>() noexcept</argsstring>
+        <name>set_begin</name>
+        <briefdescription>
+<para>set iterator to a defined beginning </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11193" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11193" bodyend="11196"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1ad26a823483846a12d890c3feed3097eb" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::primitive_iterator_t::set_end</definition>
+        <argsstring>() noexcept</argsstring>
+        <name>set_end</name>
+        <briefdescription>
+<para>set iterator to a defined past the end </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11199" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11199" bodyend="11202"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1a8d1a7d46b3fcd06edd034f04ededb5e4" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr bool</type>
+        <definition>constexpr bool nlohmann::detail::primitive_iterator_t::is_begin</definition>
+        <argsstring>() const noexcept</argsstring>
+        <name>is_begin</name>
+        <briefdescription>
+<para>return whether the iterator can be dereferenced </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11205" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11205" bodyend="11208"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1a45a7e301c23b5b90417baf2277f40b1d" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr bool</type>
+        <definition>constexpr bool nlohmann::detail::primitive_iterator_t::is_end</definition>
+        <argsstring>() const noexcept</argsstring>
+        <name>is_end</name>
+        <briefdescription>
+<para>return whether the iterator is at end </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11211" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11211" bodyend="11214"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1a00ce828d0fe58046c10e0445504df7bf" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kindref="compound">primitive_iterator_t</ref></type>
+        <definition>primitive_iterator_t nlohmann::detail::primitive_iterator_t::operator+</definition>
+        <argsstring>(difference_type n) noexcept</argsstring>
+        <name>operator+</name>
+        <param>
+          <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1af3db0d5c90de427d51645fe73a015553" kindref="member">difference_type</ref></type>
+          <declname>n</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11226" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11226" bodyend="11231"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1ad26511012fc88f3ec5d9e1cb708732fd" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kindref="compound">primitive_iterator_t</ref> &amp;</type>
+        <definition>primitive_iterator_t&amp; nlohmann::detail::primitive_iterator_t::operator++</definition>
+        <argsstring>() noexcept</argsstring>
+        <name>operator++</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11238" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11238" bodyend="11242"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1aa011863621357b3cf891670bf63a48b1" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kindref="compound">primitive_iterator_t</ref> const</type>
+        <definition>primitive_iterator_t const nlohmann::detail::primitive_iterator_t::operator++</definition>
+        <argsstring>(int) noexcept</argsstring>
+        <name>operator++</name>
+        <param>
+          <type>int</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11244" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11244" bodyend="11249"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1abecbf0c73c7fe963a699738065177bc3" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kindref="compound">primitive_iterator_t</ref> &amp;</type>
+        <definition>primitive_iterator_t&amp; nlohmann::detail::primitive_iterator_t::operator--</definition>
+        <argsstring>() noexcept</argsstring>
+        <name>operator--</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11251" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11251" bodyend="11255"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1aef3b5dfeb2cb04dc9d0a024fc1898b98" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kindref="compound">primitive_iterator_t</ref> const</type>
+        <definition>primitive_iterator_t const nlohmann::detail::primitive_iterator_t::operator--</definition>
+        <argsstring>(int) noexcept</argsstring>
+        <name>operator--</name>
+        <param>
+          <type>int</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11257" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11257" bodyend="11262"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1aee01535df0b3b40137d9241029a9a203" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kindref="compound">primitive_iterator_t</ref> &amp;</type>
+        <definition>primitive_iterator_t&amp; nlohmann::detail::primitive_iterator_t::operator+=</definition>
+        <argsstring>(difference_type n) noexcept</argsstring>
+        <name>operator+=</name>
+        <param>
+          <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1af3db0d5c90de427d51645fe73a015553" kindref="member">difference_type</ref></type>
+          <declname>n</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11264" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11264" bodyend="11268"/>
+      </memberdef>
+      <memberdef kind="function" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1a0bf83ab08abe1ae4b51c790c85cdf151" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kindref="compound">primitive_iterator_t</ref> &amp;</type>
+        <definition>primitive_iterator_t&amp; nlohmann::detail::primitive_iterator_t::operator-=</definition>
+        <argsstring>(difference_type n) noexcept</argsstring>
+        <name>operator-=</name>
+        <param>
+          <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1af3db0d5c90de427d51645fe73a015553" kindref="member">difference_type</ref></type>
+          <declname>n</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11270" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11270" bodyend="11274"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="friend">
+      <memberdef kind="friend" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1aae1e1e2ec0e229d1291d69de57d76bbe" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>friend constexpr bool</type>
+        <definition>constexpr bool operator==</definition>
+        <argsstring>(primitive_iterator_t lhs, primitive_iterator_t rhs) noexcept</argsstring>
+        <name>operator==</name>
+        <param>
+          <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kindref="compound">primitive_iterator_t</ref></type>
+          <declname>lhs</declname>
+        </param>
+        <param>
+          <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kindref="compound">primitive_iterator_t</ref></type>
+          <declname>rhs</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11216" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11216" bodyend="11219"/>
+      </memberdef>
+      <memberdef kind="friend" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1a901a95e6d73c9509d3dcde914f6c8a9d" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>friend constexpr bool</type>
+        <definition>constexpr bool operator&lt;</definition>
+        <argsstring>(primitive_iterator_t lhs, primitive_iterator_t rhs) noexcept</argsstring>
+        <name>operator&lt;</name>
+        <param>
+          <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kindref="compound">primitive_iterator_t</ref></type>
+          <declname>lhs</declname>
+        </param>
+        <param>
+          <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kindref="compound">primitive_iterator_t</ref></type>
+          <declname>rhs</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11221" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11221" bodyend="11224"/>
+      </memberdef>
+      <memberdef kind="friend" id="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1ac6d902d6ec9a02dabed5452d3ae78f7e" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>friend constexpr <ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1af3db0d5c90de427d51645fe73a015553" kindref="member">difference_type</ref></type>
+        <definition>constexpr difference_type operator-</definition>
+        <argsstring>(primitive_iterator_t lhs, primitive_iterator_t rhs) noexcept</argsstring>
+        <name>operator-</name>
+        <param>
+          <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kindref="compound">primitive_iterator_t</ref></type>
+          <declname>lhs</declname>
+        </param>
+        <param>
+          <type><ref refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t" kindref="compound">primitive_iterator_t</ref></type>
+          <declname>rhs</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11233" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11233" bodyend="11236"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="951">
+        <label>JSON_PRIVATE_UNLESS_TESTED</label>
+      </node>
+      <node id="950">
+        <label>static constexpr difference_type</label>
+      </node>
+      <node id="949">
+        <label>nlohmann::detail::primitive_iterator_t</label>
+        <link refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t"/>
+        <childnode refid="950" relation="usage">
+          <edgelabel>-end_value</edgelabel>
+          <edgelabel>-begin_value</edgelabel>
+        </childnode>
+        <childnode refid="951" relation="usage">
+          <edgelabel>-__pad0__</edgelabel>
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11176" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11175" bodyend="11275"/>
+    <listofallmembers>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1adc7b6ab7810f58afa4d6a5133995c9ba" prot="private" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>__pad0__</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1afcb3bcf9da8aa95bd82067d1a67c2326" prot="private" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>begin_value</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1af3db0d5c90de427d51645fe73a015553" prot="private" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>difference_type</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1aa37c37da44f19e6ec1d7d4a9910511c7" prot="private" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>end_value</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1ae952990886ca1756229f916661a8af81" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>get_value</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1a8d1a7d46b3fcd06edd034f04ededb5e4" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>is_begin</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1a45a7e301c23b5b90417baf2277f40b1d" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>is_end</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1a00ce828d0fe58046c10e0445504df7bf" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>operator+</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1ad26511012fc88f3ec5d9e1cb708732fd" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>operator++</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1aa011863621357b3cf891670bf63a48b1" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>operator++</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1aee01535df0b3b40137d9241029a9a203" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>operator+=</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1ac6d902d6ec9a02dabed5452d3ae78f7e" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>operator-</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1abecbf0c73c7fe963a699738065177bc3" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>operator--</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1aef3b5dfeb2cb04dc9d0a024fc1898b98" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>operator--</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1a0bf83ab08abe1ae4b51c790c85cdf151" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>operator-=</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1a901a95e6d73c9509d3dcde914f6c8a9d" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>operator&lt;</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1aae1e1e2ec0e229d1291d69de57d76bbe" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>operator==</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1a9d9b005906106e12aed738f97d7fee42" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>set_begin</name></member>
+      <member refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t_1ad26a823483846a12d890c3feed3097eb" prot="public" virt="non-virtual"><scope>nlohmann::detail::primitive_iterator_t</scope><name>set_end</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

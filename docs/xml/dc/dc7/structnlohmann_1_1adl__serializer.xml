@@ -1,0 +1,163 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="dc/dc7/structnlohmann_1_1adl__serializer" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::adl_serializer</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename ValueType</type>
+      </param>
+      <param>
+        <type>typename</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-static-func">
+      <memberdef kind="function" id="dc/dc7/structnlohmann_1_1adl__serializer_1a8180f52bf21fc610705bc521f22116ae" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename BasicJsonType</type>
+          </param>
+          <param>
+            <type>typename TargetType</type>
+            <defval>ValueType</defval>
+          </param>
+        </templateparamlist>
+        <type>auto</type>
+        <definition>static auto nlohmann::adl_serializer&lt; ValueType, typename &gt;::from_json</definition>
+        <argsstring>(BasicJsonType &amp;&amp;j, TargetType &amp;val) noexcept(noexcept(::nlohmann::from_json(std::forward&lt; BasicJsonType &gt;(j), val))) -&gt; decltype(::nlohmann::from_json(std::forward&lt; BasicJsonType &gt;(j), val), void())</argsstring>
+        <name>from_json</name>
+        <param>
+          <type>BasicJsonType &amp;&amp;</type>
+          <declname>j</declname>
+        </param>
+        <param>
+          <type>TargetType &amp;</type>
+          <declname>val</declname>
+        </param>
+        <briefdescription>
+<para>convert a JSON value to any value type </para>        </briefdescription>
+        <detaileddescription>
+<para>This function is usually called by the <computeroutput><ref refid="dc/df0/namespacenlohmann_1_1detail_1acc422c11342b31368f610b6f96fcedc6" kindref="member">get()</ref></computeroutput> function of the <ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">basic_json</ref> class (either explicit or via conversion operators).</para><para><simplesect kind="note"><para>This function is chosen for default-constructible value types.</para></simplesect>
+<parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">j</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON value to read from </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="inout">val</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>value to write to </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4863" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4863" bodyend="4868"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aef5c8ea108f4d2b03fb4a635617510de" compoundref="d5/db8/json_8hpp" startline="4231" endline="4246">nlohmann::detail::from_json</references>
+      </memberdef>
+      <memberdef kind="function" id="dc/dc7/structnlohmann_1_1adl__serializer_1a95eddeff6ff0dd0b6b11c4c7a526716d" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename BasicJsonType</type>
+          </param>
+          <param>
+            <type>typename TargetType</type>
+            <defval>ValueType</defval>
+          </param>
+        </templateparamlist>
+        <type>auto</type>
+        <definition>static auto nlohmann::adl_serializer&lt; ValueType, typename &gt;::from_json</definition>
+        <argsstring>(BasicJsonType &amp;&amp;j) noexcept(noexcept(::nlohmann::from_json(std::forward&lt; BasicJsonType &gt;(j), detail::identity_tag&lt; TargetType &gt; {}))) -&gt; decltype(::nlohmann::from_json(std::forward&lt; BasicJsonType &gt;(j), detail::identity_tag&lt; TargetType &gt;</argsstring>
+        <name>from_json</name>
+        <param>
+          <type>BasicJsonType &amp;&amp;</type>
+          <declname>j</declname>
+        </param>
+        <briefdescription>
+<para>convert a JSON value to any value type </para>        </briefdescription>
+        <detaileddescription>
+<para>This function is usually called by the <computeroutput><ref refid="dc/df0/namespacenlohmann_1_1detail_1acc422c11342b31368f610b6f96fcedc6" kindref="member">get()</ref></computeroutput> function of the <ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">basic_json</ref> class (either explicit or via conversion operators).</para><para><simplesect kind="note"><para>This function is chosen for value types which are not default-constructible.</para></simplesect>
+<parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">j</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON value to read from</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>copy of the JSON value, converted to <emphasis>ValueType</emphasis> </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4883" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4883" bodyend="4885"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aef5c8ea108f4d2b03fb4a635617510de" compoundref="d5/db8/json_8hpp" startline="4231" endline="4246">nlohmann::detail::from_json</references>
+      </memberdef>
+      <memberdef kind="function" id="dc/dc7/structnlohmann_1_1adl__serializer_1afdcc8f0204ce8ac7d28a5403f6e1f0e7" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename BasicJsonType</type>
+          </param>
+          <param>
+            <type>typename TargetType</type>
+            <defval>ValueType</defval>
+          </param>
+        </templateparamlist>
+        <type>auto</type>
+        <definition>static auto nlohmann::adl_serializer&lt; ValueType, typename &gt;::to_json</definition>
+        <argsstring>(BasicJsonType &amp;j, TargetType &amp;&amp;val) noexcept(noexcept(::nlohmann::to_json(j, std::forward&lt; TargetType &gt;(val)))) -&gt; decltype(::nlohmann::to_json(j, std::forward&lt; TargetType &gt;(val)), void())</argsstring>
+        <name>to_json</name>
+        <param>
+          <type>BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <param>
+          <type>TargetType &amp;&amp;</type>
+          <declname>val</declname>
+        </param>
+        <briefdescription>
+<para>convert any value type to a JSON value </para>        </briefdescription>
+        <detaileddescription>
+<para>This function is usually called by the constructors of the <ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">basic_json</ref> class.</para><para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="inout">j</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON value to write to </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">val</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>value to read from </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4900" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4900" bodyend="4905"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aaa77b0c9745130b77733a92a1a2e82ec" compoundref="d5/db8/json_8hpp" startline="4803" endline="4806">nlohmann::detail::to_json</references>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>default JSONSerializer template argument </para>    </briefdescription>
+    <detaileddescription>
+<para>This serializer ignores the template arguments and uses ADL (<ulink url="https://en.cppreference.com/w/cpp/language/adl">argument-dependent lookup</ulink>) for serialization. </para>    </detaileddescription>
+    <collaborationgraph>
+      <node id="1">
+        <label>nlohmann::adl_serializer&lt; ValueType, typename &gt;</label>
+        <link refid="dc/dc7/structnlohmann_1_1adl__serializer"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3353" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3353" bodyend="-1"/>
+    <listofallmembers>
+      <member refid="dc/dc7/structnlohmann_1_1adl__serializer_1a8180f52bf21fc610705bc521f22116ae" prot="public" virt="non-virtual"><scope>nlohmann::adl_serializer</scope><name>from_json</name></member>
+      <member refid="dc/dc7/structnlohmann_1_1adl__serializer_1a95eddeff6ff0dd0b6b11c4c7a526716d" prot="public" virt="non-virtual"><scope>nlohmann::adl_serializer</scope><name>from_json</name></member>
+      <member refid="dc/dc7/structnlohmann_1_1adl__serializer_1afdcc8f0204ce8ac7d28a5403f6e1f0e7" prot="public" virt="non-virtual"><scope>nlohmann::adl_serializer</scope><name>to_json</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

@@ -1,0 +1,94 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d6/d02/structnlohmann_1_1detail_1_1position__t" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::position_t</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+      <sectiondef kind="public-attrib">
+      <memberdef kind="variable" id="d6/d02/structnlohmann_1_1detail_1_1position__t_1a94cf85cd91d478c20ae143eba906ea1a" prot="public" static="no" mutable="no">
+        <type>std::size_t</type>
+        <definition>std::size_t nlohmann::detail::position_t::chars_read_total</definition>
+        <argsstring></argsstring>
+        <name>chars_read_total</name>
+        <initializer>= 0</initializer>
+        <briefdescription>
+<para>the total number of characters read </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2587" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2587" bodyend="-1"/>
+        <referencedby refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="d6/d02/structnlohmann_1_1detail_1_1position__t_1a74df94563dd32102152ceb8c6d9041d8" prot="public" static="no" mutable="no">
+        <type>std::size_t</type>
+        <definition>std::size_t nlohmann::detail::position_t::chars_read_current_line</definition>
+        <argsstring></argsstring>
+        <name>chars_read_current_line</name>
+        <initializer>= 0</initializer>
+        <briefdescription>
+<para>the number of characters read in the current line </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2589" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2589" bodyend="-1"/>
+        <referencedby refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1aefe74adeaa48781464ba2fd2ec63d221" compoundref="d5/db8/json_8hpp" startline="2813" endline="2817">nlohmann::detail::parse_error::position_string</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="d6/d02/structnlohmann_1_1detail_1_1position__t_1a4bbad8bc2c0d17c1b61c3ce729908b71" prot="public" static="no" mutable="no">
+        <type>std::size_t</type>
+        <definition>std::size_t nlohmann::detail::position_t::lines_read</definition>
+        <argsstring></argsstring>
+        <name>lines_read</name>
+        <initializer>= 0</initializer>
+        <briefdescription>
+<para>the number of lines read </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2591" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2591" bodyend="-1"/>
+        <referencedby refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1aefe74adeaa48781464ba2fd2ec63d221" compoundref="d5/db8/json_8hpp" startline="2813" endline="2817">nlohmann::detail::parse_error::position_string</referencedby>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d6/d02/structnlohmann_1_1detail_1_1position__t_1ac9ad1e0f143f162e2e0c979cd678d683" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr</type>
+        <definition>constexpr nlohmann::detail::position_t::operator size_t</definition>
+        <argsstring>() const</argsstring>
+        <name>operator size_t</name>
+        <briefdescription>
+<para>conversion to size_t to preserve SAX interface </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2594" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2594" bodyend="2597"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>struct to capture the start position of the current token </para>    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="947">
+        <label>size_t</label>
+      </node>
+      <node id="946">
+        <label>nlohmann::detail::position_t</label>
+        <link refid="d6/d02/structnlohmann_1_1detail_1_1position__t"/>
+        <childnode refid="947" relation="usage">
+          <edgelabel>+chars_read_total</edgelabel>
+          <edgelabel>+chars_read_current_line</edgelabel>
+          <edgelabel>+lines_read</edgelabel>
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2585" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2584" bodyend="2598"/>
+    <listofallmembers>
+      <member refid="d6/d02/structnlohmann_1_1detail_1_1position__t_1a74df94563dd32102152ceb8c6d9041d8" prot="public" virt="non-virtual"><scope>nlohmann::detail::position_t</scope><name>chars_read_current_line</name></member>
+      <member refid="d6/d02/structnlohmann_1_1detail_1_1position__t_1a94cf85cd91d478c20ae143eba906ea1a" prot="public" virt="non-virtual"><scope>nlohmann::detail::position_t</scope><name>chars_read_total</name></member>
+      <member refid="d6/d02/structnlohmann_1_1detail_1_1position__t_1a4bbad8bc2c0d17c1b61c3ce729908b71" prot="public" virt="non-virtual"><scope>nlohmann::detail::position_t</scope><name>lines_read</name></member>
+      <member refid="d6/d02/structnlohmann_1_1detail_1_1position__t_1ac9ad1e0f143f162e2e0c979cd678d683" prot="public" virt="non-virtual"><scope>nlohmann::detail::position_t</scope><name>operator size_t</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

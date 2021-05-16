@@ -12,7 +12,7 @@
 <para>Consider the following code snippet which showcases cudnnBackendTensor creation using the backend API and its equivalent front-end API code. Many among the backend constructs follow similar pattern.</para><para><programlisting><codeline><highlight class="normal">===========================================================================================</highlight></codeline>
 <codeline><highlight class="normal"></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>check_status<sp/>=<sp/>[](cudnnStatus_t<sp/>status)<sp/>{<sp/>assert<sp/>(status<sp/>==<sp/>CUDNN_STATUS_SUCCESS);<sp/>};</highlight></codeline>
 <codeline><highlight class="normal">===========================================================================================</highlight></codeline>
-<codeline><highlight class="normal"></highlight><highlight class="comment">//<sp/>Backend<sp/>code<sp/>for<sp/>Tensor<sp/>Creation.<sp/></highlight><highlight class="normal"></highlight></codeline>
+<codeline><highlight class="normal"></highlight><highlight class="comment">//<sp/>Backend<sp/>code<sp/>for<sp/>Tensor<sp/>Creation.</highlight><highlight class="normal"></highlight></codeline>
 <codeline><highlight class="normal">cudnnBackendDescriptor_t<sp/>tensor;</highlight></codeline>
 <codeline><highlight class="normal"></highlight></codeline>
 <codeline><highlight class="normal">check_status<sp/>(cudnnBackendCreateDescriptor(CUDNN_BACKEND_TENSOR_DESCRIPTOR,<sp/>&amp;tensor));</highlight></codeline>
@@ -46,7 +46,7 @@
 <codeline><highlight class="normal"></highlight></codeline>
 <codeline><highlight class="normal">check_status<sp/>(cudnnBackendDestroyDescriptor(tensor));</highlight></codeline>
 <codeline><highlight class="normal">===========================================================================================</highlight></codeline>
-<codeline><highlight class="normal"></highlight><highlight class="comment">//<sp/>FrontEnd<sp/>equivalent<sp/>code.<sp/></highlight><highlight class="normal"></highlight></codeline>
+<codeline><highlight class="normal"></highlight><highlight class="comment">//<sp/>FrontEnd<sp/>equivalent<sp/>code.</highlight><highlight class="normal"></highlight></codeline>
 <codeline><highlight class="normal"></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>tensor<sp/>=<sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a9fea2e22198aaf2ea11a0df46abd0749" kindref="member">cudnn_frontend::TensorBuilder</ref>()</highlight></codeline>
 <codeline><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>.<ref refid="d3/d3c/group__TensorBuilder__v8_1gae828806e2d76ca3eb6c4e289f2e93a96" kindref="member">setDim</ref>(tensor_dim.size(),<sp/>tensor_dim.data())</highlight></codeline>
 <codeline><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>.setStrides(tensor_str.size(),<sp/>tensor_str.data())</highlight></codeline>

@@ -18,6 +18,7 @@ var group__OperationBuilder__v8 =
     [ "setdyDesc", "d3/d92/group__OperationBuilder__v8.html#ga9e4a1e9a233b44cca5b65f0af172b001", null ],
     [ "setmatmulDesc", "d3/d92/group__OperationBuilder__v8.html#ga3ca1f62832f998566c1b07b4b3c71db4", null ],
     [ "setpwDesc", "d3/d92/group__OperationBuilder__v8.html#gae6b06877b2e675b2a390f0b122100669", null ],
+    [ "setreductionDesc", "d3/d92/group__OperationBuilder__v8.html#ga904279a29c2c5c949a0e487dd573ae0a", null ],
     [ "setwDesc", "d3/d92/group__OperationBuilder__v8.html#ga80466e517e980ba4953e085b3d4e3498", null ],
     [ "setxDesc", "d3/d92/group__OperationBuilder__v8.html#gaefa06fdaae3b28c6ef08a0189e2a3d3a", null ],
     [ "setxDesc", "d3/d92/group__OperationBuilder__v8.html#ga04c2492a5376f1a74a57fb49fa7b3599", null ],

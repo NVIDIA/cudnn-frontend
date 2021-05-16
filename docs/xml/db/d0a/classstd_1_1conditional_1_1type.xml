@@ -1,0 +1,32 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="db/d0a/classstd_1_1conditional_1_1type" kind="class" language="C++" prot="public">
+    <compoundname>std::conditional::type</compoundname>
+    <derivedcompoundref refid="d5/db0/structnlohmann_1_1detail_1_1conjunction_3_01B1_00_01Bn_8_8_8_01_4" prot="public" virt="non-virtual">nlohmann::detail::conjunction&lt; B1, Bn... &gt;</derivedcompoundref>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="1025">
+        <label>type</label>
+        <link refid="db/d0a/classstd_1_1conditional_1_1type"/>
+      </node>
+      <node id="1026">
+        <label>nlohmann::detail::conjunction&lt; B1, Bn... &gt;</label>
+        <link refid="d5/db0/structnlohmann_1_1detail_1_1conjunction_3_01B1_00_01Bn_8_8_8_01_4"/>
+        <childnode refid="1025" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="1027">
+        <label>type</label>
+        <link refid="db/d0a/classstd_1_1conditional_1_1type"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3553" column="1"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

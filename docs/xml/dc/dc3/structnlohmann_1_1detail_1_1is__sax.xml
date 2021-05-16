@@ -1,0 +1,150 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="dc/dc3/structnlohmann_1_1detail_1_1is__sax" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_sax</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename SAX</type>
+      </param>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="private-type">
+      <memberdef kind="typedef" id="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1aa9a29390ca9810cee149510f586f5573" prot="private" static="no">
+        <type>typename BasicJsonType::number_integer_t</type>
+        <definition>using nlohmann::detail::is_sax&lt; SAX, BasicJsonType &gt;::number_integer_t =  typename BasicJsonType::number_integer_t</definition>
+        <argsstring></argsstring>
+        <name>number_integer_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8123" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8123" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1a655c9b8038e51e5b9211e2419118644d" prot="private" static="no">
+        <type>typename BasicJsonType::number_unsigned_t</type>
+        <definition>using nlohmann::detail::is_sax&lt; SAX, BasicJsonType &gt;::number_unsigned_t =  typename BasicJsonType::number_unsigned_t</definition>
+        <argsstring></argsstring>
+        <name>number_unsigned_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8124" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8124" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1a58d3205c8d3c7a01cc330374fa7976c5" prot="private" static="no">
+        <type>typename BasicJsonType::number_float_t</type>
+        <definition>using nlohmann::detail::is_sax&lt; SAX, BasicJsonType &gt;::number_float_t =  typename BasicJsonType::number_float_t</definition>
+        <argsstring></argsstring>
+        <name>number_float_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8125" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8125" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1ad8e2e1427ff43536370b6db6ab83ae50" prot="private" static="no">
+        <type>typename BasicJsonType::string_t</type>
+        <definition>using nlohmann::detail::is_sax&lt; SAX, BasicJsonType &gt;::string_t =  typename BasicJsonType::string_t</definition>
+        <argsstring></argsstring>
+        <name>string_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8126" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8126" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1ae6abc30644e683c20f8c2c4d63834fb8" prot="private" static="no">
+        <type>typename BasicJsonType::binary_t</type>
+        <definition>using nlohmann::detail::is_sax&lt; SAX, BasicJsonType &gt;::binary_t =  typename BasicJsonType::binary_t</definition>
+        <argsstring></argsstring>
+        <name>binary_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8127" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8127" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1a6efa516f35d544cc8ce9a954f849fed1" prot="private" static="no">
+        <type>typename BasicJsonType::exception</type>
+        <definition>using nlohmann::detail::is_sax&lt; SAX, BasicJsonType &gt;::exception_t =  typename BasicJsonType::exception</definition>
+        <argsstring></argsstring>
+        <name>exception_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8128" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8128" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-static-attrib">
+      <memberdef kind="variable" id="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1a8ab7e51087000e948b4a2492257484dc" prot="public" static="yes" mutable="no">
+        <type>constexpr bool</type>
+        <definition>constexpr bool nlohmann::detail::is_sax&lt; SAX, BasicJsonType &gt;::value</definition>
+        <argsstring></argsstring>
+        <name>value</name>
+        <initializer>=
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;bool, <ref refid="dc/df0/namespacenlohmann_1_1detail_1ac1b4e524746bf8b790b2b776048b93c4" kindref="member">null_function_t</ref>, SAX&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;bool, <ref refid="dc/df0/namespacenlohmann_1_1detail_1a45ec87326503b8884b664a9ef23a6c99" kindref="member">boolean_function_t</ref>, SAX&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;bool, <ref refid="dc/df0/namespacenlohmann_1_1detail_1a4a3e14a011b9ea1ff849fc6d2411e6a0" kindref="member">number_integer_function_t</ref>, SAX, <ref refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1aa9a29390ca9810cee149510f586f5573" kindref="member">number_integer_t</ref>&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;bool, <ref refid="dc/df0/namespacenlohmann_1_1detail_1a74da7b17bda76f65d276feb18209c913" kindref="member">number_unsigned_function_t</ref>, SAX, <ref refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1a655c9b8038e51e5b9211e2419118644d" kindref="member">number_unsigned_t</ref>&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;bool, <ref refid="dc/df0/namespacenlohmann_1_1detail_1ad42df56e913abe26ed556e0e92f386f4" kindref="member">number_float_function_t</ref>, SAX, <ref refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1a58d3205c8d3c7a01cc330374fa7976c5" kindref="member">number_float_t</ref>, <ref refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1ad8e2e1427ff43536370b6db6ab83ae50" kindref="member">string_t</ref>&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;bool, <ref refid="dc/df0/namespacenlohmann_1_1detail_1a27c3fc3bd42ac406f763184aa8ae4cb0" kindref="member">string_function_t</ref>, SAX, <ref refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1ad8e2e1427ff43536370b6db6ab83ae50" kindref="member">string_t</ref>&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;bool, <ref refid="dc/df0/namespacenlohmann_1_1detail_1a4948bef216c2594dae7921d9c4045455" kindref="member">binary_function_t</ref>, SAX, <ref refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1ae6abc30644e683c20f8c2c4d63834fb8" kindref="member">binary_t</ref>&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;bool, <ref refid="dc/df0/namespacenlohmann_1_1detail_1a5fff1e6dcaabd367d9b1109a5682f9d4" kindref="member">start_object_function_t</ref>, SAX&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;bool, <ref refid="dc/df0/namespacenlohmann_1_1detail_1a44869ca9f422b260625d78e4e8121559" kindref="member">key_function_t</ref>, SAX, <ref refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1ad8e2e1427ff43536370b6db6ab83ae50" kindref="member">string_t</ref>&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;bool, <ref refid="dc/df0/namespacenlohmann_1_1detail_1af52d6d2521c386998ae940d118182ebc" kindref="member">end_object_function_t</ref>, SAX&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;bool, <ref refid="dc/df0/namespacenlohmann_1_1detail_1a80273cecc45765d7b2826ec931fbffdd" kindref="member">start_array_function_t</ref>, SAX&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;bool, <ref refid="dc/df0/namespacenlohmann_1_1detail_1aec53c029383b34a72182210e58fadb79" kindref="member">end_array_function_t</ref>, SAX&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;bool, <ref refid="dc/df0/namespacenlohmann_1_1detail_1a264d4d58bc1fd82bcc7bf6bf73d6acad" kindref="member">parse_error_function_t</ref>, SAX, <ref refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1a6efa516f35d544cc8ce9a954f849fed1" kindref="member">exception_t</ref>&gt;::value</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8131" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8131" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="657">
+        <label>nlohmann::detail::is_sax&lt; SAX, BasicJsonType &gt;</label>
+        <link refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax"/>
+        <childnode refid="658" relation="usage">
+          <edgelabel>+value</edgelabel>
+        </childnode>
+      </node>
+      <node id="658">
+        <label>bool</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8118" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8117" bodyend="8145"/>
+    <listofallmembers>
+      <member refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1ae6abc30644e683c20f8c2c4d63834fb8" prot="private" virt="non-virtual"><scope>nlohmann::detail::is_sax</scope><name>binary_t</name></member>
+      <member refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1a6efa516f35d544cc8ce9a954f849fed1" prot="private" virt="non-virtual"><scope>nlohmann::detail::is_sax</scope><name>exception_t</name></member>
+      <member refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1a58d3205c8d3c7a01cc330374fa7976c5" prot="private" virt="non-virtual"><scope>nlohmann::detail::is_sax</scope><name>number_float_t</name></member>
+      <member refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1aa9a29390ca9810cee149510f586f5573" prot="private" virt="non-virtual"><scope>nlohmann::detail::is_sax</scope><name>number_integer_t</name></member>
+      <member refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1a655c9b8038e51e5b9211e2419118644d" prot="private" virt="non-virtual"><scope>nlohmann::detail::is_sax</scope><name>number_unsigned_t</name></member>
+      <member refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1ad8e2e1427ff43536370b6db6ab83ae50" prot="private" virt="non-virtual"><scope>nlohmann::detail::is_sax</scope><name>string_t</name></member>
+      <member refid="dc/dc3/structnlohmann_1_1detail_1_1is__sax_1a8ab7e51087000e948b4a2492257484dc" prot="public" virt="non-virtual"><scope>nlohmann::detail::is_sax</scope><name>value</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

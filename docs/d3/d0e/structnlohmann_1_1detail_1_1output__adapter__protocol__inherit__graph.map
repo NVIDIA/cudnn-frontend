@@ -1,0 +1,5 @@
+<map id="nlohmann::detail::output_adapter_protocol&lt; CharType &gt;" name="nlohmann::detail::output_adapter_protocol&lt; CharType &gt;">
+<area shape="rect" id="node2" href="$d8/d94/classnlohmann_1_1detail_1_1output__stream__adapter.html" title="output adapter for output streams " alt="" coords="5,248,205,369"/>
+<area shape="rect" id="node3" href="$d2/d39/classnlohmann_1_1detail_1_1output__string__adapter.html" title="output adapter for basic_string " alt="" coords="229,248,421,369"/>
+<area shape="rect" id="node4" href="$d5/d66/classnlohmann_1_1detail_1_1output__vector__adapter.html" title="output adapter for byte vectors " alt="" coords="446,248,642,369"/>
+</map>

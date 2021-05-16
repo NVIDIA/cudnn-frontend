@@ -1,0 +1,5 @@
+var structnlohmann_1_1detail_1_1is__constructible__object__type__impl_3_01BasicJsonType_00_01Construa4d1e16800f2c4963485512ecf18377c =
+[
+    [ "object_t", "d2/d51/structnlohmann_1_1detail_1_1is__constructible__object__type__impl_3_01BasicJsonType_00_01Construa4d1e16800f2c4963485512ecf18377c.html#ae335fdc59d1b0d79e52a808b71b11c67", null ],
+    [ "value", "d2/d51/structnlohmann_1_1detail_1_1is__constructible__object__type__impl_3_01BasicJsonType_00_01Construa4d1e16800f2c4963485512ecf18377c.html#a50418a0a88d63afbf7246af49f3e554c", null ]
+];

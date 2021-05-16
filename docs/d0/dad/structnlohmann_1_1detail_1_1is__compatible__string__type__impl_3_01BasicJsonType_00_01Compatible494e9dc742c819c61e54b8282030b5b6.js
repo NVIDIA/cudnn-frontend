@@ -1,0 +1,4 @@
+var structnlohmann_1_1detail_1_1is__compatible__string__type__impl_3_01BasicJsonType_00_01Compatible494e9dc742c819c61e54b8282030b5b6 =
+[
+    [ "value", "d0/dad/structnlohmann_1_1detail_1_1is__compatible__string__type__impl_3_01BasicJsonType_00_01Compatible494e9dc742c819c61e54b8282030b5b6.html#adac1e17a2ddf9ac94be736e96e8943a9", null ]
+];

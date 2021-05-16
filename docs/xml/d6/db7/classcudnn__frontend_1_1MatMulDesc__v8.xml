@@ -145,55 +145,55 @@
 <listitem><para>math_precision</para></listitem></itemizedlist>
 </para><para>Use <ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref> to build this class. Describe returns a string describing the MatMul operation </para>    </detaileddescription>
     <inheritancegraph>
-      <node id="196">
+      <node id="773">
         <label>cudnn_frontend::MatMulDesc_v8</label>
         <link refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8"/>
-        <childnode refid="197" relation="public-inheritance">
+        <childnode refid="774" relation="public-inheritance">
         </childnode>
       </node>
-      <node id="197">
+      <node id="774">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
       </node>
     </inheritancegraph>
     <collaborationgraph>
-      <node id="202">
+      <node id="779">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="203">
+      <node id="780">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="201">
+      <node id="778">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="204">
+      <node id="781">
         <label>cudnnDataType_t</label>
       </node>
-      <node id="198">
+      <node id="775">
         <label>cudnn_frontend::MatMulDesc_v8</label>
         <link refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8"/>
-        <childnode refid="199" relation="public-inheritance">
+        <childnode refid="776" relation="public-inheritance">
         </childnode>
-        <childnode refid="204" relation="usage">
+        <childnode refid="781" relation="usage">
           <edgelabel>-math_precision</edgelabel>
         </childnode>
       </node>
-      <node id="199">
+      <node id="776">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="200" relation="usage">
+        <childnode refid="777" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="202" relation="usage">
+        <childnode refid="779" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="203" relation="usage">
+        <childnode refid="780" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="200">
+      <node id="777">
         <label>std::string</label>
-        <childnode refid="201" relation="public-inheritance">
+        <childnode refid="778" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>

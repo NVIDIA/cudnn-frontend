@@ -1,0 +1,190 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="de/d77/classnlohmann_1_1detail_1_1lexer__base" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::lexer_base</compoundname>
+    <derivedcompoundref refid="d8/d22/classnlohmann_1_1detail_1_1lexer" prot="public" virt="non-virtual">nlohmann::detail::lexer&lt; BasicJsonType, InputAdapterType &gt;</derivedcompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="enum" id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454" prot="public" static="no">
+        <name>token_type</name>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454a42dd1a73d072bb6bf3f494f22b15db8e" prot="public">
+          <name>uninitialized</name>
+          <briefdescription>
+<para>indicating the scanner is uninitialized </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454a85cc1a37b0aaa52de40e72f0ed4e0c0d" prot="public">
+          <name>literal_true</name>
+          <briefdescription>
+<para>the <computeroutput>true</computeroutput> literal </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454afab1694b1b3937a079f4625fe0b6108b" prot="public">
+          <name>literal_false</name>
+          <briefdescription>
+<para>the <computeroutput>false</computeroutput> literal </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454ab7ae4c0e46d86f884677768160b26e9e" prot="public">
+          <name>literal_null</name>
+          <briefdescription>
+<para>the <computeroutput>null</computeroutput> literal </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454a2b490e8bf366b4cbe3ebd99b26ce15ce" prot="public">
+          <name>value_string</name>
+          <briefdescription>
+<para>a string <ndash/> use get_string() for actual value </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454aaf1f040fcd2f674d2e5893d7a731078f" prot="public">
+          <name>value_unsigned</name>
+          <briefdescription>
+<para>an unsigned integer <ndash/> use get_number_unsigned() for actual value </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454a5064b6655d88a50ae16665cf7751c0ee" prot="public">
+          <name>value_integer</name>
+          <briefdescription>
+<para>a signed integer <ndash/> use get_number_integer() for actual value </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454a0d2671a6f81efb91e77f6ac3bdb11443" prot="public">
+          <name>value_float</name>
+          <briefdescription>
+<para>an floating point number <ndash/> use get_number_float() for actual value </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454a16c226b4425b68560fea322b46dabe01" prot="public">
+          <name>begin_array</name>
+          <briefdescription>
+<para>the character for array begin <computeroutput>[</computeroutput> </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454a9a9ffd53b6869d4eca271b1ed5b57fe8" prot="public">
+          <name>begin_object</name>
+          <briefdescription>
+<para>the character for object begin <computeroutput>{</computeroutput> </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454a2f3e68e7f111a1e5c7728742b3ca2b7f" prot="public">
+          <name>end_array</name>
+          <briefdescription>
+<para>the character for array end <computeroutput>]</computeroutput> </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454a7d5b4427866814de4d8f132721d59c87" prot="public">
+          <name>end_object</name>
+          <briefdescription>
+<para>the character for object end <computeroutput>}</computeroutput> </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454acc3c64f8ae08c00de1b33f19a4d2913a" prot="public">
+          <name>name_separator</name>
+          <briefdescription>
+<para>the name separator <computeroutput>:</computeroutput> </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454a745373036100d7392ad62c617cab59af" prot="public">
+          <name>value_separator</name>
+          <briefdescription>
+<para>the value separator <computeroutput>,</computeroutput> </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454a456e19aeafa334241c7ff3f589547f9d" prot="public">
+          <name>parse_error</name>
+          <briefdescription>
+<para>indicating a parse error </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454aca11f56dd477c09e06583dbdcda0985f" prot="public">
+          <name>end_of_input</name>
+          <briefdescription>
+<para>indicating the end of the input buffer </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <enumvalue id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454ad2a8e6f6721cccec0b466301dd9495a5" prot="public">
+          <name>literal_or_value</name>
+          <briefdescription>
+<para>a literal or the begin of a value (only for diagnostics) </para>          </briefdescription>
+          <detaileddescription>
+          </detaileddescription>
+        </enumvalue>
+        <briefdescription>
+<para>token types for the parser </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6454" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6453" bodyend="6472"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-static-func">
+      <memberdef kind="function" id="de/d77/classnlohmann_1_1detail_1_1lexer__base_1ad214d59300605f9d3a4a32c8917aa608" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d5/db8/json_8hpp_1a5f2aaec3b681d0a72f7d6e90b70cdcd1" kindref="member">JSON_HEDLEY_RETURNS_NON_NULL</ref> static <ref refid="d5/db8/json_8hpp_1a0d17bf1a54fc45a04ced6d3aa86a96e3" kindref="member">JSON_HEDLEY_CONST</ref> const char *</type>
+        <definition>JSON_HEDLEY_RETURNS_NON_NULL static JSON_HEDLEY_CONST const char* nlohmann::detail::lexer_base&lt; BasicJsonType &gt;::token_type_name</definition>
+        <argsstring>(const token_type t) noexcept</argsstring>
+        <name>token_type_name</name>
+        <param>
+          <type>const <ref refid="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454" kindref="member">token_type</ref></type>
+          <declname>t</declname>
+        </param>
+        <briefdescription>
+<para>return name of values of type token_type (only used for errors) </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6477" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6477" bodyend="6518"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="769">
+        <label>nlohmann::detail::lexer&lt; BasicJsonType &gt;</label>
+        <link refid="d8/d22/classnlohmann_1_1detail_1_1lexer"/>
+        <childnode refid="768" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="768">
+        <label>nlohmann::detail::lexer_base&lt; BasicJsonType &gt;</label>
+        <link refid="de/d77/classnlohmann_1_1detail_1_1lexer__base"/>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="770">
+        <label>nlohmann::detail::lexer_base&lt; BasicJsonType &gt;</label>
+        <link refid="de/d77/classnlohmann_1_1detail_1_1lexer__base"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="6450" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="6449" bodyend="6519"/>
+    <listofallmembers>
+      <member refid="de/d77/classnlohmann_1_1detail_1_1lexer__base_1aa3538cce439a2de6c7893e627b38c454" prot="public" virt="non-virtual"><scope>nlohmann::detail::lexer_base</scope><name>token_type</name></member>
+      <member refid="de/d77/classnlohmann_1_1detail_1_1lexer__base_1ad214d59300605f9d3a4a32c8917aa608" prot="public" virt="non-virtual"><scope>nlohmann::detail::lexer_base</scope><name>token_type_name</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

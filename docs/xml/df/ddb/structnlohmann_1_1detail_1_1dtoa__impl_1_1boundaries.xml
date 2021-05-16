@@ -1,0 +1,94 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::dtoa_impl::boundaries</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+      <sectiondef kind="public-attrib">
+      <memberdef kind="variable" id="df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries_1ad1668c60aeade5f2557fafed8b8aee1a" prot="public" static="no" mutable="no">
+        <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+        <definition>diyfp nlohmann::detail::dtoa_impl::boundaries::w</definition>
+        <argsstring></argsstring>
+        <name>w</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15017" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15017" bodyend="-1"/>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1aab7a9670a4f4704a5d0347ad7588576b" compoundref="d5/db8/json_8hpp" startline="15728" endline="15759">nlohmann::detail::dtoa_impl::grisu2</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries_1aec4e5028333c01f3229062f31ce16763" prot="public" static="no" mutable="no">
+        <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+        <definition>diyfp nlohmann::detail::dtoa_impl::boundaries::minus</definition>
+        <argsstring></argsstring>
+        <name>minus</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15018" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15018" bodyend="-1"/>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1aab7a9670a4f4704a5d0347ad7588576b" compoundref="d5/db8/json_8hpp" startline="15728" endline="15759">nlohmann::detail::dtoa_impl::grisu2</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries_1a3321ae2816a6ec5250a0d8e29f798232" prot="public" static="no" mutable="no">
+        <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+        <definition>diyfp nlohmann::detail::dtoa_impl::boundaries::plus</definition>
+        <argsstring></argsstring>
+        <name>plus</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15019" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15019" bodyend="-1"/>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1aab7a9670a4f4704a5d0347ad7588576b" compoundref="d5/db8/json_8hpp" startline="15728" endline="15759">nlohmann::detail::dtoa_impl::grisu2</referencedby>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="55">
+        <label>static constexpr int</label>
+      </node>
+      <node id="54">
+        <label>nlohmann::detail::dtoa_impl::diyfp</label>
+        <link refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp"/>
+        <childnode refid="55" relation="usage">
+          <edgelabel>+kPrecision</edgelabel>
+        </childnode>
+        <childnode refid="56" relation="usage">
+          <edgelabel>+f</edgelabel>
+        </childnode>
+        <childnode refid="57" relation="usage">
+          <edgelabel>+e</edgelabel>
+        </childnode>
+      </node>
+      <node id="56">
+        <label>uint64_t</label>
+      </node>
+      <node id="57">
+        <label>int</label>
+      </node>
+      <node id="53">
+        <label>nlohmann::detail::dtoa_impl::boundaries</label>
+        <link refid="df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries"/>
+        <childnode refid="54" relation="usage">
+          <edgelabel>+minus</edgelabel>
+          <edgelabel>+plus</edgelabel>
+          <edgelabel>+w</edgelabel>
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15016" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15015" bodyend="15020"/>
+    <listofallmembers>
+      <member refid="df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries_1aec4e5028333c01f3229062f31ce16763" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::boundaries</scope><name>minus</name></member>
+      <member refid="df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries_1a3321ae2816a6ec5250a0d8e29f798232" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::boundaries</scope><name>plus</name></member>
+      <member refid="df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries_1ad1668c60aeade5f2557fafed8b8aee1a" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::boundaries</scope><name>w</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

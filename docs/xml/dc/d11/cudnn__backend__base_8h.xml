@@ -82,7 +82,7 @@
         <childnode refid="14" relation="include">
         </childnode>
       </node>
-      <node id="17">
+      <node id="18">
         <label>cudnn_frontend_Tensor.h</label>
         <link refid="d3/d98/cudnn__frontend__Tensor_8h"/>
         <childnode refid="9" relation="include">
@@ -106,7 +106,7 @@
         <childnode refid="8" relation="include">
         </childnode>
       </node>
-      <node id="18">
+      <node id="19">
         <label>cudnn_frontend_VariantPack.h</label>
         <link refid="df/dc0/cudnn__frontend__VariantPack_8h"/>
         <childnode refid="5" relation="include">
@@ -129,6 +129,8 @@
         </childnode>
         <childnode refid="17" relation="include">
         </childnode>
+        <childnode refid="18" relation="include">
+        </childnode>
         <childnode refid="9" relation="include">
         </childnode>
         <childnode refid="10" relation="include">
@@ -141,7 +143,13 @@
         </childnode>
         <childnode refid="14" relation="include">
         </childnode>
-        <childnode refid="18" relation="include">
+        <childnode refid="19" relation="include">
+        </childnode>
+      </node>
+      <node id="17">
+        <label>cudnn_frontend_ReductionDesc.h</label>
+        <link refid="db/da7/cudnn__frontend__ReductionDesc_8h"/>
+        <childnode refid="9" relation="include">
         </childnode>
       </node>
       <node id="7">
@@ -201,7 +209,7 @@
 <codeline lineno="41"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1adf5bf20f5bdfbfdecd05360830b34b89" kindref="member">operator=</ref>(</highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref>&amp;)<sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
 <codeline lineno="42"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a42a928eb5b2524d1c3f67b7200dd53c9" kindref="member">OpaqueBackendPointer</ref>(<ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref>&amp;&amp;)<sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
 <codeline lineno="43"><highlight class="normal"></highlight></codeline>
-<codeline lineno="48" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aadf0c53d7aedb1c6c121b2736e98b2dd" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aadf0c53d7aedb1c6c121b2736e98b2dd" kindref="member">OpaqueBackendPointer</ref>(cudnnBackendDescriptorType_t<sp/>type)<sp/>{<sp/>status<sp/>=<sp/>cudnnBackendCreateDescriptor(type,<sp/>&amp;m_desc);<sp/>}</highlight></codeline>
+<codeline lineno="48" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aadf0c53d7aedb1c6c121b2736e98b2dd" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aadf0c53d7aedb1c6c121b2736e98b2dd" kindref="member">OpaqueBackendPointer</ref>(cudnnBackendDescriptorType_t<sp/><ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref>)<sp/>{<sp/>status<sp/>=<sp/>cudnnBackendCreateDescriptor(type,<sp/>&amp;m_desc);<sp/>}</highlight></codeline>
 <codeline lineno="53" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a9f549dd95873ac3a02689ef97f4a6c75" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a9f549dd95873ac3a02689ef97f4a6c75" kindref="member">~OpaqueBackendPointer</ref>()<sp/>{<sp/>cudnnBackendDestroyDescriptor(m_desc);<sp/>};</highlight></codeline>
 <codeline lineno="59"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnBackendDescriptor_t<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal">&amp;</highlight></codeline>
 <codeline lineno="60" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1ac1700c7d96af0250e5721f5e5f9d95bc" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1ac1700c7d96af0250e5721f5e5f9d95bc" kindref="member">get_backend_descriptor</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
@@ -220,7 +228,7 @@
 <codeline lineno="82" refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" refkind="member"><highlight class="keyword">using</highlight><highlight class="normal"><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref><sp/>=<sp/>std::shared_ptr&lt;OpaqueBackendPointer&gt;;</highlight></codeline>
 <codeline lineno="83"><highlight class="normal"></highlight></codeline>
 <codeline lineno="85"><highlight class="keyword">static</highlight><highlight class="normal"><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref></highlight></codeline>
-<codeline lineno="86" refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" kindref="member">make_shared_backend_pointer</ref>(cudnnBackendDescriptorType_t<sp/>type)<sp/>{</highlight></codeline>
+<codeline lineno="86" refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" kindref="member">make_shared_backend_pointer</ref>(cudnnBackendDescriptorType_t<sp/><ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref>)<sp/>{</highlight></codeline>
 <codeline lineno="87"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::make_shared&lt;OpaqueBackendPointer&gt;(type);</highlight></codeline>
 <codeline lineno="88"><highlight class="normal">}</highlight></codeline>
 <codeline lineno="89"><highlight class="normal"></highlight></codeline>
@@ -260,7 +268,7 @@
 <codeline lineno="138"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
 <codeline lineno="139"><highlight class="normal"></highlight></codeline>
 <codeline lineno="141"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnStatus_t</highlight></codeline>
-<codeline lineno="142" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" kindref="member">initialize_managed_backend_pointer</ref>(cudnnBackendDescriptorType_t<sp/>type)<sp/>{</highlight></codeline>
+<codeline lineno="142" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" kindref="member">initialize_managed_backend_pointer</ref>(cudnnBackendDescriptorType_t<sp/><ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref>)<sp/>{</highlight></codeline>
 <codeline lineno="143"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>pointer<sp/>=<sp/><ref refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" kindref="member">make_shared_backend_pointer</ref>(type);</highlight></codeline>
 <codeline lineno="144"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>pointer-&gt;get_status();</highlight></codeline>
 <codeline lineno="145"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>

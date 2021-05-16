@@ -1,0 +1,51 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d2/d5f/structnlohmann_1_1detail_1_1utility__internal_1_1Extend_3_01integer__sequence_3_01T_00_01Ints_8_011635d85b816e1c1a7e948fa832c519" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::utility_internal::Extend&lt; integer_sequence&lt; T, Ints... &gt;, SeqSize, 1 &gt;</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename T</type>
+      </param>
+      <param>
+        <type>T...</type>
+        <declname>Ints</declname>
+        <defname>Ints</defname>
+      </param>
+      <param>
+        <type>size_t</type>
+        <declname>SeqSize</declname>
+        <defname>SeqSize</defname>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="d2/d5f/structnlohmann_1_1detail_1_1utility__internal_1_1Extend_3_01integer__sequence_3_01T_00_01Ints_8_011635d85b816e1c1a7e948fa832c519_1a92558ed5df85e65e1a68ec1de14e2a7c" prot="public" static="no">
+        <type><ref refid="d9/d1c/structnlohmann_1_1detail_1_1integer__sequence" kindref="compound">integer_sequence</ref>&lt; T, Ints...,(Ints+SeqSize)..., 2 *SeqSize &gt;</type>
+        <definition>using nlohmann::detail::utility_internal::Extend&lt; integer_sequence&lt; T, Ints... &gt;, SeqSize, 1 &gt;::type =  integer_sequence &lt; T, Ints..., (Ints + SeqSize)..., 2 * SeqSize &gt;</definition>
+        <argsstring></argsstring>
+        <name>type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3108" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3108" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="297">
+        <label>nlohmann::detail::utility_internal::Extend&lt; integer_sequence&lt; T, Ints... &gt;, SeqSize, 1 &gt;</label>
+        <link refid="d2/d5f/structnlohmann_1_1detail_1_1utility__internal_1_1Extend_3_01integer__sequence_3_01T_00_01Ints_8_011635d85b816e1c1a7e948fa832c519"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3107" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3106" bodyend="3109"/>
+    <listofallmembers>
+      <member refid="d2/d5f/structnlohmann_1_1detail_1_1utility__internal_1_1Extend_3_01integer__sequence_3_01T_00_01Ints_8_011635d85b816e1c1a7e948fa832c519_1a92558ed5df85e65e1a68ec1de14e2a7c" prot="public" virt="non-virtual"><scope>nlohmann::detail::utility_internal::Extend&lt; integer_sequence&lt; T, Ints... &gt;, SeqSize, 1 &gt;</scope><name>type</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

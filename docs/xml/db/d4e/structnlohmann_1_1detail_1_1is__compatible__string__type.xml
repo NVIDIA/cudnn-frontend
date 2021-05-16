@@ -1,0 +1,75 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="db/d4e/structnlohmann_1_1detail_1_1is__compatible__string__type" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_compatible_string_type</compoundname>
+    <basecompoundref refid="d2/d3a/structnlohmann_1_1detail_1_1is__compatible__string__type__impl" prot="public" virt="non-virtual">nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, ConstructibleStringType &gt;</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+      <param>
+        <type>typename ConstructibleStringType</type>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="435">
+        <label>false_type</label>
+      </node>
+      <node id="434">
+        <label>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, ConstructibleStringType &gt;</label>
+        <link refid="d2/d3a/structnlohmann_1_1detail_1_1is__compatible__string__type__impl"/>
+        <childnode refid="435" relation="public-inheritance">
+        </childnode>
+        <childnode refid="436" relation="template-instance">
+          <edgelabel>&lt; BasicJsonType, ConstructibleStringType &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="433">
+        <label>nlohmann::detail::is_compatible_string_type&lt; BasicJsonType, ConstructibleStringType &gt;</label>
+        <link refid="db/d4e/structnlohmann_1_1detail_1_1is__compatible__string__type"/>
+        <childnode refid="434" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="436">
+        <label>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, CompatibleStringType, typename &gt;</label>
+        <link refid="d2/d3a/structnlohmann_1_1detail_1_1is__compatible__string__type__impl"/>
+        <childnode refid="435" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="439">
+        <label>false_type</label>
+      </node>
+      <node id="438">
+        <label>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, ConstructibleStringType &gt;</label>
+        <link refid="d2/d3a/structnlohmann_1_1detail_1_1is__compatible__string__type__impl"/>
+        <childnode refid="439" relation="public-inheritance">
+        </childnode>
+        <childnode refid="440" relation="template-instance">
+          <edgelabel>&lt; BasicJsonType, ConstructibleStringType &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="437">
+        <label>nlohmann::detail::is_compatible_string_type&lt; BasicJsonType, ConstructibleStringType &gt;</label>
+        <link refid="db/d4e/structnlohmann_1_1detail_1_1is__compatible__string__type"/>
+        <childnode refid="438" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="440">
+        <label>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, CompatibleStringType, typename &gt;</label>
+        <link refid="d2/d3a/structnlohmann_1_1detail_1_1is__compatible__string__type__impl"/>
+        <childnode refid="439" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3695" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3694" bodyend="3695"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

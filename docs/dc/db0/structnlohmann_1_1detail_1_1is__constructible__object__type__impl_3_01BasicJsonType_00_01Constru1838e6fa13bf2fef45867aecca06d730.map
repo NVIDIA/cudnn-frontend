@@ -1,0 +1,2 @@
+<map id="nlohmann::detail::is_constructible_object_type_impl&lt; BasicJsonType, ConstructibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, ConstructibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, ConstructibleObjectType &gt;::value &gt; &gt;" name="nlohmann::detail::is_constructible_object_type_impl&lt; BasicJsonType, ConstructibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, ConstructibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, ConstructibleObjectType &gt;::value &gt; &gt;">
+</map>

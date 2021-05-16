@@ -153,6 +153,7 @@
         <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aff824fb1cf44c188a7400b017458327e" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="110">padLower</references>
         <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a28e6ad906bf25653c87525f9f8e90a28" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="111">padUpper</references>
         <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac513728c785a54ef86612a0bd6fa0f1a" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="113">stride</references>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
       </memberdef>
       <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type></type>
@@ -250,71 +251,71 @@
 <listitem><para>padLower</para></listitem><listitem><para>padUpper</para></listitem><listitem><para>Dilation</para></listitem><listitem><para>Stride</para></listitem><listitem><para>Math Operation Data Type</para></listitem><listitem><para>Convolution Mode</para></listitem><listitem><para>Convolution spatial dimensions</para></listitem></itemizedlist>
 </para><para>Use <ref refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8" kindref="compound">ConvDescBuilder_v8</ref> to build this class. Describe returns a string describing the convolution operation </para>    </detaileddescription>
     <inheritancegraph>
-      <node id="18">
+      <node id="96">
         <label>cudnn_frontend::ConvDesc_v8</label>
         <link refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8"/>
-        <childnode refid="19" relation="public-inheritance">
+        <childnode refid="97" relation="public-inheritance">
         </childnode>
       </node>
-      <node id="19">
+      <node id="97">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
       </node>
     </inheritancegraph>
     <collaborationgraph>
-      <node id="24">
+      <node id="102">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="27">
+      <node id="105">
         <label>cudnnConvolutionMode_t</label>
       </node>
-      <node id="20">
+      <node id="98">
         <label>cudnn_frontend::ConvDesc_v8</label>
         <link refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8"/>
-        <childnode refid="21" relation="public-inheritance">
+        <childnode refid="99" relation="public-inheritance">
         </childnode>
-        <childnode refid="26" relation="usage">
+        <childnode refid="104" relation="usage">
           <edgelabel>-padUpper</edgelabel>
           <edgelabel>-nDims</edgelabel>
           <edgelabel>-stride</edgelabel>
           <edgelabel>-dilation</edgelabel>
           <edgelabel>-padLower</edgelabel>
         </childnode>
-        <childnode refid="27" relation="usage">
+        <childnode refid="105" relation="usage">
           <edgelabel>-mode</edgelabel>
         </childnode>
-        <childnode refid="28" relation="usage">
+        <childnode refid="106" relation="usage">
           <edgelabel>-data_type</edgelabel>
         </childnode>
       </node>
-      <node id="25">
+      <node id="103">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="23">
+      <node id="101">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="28">
+      <node id="106">
         <label>cudnnDataType_t</label>
       </node>
-      <node id="26">
+      <node id="104">
         <label>int64_t</label>
       </node>
-      <node id="21">
+      <node id="99">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="22" relation="usage">
+        <childnode refid="100" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="24" relation="usage">
+        <childnode refid="102" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="25" relation="usage">
+        <childnode refid="103" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="22">
+      <node id="100">
         <label>std::string</label>
-        <childnode refid="23" relation="public-inheritance">
+        <childnode refid="101" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>

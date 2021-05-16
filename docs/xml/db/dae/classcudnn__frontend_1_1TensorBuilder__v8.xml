@@ -227,66 +227,66 @@
     <detaileddescription>
 <para><ref refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8" kindref="compound">TensorBuilder_v8</ref> Class Helper class used to build <ref refid="d6/da7/classcudnn__frontend_1_1Tensor__v8" kindref="compound">Tensor_v8</ref> class </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="317">
+      <node id="1012">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="312">
+      <node id="1007">
         <label>cudnn_frontend::TensorBuilder_v8</label>
         <link refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8"/>
-        <childnode refid="313" relation="usage">
+        <childnode refid="1008" relation="usage">
           <edgelabel>-m_tensor</edgelabel>
         </childnode>
       </node>
-      <node id="318">
+      <node id="1013">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="316">
+      <node id="1011">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="321">
+      <node id="1016">
         <label>cudnnDataType_t</label>
       </node>
-      <node id="320">
+      <node id="1015">
         <label>bool</label>
       </node>
-      <node id="319">
+      <node id="1014">
         <label>int64_t</label>
       </node>
-      <node id="313">
+      <node id="1008">
         <label>cudnn_frontend::Tensor_v8</label>
         <link refid="d6/da7/classcudnn__frontend_1_1Tensor__v8"/>
-        <childnode refid="314" relation="public-inheritance">
+        <childnode refid="1009" relation="public-inheritance">
         </childnode>
-        <childnode refid="319" relation="usage">
+        <childnode refid="1014" relation="usage">
           <edgelabel>-btensor_dimA</edgelabel>
           <edgelabel>-nDims</edgelabel>
           <edgelabel>-id</edgelabel>
           <edgelabel>-alignment</edgelabel>
           <edgelabel>-btensor_strA</edgelabel>
         </childnode>
-        <childnode refid="320" relation="usage">
+        <childnode refid="1015" relation="usage">
           <edgelabel>-isVirtual</edgelabel>
         </childnode>
-        <childnode refid="321" relation="usage">
+        <childnode refid="1016" relation="usage">
           <edgelabel>-data_type</edgelabel>
         </childnode>
       </node>
-      <node id="314">
+      <node id="1009">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="315" relation="usage">
+        <childnode refid="1010" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="317" relation="usage">
+        <childnode refid="1012" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="318" relation="usage">
+        <childnode refid="1013" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="315">
+      <node id="1010">
         <label>std::string</label>
-        <childnode refid="316" relation="public-inheritance">
+        <childnode refid="1011" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>

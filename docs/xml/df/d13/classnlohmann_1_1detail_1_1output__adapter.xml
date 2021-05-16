@@ -1,0 +1,126 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="df/d13/classnlohmann_1_1detail_1_1output__adapter" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::output_adapter</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename</type>
+        <declname>CharType</declname>
+        <defname>CharType</defname>
+      </param>
+      <param>
+        <type>typename</type>
+        <declname>StringType</declname>
+        <defname>StringType</defname>
+        <defval>std::basic_string&lt;CharType&gt;</defval>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="df/d13/classnlohmann_1_1detail_1_1output__adapter_1a323c18d74d6680faafec6dc3ace825e2" prot="private" static="no" mutable="no">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a9b680ddfb58f27eb53a67229447fc556" kindref="member">output_adapter_t</ref>&lt; CharType &gt;</type>
+        <definition>output_adapter_t&lt;CharType&gt; nlohmann::detail::output_adapter&lt; CharType, StringType &gt;::oa</definition>
+        <argsstring></argsstring>
+        <name>oa</name>
+        <initializer>= nullptr</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13244" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13244" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="df/d13/classnlohmann_1_1detail_1_1output__adapter_1a05a30a77b568fd84676078d938cbd484" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::output_adapter&lt; CharType, StringType &gt;::output_adapter</definition>
+        <argsstring>(std::vector&lt; CharType &gt; &amp;vec)</argsstring>
+        <name>output_adapter</name>
+        <param>
+          <type>std::vector&lt; CharType &gt; &amp;</type>
+          <declname>vec</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13229" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13229" bodyend="13230"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d13/classnlohmann_1_1detail_1_1output__adapter_1a43b3ba852e6a2c3f4d312543bb04c00d" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::output_adapter&lt; CharType, StringType &gt;::output_adapter</definition>
+        <argsstring>(std::basic_ostream&lt; CharType &gt; &amp;s)</argsstring>
+        <name>output_adapter</name>
+        <param>
+          <type>std::basic_ostream&lt; CharType &gt; &amp;</type>
+          <declname>s</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13232" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13232" bodyend="13233"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d13/classnlohmann_1_1detail_1_1output__adapter_1a6ad59d1ec534383b430cd7ef8a518539" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::output_adapter&lt; CharType, StringType &gt;::output_adapter</definition>
+        <argsstring>(StringType &amp;s)</argsstring>
+        <name>output_adapter</name>
+        <param>
+          <type>StringType &amp;</type>
+          <declname>s</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13235" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13235" bodyend="13236"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d13/classnlohmann_1_1detail_1_1output__adapter_1a5fdac7aec8ade2f4bb0b5df30550d90c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::output_adapter&lt; CharType, StringType &gt;::operator output_adapter_t&lt; CharType &gt;</definition>
+        <argsstring>()</argsstring>
+        <name>operator output_adapter_t&lt; CharType &gt;</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13238" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13238" bodyend="13241"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="877">
+        <label>nlohmann::detail::output_adapter&lt; CharType, StringType &gt;</label>
+        <link refid="df/d13/classnlohmann_1_1detail_1_1output__adapter"/>
+        <childnode refid="878" relation="usage">
+          <edgelabel>-oa</edgelabel>
+        </childnode>
+      </node>
+      <node id="878">
+        <label>output_adapter_t&lt; CharType &gt;</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13227" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13226" bodyend="13245"/>
+    <listofallmembers>
+      <member refid="df/d13/classnlohmann_1_1detail_1_1output__adapter_1a323c18d74d6680faafec6dc3ace825e2" prot="private" virt="non-virtual"><scope>nlohmann::detail::output_adapter</scope><name>oa</name></member>
+      <member refid="df/d13/classnlohmann_1_1detail_1_1output__adapter_1a5fdac7aec8ade2f4bb0b5df30550d90c" prot="public" virt="non-virtual"><scope>nlohmann::detail::output_adapter</scope><name>operator output_adapter_t&lt; CharType &gt;</name></member>
+      <member refid="df/d13/classnlohmann_1_1detail_1_1output__adapter_1a05a30a77b568fd84676078d938cbd484" prot="public" virt="non-virtual"><scope>nlohmann::detail::output_adapter</scope><name>output_adapter</name></member>
+      <member refid="df/d13/classnlohmann_1_1detail_1_1output__adapter_1a43b3ba852e6a2c3f4d312543bb04c00d" prot="public" virt="non-virtual"><scope>nlohmann::detail::output_adapter</scope><name>output_adapter</name></member>
+      <member refid="df/d13/classnlohmann_1_1detail_1_1output__adapter_1a6ad59d1ec534383b430cd7ef8a518539" prot="public" virt="non-virtual"><scope>nlohmann::detail::output_adapter</scope><name>output_adapter</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

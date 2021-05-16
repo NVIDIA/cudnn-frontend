@@ -45,34 +45,34 @@
     <detaileddescription>
     </detaileddescription>
     <inheritancegraph>
-      <node id="41">
+      <node id="119">
         <label>std::runtime_error</label>
-        <childnode refid="42" relation="public-inheritance">
+        <childnode refid="120" relation="public-inheritance">
         </childnode>
       </node>
-      <node id="42">
+      <node id="120">
         <label>std::exception</label>
       </node>
-      <node id="40">
+      <node id="118">
         <label>cudnn_frontend::cudnnException</label>
         <link refid="d9/dca/classcudnn__frontend_1_1cudnnException"/>
-        <childnode refid="41" relation="public-inheritance">
+        <childnode refid="119" relation="public-inheritance">
         </childnode>
       </node>
     </inheritancegraph>
     <collaborationgraph>
-      <node id="44">
+      <node id="122">
         <label>std::runtime_error</label>
-        <childnode refid="45" relation="public-inheritance">
+        <childnode refid="123" relation="public-inheritance">
         </childnode>
       </node>
-      <node id="45">
+      <node id="123">
         <label>std::exception</label>
       </node>
-      <node id="43">
+      <node id="121">
         <label>cudnn_frontend::cudnnException</label>
         <link refid="d9/dca/classcudnn__frontend_1_1cudnnException"/>
-        <childnode refid="44" relation="public-inheritance">
+        <childnode refid="122" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>

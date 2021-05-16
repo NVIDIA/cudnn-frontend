@@ -1,0 +1,142 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d5/d1b/classnlohmann_1_1detail_1_1other__error" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::other_error</compoundname>
+    <basecompoundref refid="de/df2/classnlohmann_1_1detail_1_1exception" prot="public" virt="non-virtual">nlohmann::detail::exception</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+      <sectiondef kind="public-static-func">
+      <memberdef kind="function" id="d5/d1b/classnlohmann_1_1detail_1_1other__error_1a3a25fa67a0ec36b5d36cbc4424eb901d" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename BasicJsonType</type>
+          </param>
+        </templateparamlist>
+        <type><ref refid="d5/d1b/classnlohmann_1_1detail_1_1other__error" kindref="compound">other_error</ref></type>
+        <definition>static other_error nlohmann::detail::other_error::create</definition>
+        <argsstring>(int id_, const std::string &amp;what_arg, const BasicJsonType &amp;context)</argsstring>
+        <name>create</name>
+        <param>
+          <type>int</type>
+          <declname>id_</declname>
+        </param>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21" kindref="member">std::string</ref> &amp;</type>
+          <declname>what_arg</declname>
+        </param>
+        <param>
+          <type>const BasicJsonType &amp;</type>
+          <declname>context</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3003" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3003" bodyend="3007"/>
+        <references refid="de/df2/classnlohmann_1_1detail_1_1exception_1aa353a7dba4fd179f7224b8a2a238a264" compoundref="d5/db8/json_8hpp" startline="2664" endline="2717">nlohmann::detail::exception::diagnostics</references>
+        <references refid="d5/db8/json_8hpp_1a5338981b5ad9027c9e54b1c5597f4344" compoundref="d5/db8/json_8hpp" startline="1456">JSON_HEDLEY_NON_NULL</references>
+        <references refid="de/df2/classnlohmann_1_1detail_1_1exception_1abf41a7e9178356314082284e6cfea278" compoundref="d5/db8/json_8hpp" startline="2658" endline="2661">nlohmann::detail::exception::name</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a60041447d13e8709028a46e50219c161" compoundref="d5/db8/json_8hpp" startline="18022" endline="18090">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::json_value</referencedby>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1adcc786998f220a5b3083ee8a37c4553e" compoundref="d5/db8/json_8hpp" startline="25343" endline="25605">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::patch</referencedby>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-func">
+      <memberdef kind="function" id="d5/d1b/classnlohmann_1_1detail_1_1other__error_1adf9227d6ca5161508f6a598a0dc6e7cd" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::other_error::other_error</definition>
+        <argsstring>(int id_, const char *what_arg)</argsstring>
+        <name>other_error</name>
+        <param>
+          <type>int</type>
+          <declname>id_</declname>
+        </param>
+        <param>
+          <type>const char *</type>
+          <declname>what_arg</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3011" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3011" bodyend="3011"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>exception indicating other library errors </para>    </briefdescription>
+    <detaileddescription>
+<para>This exception is thrown in case of errors that cannot be classified with the other exception types.</para><para>Exceptions have ids 5xx.</para><para><table rows="2" cols="3"><row>
+<entry thead="yes"><para>name / id </para></entry><entry thead="yes"><para>example message </para></entry><entry thead="yes"><para>description  </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.other_error.501 </para></entry><entry thead="no"><para>unsuccessful: {&quot;op&quot;:&quot;test&quot;,&quot;path&quot;:&quot;/baz&quot;, &quot;value&quot;:&quot;bar&quot;} </para></entry><entry thead="no"><para>A JSON Patch operation &apos;test&apos; failed. The unsuccessful operation is also printed. </para></entry></row>
+</table>
+<simplesect kind="see"><para>- <ref refid="de/df2/classnlohmann_1_1detail_1_1exception" kindref="compound">exception</ref> for the base class of the library exceptions </para></simplesect>
+<simplesect kind="see"><para>- <ref refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error" kindref="compound">parse_error</ref> for exceptions indicating a parse <ref refid="dc/df0/namespacenlohmann_1_1detail_1a58bb1ef1a9ad287a9cfaf1855784d9acacb5e100e5a9a3e7f6d1fd97512215282" kindref="member">error</ref> </para></simplesect>
+<simplesect kind="see"><para>- <ref refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator" kindref="compound">invalid_iterator</ref> for exceptions indicating errors with iterators </para></simplesect>
+<simplesect kind="see"><para>- <ref refid="da/d1c/classnlohmann_1_1detail_1_1type__error" kindref="compound">type_error</ref> for exceptions indicating executing a member function with a wrong type </para></simplesect>
+<simplesect kind="see"><para>- <ref refid="d2/d67/classnlohmann_1_1detail_1_1out__of__range" kindref="compound">out_of_range</ref> for exceptions indicating access out of the defined range</para></simplesect>
+{The following code shows how an <computeroutput><ref refid="d5/d1b/classnlohmann_1_1detail_1_1other__error" kindref="compound">other_error</ref></computeroutput> exception can be caught.,<ref refid="d5/d1b/classnlohmann_1_1detail_1_1other__error" kindref="compound">other_error</ref>}</para><para><simplesect kind="since"><para>version 3.0.0 </para></simplesect>
+</para>    </detaileddescription>
+    <inheritancegraph>
+      <node id="862">
+        <label>std::exception</label>
+      </node>
+      <node id="861">
+        <label>nlohmann::detail::exception</label>
+        <link refid="de/df2/classnlohmann_1_1detail_1_1exception"/>
+        <childnode refid="862" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="860">
+        <label>nlohmann::detail::other_error</label>
+        <link refid="d5/d1b/classnlohmann_1_1detail_1_1other__error"/>
+        <childnode refid="861" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="866">
+        <label>std::runtime_error</label>
+        <childnode refid="865" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="867">
+        <label>int</label>
+      </node>
+      <node id="865">
+        <label>std::exception</label>
+      </node>
+      <node id="864">
+        <label>nlohmann::detail::exception</label>
+        <link refid="de/df2/classnlohmann_1_1detail_1_1exception"/>
+        <childnode refid="865" relation="public-inheritance">
+        </childnode>
+        <childnode refid="866" relation="usage">
+          <edgelabel>-m</edgelabel>
+        </childnode>
+        <childnode refid="867" relation="usage">
+          <edgelabel>+id</edgelabel>
+        </childnode>
+      </node>
+      <node id="863">
+        <label>nlohmann::detail::other_error</label>
+        <link refid="d5/d1b/classnlohmann_1_1detail_1_1other__error"/>
+        <childnode refid="864" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3000" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2999" bodyend="3012"/>
+    <listofallmembers>
+      <member refid="d5/d1b/classnlohmann_1_1detail_1_1other__error_1a3a25fa67a0ec36b5d36cbc4424eb901d" prot="public" virt="non-virtual"><scope>nlohmann::detail::other_error</scope><name>create</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1aa353a7dba4fd179f7224b8a2a238a264" prot="protected" virt="non-virtual"><scope>nlohmann::detail::other_error</scope><name>diagnostics</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1ae323ad0d53bc724414c2233164e65657" prot="protected" virt="non-virtual"><scope>nlohmann::detail::other_error</scope><name>exception</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1a0d4589a3fb54e81646d986c05efa3b9a" prot="public" virt="non-virtual"><scope>nlohmann::detail::other_error</scope><name>id</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1abf41a7e9178356314082284e6cfea278" prot="protected" virt="non-virtual"><scope>nlohmann::detail::other_error</scope><name>name</name></member>
+      <member refid="d5/d1b/classnlohmann_1_1detail_1_1other__error_1adf9227d6ca5161508f6a598a0dc6e7cd" prot="private" virt="non-virtual"><scope>nlohmann::detail::other_error</scope><name>other_error</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1a0672c25ecdf14d1a071d4d6478a65af0" prot="public" virt="non-virtual"><scope>nlohmann::detail::other_error</scope><name>what</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

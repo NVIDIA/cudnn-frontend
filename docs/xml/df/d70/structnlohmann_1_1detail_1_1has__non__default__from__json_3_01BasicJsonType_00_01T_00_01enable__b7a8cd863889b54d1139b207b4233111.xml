@@ -1,0 +1,69 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="df/d70/structnlohmann_1_1detail_1_1has__non__default__from__json_3_01BasicJsonType_00_01T_00_01enable__b7a8cd863889b54d1139b207b4233111" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::has_non_default_from_json&lt; BasicJsonType, T, enable_if_t&lt; !is_basic_json&lt; T &gt;::value &gt; &gt;</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+      <param>
+        <type>typename T</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="df/d70/structnlohmann_1_1detail_1_1has__non__default__from__json_3_01BasicJsonType_00_01T_00_01enable__b7a8cd863889b54d1139b207b4233111_1a4bcee5e52902d3011df08cf0233e5e10" prot="public" static="no">
+        <type>typename BasicJsonType::template json_serializer&lt; T, <ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref> &gt;</type>
+        <definition>using nlohmann::detail::has_non_default_from_json&lt; BasicJsonType, T, enable_if_t&lt; !is_basic_json&lt; T &gt;::value &gt; &gt;::serializer =  typename BasicJsonType::template json_serializer&lt;T, void&gt;</definition>
+        <argsstring></argsstring>
+        <name>serializer</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3521" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3521" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-static-attrib">
+      <memberdef kind="variable" id="df/d70/structnlohmann_1_1detail_1_1has__non__default__from__json_3_01BasicJsonType_00_01T_00_01enable__b7a8cd863889b54d1139b207b4233111_1a5d5bc2b9f1c107696d64d92cf6b5d0d7" prot="public" static="yes" mutable="no">
+        <type>constexpr bool</type>
+        <definition>constexpr bool nlohmann::detail::has_non_default_from_json&lt; BasicJsonType, T, enable_if_t&lt; !is_basic_json&lt; T &gt;::value &gt; &gt;::value</definition>
+        <argsstring></argsstring>
+        <name>value</name>
+        <initializer>=
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a7542b4dbac07817fd4849ecfa4619def" kindref="member">is_detected_exact</ref>&lt;T, <ref refid="dc/df0/namespacenlohmann_1_1detail_1a1711ee5cef66a0523055c8d9f024f322" kindref="member">from_json_function</ref>, <ref refid="df/d70/structnlohmann_1_1detail_1_1has__non__default__from__json_3_01BasicJsonType_00_01T_00_01enable__b7a8cd863889b54d1139b207b4233111_1a4bcee5e52902d3011df08cf0233e5e10" kindref="member">serializer</ref>,
+        const BasicJsonType&amp;&gt;::value</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3523" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3523" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="337">
+        <label>nlohmann::detail::has_non_default_from_json&lt; BasicJsonType, T, enable_if_t&lt; !is_basic_json&lt; T &gt;::value &gt; &gt;</label>
+        <link refid="df/d70/structnlohmann_1_1detail_1_1has__non__default__from__json_3_01BasicJsonType_00_01T_00_01enable__b7a8cd863889b54d1139b207b4233111"/>
+        <childnode refid="338" relation="usage">
+          <edgelabel>+value</edgelabel>
+        </childnode>
+      </node>
+      <node id="338">
+        <label>bool</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3520" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3519" bodyend="3526"/>
+    <listofallmembers>
+      <member refid="df/d70/structnlohmann_1_1detail_1_1has__non__default__from__json_3_01BasicJsonType_00_01T_00_01enable__b7a8cd863889b54d1139b207b4233111_1a4bcee5e52902d3011df08cf0233e5e10" prot="public" virt="non-virtual"><scope>nlohmann::detail::has_non_default_from_json&lt; BasicJsonType, T, enable_if_t&lt; !is_basic_json&lt; T &gt;::value &gt; &gt;</scope><name>serializer</name></member>
+      <member refid="df/d70/structnlohmann_1_1detail_1_1has__non__default__from__json_3_01BasicJsonType_00_01T_00_01enable__b7a8cd863889b54d1139b207b4233111_1a5d5bc2b9f1c107696d64d92cf6b5d0d7" prot="public" virt="non-virtual"><scope>nlohmann::detail::has_non_default_from_json&lt; BasicJsonType, T, enable_if_t&lt; !is_basic_json&lt; T &gt;::value &gt; &gt;</scope><name>value</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

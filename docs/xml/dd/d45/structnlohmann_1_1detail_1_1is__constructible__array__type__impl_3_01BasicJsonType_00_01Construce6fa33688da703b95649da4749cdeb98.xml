@@ -1,0 +1,45 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="dd/d45/structnlohmann_1_1detail_1_1is__constructible__array__type__impl_3_01BasicJsonType_00_01Construce6fa33688da703b95649da4749cdeb98" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_constructible_array_type_impl&lt; BasicJsonType, ConstructibleArrayType, enable_if_t&lt; std::is_same&lt; ConstructibleArrayType, typename BasicJsonType::value_type &gt;::value &gt; &gt;</compoundname>
+    <basecompoundref prot="public" virt="non-virtual">true_type</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+      <param>
+        <type>typename ConstructibleArrayType</type>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="541">
+        <label>true_type</label>
+      </node>
+      <node id="540">
+        <label>nlohmann::detail::is_constructible_array_type_impl&lt; BasicJsonType, ConstructibleArrayType, enable_if_t&lt; std::is_same&lt; ConstructibleArrayType, typename BasicJsonType::value_type &gt;::value &gt; &gt;</label>
+        <link refid="dd/d45/structnlohmann_1_1detail_1_1is__constructible__array__type__impl_3_01BasicJsonType_00_01Construce6fa33688da703b95649da4749cdeb98"/>
+        <childnode refid="541" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="543">
+        <label>true_type</label>
+      </node>
+      <node id="542">
+        <label>nlohmann::detail::is_constructible_array_type_impl&lt; BasicJsonType, ConstructibleArrayType, enable_if_t&lt; std::is_same&lt; ConstructibleArrayType, typename BasicJsonType::value_type &gt;::value &gt; &gt;</label>
+        <link refid="dd/d45/structnlohmann_1_1detail_1_1is__constructible__array__type__impl_3_01BasicJsonType_00_01Construce6fa33688da703b95649da4749cdeb98"/>
+        <childnode refid="543" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3747" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3743" bodyend="3747"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

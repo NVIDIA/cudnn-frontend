@@ -1,0 +1,200 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::wide_string_input_adapter</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BaseInputAdapter</type>
+      </param>
+      <param>
+        <type>typename WideCharType</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1a7b9f8684206b5dadf0e96986577dfc24" prot="public" static="no">
+        <type>char</type>
+        <definition>using nlohmann::detail::wide_string_input_adapter&lt; BaseInputAdapter, WideCharType &gt;::char_type =  char</definition>
+        <argsstring></argsstring>
+        <name>char_type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5514" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5514" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1a6951ed130bc49fbee6e434b62ed187ac" prot="private" static="no" mutable="no">
+        <type>BaseInputAdapter</type>
+        <definition>BaseInputAdapter nlohmann::detail::wide_string_input_adapter&lt; BaseInputAdapter, WideCharType &gt;::base_adapter</definition>
+        <argsstring></argsstring>
+        <name>base_adapter</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5537" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5537" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1af6bded96214b2fe8edd142d92141550e" prot="private" static="no" mutable="no">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5" kindref="member">std::array</ref>&lt; std::char_traits&lt; char &gt;::int_type, 4 &gt;</type>
+        <definition>std::array&lt;std::char_traits&lt;char&gt;::int_type, 4&gt; nlohmann::detail::wide_string_input_adapter&lt; BaseInputAdapter, WideCharType &gt;::utf8_bytes</definition>
+        <argsstring></argsstring>
+        <name>utf8_bytes</name>
+        <initializer>= {{0, 0, 0, 0}}</initializer>
+        <briefdescription>
+<para>a buffer for UTF-8 bytes </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5546" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5546" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1a2a1884713fedff6c17cdbbe63070d1ac" prot="private" static="no" mutable="no">
+        <type>std::size_t</type>
+        <definition>std::size_t nlohmann::detail::wide_string_input_adapter&lt; BaseInputAdapter, WideCharType &gt;::utf8_bytes_index</definition>
+        <argsstring></argsstring>
+        <name>utf8_bytes_index</name>
+        <initializer>= 0</initializer>
+        <briefdescription>
+<para>index to the utf8_codes array for the next valid byte </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5549" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5549" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1a8966550e615e62978b01d3a252b9c649" prot="private" static="no" mutable="no">
+        <type>std::size_t</type>
+        <definition>std::size_t nlohmann::detail::wide_string_input_adapter&lt; BaseInputAdapter, WideCharType &gt;::utf8_bytes_filled</definition>
+        <argsstring></argsstring>
+        <name>utf8_bytes_filled</name>
+        <initializer>= 0</initializer>
+        <briefdescription>
+<para>number of valid bytes in the utf8_codes array </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5551" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5551" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1aa12146f16f0a22ae3d23bd4af7460fcd" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::wide_string_input_adapter&lt; BaseInputAdapter, WideCharType &gt;::wide_string_input_adapter</definition>
+        <argsstring>(BaseInputAdapter base)</argsstring>
+        <name>wide_string_input_adapter</name>
+        <param>
+          <type>BaseInputAdapter</type>
+          <declname>base</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5516" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5516" bodyend="5517"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1a50f9436820b9caa9708ea69e2ba0230b" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::char_traits&lt; char &gt;::int_type</type>
+        <definition>std::char_traits&lt;char&gt;::int_type nlohmann::detail::wide_string_input_adapter&lt; BaseInputAdapter, WideCharType &gt;::get_character</definition>
+        <argsstring>() noexcept</argsstring>
+        <name>get_character</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5519" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5519" bodyend="5534"/>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-func">
+      <memberdef kind="function" id="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1a1e797f94449c5c3e68ab468d8caf0db6" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>size_t</type>
+            <declname>T</declname>
+            <defname>T</defname>
+          </param>
+        </templateparamlist>
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::wide_string_input_adapter&lt; BaseInputAdapter, WideCharType &gt;::fill_buffer</definition>
+        <argsstring>()</argsstring>
+        <name>fill_buffer</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5540" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5540" bodyend="5543"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="1063">
+        <label>size_t</label>
+      </node>
+      <node id="1057">
+        <label>nlohmann::detail::wide_string_input_adapter&lt; BaseInputAdapter, WideCharType &gt;</label>
+        <link refid="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter"/>
+        <childnode refid="1058" relation="usage">
+          <edgelabel>-utf8_bytes</edgelabel>
+        </childnode>
+        <childnode refid="1062" relation="usage">
+          <edgelabel>-base_adapter</edgelabel>
+        </childnode>
+        <childnode refid="1063" relation="usage">
+          <edgelabel>-utf8_bytes_filled</edgelabel>
+          <edgelabel>-utf8_bytes_index</edgelabel>
+        </childnode>
+      </node>
+      <node id="1061">
+        <label>T</label>
+      </node>
+      <node id="1060">
+        <label>std::array&lt; T &gt;</label>
+        <childnode refid="1061" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+      </node>
+      <node id="1059">
+        <label>int_type</label>
+      </node>
+      <node id="1062">
+        <label>BaseInputAdapter</label>
+      </node>
+      <node id="1058">
+        <label>std::array&lt; std::char_traits&lt; char &gt;::int_type, 4 &gt;</label>
+        <childnode refid="1059" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+        <childnode refid="1060" relation="template-instance">
+          <edgelabel>&lt; std::char_traits&lt; char &gt;::int_type, 4 &gt;</edgelabel>
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5512" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5511" bodyend="5552"/>
+    <listofallmembers>
+      <member refid="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1a6951ed130bc49fbee6e434b62ed187ac" prot="private" virt="non-virtual"><scope>nlohmann::detail::wide_string_input_adapter</scope><name>base_adapter</name></member>
+      <member refid="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1a7b9f8684206b5dadf0e96986577dfc24" prot="public" virt="non-virtual"><scope>nlohmann::detail::wide_string_input_adapter</scope><name>char_type</name></member>
+      <member refid="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1a1e797f94449c5c3e68ab468d8caf0db6" prot="private" virt="non-virtual"><scope>nlohmann::detail::wide_string_input_adapter</scope><name>fill_buffer</name></member>
+      <member refid="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1a50f9436820b9caa9708ea69e2ba0230b" prot="public" virt="non-virtual"><scope>nlohmann::detail::wide_string_input_adapter</scope><name>get_character</name></member>
+      <member refid="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1af6bded96214b2fe8edd142d92141550e" prot="private" virt="non-virtual"><scope>nlohmann::detail::wide_string_input_adapter</scope><name>utf8_bytes</name></member>
+      <member refid="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1a8966550e615e62978b01d3a252b9c649" prot="private" virt="non-virtual"><scope>nlohmann::detail::wide_string_input_adapter</scope><name>utf8_bytes_filled</name></member>
+      <member refid="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1a2a1884713fedff6c17cdbbe63070d1ac" prot="private" virt="non-virtual"><scope>nlohmann::detail::wide_string_input_adapter</scope><name>utf8_bytes_index</name></member>
+      <member refid="d1/dea/classnlohmann_1_1detail_1_1wide__string__input__adapter_1aa12146f16f0a22ae3d23bd4af7460fcd" prot="public" virt="non-virtual"><scope>nlohmann::detail::wide_string_input_adapter</scope><name>wide_string_input_adapter</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

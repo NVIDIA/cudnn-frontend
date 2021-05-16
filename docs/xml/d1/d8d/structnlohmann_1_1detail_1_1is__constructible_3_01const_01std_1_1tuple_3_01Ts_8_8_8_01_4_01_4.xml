@@ -1,0 +1,92 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d1/d8d/structnlohmann_1_1detail_1_1is__constructible_3_01const_01std_1_1tuple_3_01Ts_8_8_8_01_4_01_4" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_constructible&lt; const std::tuple&lt; Ts... &gt; &gt;</compoundname>
+    <basecompoundref refid="dc/dd7/structnlohmann_1_1detail_1_1is__default__constructible_3_01const_01std_1_1tuple_3_01Ts_8_8_8_01_4_01_4" prot="public" virt="non-virtual">nlohmann::detail::is_default_constructible&lt; const std::tuple&lt; Ts... &gt; &gt;</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename...</type>
+        <declname>Ts</declname>
+        <defname>Ts</defname>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="492">
+        <label>std::true_type</label>
+      </node>
+      <node id="494">
+        <label>true_type</label>
+      </node>
+      <node id="489">
+        <label>nlohmann::detail::is_constructible&lt; const std::tuple&lt; Ts... &gt; &gt;</label>
+        <link refid="d1/d8d/structnlohmann_1_1detail_1_1is__constructible_3_01const_01std_1_1tuple_3_01Ts_8_8_8_01_4_01_4"/>
+        <childnode refid="490" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="493">
+        <label>nlohmann::detail::conjunction&lt;... &gt;</label>
+        <link refid="dd/dde/structnlohmann_1_1detail_1_1conjunction"/>
+        <childnode refid="494" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="491">
+        <label>nlohmann::detail::conjunction&lt; is_default_constructible&lt; Ts &gt;... &gt;</label>
+        <link refid="dd/dde/structnlohmann_1_1detail_1_1conjunction"/>
+        <childnode refid="492" relation="public-inheritance">
+        </childnode>
+        <childnode refid="493" relation="template-instance">
+          <edgelabel>&lt; is_default_constructible&lt; Ts &gt;... &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="490">
+        <label>nlohmann::detail::is_default_constructible&lt; const std::tuple&lt; Ts... &gt; &gt;</label>
+        <link refid="dc/dd7/structnlohmann_1_1detail_1_1is__default__constructible_3_01const_01std_1_1tuple_3_01Ts_8_8_8_01_4_01_4"/>
+        <childnode refid="491" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="498">
+        <label>std::true_type</label>
+      </node>
+      <node id="500">
+        <label>true_type</label>
+      </node>
+      <node id="495">
+        <label>nlohmann::detail::is_constructible&lt; const std::tuple&lt; Ts... &gt; &gt;</label>
+        <link refid="d1/d8d/structnlohmann_1_1detail_1_1is__constructible_3_01const_01std_1_1tuple_3_01Ts_8_8_8_01_4_01_4"/>
+        <childnode refid="496" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="499">
+        <label>nlohmann::detail::conjunction&lt;... &gt;</label>
+        <link refid="dd/dde/structnlohmann_1_1detail_1_1conjunction"/>
+        <childnode refid="500" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="497">
+        <label>nlohmann::detail::conjunction&lt; is_default_constructible&lt; Ts &gt;... &gt;</label>
+        <link refid="dd/dde/structnlohmann_1_1detail_1_1conjunction"/>
+        <childnode refid="498" relation="public-inheritance">
+        </childnode>
+        <childnode refid="499" relation="template-instance">
+          <edgelabel>&lt; is_default_constructible&lt; Ts &gt;... &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="496">
+        <label>nlohmann::detail::is_default_constructible&lt; const std::tuple&lt; Ts... &gt; &gt;</label>
+        <link refid="dc/dd7/structnlohmann_1_1detail_1_1is__default__constructible_3_01const_01std_1_1tuple_3_01Ts_8_8_8_01_4_01_4"/>
+        <childnode refid="497" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3591" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3591" bodyend="3591"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

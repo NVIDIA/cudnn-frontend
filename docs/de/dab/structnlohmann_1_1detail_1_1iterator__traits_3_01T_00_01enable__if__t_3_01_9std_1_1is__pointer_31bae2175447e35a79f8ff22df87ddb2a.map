@@ -1,0 +1,4 @@
+<map id="nlohmann::detail::iterator_traits&lt; T, enable_if_t&lt; !std::is_pointer&lt; T &gt;::value &gt; &gt;" name="nlohmann::detail::iterator_traits&lt; T, enable_if_t&lt; !std::is_pointer&lt; T &gt;::value &gt; &gt;">
+<area shape="rect" id="node2" href="$d5/d3c/structnlohmann_1_1detail_1_1iterator__types.html" title="{nlohmann::detail::iterator\l_types\&lt; T \&gt;\n||}" alt="" coords="5,160,171,252"/>
+<area shape="rect" id="node3" href="$d5/d3c/structnlohmann_1_1detail_1_1iterator__types.html" title="{nlohmann::detail::iterator\l_types\&lt; It, typename \&gt;\n||}" alt="" coords="5,5,171,97"/>
+</map>

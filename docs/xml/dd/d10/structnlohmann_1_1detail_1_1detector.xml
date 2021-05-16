@@ -1,0 +1,68 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="dd/d10/structnlohmann_1_1detail_1_1detector" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::detector</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>class Default</type>
+      </param>
+      <param>
+        <type>class AlwaysVoid</type>
+      </param>
+      <param>
+        <type>template&lt; class... &gt; class</type>
+        <declname>Op</declname>
+        <defname>Op</defname>
+      </param>
+      <param>
+        <type>class...</type>
+        <declname>Args</declname>
+        <defname>Args</defname>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="dd/d10/structnlohmann_1_1detail_1_1detector_1a5a132aab543d1706e2439268faf8d487" prot="public" static="no">
+        <type>std::false_type</type>
+        <definition>using nlohmann::detail::detector&lt; Default, AlwaysVoid, Op, Args &gt;::value_t =  std::false_type</definition>
+        <argsstring></argsstring>
+        <name>value_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3296" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3296" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="dd/d10/structnlohmann_1_1detail_1_1detector_1a0cd69423587748bf3d3d702cc7b7c2ce" prot="public" static="no">
+        <type>Default</type>
+        <definition>using nlohmann::detail::detector&lt; Default, AlwaysVoid, Op, Args &gt;::type =  Default</definition>
+        <argsstring></argsstring>
+        <name>type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3297" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3297" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="125">
+        <label>nlohmann::detail::detector&lt; Default, AlwaysVoid, Op, Args &gt;</label>
+        <link refid="dd/d10/structnlohmann_1_1detail_1_1detector"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3295" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3294" bodyend="3298"/>
+    <listofallmembers>
+      <member refid="dd/d10/structnlohmann_1_1detail_1_1detector_1a0cd69423587748bf3d3d702cc7b7c2ce" prot="public" virt="non-virtual"><scope>nlohmann::detail::detector</scope><name>type</name></member>
+      <member refid="dd/d10/structnlohmann_1_1detail_1_1detector_1a5a132aab543d1706e2439268faf8d487" prot="public" virt="non-virtual"><scope>nlohmann::detail::detector</scope><name>value_t</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

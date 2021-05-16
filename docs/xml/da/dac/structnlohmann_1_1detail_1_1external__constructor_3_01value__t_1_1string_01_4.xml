@@ -1,0 +1,115 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="da/dac/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1string_01_4" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::external_constructor&lt; value_t::string &gt;</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+    </templateparamlist>
+      <sectiondef kind="public-static-func">
+      <memberdef kind="function" id="da/dac/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1string_01_4_1ad88d0b4b7ea01ea20e12cc1b82fe0d92" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename BasicJsonType</type>
+          </param>
+        </templateparamlist>
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>static void nlohmann::detail::external_constructor&lt; value_t::string &gt;::construct</definition>
+        <argsstring>(BasicJsonType &amp;j, const typename BasicJsonType::string_t &amp;s)</argsstring>
+        <name>construct</name>
+        <param>
+          <type>BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <param>
+          <type>const typename BasicJsonType::string_t &amp;</type>
+          <declname>s</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4499" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4499" bodyend="4504"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+      </memberdef>
+      <memberdef kind="function" id="da/dac/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1string_01_4_1a74f56b9ca1d4e8db9751353d76668322" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename BasicJsonType</type>
+          </param>
+        </templateparamlist>
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>static void nlohmann::detail::external_constructor&lt; value_t::string &gt;::construct</definition>
+        <argsstring>(BasicJsonType &amp;j, typename BasicJsonType::string_t &amp;&amp;s)</argsstring>
+        <name>construct</name>
+        <param>
+          <type>BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <param>
+          <type>typename BasicJsonType::string_t &amp;&amp;</type>
+          <declname>s</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4507" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4507" bodyend="4512"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+      </memberdef>
+      <memberdef kind="function" id="da/dac/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1string_01_4_1a8822d43f0e20c5a28be329f9ca7de6c4" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename BasicJsonType</type>
+          </param>
+          <param>
+            <type>typename CompatibleStringType</type>
+          </param>
+          <param>
+            <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a02bcbc878bee413f25b985ada771aa9c" kindref="member">enable_if_t</ref>&lt; !std::is_same&lt; CompatibleStringType, typename BasicJsonType::string_t &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref>, int &gt;</type>
+            <defval>0</defval>
+          </param>
+        </templateparamlist>
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>static void nlohmann::detail::external_constructor&lt; value_t::string &gt;::construct</definition>
+        <argsstring>(BasicJsonType &amp;j, const CompatibleStringType &amp;str)</argsstring>
+        <name>construct</name>
+        <param>
+          <type>BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <param>
+          <type>const CompatibleStringType &amp;</type>
+          <declname>str</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4517" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4517" bodyend="4522"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="315">
+        <label>nlohmann::detail::external_constructor&lt; value_t::string &gt;</label>
+        <link refid="da/dac/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1string_01_4"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4497" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4496" bodyend="4523"/>
+    <listofallmembers>
+      <member refid="da/dac/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1string_01_4_1ad88d0b4b7ea01ea20e12cc1b82fe0d92" prot="public" virt="non-virtual"><scope>nlohmann::detail::external_constructor&lt; value_t::string &gt;</scope><name>construct</name></member>
+      <member refid="da/dac/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1string_01_4_1a74f56b9ca1d4e8db9751353d76668322" prot="public" virt="non-virtual"><scope>nlohmann::detail::external_constructor&lt; value_t::string &gt;</scope><name>construct</name></member>
+      <member refid="da/dac/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1string_01_4_1a8822d43f0e20c5a28be329f9ca7de6c4" prot="public" virt="non-virtual"><scope>nlohmann::detail::external_constructor&lt; value_t::string &gt;</scope><name>construct</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

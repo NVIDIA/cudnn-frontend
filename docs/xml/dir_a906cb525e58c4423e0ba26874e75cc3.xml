@@ -1,0 +1,12 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="dir_a906cb525e58c4423e0ba26874e75cc3" kind="dir">
+    <compoundname>nlohmann</compoundname>
+    <innerdir refid="dir_205629aeea700779119961ffc33e6b4c">json</innerdir>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/"/>
+  </compounddef>
+</doxygen>

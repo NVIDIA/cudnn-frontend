@@ -1,10 +1,11 @@
 <map id="cudnn_frontend_Heuristics.h" name="cudnn_frontend_Heuristics.h">
-<area shape="rect" id="node5" href="$db/d7d/cudnn__frontend__OperationGraph_8h.html" title="cudnn_frontend_Operation\lGraph.h" alt="" coords="1238,80,1413,121"/>
-<area shape="rect" id="node14" href="$df/d17/cudnn__frontend__utils_8h.html" title="cudnn_frontend_utils.h" alt="" coords="1358,333,1511,360"/>
-<area shape="rect" id="node12" href="$da/d5a/cudnn__frontend__Operation_8h.html" title="cudnn_frontend_Operation.h" alt="" coords="1041,169,1226,196"/>
-<area shape="rect" id="node13" href="$d1/de7/cudnn__frontend__ConvDesc_8h.html" title="cudnn_frontend_ConvDesc.h" alt="" coords="545,251,735,278"/>
-<area shape="rect" id="node18" href="$da/d5f/cudnn__frontend__PointWiseDesc_8h.html" title="cudnn_frontend_PointWise\lDesc.h" alt="" coords="760,244,939,285"/>
-<area shape="rect" id="node19" href="$d6/d32/cudnn__frontend__MatMulDesc_8h.html" title="cudnn_frontend_MatMulDesc.h" alt="" coords="963,251,1165,278"/>
-<area shape="rect" id="node20" href="$d3/d98/cudnn__frontend__Tensor_8h.html" title="cudnn_frontend_Tensor.h" alt="" coords="1241,251,1410,278"/>
-<area shape="rect" id="node17" href="$dc/d11/cudnn__backend__base_8h.html" title="cudnn_backend_base.h" alt="" coords="1225,408,1383,435"/>
+<area shape="rect" id="node5" href="$db/d7d/cudnn__frontend__OperationGraph_8h.html" title="cudnn_frontend_Operation\lGraph.h" alt="" coords="1385,80,1559,121"/>
+<area shape="rect" id="node14" href="$df/d17/cudnn__frontend__utils_8h.html" title="cudnn_frontend_utils.h" alt="" coords="542,333,695,360"/>
+<area shape="rect" id="node12" href="$da/d5a/cudnn__frontend__Operation_8h.html" title="cudnn_frontend_Operation.h" alt="" coords="1153,169,1338,196"/>
+<area shape="rect" id="node13" href="$d1/de7/cudnn__frontend__ConvDesc_8h.html" title="cudnn_frontend_ConvDesc.h" alt="" coords="739,251,930,278"/>
+<area shape="rect" id="node18" href="$da/d5f/cudnn__frontend__PointWiseDesc_8h.html" title="cudnn_frontend_PointWise\lDesc.h" alt="" coords="1156,244,1335,285"/>
+<area shape="rect" id="node19" href="$d6/d32/cudnn__frontend__MatMulDesc_8h.html" title="cudnn_frontend_MatMulDesc.h" alt="" coords="1359,251,1561,278"/>
+<area shape="rect" id="node20" href="$db/da7/cudnn__frontend__ReductionDesc_8h.html" title="cudnn_frontend_Reduction\lDesc.h" alt="" coords="954,244,1131,285"/>
+<area shape="rect" id="node21" href="$d3/d98/cudnn__frontend__Tensor_8h.html" title="cudnn_frontend_Tensor.h" alt="" coords="494,251,663,278"/>
+<area shape="rect" id="node17" href="$dc/d11/cudnn__backend__base_8h.html" title="cudnn_backend_base.h" alt="" coords="423,408,582,435"/>
 </map>

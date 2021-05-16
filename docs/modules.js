@@ -12,6 +12,7 @@ var modules =
     [ "OperationGraphQuery", "d1/df7/group__OperationGraphQuery.html", "d1/df7/group__OperationGraphQuery" ],
     [ "OperationGraphBuilder_v8", "d2/df5/group__OperationGraphBuilder__v8.html", "d2/df5/group__OperationGraphBuilder__v8" ],
     [ "PointWiseDescBuilder_v8", "d2/db5/group__PointWiseDescBuilder__v8.html", "d2/db5/group__PointWiseDescBuilder__v8" ],
+    [ "ReductionDescBuilder_v8", "d8/d95/group__ReductionDescBuilder__v8.html", "d8/d95/group__ReductionDescBuilder__v8" ],
     [ "TensorBuilder_v8", "d3/d3c/group__TensorBuilder__v8.html", "d3/d3c/group__TensorBuilder__v8" ],
     [ "VariantPackBuilder_v8", "d5/def/group__VariantPackBuilder__v8.html", "d5/def/group__VariantPackBuilder__v8" ]
 ];

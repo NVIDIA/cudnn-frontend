@@ -1,0 +1,75 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d1/d21/structnlohmann_1_1detail_1_1is__compatible__integer__type" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_compatible_integer_type</compoundname>
+    <basecompoundref refid="dd/d13/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl" prot="public" virt="non-virtual">nlohmann::detail::is_compatible_integer_type_impl&lt; RealIntegerType, CompatibleNumberIntegerType &gt;</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename RealIntegerType</type>
+      </param>
+      <param>
+        <type>typename CompatibleNumberIntegerType</type>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="401">
+        <label>false_type</label>
+      </node>
+      <node id="400">
+        <label>nlohmann::detail::is_compatible_integer_type_impl&lt; RealIntegerType, CompatibleNumberIntegerType &gt;</label>
+        <link refid="dd/d13/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl"/>
+        <childnode refid="401" relation="public-inheritance">
+        </childnode>
+        <childnode refid="402" relation="template-instance">
+          <edgelabel>&lt; RealIntegerType, CompatibleNumberIntegerType &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="402">
+        <label>nlohmann::detail::is_compatible_integer_type_impl&lt; RealIntegerType, CompatibleNumberIntegerType, typename &gt;</label>
+        <link refid="dd/d13/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl"/>
+        <childnode refid="401" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="399">
+        <label>nlohmann::detail::is_compatible_integer_type&lt; RealIntegerType, CompatibleNumberIntegerType &gt;</label>
+        <link refid="d1/d21/structnlohmann_1_1detail_1_1is__compatible__integer__type"/>
+        <childnode refid="400" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="405">
+        <label>false_type</label>
+      </node>
+      <node id="404">
+        <label>nlohmann::detail::is_compatible_integer_type_impl&lt; RealIntegerType, CompatibleNumberIntegerType &gt;</label>
+        <link refid="dd/d13/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl"/>
+        <childnode refid="405" relation="public-inheritance">
+        </childnode>
+        <childnode refid="406" relation="template-instance">
+          <edgelabel>&lt; RealIntegerType, CompatibleNumberIntegerType &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="406">
+        <label>nlohmann::detail::is_compatible_integer_type_impl&lt; RealIntegerType, CompatibleNumberIntegerType, typename &gt;</label>
+        <link refid="dd/d13/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl"/>
+        <childnode refid="405" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="403">
+        <label>nlohmann::detail::is_compatible_integer_type&lt; RealIntegerType, CompatibleNumberIntegerType &gt;</label>
+        <link refid="d1/d21/structnlohmann_1_1detail_1_1is__compatible__integer__type"/>
+        <childnode refid="404" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3807" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3805" bodyend="3807"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

@@ -1,0 +1,341 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="db/d7e/cudnn__frontend__Errata_8h" kind="file" language="C++">
+    <compoundname>cudnn_frontend_Errata.h</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="yes">contrib/nlohmann/json/json.hpp</includes>
+    <includes local="no">cstdlib</includes>
+    <includes local="no">fstream</includes>
+    <includedby refid="de/d0c/cudnn__frontend_8h" local="yes">cudnn_frontend.h</includedby>
+    <incdepgraph>
+      <node id="246">
+        <label>valarray</label>
+      </node>
+      <node id="231">
+        <label>functional</label>
+      </node>
+      <node id="252">
+        <label>limits</label>
+      </node>
+      <node id="228">
+        <label>contrib/nlohmann/json/json.hpp</label>
+        <link refid="d5/db8/json_8hpp"/>
+        <childnode refid="229" relation="include">
+        </childnode>
+        <childnode refid="230" relation="include">
+        </childnode>
+        <childnode refid="231" relation="include">
+        </childnode>
+        <childnode refid="232" relation="include">
+        </childnode>
+        <childnode refid="233" relation="include">
+        </childnode>
+        <childnode refid="234" relation="include">
+        </childnode>
+        <childnode refid="235" relation="include">
+        </childnode>
+        <childnode refid="236" relation="include">
+        </childnode>
+        <childnode refid="237" relation="include">
+        </childnode>
+        <childnode refid="238" relation="include">
+        </childnode>
+        <childnode refid="239" relation="include">
+        </childnode>
+        <childnode refid="240" relation="include">
+        </childnode>
+        <childnode refid="241" relation="include">
+        </childnode>
+        <childnode refid="242" relation="include">
+        </childnode>
+        <childnode refid="243" relation="include">
+        </childnode>
+        <childnode refid="244" relation="include">
+        </childnode>
+        <childnode refid="245" relation="include">
+        </childnode>
+        <childnode refid="246" relation="include">
+        </childnode>
+        <childnode refid="247" relation="include">
+        </childnode>
+        <childnode refid="248" relation="include">
+        </childnode>
+        <childnode refid="249" relation="include">
+        </childnode>
+        <childnode refid="250" relation="include">
+        </childnode>
+        <childnode refid="251" relation="include">
+        </childnode>
+        <childnode refid="252" relation="include">
+        </childnode>
+        <childnode refid="253" relation="include">
+        </childnode>
+        <childnode refid="254" relation="include">
+        </childnode>
+        <childnode refid="255" relation="include">
+        </childnode>
+        <childnode refid="256" relation="include">
+        </childnode>
+        <childnode refid="257" relation="include">
+        </childnode>
+        <childnode refid="258" relation="include">
+        </childnode>
+        <childnode refid="259" relation="include">
+        </childnode>
+        <childnode refid="260" relation="include">
+        </childnode>
+      </node>
+      <node id="234">
+        <label>iterator</label>
+      </node>
+      <node id="249">
+        <label>cstdint</label>
+      </node>
+      <node id="253">
+        <label>cmath</label>
+      </node>
+      <node id="251">
+        <label>cassert</label>
+      </node>
+      <node id="248">
+        <label>stdexcept</label>
+      </node>
+      <node id="236">
+        <label>numeric</label>
+      </node>
+      <node id="237">
+        <label>string</label>
+      </node>
+      <node id="243">
+        <label>map</label>
+      </node>
+      <node id="247">
+        <label>exception</label>
+      </node>
+      <node id="261">
+        <label>fstream</label>
+      </node>
+      <node id="260">
+        <label>ostream</label>
+      </node>
+      <node id="259">
+        <label>ios</label>
+      </node>
+      <node id="254">
+        <label>cstdio</label>
+      </node>
+      <node id="244">
+        <label>tuple</label>
+      </node>
+      <node id="239">
+        <label>vector</label>
+      </node>
+      <node id="238">
+        <label>utility</label>
+      </node>
+      <node id="241">
+        <label>array</label>
+      </node>
+      <node id="227">
+        <label>cudnn_frontend_Errata.h</label>
+        <link refid="db/d7e/cudnn__frontend__Errata_8h"/>
+        <childnode refid="228" relation="include">
+        </childnode>
+        <childnode refid="250" relation="include">
+        </childnode>
+        <childnode refid="261" relation="include">
+        </childnode>
+      </node>
+      <node id="233">
+        <label>iosfwd</label>
+      </node>
+      <node id="250">
+        <label>cstdlib</label>
+      </node>
+      <node id="257">
+        <label>clocale</label>
+      </node>
+      <node id="258">
+        <label>cctype</label>
+      </node>
+      <node id="230">
+        <label>cstddef</label>
+      </node>
+      <node id="245">
+        <label>unordered_map</label>
+      </node>
+      <node id="240">
+        <label>type_traits</label>
+      </node>
+      <node id="242">
+        <label>forward_list</label>
+      </node>
+      <node id="229">
+        <label>algorithm</label>
+      </node>
+      <node id="255">
+        <label>cstring</label>
+      </node>
+      <node id="235">
+        <label>memory</label>
+      </node>
+      <node id="256">
+        <label>istream</label>
+      </node>
+      <node id="232">
+        <label>initializer_list</label>
+      </node>
+    </incdepgraph>
+    <invincdepgraph>
+      <node id="266">
+        <label>cudnn_frontend_get_plan.h</label>
+        <link refid="d2/d3b/cudnn__frontend__get__plan_8h"/>
+      </node>
+      <node id="264">
+        <label>cudnn_frontend_EngineConfigGenerator.h</label>
+        <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
+        <childnode refid="265" relation="include">
+        </childnode>
+        <childnode refid="266" relation="include">
+        </childnode>
+      </node>
+      <node id="262">
+        <label>cudnn_frontend_Errata.h</label>
+        <link refid="db/d7e/cudnn__frontend__Errata_8h"/>
+        <childnode refid="263" relation="include">
+        </childnode>
+      </node>
+      <node id="263">
+        <label>cudnn_frontend.h</label>
+        <link refid="de/d0c/cudnn__frontend_8h"/>
+        <childnode refid="264" relation="include">
+        </childnode>
+      </node>
+      <node id="265">
+        <label>cudnn_frontend_find_plan.h</label>
+        <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
+      </node>
+    </invincdepgraph>
+    <innernamespace refid="df/de1/namespacecudnn__frontend">cudnn_frontend</innernamespace>
+      <sectiondef kind="typedef">
+      <memberdef kind="typedef" id="db/d7e/cudnn__frontend__Errata_8h_1ab701e3ac61a85b337ec5c1abaad6742d" prot="public" static="no">
+        <type><ref refid="d3/d9b/namespacenlohmann_1a2bfd99e845a2e5cd90aeaf1b1431f474" kindref="member">nlohmann::json</ref></type>
+        <definition>using json =  nlohmann::json</definition>
+        <argsstring></argsstring>
+        <name>json</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Errata.h" line="30" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Errata.h" bodystart="30" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <programlisting>
+<codeline lineno="1"><highlight class="normal"></highlight></codeline>
+<codeline lineno="2"><highlight class="normal"></highlight><highlight class="comment">/*</highlight></codeline>
+<codeline lineno="3"><highlight class="comment"><sp/>*<sp/>Copyright<sp/>(c)<sp/>2021,<sp/>NVIDIA<sp/>CORPORATION.<sp/>All<sp/>rights<sp/>reserved.</highlight></codeline>
+<codeline lineno="4"><highlight class="comment"><sp/>*</highlight></codeline>
+<codeline lineno="5"><highlight class="comment"><sp/>*<sp/>Permission<sp/>is<sp/>hereby<sp/>granted,<sp/>free<sp/>of<sp/>charge,<sp/>to<sp/>any<sp/>person<sp/>obtaining<sp/>a</highlight></codeline>
+<codeline lineno="6"><highlight class="comment"><sp/>*<sp/>copy<sp/>of<sp/>this<sp/>software<sp/>and<sp/>associated<sp/>documentation<sp/>files<sp/>(the<sp/>&quot;Software&quot;),</highlight></codeline>
+<codeline lineno="7"><highlight class="comment"><sp/>*<sp/>to<sp/>deal<sp/>in<sp/>the<sp/>Software<sp/>without<sp/>restriction,<sp/>including<sp/>without<sp/>limitation</highlight></codeline>
+<codeline lineno="8"><highlight class="comment"><sp/>*<sp/>the<sp/>rights<sp/>to<sp/>use,<sp/>copy,<sp/>modify,<sp/>merge,<sp/>publish,<sp/>distribute,<sp/>sublicense,</highlight></codeline>
+<codeline lineno="9"><highlight class="comment"><sp/>*<sp/>and/or<sp/>sell<sp/>copies<sp/>of<sp/>the<sp/>Software,<sp/>and<sp/>to<sp/>permit<sp/>persons<sp/>to<sp/>whom<sp/>the</highlight></codeline>
+<codeline lineno="10"><highlight class="comment"><sp/>*<sp/>Software<sp/>is<sp/>furnished<sp/>to<sp/>do<sp/>so,<sp/>subject<sp/>to<sp/>the<sp/>following<sp/>conditions:</highlight></codeline>
+<codeline lineno="11"><highlight class="comment"><sp/>*</highlight></codeline>
+<codeline lineno="12"><highlight class="comment"><sp/>*<sp/>The<sp/>above<sp/>copyright<sp/>notice<sp/>and<sp/>this<sp/>permission<sp/>notice<sp/>shall<sp/>be<sp/>included<sp/>in</highlight></codeline>
+<codeline lineno="13"><highlight class="comment"><sp/>*<sp/>all<sp/>copies<sp/>or<sp/>substantial<sp/>portions<sp/>of<sp/>the<sp/>Software.</highlight></codeline>
+<codeline lineno="14"><highlight class="comment"><sp/>*</highlight></codeline>
+<codeline lineno="15"><highlight class="comment"><sp/>*<sp/>THE<sp/>SOFTWARE<sp/>IS<sp/>PROVIDED<sp/>&quot;AS<sp/>IS&quot;,<sp/>WITHOUT<sp/>WARRANTY<sp/>OF<sp/>ANY<sp/>KIND,<sp/>EXPRESS<sp/>OR</highlight></codeline>
+<codeline lineno="16"><highlight class="comment"><sp/>*<sp/>IMPLIED,<sp/>INCLUDING<sp/>BUT<sp/>NOT<sp/>LIMITED<sp/>TO<sp/>THE<sp/>WARRANTIES<sp/>OF<sp/>MERCHANTABILITY,</highlight></codeline>
+<codeline lineno="17"><highlight class="comment"><sp/>*<sp/>FITNESS<sp/>FOR<sp/>A<sp/>PARTICULAR<sp/>PURPOSE<sp/>AND<sp/>NONINFRINGEMENT.<sp/><sp/>IN<sp/>NO<sp/>EVENT<sp/>SHALL</highlight></codeline>
+<codeline lineno="18"><highlight class="comment"><sp/>*<sp/>THE<sp/>AUTHORS<sp/>OR<sp/>COPYRIGHT<sp/>HOLDERS<sp/>BE<sp/>LIABLE<sp/>FOR<sp/>ANY<sp/>CLAIM,<sp/>DAMAGES<sp/>OR<sp/>OTHER</highlight></codeline>
+<codeline lineno="19"><highlight class="comment"><sp/>*<sp/>LIABILITY,<sp/>WHETHER<sp/>IN<sp/>AN<sp/>ACTION<sp/>OF<sp/>CONTRACT,<sp/>TORT<sp/>OR<sp/>OTHERWISE,<sp/>ARISING</highlight></codeline>
+<codeline lineno="20"><highlight class="comment"><sp/>*<sp/>FROM,<sp/>OUT<sp/>OF<sp/>OR<sp/>IN<sp/>CONNECTION<sp/>WITH<sp/>THE<sp/>SOFTWARE<sp/>OR<sp/>THE<sp/>USE<sp/>OR<sp/>OTHER</highlight></codeline>
+<codeline lineno="21"><highlight class="comment"><sp/>*<sp/>DEALINGS<sp/>IN<sp/>THE<sp/>SOFTWARE.</highlight></codeline>
+<codeline lineno="22"><highlight class="comment"><sp/>*/</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="23"><highlight class="normal"></highlight></codeline>
+<codeline lineno="24"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&quot;<ref refid="d5/db8/json_8hpp" kindref="compound">contrib/nlohmann/json/json.hpp</ref>&quot;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="25"><highlight class="normal"></highlight></codeline>
+<codeline lineno="26"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;cstdlib&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="27"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;fstream&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="28"><highlight class="normal"></highlight><highlight class="preprocessor">#pragma<sp/>once</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="29"><highlight class="normal"></highlight></codeline>
+<codeline lineno="30" refid="db/d7e/cudnn__frontend__Errata_8h_1ab701e3ac61a85b337ec5c1abaad6742d" refkind="member"><highlight class="normal"></highlight><highlight class="keyword">using</highlight><highlight class="normal"><sp/><ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">json</ref><sp/>=<sp/><ref refid="d3/d9b/namespacenlohmann_1a2bfd99e845a2e5cd90aeaf1b1431f474" kindref="member">nlohmann::json</ref>;</highlight></codeline>
+<codeline lineno="31"><highlight class="normal"></highlight></codeline>
+<codeline lineno="32"><highlight class="normal"></highlight><highlight class="keyword">namespace<sp/></highlight><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend" kindref="compound">cudnn_frontend</ref><sp/>{</highlight></codeline>
+<codeline lineno="33"><highlight class="normal"></highlight></codeline>
+<codeline lineno="34"><highlight class="normal"></highlight><highlight class="comment">//<sp/>Loads<sp/>the<sp/>json<sp/>handle<sp/>from<sp/>the<sp/>json<sp/>file<sp/></highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="35"><highlight class="normal"></highlight><highlight class="comment">//<sp/>json<sp/>file<sp/>is<sp/>defined<sp/>by<sp/>environment<sp/>variable</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="36"><highlight class="normal"></highlight><highlight class="comment">//<sp/>CUDNN_ERRATA_JSON_FILE.<sp/>If<sp/>the<sp/>environment<sp/>variable</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="37"><highlight class="normal"></highlight><highlight class="comment">//<sp/>is<sp/>not<sp/>set<sp/>the<sp/>value<sp/>set<sp/>in<sp/>the<sp/>API<sp/>is<sp/>considered.</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="38"><highlight class="normal"></highlight><highlight class="keyword">static</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">void</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="39" refid="df/de1/namespacecudnn__frontend_1a069fb3355ab52d2e1914e72832cdcf46" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1a069fb3355ab52d2e1914e72832cdcf46" kindref="member">load_from_config</ref>(<ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">json</ref><sp/>&amp;json_handle,<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>std::string<sp/>&amp;<sp/>errata_json)<sp/>{</highlight></codeline>
+<codeline lineno="40"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">char</highlight><highlight class="normal"><sp/>*<sp/>err_json<sp/>=<sp/>std::getenv(</highlight><highlight class="stringliteral">&quot;CUDNN_ERRATA_JSON_FILE&quot;</highlight><highlight class="normal">);</highlight></codeline>
+<codeline lineno="41"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(err_json<sp/>==<sp/>NULL<sp/>&amp;&amp;<sp/>errata_json<sp/>==<sp/></highlight><highlight class="stringliteral">&quot;&quot;</highlight><highlight class="normal">)<sp/>{</highlight><highlight class="keywordflow">return</highlight><highlight class="normal">;}</highlight></codeline>
+<codeline lineno="42"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(err_json<sp/>==<sp/>NULL)<sp/>{<sp/>err_json<sp/>=<sp/>errata_json.c_str();}</highlight></codeline>
+<codeline lineno="43"><highlight class="normal"><sp/><sp/><sp/><sp/>std::ifstream<sp/>ifs(err_json,<sp/>std::ifstream::in);</highlight></codeline>
+<codeline lineno="44"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(!ifs.is_open()<sp/>||<sp/>!ifs.good())<sp/>{</highlight><highlight class="keywordflow">return</highlight><highlight class="normal">;}</highlight></codeline>
+<codeline lineno="45"><highlight class="normal"><sp/><sp/><sp/><sp/>ifs<sp/>&gt;&gt;<sp/>json_handle;</highlight></codeline>
+<codeline lineno="46"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="47"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="48"><highlight class="normal"></highlight></codeline>
+<codeline lineno="49"><highlight class="normal"></highlight><highlight class="keyword">template</highlight><highlight class="normal"><sp/>&lt;</highlight><highlight class="keyword">typename</highlight><highlight class="normal"><sp/>T&gt;</highlight></codeline>
+<codeline lineno="50"><highlight class="normal"></highlight><highlight class="keyword">static</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">bool</highlight><highlight class="normal"><sp/></highlight></codeline>
+<codeline lineno="51" refid="df/de1/namespacecudnn__frontend_1a91f2627793be5d51db9b1473275d803d" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1a91f2627793be5d51db9b1473275d803d" kindref="member">check_rule</ref>(</highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">json</ref><sp/>&amp;json_handle,<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>std::string<sp/>&amp;<sp/>executionPlanTag,</highlight></codeline>
+<codeline lineno="52"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnHandle_t<sp/>handle,<sp/>T<sp/>fn)<sp/>{</highlight></codeline>
+<codeline lineno="53"><highlight class="normal"><sp/><sp/><sp/><sp/>std::string<sp/>operation<sp/>=<sp/>json_handle[</highlight><highlight class="stringliteral">&quot;operation&quot;</highlight><highlight class="normal">];</highlight></codeline>
+<codeline lineno="54"><highlight class="normal"><sp/><sp/><sp/><sp/>std::string<sp/>engine<sp/><sp/><sp/><sp/>=<sp/><sp/>json_handle[</highlight><highlight class="stringliteral">&quot;engine&quot;</highlight><highlight class="normal">];</highlight></codeline>
+<codeline lineno="55"><highlight class="normal"><sp/><sp/><sp/><sp/>uint64_t<sp/>cudnn_start<sp/><sp/><sp/><sp/><sp/>=<sp/><sp/>0;</highlight></codeline>
+<codeline lineno="56"><highlight class="normal"><sp/><sp/><sp/><sp/>uint64_t<sp/>cudnn_end<sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/><sp/>-1;</highlight></codeline>
+<codeline lineno="57"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(json_handle.<ref refid="d9/dcc/classnlohmann_1_1basic__json_1a02c9bc4d0f33b7dec20b2798301d6971" kindref="member">contains</ref>(</highlight><highlight class="stringliteral">&quot;cudnn_version_start&quot;</highlight><highlight class="normal">))<sp/>{</highlight></codeline>
+<codeline lineno="58"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudnn_start<sp/><sp/><sp/>=<sp/><sp/>json_handle[</highlight><highlight class="stringliteral">&quot;cudnn_version_start&quot;</highlight><highlight class="normal">];</highlight></codeline>
+<codeline lineno="59"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="60"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(json_handle.<ref refid="d9/dcc/classnlohmann_1_1basic__json_1a02c9bc4d0f33b7dec20b2798301d6971" kindref="member">contains</ref>(</highlight><highlight class="stringliteral">&quot;cudnn_version_end&quot;</highlight><highlight class="normal">))<sp/>{</highlight></codeline>
+<codeline lineno="61"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudnn_end<sp/><sp/><sp/><sp/><sp/>=<sp/><sp/>json_handle[</highlight><highlight class="stringliteral">&quot;cudnn_version_end&quot;</highlight><highlight class="normal">];</highlight></codeline>
+<codeline lineno="62"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="63"><highlight class="normal"><sp/><sp/><sp/><sp/>std::string<sp/>tag_prefix<sp/>=<sp/>operation<sp/>+<sp/></highlight><highlight class="stringliteral">&quot;_&quot;</highlight><highlight class="normal"><sp/>+<sp/>engine;<sp/></highlight></codeline>
+<codeline lineno="64"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">bool</highlight><highlight class="normal"><sp/>blocked<sp/>=<sp/></highlight></codeline>
+<codeline lineno="65"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>std::equal(tag_prefix.begin(),<sp/>tag_prefix.end(),<sp/>executionPlanTag.begin())<sp/>&amp;&amp;</highlight></codeline>
+<codeline lineno="66"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_VERSION<sp/>&gt;=<sp/>cudnn_start<sp/>&amp;&amp;</highlight></codeline>
+<codeline lineno="67"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_VERSION<sp/>&lt;<sp/>cudnn_end;</highlight></codeline>
+<codeline lineno="68"><highlight class="normal"></highlight></codeline>
+<codeline lineno="69"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(blocked<sp/>&amp;&amp;<sp/>json_handle.<ref refid="d9/dcc/classnlohmann_1_1basic__json_1a02c9bc4d0f33b7dec20b2798301d6971" kindref="member">contains</ref>(</highlight><highlight class="stringliteral">&quot;knob&quot;</highlight><highlight class="normal">))<sp/>{<sp/></highlight><highlight class="comment">//<sp/>Short<sp/>circuit<sp/>if<sp/>operation<sp/>and<sp/>engine<sp/>do<sp/>not<sp/>match</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="70"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(</highlight><highlight class="keyword">auto</highlight><highlight class="normal">&amp;<sp/>kv<sp/>:<sp/>json_handle[</highlight><highlight class="stringliteral">&quot;knob&quot;</highlight><highlight class="normal">])<sp/>{</highlight></codeline>
+<codeline lineno="71"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>blocked<sp/>=<sp/>blocked<sp/>&amp;&amp;</highlight></codeline>
+<codeline lineno="72"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>(executionPlanTag.find(kv)<sp/>!=<sp/>std::string::npos);</highlight></codeline>
+<codeline lineno="73"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="74"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="75"><highlight class="normal"></highlight></codeline>
+<codeline lineno="76"><highlight class="normal"><sp/><sp/><sp/><sp/>blocked<sp/>=<sp/>blocked<sp/>&amp;&amp;<sp/>fn();<sp/></highlight></codeline>
+<codeline lineno="77"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>blocked;</highlight></codeline>
+<codeline lineno="78"><highlight class="normal"></highlight></codeline>
+<codeline lineno="79"><highlight class="normal"><sp/><sp/><sp/><sp/>(<ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref>)<sp/>handle;</highlight></codeline>
+<codeline lineno="80"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="81"><highlight class="normal"></highlight></codeline>
+<codeline lineno="82"><highlight class="normal"></highlight><highlight class="comment">//<sp/>Takes<sp/>in<sp/>an<sp/>initialzed<sp/>json<sp/>handle<sp/>and<sp/>checks<sp/>if<sp/>it<sp/>satisfies<sp/>the<sp/></highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="83"><highlight class="normal"></highlight><highlight class="comment">//<sp/>condition<sp/>for<sp/>running<sp/>it.<sp/>Returns<sp/>true<sp/>if<sp/>the<sp/>given<sp/>executionPlanTag</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="84"><highlight class="normal"></highlight><highlight class="comment">//<sp/>is<sp/>faulty.</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="85"><highlight class="normal"></highlight><highlight class="keyword">template</highlight><highlight class="normal"><sp/>&lt;</highlight><highlight class="keyword">typename</highlight><highlight class="normal"><sp/>T&gt;</highlight></codeline>
+<codeline lineno="86"><highlight class="normal"></highlight><highlight class="keyword">static</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">bool</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="87" refid="df/de1/namespacecudnn__frontend_1a8f4ddfcd38f15524ff0a35e14d21664c" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1a8f4ddfcd38f15524ff0a35e14d21664c" kindref="member">check_errata</ref>(</highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">json</ref><sp/>&amp;json_handle,<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>std::string<sp/>&amp;<sp/>executionPlanTag,</highlight></codeline>
+<codeline lineno="88"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnHandle_t<sp/>handle,<sp/>T<sp/>fn)<sp/>{</highlight></codeline>
+<codeline lineno="89"><highlight class="normal"></highlight></codeline>
+<codeline lineno="90"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(</highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;rule<sp/>:<sp/>json_handle[</highlight><highlight class="stringliteral">&quot;rules&quot;</highlight><highlight class="normal">])<sp/>{</highlight></codeline>
+<codeline lineno="91"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(check_rule&lt;T&gt;(rule,<sp/>executionPlanTag,<sp/>handle,<sp/>fn))<sp/>{</highlight></codeline>
+<codeline lineno="92"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/></highlight><highlight class="keyword">true</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="93"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="94"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="95"><highlight class="normal"></highlight></codeline>
+<codeline lineno="96"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/></highlight><highlight class="keyword">false</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="97"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="98"><highlight class="normal"></highlight></codeline>
+<codeline lineno="99"><highlight class="normal">}</highlight></codeline>
+    </programlisting>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Errata.h"/>
+  </compounddef>
+</doxygen>

@@ -1,0 +1,97 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="db/dda/classnlohmann_1_1detail_1_1iteration__proxy" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::iteration_proxy</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename</type>
+        <declname>IteratorType</declname>
+        <defname>IteratorType</defname>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="db/dda/classnlohmann_1_1detail_1_1iteration__proxy_1a88c0532ba4a5de1d527b18053b24fd19" prot="private" static="no" mutable="no">
+        <type>IteratorType::reference</type>
+        <definition>IteratorType::reference nlohmann::detail::iteration_proxy&lt; IteratorType &gt;::container</definition>
+        <argsstring></argsstring>
+        <name>container</name>
+        <briefdescription>
+<para>the container to iterate </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4400" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4400" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="db/dda/classnlohmann_1_1detail_1_1iteration__proxy_1afe257e972e3b4658ef2e355f7389d4a5" prot="public" static="no" const="no" explicit="yes" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::iteration_proxy&lt; IteratorType &gt;::iteration_proxy</definition>
+        <argsstring>(typename IteratorType::reference cont) noexcept</argsstring>
+        <name>iteration_proxy</name>
+        <param>
+          <type>typename IteratorType::reference</type>
+          <declname>cont</declname>
+        </param>
+        <briefdescription>
+<para>construct iteration proxy from a container </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4404" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4404" bodyend="4405"/>
+      </memberdef>
+      <memberdef kind="function" id="db/dda/classnlohmann_1_1detail_1_1iteration__proxy_1a379f86709d340c4ab1995539b8af623d" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d5/de9/classnlohmann_1_1detail_1_1iteration__proxy__value" kindref="compound">iteration_proxy_value</ref>&lt; IteratorType &gt;</type>
+        <definition>iteration_proxy_value&lt;IteratorType&gt; nlohmann::detail::iteration_proxy&lt; IteratorType &gt;::begin</definition>
+        <argsstring>() noexcept</argsstring>
+        <name>begin</name>
+        <briefdescription>
+<para>return iterator begin (needed for range-based for) </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4408" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4408" bodyend="4411"/>
+      </memberdef>
+      <memberdef kind="function" id="db/dda/classnlohmann_1_1detail_1_1iteration__proxy_1a90091f8492d23576edef72c5e8b9d4cf" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d5/de9/classnlohmann_1_1detail_1_1iteration__proxy__value" kindref="compound">iteration_proxy_value</ref>&lt; IteratorType &gt;</type>
+        <definition>iteration_proxy_value&lt;IteratorType&gt; nlohmann::detail::iteration_proxy&lt; IteratorType &gt;::end</definition>
+        <argsstring>() noexcept</argsstring>
+        <name>end</name>
+        <briefdescription>
+<para>return iterator end (needed for range-based for) </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4414" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4414" bodyend="4417"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>proxy class for the items() function </para>    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="671">
+        <label>nlohmann::detail::iteration_proxy&lt; IteratorType &gt;</label>
+        <link refid="db/dda/classnlohmann_1_1detail_1_1iteration__proxy"/>
+        <childnode refid="672" relation="usage">
+          <edgelabel>-container</edgelabel>
+        </childnode>
+      </node>
+      <node id="672">
+        <label>reference</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4397" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4396" bodyend="4418"/>
+    <listofallmembers>
+      <member refid="db/dda/classnlohmann_1_1detail_1_1iteration__proxy_1a379f86709d340c4ab1995539b8af623d" prot="public" virt="non-virtual"><scope>nlohmann::detail::iteration_proxy</scope><name>begin</name></member>
+      <member refid="db/dda/classnlohmann_1_1detail_1_1iteration__proxy_1a88c0532ba4a5de1d527b18053b24fd19" prot="private" virt="non-virtual"><scope>nlohmann::detail::iteration_proxy</scope><name>container</name></member>
+      <member refid="db/dda/classnlohmann_1_1detail_1_1iteration__proxy_1a90091f8492d23576edef72c5e8b9d4cf" prot="public" virt="non-virtual"><scope>nlohmann::detail::iteration_proxy</scope><name>end</name></member>
+      <member refid="db/dda/classnlohmann_1_1detail_1_1iteration__proxy_1afe257e972e3b4658ef2e355f7389d4a5" prot="public" virt="non-virtual"><scope>nlohmann::detail::iteration_proxy</scope><name>iteration_proxy</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

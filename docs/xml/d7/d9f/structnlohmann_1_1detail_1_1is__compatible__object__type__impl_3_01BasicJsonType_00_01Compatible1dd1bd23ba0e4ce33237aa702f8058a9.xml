@@ -1,0 +1,71 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d7/d9f/structnlohmann_1_1detail_1_1is__compatible__object__type__impl_3_01BasicJsonType_00_01Compatible1dd1bd23ba0e4ce33237aa702f8058a9" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_compatible_object_type_impl&lt; BasicJsonType, CompatibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, CompatibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, CompatibleObjectType &gt;::value &gt; &gt;</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+      <param>
+        <type>typename CompatibleObjectType</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="d7/d9f/structnlohmann_1_1detail_1_1is__compatible__object__type__impl_3_01BasicJsonType_00_01Compatible1dd1bd23ba0e4ce33237aa702f8058a9_1ab019855b17c1a0cb16fda6731f338afc" prot="public" static="no">
+        <type>typename BasicJsonType::object_t</type>
+        <definition>using nlohmann::detail::is_compatible_object_type_impl&lt; BasicJsonType, CompatibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, CompatibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, CompatibleObjectType &gt;::value &gt; &gt;::object_t =  typename BasicJsonType::object_t</definition>
+        <argsstring></argsstring>
+        <name>object_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3632" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3632" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-static-attrib">
+      <memberdef kind="variable" id="d7/d9f/structnlohmann_1_1detail_1_1is__compatible__object__type__impl_3_01BasicJsonType_00_01Compatible1dd1bd23ba0e4ce33237aa702f8058a9_1a74b723d759119148c44a5e0899956a72" prot="public" static="yes" mutable="no">
+        <type>constexpr bool</type>
+        <definition>constexpr bool nlohmann::detail::is_compatible_object_type_impl&lt; BasicJsonType, CompatibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, CompatibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, CompatibleObjectType &gt;::value &gt; &gt;::value</definition>
+        <argsstring></argsstring>
+        <name>value</name>
+        <initializer>=
+        <ref refid="d7/d10/structnlohmann_1_1detail_1_1is__constructible" kindref="compound">is_constructible</ref>&lt;typename object_t::key_type,
+        typename CompatibleObjectType::key_type&gt;::value &amp;&amp;
+        <ref refid="d7/d10/structnlohmann_1_1detail_1_1is__constructible" kindref="compound">is_constructible</ref>&lt;typename object_t::mapped_type,
+        typename CompatibleObjectType::mapped_type&gt;::value</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3635" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3635" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="431">
+        <label>nlohmann::detail::is_compatible_object_type_impl&lt; BasicJsonType, CompatibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, CompatibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, CompatibleObjectType &gt;::value &gt; &gt;</label>
+        <link refid="d7/d9f/structnlohmann_1_1detail_1_1is__compatible__object__type__impl_3_01BasicJsonType_00_01Compatible1dd1bd23ba0e4ce33237aa702f8058a9"/>
+        <childnode refid="432" relation="usage">
+          <edgelabel>+value</edgelabel>
+        </childnode>
+      </node>
+      <node id="432">
+        <label>bool</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3631" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3627" bodyend="3640"/>
+    <listofallmembers>
+      <member refid="d7/d9f/structnlohmann_1_1detail_1_1is__compatible__object__type__impl_3_01BasicJsonType_00_01Compatible1dd1bd23ba0e4ce33237aa702f8058a9_1ab019855b17c1a0cb16fda6731f338afc" prot="public" virt="non-virtual"><scope>nlohmann::detail::is_compatible_object_type_impl&lt; BasicJsonType, CompatibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, CompatibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, CompatibleObjectType &gt;::value &gt; &gt;</scope><name>object_t</name></member>
+      <member refid="d7/d9f/structnlohmann_1_1detail_1_1is__compatible__object__type__impl_3_01BasicJsonType_00_01Compatible1dd1bd23ba0e4ce33237aa702f8058a9_1a74b723d759119148c44a5e0899956a72" prot="public" virt="non-virtual"><scope>nlohmann::detail::is_compatible_object_type_impl&lt; BasicJsonType, CompatibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, CompatibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, CompatibleObjectType &gt;::value &gt; &gt;</scope><name>value</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

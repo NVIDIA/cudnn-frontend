@@ -17,262 +17,286 @@
     <includedby refid="d6/d67/cudnn__frontend__EngineConfig_8h" local="yes">cudnn_frontend_EngineConfig.h</includedby>
     <includedby refid="d6/d51/cudnn__frontend__ExecutionPlan_8h" local="yes">cudnn_frontend_ExecutionPlan.h</includedby>
     <incdepgraph>
-      <node id="92">
+      <node id="120">
         <label>cudnn_backend_base.h</label>
         <link refid="dc/d11/cudnn__backend__base_8h"/>
-        <childnode refid="84" relation="include">
+        <childnode refid="112" relation="include">
         </childnode>
       </node>
-      <node id="79">
+      <node id="107">
         <label>functional</label>
       </node>
-      <node id="93">
+      <node id="121">
         <label>cudnn_frontend_PointWiseDesc.h</label>
         <link refid="da/d5f/cudnn__frontend__PointWiseDesc_8h"/>
-        <childnode refid="77" relation="include">
+        <childnode refid="105" relation="include">
         </childnode>
-        <childnode refid="78" relation="include">
+        <childnode refid="106" relation="include">
         </childnode>
-        <childnode refid="79" relation="include">
+        <childnode refid="107" relation="include">
         </childnode>
-        <childnode refid="80" relation="include">
+        <childnode refid="108" relation="include">
         </childnode>
-        <childnode refid="81" relation="include">
+        <childnode refid="109" relation="include">
         </childnode>
-        <childnode refid="82" relation="include">
+        <childnode refid="110" relation="include">
         </childnode>
-        <childnode refid="84" relation="include">
+        <childnode refid="112" relation="include">
         </childnode>
-        <childnode refid="85" relation="include">
+        <childnode refid="113" relation="include">
         </childnode>
-        <childnode refid="89" relation="include">
+        <childnode refid="117" relation="include">
         </childnode>
       </node>
-      <node id="84">
+      <node id="112">
         <label>cudnn.h</label>
       </node>
-      <node id="88">
+      <node id="116">
         <label>cudnn_frontend_ConvDesc.h</label>
         <link refid="d1/de7/cudnn__frontend__ConvDesc_8h"/>
-        <childnode refid="77" relation="include">
+        <childnode refid="105" relation="include">
         </childnode>
-        <childnode refid="78" relation="include">
+        <childnode refid="106" relation="include">
         </childnode>
-        <childnode refid="79" relation="include">
+        <childnode refid="107" relation="include">
         </childnode>
-        <childnode refid="80" relation="include">
+        <childnode refid="108" relation="include">
         </childnode>
-        <childnode refid="81" relation="include">
+        <childnode refid="109" relation="include">
         </childnode>
-        <childnode refid="82" relation="include">
+        <childnode refid="110" relation="include">
         </childnode>
-        <childnode refid="84" relation="include">
+        <childnode refid="112" relation="include">
         </childnode>
-        <childnode refid="85" relation="include">
+        <childnode refid="113" relation="include">
         </childnode>
-        <childnode refid="89" relation="include">
+        <childnode refid="117" relation="include">
         </childnode>
       </node>
-      <node id="94">
+      <node id="122">
         <label>cudnn_frontend_MatMulDesc.h</label>
         <link refid="d6/d32/cudnn__frontend__MatMulDesc_8h"/>
-        <childnode refid="77" relation="include">
+        <childnode refid="105" relation="include">
         </childnode>
-        <childnode refid="78" relation="include">
+        <childnode refid="106" relation="include">
         </childnode>
-        <childnode refid="79" relation="include">
+        <childnode refid="107" relation="include">
         </childnode>
-        <childnode refid="80" relation="include">
+        <childnode refid="108" relation="include">
         </childnode>
-        <childnode refid="81" relation="include">
+        <childnode refid="109" relation="include">
         </childnode>
-        <childnode refid="82" relation="include">
+        <childnode refid="110" relation="include">
         </childnode>
-        <childnode refid="84" relation="include">
+        <childnode refid="112" relation="include">
         </childnode>
-        <childnode refid="85" relation="include">
+        <childnode refid="113" relation="include">
         </childnode>
-        <childnode refid="89" relation="include">
+        <childnode refid="117" relation="include">
         </childnode>
       </node>
-      <node id="91">
+      <node id="119">
         <label>string</label>
       </node>
-      <node id="86">
+      <node id="114">
         <label>cudnn_frontend_OperationGraph.h</label>
         <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
-        <childnode refid="77" relation="include">
+        <childnode refid="105" relation="include">
         </childnode>
-        <childnode refid="78" relation="include">
+        <childnode refid="106" relation="include">
         </childnode>
-        <childnode refid="79" relation="include">
+        <childnode refid="107" relation="include">
         </childnode>
-        <childnode refid="80" relation="include">
+        <childnode refid="108" relation="include">
         </childnode>
-        <childnode refid="81" relation="include">
+        <childnode refid="109" relation="include">
         </childnode>
-        <childnode refid="82" relation="include">
+        <childnode refid="110" relation="include">
         </childnode>
-        <childnode refid="84" relation="include">
+        <childnode refid="112" relation="include">
         </childnode>
-        <childnode refid="85" relation="include">
+        <childnode refid="113" relation="include">
         </childnode>
-        <childnode refid="87" relation="include">
+        <childnode refid="115" relation="include">
         </childnode>
-        <childnode refid="89" relation="include">
+        <childnode refid="117" relation="include">
         </childnode>
       </node>
-      <node id="90">
+      <node id="118">
         <label>exception</label>
       </node>
-      <node id="76">
+      <node id="104">
         <label>cudnn_frontend_Engine.h</label>
         <link refid="de/d6d/cudnn__frontend__Engine_8h"/>
-        <childnode refid="77" relation="include">
+        <childnode refid="105" relation="include">
         </childnode>
-        <childnode refid="78" relation="include">
+        <childnode refid="106" relation="include">
         </childnode>
-        <childnode refid="79" relation="include">
+        <childnode refid="107" relation="include">
         </childnode>
-        <childnode refid="80" relation="include">
+        <childnode refid="108" relation="include">
         </childnode>
-        <childnode refid="81" relation="include">
+        <childnode refid="109" relation="include">
         </childnode>
-        <childnode refid="82" relation="include">
+        <childnode refid="110" relation="include">
         </childnode>
-        <childnode refid="83" relation="include">
+        <childnode refid="111" relation="include">
         </childnode>
-        <childnode refid="84" relation="include">
+        <childnode refid="112" relation="include">
         </childnode>
-        <childnode refid="85" relation="include">
+        <childnode refid="113" relation="include">
         </childnode>
-        <childnode refid="86" relation="include">
+        <childnode refid="114" relation="include">
         </childnode>
-        <childnode refid="89" relation="include">
+        <childnode refid="117" relation="include">
         </childnode>
       </node>
-      <node id="95">
+      <node id="124">
         <label>cudnn_frontend_Tensor.h</label>
         <link refid="d3/d98/cudnn__frontend__Tensor_8h"/>
-        <childnode refid="77" relation="include">
+        <childnode refid="105" relation="include">
         </childnode>
-        <childnode refid="78" relation="include">
+        <childnode refid="106" relation="include">
         </childnode>
-        <childnode refid="79" relation="include">
+        <childnode refid="107" relation="include">
         </childnode>
-        <childnode refid="80" relation="include">
+        <childnode refid="108" relation="include">
         </childnode>
-        <childnode refid="81" relation="include">
+        <childnode refid="109" relation="include">
         </childnode>
-        <childnode refid="82" relation="include">
+        <childnode refid="110" relation="include">
         </childnode>
-        <childnode refid="89" relation="include">
+        <childnode refid="117" relation="include">
         </childnode>
       </node>
-      <node id="87">
+      <node id="115">
         <label>cudnn_frontend_Operation.h</label>
         <link refid="da/d5a/cudnn__frontend__Operation_8h"/>
-        <childnode refid="77" relation="include">
+        <childnode refid="105" relation="include">
         </childnode>
-        <childnode refid="78" relation="include">
+        <childnode refid="106" relation="include">
         </childnode>
-        <childnode refid="79" relation="include">
+        <childnode refid="107" relation="include">
         </childnode>
-        <childnode refid="80" relation="include">
+        <childnode refid="108" relation="include">
         </childnode>
-        <childnode refid="81" relation="include">
+        <childnode refid="109" relation="include">
         </childnode>
-        <childnode refid="82" relation="include">
+        <childnode refid="110" relation="include">
         </childnode>
-        <childnode refid="84" relation="include">
+        <childnode refid="112" relation="include">
         </childnode>
-        <childnode refid="85" relation="include">
+        <childnode refid="113" relation="include">
         </childnode>
-        <childnode refid="88" relation="include">
+        <childnode refid="116" relation="include">
         </childnode>
-        <childnode refid="93" relation="include">
+        <childnode refid="121" relation="include">
         </childnode>
-        <childnode refid="94" relation="include">
+        <childnode refid="122" relation="include">
         </childnode>
-        <childnode refid="95" relation="include">
+        <childnode refid="123" relation="include">
         </childnode>
-        <childnode refid="89" relation="include">
+        <childnode refid="124" relation="include">
+        </childnode>
+        <childnode refid="117" relation="include">
         </childnode>
       </node>
-      <node id="83">
+      <node id="111">
         <label>vector</label>
       </node>
-      <node id="85">
+      <node id="113">
         <label>cudnn_backend.h</label>
       </node>
-      <node id="82">
+      <node id="110">
         <label>utility</label>
       </node>
-      <node id="78">
+      <node id="106">
         <label>array</label>
       </node>
-      <node id="81">
+      <node id="109">
         <label>sstream</label>
       </node>
-      <node id="89">
+      <node id="117">
         <label>cudnn_frontend_utils.h</label>
         <link refid="df/d17/cudnn__frontend__utils_8h"/>
-        <childnode refid="90" relation="include">
+        <childnode refid="118" relation="include">
         </childnode>
-        <childnode refid="91" relation="include">
+        <childnode refid="119" relation="include">
         </childnode>
-        <childnode refid="92" relation="include">
+        <childnode refid="120" relation="include">
         </childnode>
       </node>
-      <node id="77">
+      <node id="123">
+        <label>cudnn_frontend_ReductionDesc.h</label>
+        <link refid="db/da7/cudnn__frontend__ReductionDesc_8h"/>
+        <childnode refid="105" relation="include">
+        </childnode>
+        <childnode refid="106" relation="include">
+        </childnode>
+        <childnode refid="107" relation="include">
+        </childnode>
+        <childnode refid="108" relation="include">
+        </childnode>
+        <childnode refid="109" relation="include">
+        </childnode>
+        <childnode refid="110" relation="include">
+        </childnode>
+        <childnode refid="112" relation="include">
+        </childnode>
+        <childnode refid="113" relation="include">
+        </childnode>
+        <childnode refid="117" relation="include">
+        </childnode>
+      </node>
+      <node id="105">
         <label>algorithm</label>
       </node>
-      <node id="80">
+      <node id="108">
         <label>memory</label>
       </node>
     </incdepgraph>
     <invincdepgraph>
-      <node id="101">
+      <node id="130">
         <label>cudnn_frontend_EngineConfig.h</label>
         <link refid="d6/d67/cudnn__frontend__EngineConfig_8h"/>
-        <childnode refid="97" relation="include">
+        <childnode refid="126" relation="include">
         </childnode>
       </node>
-      <node id="100">
+      <node id="129">
         <label>cudnn_frontend_get_plan.h</label>
         <link refid="d2/d3b/cudnn__frontend__get__plan_8h"/>
       </node>
-      <node id="102">
+      <node id="131">
         <label>cudnn_frontend_ExecutionPlan.h</label>
         <link refid="d6/d51/cudnn__frontend__ExecutionPlan_8h"/>
-        <childnode refid="97" relation="include">
+        <childnode refid="126" relation="include">
         </childnode>
       </node>
-      <node id="96">
+      <node id="125">
         <label>cudnn_frontend_Engine.h</label>
         <link refid="de/d6d/cudnn__frontend__Engine_8h"/>
-        <childnode refid="97" relation="include">
+        <childnode refid="126" relation="include">
         </childnode>
-        <childnode refid="101" relation="include">
+        <childnode refid="130" relation="include">
         </childnode>
-        <childnode refid="102" relation="include">
+        <childnode refid="131" relation="include">
         </childnode>
       </node>
-      <node id="98">
+      <node id="127">
         <label>cudnn_frontend_EngineConfigGenerator.h</label>
         <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
-        <childnode refid="99" relation="include">
+        <childnode refid="128" relation="include">
         </childnode>
-        <childnode refid="100" relation="include">
+        <childnode refid="129" relation="include">
         </childnode>
       </node>
-      <node id="97">
+      <node id="126">
         <label>cudnn_frontend.h</label>
         <link refid="de/d0c/cudnn__frontend_8h"/>
-        <childnode refid="98" relation="include">
+        <childnode refid="127" relation="include">
         </childnode>
       </node>
-      <node id="99">
+      <node id="128">
         <label>cudnn_frontend_find_plan.h</label>
         <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
       </node>
@@ -396,7 +420,7 @@
 <codeline lineno="123"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudnnStatus_t<sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref>;</highlight></codeline>
 <codeline lineno="124"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(</highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>i<sp/>=<sp/>0;<sp/>i<sp/>&lt;<sp/><ref refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1aed64863b9d73b7f6f3a7e16dc6e7eb04" kindref="member">numKnobs</ref>;<sp/>i++)<sp/>{</highlight></codeline>
 <codeline lineno="125"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>bKnob<sp/>=<sp/>bKnobs[i]-&gt;get_backend_descriptor();</highlight></codeline>
-<codeline lineno="126"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudnnBackendKnobType_t<sp/>type;</highlight></codeline>
+<codeline lineno="126"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudnnBackendKnobType_t<sp/><ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref>;</highlight></codeline>
 <codeline lineno="127"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>int64_t<sp/><ref refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1aecda8659b5a5d1dbb21b540a73141fb9" kindref="member">maxValue</ref>,<sp/><ref refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1a2403145dcb4bc55f970c6d07c1ed796e" kindref="member">minValue</ref>,<sp/><ref refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob_1a8342ab30dbe0e86d8d060983f14aba87" kindref="member">stride</ref>,<sp/>elemCount;</highlight></codeline>
 <codeline lineno="128"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>status<sp/>=</highlight></codeline>
 <codeline lineno="129"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudnnBackendGetAttribute(bKnob,<sp/>CUDNN_ATTR_KNOB_INFO_TYPE,<sp/>CUDNN_TYPE_KNOB_TYPE,<sp/>1,<sp/>&amp;elemCount,<sp/>&amp;type);</highlight></codeline>

@@ -1,0 +1,308 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="db/da7/cudnn__frontend__ReductionDesc_8h" kind="file" language="C++">
+    <compoundname>cudnn_frontend_ReductionDesc.h</compoundname>
+    <includes local="no">algorithm</includes>
+    <includes local="no">array</includes>
+    <includes local="no">functional</includes>
+    <includes local="no">memory</includes>
+    <includes local="no">sstream</includes>
+    <includes local="no">utility</includes>
+    <includes local="no">cudnn.h</includes>
+    <includes local="no">cudnn_backend.h</includes>
+    <includes refid="df/d17/cudnn__frontend__utils_8h" local="yes">cudnn_frontend_utils.h</includes>
+    <includedby refid="da/d5a/cudnn__frontend__Operation_8h" local="yes">cudnn_frontend_Operation.h</includedby>
+    <incdepgraph>
+      <node id="561">
+        <label>cudnn_backend_base.h</label>
+        <link refid="dc/d11/cudnn__backend__base_8h"/>
+        <childnode refid="556" relation="include">
+        </childnode>
+      </node>
+      <node id="552">
+        <label>functional</label>
+      </node>
+      <node id="556">
+        <label>cudnn.h</label>
+      </node>
+      <node id="560">
+        <label>string</label>
+      </node>
+      <node id="559">
+        <label>exception</label>
+      </node>
+      <node id="557">
+        <label>cudnn_backend.h</label>
+      </node>
+      <node id="555">
+        <label>utility</label>
+      </node>
+      <node id="551">
+        <label>array</label>
+      </node>
+      <node id="554">
+        <label>sstream</label>
+      </node>
+      <node id="558">
+        <label>cudnn_frontend_utils.h</label>
+        <link refid="df/d17/cudnn__frontend__utils_8h"/>
+        <childnode refid="559" relation="include">
+        </childnode>
+        <childnode refid="560" relation="include">
+        </childnode>
+        <childnode refid="561" relation="include">
+        </childnode>
+      </node>
+      <node id="549">
+        <label>cudnn_frontend_ReductionDesc.h</label>
+        <link refid="db/da7/cudnn__frontend__ReductionDesc_8h"/>
+        <childnode refid="550" relation="include">
+        </childnode>
+        <childnode refid="551" relation="include">
+        </childnode>
+        <childnode refid="552" relation="include">
+        </childnode>
+        <childnode refid="553" relation="include">
+        </childnode>
+        <childnode refid="554" relation="include">
+        </childnode>
+        <childnode refid="555" relation="include">
+        </childnode>
+        <childnode refid="556" relation="include">
+        </childnode>
+        <childnode refid="557" relation="include">
+        </childnode>
+        <childnode refid="558" relation="include">
+        </childnode>
+      </node>
+      <node id="550">
+        <label>algorithm</label>
+      </node>
+      <node id="553">
+        <label>memory</label>
+      </node>
+    </incdepgraph>
+    <invincdepgraph>
+      <node id="571">
+        <label>cudnn_frontend_EngineConfig.h</label>
+        <link refid="d6/d67/cudnn__frontend__EngineConfig_8h"/>
+        <childnode refid="566" relation="include">
+        </childnode>
+      </node>
+      <node id="569">
+        <label>cudnn_frontend_get_plan.h</label>
+        <link refid="d2/d3b/cudnn__frontend__get__plan_8h"/>
+      </node>
+      <node id="572">
+        <label>cudnn_frontend_ExecutionPlan.h</label>
+        <link refid="d6/d51/cudnn__frontend__ExecutionPlan_8h"/>
+        <childnode refid="566" relation="include">
+        </childnode>
+      </node>
+      <node id="564">
+        <label>cudnn_frontend_OperationGraph.h</label>
+        <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
+        <childnode refid="565" relation="include">
+        </childnode>
+        <childnode refid="570" relation="include">
+        </childnode>
+        <childnode refid="566" relation="include">
+        </childnode>
+      </node>
+      <node id="570">
+        <label>cudnn_frontend_Engine.h</label>
+        <link refid="de/d6d/cudnn__frontend__Engine_8h"/>
+        <childnode refid="566" relation="include">
+        </childnode>
+        <childnode refid="571" relation="include">
+        </childnode>
+        <childnode refid="572" relation="include">
+        </childnode>
+      </node>
+      <node id="563">
+        <label>cudnn_frontend_Operation.h</label>
+        <link refid="da/d5a/cudnn__frontend__Operation_8h"/>
+        <childnode refid="564" relation="include">
+        </childnode>
+        <childnode refid="566" relation="include">
+        </childnode>
+      </node>
+      <node id="567">
+        <label>cudnn_frontend_EngineConfigGenerator.h</label>
+        <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
+        <childnode refid="568" relation="include">
+        </childnode>
+        <childnode refid="569" relation="include">
+        </childnode>
+      </node>
+      <node id="566">
+        <label>cudnn_frontend.h</label>
+        <link refid="de/d0c/cudnn__frontend_8h"/>
+        <childnode refid="567" relation="include">
+        </childnode>
+      </node>
+      <node id="562">
+        <label>cudnn_frontend_ReductionDesc.h</label>
+        <link refid="db/da7/cudnn__frontend__ReductionDesc_8h"/>
+        <childnode refid="563" relation="include">
+        </childnode>
+      </node>
+      <node id="568">
+        <label>cudnn_frontend_find_plan.h</label>
+        <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
+      </node>
+      <node id="565">
+        <label>cudnn_frontend_Heuristics.h</label>
+        <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
+        <childnode refid="566" relation="include">
+        </childnode>
+      </node>
+    </invincdepgraph>
+    <innerclass refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" prot="public">cudnn_frontend::ReductionDesc_v8</innerclass>
+    <innerclass refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" prot="public">cudnn_frontend::ReductionDescBuilder_v8</innerclass>
+    <innernamespace refid="df/de1/namespacecudnn__frontend">cudnn_frontend</innernamespace>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <programlisting>
+<codeline lineno="1"><highlight class="comment">/*</highlight></codeline>
+<codeline lineno="2"><highlight class="comment"><sp/>*<sp/>Copyright<sp/>(c)<sp/>2021,<sp/>NVIDIA<sp/>CORPORATION.<sp/>All<sp/>rights<sp/>reserved.</highlight></codeline>
+<codeline lineno="3"><highlight class="comment"><sp/>*</highlight></codeline>
+<codeline lineno="4"><highlight class="comment"><sp/>*<sp/>Permission<sp/>is<sp/>hereby<sp/>granted,<sp/>free<sp/>of<sp/>charge,<sp/>to<sp/>any<sp/>person<sp/>obtaining<sp/>a</highlight></codeline>
+<codeline lineno="5"><highlight class="comment"><sp/>*<sp/>copy<sp/>of<sp/>this<sp/>software<sp/>and<sp/>associated<sp/>documentation<sp/>files<sp/>(the<sp/>&quot;Software&quot;),</highlight></codeline>
+<codeline lineno="6"><highlight class="comment"><sp/>*<sp/>to<sp/>deal<sp/>in<sp/>the<sp/>Software<sp/>without<sp/>restriction,<sp/>including<sp/>without<sp/>limitation</highlight></codeline>
+<codeline lineno="7"><highlight class="comment"><sp/>*<sp/>the<sp/>rights<sp/>to<sp/>use,<sp/>copy,<sp/>modify,<sp/>merge,<sp/>publish,<sp/>distribute,<sp/>sublicense,</highlight></codeline>
+<codeline lineno="8"><highlight class="comment"><sp/>*<sp/>and/or<sp/>sell<sp/>copies<sp/>of<sp/>the<sp/>Software,<sp/>and<sp/>to<sp/>permit<sp/>persons<sp/>to<sp/>whom<sp/>the</highlight></codeline>
+<codeline lineno="9"><highlight class="comment"><sp/>*<sp/>Software<sp/>is<sp/>furnished<sp/>to<sp/>do<sp/>so,<sp/>subject<sp/>to<sp/>the<sp/>following<sp/>conditions:</highlight></codeline>
+<codeline lineno="10"><highlight class="comment"><sp/>*</highlight></codeline>
+<codeline lineno="11"><highlight class="comment"><sp/>*<sp/>The<sp/>above<sp/>copyright<sp/>notice<sp/>and<sp/>this<sp/>permission<sp/>notice<sp/>shall<sp/>be<sp/>included<sp/>in</highlight></codeline>
+<codeline lineno="12"><highlight class="comment"><sp/>*<sp/>all<sp/>copies<sp/>or<sp/>substantial<sp/>portions<sp/>of<sp/>the<sp/>Software.</highlight></codeline>
+<codeline lineno="13"><highlight class="comment"><sp/>*</highlight></codeline>
+<codeline lineno="14"><highlight class="comment"><sp/>*<sp/>THE<sp/>SOFTWARE<sp/>IS<sp/>PROVIDED<sp/>&quot;AS<sp/>IS&quot;,<sp/>WITHOUT<sp/>WARRANTY<sp/>OF<sp/>ANY<sp/>KIND,<sp/>EXPRESS<sp/>OR</highlight></codeline>
+<codeline lineno="15"><highlight class="comment"><sp/>*<sp/>IMPLIED,<sp/>INCLUDING<sp/>BUT<sp/>NOT<sp/>LIMITED<sp/>TO<sp/>THE<sp/>WARRANTIES<sp/>OF<sp/>MERCHANTABILITY,</highlight></codeline>
+<codeline lineno="16"><highlight class="comment"><sp/>*<sp/>FITNESS<sp/>FOR<sp/>A<sp/>PARTICULAR<sp/>PURPOSE<sp/>AND<sp/>NONINFRINGEMENT.<sp/><sp/>IN<sp/>NO<sp/>EVENT<sp/>SHALL</highlight></codeline>
+<codeline lineno="17"><highlight class="comment"><sp/>*<sp/>THE<sp/>AUTHORS<sp/>OR<sp/>COPYRIGHT<sp/>HOLDERS<sp/>BE<sp/>LIABLE<sp/>FOR<sp/>ANY<sp/>CLAIM,<sp/>DAMAGES<sp/>OR<sp/>OTHER</highlight></codeline>
+<codeline lineno="18"><highlight class="comment"><sp/>*<sp/>LIABILITY,<sp/>WHETHER<sp/>IN<sp/>AN<sp/>ACTION<sp/>OF<sp/>CONTRACT,<sp/>TORT<sp/>OR<sp/>OTHERWISE,<sp/>ARISING</highlight></codeline>
+<codeline lineno="19"><highlight class="comment"><sp/>*<sp/>FROM,<sp/>OUT<sp/>OF<sp/>OR<sp/>IN<sp/>CONNECTION<sp/>WITH<sp/>THE<sp/>SOFTWARE<sp/>OR<sp/>THE<sp/>USE<sp/>OR<sp/>OTHER</highlight></codeline>
+<codeline lineno="20"><highlight class="comment"><sp/>*<sp/>DEALINGS<sp/>IN<sp/>THE<sp/>SOFTWARE.</highlight></codeline>
+<codeline lineno="21"><highlight class="comment"><sp/>*/</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="22"><highlight class="normal"></highlight></codeline>
+<codeline lineno="23"><highlight class="normal"></highlight><highlight class="preprocessor">#pragma<sp/>once</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="24"><highlight class="normal"></highlight></codeline>
+<codeline lineno="25"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;algorithm&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="26"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;array&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="27"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;functional&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="28"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;memory&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="29"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;sstream&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="30"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;utility&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="31"><highlight class="normal"></highlight></codeline>
+<codeline lineno="32"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;cudnn.h&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="33"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;cudnn_backend.h&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="34"><highlight class="normal"></highlight></codeline>
+<codeline lineno="35"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&quot;<ref refid="df/d17/cudnn__frontend__utils_8h" kindref="compound">cudnn_frontend_utils.h</ref>&quot;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="36"><highlight class="normal"></highlight></codeline>
+<codeline lineno="37"><highlight class="normal"></highlight><highlight class="keyword">namespace<sp/></highlight><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend" kindref="compound">cudnn_frontend</ref><sp/>{</highlight></codeline>
+<codeline lineno="48" refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" refkind="compound"><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" kindref="compound">ReductionDesc_v8</ref><sp/>:<sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal"><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" kindref="compound">BackendDescriptor</ref><sp/>{</highlight></codeline>
+<codeline lineno="49"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="50" refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a2d40c33ae24254be60d002d429637d22" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">friend</highlight><highlight class="normal"><sp/></highlight><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" kindref="compound">ReductionDescBuilder_v8</ref>;</highlight></codeline>
+<codeline lineno="51"><highlight class="normal"><sp/><sp/><sp/><sp/>std::string</highlight></codeline>
+<codeline lineno="52" refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1ad4d7570552aaf140e380e7a44e7785af" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1ad4d7570552aaf140e380e7a44e7785af" kindref="member">describe</ref>()</highlight><highlight class="keyword"><sp/>const<sp/>override<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="53"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>std::stringstream<sp/>ss;</highlight></codeline>
+<codeline lineno="54"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>ss<sp/>&lt;&lt;<sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_REDUCTION_DESCRIPTOR<sp/>:&quot;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="55"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&lt;&lt;<sp/></highlight><highlight class="stringliteral">&quot;<sp/>Math<sp/>precision<sp/>&quot;</highlight><highlight class="normal"><sp/>&lt;&lt;<sp/>(<ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1ab20fbdc2c97f07ff305cc6693adc242f" kindref="member">math_precision</ref>)<sp/>&lt;&lt;<sp/></highlight><highlight class="stringliteral">&quot;Reduction<sp/>operator<sp/>&quot;</highlight><highlight class="normal"><sp/>&lt;&lt;<sp/>(<ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a7de6c8f64b486904b1e7542eb6b40281" kindref="member">reduction_op</ref>);</highlight></codeline>
+<codeline lineno="56"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>ss.str();</highlight></codeline>
+<codeline lineno="57"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="58"><highlight class="normal"></highlight></codeline>
+<codeline lineno="59" refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1aa88b55d2bdfc1d3cdd15784b091eb3d4" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1aa88b55d2bdfc1d3cdd15784b091eb3d4" kindref="member">ReductionDesc_v8</ref>(<ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" kindref="compound">ReductionDesc_v8</ref><sp/>&amp;&amp;from)</highlight></codeline>
+<codeline lineno="60"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>:<sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" kindref="compound">BackendDescriptor</ref>(from.<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a57c83e78374bac747b5660fb271b947a" kindref="member">get_desc</ref>(),<sp/>from.<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" kindref="member">get_status</ref>(),<sp/>from.<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1abfde0f34b0bf49c45d3d9c0408284f6f" kindref="member">get_error</ref>()),</highlight></codeline>
+<codeline lineno="61"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1ab20fbdc2c97f07ff305cc6693adc242f" kindref="member">math_precision</ref>(from.<ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1ab20fbdc2c97f07ff305cc6693adc242f" kindref="member">math_precision</ref>),</highlight></codeline>
+<codeline lineno="62"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a7de6c8f64b486904b1e7542eb6b40281" kindref="member">reduction_op</ref>(from.<ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a7de6c8f64b486904b1e7542eb6b40281" kindref="member">reduction_op</ref>)<sp/>{}</highlight></codeline>
+<codeline lineno="63"><highlight class="normal"></highlight></codeline>
+<codeline lineno="64"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a2f878e63e294f06ac57a614db0a6c749" kindref="member">~ReductionDesc_v8</ref>()<sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="65"><highlight class="normal"></highlight></codeline>
+<codeline lineno="66"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">private</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="67"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1ad85b9113cca58bfeacc1ca33752cb578" kindref="member">ReductionDesc_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="68"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1ad85b9113cca58bfeacc1ca33752cb578" kindref="member">ReductionDesc_v8</ref>(<ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" kindref="compound">ReductionDesc_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="69"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" kindref="compound">ReductionDesc_v8</ref><sp/>&amp;</highlight></codeline>
+<codeline lineno="70"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a51f082e952ed5e01ddc9ef3f02f32f3b" kindref="member">operator=</ref>(<ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" kindref="compound">ReductionDesc_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="71"><highlight class="normal"></highlight></codeline>
+<codeline lineno="72" refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1ab20fbdc2c97f07ff305cc6693adc242f" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnDataType_t<sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1ab20fbdc2c97f07ff305cc6693adc242f" kindref="member">math_precision</ref><sp/><sp/><sp/><sp/><sp/>=<sp/>CUDNN_DATA_FLOAT;</highlight></codeline>
+<codeline lineno="73" refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a7de6c8f64b486904b1e7542eb6b40281" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnReduceTensorOp_t<sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a7de6c8f64b486904b1e7542eb6b40281" kindref="member">reduction_op</ref><sp/>=<sp/>CUDNN_REDUCE_TENSOR_ADD;</highlight></codeline>
+<codeline lineno="74"><highlight class="normal">};</highlight></codeline>
+<codeline lineno="75"><highlight class="normal"></highlight></codeline>
+<codeline lineno="79" refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" refkind="compound"><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" kindref="compound">ReductionDescBuilder_v8</ref><sp/>{</highlight></codeline>
+<codeline lineno="80"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="85"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="87" refid="d8/d95/group__ReductionDescBuilder__v8_1ga1822b91228b5f6b790cd7c2d77402cdb" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d8/d95/group__ReductionDescBuilder__v8_1ga1822b91228b5f6b790cd7c2d77402cdb" kindref="member">setMathPrecision</ref>(cudnnDataType_t<sp/>data_type_)<sp/>-&gt;<sp/><ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" kindref="compound">ReductionDescBuilder_v8</ref><sp/>&amp;<sp/>{</highlight></codeline>
+<codeline lineno="88"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>m_reductionDesc.math_precision<sp/>=<sp/>data_type_;</highlight></codeline>
+<codeline lineno="89"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>*</highlight><highlight class="keyword">this</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="90"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="92"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="93" refid="d8/d95/group__ReductionDescBuilder__v8_1gab00c3396fedc8b68356c426d19a54cf9" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d8/d95/group__ReductionDescBuilder__v8_1gab00c3396fedc8b68356c426d19a54cf9" kindref="member">setReductionOp</ref>(cudnnReduceTensorOp_t<sp/>op_)<sp/>-&gt;<sp/><ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" kindref="compound">ReductionDescBuilder_v8</ref><sp/>&amp;<sp/>{</highlight></codeline>
+<codeline lineno="94"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>m_reductionDesc.reduction_op<sp/>=<sp/>op_;</highlight></codeline>
+<codeline lineno="95"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>*</highlight><highlight class="keyword">this</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="96"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="99"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" kindref="compound">ReductionDesc_v8</ref><sp/>&amp;&amp;</highlight></codeline>
+<codeline lineno="102" refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8_1a84355923606ae86f66264fbcc5c305ad" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8_1a84355923606ae86f66264fbcc5c305ad" kindref="member">build</ref>()<sp/>{</highlight></codeline>
+<codeline lineno="103"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="comment">//<sp/>Create<sp/>a<sp/>descriptor.<sp/>Memory<sp/>allocation<sp/>happens<sp/>here.</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="104"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>=<sp/>m_reductionDesc.initialize_managed_backend_pointer(CUDNN_BACKEND_REDUCTION_DESCRIPTOR);</highlight></codeline>
+<codeline lineno="105"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
+<codeline lineno="106"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
+<codeline lineno="107"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_reductionDesc,<sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref>,<sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_REDUCTION_DESCRIPTOR:<sp/>cudnnCreate<sp/>Failed&quot;</highlight><highlight class="normal">);</highlight></codeline>
+<codeline lineno="108"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_reductionDesc);</highlight></codeline>
+<codeline lineno="109"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="110"><highlight class="normal"></highlight></codeline>
+<codeline lineno="111"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="comment">//<sp/>Once<sp/>Created<sp/>lets<sp/>set<sp/>the<sp/>descriptor<sp/>parameters.</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="112"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>=<sp/>cudnnBackendSetAttribute(m_reductionDesc.pointer-&gt;get_backend_descriptor(),</highlight></codeline>
+<codeline lineno="113"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_ATTR_REDUCTION_COMP_TYPE,</highlight></codeline>
+<codeline lineno="114"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_TYPE_DATA_TYPE,</highlight></codeline>
+<codeline lineno="115"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>1,</highlight></codeline>
+<codeline lineno="116"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_reductionDesc.math_precision);</highlight></codeline>
+<codeline lineno="117"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
+<codeline lineno="118"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
+<codeline lineno="119"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_reductionDesc,</highlight></codeline>
+<codeline lineno="120"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref>,</highlight></codeline>
+<codeline lineno="121"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_REDUCTION_DESCRIPTOR:<sp/>SetAttribute<sp/>CUDNN_ATTR_REDUCTION_COMP_TYPE<sp/>Failed&quot;</highlight><highlight class="normal">);</highlight></codeline>
+<codeline lineno="122"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_reductionDesc);</highlight></codeline>
+<codeline lineno="123"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="124"><highlight class="normal"></highlight></codeline>
+<codeline lineno="125"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>=<sp/>cudnnBackendSetAttribute(m_reductionDesc.pointer-&gt;get_backend_descriptor(),</highlight></codeline>
+<codeline lineno="126"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_ATTR_REDUCTION_OPERATOR,</highlight></codeline>
+<codeline lineno="127"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_TYPE_REDUCTION_OPERATOR_TYPE,</highlight></codeline>
+<codeline lineno="128"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>1,</highlight></codeline>
+<codeline lineno="129"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_reductionDesc.reduction_op);</highlight></codeline>
+<codeline lineno="130"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
+<codeline lineno="131"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
+<codeline lineno="132"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_reductionDesc,</highlight></codeline>
+<codeline lineno="133"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref>,</highlight></codeline>
+<codeline lineno="134"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_REDUCTION_DESCRIPTOR:<sp/>SetAttribute<sp/>CUDNN_ATTR_REDUCTION_OPERATOR<sp/>Failed&quot;</highlight><highlight class="normal">);</highlight></codeline>
+<codeline lineno="135"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_reductionDesc);</highlight></codeline>
+<codeline lineno="136"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="137"><highlight class="normal"></highlight></codeline>
+<codeline lineno="138"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="comment">//<sp/>Finalizing<sp/>the<sp/>descriptor</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="139"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>=<sp/>cudnnBackendFinalize(m_reductionDesc.pointer-&gt;get_backend_descriptor());</highlight></codeline>
+<codeline lineno="140"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
+<codeline lineno="141"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
+<codeline lineno="142"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_reductionDesc,<sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref>,<sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_REDUCTION_DESCRIPTOR:<sp/>cudnnFinalize<sp/>Failed&quot;</highlight><highlight class="normal">);</highlight></codeline>
+<codeline lineno="143"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_reductionDesc);</highlight></codeline>
+<codeline lineno="144"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="145"><highlight class="normal"></highlight></codeline>
+<codeline lineno="146"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_reductionDesc);</highlight></codeline>
+<codeline lineno="147"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="148"><highlight class="normal"></highlight></codeline>
+<codeline lineno="149"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">explicit</highlight><highlight class="normal"><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a2d40c33ae24254be60d002d429637d22" kindref="member">ReductionDescBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="150"><highlight class="normal"><sp/><sp/><sp/><sp/>~<ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" kindref="compound">ReductionDescBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="151"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a2d40c33ae24254be60d002d429637d22" kindref="member">ReductionDescBuilder_v8</ref>(<ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" kindref="compound">ReductionDescBuilder_v8</ref><sp/>&amp;&amp;)<sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="152"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a2d40c33ae24254be60d002d429637d22" kindref="member">ReductionDescBuilder_v8</ref>(<ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" kindref="compound">ReductionDescBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="153"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" kindref="compound">ReductionDescBuilder_v8</ref><sp/>&amp;</highlight></codeline>
+<codeline lineno="154"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a51f082e952ed5e01ddc9ef3f02f32f3b" kindref="member">operator=</ref>(<ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" kindref="compound">ReductionDescBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="155"><highlight class="normal"></highlight></codeline>
+<codeline lineno="156"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">private</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="157" refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8_1a462f9f96ab258f9dfdb490de30ca9d22" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" kindref="compound">ReductionDesc_v8</ref><sp/><ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8_1a462f9f96ab258f9dfdb490de30ca9d22" kindref="member">m_reductionDesc</ref>;</highlight></codeline>
+<codeline lineno="158"><highlight class="normal">};</highlight></codeline>
+<codeline lineno="159"><highlight class="normal">}</highlight></codeline>
+    </programlisting>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h"/>
+  </compounddef>
+</doxygen>

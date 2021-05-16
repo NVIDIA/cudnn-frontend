@@ -1,0 +1,196 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol" kind="struct" language="C++" prot="public" abstract="yes">
+    <compoundname>nlohmann::detail::output_adapter_protocol</compoundname>
+    <derivedcompoundref refid="d8/d94/classnlohmann_1_1detail_1_1output__stream__adapter" prot="public" virt="non-virtual">nlohmann::detail::output_stream_adapter&lt; CharType &gt;</derivedcompoundref>
+    <derivedcompoundref refid="d2/d39/classnlohmann_1_1detail_1_1output__string__adapter" prot="public" virt="non-virtual">nlohmann::detail::output_string_adapter&lt; CharType, StringType &gt;</derivedcompoundref>
+    <derivedcompoundref refid="d5/d66/classnlohmann_1_1detail_1_1output__vector__adapter" prot="public" virt="non-virtual">nlohmann::detail::output_vector_adapter&lt; CharType &gt;</derivedcompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename CharType</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1a3381896fe1be557f591de2e917cdc7d5" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>virtual void nlohmann::detail::output_adapter_protocol&lt; CharType &gt;::write_character</definition>
+        <argsstring>(CharType c)=0</argsstring>
+        <name>write_character</name>
+        <reimplementedby refid="d5/d66/classnlohmann_1_1detail_1_1output__vector__adapter_1af6a22d4210bb7bc2da66021300ddd6db">write_character</reimplementedby>
+        <reimplementedby refid="d8/d94/classnlohmann_1_1detail_1_1output__stream__adapter_1a6e2698c76b200b2d8fac6cebfc43a245">write_character</reimplementedby>
+        <reimplementedby refid="d2/d39/classnlohmann_1_1detail_1_1output__string__adapter_1a2d76cc6c88ddbc196a63fcfcac9ee7d1">write_character</reimplementedby>
+        <param>
+          <type>CharType</type>
+          <declname>c</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13138" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1a2f410a164e0eda17cf6561114b0eee4a" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>virtual void nlohmann::detail::output_adapter_protocol&lt; CharType &gt;::write_characters</definition>
+        <argsstring>(const CharType *s, std::size_t length)=0</argsstring>
+        <name>write_characters</name>
+        <reimplementedby refid="d5/d66/classnlohmann_1_1detail_1_1output__vector__adapter_1ad6f6c461dec7bedd5359454dc22fc9aa">write_characters</reimplementedby>
+        <reimplementedby refid="d8/d94/classnlohmann_1_1detail_1_1output__stream__adapter_1ad61375497a7d03cb0bdcddfdaad185d0">write_characters</reimplementedby>
+        <reimplementedby refid="d2/d39/classnlohmann_1_1detail_1_1output__string__adapter_1ab5ea4da075305d225dfd84ad997e8747">write_characters</reimplementedby>
+        <param>
+          <type>const CharType *</type>
+          <declname>s</declname>
+        </param>
+        <param>
+          <type>std::size_t</type>
+          <declname>length</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13139" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1ad71cdc057030f8a775a191face25061a" prot="public" static="no" const="no" explicit="no" inline="no" virt="virtual">
+        <type></type>
+        <definition>virtual nlohmann::detail::output_adapter_protocol&lt; CharType &gt;::~output_adapter_protocol</definition>
+        <argsstring>()=default</argsstring>
+        <name>~output_adapter_protocol</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13140" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1afd96245615e3b648e59e4a27bdfa67e0" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::output_adapter_protocol&lt; CharType &gt;::output_adapter_protocol</definition>
+        <argsstring>()=default</argsstring>
+        <name>output_adapter_protocol</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13142" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1adf6ef7a244c32162fe98d9773f31fa8a" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::output_adapter_protocol&lt; CharType &gt;::output_adapter_protocol</definition>
+        <argsstring>(const output_adapter_protocol &amp;)=default</argsstring>
+        <name>output_adapter_protocol</name>
+        <param>
+          <type>const <ref refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol" kindref="compound">output_adapter_protocol</ref> &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13143" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1a9527a27ddd468e4360a3530cbd9c35a6" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::output_adapter_protocol&lt; CharType &gt;::output_adapter_protocol</definition>
+        <argsstring>(output_adapter_protocol &amp;&amp;) noexcept=default</argsstring>
+        <name>output_adapter_protocol</name>
+        <param>
+          <type><ref refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol" kindref="compound">output_adapter_protocol</ref> &amp;&amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13144" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1ab2a6b7a5b86c612df2d99d2970380456" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol" kindref="compound">output_adapter_protocol</ref> &amp;</type>
+        <definition>output_adapter_protocol&amp; nlohmann::detail::output_adapter_protocol&lt; CharType &gt;::operator=</definition>
+        <argsstring>(const output_adapter_protocol &amp;)=default</argsstring>
+        <name>operator=</name>
+        <param>
+          <type>const <ref refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol" kindref="compound">output_adapter_protocol</ref> &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13145" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1a2235c8f3da8dfe5b26cb030f6886811a" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol" kindref="compound">output_adapter_protocol</ref> &amp;</type>
+        <definition>output_adapter_protocol&amp; nlohmann::detail::output_adapter_protocol&lt; CharType &gt;::operator=</definition>
+        <argsstring>(output_adapter_protocol &amp;&amp;) noexcept=default</argsstring>
+        <name>operator=</name>
+        <param>
+          <type><ref refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol" kindref="compound">output_adapter_protocol</ref> &amp;&amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13146" column="1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>abstract output adapter interface </para>    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="881">
+        <label>nlohmann::detail::output_string_adapter&lt; CharType &gt;</label>
+        <link refid="d2/d39/classnlohmann_1_1detail_1_1output__string__adapter"/>
+        <childnode refid="879" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="882">
+        <label>nlohmann::detail::output_vector_adapter&lt; CharType &gt;</label>
+        <link refid="d5/d66/classnlohmann_1_1detail_1_1output__vector__adapter"/>
+        <childnode refid="879" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="879">
+        <label>nlohmann::detail::output_adapter_protocol&lt; CharType &gt;</label>
+        <link refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol"/>
+      </node>
+      <node id="880">
+        <label>nlohmann::detail::output_stream_adapter&lt; CharType &gt;</label>
+        <link refid="d8/d94/classnlohmann_1_1detail_1_1output__stream__adapter"/>
+        <childnode refid="879" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="883">
+        <label>nlohmann::detail::output_adapter_protocol&lt; CharType &gt;</label>
+        <link refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13137" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13136" bodyend="13147"/>
+    <listofallmembers>
+      <member refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1ab2a6b7a5b86c612df2d99d2970380456" prot="public" virt="non-virtual"><scope>nlohmann::detail::output_adapter_protocol</scope><name>operator=</name></member>
+      <member refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1a2235c8f3da8dfe5b26cb030f6886811a" prot="public" virt="non-virtual"><scope>nlohmann::detail::output_adapter_protocol</scope><name>operator=</name></member>
+      <member refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1afd96245615e3b648e59e4a27bdfa67e0" prot="public" virt="non-virtual"><scope>nlohmann::detail::output_adapter_protocol</scope><name>output_adapter_protocol</name></member>
+      <member refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1adf6ef7a244c32162fe98d9773f31fa8a" prot="public" virt="non-virtual"><scope>nlohmann::detail::output_adapter_protocol</scope><name>output_adapter_protocol</name></member>
+      <member refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1a9527a27ddd468e4360a3530cbd9c35a6" prot="public" virt="non-virtual"><scope>nlohmann::detail::output_adapter_protocol</scope><name>output_adapter_protocol</name></member>
+      <member refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1a3381896fe1be557f591de2e917cdc7d5" prot="public" virt="pure-virtual"><scope>nlohmann::detail::output_adapter_protocol</scope><name>write_character</name></member>
+      <member refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1a2f410a164e0eda17cf6561114b0eee4a" prot="public" virt="pure-virtual"><scope>nlohmann::detail::output_adapter_protocol</scope><name>write_characters</name></member>
+      <member refid="dc/d9b/structnlohmann_1_1detail_1_1output__adapter__protocol_1ad71cdc057030f8a775a191face25061a" prot="public" virt="virtual"><scope>nlohmann::detail::output_adapter_protocol</scope><name>~output_adapter_protocol</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

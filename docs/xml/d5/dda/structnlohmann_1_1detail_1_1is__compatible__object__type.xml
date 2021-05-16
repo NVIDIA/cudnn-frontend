@@ -1,0 +1,75 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d5/dda/structnlohmann_1_1detail_1_1is__compatible__object__type" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_compatible_object_type</compoundname>
+    <basecompoundref refid="dc/da5/structnlohmann_1_1detail_1_1is__compatible__object__type__impl" prot="public" virt="non-virtual">nlohmann::detail::is_compatible_object_type_impl&lt; BasicJsonType, CompatibleObjectType &gt;</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+      <param>
+        <type>typename CompatibleObjectType</type>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="417">
+        <label>nlohmann::detail::is_compatible_object_type_impl&lt; BasicJsonType, CompatibleObjectType &gt;</label>
+        <link refid="dc/da5/structnlohmann_1_1detail_1_1is__compatible__object__type__impl"/>
+        <childnode refid="418" relation="public-inheritance">
+        </childnode>
+        <childnode refid="419" relation="template-instance">
+          <edgelabel>&lt; BasicJsonType, CompatibleObjectType &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="418">
+        <label>false_type</label>
+      </node>
+      <node id="419">
+        <label>nlohmann::detail::is_compatible_object_type_impl&lt; BasicJsonType, CompatibleObjectType, typename &gt;</label>
+        <link refid="dc/da5/structnlohmann_1_1detail_1_1is__compatible__object__type__impl"/>
+        <childnode refid="418" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="416">
+        <label>nlohmann::detail::is_compatible_object_type&lt; BasicJsonType, CompatibleObjectType &gt;</label>
+        <link refid="d5/dda/structnlohmann_1_1detail_1_1is__compatible__object__type"/>
+        <childnode refid="417" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="421">
+        <label>nlohmann::detail::is_compatible_object_type_impl&lt; BasicJsonType, CompatibleObjectType &gt;</label>
+        <link refid="dc/da5/structnlohmann_1_1detail_1_1is__compatible__object__type__impl"/>
+        <childnode refid="422" relation="public-inheritance">
+        </childnode>
+        <childnode refid="423" relation="template-instance">
+          <edgelabel>&lt; BasicJsonType, CompatibleObjectType &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="422">
+        <label>false_type</label>
+      </node>
+      <node id="423">
+        <label>nlohmann::detail::is_compatible_object_type_impl&lt; BasicJsonType, CompatibleObjectType, typename &gt;</label>
+        <link refid="dc/da5/structnlohmann_1_1detail_1_1is__compatible__object__type__impl"/>
+        <childnode refid="422" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="420">
+        <label>nlohmann::detail::is_compatible_object_type&lt; BasicJsonType, CompatibleObjectType &gt;</label>
+        <link refid="d5/dda/structnlohmann_1_1detail_1_1is__compatible__object__type"/>
+        <childnode refid="421" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3644" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3643" bodyend="3644"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

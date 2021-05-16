@@ -1,0 +1,43 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d3/d72/structnlohmann_1_1detail_1_1make__void" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::make_void</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename ...</type>
+        <declname>Ts</declname>
+        <defname>Ts</defname>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="d3/d72/structnlohmann_1_1detail_1_1make__void_1a8961e24ae3b2cb65ec47d1ce805d94e4" prot="public" static="no">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>using nlohmann::detail::make_void&lt; Ts &gt;::type =  void</definition>
+        <argsstring></argsstring>
+        <name>type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3209" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3209" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="772">
+        <label>nlohmann::detail::make_void&lt; Ts &gt;</label>
+        <link refid="d3/d72/structnlohmann_1_1detail_1_1make__void"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3208" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3207" bodyend="3210"/>
+    <listofallmembers>
+      <member refid="d3/d72/structnlohmann_1_1detail_1_1make__void_1a8961e24ae3b2cb65ec47d1ce805d94e4" prot="public" virt="non-virtual"><scope>nlohmann::detail::make_void</scope><name>type</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

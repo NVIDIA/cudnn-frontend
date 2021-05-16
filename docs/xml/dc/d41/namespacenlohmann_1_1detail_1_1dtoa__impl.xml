@@ -1,0 +1,379 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl" kind="namespace" language="C++">
+    <compoundname>nlohmann::detail::dtoa_impl</compoundname>
+    <innerclass refid="df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries" prot="public">nlohmann::detail::dtoa_impl::boundaries</innerclass>
+    <innerclass refid="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power" prot="public">nlohmann::detail::dtoa_impl::cached_power</innerclass>
+    <innerclass refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" prot="public">nlohmann::detail::dtoa_impl::diyfp</innerclass>
+      <sectiondef kind="var">
+      <memberdef kind="variable" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1ac1ea1316de0b4a219f707c76b1db1966" prot="public" static="no" mutable="no">
+        <type>constexpr int</type>
+        <definition>constexpr int nlohmann::detail::dtoa_impl::kAlpha</definition>
+        <argsstring></argsstring>
+        <name>kAlpha</name>
+        <initializer>= -60</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15151" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15151" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a4a750fcc38da1ce68b7e25ab3a230e20" prot="public" static="no" mutable="no">
+        <type>constexpr int</type>
+        <definition>constexpr int nlohmann::detail::dtoa_impl::kGamma</definition>
+        <argsstring></argsstring>
+        <name>kGamma</name>
+        <initializer>= -32</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15152" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15152" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a1c5d30eb51e5e994a3f48bde104d2ce8" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename Target</type>
+          </param>
+          <param>
+            <type>typename Source</type>
+          </param>
+        </templateparamlist>
+        <type>Target</type>
+        <definition>Target nlohmann::detail::dtoa_impl::reinterpret_bits</definition>
+        <argsstring>(const Source source)</argsstring>
+        <name>reinterpret_bits</name>
+        <param>
+          <type>const Source</type>
+          <declname>source</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14888" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14888" bodyend="14895"/>
+      </memberdef>
+      <memberdef kind="function" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a22b6e37654ac93c6d0d9c06ec1bf5ded" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename FloatType</type>
+          </param>
+        </templateparamlist>
+        <type><ref refid="df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries" kindref="compound">boundaries</ref></type>
+        <definition>boundaries nlohmann::detail::dtoa_impl::compute_boundaries</definition>
+        <argsstring>(FloatType value)</argsstring>
+        <name>compute_boundaries</name>
+        <param>
+          <type>FloatType</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para>Compute the (normalized) diyfp representing the input number &apos;value&apos; and its boundaries.</para><para><simplesect kind="pre"><para>value must be finite and positive </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15029" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15029" bodyend="15094"/>
+        <references refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1ae22e170815983961447c429f324c944d" compoundref="d5/db8/json_8hpp" startline="14902">nlohmann::detail::dtoa_impl::diyfp::e</references>
+        <references refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1aea90459e340a231ca31d46946803ef51" compoundref="d5/db8/json_8hpp" startline="14901">nlohmann::detail::dtoa_impl::diyfp::f</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804">nlohmann::detail::value</references>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1aab7a9670a4f4704a5d0347ad7588576b" compoundref="d5/db8/json_8hpp" startline="15728" endline="15759">grisu2</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1adbf329a18c5cf854a3477327afd2200b" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power" kindref="compound">cached_power</ref></type>
+        <definition>cached_power nlohmann::detail::dtoa_impl::get_cached_power_for_binary_exponent</definition>
+        <argsstring>(int e)</argsstring>
+        <name>get_cached_power_for_binary_exponent</name>
+        <param>
+          <type>int</type>
+          <declname>e</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para>For a normalized diyfp w = f * 2^e, this function returns a (normalized) cached power-of-ten c = f_c * 2^e_c, such that the exponent of the product w * c satisfies (Definition 3.2 from [1]) <verbatim> alpha &lt;= e_c + e + q &lt;= gamma.</verbatim> </para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15168" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15168" bodyend="15326"/>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a05b681dcb8569b9784c6dccfadb01633" compoundref="d5/db8/json_8hpp" startline="15668" endline="15719">grisu2</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a36ded358763b5dbcea9867660fbe4e28" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>int</type>
+        <definition>int nlohmann::detail::dtoa_impl::find_largest_pow10</definition>
+        <argsstring>(const std::uint32_t n, std::uint32_t &amp;pow10)</argsstring>
+        <name>find_largest_pow10</name>
+        <param>
+          <type>const std::uint32_t</type>
+          <declname>n</declname>
+        </param>
+        <param>
+          <type>std::uint32_t &amp;</type>
+          <declname>pow10</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para>For n != 0, returns k, such that pow10 := 10^(k-1) &lt;= n &lt; 10^k. For n == 0, returns 1 and sets pow10 := 1. </para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15332" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15332" bodyend="15384"/>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a9b899c72b0e1e3dd46d75c2b4e6bcdfb" compoundref="d5/db8/json_8hpp" startline="15427" endline="15660">grisu2_digit_gen</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a5bc841e0bee12fd6489d49cf7bd07bb4" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::dtoa_impl::grisu2_round</definition>
+        <argsstring>(char *buf, int len, std::uint64_t dist, std::uint64_t delta, std::uint64_t rest, std::uint64_t ten_k)</argsstring>
+        <name>grisu2_round</name>
+        <param>
+          <type>char *</type>
+          <declname>buf</declname>
+        </param>
+        <param>
+          <type>int</type>
+          <declname>len</declname>
+        </param>
+        <param>
+          <type>std::uint64_t</type>
+          <declname>dist</declname>
+        </param>
+        <param>
+          <type>std::uint64_t</type>
+          <declname>delta</declname>
+        </param>
+        <param>
+          <type>std::uint64_t</type>
+          <declname>rest</declname>
+        </param>
+        <param>
+          <type>std::uint64_t</type>
+          <declname>ten_k</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15386" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15386" bodyend="15421"/>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a9b899c72b0e1e3dd46d75c2b4e6bcdfb" compoundref="d5/db8/json_8hpp" startline="15427" endline="15660">grisu2_digit_gen</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a9b899c72b0e1e3dd46d75c2b4e6bcdfb" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::dtoa_impl::grisu2_digit_gen</definition>
+        <argsstring>(char *buffer, int &amp;length, int &amp;decimal_exponent, diyfp M_minus, diyfp w, diyfp M_plus)</argsstring>
+        <name>grisu2_digit_gen</name>
+        <param>
+          <type>char *</type>
+          <declname>buffer</declname>
+        </param>
+        <param>
+          <type>int &amp;</type>
+          <declname>length</declname>
+        </param>
+        <param>
+          <type>int &amp;</type>
+          <declname>decimal_exponent</declname>
+        </param>
+        <param>
+          <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+          <declname>M_minus</declname>
+        </param>
+        <param>
+          <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+          <declname>w</declname>
+        </param>
+        <param>
+          <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+          <declname>M_plus</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para>Generates V = buffer * 10^decimal_exponent, such that M- &lt;= V &lt;= M+. M- and M+ must be normalized and share the same exponent -60 &lt;= e &lt;= -32. </para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15427" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15427" bodyend="15660"/>
+        <references refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1ae22e170815983961447c429f324c944d" compoundref="d5/db8/json_8hpp" startline="14902">nlohmann::detail::dtoa_impl::diyfp::e</references>
+        <references refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1aea90459e340a231ca31d46946803ef51" compoundref="d5/db8/json_8hpp" startline="14901">nlohmann::detail::dtoa_impl::diyfp::f</references>
+        <references refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a36ded358763b5dbcea9867660fbe4e28" compoundref="d5/db8/json_8hpp" startline="15332" endline="15384">find_largest_pow10</references>
+        <references refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a5bc841e0bee12fd6489d49cf7bd07bb4" compoundref="d5/db8/json_8hpp" startline="15386" endline="15421">grisu2_round</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a5338981b5ad9027c9e54b1c5597f4344" compoundref="d5/db8/json_8hpp" startline="1456">JSON_HEDLEY_NON_NULL</references>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a05b681dcb8569b9784c6dccfadb01633" compoundref="d5/db8/json_8hpp" startline="15668" endline="15719">grisu2</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a05b681dcb8569b9784c6dccfadb01633" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::dtoa_impl::grisu2</definition>
+        <argsstring>(char *buf, int &amp;len, int &amp;decimal_exponent, diyfp m_minus, diyfp v, diyfp m_plus)</argsstring>
+        <name>grisu2</name>
+        <param>
+          <type>char *</type>
+          <declname>buf</declname>
+        </param>
+        <param>
+          <type>int &amp;</type>
+          <declname>len</declname>
+        </param>
+        <param>
+          <type>int &amp;</type>
+          <declname>decimal_exponent</declname>
+        </param>
+        <param>
+          <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+          <declname>m_minus</declname>
+        </param>
+        <param>
+          <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+          <declname>v</declname>
+        </param>
+        <param>
+          <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+          <declname>m_plus</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para>v = buf * 10^decimal_exponent len is the length of the buffer (number of decimal digits) The buffer must be large enough, i.e. &gt;= max_digits10. </para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15668" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15668" bodyend="15719"/>
+        <references refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1ae22e170815983961447c429f324c944d" compoundref="d5/db8/json_8hpp" startline="14902">nlohmann::detail::dtoa_impl::diyfp::e</references>
+        <references refid="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power_1a9e89bc89bb7bf4361f43ea27eed91d23" compoundref="d5/db8/json_8hpp" startline="15157">nlohmann::detail::dtoa_impl::cached_power::e</references>
+        <references refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1aea90459e340a231ca31d46946803ef51" compoundref="d5/db8/json_8hpp" startline="14901">nlohmann::detail::dtoa_impl::diyfp::f</references>
+        <references refid="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power_1a21ae81f515f5b08d5bf423775ee56074" compoundref="d5/db8/json_8hpp" startline="15156">nlohmann::detail::dtoa_impl::cached_power::f</references>
+        <references refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1adbf329a18c5cf854a3477327afd2200b" compoundref="d5/db8/json_8hpp" startline="15168" endline="15326">get_cached_power_for_binary_exponent</references>
+        <references refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a9b899c72b0e1e3dd46d75c2b4e6bcdfb" compoundref="d5/db8/json_8hpp" startline="15427" endline="15660">grisu2_digit_gen</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a5338981b5ad9027c9e54b1c5597f4344" compoundref="d5/db8/json_8hpp" startline="1456">JSON_HEDLEY_NON_NULL</references>
+        <references refid="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power_1a8c1f2efed643eeaa8fae83c697a29c6a" compoundref="d5/db8/json_8hpp" startline="15158">nlohmann::detail::dtoa_impl::cached_power::k</references>
+        <referencedby refid="dc/df0/namespacenlohmann_1_1detail_1a6cca370ac6c99294dbe4fe24716a57dd" compoundref="d5/db8/json_8hpp" startline="15905" endline="15948">nlohmann::detail::to_chars</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1aab7a9670a4f4704a5d0347ad7588576b" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename FloatType</type>
+          </param>
+        </templateparamlist>
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::dtoa_impl::grisu2</definition>
+        <argsstring>(char *buf, int &amp;len, int &amp;decimal_exponent, FloatType value)</argsstring>
+        <name>grisu2</name>
+        <param>
+          <type>char *</type>
+          <declname>buf</declname>
+        </param>
+        <param>
+          <type>int &amp;</type>
+          <declname>len</declname>
+        </param>
+        <param>
+          <type>int &amp;</type>
+          <declname>decimal_exponent</declname>
+        </param>
+        <param>
+          <type>FloatType</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para>v = buf * 10^decimal_exponent len is the length of the buffer (number of decimal digits) The buffer must be large enough, i.e. &gt;= max_digits10. </para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15728" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15728" bodyend="15759"/>
+        <references refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a22b6e37654ac93c6d0d9c06ec1bf5ded" compoundref="d5/db8/json_8hpp" startline="15029" endline="15094">compute_boundaries</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a5338981b5ad9027c9e54b1c5597f4344" compoundref="d5/db8/json_8hpp" startline="1456">JSON_HEDLEY_NON_NULL</references>
+        <references refid="d5/db8/json_8hpp_1a5f2aaec3b681d0a72f7d6e90b70cdcd1" compoundref="d5/db8/json_8hpp" startline="1897">JSON_HEDLEY_RETURNS_NON_NULL</references>
+        <references refid="df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries_1aec4e5028333c01f3229062f31ce16763" compoundref="d5/db8/json_8hpp" startline="15018">nlohmann::detail::dtoa_impl::boundaries::minus</references>
+        <references refid="df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries_1a3321ae2816a6ec5250a0d8e29f798232" compoundref="d5/db8/json_8hpp" startline="15019">nlohmann::detail::dtoa_impl::boundaries::plus</references>
+        <references refid="df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries_1ad1668c60aeade5f2557fafed8b8aee1a" compoundref="d5/db8/json_8hpp" startline="15017">nlohmann::detail::dtoa_impl::boundaries::w</references>
+      </memberdef>
+      <memberdef kind="function" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1ad90f19ed10d8133b727df4b9bc5ddf5c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d5/db8/json_8hpp_1a5f2aaec3b681d0a72f7d6e90b70cdcd1" kindref="member">JSON_HEDLEY_RETURNS_NON_NULL</ref> char *</type>
+        <definition>JSON_HEDLEY_RETURNS_NON_NULL char* nlohmann::detail::dtoa_impl::append_exponent</definition>
+        <argsstring>(char *buf, int e)</argsstring>
+        <name>append_exponent</name>
+        <param>
+          <type>char *</type>
+          <declname>buf</declname>
+        </param>
+        <param>
+          <type>int</type>
+          <declname>e</declname>
+        </param>
+        <briefdescription>
+<para>appends a decimal representation of e to buf </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>a pointer to the element following the exponent. </para></simplesect>
+<simplesect kind="pre"><para>-1000 &lt; e &lt; 1000 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15768" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15768" bodyend="15807"/>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a5338981b5ad9027c9e54b1c5597f4344" compoundref="d5/db8/json_8hpp" startline="1456">JSON_HEDLEY_NON_NULL</references>
+        <references refid="d5/db8/json_8hpp_1a5f2aaec3b681d0a72f7d6e90b70cdcd1" compoundref="d5/db8/json_8hpp" startline="1897">JSON_HEDLEY_RETURNS_NON_NULL</references>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1ab441f2761e33839ca48bc2225e14a2a9" compoundref="d5/db8/json_8hpp" startline="15820" endline="15888">format_buffer</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1ab441f2761e33839ca48bc2225e14a2a9" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d5/db8/json_8hpp_1a5f2aaec3b681d0a72f7d6e90b70cdcd1" kindref="member">JSON_HEDLEY_RETURNS_NON_NULL</ref> char *</type>
+        <definition>JSON_HEDLEY_RETURNS_NON_NULL char* nlohmann::detail::dtoa_impl::format_buffer</definition>
+        <argsstring>(char *buf, int len, int decimal_exponent, int min_exp, int max_exp)</argsstring>
+        <name>format_buffer</name>
+        <param>
+          <type>char *</type>
+          <declname>buf</declname>
+        </param>
+        <param>
+          <type>int</type>
+          <declname>len</declname>
+        </param>
+        <param>
+          <type>int</type>
+          <declname>decimal_exponent</declname>
+        </param>
+        <param>
+          <type>int</type>
+          <declname>min_exp</declname>
+        </param>
+        <param>
+          <type>int</type>
+          <declname>max_exp</declname>
+        </param>
+        <briefdescription>
+<para>prettify v = buf * 10^decimal_exponent </para>        </briefdescription>
+        <detaileddescription>
+<para>If v is in the range [10^min_exp, 10^max_exp) it will be printed in fixed-point notation. Otherwise it will be printed in exponential notation.</para><para><simplesect kind="pre"><para>min_exp &lt; 0 </para></simplesect>
+<simplesect kind="pre"><para>max_exp &gt; 0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15820" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15820" bodyend="15888"/>
+        <references refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1ad90f19ed10d8133b727df4b9bc5ddf5c" compoundref="d5/db8/json_8hpp" startline="15768" endline="15807">append_exponent</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a5338981b5ad9027c9e54b1c5597f4344" compoundref="d5/db8/json_8hpp" startline="1456">JSON_HEDLEY_NON_NULL</references>
+        <references refid="d5/db8/json_8hpp_1a5f2aaec3b681d0a72f7d6e90b70cdcd1" compoundref="d5/db8/json_8hpp" startline="1897">JSON_HEDLEY_RETURNS_NON_NULL</references>
+        <referencedby refid="dc/df0/namespacenlohmann_1_1detail_1a6cca370ac6c99294dbe4fe24716a57dd" compoundref="d5/db8/json_8hpp" startline="15905" endline="15948">nlohmann::detail::to_chars</referencedby>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>implements the Grisu2 algorithm for binary to decimal floating-point conversion. </para>    </briefdescription>
+    <detaileddescription>
+<para>This implementation is a slightly modified version of the reference implementation which may be obtained from <ulink url="http://florian.loitsch.com/publications">http://florian.loitsch.com/publications</ulink> (bench.tar.gz).</para><para>The code is distributed under the MIT license, Copyright (c) 2009 Florian Loitsch.</para><para>For a detailed description of the algorithm see:</para><para>[1] Loitsch, &quot;Printing Floating-Point Numbers Quickly and Accurately with
+    Integers&quot;, Proceedings of the ACM SIGPLAN 2010 Conference on Programming Language Design and Implementation, PLDI 2010 [2] Burger, Dybvig, &quot;Printing Floating-Point Numbers Quickly and Accurately&quot;, Proceedings of the ACM SIGPLAN 1996 Conference on Programming Language Design and Implementation, PLDI 1996 </para>    </detaileddescription>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14885" column="1"/>
+  </compounddef>
+</doxygen>

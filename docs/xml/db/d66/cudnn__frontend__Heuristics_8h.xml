@@ -9,235 +9,259 @@
     <includes refid="df/d17/cudnn__frontend__utils_8h" local="yes">cudnn_frontend_utils.h</includes>
     <includedby refid="de/d0c/cudnn__frontend_8h" local="yes">cudnn_frontend.h</includedby>
     <incdepgraph>
-      <node id="284">
+      <node id="435">
         <label>cudnn_backend_base.h</label>
         <link refid="dc/d11/cudnn__backend__base_8h"/>
-        <childnode refid="270" relation="include">
+        <childnode refid="421" relation="include">
         </childnode>
       </node>
-      <node id="275">
+      <node id="426">
         <label>functional</label>
       </node>
-      <node id="285">
+      <node id="436">
         <label>cudnn_frontend_PointWiseDesc.h</label>
         <link refid="da/d5f/cudnn__frontend__PointWiseDesc_8h"/>
-        <childnode refid="273" relation="include">
+        <childnode refid="424" relation="include">
         </childnode>
-        <childnode refid="274" relation="include">
+        <childnode refid="425" relation="include">
         </childnode>
-        <childnode refid="275" relation="include">
+        <childnode refid="426" relation="include">
         </childnode>
-        <childnode refid="276" relation="include">
+        <childnode refid="427" relation="include">
         </childnode>
-        <childnode refid="277" relation="include">
+        <childnode refid="428" relation="include">
         </childnode>
-        <childnode refid="278" relation="include">
+        <childnode refid="429" relation="include">
         </childnode>
-        <childnode refid="270" relation="include">
+        <childnode refid="421" relation="include">
         </childnode>
-        <childnode refid="271" relation="include">
+        <childnode refid="422" relation="include">
         </childnode>
-        <childnode refid="281" relation="include">
+        <childnode refid="432" relation="include">
         </childnode>
       </node>
-      <node id="270">
+      <node id="421">
         <label>cudnn.h</label>
       </node>
-      <node id="280">
+      <node id="431">
         <label>cudnn_frontend_ConvDesc.h</label>
         <link refid="d1/de7/cudnn__frontend__ConvDesc_8h"/>
-        <childnode refid="273" relation="include">
+        <childnode refid="424" relation="include">
         </childnode>
-        <childnode refid="274" relation="include">
+        <childnode refid="425" relation="include">
         </childnode>
-        <childnode refid="275" relation="include">
+        <childnode refid="426" relation="include">
         </childnode>
-        <childnode refid="276" relation="include">
+        <childnode refid="427" relation="include">
         </childnode>
-        <childnode refid="277" relation="include">
+        <childnode refid="428" relation="include">
         </childnode>
-        <childnode refid="278" relation="include">
+        <childnode refid="429" relation="include">
         </childnode>
-        <childnode refid="270" relation="include">
+        <childnode refid="421" relation="include">
         </childnode>
-        <childnode refid="271" relation="include">
+        <childnode refid="422" relation="include">
         </childnode>
-        <childnode refid="281" relation="include">
+        <childnode refid="432" relation="include">
         </childnode>
       </node>
-      <node id="286">
+      <node id="437">
         <label>cudnn_frontend_MatMulDesc.h</label>
         <link refid="d6/d32/cudnn__frontend__MatMulDesc_8h"/>
-        <childnode refid="273" relation="include">
+        <childnode refid="424" relation="include">
         </childnode>
-        <childnode refid="274" relation="include">
+        <childnode refid="425" relation="include">
         </childnode>
-        <childnode refid="275" relation="include">
+        <childnode refid="426" relation="include">
         </childnode>
-        <childnode refid="276" relation="include">
+        <childnode refid="427" relation="include">
         </childnode>
-        <childnode refid="277" relation="include">
+        <childnode refid="428" relation="include">
         </childnode>
-        <childnode refid="278" relation="include">
+        <childnode refid="429" relation="include">
         </childnode>
-        <childnode refid="270" relation="include">
+        <childnode refid="421" relation="include">
         </childnode>
-        <childnode refid="271" relation="include">
+        <childnode refid="422" relation="include">
         </childnode>
-        <childnode refid="281" relation="include">
+        <childnode refid="432" relation="include">
         </childnode>
       </node>
-      <node id="283">
+      <node id="434">
         <label>string</label>
       </node>
-      <node id="272">
+      <node id="423">
         <label>cudnn_frontend_OperationGraph.h</label>
         <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
-        <childnode refid="273" relation="include">
+        <childnode refid="424" relation="include">
         </childnode>
-        <childnode refid="274" relation="include">
+        <childnode refid="425" relation="include">
         </childnode>
-        <childnode refid="275" relation="include">
+        <childnode refid="426" relation="include">
         </childnode>
-        <childnode refid="276" relation="include">
+        <childnode refid="427" relation="include">
         </childnode>
-        <childnode refid="277" relation="include">
+        <childnode refid="428" relation="include">
         </childnode>
-        <childnode refid="278" relation="include">
+        <childnode refid="429" relation="include">
         </childnode>
-        <childnode refid="270" relation="include">
+        <childnode refid="421" relation="include">
         </childnode>
-        <childnode refid="271" relation="include">
+        <childnode refid="422" relation="include">
         </childnode>
-        <childnode refid="279" relation="include">
+        <childnode refid="430" relation="include">
         </childnode>
-        <childnode refid="281" relation="include">
+        <childnode refid="432" relation="include">
         </childnode>
       </node>
-      <node id="282">
+      <node id="433">
         <label>exception</label>
       </node>
-      <node id="287">
+      <node id="439">
         <label>cudnn_frontend_Tensor.h</label>
         <link refid="d3/d98/cudnn__frontend__Tensor_8h"/>
-        <childnode refid="273" relation="include">
+        <childnode refid="424" relation="include">
         </childnode>
-        <childnode refid="274" relation="include">
+        <childnode refid="425" relation="include">
         </childnode>
-        <childnode refid="275" relation="include">
+        <childnode refid="426" relation="include">
         </childnode>
-        <childnode refid="276" relation="include">
+        <childnode refid="427" relation="include">
         </childnode>
-        <childnode refid="277" relation="include">
+        <childnode refid="428" relation="include">
         </childnode>
-        <childnode refid="278" relation="include">
+        <childnode refid="429" relation="include">
         </childnode>
-        <childnode refid="281" relation="include">
+        <childnode refid="432" relation="include">
         </childnode>
       </node>
-      <node id="279">
+      <node id="430">
         <label>cudnn_frontend_Operation.h</label>
         <link refid="da/d5a/cudnn__frontend__Operation_8h"/>
-        <childnode refid="273" relation="include">
+        <childnode refid="424" relation="include">
         </childnode>
-        <childnode refid="274" relation="include">
+        <childnode refid="425" relation="include">
         </childnode>
-        <childnode refid="275" relation="include">
+        <childnode refid="426" relation="include">
         </childnode>
-        <childnode refid="276" relation="include">
+        <childnode refid="427" relation="include">
         </childnode>
-        <childnode refid="277" relation="include">
+        <childnode refid="428" relation="include">
         </childnode>
-        <childnode refid="278" relation="include">
+        <childnode refid="429" relation="include">
         </childnode>
-        <childnode refid="270" relation="include">
+        <childnode refid="421" relation="include">
         </childnode>
-        <childnode refid="271" relation="include">
+        <childnode refid="422" relation="include">
         </childnode>
-        <childnode refid="280" relation="include">
+        <childnode refid="431" relation="include">
         </childnode>
-        <childnode refid="285" relation="include">
+        <childnode refid="436" relation="include">
         </childnode>
-        <childnode refid="286" relation="include">
+        <childnode refid="437" relation="include">
         </childnode>
-        <childnode refid="287" relation="include">
+        <childnode refid="438" relation="include">
         </childnode>
-        <childnode refid="281" relation="include">
+        <childnode refid="439" relation="include">
+        </childnode>
+        <childnode refid="432" relation="include">
         </childnode>
       </node>
-      <node id="269">
+      <node id="420">
         <label>vector</label>
       </node>
-      <node id="271">
+      <node id="422">
         <label>cudnn_backend.h</label>
       </node>
-      <node id="278">
+      <node id="429">
         <label>utility</label>
       </node>
-      <node id="274">
+      <node id="425">
         <label>array</label>
       </node>
-      <node id="277">
+      <node id="428">
         <label>sstream</label>
       </node>
-      <node id="281">
+      <node id="432">
         <label>cudnn_frontend_utils.h</label>
         <link refid="df/d17/cudnn__frontend__utils_8h"/>
-        <childnode refid="282" relation="include">
+        <childnode refid="433" relation="include">
         </childnode>
-        <childnode refid="283" relation="include">
+        <childnode refid="434" relation="include">
         </childnode>
-        <childnode refid="284" relation="include">
+        <childnode refid="435" relation="include">
         </childnode>
       </node>
-      <node id="268">
+      <node id="438">
+        <label>cudnn_frontend_ReductionDesc.h</label>
+        <link refid="db/da7/cudnn__frontend__ReductionDesc_8h"/>
+        <childnode refid="424" relation="include">
+        </childnode>
+        <childnode refid="425" relation="include">
+        </childnode>
+        <childnode refid="426" relation="include">
+        </childnode>
+        <childnode refid="427" relation="include">
+        </childnode>
+        <childnode refid="428" relation="include">
+        </childnode>
+        <childnode refid="429" relation="include">
+        </childnode>
+        <childnode refid="421" relation="include">
+        </childnode>
+        <childnode refid="422" relation="include">
+        </childnode>
+        <childnode refid="432" relation="include">
+        </childnode>
+      </node>
+      <node id="419">
         <label>cudnn_frontend_Heuristics.h</label>
         <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
-        <childnode refid="269" relation="include">
+        <childnode refid="420" relation="include">
         </childnode>
-        <childnode refid="270" relation="include">
+        <childnode refid="421" relation="include">
         </childnode>
-        <childnode refid="271" relation="include">
+        <childnode refid="422" relation="include">
         </childnode>
-        <childnode refid="272" relation="include">
+        <childnode refid="423" relation="include">
         </childnode>
-        <childnode refid="281" relation="include">
+        <childnode refid="432" relation="include">
         </childnode>
       </node>
-      <node id="273">
+      <node id="424">
         <label>algorithm</label>
       </node>
-      <node id="276">
+      <node id="427">
         <label>memory</label>
       </node>
     </incdepgraph>
     <invincdepgraph>
-      <node id="292">
+      <node id="444">
         <label>cudnn_frontend_get_plan.h</label>
         <link refid="d2/d3b/cudnn__frontend__get__plan_8h"/>
       </node>
-      <node id="290">
+      <node id="442">
         <label>cudnn_frontend_EngineConfigGenerator.h</label>
         <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
-        <childnode refid="291" relation="include">
+        <childnode refid="443" relation="include">
         </childnode>
-        <childnode refid="292" relation="include">
+        <childnode refid="444" relation="include">
         </childnode>
       </node>
-      <node id="289">
+      <node id="441">
         <label>cudnn_frontend.h</label>
         <link refid="de/d0c/cudnn__frontend_8h"/>
-        <childnode refid="290" relation="include">
+        <childnode refid="442" relation="include">
         </childnode>
       </node>
-      <node id="291">
+      <node id="443">
         <label>cudnn_frontend_find_plan.h</label>
         <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
       </node>
-      <node id="288">
+      <node id="440">
         <label>cudnn_frontend_Heuristics.h</label>
         <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
-        <childnode refid="289" relation="include">
+        <childnode refid="441" relation="include">
         </childnode>
       </node>
     </invincdepgraph>

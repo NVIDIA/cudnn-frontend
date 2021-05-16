@@ -1,0 +1,159 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::iterator_input_adapter</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename IteratorType</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1a7cc60e68767005322ab4b692c9dff283" prot="public" static="no">
+        <type>typename std::iterator_traits&lt; IteratorType &gt;::value_type</type>
+        <definition>using nlohmann::detail::iterator_input_adapter&lt; IteratorType &gt;::char_type =  typename std::iterator_traits&lt;IteratorType&gt;::value_type</definition>
+        <argsstring></argsstring>
+        <name>char_type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5354" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5354" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1a8abccad27590d381a94e474b16161938" prot="private" static="no" mutable="no">
+        <type>IteratorType</type>
+        <definition>IteratorType nlohmann::detail::iterator_input_adapter&lt; IteratorType &gt;::current</definition>
+        <argsstring></argsstring>
+        <name>current</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5373" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5373" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1a8aa29994ca6fdc0f8c96abf9151738ab" prot="private" static="no" mutable="no">
+        <type>IteratorType</type>
+        <definition>IteratorType nlohmann::detail::iterator_input_adapter&lt; IteratorType &gt;::end</definition>
+        <argsstring></argsstring>
+        <name>end</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5374" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5374" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="friend">
+      <memberdef kind="friend" id="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1ab86106ba230f1542b94dcd96e6ab3221" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename BaseInputAdapter</type>
+          </param>
+          <param>
+            <type>size_t</type>
+            <declname>T</declname>
+            <defname>T</defname>
+          </param>
+        </templateparamlist>
+        <type>friend struct</type>
+        <definition>friend struct wide_string_input_helper</definition>
+        <argsstring></argsstring>
+        <name>wide_string_input_helper</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5377" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5377" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1a9423d7166b9e3092f149266acd064ba7" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::iterator_input_adapter&lt; IteratorType &gt;::iterator_input_adapter</definition>
+        <argsstring>(IteratorType first, IteratorType last)</argsstring>
+        <name>iterator_input_adapter</name>
+        <param>
+          <type>IteratorType</type>
+          <declname>first</declname>
+        </param>
+        <param>
+          <type>IteratorType</type>
+          <declname>last</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5356" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5356" bodyend="5358"/>
+      </memberdef>
+      <memberdef kind="function" id="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1a01706f07681df083c2174d236ff3d643" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::char_traits&lt; <ref refid="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1a7cc60e68767005322ab4b692c9dff283" kindref="member">char_type</ref> &gt;::int_type</type>
+        <definition>std::char_traits&lt;char_type&gt;::int_type nlohmann::detail::iterator_input_adapter&lt; IteratorType &gt;::get_character</definition>
+        <argsstring>()</argsstring>
+        <name>get_character</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5360" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5360" bodyend="5370"/>
+        <references refid="d5/db8/json_8hpp_1a355f2770653ff7bdd5c74b204b5a3ad0" compoundref="d5/db8/json_8hpp" startline="1563">JSON_HEDLEY_LIKELY</references>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-func">
+      <memberdef kind="function" id="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1ace7ba18b59cde50cbc53687034f649be" prot="private" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::iterator_input_adapter&lt; IteratorType &gt;::empty</definition>
+        <argsstring>() const</argsstring>
+        <name>empty</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5379" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5379" bodyend="5382"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="680">
+        <label>nlohmann::detail::iterator_input_adapter&lt; IteratorType &gt;</label>
+        <link refid="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter"/>
+        <childnode refid="681" relation="usage">
+          <edgelabel>-current</edgelabel>
+          <edgelabel>-end</edgelabel>
+        </childnode>
+      </node>
+      <node id="681">
+        <label>IteratorType</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5352" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5351" bodyend="5383"/>
+    <listofallmembers>
+      <member refid="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1a7cc60e68767005322ab4b692c9dff283" prot="public" virt="non-virtual"><scope>nlohmann::detail::iterator_input_adapter</scope><name>char_type</name></member>
+      <member refid="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1a8abccad27590d381a94e474b16161938" prot="private" virt="non-virtual"><scope>nlohmann::detail::iterator_input_adapter</scope><name>current</name></member>
+      <member refid="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1ace7ba18b59cde50cbc53687034f649be" prot="private" virt="non-virtual"><scope>nlohmann::detail::iterator_input_adapter</scope><name>empty</name></member>
+      <member refid="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1a8aa29994ca6fdc0f8c96abf9151738ab" prot="private" virt="non-virtual"><scope>nlohmann::detail::iterator_input_adapter</scope><name>end</name></member>
+      <member refid="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1a01706f07681df083c2174d236ff3d643" prot="public" virt="non-virtual"><scope>nlohmann::detail::iterator_input_adapter</scope><name>get_character</name></member>
+      <member refid="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1a9423d7166b9e3092f149266acd064ba7" prot="public" virt="non-virtual"><scope>nlohmann::detail::iterator_input_adapter</scope><name>iterator_input_adapter</name></member>
+      <member refid="d4/dbe/classnlohmann_1_1detail_1_1iterator__input__adapter_1ab86106ba230f1542b94dcd96e6ab3221" prot="private" virt="non-virtual"><scope>nlohmann::detail::iterator_input_adapter</scope><name>wide_string_input_helper</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

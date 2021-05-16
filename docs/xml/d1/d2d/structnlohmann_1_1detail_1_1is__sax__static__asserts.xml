@@ -1,0 +1,114 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_sax_static_asserts</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename SAX</type>
+      </param>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="private-type">
+      <memberdef kind="typedef" id="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts_1a474adf99bf1eaa8292284fd3064c80fe" prot="private" static="no">
+        <type>typename BasicJsonType::number_integer_t</type>
+        <definition>using nlohmann::detail::is_sax_static_asserts&lt; SAX, BasicJsonType &gt;::number_integer_t =  typename BasicJsonType::number_integer_t</definition>
+        <argsstring></argsstring>
+        <name>number_integer_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8154" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8154" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts_1af8733df7fcaebb25434285885db7f127" prot="private" static="no">
+        <type>typename BasicJsonType::number_unsigned_t</type>
+        <definition>using nlohmann::detail::is_sax_static_asserts&lt; SAX, BasicJsonType &gt;::number_unsigned_t =  typename BasicJsonType::number_unsigned_t</definition>
+        <argsstring></argsstring>
+        <name>number_unsigned_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8155" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8155" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts_1a65d4be40c41ddc31fd2c3583d87d5faf" prot="private" static="no">
+        <type>typename BasicJsonType::number_float_t</type>
+        <definition>using nlohmann::detail::is_sax_static_asserts&lt; SAX, BasicJsonType &gt;::number_float_t =  typename BasicJsonType::number_float_t</definition>
+        <argsstring></argsstring>
+        <name>number_float_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8156" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8156" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts_1a067c98d2145bb54d862f4794ac1287bb" prot="private" static="no">
+        <type>typename BasicJsonType::string_t</type>
+        <definition>using nlohmann::detail::is_sax_static_asserts&lt; SAX, BasicJsonType &gt;::string_t =  typename BasicJsonType::string_t</definition>
+        <argsstring></argsstring>
+        <name>string_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8157" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8157" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts_1adb3ffd1849091f6edb5c2d6e650e4266" prot="private" static="no">
+        <type>typename BasicJsonType::binary_t</type>
+        <definition>using nlohmann::detail::is_sax_static_asserts&lt; SAX, BasicJsonType &gt;::binary_t =  typename BasicJsonType::binary_t</definition>
+        <argsstring></argsstring>
+        <name>binary_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8158" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8158" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts_1a34e1bc8ab7adbbab5f7d8c45a964020b" prot="private" static="no">
+        <type>typename BasicJsonType::exception</type>
+        <definition>using nlohmann::detail::is_sax_static_asserts&lt; SAX, BasicJsonType &gt;::exception_t =  typename BasicJsonType::exception</definition>
+        <argsstring></argsstring>
+        <name>exception_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8159" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8159" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="660">
+        <label>nlohmann::detail::is_sax_static_asserts&lt; SAX, BasicJsonType &gt;</label>
+        <link refid="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8149" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8148" bodyend="8199"/>
+    <listofallmembers>
+      <member refid="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts_1adb3ffd1849091f6edb5c2d6e650e4266" prot="private" virt="non-virtual"><scope>nlohmann::detail::is_sax_static_asserts</scope><name>binary_t</name></member>
+      <member refid="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts_1a34e1bc8ab7adbbab5f7d8c45a964020b" prot="private" virt="non-virtual"><scope>nlohmann::detail::is_sax_static_asserts</scope><name>exception_t</name></member>
+      <member refid="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts_1a65d4be40c41ddc31fd2c3583d87d5faf" prot="private" virt="non-virtual"><scope>nlohmann::detail::is_sax_static_asserts</scope><name>number_float_t</name></member>
+      <member refid="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts_1a474adf99bf1eaa8292284fd3064c80fe" prot="private" virt="non-virtual"><scope>nlohmann::detail::is_sax_static_asserts</scope><name>number_integer_t</name></member>
+      <member refid="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts_1af8733df7fcaebb25434285885db7f127" prot="private" virt="non-virtual"><scope>nlohmann::detail::is_sax_static_asserts</scope><name>number_unsigned_t</name></member>
+      <member refid="d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts_1a067c98d2145bb54d862f4794ac1287bb" prot="private" virt="non-virtual"><scope>nlohmann::detail::is_sax_static_asserts</scope><name>string_t</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

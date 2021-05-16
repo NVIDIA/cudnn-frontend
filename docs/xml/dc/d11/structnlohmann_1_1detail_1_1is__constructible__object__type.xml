@@ -1,0 +1,75 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="dc/d11/structnlohmann_1_1detail_1_1is__constructible__object__type" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_constructible_object_type</compoundname>
+    <basecompoundref refid="dd/da4/structnlohmann_1_1detail_1_1is__constructible__object__type__impl" prot="public" virt="non-virtual">nlohmann::detail::is_constructible_object_type_impl&lt; BasicJsonType, ConstructibleObjectType &gt;</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+      <param>
+        <type>typename ConstructibleObjectType</type>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="546">
+        <label>false_type</label>
+      </node>
+      <node id="545">
+        <label>nlohmann::detail::is_constructible_object_type_impl&lt; BasicJsonType, ConstructibleObjectType &gt;</label>
+        <link refid="dd/da4/structnlohmann_1_1detail_1_1is__constructible__object__type__impl"/>
+        <childnode refid="546" relation="public-inheritance">
+        </childnode>
+        <childnode refid="547" relation="template-instance">
+          <edgelabel>&lt; BasicJsonType, ConstructibleObjectType &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="544">
+        <label>nlohmann::detail::is_constructible_object_type&lt; BasicJsonType, ConstructibleObjectType &gt;</label>
+        <link refid="dc/d11/structnlohmann_1_1detail_1_1is__constructible__object__type"/>
+        <childnode refid="545" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="547">
+        <label>nlohmann::detail::is_constructible_object_type_impl&lt; BasicJsonType, ConstructibleObjectType, typename &gt;</label>
+        <link refid="dd/da4/structnlohmann_1_1detail_1_1is__constructible__object__type__impl"/>
+        <childnode refid="546" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="550">
+        <label>false_type</label>
+      </node>
+      <node id="549">
+        <label>nlohmann::detail::is_constructible_object_type_impl&lt; BasicJsonType, ConstructibleObjectType &gt;</label>
+        <link refid="dd/da4/structnlohmann_1_1detail_1_1is__constructible__object__type__impl"/>
+        <childnode refid="550" relation="public-inheritance">
+        </childnode>
+        <childnode refid="551" relation="template-instance">
+          <edgelabel>&lt; BasicJsonType, ConstructibleObjectType &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="548">
+        <label>nlohmann::detail::is_constructible_object_type&lt; BasicJsonType, ConstructibleObjectType &gt;</label>
+        <link refid="dc/d11/structnlohmann_1_1detail_1_1is__constructible__object__type"/>
+        <childnode refid="549" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="551">
+        <label>nlohmann::detail::is_constructible_object_type_impl&lt; BasicJsonType, ConstructibleObjectType, typename &gt;</label>
+        <link refid="dd/da4/structnlohmann_1_1detail_1_1is__constructible__object__type__impl"/>
+        <childnode refid="550" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3677" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3675" bodyend="3677"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

@@ -6,6 +6,7 @@ var classcudnn__frontend_1_1OperationGraph__v8 =
     [ "OperationGraph_v8", "de/dd9/classcudnn__frontend_1_1OperationGraph__v8.html#a0b3b76a619160671c45c733eb1a13455", null ],
     [ "describe", "de/dd9/classcudnn__frontend_1_1OperationGraph__v8.html#acd0b5f47407184b0b26bf4d4b5d0ce32", null ],
     [ "getEngineCount", "d1/df7/group__OperationGraphQuery.html#ga7a7a8d03f5a3aa54f14b83be4abe2a26", null ],
+    [ "getOpCount", "de/dd9/classcudnn__frontend_1_1OperationGraph__v8.html#aa344863fca30448e6f3e139d69f62080", null ],
     [ "getTag", "de/dd9/classcudnn__frontend_1_1OperationGraph__v8.html#a19fd5ed99ab4053c8a178bd33843460a", null ],
     [ "operator=", "de/dd9/classcudnn__frontend_1_1OperationGraph__v8.html#a87704bb46bb12bba977a21ed579a4ef3", null ],
     [ "OperationGraphBuilder_v8", "de/dd9/classcudnn__frontend_1_1OperationGraph__v8.html#a5af59a099cc90eda429563e285b2907f", null ],

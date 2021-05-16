@@ -1,0 +1,8 @@
+<map id="nlohmann::detail::exception" name="nlohmann::detail::exception">
+<area shape="rect" id="node3" href="$d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator.html" title="exception indicating errors with iterators " alt="" coords="5,329,168,436"/>
+<area shape="rect" id="node4" href="$d5/d1b/classnlohmann_1_1detail_1_1other__error.html" title="exception indicating other library errors " alt="" coords="192,329,347,436"/>
+<area shape="rect" id="node5" href="$d2/d67/classnlohmann_1_1detail_1_1out__of__range.html" title="exception indicating access out of the defined range " alt="" coords="371,329,514,436"/>
+<area shape="rect" id="node6" href="$d5/d1a/classnlohmann_1_1detail_1_1parse__error.html" title="exception indicating a parse error " alt="" coords="539,315,696,451"/>
+<area shape="rect" id="node7" href="$da/d1c/classnlohmann_1_1detail_1_1type__error.html" title="exception indicating executing a member function with a wrong type " alt="" coords="721,329,871,436"/>
+<area shape="rect" id="node2" title="STL class. " alt="" coords="391,5,495,83"/>
+</map>

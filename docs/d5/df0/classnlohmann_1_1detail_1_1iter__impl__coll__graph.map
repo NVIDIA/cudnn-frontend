@@ -1,0 +1,5 @@
+<map id="nlohmann::detail::iter_impl&lt; BasicJsonType &gt;" name="nlohmann::detail::iter_impl&lt; BasicJsonType &gt;">
+<area shape="rect" id="node2" href="$d7/d10/structnlohmann_1_1detail_1_1internal__iterator.html" title="{nlohmann::detail::internal\l_iterator\&lt; typename std\l::remove_const\&lt; BasicJsonType\l \&gt;::type \&gt;\n||}" alt="" coords="241,675,455,796"/>
+<area shape="rect" id="node7" href="$d7/d10/structnlohmann_1_1detail_1_1internal__iterator.html" title="an iterator value " alt="" coords="257,491,439,583"/>
+<area shape="rect" id="node4" href="$d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t.html" title="{nlohmann::detail::primitive\l_iterator_t\n||+ get_value()\l+ set_begin()\l+ set_end()\l+ is_begin()\l+ is_end()\l+ operator+()\l+ operator++()\l+ operator++()\l+ operator&#45;&#45;()\l+ operator&#45;&#45;()\l+ operator+=()\l+ operator&#45;=()\l}" alt="" coords="438,175,613,428"/>
+</map>

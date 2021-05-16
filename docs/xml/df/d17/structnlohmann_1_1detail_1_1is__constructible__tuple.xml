@@ -1,0 +1,45 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="df/d17/structnlohmann_1_1detail_1_1is__constructible__tuple" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_constructible_tuple</compoundname>
+    <basecompoundref prot="public" virt="non-virtual">false_type</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename T1</type>
+      </param>
+      <param>
+        <type>typename T2</type>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="581">
+        <label>false_type</label>
+      </node>
+      <node id="580">
+        <label>nlohmann::detail::is_constructible_tuple&lt; T1, T2 &gt;</label>
+        <link refid="df/d17/structnlohmann_1_1detail_1_1is__constructible__tuple"/>
+        <childnode refid="581" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="583">
+        <label>false_type</label>
+      </node>
+      <node id="582">
+        <label>nlohmann::detail::is_constructible_tuple&lt; T1, T2 &gt;</label>
+        <link refid="df/d17/structnlohmann_1_1detail_1_1is__constructible__tuple"/>
+        <childnode refid="583" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3826" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3826" bodyend="3826"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

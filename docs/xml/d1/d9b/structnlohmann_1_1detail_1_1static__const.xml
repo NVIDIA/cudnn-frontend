@@ -1,0 +1,48 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d1/d9b/structnlohmann_1_1detail_1_1static__const" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::static_const</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename T</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-static-attrib">
+      <memberdef kind="variable" id="d1/d9b/structnlohmann_1_1detail_1_1static__const_1a6bb7ab2ddd6abc41fb4ffb7c6dfa237e" prot="public" static="yes" mutable="no">
+        <type>constexpr T</type>
+        <definition>constexpr T nlohmann::detail::static_const&lt; T &gt;::value</definition>
+        <argsstring></argsstring>
+        <name>value</name>
+        <initializer>{}</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3166" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3166" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="994">
+        <label>static constexpr T</label>
+      </node>
+      <node id="993">
+        <label>nlohmann::detail::static_const&lt; T &gt;</label>
+        <link refid="d1/d9b/structnlohmann_1_1detail_1_1static__const"/>
+        <childnode refid="994" relation="usage">
+          <edgelabel>+value</edgelabel>
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3165" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3164" bodyend="3167"/>
+    <listofallmembers>
+      <member refid="d1/d9b/structnlohmann_1_1detail_1_1static__const_1a6bb7ab2ddd6abc41fb4ffb7c6dfa237e" prot="public" virt="non-virtual"><scope>nlohmann::detail::static_const</scope><name>value</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

@@ -1,0 +1,64 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="db/d25/structnlohmann_1_1detail_1_1is__constructible__array__type__impl_3_01BasicJsonType_00_01Construc0e52d76e0092123e197792b4c785ae52" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_constructible_array_type_impl&lt; BasicJsonType, ConstructibleArrayType, enable_if_t&lt; !std::is_same&lt; ConstructibleArrayType, typename BasicJsonType::value_type &gt;::value &amp;&amp;is_default_constructible&lt; ConstructibleArrayType &gt;::value &amp;&amp;(std::is_move_assignable&lt; ConstructibleArrayType &gt;::value||std::is_copy_assignable&lt; ConstructibleArrayType &gt;::value)&amp;&amp;is_detected&lt; value_type_t, ConstructibleArrayType &gt;::value &amp;&amp;is_detected&lt; iterator_t, ConstructibleArrayType &gt;::value &amp;&amp;is_complete_type&lt; detected_t&lt; value_type_t, ConstructibleArrayType &gt; &gt;::value &gt; &gt;</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+      <param>
+        <type>typename ConstructibleArrayType</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-static-attrib">
+      <memberdef kind="variable" id="db/d25/structnlohmann_1_1detail_1_1is__constructible__array__type__impl_3_01BasicJsonType_00_01Construc0e52d76e0092123e197792b4c785ae52_1a6ae337e4735fd1e84675a7a0eabc09aa" prot="public" static="yes" mutable="no">
+        <type>constexpr bool</type>
+        <definition>constexpr bool nlohmann::detail::is_constructible_array_type_impl&lt; BasicJsonType, ConstructibleArrayType, enable_if_t&lt; !std::is_same&lt; ConstructibleArrayType, typename BasicJsonType::value_type &gt;::value &amp;&amp;is_default_constructible&lt; ConstructibleArrayType &gt;::value &amp;&amp;(std::is_move_assignable&lt; ConstructibleArrayType &gt;::value||std::is_copy_assignable&lt; ConstructibleArrayType &gt;::value)&amp;&amp;is_detected&lt; value_type_t, ConstructibleArrayType &gt;::value &amp;&amp;is_detected&lt; iterator_t, ConstructibleArrayType &gt;::value &amp;&amp;is_complete_type&lt; detected_t&lt; value_type_t, ConstructibleArrayType &gt; &gt;::value &gt; &gt;::value</definition>
+        <argsstring></argsstring>
+        <name>value</name>
+        <initializer>=
+        
+        
+        
+        
+        
+        !<ref refid="d3/d30/structnlohmann_1_1detail_1_1is__iterator__traits" kindref="compound">is_iterator_traits</ref>&lt;<ref refid="d8/db6/structnlohmann_1_1detail_1_1iterator__traits" kindref="compound">iterator_traits</ref>&lt;ConstructibleArrayType&gt;&gt;::value &amp;&amp;
+
+        (std::is_same&lt;typename ConstructibleArrayType::value_type,
+         typename BasicJsonType::array_t::value_type&gt;::value ||
+         <ref refid="dc/dac/structnlohmann_1_1detail_1_1has__from__json" kindref="compound">has_from_json</ref>&lt;BasicJsonType,
+         typename ConstructibleArrayType::value_type&gt;::value ||
+         <ref refid="d7/d08/structnlohmann_1_1detail_1_1has__non__default__from__json" kindref="compound">has_non_default_from_json</ref> &lt;
+         BasicJsonType, typename ConstructibleArrayType::value_type &gt;::value)</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3762" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3762" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="538">
+        <label>nlohmann::detail::is_constructible_array_type_impl&lt; BasicJsonType, ConstructibleArrayType, enable_if_t&lt; !std::is_same&lt; ConstructibleArrayType, typename BasicJsonType::value_type &gt;::value &amp;&amp;is_default_constructible&lt; ConstructibleArrayType &gt;::value &amp;&amp;(std::is_move_assignable&lt; ConstructibleArrayType &gt;::value||std::is_copy_assignable&lt; ConstructibleArrayType &gt;::value)&amp;&amp;is_detected&lt; value_type_t, ConstructibleArrayType &gt;::value &amp;&amp;is_detected&lt; iterator_t, ConstructibleArrayType &gt;::value &amp;&amp;is_complete_type&lt; detected_t&lt; value_type_t, ConstructibleArrayType &gt; &gt;::value &gt; &gt;</label>
+        <link refid="db/d25/structnlohmann_1_1detail_1_1is__constructible__array__type__impl_3_01BasicJsonType_00_01Construc0e52d76e0092123e197792b4c785ae52"/>
+        <childnode refid="539" relation="usage">
+          <edgelabel>+value</edgelabel>
+        </childnode>
+      </node>
+      <node id="539">
+        <label>bool</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3761" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3750" bodyend="3776"/>
+    <listofallmembers>
+      <member refid="db/d25/structnlohmann_1_1detail_1_1is__constructible__array__type__impl_3_01BasicJsonType_00_01Construc0e52d76e0092123e197792b4c785ae52_1a6ae337e4735fd1e84675a7a0eabc09aa" prot="public" virt="non-virtual"><scope>nlohmann::detail::is_constructible_array_type_impl&lt; BasicJsonType, ConstructibleArrayType, enable_if_t&lt; !std::is_same&lt; ConstructibleArrayType, typename BasicJsonType::value_type &gt;::value &amp;&amp;is_default_constructible&lt; ConstructibleArrayType &gt;::value &amp;&amp;(std::is_move_assignable&lt; ConstructibleArrayType &gt;::value||std::is_copy_assignable&lt; ConstructibleArrayType &gt;::value)&amp;&amp;is_detected&lt; value_type_t, ConstructibleArrayType &gt;::value &amp;&amp;is_detected&lt; iterator_t, ConstructibleArrayType &gt;::value &amp;&amp;is_complete_type&lt; detected_t&lt; value_type_t, ConstructibleArrayType &gt; &gt;::value &gt; &gt;</scope><name>value</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

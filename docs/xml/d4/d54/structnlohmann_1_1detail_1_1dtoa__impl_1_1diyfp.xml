@@ -1,0 +1,212 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::dtoa_impl::diyfp</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+      <sectiondef kind="public-static-attrib">
+      <memberdef kind="variable" id="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1a03682754b06ed4f30b263119eecc2d52" prot="public" static="yes" mutable="no">
+        <type>constexpr int</type>
+        <definition>constexpr int nlohmann::detail::dtoa_impl::diyfp::kPrecision</definition>
+        <argsstring></argsstring>
+        <name>kPrecision</name>
+        <initializer>= 64</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14899" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14899" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-attrib">
+      <memberdef kind="variable" id="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1aea90459e340a231ca31d46946803ef51" prot="public" static="no" mutable="no">
+        <type>std::uint64_t</type>
+        <definition>std::uint64_t nlohmann::detail::dtoa_impl::diyfp::f</definition>
+        <argsstring></argsstring>
+        <name>f</name>
+        <initializer>= 0</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14901" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14901" bodyend="-1"/>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a22b6e37654ac93c6d0d9c06ec1bf5ded" compoundref="d5/db8/json_8hpp" startline="15029" endline="15094">nlohmann::detail::dtoa_impl::compute_boundaries</referencedby>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a05b681dcb8569b9784c6dccfadb01633" compoundref="d5/db8/json_8hpp" startline="15668" endline="15719">nlohmann::detail::dtoa_impl::grisu2</referencedby>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a9b899c72b0e1e3dd46d75c2b4e6bcdfb" compoundref="d5/db8/json_8hpp" startline="15427" endline="15660">nlohmann::detail::dtoa_impl::grisu2_digit_gen</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1ae22e170815983961447c429f324c944d" prot="public" static="no" mutable="no">
+        <type>int</type>
+        <definition>int nlohmann::detail::dtoa_impl::diyfp::e</definition>
+        <argsstring></argsstring>
+        <name>e</name>
+        <initializer>= 0</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14902" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14902" bodyend="-1"/>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a22b6e37654ac93c6d0d9c06ec1bf5ded" compoundref="d5/db8/json_8hpp" startline="15029" endline="15094">nlohmann::detail::dtoa_impl::compute_boundaries</referencedby>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a05b681dcb8569b9784c6dccfadb01633" compoundref="d5/db8/json_8hpp" startline="15668" endline="15719">nlohmann::detail::dtoa_impl::grisu2</referencedby>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a9b899c72b0e1e3dd46d75c2b4e6bcdfb" compoundref="d5/db8/json_8hpp" startline="15427" endline="15660">nlohmann::detail::dtoa_impl::grisu2_digit_gen</referencedby>
+        <referencedby refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1a6b6665e467ebabe0c0f7418d3fe4b118" compoundref="d5/db8/json_8hpp" startline="15004" endline="15012">normalize_to</referencedby>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1ad8798a8823a49c8412f0fada9892c918" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr</type>
+        <definition>constexpr nlohmann::detail::dtoa_impl::diyfp::diyfp</definition>
+        <argsstring>(std::uint64_t f_, int e_) noexcept</argsstring>
+        <name>diyfp</name>
+        <param>
+          <type>std::uint64_t</type>
+          <declname>f_</declname>
+        </param>
+        <param>
+          <type>int</type>
+          <declname>e_</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14904" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14904" bodyend="14904"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-static-func">
+      <memberdef kind="function" id="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1aeb26771af54ad73598c1a0430d65d884" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+        <definition>static diyfp nlohmann::detail::dtoa_impl::diyfp::sub</definition>
+        <argsstring>(const diyfp &amp;x, const diyfp &amp;y) noexcept</argsstring>
+        <name>sub</name>
+        <param>
+          <type>const <ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref> &amp;</type>
+          <declname>x</declname>
+        </param>
+        <param>
+          <type>const <ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref> &amp;</type>
+          <declname>y</declname>
+        </param>
+        <briefdescription>
+<para>returns x - y </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>x.e == y.e and x.f &gt;= y.f </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14910" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14910" bodyend="14916"/>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+      </memberdef>
+      <memberdef kind="function" id="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1aa5f250d12ce89c81fdb08900c6a823e8" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+        <definition>static diyfp nlohmann::detail::dtoa_impl::diyfp::mul</definition>
+        <argsstring>(const diyfp &amp;x, const diyfp &amp;y) noexcept</argsstring>
+        <name>mul</name>
+        <param>
+          <type>const <ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref> &amp;</type>
+          <declname>x</declname>
+        </param>
+        <param>
+          <type>const <ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref> &amp;</type>
+          <declname>y</declname>
+        </param>
+        <briefdescription>
+<para>returns x * y </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="note"><para>The result is rounded. (Only the upper q bits are returned.) </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14922" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14922" bodyend="14981"/>
+      </memberdef>
+      <memberdef kind="function" id="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1a2246b5b40c7c6992153ef174063d6aa6" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+        <definition>static diyfp nlohmann::detail::dtoa_impl::diyfp::normalize</definition>
+        <argsstring>(diyfp x) noexcept</argsstring>
+        <name>normalize</name>
+        <param>
+          <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+          <declname>x</declname>
+        </param>
+        <briefdescription>
+<para>normalize x such that the significand is &gt;= 2^(q-1) </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>x.f != 0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14987" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14987" bodyend="14998"/>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+      </memberdef>
+      <memberdef kind="function" id="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1a6b6665e467ebabe0c0f7418d3fe4b118" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref></type>
+        <definition>static diyfp nlohmann::detail::dtoa_impl::diyfp::normalize_to</definition>
+        <argsstring>(const diyfp &amp;x, const int target_exponent) noexcept</argsstring>
+        <name>normalize_to</name>
+        <param>
+          <type>const <ref refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp" kindref="compound">diyfp</ref> &amp;</type>
+          <declname>x</declname>
+        </param>
+        <param>
+          <type>const int</type>
+          <declname>target_exponent</declname>
+        </param>
+        <briefdescription>
+<para>normalize x such that the result has the exponent E </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>e &gt;= x.e and the upper e - x.e bits of x.f must be zero. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15004" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15004" bodyend="15012"/>
+        <references refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1ae22e170815983961447c429f324c944d" compoundref="d5/db8/json_8hpp" startline="14902">e</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="130">
+        <label>static constexpr int</label>
+      </node>
+      <node id="129">
+        <label>nlohmann::detail::dtoa_impl::diyfp</label>
+        <link refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp"/>
+        <childnode refid="130" relation="usage">
+          <edgelabel>+kPrecision</edgelabel>
+        </childnode>
+        <childnode refid="131" relation="usage">
+          <edgelabel>+f</edgelabel>
+        </childnode>
+        <childnode refid="132" relation="usage">
+          <edgelabel>+e</edgelabel>
+        </childnode>
+      </node>
+      <node id="131">
+        <label>uint64_t</label>
+      </node>
+      <node id="132">
+        <label>int</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14898" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14897" bodyend="15013"/>
+    <listofallmembers>
+      <member refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1ad8798a8823a49c8412f0fada9892c918" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::diyfp</scope><name>diyfp</name></member>
+      <member refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1ae22e170815983961447c429f324c944d" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::diyfp</scope><name>e</name></member>
+      <member refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1aea90459e340a231ca31d46946803ef51" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::diyfp</scope><name>f</name></member>
+      <member refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1a03682754b06ed4f30b263119eecc2d52" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::diyfp</scope><name>kPrecision</name></member>
+      <member refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1aa5f250d12ce89c81fdb08900c6a823e8" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::diyfp</scope><name>mul</name></member>
+      <member refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1a2246b5b40c7c6992153ef174063d6aa6" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::diyfp</scope><name>normalize</name></member>
+      <member refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1a6b6665e467ebabe0c0f7418d3fe4b118" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::diyfp</scope><name>normalize_to</name></member>
+      <member refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1aeb26771af54ad73598c1a0430d65d884" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::diyfp</scope><name>sub</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

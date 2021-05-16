@@ -142,7 +142,7 @@ Public Member Functions</h2></td></tr>
 <tr class="memitem:a57c83e78374bac747b5660fb271b947a inherit pub_methods_classcudnn__frontend_1_1BackendDescriptor"><td class="memItemLeft" align="right" valign="top"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#ac94d582cdfa2adf3d68a4e675e5d69aa">ManagedOpaqueDescriptor</a>&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d6/d88/classcudnn__frontend_1_1BackendDescriptor.html#a57c83e78374bac747b5660fb271b947a">get_desc</a> () const</td></tr>
 <tr class="memdesc:a57c83e78374bac747b5660fb271b947a inherit pub_methods_classcudnn__frontend_1_1BackendDescriptor"><td class="mdescLeft">&#160;</td><td class="mdescRight">Returns a copy of underlying managed descriptor.  <a href="../../d6/d88/classcudnn__frontend_1_1BackendDescriptor.html#a57c83e78374bac747b5660fb271b947a">More...</a><br /></td></tr>
 <tr class="separator:a57c83e78374bac747b5660fb271b947a inherit pub_methods_classcudnn__frontend_1_1BackendDescriptor"><td class="memSeparator" colspan="2">&#160;</td></tr>
-<tr class="memitem:a070df0d11a52793ce9480dbdcee0c24e inherit pub_methods_classcudnn__frontend_1_1BackendDescriptor"><td class="memItemLeft" align="right" valign="top">cudnnStatus_t&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d6/d88/classcudnn__frontend_1_1BackendDescriptor.html#a070df0d11a52793ce9480dbdcee0c24e">initialize_managed_backend_pointer</a> (cudnnBackendDescriptorType_t type)</td></tr>
+<tr class="memitem:a070df0d11a52793ce9480dbdcee0c24e inherit pub_methods_classcudnn__frontend_1_1BackendDescriptor"><td class="memItemLeft" align="right" valign="top">cudnnStatus_t&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d6/d88/classcudnn__frontend_1_1BackendDescriptor.html#a070df0d11a52793ce9480dbdcee0c24e">initialize_managed_backend_pointer</a> (cudnnBackendDescriptorType_t <a class="el" href="../../db/d0a/classstd_1_1conditional_1_1type.html">type</a>)</td></tr>
 <tr class="memdesc:a070df0d11a52793ce9480dbdcee0c24e inherit pub_methods_classcudnn__frontend_1_1BackendDescriptor"><td class="mdescLeft">&#160;</td><td class="mdescRight">Initializes the underlying managed descriptor.  <a href="../../d6/d88/classcudnn__frontend_1_1BackendDescriptor.html#a070df0d11a52793ce9480dbdcee0c24e">More...</a><br /></td></tr>
 <tr class="separator:a070df0d11a52793ce9480dbdcee0c24e inherit pub_methods_classcudnn__frontend_1_1BackendDescriptor"><td class="memSeparator" colspan="2">&#160;</td></tr>
 </table><table class="memberdecls">
@@ -185,6 +185,8 @@ Private Attributes</h2></td></tr>
 <tr class="separator:aac54965185417e264093156b143a3751"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:ac4b85cbb9ba522c98eb524a7712721af"><td class="memItemLeft" align="right" valign="top"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#ac94d582cdfa2adf3d68a4e675e5d69aa">ManagedOpaqueDescriptor</a>&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d4/d30/classcudnn__frontend_1_1Operation__v8.html#ac4b85cbb9ba522c98eb524a7712721af">matmuldesc</a> = nullptr</td></tr>
 <tr class="separator:ac4b85cbb9ba522c98eb524a7712721af"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:a99735bf6f673f0e3346e9be611125e2f"><td class="memItemLeft" align="right" valign="top"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#ac94d582cdfa2adf3d68a4e675e5d69aa">ManagedOpaqueDescriptor</a>&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a99735bf6f673f0e3346e9be611125e2f">reductiondesc</a> = nullptr</td></tr>
+<tr class="separator:a99735bf6f673f0e3346e9be611125e2f"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a0414d5eb022c25584d60491f416e6449"><td class="memItemLeft" align="right" valign="top">cudnnBackendAttributeType_t&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a0414d5eb022c25584d60491f416e6449">alphabetaType</a> = CUDNN_TYPE_FLOAT</td></tr>
 <tr class="separator:a0414d5eb022c25584d60491f416e6449"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a4a71d73a1231c39e51a74f750586a733"><td class="memItemLeft" align="right" valign="top">float&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a4a71d73a1231c39e51a74f750586a733">alpha_s</a> = 1.0f</td></tr>
@@ -248,13 +250,14 @@ Additional Inherited Members</h2></td></tr>
 <li>cmatdesc</li>
 <li>pwdesc</li>
 <li>matmuldesc</li>
+<li>reductiondesc</li>
 <li>alpha</li>
 <li>beta</li>
 <li>alpha2</li>
 </ul>
 <p>Use <a class="el" href="../../d1/d29/classcudnn__frontend_1_1OperationBuilder__v8.html">OperationBuilder_v8</a> to build this class. Describe returns a string describing the convolution operation </p>
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00065">65</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00067">67</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 </div><h2 class="groupheader">Constructor &amp; Destructor Documentation</h2>
 <a id="ad45e7200660f993615e34ceeb9ec49c6"></a>
 <h2 class="memtitle"><span class="permalink"><a href="#ad45e7200660f993615e34ceeb9ec49c6">&#9670;&nbsp;</a></span>Operation_v8() <span class="overload">[1/3]</span></h2>
@@ -280,7 +283,7 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00092">92</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00095">95</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
 </div>
 </div>
@@ -307,7 +310,7 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00125">getTag()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00129">getTag()</a>.</p>
 
 </div>
 </div>
@@ -334,7 +337,7 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00125">getTag()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00129">getTag()</a>.</p>
 
 </div>
 </div>
@@ -392,9 +395,9 @@ Additional Inherited Members</h2></td></tr>
 
 <p>Implements <a class="el" href="../../d6/d88/classcudnn__frontend_1_1BackendDescriptor.html#ab652fb3e9a58092fbb137b0e959a9478">cudnn_frontend::BackendDescriptor</a>.</p>
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">69</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">71</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00155">alpha2_d</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00154">alpha2_s</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00155">alpha_d</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00154">alpha_s</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00153">alphabetaType</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00147">amatdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00142">bdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00155">beta_d</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00154">beta_s</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00148">bmatdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00146">cdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00149">cmatdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00145">dwdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00144">dxdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00143">dydesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00151">matmuldesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00137">op_mode</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00150">pwdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00141">wdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00139">xdesc</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00140">ydesc</a>.</p>
+<p class="reference">References <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00160">alpha2_d</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00159">alpha2_s</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00160">alpha_d</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00159">alpha_s</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00158">alphabetaType</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00151">amatdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00146">bdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00160">beta_d</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00159">beta_s</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00152">bmatdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00150">cdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00153">cmatdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00149">dwdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00148">dxdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00147">dydesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00155">matmuldesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00141">op_mode</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00154">pwdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00156">reductiondesc</a>, <a class="el" href="../../d5/db8/json_8hpp_source.html#l25855">nlohmann::to_string()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00145">wdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00143">xdesc</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00144">ydesc</a>.</p>
 
 </div>
 </div>
@@ -421,9 +424,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00120">120</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00124">124</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00149">cmatdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00137">op_mode</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00140">ydesc</a>.</p>
+<p class="reference">References <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00153">cmatdesc</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00141">op_mode</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00144">ydesc</a>.</p>
 
 </div>
 </div>
@@ -450,9 +453,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00125">125</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00129">129</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a810b2f50d53d6655c2048d3c3afbcfc4">Operation_v8()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00161">operationTag</a>, <a class="el" href="../../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a5012e920483271f655bc04d6f52dc41f">operator=()</a>, and <a class="el" href="../../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a67d82f53ecbdfe2416d2a26410138d78">~Operation_v8()</a>.</p>
+<p class="reference">References <a class="el" href="../../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a810b2f50d53d6655c2048d3c3afbcfc4">Operation_v8()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00166">operationTag</a>, <a class="el" href="../../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a5012e920483271f655bc04d6f52dc41f">operator=()</a>, and <a class="el" href="../../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a67d82f53ecbdfe2416d2a26410138d78">~Operation_v8()</a>.</p>
 
 </div>
 </div>
@@ -480,7 +483,7 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00125">getTag()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00129">getTag()</a>.</p>
 
 </div>
 </div>
@@ -505,7 +508,7 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00067">67</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">69</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
 </div>
 </div>
@@ -530,9 +533,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00155">155</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00160">160</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00347">cudnn_frontend::OperationBuilder_v8::setAlpha2()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00364">cudnn_frontend::OperationBuilder_v8::setAlpha2()</a>.</p>
 
 </div>
 </div>
@@ -556,9 +559,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00154">154</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00159">159</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00347">cudnn_frontend::OperationBuilder_v8::setAlpha2()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00364">cudnn_frontend::OperationBuilder_v8::setAlpha2()</a>.</p>
 
 </div>
 </div>
@@ -582,9 +585,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00155">155</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00160">160</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00333">cudnn_frontend::OperationBuilder_v8::setAlpha()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00350">cudnn_frontend::OperationBuilder_v8::setAlpha()</a>.</p>
 
 </div>
 </div>
@@ -608,9 +611,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00154">154</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00159">159</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00333">cudnn_frontend::OperationBuilder_v8::setAlpha()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00350">cudnn_frontend::OperationBuilder_v8::setAlpha()</a>.</p>
 
 </div>
 </div>
@@ -634,9 +637,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00153">153</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00158">158</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00333">cudnn_frontend::OperationBuilder_v8::setAlpha()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00347">cudnn_frontend::OperationBuilder_v8::setAlpha2()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00361">cudnn_frontend::OperationBuilder_v8::setBeta()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00350">cudnn_frontend::OperationBuilder_v8::setAlpha()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00364">cudnn_frontend::OperationBuilder_v8::setAlpha2()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00378">cudnn_frontend::OperationBuilder_v8::setBeta()</a>.</p>
 
 </div>
 </div>
@@ -660,9 +663,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00147">147</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00151">151</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00252">cudnn_frontend::OperationBuilder_v8::setaMatDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00258">cudnn_frontend::OperationBuilder_v8::setaMatDesc()</a>.</p>
 
 </div>
 </div>
@@ -686,9 +689,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00142">142</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00146">146</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00192">cudnn_frontend::OperationBuilder_v8::setbDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00198">cudnn_frontend::OperationBuilder_v8::setbDesc()</a>.</p>
 
 </div>
 </div>
@@ -712,9 +715,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00155">155</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00160">160</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00361">cudnn_frontend::OperationBuilder_v8::setBeta()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00378">cudnn_frontend::OperationBuilder_v8::setBeta()</a>.</p>
 
 </div>
 </div>
@@ -738,9 +741,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00154">154</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00159">159</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00361">cudnn_frontend::OperationBuilder_v8::setBeta()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00378">cudnn_frontend::OperationBuilder_v8::setBeta()</a>.</p>
 
 </div>
 </div>
@@ -764,9 +767,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00148">148</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00152">152</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00263">cudnn_frontend::OperationBuilder_v8::setbMatDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00269">cudnn_frontend::OperationBuilder_v8::setbMatDesc()</a>.</p>
 
 </div>
 </div>
@@ -790,9 +793,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00146">146</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00150">150</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00241">cudnn_frontend::OperationBuilder_v8::setcDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00247">cudnn_frontend::OperationBuilder_v8::setcDesc()</a>.</p>
 
 </div>
 </div>
@@ -816,9 +819,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00149">149</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00153">153</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00120">getOutputTensor()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00274">cudnn_frontend::OperationBuilder_v8::setcMatDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00124">getOutputTensor()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00280">cudnn_frontend::OperationBuilder_v8::setcMatDesc()</a>.</p>
 
 </div>
 </div>
@@ -842,9 +845,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00145">145</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00149">149</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00235">cudnn_frontend::OperationBuilder_v8::setdwDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00241">cudnn_frontend::OperationBuilder_v8::setdwDesc()</a>.</p>
 
 </div>
 </div>
@@ -868,9 +871,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00144">144</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00148">148</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00230">cudnn_frontend::OperationBuilder_v8::setdxDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00236">cudnn_frontend::OperationBuilder_v8::setdxDesc()</a>.</p>
 
 </div>
 </div>
@@ -894,9 +897,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00143">143</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00147">147</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00220">cudnn_frontend::OperationBuilder_v8::setdyDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00226">cudnn_frontend::OperationBuilder_v8::setdyDesc()</a>.</p>
 
 </div>
 </div>
@@ -920,9 +923,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00159">159</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00164">164</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00296">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00313">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>.</p>
 
 </div>
 </div>
@@ -946,9 +949,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00158">158</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00163">163</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00296">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00313">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>.</p>
 
 </div>
 </div>
@@ -972,9 +975,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00160">160</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00165">165</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00296">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00313">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>.</p>
 
 </div>
 </div>
@@ -998,9 +1001,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00151">151</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00155">155</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00285">cudnn_frontend::OperationBuilder_v8::setmatmulDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00291">cudnn_frontend::OperationBuilder_v8::setmatmulDesc()</a>.</p>
 
 </div>
 </div>
@@ -1024,9 +1027,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00137">137</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00141">141</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00120">getOutputTensor()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00375">cudnn_frontend::OperationBuilder_v8::OperationBuilder_v8()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00124">getOutputTensor()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00392">cudnn_frontend::OperationBuilder_v8::OperationBuilder_v8()</a>.</p>
 
 </div>
 </div>
@@ -1050,9 +1053,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00161">161</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00166">166</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00125">getTag()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00129">getTag()</a>.</p>
 
 </div>
 </div>
@@ -1076,9 +1079,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00157">157</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00162">162</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00296">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00313">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>.</p>
 
 </div>
 </div>
@@ -1102,9 +1105,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00156">156</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00161">161</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00296">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00313">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>.</p>
 
 </div>
 </div>
@@ -1128,9 +1131,35 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00150">150</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00154">154</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00296">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00313">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>.</p>
+
+</div>
+</div>
+<a id="a99735bf6f673f0e3346e9be611125e2f"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#a99735bf6f673f0e3346e9be611125e2f">&#9670;&nbsp;</a></span>reductiondesc</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#ac94d582cdfa2adf3d68a4e675e5d69aa">ManagedOpaqueDescriptor</a> cudnn_frontend::Operation_v8::reductiondesc = nullptr</td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">private</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00156">156</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00302">cudnn_frontend::OperationBuilder_v8::setreductionDesc()</a>.</p>
 
 </div>
 </div>
@@ -1154,9 +1183,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00141">141</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00145">145</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00208">cudnn_frontend::OperationBuilder_v8::setwDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00214">cudnn_frontend::OperationBuilder_v8::setwDesc()</a>.</p>
 
 </div>
 </div>
@@ -1180,9 +1209,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00139">139</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00143">143</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00181">cudnn_frontend::OperationBuilder_v8::setxDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00187">cudnn_frontend::OperationBuilder_v8::setxDesc()</a>.</p>
 
 </div>
 </div>
@@ -1206,9 +1235,9 @@ Additional Inherited Members</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00140">140</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00144">144</a> of file <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html">cudnn_frontend_Operation.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00069">describe()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00120">getOutputTensor()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00203">cudnn_frontend::OperationBuilder_v8::setyDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00071">describe()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00124">getOutputTensor()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00209">cudnn_frontend::OperationBuilder_v8::setyDesc()</a>.</p>
 
 </div>
 </div>

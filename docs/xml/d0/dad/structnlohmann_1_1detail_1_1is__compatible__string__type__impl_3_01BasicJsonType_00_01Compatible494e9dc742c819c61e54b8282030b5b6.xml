@@ -1,0 +1,52 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d0/dad/structnlohmann_1_1detail_1_1is__compatible__string__type__impl_3_01BasicJsonType_00_01Compatible494e9dc742c819c61e54b8282030b5b6" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, CompatibleStringType, enable_if_t&lt; is_detected_exact&lt; typename BasicJsonType::string_t::value_type, value_type_t, CompatibleStringType &gt;::value &gt; &gt;</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+      <param>
+        <type>typename CompatibleStringType</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-static-attrib">
+      <memberdef kind="variable" id="d0/dad/structnlohmann_1_1detail_1_1is__compatible__string__type__impl_3_01BasicJsonType_00_01Compatible494e9dc742c819c61e54b8282030b5b6_1adac1e17a2ddf9ac94be736e96e8943a9" prot="public" static="yes" mutable="no">
+        <type>constexpr auto</type>
+        <definition>constexpr auto nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, CompatibleStringType, enable_if_t&lt; is_detected_exact&lt; typename BasicJsonType::string_t::value_type, value_type_t, CompatibleStringType &gt;::value &gt; &gt;::value</definition>
+        <argsstring></argsstring>
+        <name>value</name>
+        <initializer>=
+        <ref refid="d7/d10/structnlohmann_1_1detail_1_1is__constructible" kindref="compound">is_constructible</ref>&lt;typename BasicJsonType::string_t, CompatibleStringType&gt;::value</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3689" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3689" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="449">
+        <label>static constexpr auto</label>
+      </node>
+      <node id="448">
+        <label>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, CompatibleStringType, enable_if_t&lt; is_detected_exact&lt; typename BasicJsonType::string_t::value_type, value_type_t, CompatibleStringType &gt;::value &gt; &gt;</label>
+        <link refid="d0/dad/structnlohmann_1_1detail_1_1is__compatible__string__type__impl_3_01BasicJsonType_00_01Compatible494e9dc742c819c61e54b8282030b5b6"/>
+        <childnode refid="449" relation="usage">
+          <edgelabel>+value</edgelabel>
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3688" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3684" bodyend="3691"/>
+    <listofallmembers>
+      <member refid="d0/dad/structnlohmann_1_1detail_1_1is__compatible__string__type__impl_3_01BasicJsonType_00_01Compatible494e9dc742c819c61e54b8282030b5b6_1adac1e17a2ddf9ac94be736e96e8943a9" prot="public" virt="non-virtual"><scope>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, CompatibleStringType, enable_if_t&lt; is_detected_exact&lt; typename BasicJsonType::string_t::value_type, value_type_t, CompatibleStringType &gt;::value &gt; &gt;</scope><name>value</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

@@ -1,0 +1,42 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d4/df6/structnlohmann_1_1detail_1_1is__basic__json" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_basic_json</compoundname>
+    <basecompoundref prot="public" virt="non-virtual">false_type</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename</type>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="374">
+        <label>nlohmann::detail::is_basic_json&lt; typename &gt;</label>
+        <link refid="d4/df6/structnlohmann_1_1detail_1_1is__basic__json"/>
+        <childnode refid="375" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="375">
+        <label>false_type</label>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="376">
+        <label>nlohmann::detail::is_basic_json&lt; typename &gt;</label>
+        <link refid="d4/df6/structnlohmann_1_1detail_1_1is__basic__json"/>
+        <childnode refid="377" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="377">
+        <label>false_type</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3434" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3434" bodyend="3434"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

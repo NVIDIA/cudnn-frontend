@@ -1,0 +1,42 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d0/d8d/structnlohmann_1_1detail_1_1is__json__ref_3_01json__ref_3_01T_01_4_01_4" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_json_ref&lt; json_ref&lt; T &gt; &gt;</compoundname>
+    <basecompoundref prot="public" virt="non-virtual">true_type</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename T</type>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="653">
+        <label>true_type</label>
+      </node>
+      <node id="652">
+        <label>nlohmann::detail::is_json_ref&lt; json_ref&lt; T &gt; &gt;</label>
+        <link refid="d0/d8d/structnlohmann_1_1detail_1_1is__json__ref_3_01json__ref_3_01T_01_4_01_4"/>
+        <childnode refid="653" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="655">
+        <label>true_type</label>
+      </node>
+      <node id="654">
+        <label>nlohmann::detail::is_json_ref&lt; json_ref&lt; T &gt; &gt;</label>
+        <link refid="d0/d8d/structnlohmann_1_1detail_1_1is__json__ref_3_01json__ref_3_01T_01_4_01_4"/>
+        <childnode refid="655" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3450" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3450" bodyend="3450"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

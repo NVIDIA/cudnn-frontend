@@ -1,0 +1,48 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d3/d8d/structnlohmann_1_1detail_1_1utility__internal_1_1Gen" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::utility_internal::Gen</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename</type>
+        <declname>T</declname>
+        <defname>T</defname>
+      </param>
+      <param>
+        <type>size_t</type>
+        <declname>N</declname>
+        <defname>N</defname>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="d3/d8d/structnlohmann_1_1detail_1_1utility__internal_1_1Gen_1a1d6f2c7fb3fa065bf8cf6e6e3544dcef" prot="public" static="no">
+        <type>typename <ref refid="d7/d3c/structnlohmann_1_1detail_1_1utility__internal_1_1Extend" kindref="compound">Extend</ref>&lt; typename <ref refid="d3/d8d/structnlohmann_1_1detail_1_1utility__internal_1_1Gen" kindref="compound">Gen</ref>&lt; T, N/2 &gt;::<ref refid="d3/d8d/structnlohmann_1_1detail_1_1utility__internal_1_1Gen_1a1d6f2c7fb3fa065bf8cf6e6e3544dcef" kindref="member">type</ref>, N/2, N % 2 &gt;::<ref refid="d3/d8d/structnlohmann_1_1detail_1_1utility__internal_1_1Gen_1a1d6f2c7fb3fa065bf8cf6e6e3544dcef" kindref="member">type</ref></type>
+        <definition>using nlohmann::detail::utility_internal::Gen&lt; T, N &gt;::type =  typename Extend &lt; typename Gen &lt; T, N / 2 &gt;::type, N / 2, N % 2 &gt;::type</definition>
+        <argsstring></argsstring>
+        <name>type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3116" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3117" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="322">
+        <label>nlohmann::detail::utility_internal::Gen&lt; T, N &gt;</label>
+        <link refid="d3/d8d/structnlohmann_1_1detail_1_1utility__internal_1_1Gen"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3115" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3114" bodyend="3118"/>
+    <listofallmembers>
+      <member refid="d3/d8d/structnlohmann_1_1detail_1_1utility__internal_1_1Gen_1a1d6f2c7fb3fa065bf8cf6e6e3544dcef" prot="public" virt="non-virtual"><scope>nlohmann::detail::utility_internal::Gen</scope><name>type</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

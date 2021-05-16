@@ -194,58 +194,58 @@
     <detaileddescription>
 <para><ref refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8" kindref="compound">VariantPackBuilder_v8</ref> Class Helper class used to build <ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">VariantPack_v8</ref> class </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="338">
+      <node id="1052">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="341">
+      <node id="1055">
         <label>void *</label>
       </node>
-      <node id="339">
+      <node id="1053">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="337">
+      <node id="1051">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="334">
+      <node id="1048">
         <label>cudnn_frontend::VariantPack_v8</label>
         <link refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8"/>
-        <childnode refid="335" relation="public-inheritance">
+        <childnode refid="1049" relation="public-inheritance">
         </childnode>
-        <childnode refid="340" relation="usage">
+        <childnode refid="1054" relation="usage">
           <edgelabel>-num_ptrs</edgelabel>
           <edgelabel>-uid</edgelabel>
         </childnode>
-        <childnode refid="341" relation="usage">
+        <childnode refid="1055" relation="usage">
           <edgelabel>-data_pointers</edgelabel>
           <edgelabel>-workspace</edgelabel>
         </childnode>
       </node>
-      <node id="340">
+      <node id="1054">
         <label>int64_t</label>
       </node>
-      <node id="333">
+      <node id="1047">
         <label>cudnn_frontend::VariantPackBuilder_v8</label>
         <link refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8"/>
-        <childnode refid="334" relation="usage">
+        <childnode refid="1048" relation="usage">
           <edgelabel>-m_variant_pack</edgelabel>
         </childnode>
       </node>
-      <node id="335">
+      <node id="1049">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="336" relation="usage">
+        <childnode refid="1050" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="338" relation="usage">
+        <childnode refid="1052" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="339" relation="usage">
+        <childnode refid="1053" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="336">
+      <node id="1050">
         <label>std::string</label>
-        <childnode refid="337" relation="public-inheritance">
+        <childnode refid="1051" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>

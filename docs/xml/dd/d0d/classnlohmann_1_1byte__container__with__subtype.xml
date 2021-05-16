@@ -1,0 +1,327 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="dd/d0d/classnlohmann_1_1byte__container__with__subtype" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::byte_container_with_subtype</compoundname>
+    <basecompoundref refid="d7/d1c/classBinaryType" prot="public" virt="non-virtual">BinaryType</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename <ref refid="d7/d1c/classBinaryType" kindref="compound">BinaryType</ref></type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a4d27e8633c5a5e3b49dd4ccb06515713" prot="public" static="no">
+        <type><ref refid="d7/d1c/classBinaryType" kindref="compound">BinaryType</ref></type>
+        <definition>using nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::container_type =  BinaryType</definition>
+        <argsstring></argsstring>
+        <name>container_type</name>
+        <briefdescription>
+<para>the type of the underlying container </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4937" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4937" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ae36c8f29f4f50a00962b0e9110ba2756" prot="private" static="no" mutable="no">
+        <type>std::uint8_t</type>
+        <definition>std::uint8_t nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::m_subtype</definition>
+        <argsstring></argsstring>
+        <name>m_subtype</name>
+        <initializer>= 0</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5071" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5071" bodyend="-1"/>
+        <referencedby refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1aee67fde9d3d571a07d5bb35df21c0555" compoundref="d5/db8/json_8hpp" startline="4963" endline="4967">nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::operator==</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a69aa7a914a7a31b61d3a9567d74ddf7b" prot="private" static="no" mutable="no">
+        <type>bool</type>
+        <definition>bool nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::m_has_subtype</definition>
+        <argsstring></argsstring>
+        <name>m_has_subtype</name>
+        <initializer>= false</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5072" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5072" bodyend="-1"/>
+        <referencedby refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1aee67fde9d3d571a07d5bb35df21c0555" compoundref="d5/db8/json_8hpp" startline="4963" endline="4967">nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::operator==</referencedby>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a89c78caf8c7b54dc1bcfa4b0b23d2fc8" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::byte_container_with_subtype</definition>
+        <argsstring>() noexcept(noexcept(container_type()))</argsstring>
+        <name>byte_container_with_subtype</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4939" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4939" bodyend="4941"/>
+      </memberdef>
+      <memberdef kind="function" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a640b6dd55847e86dbb936f97b946170e" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::byte_container_with_subtype</definition>
+        <argsstring>(const container_type &amp;b) noexcept(noexcept(container_type(b)))</argsstring>
+        <name>byte_container_with_subtype</name>
+        <param>
+          <type>const <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a4d27e8633c5a5e3b49dd4ccb06515713" kindref="member">container_type</ref> &amp;</type>
+          <declname>b</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4943" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4943" bodyend="4945"/>
+      </memberdef>
+      <memberdef kind="function" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a73dcae1798eab1b496936bfae7b4b9c0" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::byte_container_with_subtype</definition>
+        <argsstring>(container_type &amp;&amp;b) noexcept(noexcept(container_type(std::move(b))))</argsstring>
+        <name>byte_container_with_subtype</name>
+        <param>
+          <type><ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a4d27e8633c5a5e3b49dd4ccb06515713" kindref="member">container_type</ref> &amp;&amp;</type>
+          <declname>b</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4947" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4947" bodyend="4949"/>
+      </memberdef>
+      <memberdef kind="function" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a9bd3e08ec6d3ed9014ad7d83eca5e3b3" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::byte_container_with_subtype</definition>
+        <argsstring>(const container_type &amp;b, std::uint8_t subtype_) noexcept(noexcept(container_type(b)))</argsstring>
+        <name>byte_container_with_subtype</name>
+        <param>
+          <type>const <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a4d27e8633c5a5e3b49dd4ccb06515713" kindref="member">container_type</ref> &amp;</type>
+          <declname>b</declname>
+        </param>
+        <param>
+          <type>std::uint8_t</type>
+          <declname>subtype_</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4951" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4951" bodyend="4955"/>
+      </memberdef>
+      <memberdef kind="function" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1aa9e66c61f46afdd9a9c3617967c4c797" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::byte_container_with_subtype</definition>
+        <argsstring>(container_type &amp;&amp;b, std::uint8_t subtype_) noexcept(noexcept(container_type(std::move(b))))</argsstring>
+        <name>byte_container_with_subtype</name>
+        <param>
+          <type><ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a4d27e8633c5a5e3b49dd4ccb06515713" kindref="member">container_type</ref> &amp;&amp;</type>
+          <declname>b</declname>
+        </param>
+        <param>
+          <type>std::uint8_t</type>
+          <declname>subtype_</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4957" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4957" bodyend="4961"/>
+      </memberdef>
+      <memberdef kind="function" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1aee67fde9d3d571a07d5bb35df21c0555" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::operator==</definition>
+        <argsstring>(const byte_container_with_subtype &amp;rhs) const</argsstring>
+        <name>operator==</name>
+        <param>
+          <type>const <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype" kindref="compound">byte_container_with_subtype</ref> &amp;</type>
+          <declname>rhs</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4963" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4963" bodyend="4967"/>
+        <references refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a69aa7a914a7a31b61d3a9567d74ddf7b" compoundref="d5/db8/json_8hpp" startline="5072">nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::m_has_subtype</references>
+        <references refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ae36c8f29f4f50a00962b0e9110ba2756" compoundref="d5/db8/json_8hpp" startline="5071">nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::m_subtype</references>
+      </memberdef>
+      <memberdef kind="function" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a760bf39cc5477bc663d8bb3c44aabf6a" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::operator!=</definition>
+        <argsstring>(const byte_container_with_subtype &amp;rhs) const</argsstring>
+        <name>operator!=</name>
+        <param>
+          <type>const <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype" kindref="compound">byte_container_with_subtype</ref> &amp;</type>
+          <declname>rhs</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4969" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4969" bodyend="4972"/>
+      </memberdef>
+      <memberdef kind="function" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a63227e70c8b976fd6f65bb2d2d7dd021" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>void</type>
+        <definition>void nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::set_subtype</definition>
+        <argsstring>(std::uint8_t subtype_) noexcept</argsstring>
+        <name>set_subtype</name>
+        <param>
+          <type>std::uint8_t</type>
+          <declname>subtype_</declname>
+        </param>
+        <briefdescription>
+<para>sets the binary subtype </para>        </briefdescription>
+        <detaileddescription>
+<para>Sets the binary subtype of the value, also flags a binary JSON value as having a subtype, which has implications for serialization.</para><para>Constant.</para><para>No-throw guarantee: this member function never throws exceptions.</para><para><simplesect kind="see"><para>see <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype()</ref> <ndash/> return the binary <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype</ref> </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a7b122b28ff2b8680557ca44ac9748e49" kindref="member">clear_subtype()</ref> <ndash/> clears the binary <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype</ref> </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a9fc42fb07003bf7048c2f1fc79478e02" kindref="member">has_subtype()</ref> <ndash/> returns whether or not the binary value has a <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype</ref></para></simplesect>
+<simplesect kind="since"><para>version 3.8.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4992" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4992" bodyend="4996"/>
+      </memberdef>
+      <memberdef kind="function" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr std::uint8_t</type>
+        <definition>constexpr std::uint8_t nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::subtype</definition>
+        <argsstring>() const noexcept</argsstring>
+        <name>subtype</name>
+        <briefdescription>
+<para>return the binary subtype </para>        </briefdescription>
+        <detaileddescription>
+<para>Returns the numerical subtype of the value if it has a subtype. If it does not have a subtype, this function will return size_t(-1) as a sentinel value.</para><para><simplesect kind="return"><para>the numerical subtype of the binary value</para></simplesect>
+Constant.</para><para>No-throw guarantee: this member function never throws exceptions.</para><para><simplesect kind="see"><para>see <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a63227e70c8b976fd6f65bb2d2d7dd021" kindref="member">set_subtype()</ref> <ndash/> sets the binary <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype</ref> </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a7b122b28ff2b8680557ca44ac9748e49" kindref="member">clear_subtype()</ref> <ndash/> clears the binary <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype</ref> </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a9fc42fb07003bf7048c2f1fc79478e02" kindref="member">has_subtype()</ref> <ndash/> returns whether or not the binary value has a <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype</ref></para></simplesect>
+<simplesect kind="since"><para>version 3.8.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5019" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5019" bodyend="5022"/>
+      </memberdef>
+      <memberdef kind="function" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a9fc42fb07003bf7048c2f1fc79478e02" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr bool</type>
+        <definition>constexpr bool nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::has_subtype</definition>
+        <argsstring>() const noexcept</argsstring>
+        <name>has_subtype</name>
+        <briefdescription>
+<para>return whether the value has a subtype </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>whether the value has a subtype</para></simplesect>
+Constant.</para><para>No-throw guarantee: this member function never throws exceptions.</para><para><simplesect kind="see"><para>see <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype()</ref> <ndash/> return the binary <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype</ref> </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a63227e70c8b976fd6f65bb2d2d7dd021" kindref="member">set_subtype()</ref> <ndash/> sets the binary <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype</ref> </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a7b122b28ff2b8680557ca44ac9748e49" kindref="member">clear_subtype()</ref> <ndash/> clears the binary <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype</ref></para></simplesect>
+<simplesect kind="since"><para>version 3.8.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5040" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5040" bodyend="5043"/>
+      </memberdef>
+      <memberdef kind="function" id="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a7b122b28ff2b8680557ca44ac9748e49" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>void</type>
+        <definition>void nlohmann::byte_container_with_subtype&lt; BinaryType &gt;::clear_subtype</definition>
+        <argsstring>() noexcept</argsstring>
+        <name>clear_subtype</name>
+        <briefdescription>
+<para>clears the binary subtype </para>        </briefdescription>
+        <detaileddescription>
+<para>Clears the binary subtype and flags the value as not having a subtype, which has implications for serialization; for instance MessagePack will prefer the bin family over the ext family.</para><para>Constant.</para><para>No-throw guarantee: this member function never throws exceptions.</para><para><simplesect kind="see"><para>see <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype()</ref> <ndash/> return the binary <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype</ref> </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a63227e70c8b976fd6f65bb2d2d7dd021" kindref="member">set_subtype()</ref> <ndash/> sets the binary <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype</ref> </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a9fc42fb07003bf7048c2f1fc79478e02" kindref="member">has_subtype()</ref> <ndash/> returns whether or not the binary value has a <ref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" kindref="member">subtype</ref></para></simplesect>
+<simplesect kind="since"><para>version 3.8.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5064" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5064" bodyend="5068"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>an internal type for a backed binary type </para>    </briefdescription>
+    <detaileddescription>
+<para>This type extends the template parameter <emphasis><ref refid="d7/d1c/classBinaryType" kindref="compound">BinaryType</ref></emphasis> provided to <computeroutput><ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">basic_json</ref></computeroutput> with a subtype used by BSON and MessagePack. This type exists so that the user does not have to specify a type themselves with a specific naming scheme in order to override the binary type.</para><para><parameterlist kind="templateparam"><parameteritem>
+<parameternamelist>
+<parametername><ref refid="d7/d1c/classBinaryType" kindref="compound">BinaryType</ref></parametername>
+</parameternamelist>
+<parameterdescription>
+<para>container to store bytes (<computeroutput>std::vector&lt;std::uint8_t&gt;</computeroutput> by default)</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="since"><para>version 3.8.0 </para></simplesect>
+</para>    </detaileddescription>
+    <inheritancegraph>
+      <node id="59">
+        <label>BinaryType</label>
+        <link refid="d7/d1c/classBinaryType"/>
+      </node>
+      <node id="58">
+        <label>nlohmann::byte_container_with_subtype&lt; BinaryType &gt;</label>
+        <link refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype"/>
+        <childnode refid="59" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="61">
+        <label>BinaryType</label>
+        <link refid="d7/d1c/classBinaryType"/>
+      </node>
+      <node id="62">
+        <label>uint8_t</label>
+      </node>
+      <node id="63">
+        <label>bool</label>
+      </node>
+      <node id="60">
+        <label>nlohmann::byte_container_with_subtype&lt; BinaryType &gt;</label>
+        <link refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype"/>
+        <childnode refid="61" relation="public-inheritance">
+        </childnode>
+        <childnode refid="62" relation="usage">
+          <edgelabel>-m_subtype</edgelabel>
+        </childnode>
+        <childnode refid="63" relation="usage">
+          <edgelabel>-m_has_subtype</edgelabel>
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4934" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4933" bodyend="5073"/>
+    <listofallmembers>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a89c78caf8c7b54dc1bcfa4b0b23d2fc8" prot="public" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>byte_container_with_subtype</name></member>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a640b6dd55847e86dbb936f97b946170e" prot="public" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>byte_container_with_subtype</name></member>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a73dcae1798eab1b496936bfae7b4b9c0" prot="public" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>byte_container_with_subtype</name></member>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a9bd3e08ec6d3ed9014ad7d83eca5e3b3" prot="public" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>byte_container_with_subtype</name></member>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1aa9e66c61f46afdd9a9c3617967c4c797" prot="public" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>byte_container_with_subtype</name></member>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a7b122b28ff2b8680557ca44ac9748e49" prot="public" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>clear_subtype</name></member>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a4d27e8633c5a5e3b49dd4ccb06515713" prot="public" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>container_type</name></member>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a9fc42fb07003bf7048c2f1fc79478e02" prot="public" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>has_subtype</name></member>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a69aa7a914a7a31b61d3a9567d74ddf7b" prot="private" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>m_has_subtype</name></member>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ae36c8f29f4f50a00962b0e9110ba2756" prot="private" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>m_subtype</name></member>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a760bf39cc5477bc663d8bb3c44aabf6a" prot="public" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>operator!=</name></member>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1aee67fde9d3d571a07d5bb35df21c0555" prot="public" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>operator==</name></member>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1a63227e70c8b976fd6f65bb2d2d7dd021" prot="public" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>set_subtype</name></member>
+      <member refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype_1ac3ca9d09e55342f9588404e1dc2222f0" prot="public" virt="non-virtual"><scope>nlohmann::byte_container_with_subtype</scope><name>subtype</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

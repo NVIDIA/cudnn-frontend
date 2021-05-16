@@ -1,0 +1,47 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d7/d10/structnlohmann_1_1detail_1_1is__constructible" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_constructible</compoundname>
+    <basecompoundref prot="public" virt="non-virtual">std::is_constructible&lt; T, Args... &gt;</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename T</type>
+      </param>
+      <param>
+        <type>typename...</type>
+        <declname>Args</declname>
+        <defname>Args</defname>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="475">
+        <label>nlohmann::detail::is_constructible&lt; T, Args &gt;</label>
+        <link refid="d7/d10/structnlohmann_1_1detail_1_1is__constructible"/>
+        <childnode refid="476" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="476">
+        <label>std::is_constructible&lt; T, Args... &gt;</label>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="477">
+        <label>nlohmann::detail::is_constructible&lt; T, Args &gt;</label>
+        <link refid="d7/d10/structnlohmann_1_1detail_1_1is__constructible"/>
+        <childnode refid="478" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="478">
+        <label>std::is_constructible&lt; T, Args... &gt;</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3579" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3579" bodyend="3579"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

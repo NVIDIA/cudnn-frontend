@@ -1,0 +1,1248 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="da/de8/classnlohmann_1_1json__pointer" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::json_pointer</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename <ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref></type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="friend">
+      <memberdef kind="friend" id="da/de8/classnlohmann_1_1json__pointer_1ada3100cdb8700566051828f1355fa745" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type>friend class</type>
+        <definition>friend class basic_json</definition>
+        <argsstring></argsstring>
+        <name>basic_json</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12109" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12109" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="friend" id="da/de8/classnlohmann_1_1json__pointer_1a90a11fe6c7f37b1746a3ff9cb24b0d53" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>friend <ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref></type>
+        <definition>json_pointer operator/</definition>
+        <argsstring>(const json_pointer &amp;lhs, const json_pointer &amp;rhs)</argsstring>
+        <name>operator/</name>
+        <param>
+          <type>const <ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref> &amp;</type>
+          <declname>lhs</declname>
+        </param>
+        <param>
+          <type>const <ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref> &amp;</type>
+          <declname>rhs</declname>
+        </param>
+        <briefdescription>
+<para>create a new JSON pointer by appending the right JSON pointer at the end of the left JSON pointer </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">lhs</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON pointer </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">rhs</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON pointer </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>a new JSON pointer with <emphasis>rhs</emphasis> appended to <emphasis>lhs</emphasis> </para></simplesect>
+{The example shows the usage of <computeroutput>operator/</computeroutput>.,json_pointer__operator_add_binary}</para><para>Linear in the length of <emphasis>lhs</emphasis> and <emphasis>rhs</emphasis>.</para><para><simplesect kind="see"><para>see <ref refid="da/de8/classnlohmann_1_1json__pointer_1a7395bd0af29ac23fd3f21543c935cdfa" kindref="member">operator/=(const json_pointer&amp;)</ref> to append a JSON pointer</para></simplesect>
+<simplesect kind="since"><para>version 3.6.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12249" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12249" bodyend="12253"/>
+      </memberdef>
+      <memberdef kind="friend" id="da/de8/classnlohmann_1_1json__pointer_1a926c9065dbed1bedc17857a813f7a46f" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>friend <ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref></type>
+        <definition>json_pointer operator/</definition>
+        <argsstring>(const json_pointer &amp;ptr, std::string token)</argsstring>
+        <name>operator/</name>
+        <param>
+          <type>const <ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref> &amp;</type>
+          <declname>ptr</declname>
+        </param>
+        <param>
+          <type>std::string</type>
+          <declname>token</declname>
+        </param>
+        <briefdescription>
+<para>create a new JSON pointer by appending the unescaped token at the end of the JSON pointer </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">ptr</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON pointer </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">token</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>reference token </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>a new JSON pointer with unescaped <emphasis>token</emphasis> appended to <emphasis>ptr</emphasis> </para></simplesect>
+{The example shows the usage of <computeroutput>operator/</computeroutput>.,json_pointer__operator_add_binary}</para><para>Linear in the length of <emphasis>ptr</emphasis>.</para><para><simplesect kind="see"><para>see <ref refid="da/de8/classnlohmann_1_1json__pointer_1abdd21567b2b1d69329af0f520335e68b" kindref="member">operator/=(std::string)</ref> to append a reference token</para></simplesect>
+<simplesect kind="since"><para>version 3.6.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12270" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12270" bodyend="12273"/>
+      </memberdef>
+      <memberdef kind="friend" id="da/de8/classnlohmann_1_1json__pointer_1af5a4bc4f82113c271c9a0cd4d3b5f31c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>friend <ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref></type>
+        <definition>json_pointer operator/</definition>
+        <argsstring>(const json_pointer &amp;ptr, std::size_t array_idx)</argsstring>
+        <name>operator/</name>
+        <param>
+          <type>const <ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref> &amp;</type>
+          <declname>ptr</declname>
+        </param>
+        <param>
+          <type>std::size_t</type>
+          <declname>array_idx</declname>
+        </param>
+        <briefdescription>
+<para>create a new JSON pointer by appending the array-index-token at the end of the JSON pointer </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">ptr</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON pointer </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">array_idx</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>array index </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>a new JSON pointer with <emphasis>array_idx</emphasis> appended to <emphasis>ptr</emphasis> </para></simplesect>
+{The example shows the usage of <computeroutput>operator/</computeroutput>.,json_pointer__operator_add_binary}</para><para>Linear in the length of <emphasis>ptr</emphasis>.</para><para><simplesect kind="see"><para>see <ref refid="da/de8/classnlohmann_1_1json__pointer_1a7de51480324eb1c5a89ed552cd699875" kindref="member">operator/=(std::size_t)</ref> to append an array index</para></simplesect>
+<simplesect kind="since"><para>version 3.6.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12290" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12290" bodyend="12293"/>
+      </memberdef>
+      <memberdef kind="friend" id="da/de8/classnlohmann_1_1json__pointer_1a4667ef558c8c3f8a646bfda0c6654653" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>friend bool</type>
+        <definition>bool operator==</definition>
+        <argsstring>(json_pointer const &amp;lhs, json_pointer const &amp;rhs) noexcept</argsstring>
+        <name>operator==</name>
+        <param>
+          <type><ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref> const &amp;</type>
+          <declname>lhs</declname>
+        </param>
+        <param>
+          <type><ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref> const &amp;</type>
+          <declname>rhs</declname>
+        </param>
+        <briefdescription>
+<para>compares two JSON pointers for equality </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">lhs</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON pointer to compare </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">rhs</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON pointer to compare </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether <emphasis>lhs</emphasis> is equal to <emphasis>rhs</emphasis> </para></simplesect>
+Linear in the length of the JSON pointer</para><para>No-throw guarantee: this function never throws exceptions. </para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12994" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12994" bodyend="12998"/>
+      </memberdef>
+      <memberdef kind="friend" id="da/de8/classnlohmann_1_1json__pointer_1a6779edcf28e6f018a3bbb29c0b4b5e1e" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>friend bool</type>
+        <definition>bool operator!=</definition>
+        <argsstring>(json_pointer const &amp;lhs, json_pointer const &amp;rhs) noexcept</argsstring>
+        <name>operator!=</name>
+        <param>
+          <type><ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref> const &amp;</type>
+          <declname>lhs</declname>
+        </param>
+        <param>
+          <type><ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref> const &amp;</type>
+          <declname>rhs</declname>
+        </param>
+        <briefdescription>
+<para>compares two JSON pointers for inequality </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">lhs</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON pointer to compare </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">rhs</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON pointer to compare </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether <emphasis>lhs</emphasis> is not equal <emphasis>rhs</emphasis> </para></simplesect>
+Linear in the length of the JSON pointer</para><para>No-throw guarantee: this function never throws exceptions. </para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13011" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13011" bodyend="13015"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="da/de8/classnlohmann_1_1json__pointer_1a551777cfe37bf7adb82253482030d992" prot="private" static="no" mutable="no">
+        <type><ref refid="d5/db8/json_8hpp_1a2cf645f34610e7f7d6e09ab88a2ab917" kindref="member">JSON_PRIVATE_UNLESS_TESTED</ref></type>
+        <definition>JSON_PRIVATE_UNLESS_TESTED nlohmann::json_pointer&lt; BasicJsonType &gt;::__pad0__</definition>
+        <argsstring></argsstring>
+        <name>__pad0__</name>
+        <bitfield> json_pointer top() const { if (JSON_HEDLEY_UNLIKELY(empty())) { JSON_THROW(detail::out_of_range::create(405</bitfield>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12463" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12468" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="da/de8/classnlohmann_1_1json__pointer_1a9d826fc24f7821325e4f24d4393d6adc" prot="private" static="no" mutable="no">
+        <type><ref refid="d5/db8/json_8hpp_1a2cf645f34610e7f7d6e09ab88a2ab917" kindref="member">JSON_PRIVATE_UNLESS_TESTED</ref> JSON pointer has no</type>
+        <definition>JSON_PRIVATE_UNLESS_TESTED JSON pointer has no nlohmann::json_pointer&lt; BasicJsonType &gt;::parent</definition>
+        <argsstring></argsstring>
+        <name>parent</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12468" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12468" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="da/de8/classnlohmann_1_1json__pointer_1ae3d35f4085faec07b87c88ba0dae457d" prot="private" static="no" mutable="no">
+        <type><ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref></type>
+        <definition>json_pointer nlohmann::json_pointer&lt; BasicJsonType &gt;::result</definition>
+        <argsstring></argsstring>
+        <name>result</name>
+        <initializer>= *this</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12471" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12471" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="da/de8/classnlohmann_1_1json__pointer_1a468dde132b1384d962c75eca7306f6cb" prot="private" static="no" mutable="no">
+        <type><ref refid="da/de8/classnlohmann_1_1json__pointer_1ae3d35f4085faec07b87c88ba0dae457d" kindref="member">result</ref></type>
+        <definition>result nlohmann::json_pointer&lt; BasicJsonType &gt;::reference_tokens</definition>
+        <argsstring></argsstring>
+        <name>reference_tokens</name>
+        <initializer>= {reference_tokens[0]}</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12472" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12472" bodyend="-1"/>
+        <referencedby refid="da/de8/classnlohmann_1_1json__pointer_1a7395bd0af29ac23fd3f21543c935cdfa" compoundref="d5/db8/json_8hpp" startline="12183" endline="12189">nlohmann::json_pointer&lt; BasicJsonType &gt;::operator/=</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="da/de8/classnlohmann_1_1json__pointer_1a8473b794a810d3fdb46cf985bfa9e2bb" prot="private" static="no" mutable="no">
+        <type>return</type>
+        <definition>return nlohmann::json_pointer&lt; BasicJsonType &gt;::result</definition>
+        <argsstring></argsstring>
+        <name>result</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12473" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12473" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="da/de8/classnlohmann_1_1json__pointer_1a07a990a6838de4f38ee9d881e7b9fd61" prot="private" static="no" mutable="no">
+        <type>std::vector&lt; std::string &gt;</type>
+        <definition>std::vector&lt;std::string&gt; nlohmann::json_pointer&lt; BasicJsonType &gt;::reference_tokens</definition>
+        <argsstring></argsstring>
+        <name>reference_tokens</name>
+        <briefdescription>
+<para>the reference tokens </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13018" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13018" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a7f32d7c62841f0c4a6784cf741a6e4f8" prot="public" static="no" const="no" explicit="yes" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::json_pointer&lt; BasicJsonType &gt;::json_pointer</definition>
+        <argsstring>(const std::string &amp;s=&quot;&quot;)</argsstring>
+        <name>json_pointer</name>
+        <param>
+          <type>const std::string &amp;</type>
+          <declname>s</declname>
+          <defval>&quot;&quot;</defval>
+        </param>
+        <briefdescription>
+<para>create JSON pointer </para>        </briefdescription>
+        <detaileddescription>
+<para>Create a JSON pointer according to the syntax described in <ulink url="https://tools.ietf.org/html/rfc6901#section-3">Section 3 of RFC6901</ulink>.</para><para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">s</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>string representing the JSON pointer; if omitted, the empty string is assumed which references the whole JSON value</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<parameterlist kind="exception"><parameteritem>
+<parameternamelist>
+<parametername>parse_error.107</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if the given JSON pointer <emphasis>s</emphasis> is nonempty and does not begin with a slash (<computeroutput>/</computeroutput>); see example below</para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>parse_error.108</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if a tilde (<computeroutput>~</computeroutput>) in the given JSON pointer <emphasis>s</emphasis> is not followed by <computeroutput>0</computeroutput> (representing <computeroutput>~</computeroutput>) or <computeroutput>1</computeroutput> (representing <computeroutput>/</computeroutput>); see example below</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+{The example shows the construction several valid JSON pointers as well as the exceptional behavior.,<ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref>}</para><para><simplesect kind="since"><para>version 2.0.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12133" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12133" bodyend="12135"/>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a3d4b15d32d096e3776c5d2c773b524f5" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::string</type>
+        <definition>std::string nlohmann::json_pointer&lt; BasicJsonType &gt;::to_string</definition>
+        <argsstring>() const</argsstring>
+        <name>to_string</name>
+        <briefdescription>
+<para>return a string representation of the JSON pointer </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="invariant"><para>For each JSON pointer <computeroutput>ptr</computeroutput>, it holds: <programlisting><codeline><highlight class="normal">ptr<sp/>==<sp/><ref refid="da/de8/classnlohmann_1_1json__pointer_1a7f32d7c62841f0c4a6784cf741a6e4f8" kindref="member">json_pointer</ref>(ptr.to_string());</highlight></codeline>
+</programlisting></para></simplesect>
+<simplesect kind="return"><para>a string representation of the JSON pointer</para></simplesect>
+{The example shows the result of <computeroutput>to_string</computeroutput>.,json_pointer__to_string}</para><para><simplesect kind="since"><para>version 2.0.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12151" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12151" bodyend="12159"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a9d486a036924098fe1a77de14d23f56c" compoundref="d5/db8/json_8hpp" startline="2551" endline="2556">nlohmann::detail::escape</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1ae9015c658f99cf3d48a8563accc79988" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::json_pointer&lt; BasicJsonType &gt;::operator std::string</definition>
+        <argsstring>() const</argsstring>
+        <name>operator std::string</name>
+        <briefdescription>
+<para>return a string representation of the JSON pointer </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="invariant"><para>For each JSON pointer <computeroutput>ptr</computeroutput>, it holds: <programlisting><codeline><highlight class="normal">ptr<sp/>==<sp/><ref refid="da/de8/classnlohmann_1_1json__pointer_1a7f32d7c62841f0c4a6784cf741a6e4f8" kindref="member">json_pointer</ref>(ptr.to_string());</highlight></codeline>
+</programlisting></para></simplesect>
+<simplesect kind="return"><para>a string representation of the JSON pointer</para></simplesect>
+{The example shows the result of <computeroutput>to_string</computeroutput>.,json_pointer__to_string}</para><para><simplesect kind="since"><para>version 2.0.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12162" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12162" bodyend="12165"/>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a7395bd0af29ac23fd3f21543c935cdfa" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref> &amp;</type>
+        <definition>json_pointer&amp; nlohmann::json_pointer&lt; BasicJsonType &gt;::operator/=</definition>
+        <argsstring>(const json_pointer &amp;ptr)</argsstring>
+        <name>operator/=</name>
+        <param>
+          <type>const <ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref> &amp;</type>
+          <declname>ptr</declname>
+        </param>
+        <briefdescription>
+<para>append another JSON pointer at the end of this JSON pointer </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">ptr</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON pointer to append </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>JSON pointer with <emphasis>ptr</emphasis> appended</para></simplesect>
+{The example shows the usage of <computeroutput>operator/=</computeroutput>.,json_pointer__operator_add}</para><para>Linear in the length of <emphasis>ptr</emphasis>.</para><para><simplesect kind="see"><para>see <ref refid="da/de8/classnlohmann_1_1json__pointer_1abdd21567b2b1d69329af0f520335e68b" kindref="member">operator/=(std::string)</ref> to append a reference token </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="da/de8/classnlohmann_1_1json__pointer_1a7de51480324eb1c5a89ed552cd699875" kindref="member">operator/=(std::size_t)</ref> to append an array index </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="da/de8/classnlohmann_1_1json__pointer_1a90a11fe6c7f37b1746a3ff9cb24b0d53" kindref="member">operator/(const json_pointer&amp;, const json_pointer&amp;)</ref> for a binary operator</para></simplesect>
+<simplesect kind="since"><para>version 3.6.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12183" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12183" bodyend="12189"/>
+        <references refid="da/de8/classnlohmann_1_1json__pointer_1a468dde132b1384d962c75eca7306f6cb" compoundref="d5/db8/json_8hpp" startline="12472">nlohmann::json_pointer&lt; BasicJsonType &gt;::reference_tokens</references>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1abdd21567b2b1d69329af0f520335e68b" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref> &amp;</type>
+        <definition>json_pointer&amp; nlohmann::json_pointer&lt; BasicJsonType &gt;::operator/=</definition>
+        <argsstring>(std::string token)</argsstring>
+        <name>operator/=</name>
+        <param>
+          <type>std::string</type>
+          <declname>token</declname>
+        </param>
+        <briefdescription>
+<para>append an unescaped reference token at the end of this JSON pointer </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">token</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>reference token to append </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>JSON pointer with <emphasis>token</emphasis> appended without escaping <emphasis>token</emphasis> </para></simplesect>
+{The example shows the usage of <computeroutput>operator/=</computeroutput>.,json_pointer__operator_add}</para><para>Amortized constant.</para><para><simplesect kind="see"><para>see <ref refid="da/de8/classnlohmann_1_1json__pointer_1a7395bd0af29ac23fd3f21543c935cdfa" kindref="member">operator/=(const json_pointer&amp;)</ref> to append a JSON pointer </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="da/de8/classnlohmann_1_1json__pointer_1a7de51480324eb1c5a89ed552cd699875" kindref="member">operator/=(std::size_t)</ref> to append an array index </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="da/de8/classnlohmann_1_1json__pointer_1af5a4bc4f82113c271c9a0cd4d3b5f31c" kindref="member">operator/(const json_pointer&amp;, std::size_t)</ref> for a binary operator</para></simplesect>
+<simplesect kind="since"><para>version 3.6.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12207" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12207" bodyend="12211"/>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a7de51480324eb1c5a89ed552cd699875" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref> &amp;</type>
+        <definition>json_pointer&amp; nlohmann::json_pointer&lt; BasicJsonType &gt;::operator/=</definition>
+        <argsstring>(std::size_t array_idx)</argsstring>
+        <name>operator/=</name>
+        <param>
+          <type>std::size_t</type>
+          <declname>array_idx</declname>
+        </param>
+        <briefdescription>
+<para>append an array index at the end of this JSON pointer </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">array_idx</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>array index to append </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>JSON pointer with <emphasis>array_idx</emphasis> appended</para></simplesect>
+{The example shows the usage of <computeroutput>operator/=</computeroutput>.,json_pointer__operator_add}</para><para>Amortized constant.</para><para><simplesect kind="see"><para>see <ref refid="da/de8/classnlohmann_1_1json__pointer_1a7395bd0af29ac23fd3f21543c935cdfa" kindref="member">operator/=(const json_pointer&amp;)</ref> to append a JSON pointer </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="da/de8/classnlohmann_1_1json__pointer_1abdd21567b2b1d69329af0f520335e68b" kindref="member">operator/=(std::string)</ref> to append a reference token </para></simplesect>
+<simplesect kind="see"><para>see <ref refid="da/de8/classnlohmann_1_1json__pointer_1a926c9065dbed1bedc17857a813f7a46f" kindref="member">operator/(const json_pointer&amp;, std::string)</ref> for a binary operator</para></simplesect>
+<simplesect kind="since"><para>version 3.6.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12229" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12229" bodyend="12232"/>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1afdaacce1edb7145e0434e014f0e8685a" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref></type>
+        <definition>json_pointer nlohmann::json_pointer&lt; BasicJsonType &gt;::parent_pointer</definition>
+        <argsstring>() const</argsstring>
+        <name>parent_pointer</name>
+        <briefdescription>
+<para>returns the parent of this JSON pointer </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>parent of this JSON pointer; in case this JSON pointer is the root, the root itself is returned</para></simplesect>
+Linear in the length of the JSON pointer.</para><para>{The example shows the result of <computeroutput>parent_pointer</computeroutput> for different JSON Pointers.,json_pointer__parent_pointer}</para><para><simplesect kind="since"><para>version 3.6.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12308" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12308" bodyend="12318"/>
+        <references refid="da/de8/classnlohmann_1_1json__pointer_1a4b1ee4d511ca195bed896a3da47e264c" compoundref="d5/db8/json_8hpp" startline="12333" endline="12341">nlohmann::json_pointer&lt; BasicJsonType &gt;::pop_back</references>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a4b1ee4d511ca195bed896a3da47e264c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>void</type>
+        <definition>void nlohmann::json_pointer&lt; BasicJsonType &gt;::pop_back</definition>
+        <argsstring>()</argsstring>
+        <name>pop_back</name>
+        <briefdescription>
+<para>remove last reference token </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>not <computeroutput><ref refid="da/de8/classnlohmann_1_1json__pointer_1a649252bda4a2e75a0915b11a25d8bcc3" kindref="member">empty()</ref></computeroutput></para></simplesect>
+{The example shows the usage of <computeroutput>pop_back</computeroutput>.,json_pointer__pop_back}</para><para>Constant.</para><para><parameterlist kind="exception"><parameteritem>
+<parameternamelist>
+<parametername>out_of_range.405</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if JSON pointer has no parent</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="since"><para>version 3.6.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12333" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12333" bodyend="12341"/>
+        <references refid="d2/d67/classnlohmann_1_1detail_1_1out__of__range_1a238f1bda3b6c92b5970fbf9187ccd325" compoundref="d5/db8/json_8hpp" startline="2964" endline="2968">nlohmann::detail::out_of_range::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <referencedby refid="da/de8/classnlohmann_1_1json__pointer_1afdaacce1edb7145e0434e014f0e8685a" compoundref="d5/db8/json_8hpp" startline="12308" endline="12318">nlohmann::json_pointer&lt; BasicJsonType &gt;::parent_pointer</referencedby>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1adcc786998f220a5b3083ee8a37c4553e" compoundref="d5/db8/json_8hpp" startline="25343" endline="25605">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::patch</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a213bc67c32a30c68ac6bf06f5195d482" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>const std::string &amp;</type>
+        <definition>const std::string&amp; nlohmann::json_pointer&lt; BasicJsonType &gt;::back</definition>
+        <argsstring>() const</argsstring>
+        <name>back</name>
+        <briefdescription>
+<para>return last reference token </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>not <computeroutput><ref refid="da/de8/classnlohmann_1_1json__pointer_1a649252bda4a2e75a0915b11a25d8bcc3" kindref="member">empty()</ref></computeroutput> </para></simplesect>
+<simplesect kind="return"><para>last reference token</para></simplesect>
+{The example shows the usage of <computeroutput>back</computeroutput>.,json_pointer__back}</para><para>Constant.</para><para><parameterlist kind="exception"><parameteritem>
+<parameternamelist>
+<parametername>out_of_range.405</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if JSON pointer has no parent</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="since"><para>version 3.6.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12357" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12357" bodyend="12365"/>
+        <references refid="d2/d67/classnlohmann_1_1detail_1_1out__of__range_1a238f1bda3b6c92b5970fbf9187ccd325" compoundref="d5/db8/json_8hpp" startline="2964" endline="2968">nlohmann::detail::out_of_range::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1adcc786998f220a5b3083ee8a37c4553e" compoundref="d5/db8/json_8hpp" startline="25343" endline="25605">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::patch</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a697d12b5bd6205f8866691b166b7c7dc" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>void</type>
+        <definition>void nlohmann::json_pointer&lt; BasicJsonType &gt;::push_back</definition>
+        <argsstring>(const std::string &amp;token)</argsstring>
+        <name>push_back</name>
+        <param>
+          <type>const std::string &amp;</type>
+          <declname>token</declname>
+        </param>
+        <briefdescription>
+<para>append an unescaped token at the end of the reference pointer </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">token</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>token to add</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+Amortized constant.</para><para>{The example shows the result of <computeroutput>push_back</computeroutput> for different JSON Pointers.,json_pointer__push_back}</para><para><simplesect kind="since"><para>version 3.6.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12379" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12379" bodyend="12382"/>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1ac228b13596d3c34185da9fe61b570194" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>void</type>
+        <definition>void nlohmann::json_pointer&lt; BasicJsonType &gt;::push_back</definition>
+        <argsstring>(std::string &amp;&amp;token)</argsstring>
+        <name>push_back</name>
+        <param>
+          <type>std::string &amp;&amp;</type>
+          <declname>token</declname>
+        </param>
+        <briefdescription>
+<para>append an unescaped token at the end of the reference pointer </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">token</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>token to add</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+Amortized constant.</para><para>{The example shows the result of <computeroutput>push_back</computeroutput> for different JSON Pointers.,json_pointer__push_back}</para><para><simplesect kind="since"><para>version 3.6.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12385" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12385" bodyend="12388"/>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a649252bda4a2e75a0915b11a25d8bcc3" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::json_pointer&lt; BasicJsonType &gt;::empty</definition>
+        <argsstring>() const noexcept</argsstring>
+        <name>empty</name>
+        <briefdescription>
+<para>return whether pointer points to the root document </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>true iff the JSON pointer points to the root document</para></simplesect>
+Constant.</para><para>No-throw guarantee: this function never throws exceptions.</para><para>{The example shows the result of <computeroutput>empty</computeroutput> for different JSON Pointers.,json_pointer__empty}</para><para><simplesect kind="since"><para>version 3.6.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12404" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12404" bodyend="12407"/>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1adcc786998f220a5b3083ee8a37c4553e" compoundref="d5/db8/json_8hpp" startline="25343" endline="25605">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::patch</referencedby>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-static-func">
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1ae28e4b79b9d4fac9e6dca29f47f946fa" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>BasicJsonType::size_type</type>
+        <definition>static BasicJsonType::size_type nlohmann::json_pointer&lt; BasicJsonType &gt;::array_index</definition>
+        <argsstring>(const std::string &amp;s)</argsstring>
+        <name>array_index</name>
+        <param>
+          <type>const std::string &amp;</type>
+          <declname>s</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">s</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>reference token to be converted into an array index</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>integer representation of <emphasis>s</emphasis> </para></simplesect>
+<parameterlist kind="exception"><parameteritem>
+<parameternamelist>
+<parametername>parse_error.106</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if an array index begins with &apos;0&apos; </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>parse_error.109</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if an array index begins not with a digit </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>out_of_range.404</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if string <emphasis>s</emphasis> could not be converted to an integer </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>out_of_range.410</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if an array index exceeds size_type </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12420" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12420" bodyend="12461"/>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="d2/d67/classnlohmann_1_1detail_1_1out__of__range_1a238f1bda3b6c92b5970fbf9187ccd325" compoundref="d5/db8/json_8hpp" startline="2964" endline="2968">nlohmann::detail::out_of_range::create</references>
+        <references refid="d5/db8/json_8hpp_1a6954bec49ed2a2dfb938c1131c82740a" compoundref="d5/db8/json_8hpp" startline="2265">JSON_CATCH</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a2cf645f34610e7f7d6e09ab88a2ab917" compoundref="d5/db8/json_8hpp" startline="2299">JSON_PRIVATE_UNLESS_TESTED</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="d5/db8/json_8hpp_1a985d3b82445302c57257f6432f261fe9" compoundref="d5/db8/json_8hpp" startline="2264">JSON_TRY</references>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1adcc786998f220a5b3083ee8a37c4553e" compoundref="d5/db8/json_8hpp" startline="25343" endline="25605">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::patch</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1ae01c32c6a071c2e5198d5dfcce290e50" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::vector&lt; std::string &gt;</type>
+        <definition>static std::vector&lt;std::string&gt; nlohmann::json_pointer&lt; BasicJsonType &gt;::split</definition>
+        <argsstring>(const std::string &amp;reference_string)</argsstring>
+        <name>split</name>
+        <param>
+          <type>const std::string &amp;</type>
+          <declname>reference_string</declname>
+        </param>
+        <briefdescription>
+<para>split the string input to reference tokens </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="note"><para>This function is only called by the <ref refid="da/de8/classnlohmann_1_1json__pointer" kindref="compound">json_pointer</ref> constructor. All exceptions below are documented there.</para></simplesect>
+<parameterlist kind="exception"><parameteritem>
+<parameternamelist>
+<parametername>parse_error.107</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if the pointer is not empty or begins with &apos;/&apos; </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>parse_error.108</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if character &apos;~&apos; is not followed by &apos;0&apos; or &apos;1&apos; </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12825" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12825" bodyend="12883"/>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a0b76dc40f2f2c2f983b6b7f74976cc89" compoundref="d5/db8/json_8hpp" startline="2565" endline="2569">nlohmann::detail::unescape</references>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1ab0d7759d0caa6a0c0187916da28e6ee7" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>void</type>
+        <definition>static void nlohmann::json_pointer&lt; BasicJsonType &gt;::flatten</definition>
+        <argsstring>(const std::string &amp;reference_string, const BasicJsonType &amp;value, BasicJsonType &amp;result)</argsstring>
+        <name>flatten</name>
+        <param>
+          <type>const std::string &amp;</type>
+          <declname>reference_string</declname>
+        </param>
+        <param>
+          <type>const <ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> &amp;</type>
+          <declname>value</declname>
+        </param>
+        <param>
+          <type><ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> &amp;</type>
+          <declname>result</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">reference_string</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the reference string to the current value </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">value</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the value to consider </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="inout">result</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the result object to insert values to</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="note"><para>Empty objects or arrays are flattened to <computeroutput>null</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12893" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12893" bodyend="12943"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a9d486a036924098fe1a77de14d23f56c" compoundref="d5/db8/json_8hpp" startline="2551" endline="2556">nlohmann::detail::escape</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804">nlohmann::detail::value</references>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1ab7aa6e048e659481a036f2d872c7cba6" compoundref="d5/db8/json_8hpp" startline="25245" endline="25250">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::flatten</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a920065221e3c81676c3211c100d024a7" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref></type>
+        <definition>static BasicJsonType nlohmann::json_pointer&lt; BasicJsonType &gt;::unflatten</definition>
+        <argsstring>(const BasicJsonType &amp;value)</argsstring>
+        <name>unflatten</name>
+        <param>
+          <type>const <ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> &amp;</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">value</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>flattened JSON</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>unflattened JSON</para></simplesect>
+<parameterlist kind="exception"><parameteritem>
+<parameternamelist>
+<parametername>parse_error.109</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if array index is not a number </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>type_error.314</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if value is not an object </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>type_error.315</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if object values are not primitive </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>type_error.313</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if value cannot be unflattened </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12956" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12956" bodyend="12981"/>
+        <references refid="da/d1c/classnlohmann_1_1detail_1_1type__error_1a838a5e301cf97289c2d106b9ace1470f" compoundref="d5/db8/json_8hpp" startline="2916" endline="2920">nlohmann::detail::type_error::create</references>
+        <references refid="da/de8/classnlohmann_1_1json__pointer_1a583c726016f440ffe65553935c101ff5" compoundref="d5/db8/json_8hpp" startline="12485" endline="12536">nlohmann::json_pointer&lt; BasicJsonType &gt;::get_and_create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1adea158bff8642202420898f6322da479" compoundref="d5/db8/json_8hpp" startline="25282" endline="25285">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::unflatten</referencedby>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-func">
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="d5/db8/json_8hpp_1a2cf645f34610e7f7d6e09ab88a2ab917" kindref="member">JSON_PRIVATE_UNLESS_TESTED</ref> JSON pointer has no</type>
+        <definition>JSON_PRIVATE_UNLESS_TESTED JSON pointer has no nlohmann::json_pointer&lt; BasicJsonType &gt;::BasicJsonType</definition>
+        <argsstring>()))</argsstring>
+        <name>BasicJsonType</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12468" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a583c726016f440ffe65553935c101ff5" prot="private" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> &amp;</type>
+        <definition>BasicJsonType&amp; nlohmann::json_pointer&lt; BasicJsonType &gt;::get_and_create</definition>
+        <argsstring>(BasicJsonType &amp;j) const</argsstring>
+        <name>get_and_create</name>
+        <param>
+          <type><ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> &amp;</type>
+          <declname>j</declname>
+        </param>
+        <briefdescription>
+<para>create and return a reference to the pointed to value </para>        </briefdescription>
+        <detaileddescription>
+<para>Linear in the number of reference tokens.</para><para><parameterlist kind="exception"><parameteritem>
+<parameternamelist>
+<parametername>parse_error.109</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if array index is not a number </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>type_error.313</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if value cannot be unflattened </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12485" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12485" bodyend="12536"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="da/d1c/classnlohmann_1_1detail_1_1type__error_1a838a5e301cf97289c2d106b9ace1470f" compoundref="d5/db8/json_8hpp" startline="2916" endline="2920">nlohmann::detail::type_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a37a6259cc0c1dae299a7866489dff0bd">nlohmann::detail::null</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <referencedby refid="da/de8/classnlohmann_1_1json__pointer_1a920065221e3c81676c3211c100d024a7" compoundref="d5/db8/json_8hpp" startline="12956" endline="12981">nlohmann::json_pointer&lt; BasicJsonType &gt;::unflatten</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a577512ee6b7f030e8872b4d29fa5c3e5" prot="private" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> &amp;</type>
+        <definition>BasicJsonType&amp; nlohmann::json_pointer&lt; BasicJsonType &gt;::get_unchecked</definition>
+        <argsstring>(BasicJsonType *ptr) const</argsstring>
+        <name>get_unchecked</name>
+        <param>
+          <type><ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> *</type>
+          <declname>ptr</declname>
+        </param>
+        <briefdescription>
+<para>return a reference to the pointed to value </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="note"><para>This version does not throw if a value is not present, but tries to create nested values instead. For instance, calling this function with pointer <computeroutput>&quot;/this/that&quot;</computeroutput> on a null value is equivalent to calling <computeroutput>operator[](&quot;this&quot;).operator[](&quot;that&quot;)</computeroutput> on that value, effectively changing the null value to an object.</para></simplesect>
+<parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">ptr</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>a JSON value</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>reference to the JSON value pointed to by the JSON pointer</para></simplesect>
+Linear in the length of the JSON pointer.</para><para><parameterlist kind="exception"><parameteritem>
+<parameternamelist>
+<parametername>parse_error.106</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if an array index begins with &apos;0&apos; </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>parse_error.109</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if an array index was not a number </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>out_of_range.404</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if the JSON pointer can not be resolved </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12557" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12557" bodyend="12608"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d2/d67/classnlohmann_1_1detail_1_1out__of__range_1a238f1bda3b6c92b5970fbf9187ccd325" compoundref="d5/db8/json_8hpp" startline="2964" endline="2968">nlohmann::detail::out_of_range::create</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a0d3deaa73b3644b4da3f8ef3172cd8d2" compoundref="d5/db8/json_8hpp" startline="25104" endline="25107">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::operator[]</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a366d68a67e40d86676d3bdb52e167294" prot="private" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> &amp;</type>
+        <definition>BasicJsonType&amp; nlohmann::json_pointer&lt; BasicJsonType &gt;::get_checked</definition>
+        <argsstring>(BasicJsonType *ptr) const</argsstring>
+        <name>get_checked</name>
+        <param>
+          <type><ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> *</type>
+          <declname>ptr</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="exception"><parameteritem>
+<parameternamelist>
+<parametername>parse_error.106</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if an array index begins with &apos;0&apos; </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>parse_error.109</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if an array index was not a number </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>out_of_range.402</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if the array index &apos;-&apos; is used </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>out_of_range.404</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if the JSON pointer can not be resolved </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12616" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12616" bodyend="12650"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d2/d67/classnlohmann_1_1detail_1_1out__of__range_1a238f1bda3b6c92b5970fbf9187ccd325" compoundref="d5/db8/json_8hpp" startline="2964" endline="2968">nlohmann::detail::out_of_range::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1aa014a978f8b6c085db8825faa8dad320" compoundref="d5/db8/json_8hpp" startline="25175" endline="25178">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::at</referencedby>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a36bd6765ccd8aeeeb4e49a766ba639df" compoundref="d5/db8/json_8hpp" startline="21013" endline="21030">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::value</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1ad6a01f8e1556eef68e5a49b33fef1548" prot="private" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>const <ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> &amp;</type>
+        <definition>const BasicJsonType&amp; nlohmann::json_pointer&lt; BasicJsonType &gt;::get_unchecked</definition>
+        <argsstring>(const BasicJsonType *ptr) const</argsstring>
+        <name>get_unchecked</name>
+        <param>
+          <type>const <ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> *</type>
+          <declname>ptr</declname>
+        </param>
+        <briefdescription>
+<para>return a const reference to the pointed to value </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">ptr</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>a JSON value</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>const reference to the JSON value pointed to by the JSON pointer</para></simplesect>
+<parameterlist kind="exception"><parameteritem>
+<parameternamelist>
+<parametername>parse_error.106</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if an array index begins with &apos;0&apos; </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>parse_error.109</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if an array index was not a number </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>out_of_range.402</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if the array index &apos;-&apos; is used </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>out_of_range.404</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if the JSON pointer can not be resolved </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12665" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12665" bodyend="12697"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d2/d67/classnlohmann_1_1detail_1_1out__of__range_1a238f1bda3b6c92b5970fbf9187ccd325" compoundref="d5/db8/json_8hpp" startline="2964" endline="2968">nlohmann::detail::out_of_range::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a55a5bbbc3007e479607304a3e8cb9bf5" prot="private" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>const <ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> &amp;</type>
+        <definition>const BasicJsonType&amp; nlohmann::json_pointer&lt; BasicJsonType &gt;::get_checked</definition>
+        <argsstring>(const BasicJsonType *ptr) const</argsstring>
+        <name>get_checked</name>
+        <param>
+          <type>const <ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> *</type>
+          <declname>ptr</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="exception"><parameteritem>
+<parameternamelist>
+<parametername>parse_error.106</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if an array index begins with &apos;0&apos; </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>parse_error.109</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if an array index was not a number </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>out_of_range.402</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if the array index &apos;-&apos; is used </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>out_of_range.404</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if the JSON pointer can not be resolved </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12705" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12705" bodyend="12739"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d2/d67/classnlohmann_1_1detail_1_1out__of__range_1a238f1bda3b6c92b5970fbf9187ccd325" compoundref="d5/db8/json_8hpp" startline="2964" endline="2968">nlohmann::detail::out_of_range::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+      </memberdef>
+      <memberdef kind="function" id="da/de8/classnlohmann_1_1json__pointer_1a90d38e45e2d3add52d824bc55da8f772" prot="private" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::json_pointer&lt; BasicJsonType &gt;::contains</definition>
+        <argsstring>(const BasicJsonType *ptr) const</argsstring>
+        <name>contains</name>
+        <param>
+          <type>const <ref refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" kindref="member">BasicJsonType</ref> *</type>
+          <declname>ptr</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="exception"><parameteritem>
+<parameternamelist>
+<parametername>parse_error.106</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if an array index begins with &apos;0&apos; </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername>parse_error.109</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>if an array index was not a number </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="12745" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="12745" bodyend="12814"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1adb82c1f34c73486e013da71ae369e597" compoundref="d5/db8/json_8hpp" startline="21589" endline="21592">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::contains</referencedby>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>JSON Pointer. </para>    </briefdescription>
+    <detaileddescription>
+<para>A JSON pointer defines a string syntax for identifying a specific value within a JSON document. It can be used with functions <computeroutput>at</computeroutput> and <computeroutput>operator[]</computeroutput>. Furthermore, JSON pointers are the base for JSON patches.</para><para><simplesect kind="see"><para><ulink url="https://tools.ietf.org/html/rfc6901">RFC 6901</ulink></para></simplesect>
+<simplesect kind="since"><para>version 2.0.0 </para></simplesect>
+</para>    </detaileddescription>
+    <collaborationgraph>
+      <node id="704">
+        <label>return</label>
+      </node>
+      <node id="711">
+        <label>T</label>
+      </node>
+      <node id="706">
+        <label>JSON_PRIVATE_UNLESS_TESTED</label>
+      </node>
+      <node id="710">
+        <label>std::vector&lt; T &gt;</label>
+        <childnode refid="711" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+      </node>
+      <node id="705">
+        <label>JSON_PRIVATE_UNLESS_TESTED JSON pointer has no</label>
+      </node>
+      <node id="703">
+        <label>nlohmann::json_pointer&lt; BasicJsonType &gt;</label>
+        <link refid="da/de8/classnlohmann_1_1json__pointer"/>
+        <childnode refid="704" relation="usage">
+          <edgelabel>-result</edgelabel>
+        </childnode>
+        <childnode refid="703" relation="usage">
+          <edgelabel>-result</edgelabel>
+        </childnode>
+        <childnode refid="705" relation="usage">
+          <edgelabel>-parent</edgelabel>
+        </childnode>
+        <childnode refid="706" relation="usage">
+          <edgelabel>-__pad0__</edgelabel>
+        </childnode>
+        <childnode refid="707" relation="usage">
+          <edgelabel>-reference_tokens</edgelabel>
+        </childnode>
+        <childnode refid="712" relation="usage">
+          <edgelabel>-reference_tokens</edgelabel>
+        </childnode>
+      </node>
+      <node id="709">
+        <label>std::basic_string&lt; char &gt;</label>
+      </node>
+      <node id="707">
+        <label>std::vector&lt; std::string &gt;</label>
+        <childnode refid="708" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+        <childnode refid="710" relation="template-instance">
+          <edgelabel>&lt; std::string &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="712">
+        <label>result</label>
+      </node>
+      <node id="708">
+        <label>std::string</label>
+        <childnode refid="709" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3380" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3380" bodyend="-1"/>
+    <listofallmembers>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a551777cfe37bf7adb82253482030d992" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>__pad0__</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1ae28e4b79b9d4fac9e6dca29f47f946fa" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>array_index</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a213bc67c32a30c68ac6bf06f5195d482" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>back</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1ada3100cdb8700566051828f1355fa745" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>basic_json</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a0f3376aebd6c88555d12f34480f93741" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>BasicJsonType</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a90d38e45e2d3add52d824bc55da8f772" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>contains</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a649252bda4a2e75a0915b11a25d8bcc3" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>empty</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1ab0d7759d0caa6a0c0187916da28e6ee7" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>flatten</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a583c726016f440ffe65553935c101ff5" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>get_and_create</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a366d68a67e40d86676d3bdb52e167294" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>get_checked</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a55a5bbbc3007e479607304a3e8cb9bf5" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>get_checked</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a577512ee6b7f030e8872b4d29fa5c3e5" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>get_unchecked</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1ad6a01f8e1556eef68e5a49b33fef1548" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>get_unchecked</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a7f32d7c62841f0c4a6784cf741a6e4f8" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>json_pointer</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1ae9015c658f99cf3d48a8563accc79988" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>operator std::string</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a6779edcf28e6f018a3bbb29c0b4b5e1e" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>operator!=</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a90a11fe6c7f37b1746a3ff9cb24b0d53" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>operator/</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a926c9065dbed1bedc17857a813f7a46f" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>operator/</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1af5a4bc4f82113c271c9a0cd4d3b5f31c" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>operator/</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a7395bd0af29ac23fd3f21543c935cdfa" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>operator/=</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1abdd21567b2b1d69329af0f520335e68b" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>operator/=</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a7de51480324eb1c5a89ed552cd699875" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>operator/=</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a4667ef558c8c3f8a646bfda0c6654653" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>operator==</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a9d826fc24f7821325e4f24d4393d6adc" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>parent</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1afdaacce1edb7145e0434e014f0e8685a" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>parent_pointer</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a4b1ee4d511ca195bed896a3da47e264c" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>pop_back</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a697d12b5bd6205f8866691b166b7c7dc" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>push_back</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1ac228b13596d3c34185da9fe61b570194" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>push_back</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a468dde132b1384d962c75eca7306f6cb" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>reference_tokens</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a07a990a6838de4f38ee9d881e7b9fd61" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>reference_tokens</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1ae3d35f4085faec07b87c88ba0dae457d" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>result</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a8473b794a810d3fdb46cf985bfa9e2bb" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>result</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1ae01c32c6a071c2e5198d5dfcce290e50" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>split</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a3d4b15d32d096e3776c5d2c773b524f5" prot="public" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>to_string</name></member>
+      <member refid="da/de8/classnlohmann_1_1json__pointer_1a920065221e3c81676c3211c100d024a7" prot="private" virt="non-virtual"><scope>nlohmann::json_pointer</scope><name>unflatten</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

@@ -1,0 +1,85 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d0/d14/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl_3_01RealIntegerType_00_01Compatie5920c849e839ebb9f8c57349c900796" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_compatible_integer_type_impl&lt; RealIntegerType, CompatibleNumberIntegerType, enable_if_t&lt; std::is_integral&lt; RealIntegerType &gt;::value &amp;&amp;std::is_integral&lt; CompatibleNumberIntegerType &gt;::value &amp;&amp;!std::is_same&lt; bool, CompatibleNumberIntegerType &gt;::value &gt; &gt;</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename RealIntegerType</type>
+      </param>
+      <param>
+        <type>typename CompatibleNumberIntegerType</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="d0/d14/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl_3_01RealIntegerType_00_01Compatie5920c849e839ebb9f8c57349c900796_1ab267aabfe36c5b9c305c5e5faf06ea36" prot="public" static="no">
+        <type>std::numeric_limits&lt; RealIntegerType &gt;</type>
+        <definition>using nlohmann::detail::is_compatible_integer_type_impl&lt; RealIntegerType, CompatibleNumberIntegerType, enable_if_t&lt; std::is_integral&lt; RealIntegerType &gt;::value &amp;&amp;std::is_integral&lt; CompatibleNumberIntegerType &gt;::value &amp;&amp;!std::is_same&lt; bool, CompatibleNumberIntegerType &gt;::value &gt; &gt;::RealLimits =  std::numeric_limits&lt;RealIntegerType&gt;</definition>
+        <argsstring></argsstring>
+        <name>RealLimits</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3794" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3794" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d0/d14/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl_3_01RealIntegerType_00_01Compatie5920c849e839ebb9f8c57349c900796_1a24d97696ca33fba8096e452b1901a8e6" prot="public" static="no">
+        <type>std::numeric_limits&lt; CompatibleNumberIntegerType &gt;</type>
+        <definition>using nlohmann::detail::is_compatible_integer_type_impl&lt; RealIntegerType, CompatibleNumberIntegerType, enable_if_t&lt; std::is_integral&lt; RealIntegerType &gt;::value &amp;&amp;std::is_integral&lt; CompatibleNumberIntegerType &gt;::value &amp;&amp;!std::is_same&lt; bool, CompatibleNumberIntegerType &gt;::value &gt; &gt;::CompatibleLimits =  std::numeric_limits&lt;CompatibleNumberIntegerType&gt;</definition>
+        <argsstring></argsstring>
+        <name>CompatibleLimits</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3795" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3795" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-static-attrib">
+      <memberdef kind="variable" id="d0/d14/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl_3_01RealIntegerType_00_01Compatie5920c849e839ebb9f8c57349c900796_1a8fd20d5e7d65d14b4e9f4ee181a3aded" prot="public" static="yes" mutable="no">
+        <type>constexpr auto</type>
+        <definition>constexpr auto nlohmann::detail::is_compatible_integer_type_impl&lt; RealIntegerType, CompatibleNumberIntegerType, enable_if_t&lt; std::is_integral&lt; RealIntegerType &gt;::value &amp;&amp;std::is_integral&lt; CompatibleNumberIntegerType &gt;::value &amp;&amp;!std::is_same&lt; bool, CompatibleNumberIntegerType &gt;::value &gt; &gt;::value</definition>
+        <argsstring></argsstring>
+        <name>value</name>
+        <initializer>=
+        <ref refid="d7/d10/structnlohmann_1_1detail_1_1is__constructible" kindref="compound">is_constructible</ref>&lt;RealIntegerType,
+        CompatibleNumberIntegerType&gt;::value &amp;&amp;
+        CompatibleLimits::is_integer &amp;&amp;
+        RealLimits::is_signed == CompatibleLimits::is_signed</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3797" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3797" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="414">
+        <label>nlohmann::detail::is_compatible_integer_type_impl&lt; RealIntegerType, CompatibleNumberIntegerType, enable_if_t&lt; std::is_integral&lt; RealIntegerType &gt;::value &amp;&amp;std::is_integral&lt; CompatibleNumberIntegerType &gt;::value &amp;&amp;!std::is_same&lt; bool, CompatibleNumberIntegerType &gt;::value &gt; &gt;</label>
+        <link refid="d0/d14/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl_3_01RealIntegerType_00_01Compatie5920c849e839ebb9f8c57349c900796"/>
+        <childnode refid="415" relation="usage">
+          <edgelabel>+value</edgelabel>
+        </childnode>
+      </node>
+      <node id="415">
+        <label>static constexpr auto</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3792" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3787" bodyend="3802"/>
+    <listofallmembers>
+      <member refid="d0/d14/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl_3_01RealIntegerType_00_01Compatie5920c849e839ebb9f8c57349c900796_1a24d97696ca33fba8096e452b1901a8e6" prot="public" virt="non-virtual"><scope>nlohmann::detail::is_compatible_integer_type_impl&lt; RealIntegerType, CompatibleNumberIntegerType, enable_if_t&lt; std::is_integral&lt; RealIntegerType &gt;::value &amp;&amp;std::is_integral&lt; CompatibleNumberIntegerType &gt;::value &amp;&amp;!std::is_same&lt; bool, CompatibleNumberIntegerType &gt;::value &gt; &gt;</scope><name>CompatibleLimits</name></member>
+      <member refid="d0/d14/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl_3_01RealIntegerType_00_01Compatie5920c849e839ebb9f8c57349c900796_1ab267aabfe36c5b9c305c5e5faf06ea36" prot="public" virt="non-virtual"><scope>nlohmann::detail::is_compatible_integer_type_impl&lt; RealIntegerType, CompatibleNumberIntegerType, enable_if_t&lt; std::is_integral&lt; RealIntegerType &gt;::value &amp;&amp;std::is_integral&lt; CompatibleNumberIntegerType &gt;::value &amp;&amp;!std::is_same&lt; bool, CompatibleNumberIntegerType &gt;::value &gt; &gt;</scope><name>RealLimits</name></member>
+      <member refid="d0/d14/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl_3_01RealIntegerType_00_01Compatie5920c849e839ebb9f8c57349c900796_1a8fd20d5e7d65d14b4e9f4ee181a3aded" prot="public" virt="non-virtual"><scope>nlohmann::detail::is_compatible_integer_type_impl&lt; RealIntegerType, CompatibleNumberIntegerType, enable_if_t&lt; std::is_integral&lt; RealIntegerType &gt;::value &amp;&amp;std::is_integral&lt; CompatibleNumberIntegerType &gt;::value &amp;&amp;!std::is_same&lt; bool, CompatibleNumberIntegerType &gt;::value &gt; &gt;</scope><name>value</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

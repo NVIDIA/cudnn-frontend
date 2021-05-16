@@ -67,7 +67,7 @@
           <declname>mode_</declname>
         </param>
         <briefdescription>
-<para>Set upper and lower limits for the RELU activation. </para>        </briefdescription>
+<para>Set pointwise mode for the activation. </para>        </briefdescription>
         <detaileddescription>
         </detaileddescription>
         <inbodydescription>
@@ -290,53 +290,53 @@
     <detaileddescription>
 <para><ref refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8" kindref="compound">PointWiseDescBuilder_v8</ref> Class Helper class used to build <ref refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8" kindref="compound">PointWiseDesc_v8</ref> class </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="294">
+      <node id="939">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="298">
+      <node id="943">
         <label>cudnnPointwiseMode_t</label>
       </node>
-      <node id="295">
+      <node id="940">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="293">
+      <node id="938">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="296">
+      <node id="941">
         <label>double</label>
       </node>
-      <node id="297">
+      <node id="942">
         <label>cudnnNanPropagation_t</label>
       </node>
-      <node id="299">
+      <node id="944">
         <label>cudnnDataType_t</label>
       </node>
-      <node id="291">
+      <node id="936">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="292" relation="usage">
+        <childnode refid="937" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="294" relation="usage">
+        <childnode refid="939" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="295" relation="usage">
+        <childnode refid="940" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="289">
+      <node id="934">
         <label>cudnn_frontend::PointWiseDescBuilder_v8</label>
         <link refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8"/>
-        <childnode refid="290" relation="usage">
+        <childnode refid="935" relation="usage">
           <edgelabel>-m_pointWiseDesc</edgelabel>
         </childnode>
       </node>
-      <node id="290">
+      <node id="935">
         <label>cudnn_frontend::PointWiseDesc_v8</label>
         <link refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8"/>
-        <childnode refid="291" relation="public-inheritance">
+        <childnode refid="936" relation="public-inheritance">
         </childnode>
-        <childnode refid="296" relation="usage">
+        <childnode refid="941" relation="usage">
           <edgelabel>-upper_clip</edgelabel>
           <edgelabel>-swish_beta</edgelabel>
           <edgelabel>-lower_clip_slope</edgelabel>
@@ -344,19 +344,19 @@
           <edgelabel>-elu_alpha</edgelabel>
           <edgelabel>-softplus_beta</edgelabel>
         </childnode>
-        <childnode refid="297" relation="usage">
+        <childnode refid="942" relation="usage">
           <edgelabel>-nan_propagation</edgelabel>
         </childnode>
-        <childnode refid="298" relation="usage">
+        <childnode refid="943" relation="usage">
           <edgelabel>-mode</edgelabel>
         </childnode>
-        <childnode refid="299" relation="usage">
+        <childnode refid="944" relation="usage">
           <edgelabel>-math_precision</edgelabel>
         </childnode>
       </node>
-      <node id="292">
+      <node id="937">
         <label>std::string</label>
-        <childnode refid="293" relation="public-inheritance">
+        <childnode refid="938" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>

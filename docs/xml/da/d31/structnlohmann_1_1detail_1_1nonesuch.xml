@@ -1,0 +1,118 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="da/d31/structnlohmann_1_1detail_1_1nonesuch" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::nonesuch</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="da/d31/structnlohmann_1_1detail_1_1nonesuch_1a6fe87da966856c6cb06617940d90f010" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::nonesuch::nonesuch</definition>
+        <argsstring>()=delete</argsstring>
+        <name>nonesuch</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3282" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="da/d31/structnlohmann_1_1detail_1_1nonesuch_1a7b1119845860e548b67f1644a2084373" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::nonesuch::~nonesuch</definition>
+        <argsstring>()=delete</argsstring>
+        <name>~nonesuch</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3283" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="da/d31/structnlohmann_1_1detail_1_1nonesuch_1a563462ef2d05fe60cdf1dc7f567dc276" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::nonesuch::nonesuch</definition>
+        <argsstring>(nonesuch const &amp;)=delete</argsstring>
+        <name>nonesuch</name>
+        <param>
+          <type><ref refid="da/d31/structnlohmann_1_1detail_1_1nonesuch" kindref="compound">nonesuch</ref> const &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3284" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="da/d31/structnlohmann_1_1detail_1_1nonesuch_1ad7719f7d2a00263be8b8d123870217d8" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::nonesuch::nonesuch</definition>
+        <argsstring>(nonesuch const &amp;&amp;)=delete</argsstring>
+        <name>nonesuch</name>
+        <param>
+          <type><ref refid="da/d31/structnlohmann_1_1detail_1_1nonesuch" kindref="compound">nonesuch</ref> const &amp;&amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3285" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="da/d31/structnlohmann_1_1detail_1_1nonesuch_1add6ef84c52a851e391cef514c85f2ffe" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::nonesuch::operator=</definition>
+        <argsstring>(nonesuch const &amp;)=delete</argsstring>
+        <name>operator=</name>
+        <param>
+          <type><ref refid="da/d31/structnlohmann_1_1detail_1_1nonesuch" kindref="compound">nonesuch</ref> const &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3286" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="da/d31/structnlohmann_1_1detail_1_1nonesuch_1a78ca022a1b4defe4f7ba662843602231" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::nonesuch::operator=</definition>
+        <argsstring>(nonesuch &amp;&amp;)=delete</argsstring>
+        <name>operator=</name>
+        <param>
+          <type><ref refid="da/d31/structnlohmann_1_1detail_1_1nonesuch" kindref="compound">nonesuch</ref> &amp;&amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3287" column="1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="792">
+        <label>nlohmann::detail::nonesuch</label>
+        <link refid="da/d31/structnlohmann_1_1detail_1_1nonesuch"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3281" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3280" bodyend="3288"/>
+    <listofallmembers>
+      <member refid="da/d31/structnlohmann_1_1detail_1_1nonesuch_1a6fe87da966856c6cb06617940d90f010" prot="public" virt="non-virtual"><scope>nlohmann::detail::nonesuch</scope><name>nonesuch</name></member>
+      <member refid="da/d31/structnlohmann_1_1detail_1_1nonesuch_1a563462ef2d05fe60cdf1dc7f567dc276" prot="public" virt="non-virtual"><scope>nlohmann::detail::nonesuch</scope><name>nonesuch</name></member>
+      <member refid="da/d31/structnlohmann_1_1detail_1_1nonesuch_1ad7719f7d2a00263be8b8d123870217d8" prot="public" virt="non-virtual"><scope>nlohmann::detail::nonesuch</scope><name>nonesuch</name></member>
+      <member refid="da/d31/structnlohmann_1_1detail_1_1nonesuch_1add6ef84c52a851e391cef514c85f2ffe" prot="public" virt="non-virtual"><scope>nlohmann::detail::nonesuch</scope><name>operator=</name></member>
+      <member refid="da/d31/structnlohmann_1_1detail_1_1nonesuch_1a78ca022a1b4defe4f7ba662843602231" prot="public" virt="non-virtual"><scope>nlohmann::detail::nonesuch</scope><name>operator=</name></member>
+      <member refid="da/d31/structnlohmann_1_1detail_1_1nonesuch_1a7b1119845860e548b67f1644a2084373" prot="public" virt="non-virtual"><scope>nlohmann::detail::nonesuch</scope><name>~nonesuch</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

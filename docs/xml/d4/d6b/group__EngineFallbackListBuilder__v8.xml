@@ -19,7 +19,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" line="116" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" bodystart="116" bodyend="120"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" line="128" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" bodystart="128" bodyend="133"/>
       </memberdef>
       <memberdef kind="function" id="d4/d6b/group__EngineFallbackListBuilder__v8_1gaf66485fe1a0faccab971edd0c70f04b4" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -36,8 +36,8 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" line="122" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" bodystart="122" bodyend="125"/>
-        <references refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1a9a557db46e3559fcaa0e800d976d6238" compoundref="df/d3e/cudnn__frontend__EngineFallbackList_8h" startline="100">cudnn_frontend::EngineFallbackList_v8::mode</references>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" line="135" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" bodystart="135" bodyend="138"/>
+        <references refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8_1a9a557db46e3559fcaa0e800d976d6238" compoundref="df/d3e/cudnn__frontend__EngineFallbackList_8h" startline="111">cudnn_frontend::EngineFallbackList_v8::mode</references>
       </memberdef>
       </sectiondef>
     <briefdescription>

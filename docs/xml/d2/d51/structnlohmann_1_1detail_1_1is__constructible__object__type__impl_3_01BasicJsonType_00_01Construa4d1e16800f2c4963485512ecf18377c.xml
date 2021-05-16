@@ -1,0 +1,80 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d2/d51/structnlohmann_1_1detail_1_1is__constructible__object__type__impl_3_01BasicJsonType_00_01Construa4d1e16800f2c4963485512ecf18377c" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_constructible_object_type_impl&lt; BasicJsonType, ConstructibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, ConstructibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, ConstructibleObjectType &gt;::value &gt; &gt;</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+      <param>
+        <type>typename ConstructibleObjectType</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="d2/d51/structnlohmann_1_1detail_1_1is__constructible__object__type__impl_3_01BasicJsonType_00_01Construa4d1e16800f2c4963485512ecf18377c_1ae335fdc59d1b0d79e52a808b71b11c67" prot="public" static="no">
+        <type>typename BasicJsonType::object_t</type>
+        <definition>using nlohmann::detail::is_constructible_object_type_impl&lt; BasicJsonType, ConstructibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, ConstructibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, ConstructibleObjectType &gt;::value &gt; &gt;::object_t =  typename BasicJsonType::object_t</definition>
+        <argsstring></argsstring>
+        <name>object_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3656" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3656" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-static-attrib">
+      <memberdef kind="variable" id="d2/d51/structnlohmann_1_1detail_1_1is__constructible__object__type__impl_3_01BasicJsonType_00_01Construa4d1e16800f2c4963485512ecf18377c_1a50418a0a88d63afbf7246af49f3e554c" prot="public" static="yes" mutable="no">
+        <type>constexpr bool</type>
+        <definition>constexpr bool nlohmann::detail::is_constructible_object_type_impl&lt; BasicJsonType, ConstructibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, ConstructibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, ConstructibleObjectType &gt;::value &gt; &gt;::value</definition>
+        <argsstring></argsstring>
+        <name>value</name>
+        <initializer>=
+        (<ref refid="d2/d91/structnlohmann_1_1detail_1_1is__default__constructible" kindref="compound">is_default_constructible</ref>&lt;ConstructibleObjectType&gt;::value &amp;&amp;
+         (std::is_move_assignable&lt;ConstructibleObjectType&gt;::value ||
+          std::is_copy_assignable&lt;ConstructibleObjectType&gt;::value) &amp;&amp;
+         (<ref refid="d7/d10/structnlohmann_1_1detail_1_1is__constructible" kindref="compound">is_constructible</ref>&lt;typename ConstructibleObjectType::key_type,
+          typename object_t::key_type&gt;::value &amp;&amp;
+          std::is_same &lt;
+          typename object_t::mapped_type,
+          typename ConstructibleObjectType::mapped_type &gt;::value)) ||
+        (<ref refid="dc/dac/structnlohmann_1_1detail_1_1has__from__json" kindref="compound">has_from_json</ref>&lt;BasicJsonType,
+         typename ConstructibleObjectType::mapped_type&gt;::value ||
+         <ref refid="d7/d08/structnlohmann_1_1detail_1_1has__non__default__from__json" kindref="compound">has_non_default_from_json</ref> &lt;
+         BasicJsonType,
+         typename ConstructibleObjectType::mapped_type &gt;::value)</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3658" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3658" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="559">
+        <label>nlohmann::detail::is_constructible_object_type_impl&lt; BasicJsonType, ConstructibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, ConstructibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, ConstructibleObjectType &gt;::value &gt; &gt;</label>
+        <link refid="d2/d51/structnlohmann_1_1detail_1_1is__constructible__object__type__impl_3_01BasicJsonType_00_01Construa4d1e16800f2c4963485512ecf18377c"/>
+        <childnode refid="560" relation="usage">
+          <edgelabel>+value</edgelabel>
+        </childnode>
+      </node>
+      <node id="560">
+        <label>bool</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3655" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3651" bodyend="3672"/>
+    <listofallmembers>
+      <member refid="d2/d51/structnlohmann_1_1detail_1_1is__constructible__object__type__impl_3_01BasicJsonType_00_01Construa4d1e16800f2c4963485512ecf18377c_1ae335fdc59d1b0d79e52a808b71b11c67" prot="public" virt="non-virtual"><scope>nlohmann::detail::is_constructible_object_type_impl&lt; BasicJsonType, ConstructibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, ConstructibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, ConstructibleObjectType &gt;::value &gt; &gt;</scope><name>object_t</name></member>
+      <member refid="d2/d51/structnlohmann_1_1detail_1_1is__constructible__object__type__impl_3_01BasicJsonType_00_01Construa4d1e16800f2c4963485512ecf18377c_1a50418a0a88d63afbf7246af49f3e554c" prot="public" virt="non-virtual"><scope>nlohmann::detail::is_constructible_object_type_impl&lt; BasicJsonType, ConstructibleObjectType, enable_if_t&lt; is_detected&lt; mapped_type_t, ConstructibleObjectType &gt;::value &amp;&amp;is_detected&lt; key_type_t, ConstructibleObjectType &gt;::value &gt; &gt;</scope><name>value</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

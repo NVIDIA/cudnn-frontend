@@ -1,0 +1,32 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d7/d1c/classBinaryType" kind="class" language="C++" prot="public">
+    <compoundname>BinaryType</compoundname>
+    <derivedcompoundref refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype" prot="public" virt="non-virtual">nlohmann::byte_container_with_subtype&lt; BinaryType &gt;</derivedcompoundref>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="49">
+        <label>BinaryType</label>
+        <link refid="d7/d1c/classBinaryType"/>
+      </node>
+      <node id="50">
+        <label>nlohmann::byte_container_with_subtype&lt; BinaryType &gt;</label>
+        <link refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype"/>
+        <childnode refid="49" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="51">
+        <label>BinaryType</label>
+        <link refid="d7/d1c/classBinaryType"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4934" column="1"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

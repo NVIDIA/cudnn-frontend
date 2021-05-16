@@ -25,6 +25,8 @@ var namespacecudnn__frontend =
     [ "OperationGraphBuilder_v8", "d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8.html", "d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" ],
     [ "PointWiseDesc_v8", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8" ],
     [ "PointWiseDescBuilder_v8", "d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html", "d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8" ],
+    [ "ReductionDesc_v8", "d4/df1/classcudnn__frontend_1_1ReductionDesc__v8.html", "d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" ],
+    [ "ReductionDescBuilder_v8", "d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8.html", "d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" ],
     [ "Tensor_v8", "d6/da7/classcudnn__frontend_1_1Tensor__v8.html", "d6/da7/classcudnn__frontend_1_1Tensor__v8" ],
     [ "TensorBuilder_v8", "db/dae/classcudnn__frontend_1_1TensorBuilder__v8.html", "db/dae/classcudnn__frontend_1_1TensorBuilder__v8" ],
     [ "VariantPack_v8", "d0/d20/classcudnn__frontend_1_1VariantPack__v8.html", "d0/d20/classcudnn__frontend_1_1VariantPack__v8" ],

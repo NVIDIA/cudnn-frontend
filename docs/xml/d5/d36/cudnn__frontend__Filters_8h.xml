@@ -5,42 +5,42 @@
     <includes local="no">cudnn.h</includes>
     <includedby refid="de/d0c/cudnn__frontend_8h" local="yes">cudnn_frontend.h</includedby>
     <incdepgraph>
-      <node id="197">
+      <node id="295">
         <label>cudnn.h</label>
       </node>
-      <node id="196">
+      <node id="294">
         <label>cudnn_frontend_Filters.h</label>
         <link refid="d5/d36/cudnn__frontend__Filters_8h"/>
-        <childnode refid="197" relation="include">
+        <childnode refid="295" relation="include">
         </childnode>
       </node>
     </incdepgraph>
     <invincdepgraph>
-      <node id="202">
+      <node id="300">
         <label>cudnn_frontend_get_plan.h</label>
         <link refid="d2/d3b/cudnn__frontend__get__plan_8h"/>
       </node>
-      <node id="198">
+      <node id="296">
         <label>cudnn_frontend_Filters.h</label>
         <link refid="d5/d36/cudnn__frontend__Filters_8h"/>
-        <childnode refid="199" relation="include">
+        <childnode refid="297" relation="include">
         </childnode>
       </node>
-      <node id="200">
+      <node id="298">
         <label>cudnn_frontend_EngineConfigGenerator.h</label>
         <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
-        <childnode refid="201" relation="include">
+        <childnode refid="299" relation="include">
         </childnode>
-        <childnode refid="202" relation="include">
+        <childnode refid="300" relation="include">
         </childnode>
       </node>
-      <node id="199">
+      <node id="297">
         <label>cudnn_frontend.h</label>
         <link refid="de/d0c/cudnn__frontend_8h"/>
-        <childnode refid="200" relation="include">
+        <childnode refid="298" relation="include">
         </childnode>
       </node>
-      <node id="201">
+      <node id="299">
         <label>cudnn_frontend_find_plan.h</label>
         <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
       </node>
@@ -119,7 +119,36 @@
 <codeline lineno="66"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
 <codeline lineno="67"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>hasNumerics;</highlight></codeline>
 <codeline lineno="68"><highlight class="normal">}</highlight></codeline>
-<codeline lineno="69"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="69"><highlight class="normal"></highlight></codeline>
+<codeline lineno="70"><highlight class="normal"></highlight><highlight class="preprocessor">#if<sp/>(CUDNN_VERSION<sp/>&gt;=<sp/>8200)</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="71"><highlight class="normal"></highlight><highlight class="keyword">template</highlight><highlight class="normal"><sp/>&lt;cudnnBackendBehaviorNote_t<sp/>BEHAVIOR_NOTE&gt;</highlight></codeline>
+<codeline lineno="72"><highlight class="normal"></highlight><highlight class="keywordtype">bool</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="73"><highlight class="normal">hasBehaviorNote(cudnnBackendDescriptor_t<sp/>engine_config)<sp/>{</highlight></codeline>
+<codeline lineno="74"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">bool</highlight><highlight class="normal"><sp/>hasBehavior<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keyword">false</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="75"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>status<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/>CUDNN_STATUS_SUCCESS;</highlight></codeline>
+<codeline lineno="76"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref><sp/>engine<sp/><sp/><sp/>=<sp/><ref refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" kindref="member">make_shared_backend_pointer</ref>(CUDNN_BACKEND_ENGINE_DESCRIPTOR);</highlight></codeline>
+<codeline lineno="77"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnBackendDescriptor_t<sp/>engine_<sp/>=<sp/>engine-&gt;get_backend_descriptor();</highlight></codeline>
+<codeline lineno="78"><highlight class="normal"><sp/><sp/><sp/><sp/>int64_t<sp/>engine_count<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/>-1;</highlight></codeline>
+<codeline lineno="79"><highlight class="normal"><sp/><sp/><sp/><sp/>status<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/>cudnnBackendGetAttribute(</highlight></codeline>
+<codeline lineno="80"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>engine_config,<sp/>CUDNN_ATTR_ENGINECFG_ENGINE,<sp/>CUDNN_TYPE_BACKEND_DESCRIPTOR,<sp/>1,<sp/>&amp;engine_count,<sp/>&amp;engine_);</highlight></codeline>
+<codeline lineno="81"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(status<sp/>==<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
+<codeline lineno="82"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudnnBackendBehaviorNote_t<sp/>notes[CUDNN_BEHAVIOR_NOTE_TYPE_COUNT];</highlight></codeline>
+<codeline lineno="83"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>int64_t<sp/>elem_count<sp/>=<sp/>0;</highlight></codeline>
+<codeline lineno="84"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudnnBackendGetAttribute(engine-&gt;get_backend_descriptor(),</highlight></codeline>
+<codeline lineno="85"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,</highlight></codeline>
+<codeline lineno="86"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_TYPE_BEHAVIOR_NOTE,</highlight></codeline>
+<codeline lineno="87"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,</highlight></codeline>
+<codeline lineno="88"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;elem_count,</highlight></codeline>
+<codeline lineno="89"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>notes);</highlight></codeline>
+<codeline lineno="90"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(std::any_of(</highlight></codeline>
+<codeline lineno="91"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>notes,<sp/>notes<sp/>+<sp/>elem_count,<sp/>[](cudnnBackendBehaviorNote_t<sp/>note)<sp/>{<sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>note<sp/>==<sp/>BEHAVIOR_NOTE;<sp/>}))<sp/>{</highlight></codeline>
+<codeline lineno="92"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>hasBehavior<sp/>=<sp/></highlight><highlight class="keyword">true</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="93"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="94"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="95"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>hasBehavior;</highlight></codeline>
+<codeline lineno="96"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="97"><highlight class="normal"></highlight><highlight class="preprocessor">#endif</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="98"><highlight class="normal">}</highlight></codeline>
     </programlisting>
     <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Filters.h"/>
   </compounddef>

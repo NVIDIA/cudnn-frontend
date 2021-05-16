@@ -37,62 +37,62 @@
     <detaileddescription>
 <para>A pair of execution plan and its run time. Necessary to return a sorted executionPlan </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="170">
+      <node id="270">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="172">
+      <node id="272">
         <label>cudnnHandle_t</label>
       </node>
-      <node id="173">
+      <node id="273">
         <label>float</label>
       </node>
-      <node id="171">
+      <node id="271">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="169">
+      <node id="269">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="166">
+      <node id="266">
         <label>cudnn_frontend::ExecutionPlan_v8</label>
         <link refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8"/>
-        <childnode refid="167" relation="public-inheritance">
+        <childnode refid="267" relation="public-inheritance">
         </childnode>
-        <childnode refid="168" relation="usage">
+        <childnode refid="268" relation="usage">
           <edgelabel>-planTag</edgelabel>
         </childnode>
-        <childnode refid="172" relation="usage">
+        <childnode refid="272" relation="usage">
           <edgelabel>-handle</edgelabel>
         </childnode>
-        <childnode refid="170" relation="usage">
+        <childnode refid="270" relation="usage">
           <edgelabel>-engine_config</edgelabel>
         </childnode>
       </node>
-      <node id="165">
+      <node id="265">
         <label>cudnn_frontend::executionOption</label>
         <link refid="d6/d1b/structcudnn__frontend_1_1executionOption"/>
-        <childnode refid="166" relation="usage">
+        <childnode refid="266" relation="usage">
           <edgelabel>+plan</edgelabel>
         </childnode>
-        <childnode refid="173" relation="usage">
+        <childnode refid="273" relation="usage">
           <edgelabel>+time_ms</edgelabel>
         </childnode>
       </node>
-      <node id="167">
+      <node id="267">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="168" relation="usage">
+        <childnode refid="268" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="170" relation="usage">
+        <childnode refid="270" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="171" relation="usage">
+        <childnode refid="271" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="168">
+      <node id="268">
         <label>std::string</label>
-        <childnode refid="169" relation="public-inheritance">
+        <childnode refid="269" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>

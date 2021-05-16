@@ -1,0 +1,1187 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="df/d1a/classnlohmann_1_1detail_1_1binary__writer" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::binary_writer</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+      <param>
+        <type>typename CharType</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="private-type">
+      <memberdef kind="typedef" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" prot="private" static="no">
+        <type>typename BasicJsonType::string_t</type>
+        <definition>using nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::string_t =  typename BasicJsonType::string_t</definition>
+        <argsstring></argsstring>
+        <name>string_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13264" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13264" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a3169b4f7abb773ea30348770629c53e8" prot="private" static="no">
+        <type>typename BasicJsonType::binary_t</type>
+        <definition>using nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::binary_t =  typename BasicJsonType::binary_t</definition>
+        <argsstring></argsstring>
+        <name>binary_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13265" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13265" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1abb4b7c621d0cb7633b5806c603f3c51a" prot="private" static="no">
+        <type>typename BasicJsonType::number_float_t</type>
+        <definition>using nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::number_float_t =  typename BasicJsonType::number_float_t</definition>
+        <argsstring></argsstring>
+        <name>number_float_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13266" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13266" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a048887c907afe39759b777e8c888414c" prot="private" static="no" mutable="no">
+        <type>const bool</type>
+        <definition>const bool nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::is_little_endian</definition>
+        <argsstring></argsstring>
+        <name>is_little_endian</name>
+        <initializer>= <ref refid="dc/df0/namespacenlohmann_1_1detail_1ad2860d9bcd96cd7b8258a5b94674508c" kindref="member">little_endianess</ref>()</initializer>
+        <briefdescription>
+<para>whether we can assume little endianess </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14822" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14822" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a6f15b782a7900f50ef37d123008e601b" prot="private" static="no" mutable="no">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a9b680ddfb58f27eb53a67229447fc556" kindref="member">output_adapter_t</ref>&lt; CharType &gt;</type>
+        <definition>output_adapter_t&lt;CharType&gt; nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::oa</definition>
+        <argsstring></argsstring>
+        <name>oa</name>
+        <initializer>= nullptr</initializer>
+        <briefdescription>
+<para>the output </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14825" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14825" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a373289af95a946c19bb4a58a5df71a78" prot="public" static="no" const="no" explicit="yes" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::binary_writer</definition>
+        <argsstring>(output_adapter_t&lt; CharType &gt; adapter)</argsstring>
+        <name>binary_writer</name>
+        <param>
+          <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a9b680ddfb58f27eb53a67229447fc556" kindref="member">output_adapter_t</ref>&lt; CharType &gt;</type>
+          <declname>adapter</declname>
+        </param>
+        <briefdescription>
+<para>create a binary writer </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">adapter</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>output adapter to write to </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13274" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13274" bodyend="13277"/>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a9ffc566db5219b473762462234b47db9" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson</definition>
+        <argsstring>(const BasicJsonType &amp;j)</argsstring>
+        <name>write_bson</name>
+        <param>
+          <type>const BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">j</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON value to serialize </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="pre"><para>j.type() == <ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666" kindref="member">value_t::object</ref> </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13283" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13283" bodyend="13298"/>
+        <references refid="da/d1c/classnlohmann_1_1detail_1_1type__error_1a838a5e301cf97289c2d106b9ace1470f" compoundref="d5/db8/json_8hpp" startline="2916" endline="2920">nlohmann::detail::type_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1aa0ab8d27fd88a33a2f801413ac4c7fbc" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_cbor</definition>
+        <argsstring>(const BasicJsonType &amp;j)</argsstring>
+        <name>write_cbor</name>
+        <param>
+          <type>const BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">j</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON value to serialize </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13303" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13303" bodyend="13603"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a9d7183f16acce70658f686ae7f1a4d20">nlohmann::detail::binary</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a84e2c64f38f78ba3ea5c905ab5a2da27">nlohmann::detail::boolean</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40aaf9de350d652f0c9055ddab514bd23ea">nlohmann::detail::cbor</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a37a6259cc0c1dae299a7866489dff0bd">nlohmann::detail::null</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ad9966ecb59667235a57b4b999a649eef">nlohmann::detail::number_float</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a5763da164f8659d94a56e29df64b4bcc">nlohmann::detail::number_integer</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985adce7cc8ec29055c4158828921f2f265e">nlohmann::detail::number_unsigned</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ae4e0852b64102ce4b07d99f08f828b7c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_msgpack</definition>
+        <argsstring>(const BasicJsonType &amp;j)</argsstring>
+        <name>write_msgpack</name>
+        <param>
+          <type>const BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">j</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON value to serialize </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13608" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13608" bodyend="13924"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a9d7183f16acce70658f686ae7f1a4d20">nlohmann::detail::binary</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a84e2c64f38f78ba3ea5c905ab5a2da27">nlohmann::detail::boolean</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40ac40d516627022a54003ac2b74a82688a">nlohmann::detail::msgpack</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a37a6259cc0c1dae299a7866489dff0bd">nlohmann::detail::null</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ad9966ecb59667235a57b4b999a649eef">nlohmann::detail::number_float</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a5763da164f8659d94a56e29df64b4bcc">nlohmann::detail::number_integer</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985adce7cc8ec29055c4158828921f2f265e">nlohmann::detail::number_unsigned</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a0f6c65053d859269f88eb4ebb0cd7060" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_ubjson</definition>
+        <argsstring>(const BasicJsonType &amp;j, const bool use_count, const bool use_type, const bool add_prefix=true)</argsstring>
+        <name>write_ubjson</name>
+        <param>
+          <type>const BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <param>
+          <type>const bool</type>
+          <declname>use_count</declname>
+        </param>
+        <param>
+          <type>const bool</type>
+          <declname>use_type</declname>
+        </param>
+        <param>
+          <type>const bool</type>
+          <declname>add_prefix</declname>
+          <defval>true</defval>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">j</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON value to serialize </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">use_count</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>whether to use &apos;#&apos; prefixes (optimized format) </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">use_type</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>whether to use &apos;$&apos; prefixes (optimized format) </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">add_prefix</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>whether prefixes need to be used for this value </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13932" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13932" bodyend="14128"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a9d7183f16acce70658f686ae7f1a4d20">nlohmann::detail::binary</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a84e2c64f38f78ba3ea5c905ab5a2da27">nlohmann::detail::boolean</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a37a6259cc0c1dae299a7866489dff0bd">nlohmann::detail::null</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ad9966ecb59667235a57b4b999a649eef">nlohmann::detail::number_float</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a5763da164f8659d94a56e29df64b4bcc">nlohmann::detail::number_integer</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985adce7cc8ec29055c4158828921f2f265e">nlohmann::detail::number_unsigned</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-static-func">
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a11637a023d22e57a7e7aff3f98b10f84" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::size_t</type>
+        <definition>static std::size_t nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::calc_bson_entry_header_size</definition>
+        <argsstring>(const string_t &amp;name, const BasicJsonType &amp;j)</argsstring>
+        <name>calc_bson_entry_header_size</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>name</declname>
+        </param>
+        <param>
+          <type>const BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>The size of a BSON document entry header, including the id marker and the entry name size (and its null-terminator). </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14139" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14139" bodyend="14148"/>
+        <references refid="d2/d67/classnlohmann_1_1detail_1_1out__of__range_1a238f1bda3b6c92b5970fbf9187ccd325" compoundref="d5/db8/json_8hpp" startline="2964" endline="2968">nlohmann::detail::out_of_range::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1aea44fd97a5cb9b4f175e66e3e4fdf158" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::size_t</type>
+        <definition>static std::size_t nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::calc_bson_string_size</definition>
+        <argsstring>(const string_t &amp;value)</argsstring>
+        <name>calc_bson_string_size</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>The size of the BSON-encoded string in <emphasis>value</emphasis> </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14185" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14185" bodyend="14188"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1aeab70c895931b96ea598306b37eca271" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::size_t</type>
+        <definition>static std::size_t nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::calc_bson_integer_size</definition>
+        <argsstring>(const std::int64_t value)</argsstring>
+        <name>calc_bson_integer_size</name>
+        <param>
+          <type>const std::int64_t</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>The size of the BSON-encoded integer <emphasis>value</emphasis> </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14215" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14215" bodyend="14220"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1aa1d6bb9f3af16f07ce2440c354b5787b" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr std::size_t</type>
+        <definition>static constexpr std::size_t nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::calc_bson_unsigned_size</definition>
+        <argsstring>(const std::uint64_t value) noexcept</argsstring>
+        <name>calc_bson_unsigned_size</name>
+        <param>
+          <type>const std::uint64_t</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>The size of the BSON-encoded unsigned integer in <emphasis>j</emphasis> </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14243" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14243" bodyend="14248"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804">nlohmann::detail::value</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1af08f9302a02516ff8cf358a99aaa1ddf" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::size_t</type>
+        <definition>static std::size_t nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::calc_bson_array_size</definition>
+        <argsstring>(const typename BasicJsonType::array_t &amp;value)</argsstring>
+        <name>calc_bson_array_size</name>
+        <param>
+          <type>const typename BasicJsonType::array_t &amp;</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>The size of the BSON-encoded array <emphasis>value</emphasis> </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14285" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14285" bodyend="14295"/>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a9dd6062fd249a695e0f93d558dba4685" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::size_t</type>
+        <definition>static std::size_t nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::calc_bson_binary_size</definition>
+        <argsstring>(const typename BasicJsonType::binary_t &amp;value)</argsstring>
+        <name>calc_bson_binary_size</name>
+        <param>
+          <type>const typename BasicJsonType::binary_t &amp;</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>The size of the BSON-encoded binary array <emphasis>value</emphasis> </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14300" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14300" bodyend="14303"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a1e4372c5984184eb5bcc09af1fcc2ee0" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::size_t</type>
+        <definition>static std::size_t nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::calc_bson_element_size</definition>
+        <argsstring>(const string_t &amp;name, const BasicJsonType &amp;j)</argsstring>
+        <name>calc_bson_element_size</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>name</declname>
+        </param>
+        <param>
+          <type>const BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <briefdescription>
+<para>Calculates the size necessary to serialize the JSON value <emphasis>j</emphasis> with its <emphasis>name</emphasis>. </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>The calculated size for the BSON document entry for <emphasis>j</emphasis> with the given <emphasis>name</emphasis>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14342" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14342" bodyend="14381"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a9d7183f16acce70658f686ae7f1a4d20">nlohmann::detail::binary</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a84e2c64f38f78ba3ea5c905ab5a2da27">nlohmann::detail::boolean</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a37a6259cc0c1dae299a7866489dff0bd">nlohmann::detail::null</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ad9966ecb59667235a57b4b999a649eef">nlohmann::detail::number_float</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a5763da164f8659d94a56e29df64b4bcc">nlohmann::detail::number_integer</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985adce7cc8ec29055c4158828921f2f265e">nlohmann::detail::number_unsigned</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1acc6f1cc1fd370ee84ebc8cf7b8712840" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::size_t</type>
+        <definition>static std::size_t nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::calc_bson_object_size</definition>
+        <argsstring>(const typename BasicJsonType::object_t &amp;value)</argsstring>
+        <name>calc_bson_object_size</name>
+        <param>
+          <type>const typename BasicJsonType::object_t &amp;</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+<para>Calculates the size of the BSON serialization of the given JSON-object <emphasis>j</emphasis>. </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">value</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON value to serialize </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="pre"><para>value.type() == <ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666" kindref="member">value_t::object</ref> </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14435" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14435" bodyend="14444"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a2b5cb010077da6241a18bb334736464c" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr CharType</type>
+        <definition>static constexpr CharType nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::get_cbor_float_prefix</definition>
+        <argsstring>(float)</argsstring>
+        <name>get_cbor_float_prefix</name>
+        <param>
+          <type>float</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14466" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14466" bodyend="14469"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1afe5ac43e05973ba09ee79227bb589b59" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr CharType</type>
+        <definition>static constexpr CharType nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::get_cbor_float_prefix</definition>
+        <argsstring>(double)</argsstring>
+        <name>get_cbor_float_prefix</name>
+        <param>
+          <type>double</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14471" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14471" bodyend="14474"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ad452d114696407b98abc69b6001c270e" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr CharType</type>
+        <definition>static constexpr CharType nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::get_msgpack_float_prefix</definition>
+        <argsstring>(float)</argsstring>
+        <name>get_msgpack_float_prefix</name>
+        <param>
+          <type>float</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14480" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14480" bodyend="14483"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a47234a6e7ac9206d43553985f4cacbf2" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr CharType</type>
+        <definition>static constexpr CharType nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::get_msgpack_float_prefix</definition>
+        <argsstring>(double)</argsstring>
+        <name>get_msgpack_float_prefix</name>
+        <param>
+          <type>double</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14485" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14485" bodyend="14488"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a6837b20574152f7f645d0f6cd9fafdeb" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr CharType</type>
+        <definition>static constexpr CharType nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::get_ubjson_float_prefix</definition>
+        <argsstring>(float)</argsstring>
+        <name>get_ubjson_float_prefix</name>
+        <param>
+          <type>float</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14717" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14717" bodyend="14720"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a19eb47a53dbbe28f319532bef25d84e6" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>constexpr CharType</type>
+        <definition>static constexpr CharType nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::get_ubjson_float_prefix</definition>
+        <argsstring>(double)</argsstring>
+        <name>get_ubjson_float_prefix</name>
+        <param>
+          <type>double</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14722" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14722" bodyend="14725"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-func">
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a1b5b7f5c03b1f8b1f59ea61db9634108" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_entry_header</definition>
+        <argsstring>(const string_t &amp;name, const std::uint8_t element_type)</argsstring>
+        <name>write_bson_entry_header</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>name</declname>
+        </param>
+        <param>
+          <type>const std::uint8_t</type>
+          <declname>element_type</declname>
+        </param>
+        <briefdescription>
+<para>Writes the given <emphasis>element_type</emphasis> and <emphasis>name</emphasis> to the output adapter. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14153" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14153" bodyend="14160"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ae099435e1df3096e0fc78333282f8f67" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_boolean</definition>
+        <argsstring>(const string_t &amp;name, const bool value)</argsstring>
+        <name>write_bson_boolean</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>name</declname>
+        </param>
+        <param>
+          <type>const bool</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+<para>Writes a BSON element with key <emphasis>name</emphasis> and boolean value <emphasis>value</emphasis>. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14165" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14165" bodyend="14170"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a263ec18815467bb9919021ef126919ca" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_double</definition>
+        <argsstring>(const string_t &amp;name, const double value)</argsstring>
+        <name>write_bson_double</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>name</declname>
+        </param>
+        <param>
+          <type>const double</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+<para>Writes a BSON element with key <emphasis>name</emphasis> and double value <emphasis>value</emphasis>. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14175" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14175" bodyend="14180"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804">nlohmann::detail::value</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a5e6574416915208fc035b57338ae3252" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_string</definition>
+        <argsstring>(const string_t &amp;name, const string_t &amp;value)</argsstring>
+        <name>write_bson_string</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>name</declname>
+        </param>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+<para>Writes a BSON element with key <emphasis>name</emphasis> and string value <emphasis>value</emphasis>. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14193" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14193" bodyend="14202"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a9927c1110b18661e0224a76156e5a7a9" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_null</definition>
+        <argsstring>(const string_t &amp;name)</argsstring>
+        <name>write_bson_null</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>name</declname>
+        </param>
+        <briefdescription>
+<para>Writes a BSON element with key <emphasis>name</emphasis> and null value. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14207" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14207" bodyend="14210"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a553ad4dbdf27238eef90867e4bf2f3e5" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_integer</definition>
+        <argsstring>(const string_t &amp;name, const std::int64_t value)</argsstring>
+        <name>write_bson_integer</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>name</declname>
+        </param>
+        <param>
+          <type>const std::int64_t</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+<para>Writes a BSON element with key <emphasis>name</emphasis> and integer <emphasis>value</emphasis>. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14225" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14225" bodyend="14238"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804">nlohmann::detail::value</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ac274e3d7a803e7223bb1a4fcb7cd594c" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_unsigned</definition>
+        <argsstring>(const string_t &amp;name, const BasicJsonType &amp;j)</argsstring>
+        <name>write_bson_unsigned</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>name</declname>
+        </param>
+        <param>
+          <type>const BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <briefdescription>
+<para>Writes a BSON element with key <emphasis>name</emphasis> and unsigned <emphasis>value</emphasis>. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14253" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14253" bodyend="14270"/>
+        <references refid="d2/d67/classnlohmann_1_1detail_1_1out__of__range_1a238f1bda3b6c92b5970fbf9187ccd325" compoundref="d5/db8/json_8hpp" startline="2964" endline="2968">nlohmann::detail::out_of_range::create</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a6231302930265eccb3f56c378f7b0661" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_object_entry</definition>
+        <argsstring>(const string_t &amp;name, const typename BasicJsonType::object_t &amp;value)</argsstring>
+        <name>write_bson_object_entry</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>name</declname>
+        </param>
+        <param>
+          <type>const typename BasicJsonType::object_t &amp;</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+<para>Writes a BSON element with key <emphasis>name</emphasis> and object <emphasis>value</emphasis>. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14275" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14275" bodyend="14280"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a025212bd170253638b9f05b3b6aa5bf9" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_array</definition>
+        <argsstring>(const string_t &amp;name, const typename BasicJsonType::array_t &amp;value)</argsstring>
+        <name>write_bson_array</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>name</declname>
+        </param>
+        <param>
+          <type>const typename BasicJsonType::array_t &amp;</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+<para>Writes a BSON element with key <emphasis>name</emphasis> and array <emphasis>value</emphasis>. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14308" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14308" bodyend="14322"/>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a97d34d9a70ddc06ae782c55454df42bc" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_binary</definition>
+        <argsstring>(const string_t &amp;name, const binary_t &amp;value)</argsstring>
+        <name>write_bson_binary</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>name</declname>
+        </param>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a3169b4f7abb773ea30348770629c53e8" kindref="member">binary_t</ref> &amp;</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+<para>Writes a BSON element with key <emphasis>name</emphasis> and binary value <emphasis>value</emphasis>. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14327" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14327" bodyend="14336"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a7ff58bf1a80018148bed860667ffca07" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_element</definition>
+        <argsstring>(const string_t &amp;name, const BasicJsonType &amp;j)</argsstring>
+        <name>write_bson_element</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" kindref="member">string_t</ref> &amp;</type>
+          <declname>name</declname>
+        </param>
+        <param>
+          <type>const BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <briefdescription>
+<para>Serializes the JSON value <emphasis>j</emphasis> to BSON and associates it with the key <emphasis>name</emphasis>. </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername>name</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>The name to associate with the JSON entity <emphasis>j</emphasis> within the current BSON document </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14389" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14389" bodyend="14427"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a9d7183f16acce70658f686ae7f1a4d20">nlohmann::detail::binary</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a84e2c64f38f78ba3ea5c905ab5a2da27">nlohmann::detail::boolean</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a37a6259cc0c1dae299a7866489dff0bd">nlohmann::detail::null</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ad9966ecb59667235a57b4b999a649eef">nlohmann::detail::number_float</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a5763da164f8659d94a56e29df64b4bcc">nlohmann::detail::number_integer</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985adce7cc8ec29055c4158828921f2f265e">nlohmann::detail::number_unsigned</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29b3e0f83a8e5f2307804023109ba2c9" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_object</definition>
+        <argsstring>(const typename BasicJsonType::object_t &amp;value)</argsstring>
+        <name>write_bson_object</name>
+        <param>
+          <type>const typename BasicJsonType::object_t &amp;</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">value</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>JSON value to serialize </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="pre"><para>value.type() == <ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666" kindref="member">value_t::object</ref> </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14450" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14450" bodyend="14460"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a0ea6745f944c0c61672146886b4ee90f" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename NumberType</type>
+          </param>
+          <param>
+            <type>typename std::enable_if&lt; std::is_floating_point&lt; NumberType &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref>, int &gt;::<ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref></type>
+            <defval>0</defval>
+          </param>
+        </templateparamlist>
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_number_with_ubjson_prefix</definition>
+        <argsstring>(const NumberType n, const bool add_prefix)</argsstring>
+        <name>write_number_with_ubjson_prefix</name>
+        <param>
+          <type>const NumberType</type>
+          <declname>n</declname>
+        </param>
+        <param>
+          <type>const bool</type>
+          <declname>add_prefix</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14497" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14497" bodyend="14505"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a0ea6745f944c0c61672146886b4ee90f" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename NumberType</type>
+          </param>
+          <param>
+            <type>typename std::enable_if&lt; std::is_unsigned&lt; NumberType &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref>, int &gt;::<ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref></type>
+            <defval>0</defval>
+          </param>
+        </templateparamlist>
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_number_with_ubjson_prefix</definition>
+        <argsstring>(const NumberType n, const bool add_prefix)</argsstring>
+        <name>write_number_with_ubjson_prefix</name>
+        <param>
+          <type>const NumberType</type>
+          <declname>n</declname>
+        </param>
+        <param>
+          <type>const bool</type>
+          <declname>add_prefix</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14510" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14510" bodyend="14567"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a0ea6745f944c0c61672146886b4ee90f" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename NumberType</type>
+          </param>
+          <param>
+            <type>typename std::enable_if&lt; std::is_signed&lt; NumberType &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref> &amp;&amp;!std::is_floating_point&lt; NumberType &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref>, int &gt;::<ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref></type>
+            <defval>0</defval>
+          </param>
+        </templateparamlist>
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_number_with_ubjson_prefix</definition>
+        <argsstring>(const NumberType n, const bool add_prefix)</argsstring>
+        <name>write_number_with_ubjson_prefix</name>
+        <param>
+          <type>const NumberType</type>
+          <declname>n</declname>
+        </param>
+        <param>
+          <type>const bool</type>
+          <declname>add_prefix</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14573" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14573" bodyend="14632"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a4c129249a5aee8e4ec8add6c6184e4f7" prot="private" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>CharType</type>
+        <definition>CharType nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::ubjson_prefix</definition>
+        <argsstring>(const BasicJsonType &amp;j) const noexcept</argsstring>
+        <name>ubjson_prefix</name>
+        <param>
+          <type>const BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <briefdescription>
+<para>determine the type prefix of container values </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14637" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14637" bodyend="14715"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a9d7183f16acce70658f686ae7f1a4d20">nlohmann::detail::binary</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a84e2c64f38f78ba3ea5c905ab5a2da27">nlohmann::detail::boolean</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a37a6259cc0c1dae299a7866489dff0bd">nlohmann::detail::null</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ad9966ecb59667235a57b4b999a649eef">nlohmann::detail::number_float</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a5763da164f8659d94a56e29df64b4bcc">nlohmann::detail::number_integer</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985adce7cc8ec29055c4158828921f2f265e">nlohmann::detail::number_unsigned</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a6e11b7227fcecc25a548ed45507b7d1c" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename NumberType</type>
+          </param>
+          <param>
+            <type>bool</type>
+            <declname>OutputIsLittleEndian</declname>
+            <defname>OutputIsLittleEndian</defname>
+            <defval>false</defval>
+          </param>
+        </templateparamlist>
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_number</definition>
+        <argsstring>(const NumberType n)</argsstring>
+        <name>write_number</name>
+        <param>
+          <type>const NumberType</type>
+          <declname>n</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14743" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14743" bodyend="14757"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ae69dc3c5b2e8c1c8e461779cddb87436" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_compact_float</definition>
+        <argsstring>(const number_float_t n, detail::input_format_t format)</argsstring>
+        <name>write_compact_float</name>
+        <param>
+          <type>const <ref refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1abb4b7c621d0cb7633b5806c603f3c51a" kindref="member">number_float_t</ref></type>
+          <declname>n</declname>
+        </param>
+        <param>
+          <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40" kindref="member">detail::input_format_t</ref></type>
+          <declname>format</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14759" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14759" bodyend="14777"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40aaf9de350d652f0c9055ddab514bd23ea">nlohmann::detail::cbor</references>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-static-func">
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ab77aa48692bd4e64e4f051ce6aeb6d2d" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename C</type>
+            <defval>CharType</defval>
+          </param>
+          <param>
+            <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a02bcbc878bee413f25b985ada771aa9c" kindref="member">enable_if_t</ref>&lt; std::is_signed&lt; C &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref> &amp;&amp;std::is_signed&lt; char &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref> &gt; *</type>
+            <defval>nullptr</defval>
+          </param>
+        </templateparamlist>
+        <type>constexpr CharType</type>
+        <definition>static constexpr CharType nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::to_char_type</definition>
+        <argsstring>(std::uint8_t x) noexcept</argsstring>
+        <name>to_char_type</name>
+        <param>
+          <type>std::uint8_t</type>
+          <declname>x</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14786" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14786" bodyend="14789"/>
+        <referencedby refid="d4/d0a/classnlohmann_1_1detail_1_1serializer_1ab14b8ec1f8102aa4c7e3c349f317654e" compoundref="d5/db8/json_8hpp" startline="16333" endline="16522">nlohmann::detail::serializer&lt; BasicJsonType &gt;::for</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a5e46f0dd3550901b15cf85265808d1ec" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename C</type>
+            <defval>CharType</defval>
+          </param>
+          <param>
+            <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a02bcbc878bee413f25b985ada771aa9c" kindref="member">enable_if_t</ref>&lt; std::is_signed&lt; C &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref> &amp;&amp;std::is_unsigned&lt; char &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref> &gt; *</type>
+            <defval>nullptr</defval>
+          </param>
+        </templateparamlist>
+        <type>CharType</type>
+        <definition>static CharType nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::to_char_type</definition>
+        <argsstring>(std::uint8_t x) noexcept</argsstring>
+        <name>to_char_type</name>
+        <param>
+          <type>std::uint8_t</type>
+          <declname>x</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14793" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14793" bodyend="14800"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ab77aa48692bd4e64e4f051ce6aeb6d2d" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename C</type>
+            <defval>CharType</defval>
+          </param>
+          <param>
+            <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a02bcbc878bee413f25b985ada771aa9c" kindref="member">enable_if_t</ref>&lt; std::is_unsigned&lt; C &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref> &gt; *</type>
+            <defval>nullptr</defval>
+          </param>
+        </templateparamlist>
+        <type>constexpr CharType</type>
+        <definition>static constexpr CharType nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::to_char_type</definition>
+        <argsstring>(std::uint8_t x) noexcept</argsstring>
+        <name>to_char_type</name>
+        <param>
+          <type>std::uint8_t</type>
+          <declname>x</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14804" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14804" bodyend="14807"/>
+      </memberdef>
+      <memberdef kind="function" id="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a2c2b2132ce56b3b45593374b622baa67" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename InputCharType</type>
+          </param>
+          <param>
+            <type>typename C</type>
+            <defval>CharType</defval>
+          </param>
+          <param>
+            <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a02bcbc878bee413f25b985ada771aa9c" kindref="member">enable_if_t</ref>&lt; std::is_signed&lt; C &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref> &amp;&amp;std::is_signed&lt; char &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref> &amp;&amp;std::is_same&lt; char, typename std::remove_cv&lt; InputCharType &gt;::<ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref> &gt;::<ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804" kindref="member">value</ref> &gt; *</type>
+            <defval>nullptr</defval>
+          </param>
+        </templateparamlist>
+        <type>constexpr CharType</type>
+        <definition>static constexpr CharType nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::to_char_type</definition>
+        <argsstring>(InputCharType x) noexcept</argsstring>
+        <name>to_char_type</name>
+        <param>
+          <type>InputCharType</type>
+          <declname>x</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14815" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14815" bodyend="14818"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>serialization to CBOR and MessagePack values </para>    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="47">
+        <label>output_adapter_t&lt; CharType &gt;</label>
+      </node>
+      <node id="46">
+        <label>nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;</label>
+        <link refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer"/>
+        <childnode refid="47" relation="usage">
+          <edgelabel>-oa</edgelabel>
+        </childnode>
+        <childnode refid="48" relation="usage">
+          <edgelabel>-is_little_endian</edgelabel>
+        </childnode>
+      </node>
+      <node id="48">
+        <label>bool</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="13263" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="13262" bodyend="14826"/>
+    <listofallmembers>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a3169b4f7abb773ea30348770629c53e8" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>binary_t</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a373289af95a946c19bb4a58a5df71a78" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>binary_writer</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1af08f9302a02516ff8cf358a99aaa1ddf" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>calc_bson_array_size</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a9dd6062fd249a695e0f93d558dba4685" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>calc_bson_binary_size</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a1e4372c5984184eb5bcc09af1fcc2ee0" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>calc_bson_element_size</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a11637a023d22e57a7e7aff3f98b10f84" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>calc_bson_entry_header_size</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1aeab70c895931b96ea598306b37eca271" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>calc_bson_integer_size</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1acc6f1cc1fd370ee84ebc8cf7b8712840" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>calc_bson_object_size</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1aea44fd97a5cb9b4f175e66e3e4fdf158" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>calc_bson_string_size</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1aa1d6bb9f3af16f07ce2440c354b5787b" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>calc_bson_unsigned_size</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a2b5cb010077da6241a18bb334736464c" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>get_cbor_float_prefix</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1afe5ac43e05973ba09ee79227bb589b59" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>get_cbor_float_prefix</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ad452d114696407b98abc69b6001c270e" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>get_msgpack_float_prefix</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a47234a6e7ac9206d43553985f4cacbf2" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>get_msgpack_float_prefix</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a6837b20574152f7f645d0f6cd9fafdeb" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>get_ubjson_float_prefix</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a19eb47a53dbbe28f319532bef25d84e6" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>get_ubjson_float_prefix</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a048887c907afe39759b777e8c888414c" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>is_little_endian</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1abb4b7c621d0cb7633b5806c603f3c51a" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>number_float_t</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a6f15b782a7900f50ef37d123008e601b" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>oa</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29f2ae7a5c4a8c1dae47b3b2310de8a8" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>string_t</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ab77aa48692bd4e64e4f051ce6aeb6d2d" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>to_char_type</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a5e46f0dd3550901b15cf85265808d1ec" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>to_char_type</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ab77aa48692bd4e64e4f051ce6aeb6d2d" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>to_char_type</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a2c2b2132ce56b3b45593374b622baa67" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>to_char_type</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a4c129249a5aee8e4ec8add6c6184e4f7" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>ubjson_prefix</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a9ffc566db5219b473762462234b47db9" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_bson</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a025212bd170253638b9f05b3b6aa5bf9" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_bson_array</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a97d34d9a70ddc06ae782c55454df42bc" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_bson_binary</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ae099435e1df3096e0fc78333282f8f67" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_bson_boolean</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a263ec18815467bb9919021ef126919ca" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_bson_double</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a7ff58bf1a80018148bed860667ffca07" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_bson_element</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a1b5b7f5c03b1f8b1f59ea61db9634108" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_bson_entry_header</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a553ad4dbdf27238eef90867e4bf2f3e5" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_bson_integer</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a9927c1110b18661e0224a76156e5a7a9" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_bson_null</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a29b3e0f83a8e5f2307804023109ba2c9" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_bson_object</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a6231302930265eccb3f56c378f7b0661" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_bson_object_entry</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a5e6574416915208fc035b57338ae3252" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_bson_string</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ac274e3d7a803e7223bb1a4fcb7cd594c" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_bson_unsigned</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1aa0ab8d27fd88a33a2f801413ac4c7fbc" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_cbor</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ae69dc3c5b2e8c1c8e461779cddb87436" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_compact_float</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ae4e0852b64102ce4b07d99f08f828b7c" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_msgpack</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a6e11b7227fcecc25a548ed45507b7d1c" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_number</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a0ea6745f944c0c61672146886b4ee90f" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_number_with_ubjson_prefix</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a0ea6745f944c0c61672146886b4ee90f" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_number_with_ubjson_prefix</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a0ea6745f944c0c61672146886b4ee90f" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_number_with_ubjson_prefix</name></member>
+      <member refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a0f6c65053d859269f88eb4ebb0cd7060" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_writer</scope><name>write_ubjson</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

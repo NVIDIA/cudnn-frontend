@@ -7,6 +7,7 @@ var searchData=
   ['cudnn_5ffrontend_5fengineconfig_2eh',['cudnn_frontend_EngineConfig.h',['../d6/d67/cudnn__frontend__EngineConfig_8h.html',1,'']]],
   ['cudnn_5ffrontend_5fengineconfiggenerator_2eh',['cudnn_frontend_EngineConfigGenerator.h',['../de/d1e/cudnn__frontend__EngineConfigGenerator_8h.html',1,'']]],
   ['cudnn_5ffrontend_5fenginefallbacklist_2eh',['cudnn_frontend_EngineFallbackList.h',['../df/d3e/cudnn__frontend__EngineFallbackList_8h.html',1,'']]],
+  ['cudnn_5ffrontend_5ferrata_2eh',['cudnn_frontend_Errata.h',['../db/d7e/cudnn__frontend__Errata_8h.html',1,'']]],
   ['cudnn_5ffrontend_5fexecutionplan_2eh',['cudnn_frontend_ExecutionPlan.h',['../d6/d51/cudnn__frontend__ExecutionPlan_8h.html',1,'']]],
   ['cudnn_5ffrontend_5ffilters_2eh',['cudnn_frontend_Filters.h',['../d5/d36/cudnn__frontend__Filters_8h.html',1,'']]],
   ['cudnn_5ffrontend_5ffind_5fplan_2eh',['cudnn_frontend_find_plan.h',['../d3/d6b/cudnn__frontend__find__plan_8h.html',1,'']]],
@@ -16,6 +17,7 @@ var searchData=
   ['cudnn_5ffrontend_5foperation_2eh',['cudnn_frontend_Operation.h',['../da/d5a/cudnn__frontend__Operation_8h.html',1,'']]],
   ['cudnn_5ffrontend_5foperationgraph_2eh',['cudnn_frontend_OperationGraph.h',['../db/d7d/cudnn__frontend__OperationGraph_8h.html',1,'']]],
   ['cudnn_5ffrontend_5fpointwisedesc_2eh',['cudnn_frontend_PointWiseDesc.h',['../da/d5f/cudnn__frontend__PointWiseDesc_8h.html',1,'']]],
+  ['cudnn_5ffrontend_5freductiondesc_2eh',['cudnn_frontend_ReductionDesc.h',['../db/da7/cudnn__frontend__ReductionDesc_8h.html',1,'']]],
   ['cudnn_5ffrontend_5ftensor_2eh',['cudnn_frontend_Tensor.h',['../d3/d98/cudnn__frontend__Tensor_8h.html',1,'']]],
   ['cudnn_5ffrontend_5futils_2eh',['cudnn_frontend_utils.h',['../df/d17/cudnn__frontend__utils_8h.html',1,'']]],
   ['cudnn_5ffrontend_5fvariantpack_2eh',['cudnn_frontend_VariantPack.h',['../df/dc0/cudnn__frontend__VariantPack_8h.html',1,'']]]

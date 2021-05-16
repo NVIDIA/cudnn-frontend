@@ -1,0 +1,16 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="df/d92/namespacenlohmann_1_1detail_1_1utility__internal" kind="namespace" language="C++">
+    <compoundname>nlohmann::detail::utility_internal</compoundname>
+    <innerclass refid="d7/d3c/structnlohmann_1_1detail_1_1utility__internal_1_1Extend" prot="public">nlohmann::detail::utility_internal::Extend</innerclass>
+    <innerclass refid="de/dbf/structnlohmann_1_1detail_1_1utility__internal_1_1Extend_3_01integer__sequence_3_01T_00_01Ints_8_453fbce128d545e87778192b2e607842" prot="public">nlohmann::detail::utility_internal::Extend&lt; integer_sequence&lt; T, Ints... &gt;, SeqSize, 0 &gt;</innerclass>
+    <innerclass refid="d2/d5f/structnlohmann_1_1detail_1_1utility__internal_1_1Extend_3_01integer__sequence_3_01T_00_01Ints_8_011635d85b816e1c1a7e948fa832c519" prot="public">nlohmann::detail::utility_internal::Extend&lt; integer_sequence&lt; T, Ints... &gt;, SeqSize, 1 &gt;</innerclass>
+    <innerclass refid="d3/d8d/structnlohmann_1_1detail_1_1utility__internal_1_1Gen" prot="public">nlohmann::detail::utility_internal::Gen</innerclass>
+    <innerclass refid="d9/d5f/structnlohmann_1_1detail_1_1utility__internal_1_1Gen_3_01T_00_010_01_4" prot="public">nlohmann::detail::utility_internal::Gen&lt; T, 0 &gt;</innerclass>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3093" column="1"/>
+  </compounddef>
+</doxygen>

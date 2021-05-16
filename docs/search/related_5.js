@@ -1,4 +1,4 @@
 var searchData=
 [
-  ['tensorbuilder_5fv8',['TensorBuilder_v8',['../d6/da7/classcudnn__frontend_1_1Tensor__v8.html#a14f9c4498f4be5b3c2b0a94c708891fb',1,'cudnn_frontend::Tensor_v8']]]
+  ['matmuldescbuilder_5fv8',['MatMulDescBuilder_v8',['../d6/db7/classcudnn__frontend_1_1MatMulDesc__v8.html#aa99cc0548322d7298b9ca664a976281f',1,'cudnn_frontend::MatMulDesc_v8']]]
 ];

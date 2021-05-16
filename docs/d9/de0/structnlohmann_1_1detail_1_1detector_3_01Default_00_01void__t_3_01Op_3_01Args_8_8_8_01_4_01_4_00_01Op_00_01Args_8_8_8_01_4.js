@@ -1,0 +1,5 @@
+var structnlohmann_1_1detail_1_1detector_3_01Default_00_01void__t_3_01Op_3_01Args_8_8_8_01_4_01_4_00_01Op_00_01Args_8_8_8_01_4 =
+[
+    [ "type", "d9/de0/structnlohmann_1_1detail_1_1detector_3_01Default_00_01void__t_3_01Op_3_01Args_8_8_8_01_4_01_4_00_01Op_00_01Args_8_8_8_01_4.html#a5afd6a40e94dde21d120ac646468c495", null ],
+    [ "value_t", "d9/de0/structnlohmann_1_1detail_1_1detector_3_01Default_00_01void__t_3_01Op_3_01Args_8_8_8_01_4_01_4_00_01Op_00_01Args_8_8_8_01_4.html#ab748f9f00bb31bee4978a033589f8c85", null ]
+];

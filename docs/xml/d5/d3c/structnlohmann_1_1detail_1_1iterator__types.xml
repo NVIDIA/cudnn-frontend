@@ -1,0 +1,48 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d5/d3c/structnlohmann_1_1detail_1_1iterator__types" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::iterator_types</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename It</type>
+      </param>
+      <param>
+        <type>typename</type>
+        <defval><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></defval>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="697">
+        <label>nlohmann::detail::iterator_types&lt; T &gt;</label>
+        <link refid="d5/d3c/structnlohmann_1_1detail_1_1iterator__types"/>
+        <childnode refid="696" relation="template-instance">
+          <edgelabel>&lt; T &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="698">
+        <label>nlohmann::detail::iterator_traits&lt; T, enable_if_t&lt; !std::is_pointer&lt; T &gt;::value &gt; &gt;</label>
+        <link refid="d5/da3/structnlohmann_1_1detail_1_1iterator__traits_3_01T_00_01enable__if__t_3_01_9std_1_1is__pointer_3_01T_01_4_1_1value_01_4_01_4"/>
+        <childnode refid="697" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="696">
+        <label>nlohmann::detail::iterator_types&lt; It, typename &gt;</label>
+        <link refid="d5/d3c/structnlohmann_1_1detail_1_1iterator__types"/>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="699">
+        <label>nlohmann::detail::iterator_types&lt; It, typename &gt;</label>
+        <link refid="d5/d3c/structnlohmann_1_1detail_1_1iterator__types"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3223" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3223" bodyend="3223"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

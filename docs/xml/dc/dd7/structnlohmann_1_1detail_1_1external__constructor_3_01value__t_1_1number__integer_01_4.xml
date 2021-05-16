@@ -1,0 +1,52 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="dc/dd7/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1number__integer_01_4" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::external_constructor&lt; value_t::number_integer &gt;</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+    </templateparamlist>
+      <sectiondef kind="public-static-func">
+      <memberdef kind="function" id="dc/dd7/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1number__integer_01_4_1a7c3949672ddb45095cc2527635feef0b" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename BasicJsonType</type>
+          </param>
+        </templateparamlist>
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>static void nlohmann::detail::external_constructor&lt; value_t::number_integer &gt;::construct</definition>
+        <argsstring>(BasicJsonType &amp;j, typename BasicJsonType::number_integer_t val) noexcept</argsstring>
+        <name>construct</name>
+        <param>
+          <type>BasicJsonType &amp;</type>
+          <declname>j</declname>
+        </param>
+        <param>
+          <type>typename BasicJsonType::number_integer_t</type>
+          <declname>val</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4573" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4573" bodyend="4578"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a5763da164f8659d94a56e29df64b4bcc">nlohmann::detail::number_integer</references>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="309">
+        <label>nlohmann::detail::external_constructor&lt; value_t::number_integer &gt;</label>
+        <link refid="dc/dd7/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1number__integer_01_4"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="4571" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="4570" bodyend="4579"/>
+    <listofallmembers>
+      <member refid="dc/dd7/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1number__integer_01_4_1a7c3949672ddb45095cc2527635feef0b" prot="public" virt="non-virtual"><scope>nlohmann::detail::external_constructor&lt; value_t::number_integer &gt;</scope><name>construct</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

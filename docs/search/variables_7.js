@@ -1,5 +1,4 @@
 var searchData=
 [
-  ['knobs',['knobs',['../dc/d3c/classcudnn__frontend_1_1Engine__v8.html#add2d5998a38944fd0dba03fce96fe7aa',1,'cudnn_frontend::Engine_v8']]],
-  ['knobtype',['knobType',['../dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob.html#adc13c98616305cd23d86dc5dc1dfe86e',1,'cudnn_frontend::Engine_v8::Knob']]]
+  ['handle',['handle',['../d7/d0d/group__ExecutionPlanQuery.html#ga4c36108c6511420d81fcda5292761726',1,'cudnn_frontend::ExecutionPlan_v8::handle()'],['../de/dd9/classcudnn__frontend_1_1OperationGraph__v8.html#abd35d4e84bb6ee70e8df38de093fc376',1,'cudnn_frontend::OperationGraph_v8::handle()']]]
 ];

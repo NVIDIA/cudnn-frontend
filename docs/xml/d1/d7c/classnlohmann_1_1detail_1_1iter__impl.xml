@@ -1,0 +1,1029 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::iter_impl</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename</type>
+        <declname>BasicJsonType</declname>
+        <defname>BasicJsonType</defname>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="private-type">
+      <memberdef kind="typedef" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ac7c5a1f964aa1c02f7b046029a5c8904" prot="private" static="no">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref>&lt; typename std::conditional&lt; std::is_const&lt; <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abf18f18793f84b0222aebb5a2a87da7a" kindref="member">BasicJsonType</ref> &gt;::<ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ab447c50354c6611fa2ae0100ac17845c" kindref="member">value</ref>, typename std::remove_const&lt; <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abf18f18793f84b0222aebb5a2a87da7a" kindref="member">BasicJsonType</ref> &gt;::type, const <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abf18f18793f84b0222aebb5a2a87da7a" kindref="member">BasicJsonType</ref> &gt;::type &gt;</type>
+        <definition>using nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::other_iter_impl =  iter_impl&lt;typename std::conditional&lt;std::is_const&lt;BasicJsonType&gt;::value, typename std::remove_const&lt;BasicJsonType&gt;::type, const BasicJsonType&gt;::type&gt;</definition>
+        <argsstring></argsstring>
+        <name>other_iter_impl</name>
+        <briefdescription>
+<para>the iterator with BasicJsonType of different const-ness </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11351" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11351" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ab9a9598052e83fa14a2288e56d5dda7c" prot="private" static="no">
+        <type>typename BasicJsonType::object_t</type>
+        <definition>using nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::object_t =  typename BasicJsonType::object_t</definition>
+        <argsstring></argsstring>
+        <name>object_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11358" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11358" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1aef02cf75b1cb199286fd2f666c60e38e" prot="private" static="no">
+        <type>typename BasicJsonType::array_t</type>
+        <definition>using nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::array_t =  typename BasicJsonType::array_t</definition>
+        <argsstring></argsstring>
+        <name>array_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11359" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11359" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ad9e091f5c70b34b5b1abc1ab15fd9106" prot="public" static="no">
+        <type>std::bidirectional_iterator_tag</type>
+        <definition>using nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::iterator_category =  std::bidirectional_iterator_tag</definition>
+        <argsstring></argsstring>
+        <name>iterator_category</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para>The std::iterator class template (used as a base class to provide typedefs) is deprecated in C++17. The C++ Standard has never required user-defined iterators to derive from std::iterator. A user-defined iterator should provide publicly accessible typedefs named iterator_category, value_type, difference_type, pointer, and reference. Note that value_type is required to be non-const, even for constant iterators. </para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11371" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11371" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ab35586a44f2222272c5346baa3013f67" prot="public" static="no">
+        <type>typename BasicJsonType::value_type</type>
+        <definition>using nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::value_type =  typename BasicJsonType::value_type</definition>
+        <argsstring></argsstring>
+        <name>value_type</name>
+        <briefdescription>
+<para>the type of the values when the iterator is dereferenced </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11374" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11374" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a2f7ea9f7022850809c60fc3263775840" prot="public" static="no">
+        <type>typename BasicJsonType::difference_type</type>
+        <definition>using nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::difference_type =  typename BasicJsonType::difference_type</definition>
+        <argsstring></argsstring>
+        <name>difference_type</name>
+        <briefdescription>
+<para>a type to represent differences between iterators </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11376" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11376" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a69e52f890ce8c556fd68ce109e24b360" prot="public" static="no">
+        <type>typename std::conditional&lt; std::is_const&lt; <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abf18f18793f84b0222aebb5a2a87da7a" kindref="member">BasicJsonType</ref> &gt;::<ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ab447c50354c6611fa2ae0100ac17845c" kindref="member">value</ref>, typename BasicJsonType::const_pointer, typename BasicJsonType::pointer &gt;::type</type>
+        <definition>using nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::pointer =  typename std::conditional&lt;std::is_const&lt;BasicJsonType&gt;::value, typename BasicJsonType::const_pointer, typename BasicJsonType::pointer&gt;::type</definition>
+        <argsstring></argsstring>
+        <name>pointer</name>
+        <briefdescription>
+<para>defines a pointer to the type iterated over (value_type) </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11378" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11380" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a5be8001be099c6b82310f4d387b953ce" prot="public" static="no">
+        <type>typename std::conditional&lt; std::is_const&lt; <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abf18f18793f84b0222aebb5a2a87da7a" kindref="member">BasicJsonType</ref> &gt;::<ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ab447c50354c6611fa2ae0100ac17845c" kindref="member">value</ref>, typename BasicJsonType::const_reference, typename BasicJsonType::reference &gt;::type</type>
+        <definition>using nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::reference =  typename std::conditional&lt;std::is_const&lt;BasicJsonType&gt;::value, typename BasicJsonType::const_reference, typename BasicJsonType::reference&gt;::type</definition>
+        <argsstring></argsstring>
+        <name>reference</name>
+        <briefdescription>
+<para>defines a reference to the type iterated over (value_type) </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11382" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11385" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1aba0841e618c77cc65ccfd52164c346b9" prot="private" static="no" mutable="no">
+        <type>friend</type>
+        <definition>friend nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::other_iter_impl</definition>
+        <argsstring></argsstring>
+        <name>other_iter_impl</name>
+        <briefdescription>
+<para>allow <ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">basic_json</ref> to access private members </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11353" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11353" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abf18f18793f84b0222aebb5a2a87da7a" prot="private" static="no" mutable="no">
+        <type>friend</type>
+        <definition>friend nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::BasicJsonType</definition>
+        <argsstring></argsstring>
+        <name>BasicJsonType</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11354" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11354" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a28328d17a18d9754c89c5c8159677a6f" prot="private" static="no" mutable="no">
+        <type>friend</type>
+        <definition>friend nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::iteration_proxy&lt; iter_impl &gt;</definition>
+        <argsstring></argsstring>
+        <name>iteration_proxy&lt; iter_impl &gt;</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11355" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11355" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ac501dc2374b4d17a884fc9a656e80d5a" prot="private" static="no" mutable="no">
+        <type>friend</type>
+        <definition>friend nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::iteration_proxy_value&lt; iter_impl &gt;</definition>
+        <argsstring></argsstring>
+        <name>iteration_proxy_value&lt; iter_impl &gt;</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11356" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11356" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-attrib">
+      <memberdef kind="variable" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1aa4bddeaa9a97b2a9b715918a7e8dcc3a" prot="public" static="no" mutable="no">
+        <type><ref refid="d5/db8/json_8hpp_1a2cf645f34610e7f7d6e09ab88a2ab917" kindref="member">JSON_PRIVATE_UNLESS_TESTED</ref></type>
+        <definition>JSON_PRIVATE_UNLESS_TESTED nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::__pad0__</definition>
+        <argsstring></argsstring>
+        <name>__pad0__</name>
+        <bitfield> void set_begin() noexcept { JSON_ASSERT(m_object != nullptr)</bitfield>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11482" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11489" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a4a60e9d074cc53929b73eaa7963f1fa9" prot="public" static="no" mutable="no">
+        <type><ref refid="d5/db8/json_8hpp_1a2cf645f34610e7f7d6e09ab88a2ab917" kindref="member">JSON_PRIVATE_UNLESS_TESTED</ref></type>
+        <definition>JSON_PRIVATE_UNLESS_TESTED nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::__pad1__</definition>
+        <argsstring></argsstring>
+        <name>__pad1__</name>
+        <bitfield> pointer m_object = nullptr</bitfield>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11948" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11950" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a8a86a7c0d4af0cc4ab345b6f0e13cdfa" prot="public" static="no" mutable="no">
+        <type><ref refid="d7/d10/structnlohmann_1_1detail_1_1internal__iterator" kindref="compound">internal_iterator</ref>&lt; typename std::remove_const&lt; <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abf18f18793f84b0222aebb5a2a87da7a" kindref="member">BasicJsonType</ref> &gt;::type &gt;</type>
+        <definition>internal_iterator&lt;typename std::remove_const&lt;BasicJsonType&gt;::type&gt; nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::m_it</definition>
+        <argsstring></argsstring>
+        <name>m_it</name>
+        <initializer>{}</initializer>
+        <briefdescription>
+<para>the actual iterator of the associated instance </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11952" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11952" bodyend="-1"/>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a8137d5471edcd71606e42155ed9c23e2" compoundref="d5/db8/json_8hpp" startline="22788" endline="22815">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::insert</referencedby>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1ab5c8034e997c5b852b92bdc6a3f70994" compoundref="d5/db8/json_8hpp" startline="22651" endline="22665">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::insert_iterator</referencedby>
+        <referencedby refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a49bf3e708a9c1c88c415011735962d06" compoundref="d5/db8/json_8hpp" startline="11875" endline="11890">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator-</referencedby>
+        <referencedby refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a0d14cd76203e00bdcef6a64a5d055cc7" compoundref="d5/db8/json_8hpp" startline="11750" endline="11771">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator&lt;</referencedby>
+        <referencedby refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a9a5cd7864a8f848ef107d3f5a330f5e7" compoundref="d5/db8/json_8hpp" startline="11450" endline="11458">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator=</referencedby>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a31090f248ce10fd7b386027c1a19c16f" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::iter_impl</definition>
+        <argsstring>()=default</argsstring>
+        <name>iter_impl</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11387" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a3fc5c9a782628d91047aa35f40bb7fdc" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::~iter_impl</definition>
+        <argsstring>()=default</argsstring>
+        <name>~iter_impl</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11388" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a603ba9c477f878a69ed281becca6f56a" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::iter_impl</definition>
+        <argsstring>(iter_impl &amp;&amp;) noexcept=default</argsstring>
+        <name>iter_impl</name>
+        <param>
+          <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;&amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11389" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ae3dc277c25007ac952d57f9a1972ce79" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;</type>
+        <definition>iter_impl&amp; nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator=</definition>
+        <argsstring>(iter_impl &amp;&amp;) noexcept=default</argsstring>
+        <name>operator=</name>
+        <param>
+          <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;&amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11390" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a88a00484ac201c52fc5f613d88a2918b" prot="public" static="no" const="no" explicit="yes" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::iter_impl</definition>
+        <argsstring>(pointer object) noexcept</argsstring>
+        <name>iter_impl</name>
+        <param>
+          <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a69e52f890ce8c556fd68ce109e24b360" kindref="member">pointer</ref></type>
+          <declname>object</declname>
+        </param>
+        <briefdescription>
+<para>constructor for a given JSON instance </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">object</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>pointer to a JSON object for this iterator </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="pre"><para>object != nullptr </para></simplesect>
+<simplesect kind="post"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11398" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11398" bodyend="11422"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a71f84fb6e009619f12972bcf9002b8cd" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::iter_impl</definition>
+        <argsstring>(const iter_impl&lt; const BasicJsonType &gt; &amp;other) noexcept</argsstring>
+        <name>iter_impl</name>
+        <param>
+          <type>const <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref>&lt; const <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abf18f18793f84b0222aebb5a2a87da7a" kindref="member">BasicJsonType</ref> &gt; &amp;</type>
+          <declname>other</declname>
+        </param>
+        <briefdescription>
+<para>const copy constructor </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="note"><para>The conventional copy constructor and copy assignment are implicitly defined. Combined with the following converting constructor and assignment, they support: (1) copy from iterator to iterator, (2) copy from const iterator to const iterator, and (3) conversion from iterator to const iterator. However conversion from const iterator to iterator is not defined.</para></simplesect>
+<parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">other</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>const iterator to copy from </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="note"><para>This copy constructor had to be defined explicitly to circumvent a bug occurring on msvc v19.0 compiler (VS 2015) debug build. For more information refer to: <ulink url="https://github.com/nlohmann/json/issues/1608">https://github.com/nlohmann/json/issues/1608</ulink> </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11440" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11440" bodyend="11442"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a9a5cd7864a8f848ef107d3f5a330f5e7" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;</type>
+        <definition>iter_impl&amp; nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator=</definition>
+        <argsstring>(const iter_impl&lt; const BasicJsonType &gt; &amp;other) noexcept</argsstring>
+        <name>operator=</name>
+        <param>
+          <type>const <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref>&lt; const <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abf18f18793f84b0222aebb5a2a87da7a" kindref="member">BasicJsonType</ref> &gt; &amp;</type>
+          <declname>other</declname>
+        </param>
+        <briefdescription>
+<para>converting assignment </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">other</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>const iterator to copy from </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>const/non-const iterator </para></simplesect>
+<simplesect kind="note"><para>It is not checked whether <emphasis>other</emphasis> is initialized. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11450" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11450" bodyend="11458"/>
+        <references refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a8a86a7c0d4af0cc4ab345b6f0e13cdfa" compoundref="d5/db8/json_8hpp" startline="11952">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::m_it</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a867f7eb55091be31b013adb3e46816d3" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::iter_impl</definition>
+        <argsstring>(const iter_impl&lt; typename std::remove_const&lt; BasicJsonType &gt;::type &gt; &amp;other) noexcept</argsstring>
+        <name>iter_impl</name>
+        <param>
+          <type>const <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref>&lt; typename std::remove_const&lt; <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abf18f18793f84b0222aebb5a2a87da7a" kindref="member">BasicJsonType</ref> &gt;::type &gt; &amp;</type>
+          <declname>other</declname>
+        </param>
+        <briefdescription>
+<para>converting constructor </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">other</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>non-const iterator to copy from </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="note"><para>It is not checked whether <emphasis>other</emphasis> is initialized. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11465" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11465" bodyend="11467"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a7159ed1cfe7c423a2baef8bea0c94509" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;</type>
+        <definition>iter_impl&amp; nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator=</definition>
+        <argsstring>(const iter_impl&lt; typename std::remove_const&lt; BasicJsonType &gt;::type &gt; &amp;other) noexcept</argsstring>
+        <name>operator=</name>
+        <param>
+          <type>const <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref>&lt; typename std::remove_const&lt; <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abf18f18793f84b0222aebb5a2a87da7a" kindref="member">BasicJsonType</ref> &gt;::type &gt; &amp;</type>
+          <declname>other</declname>
+        </param>
+        <briefdescription>
+<para>converting assignment </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">other</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>non-const iterator to copy from </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>const/non-const iterator </para></simplesect>
+<simplesect kind="note"><para>It is not checked whether <emphasis>other</emphasis> is initialized. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11475" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11475" bodyend="11480"/>
+        <references refid="d5/db8/json_8hpp_1a2cf645f34610e7f7d6e09ab88a2ab917" compoundref="d5/db8/json_8hpp" startline="2299">JSON_PRIVATE_UNLESS_TESTED</references>
+        <references refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a8a86a7c0d4af0cc4ab345b6f0e13cdfa" compoundref="d5/db8/json_8hpp" startline="11952">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::m_it</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abc2f80067020fae59d7fbccf39f1547a" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::switch</definition>
+        <argsstring>(m_object-&gt;m_type)</argsstring>
+        <name>switch</name>
+        <param>
+          <type>m_object-&gt;</type>
+          <declname>m_type</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11491" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11491" bodyend="11517"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a37a6259cc0c1dae299a7866489dff0bd">nlohmann::detail::null</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a23e50ad4c13aa62d9ac7f60a123823ee" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>void nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::set_end</definition>
+        <argsstring>() noexcept</argsstring>
+        <name>set_end</name>
+        <briefdescription>
+<para>set the iterator past the last value </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11524" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11524" bodyend="11548"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a3017cf0f1a4673e904e34cfef62e7758" compoundref="d5/db8/json_8hpp" startline="21739" endline="21744">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::cend</referencedby>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a931267ec3f09eb67e4382f321b2c52bc" compoundref="d5/db8/json_8hpp" startline="21699" endline="21704">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::end</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a5ca57856d9bba54a5fc51cee891de827" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a5be8001be099c6b82310f4d387b953ce" kindref="member">reference</ref></type>
+        <definition>reference nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator*</definition>
+        <argsstring>() const</argsstring>
+        <name>operator*</name>
+        <briefdescription>
+<para>return a reference to the value pointed to by the iterator </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11555" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11555" bodyend="11586"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator_1a34104b98ab00564e564176b4d2ba7c3c" compoundref="d5/db8/json_8hpp" startline="2861" endline="2865">nlohmann::detail::invalid_iterator::create</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a355f2770653ff7bdd5c74b204b5a3ad0" compoundref="d5/db8/json_8hpp" startline="1563">JSON_HEDLEY_LIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a37a6259cc0c1dae299a7866489dff0bd">nlohmann::detail::null</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a6da3d2b34528aff328f3dcb513076dec" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a69e52f890ce8c556fd68ce109e24b360" kindref="member">pointer</ref></type>
+        <definition>pointer nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator-&gt;</definition>
+        <argsstring>() const</argsstring>
+        <name>operator-&gt;</name>
+        <briefdescription>
+<para>dereference the iterator </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11592" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11592" bodyend="11620"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator_1a34104b98ab00564e564176b4d2ba7c3c" compoundref="d5/db8/json_8hpp" startline="2861" endline="2865">nlohmann::detail::invalid_iterator::create</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a355f2770653ff7bdd5c74b204b5a3ad0" compoundref="d5/db8/json_8hpp" startline="1563">JSON_HEDLEY_LIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a7d2397773b2dce42f30f0375a6a1d850" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> const</type>
+        <definition>iter_impl const nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator++</definition>
+        <argsstring>(int)</argsstring>
+        <name>operator++</name>
+        <param>
+          <type>int</type>
+        </param>
+        <briefdescription>
+<para>post-increment (it++) </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11626" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11626" bodyend="11631"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abdfe2a7f464400a7ab572782d14b922f" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;</type>
+        <definition>iter_impl&amp; nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator++</definition>
+        <argsstring>()</argsstring>
+        <name>operator++</name>
+        <briefdescription>
+<para>pre-increment (++it) </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11637" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11637" bodyend="11663"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a1fc43e764467b8ea4a4cdd01f629d757" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> const</type>
+        <definition>iter_impl const nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator--</definition>
+        <argsstring>(int)</argsstring>
+        <name>operator--</name>
+        <param>
+          <type>int</type>
+        </param>
+        <briefdescription>
+<para>post-decrement (it<ndash/>) </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11669" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11669" bodyend="11674"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a84e689fb581d651d130039f7cb81494a" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;</type>
+        <definition>iter_impl&amp; nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator--</definition>
+        <argsstring>()</argsstring>
+        <name>operator--</name>
+        <briefdescription>
+<para>pre-decrement (<ndash/>it) </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11680" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11680" bodyend="11706"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1aaddab83c2b4023cb0f0fdbc757c54f65" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename IterImpl</type>
+          </param>
+          <param>
+            <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a02bcbc878bee413f25b985ada771aa9c" kindref="member">detail::enable_if_t</ref>&lt;(std::is_same&lt; IterImpl, <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &gt;::<ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ab447c50354c6611fa2ae0100ac17845c" kindref="member">value</ref>||std::is_same&lt; IterImpl, <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ac7c5a1f964aa1c02f7b046029a5c8904" kindref="member">other_iter_impl</ref> &gt;::<ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ab447c50354c6611fa2ae0100ac17845c" kindref="member">value</ref>), std::nullptr_t &gt;</type>
+            <defval>nullptr</defval>
+          </param>
+        </templateparamlist>
+        <type>bool</type>
+        <definition>bool nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator==</definition>
+        <argsstring>(const IterImpl &amp;other) const</argsstring>
+        <name>operator==</name>
+        <param>
+          <type>const IterImpl &amp;</type>
+          <declname>other</declname>
+        </param>
+        <briefdescription>
+<para>comparison: equal </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11713" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11713" bodyend="11734"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator_1a34104b98ab00564e564176b4d2ba7c3c" compoundref="d5/db8/json_8hpp" startline="2861" endline="2865">nlohmann::detail::invalid_iterator::create</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a190077df326c10886020bbcfaa169b20" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename IterImpl</type>
+          </param>
+          <param>
+            <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a02bcbc878bee413f25b985ada771aa9c" kindref="member">detail::enable_if_t</ref>&lt;(std::is_same&lt; IterImpl, <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &gt;::<ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ab447c50354c6611fa2ae0100ac17845c" kindref="member">value</ref>||std::is_same&lt; IterImpl, <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ac7c5a1f964aa1c02f7b046029a5c8904" kindref="member">other_iter_impl</ref> &gt;::<ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ab447c50354c6611fa2ae0100ac17845c" kindref="member">value</ref>), std::nullptr_t &gt;</type>
+            <defval>nullptr</defval>
+          </param>
+        </templateparamlist>
+        <type>bool</type>
+        <definition>bool nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator!=</definition>
+        <argsstring>(const IterImpl &amp;other) const</argsstring>
+        <name>operator!=</name>
+        <param>
+          <type>const IterImpl &amp;</type>
+          <declname>other</declname>
+        </param>
+        <briefdescription>
+<para>comparison: not equal </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11741" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11741" bodyend="11744"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a0d14cd76203e00bdcef6a64a5d055cc7" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator&lt;</definition>
+        <argsstring>(const iter_impl &amp;other) const</argsstring>
+        <name>operator&lt;</name>
+        <param>
+          <type>const <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;</type>
+          <declname>other</declname>
+        </param>
+        <briefdescription>
+<para>comparison: smaller </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11750" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11750" bodyend="11771"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d7/d10/structnlohmann_1_1detail_1_1internal__iterator_1a8294a6e6f01b58e1cce8fbae66a50b5d" compoundref="d5/db8/json_8hpp" startline="11295">nlohmann::detail::internal_iterator&lt; BasicJsonType &gt;::array_iterator</references>
+        <references refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator_1a34104b98ab00564e564176b4d2ba7c3c" compoundref="d5/db8/json_8hpp" startline="2861" endline="2865">nlohmann::detail::invalid_iterator::create</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a8a86a7c0d4af0cc4ab345b6f0e13cdfa" compoundref="d5/db8/json_8hpp" startline="11952">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::m_it</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <references refid="d7/d10/structnlohmann_1_1detail_1_1internal__iterator_1a2b3bb45f968210e42c282017eeeb63a8" compoundref="d5/db8/json_8hpp" startline="11297">nlohmann::detail::internal_iterator&lt; BasicJsonType &gt;::primitive_iterator</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ac6f71b36d7c87e427d1fee83f2600fad" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator&lt;=</definition>
+        <argsstring>(const iter_impl &amp;other) const</argsstring>
+        <name>operator&lt;=</name>
+        <param>
+          <type>const <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;</type>
+          <declname>other</declname>
+        </param>
+        <briefdescription>
+<para>comparison: less than or equal </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11777" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11777" bodyend="11780"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1aaf3620b8dfa4bed8a9ac2b51dd55dbd7" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator&gt;</definition>
+        <argsstring>(const iter_impl &amp;other) const</argsstring>
+        <name>operator&gt;</name>
+        <param>
+          <type>const <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;</type>
+          <declname>other</declname>
+        </param>
+        <briefdescription>
+<para>comparison: greater than </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11786" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11786" bodyend="11789"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a634f85da575cb60b012a687efa26e11a" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator&gt;=</definition>
+        <argsstring>(const iter_impl &amp;other) const</argsstring>
+        <name>operator&gt;=</name>
+        <param>
+          <type>const <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;</type>
+          <declname>other</declname>
+        </param>
+        <briefdescription>
+<para>comparison: greater than or equal </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11795" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11795" bodyend="11798"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a09169efff3bd1771fff29bd92cea19e0" compoundref="d5/db8/json_8hpp" startline="145" endline="157">nlohmann::detail::operator&lt;</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a3eef94f9d167046e7f773aeb6b78090c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;</type>
+        <definition>iter_impl&amp; nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator+=</definition>
+        <argsstring>(difference_type i)</argsstring>
+        <name>operator+=</name>
+        <param>
+          <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a2f7ea9f7022850809c60fc3263775840" kindref="member">difference_type</ref></type>
+          <declname>i</declname>
+        </param>
+        <briefdescription>
+<para>add to iterator </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11804" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11804" bodyend="11827"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator_1a34104b98ab00564e564176b4d2ba7c3c" compoundref="d5/db8/json_8hpp" startline="2861" endline="2865">nlohmann::detail::invalid_iterator::create</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abcc9d51bc52f2e8483bbe4018f05e978" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;</type>
+        <definition>iter_impl&amp; nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator-=</definition>
+        <argsstring>(difference_type i)</argsstring>
+        <name>operator-=</name>
+        <param>
+          <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a2f7ea9f7022850809c60fc3263775840" kindref="member">difference_type</ref></type>
+          <declname>i</declname>
+        </param>
+        <briefdescription>
+<para>subtract from iterator </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11833" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11833" bodyend="11836"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a8ef76aeb5a5032768f0f61f48ac189c0" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref></type>
+        <definition>iter_impl nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator+</definition>
+        <argsstring>(difference_type i) const</argsstring>
+        <name>operator+</name>
+        <param>
+          <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a2f7ea9f7022850809c60fc3263775840" kindref="member">difference_type</ref></type>
+          <declname>i</declname>
+        </param>
+        <briefdescription>
+<para>add to iterator </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11842" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11842" bodyend="11847"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a0dd9c415b94a02ff2aa25da75e52da30" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref></type>
+        <definition>iter_impl nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator-</definition>
+        <argsstring>(difference_type i) const</argsstring>
+        <name>operator-</name>
+        <param>
+          <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a2f7ea9f7022850809c60fc3263775840" kindref="member">difference_type</ref></type>
+          <declname>i</declname>
+        </param>
+        <briefdescription>
+<para>subtract from iterator </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11864" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11864" bodyend="11869"/>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a49bf3e708a9c1c88c415011735962d06" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a2f7ea9f7022850809c60fc3263775840" kindref="member">difference_type</ref></type>
+        <definition>difference_type nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator-</definition>
+        <argsstring>(const iter_impl &amp;other) const</argsstring>
+        <name>operator-</name>
+        <param>
+          <type>const <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;</type>
+          <declname>other</declname>
+        </param>
+        <briefdescription>
+<para>return difference </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11875" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11875" bodyend="11890"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d7/d10/structnlohmann_1_1detail_1_1internal__iterator_1a8294a6e6f01b58e1cce8fbae66a50b5d" compoundref="d5/db8/json_8hpp" startline="11295">nlohmann::detail::internal_iterator&lt; BasicJsonType &gt;::array_iterator</references>
+        <references refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator_1a34104b98ab00564e564176b4d2ba7c3c" compoundref="d5/db8/json_8hpp" startline="2861" endline="2865">nlohmann::detail::invalid_iterator::create</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a8a86a7c0d4af0cc4ab345b6f0e13cdfa" compoundref="d5/db8/json_8hpp" startline="11952">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::m_it</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+        <references refid="d7/d10/structnlohmann_1_1detail_1_1internal__iterator_1a2b3bb45f968210e42c282017eeeb63a8" compoundref="d5/db8/json_8hpp" startline="11297">nlohmann::detail::internal_iterator&lt; BasicJsonType &gt;::primitive_iterator</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ac0b9276f1102ed4b9cd3f5f56287e3ce" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a5be8001be099c6b82310f4d387b953ce" kindref="member">reference</ref></type>
+        <definition>reference nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator[]</definition>
+        <argsstring>(difference_type n) const</argsstring>
+        <name>operator[]</name>
+        <param>
+          <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a2f7ea9f7022850809c60fc3263775840" kindref="member">difference_type</ref></type>
+          <declname>n</declname>
+        </param>
+        <briefdescription>
+<para>access to successor </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11896" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11896" bodyend="11921"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5">nlohmann::detail::array</references>
+        <references refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator_1a34104b98ab00564e564176b4d2ba7c3c" compoundref="d5/db8/json_8hpp" startline="2861" endline="2865">nlohmann::detail::invalid_iterator::create</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a355f2770653ff7bdd5c74b204b5a3ad0" compoundref="d5/db8/json_8hpp" startline="1563">JSON_HEDLEY_LIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985a37a6259cc0c1dae299a7866489dff0bd">nlohmann::detail::null</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985aa8cfde6331bd59eb2ac96f8911c4b666">nlohmann::detail::object</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a15dfb2744fed2ef40c12a9e9a20d6dbc" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>const object_t::key_type &amp;</type>
+        <definition>const object_t::key_type&amp; nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::key</definition>
+        <argsstring>() const</argsstring>
+        <name>key</name>
+        <briefdescription>
+<para>return the key of an object iterator </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11927" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11927" bodyend="11937"/>
+        <references refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator_1a34104b98ab00564e564176b4d2ba7c3c" compoundref="d5/db8/json_8hpp" startline="2861" endline="2865">nlohmann::detail::invalid_iterator::create</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a355f2770653ff7bdd5c74b204b5a3ad0" compoundref="d5/db8/json_8hpp" startline="1563">JSON_HEDLEY_LIKELY</references>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+      </memberdef>
+      <memberdef kind="function" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ab447c50354c6611fa2ae0100ac17845c" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a5be8001be099c6b82310f4d387b953ce" kindref="member">reference</ref></type>
+        <definition>reference nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::value</definition>
+        <argsstring>() const</argsstring>
+        <name>value</name>
+        <briefdescription>
+<para>return the value of an iterator </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11943" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11943" bodyend="11946"/>
+        <references refid="d5/db8/json_8hpp_1a2cf645f34610e7f7d6e09ab88a2ab917" compoundref="d5/db8/json_8hpp" startline="2299">JSON_PRIVATE_UNLESS_TESTED</references>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="friend">
+      <memberdef kind="friend" id="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a94108d1a7563e103534f23eb5c1ee175" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>friend <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref></type>
+        <definition>iter_impl operator+</definition>
+        <argsstring>(difference_type i, const iter_impl &amp;it)</argsstring>
+        <name>operator+</name>
+        <param>
+          <type><ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a2f7ea9f7022850809c60fc3263775840" kindref="member">difference_type</ref></type>
+          <declname>i</declname>
+        </param>
+        <param>
+          <type>const <ref refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl" kindref="compound">iter_impl</ref> &amp;</type>
+          <declname>it</declname>
+        </param>
+        <briefdescription>
+<para>addition of distance and iterator </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="pre"><para>The iterator is initialized; i.e. <computeroutput>m_object != nullptr</computeroutput>. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11853" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11853" bodyend="11858"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>a template for a bidirectional iterator for the <ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">basic_json</ref> class This class implements a both iterators (iterator and const_iterator) for the <ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">basic_json</ref> class. </para>    </briefdescription>
+    <detaileddescription>
+<para><simplesect kind="note"><para>An iterator is called <emphasis>initialized</emphasis> when a pointer to a JSON value has been set (e.g., by a constructor or a copy assignment). If the iterator is default-constructed, it is <emphasis>uninitialized</emphasis> and most methods are undefined. The library uses assertions to detect calls on uninitialized iterators.**  The class satisfies the following concept requirements:<itemizedlist>
+<listitem><para><ulink url="https://en.cppreference.com/w/cpp/named_req/BidirectionalIterator">BidirectionalIterator</ulink>: The iterator that can be moved can be moved in both directions (i.e. incremented and decremented). </para></listitem></itemizedlist>
+</para></simplesect>
+<simplesect kind="since"><para>version 1.0.0, simplified in version 2.0.9, change to bidirectional iterators in version 3.0.0 (see <ulink url="https://github.com/nlohmann/json/issues/593">https://github.com/nlohmann/json/issues/593</ulink>) </para></simplesect>
+</para>    </detaileddescription>
+    <collaborationgraph>
+      <node id="662">
+        <label>nlohmann::detail::iter_impl&lt; BasicJsonType &gt;</label>
+        <link refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl"/>
+        <childnode refid="663" relation="usage">
+          <edgelabel>+m_it</edgelabel>
+        </childnode>
+        <childnode refid="667" relation="usage">
+          <edgelabel>+__pad0__</edgelabel>
+          <edgelabel>+__pad1__</edgelabel>
+        </childnode>
+        <childnode refid="669" relation="usage">
+          <edgelabel>-other_iter_impl</edgelabel>
+          <edgelabel>-iteration_proxy_value&lt; iter_impl &gt;</edgelabel>
+          <edgelabel>-iteration_proxy&lt; iter_impl &gt;</edgelabel>
+          <edgelabel>-BasicJsonType</edgelabel>
+        </childnode>
+      </node>
+      <node id="664">
+        <label>iterator</label>
+      </node>
+      <node id="667">
+        <label>JSON_PRIVATE_UNLESS_TESTED</label>
+      </node>
+      <node id="666">
+        <label>static constexpr difference_type</label>
+      </node>
+      <node id="663">
+        <label>nlohmann::detail::internal_iterator&lt; typename std::remove_const&lt; BasicJsonType &gt;::type &gt;</label>
+        <link refid="d7/d10/structnlohmann_1_1detail_1_1internal__iterator"/>
+        <childnode refid="664" relation="usage">
+          <edgelabel>+array_iterator</edgelabel>
+        </childnode>
+        <childnode refid="664" relation="usage">
+          <edgelabel>+object_iterator</edgelabel>
+        </childnode>
+        <childnode refid="665" relation="usage">
+          <edgelabel>+primitive_iterator</edgelabel>
+        </childnode>
+        <childnode refid="668" relation="template-instance">
+          <edgelabel>&lt; typename std::remove_const&lt; BasicJsonType &gt;::type &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="665">
+        <label>nlohmann::detail::primitive_iterator_t</label>
+        <link refid="d2/d2c/classnlohmann_1_1detail_1_1primitive__iterator__t"/>
+        <childnode refid="666" relation="usage">
+          <edgelabel>-end_value</edgelabel>
+          <edgelabel>-begin_value</edgelabel>
+        </childnode>
+        <childnode refid="667" relation="usage">
+          <edgelabel>-__pad0__</edgelabel>
+        </childnode>
+      </node>
+      <node id="668">
+        <label>nlohmann::detail::internal_iterator&lt; BasicJsonType &gt;</label>
+        <link refid="d7/d10/structnlohmann_1_1detail_1_1internal__iterator"/>
+        <childnode refid="664" relation="usage">
+          <edgelabel>+array_iterator</edgelabel>
+        </childnode>
+        <childnode refid="664" relation="usage">
+          <edgelabel>+object_iterator</edgelabel>
+        </childnode>
+        <childnode refid="665" relation="usage">
+          <edgelabel>+primitive_iterator</edgelabel>
+        </childnode>
+      </node>
+      <node id="669">
+        <label>friend</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="11349" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="11348" bodyend="11953"/>
+    <listofallmembers>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1aa4bddeaa9a97b2a9b715918a7e8dcc3a" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>__pad0__</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a4a60e9d074cc53929b73eaa7963f1fa9" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>__pad1__</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1aef02cf75b1cb199286fd2f666c60e38e" prot="private" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>array_t</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abf18f18793f84b0222aebb5a2a87da7a" prot="private" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>BasicJsonType</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a2f7ea9f7022850809c60fc3263775840" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>difference_type</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a31090f248ce10fd7b386027c1a19c16f" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>iter_impl</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a603ba9c477f878a69ed281becca6f56a" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>iter_impl</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a88a00484ac201c52fc5f613d88a2918b" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>iter_impl</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a71f84fb6e009619f12972bcf9002b8cd" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>iter_impl</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a867f7eb55091be31b013adb3e46816d3" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>iter_impl</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a28328d17a18d9754c89c5c8159677a6f" prot="private" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>iteration_proxy&lt; iter_impl &gt;</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ac501dc2374b4d17a884fc9a656e80d5a" prot="private" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>iteration_proxy_value&lt; iter_impl &gt;</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ad9e091f5c70b34b5b1abc1ab15fd9106" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>iterator_category</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a15dfb2744fed2ef40c12a9e9a20d6dbc" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>key</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a8a86a7c0d4af0cc4ab345b6f0e13cdfa" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>m_it</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ab9a9598052e83fa14a2288e56d5dda7c" prot="private" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>object_t</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a190077df326c10886020bbcfaa169b20" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator!=</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a5ca57856d9bba54a5fc51cee891de827" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator*</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a8ef76aeb5a5032768f0f61f48ac189c0" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator+</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a94108d1a7563e103534f23eb5c1ee175" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator+</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a7d2397773b2dce42f30f0375a6a1d850" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator++</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abdfe2a7f464400a7ab572782d14b922f" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator++</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a3eef94f9d167046e7f773aeb6b78090c" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator+=</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a0dd9c415b94a02ff2aa25da75e52da30" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator-</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a49bf3e708a9c1c88c415011735962d06" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator-</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a1fc43e764467b8ea4a4cdd01f629d757" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator--</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a84e689fb581d651d130039f7cb81494a" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator--</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abcc9d51bc52f2e8483bbe4018f05e978" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator-=</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a6da3d2b34528aff328f3dcb513076dec" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator-&gt;</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a0d14cd76203e00bdcef6a64a5d055cc7" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator&lt;</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ac6f71b36d7c87e427d1fee83f2600fad" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator&lt;=</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ae3dc277c25007ac952d57f9a1972ce79" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator=</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a9a5cd7864a8f848ef107d3f5a330f5e7" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator=</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a7159ed1cfe7c423a2baef8bea0c94509" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator=</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1aaddab83c2b4023cb0f0fdbc757c54f65" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator==</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1aaf3620b8dfa4bed8a9ac2b51dd55dbd7" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator&gt;</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a634f85da575cb60b012a687efa26e11a" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator&gt;=</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ac0b9276f1102ed4b9cd3f5f56287e3ce" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>operator[]</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ac7c5a1f964aa1c02f7b046029a5c8904" prot="private" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>other_iter_impl</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1aba0841e618c77cc65ccfd52164c346b9" prot="private" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>other_iter_impl</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a69e52f890ce8c556fd68ce109e24b360" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>pointer</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a5be8001be099c6b82310f4d387b953ce" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>reference</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a23e50ad4c13aa62d9ac7f60a123823ee" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>set_end</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1abc2f80067020fae59d7fbccf39f1547a" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>switch</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ab447c50354c6611fa2ae0100ac17845c" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>value</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ab35586a44f2222272c5346baa3013f67" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>value_type</name></member>
+      <member refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a3fc5c9a782628d91047aa35f40bb7fdc" prot="public" virt="non-virtual"><scope>nlohmann::detail::iter_impl</scope><name>~iter_impl</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

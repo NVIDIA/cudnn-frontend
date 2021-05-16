@@ -1,0 +1,80 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::dtoa_impl::cached_power</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+      <sectiondef kind="public-attrib">
+      <memberdef kind="variable" id="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power_1a21ae81f515f5b08d5bf423775ee56074" prot="public" static="no" mutable="no">
+        <type>std::uint64_t</type>
+        <definition>std::uint64_t nlohmann::detail::dtoa_impl::cached_power::f</definition>
+        <argsstring></argsstring>
+        <name>f</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15156" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15156" bodyend="-1"/>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a05b681dcb8569b9784c6dccfadb01633" compoundref="d5/db8/json_8hpp" startline="15668" endline="15719">nlohmann::detail::dtoa_impl::grisu2</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power_1a9e89bc89bb7bf4361f43ea27eed91d23" prot="public" static="no" mutable="no">
+        <type>int</type>
+        <definition>int nlohmann::detail::dtoa_impl::cached_power::e</definition>
+        <argsstring></argsstring>
+        <name>e</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15157" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15157" bodyend="-1"/>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a05b681dcb8569b9784c6dccfadb01633" compoundref="d5/db8/json_8hpp" startline="15668" endline="15719">nlohmann::detail::dtoa_impl::grisu2</referencedby>
+      </memberdef>
+      <memberdef kind="variable" id="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power_1a8c1f2efed643eeaa8fae83c697a29c6a" prot="public" static="no" mutable="no">
+        <type>int</type>
+        <definition>int nlohmann::detail::dtoa_impl::cached_power::k</definition>
+        <argsstring></argsstring>
+        <name>k</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15158" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15158" bodyend="-1"/>
+        <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a05b681dcb8569b9784c6dccfadb01633" compoundref="d5/db8/json_8hpp" startline="15668" endline="15719">nlohmann::detail::dtoa_impl::grisu2</referencedby>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="66">
+        <label>uint64_t</label>
+      </node>
+      <node id="67">
+        <label>int</label>
+      </node>
+      <node id="65">
+        <label>nlohmann::detail::dtoa_impl::cached_power</label>
+        <link refid="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power"/>
+        <childnode refid="66" relation="usage">
+          <edgelabel>+f</edgelabel>
+        </childnode>
+        <childnode refid="67" relation="usage">
+          <edgelabel>+e</edgelabel>
+          <edgelabel>+k</edgelabel>
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15155" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15154" bodyend="15159"/>
+    <listofallmembers>
+      <member refid="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power_1a9e89bc89bb7bf4361f43ea27eed91d23" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::cached_power</scope><name>e</name></member>
+      <member refid="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power_1a21ae81f515f5b08d5bf423775ee56074" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::cached_power</scope><name>f</name></member>
+      <member refid="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power_1a8c1f2efed643eeaa8fae83c697a29c6a" prot="public" virt="non-virtual"><scope>nlohmann::detail::dtoa_impl::cached_power</scope><name>k</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

@@ -142,6 +142,10 @@ Classes</h2></td></tr>
 <tr class="separator:"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:"><td class="memItemLeft" align="right" valign="top">class &#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8.html">PointWiseDescBuilder_v8</a></td></tr>
 <tr class="separator:"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:"><td class="memItemLeft" align="right" valign="top">class &#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d4/df1/classcudnn__frontend_1_1ReductionDesc__v8.html">ReductionDesc_v8</a></td></tr>
+<tr class="separator:"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:"><td class="memItemLeft" align="right" valign="top">class &#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8.html">ReductionDescBuilder_v8</a></td></tr>
+<tr class="separator:"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:"><td class="memItemLeft" align="right" valign="top">class &#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d6/da7/classcudnn__frontend_1_1Tensor__v8.html">Tensor_v8</a></td></tr>
 <tr class="separator:"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:"><td class="memItemLeft" align="right" valign="top">class &#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../db/dae/classcudnn__frontend_1_1TensorBuilder__v8.html">TensorBuilder_v8</a></td></tr>
@@ -171,6 +175,10 @@ Typedefs</h2></td></tr>
 <tr class="separator:ad809552e9ec400bcbfcfc0ea5acd4e56"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a0c344e3bc1f332aa9f5b213eb1ae9ee6"><td class="memItemLeft" align="right" valign="top">using&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#a0c344e3bc1f332aa9f5b213eb1ae9ee6">MatMulDescBuilder</a> = <a class="el" href="../../de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8.html">MatMulDescBuilder_v8</a></td></tr>
 <tr class="separator:a0c344e3bc1f332aa9f5b213eb1ae9ee6"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:a4b09ba4625f988c32edfc305b5397f48"><td class="memItemLeft" align="right" valign="top">using&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#a4b09ba4625f988c32edfc305b5397f48">ReductionDesc</a> = <a class="el" href="../../d4/df1/classcudnn__frontend_1_1ReductionDesc__v8.html">ReductionDesc_v8</a></td></tr>
+<tr class="separator:a4b09ba4625f988c32edfc305b5397f48"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:aa5a388535aed6e36ef90002af0b80a80"><td class="memItemLeft" align="right" valign="top">using&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#aa5a388535aed6e36ef90002af0b80a80">ReductionDescBuilder</a> = <a class="el" href="../../d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8.html">ReductionDescBuilder_v8</a></td></tr>
+<tr class="separator:aa5a388535aed6e36ef90002af0b80a80"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a2f1497702504947953a0f5a69b6eeb2a"><td class="memItemLeft" align="right" valign="top">using&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#a2f1497702504947953a0f5a69b6eeb2a">Operation</a> = <a class="el" href="../../d4/d30/classcudnn__frontend_1_1Operation__v8.html">Operation_v8</a></td></tr>
 <tr class="separator:a2f1497702504947953a0f5a69b6eeb2a"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:ae6d02ff4c7922673ed3862145a4019d4"><td class="memItemLeft" align="right" valign="top">using&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#ae6d02ff4c7922673ed3862145a4019d4">OperationBuilder</a> = <a class="el" href="../../d1/d29/classcudnn__frontend_1_1OperationBuilder__v8.html">OperationBuilder_v8</a></td></tr>
@@ -229,12 +237,20 @@ Enumerations</h2></td></tr>
 </table><table class="memberdecls">
 <tr class="heading"><td colspan="2"><h2 class="groupheader"><a name="func-members"></a>
 Functions</h2></td></tr>
-<tr class="memitem:aee9c79eb8972c944de14ccd70bf5db43"><td class="memItemLeft" align="right" valign="top">static <a class="el" href="../../df/de1/namespacecudnn__frontend.html#ac94d582cdfa2adf3d68a4e675e5d69aa">ManagedOpaqueDescriptor</a>&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#aee9c79eb8972c944de14ccd70bf5db43">make_shared_backend_pointer</a> (cudnnBackendDescriptorType_t type)</td></tr>
+<tr class="memitem:aee9c79eb8972c944de14ccd70bf5db43"><td class="memItemLeft" align="right" valign="top">static <a class="el" href="../../df/de1/namespacecudnn__frontend.html#ac94d582cdfa2adf3d68a4e675e5d69aa">ManagedOpaqueDescriptor</a>&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#aee9c79eb8972c944de14ccd70bf5db43">make_shared_backend_pointer</a> (cudnnBackendDescriptorType_t <a class="el" href="../../db/d0a/classstd_1_1conditional_1_1type.html">type</a>)</td></tr>
 <tr class="separator:aee9c79eb8972c944de14ccd70bf5db43"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a0f52559baeb4e9ee8835d95ea50a875e"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#a0f52559baeb4e9ee8835d95ea50a875e">filter</a> (<a class="el" href="../../df/de1/namespacecudnn__frontend.html#ad31f040777311d1d1a7a2490f23e026e">Predicate</a> pred, <a class="el" href="../../df/de1/namespacecudnn__frontend.html#a560644a5c1e6016c509a379ca6e03f05">executionPlans_t</a> &amp;plans) -&gt; <a class="el" href="../../df/de1/namespacecudnn__frontend.html#a560644a5c1e6016c509a379ca6e03f05">executionPlans_t</a></td></tr>
 <tr class="separator:a0f52559baeb4e9ee8835d95ea50a875e"><td class="memSeparator" colspan="2">&#160;</td></tr>
-<tr class="memitem:ad365eee23138df472d716d9dbf119f0e"><td class="memItemLeft" align="right" valign="top">static auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#ad365eee23138df472d716d9dbf119f0e">get_fallback_engine_list</a> (cudnnBackendDescriptorType_t mode) -&gt; std::vector&lt; int &gt;</td></tr>
-<tr class="separator:ad365eee23138df472d716d9dbf119f0e"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:af057a1fb628c89d02eb47c7cfa9ce0af"><td class="memItemLeft" align="right" valign="top">static auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#af057a1fb628c89d02eb47c7cfa9ce0af">get_fallback_engine_list</a> (cudnnBackendDescriptorType_t mode, const std::string &amp;opGraphTag) -&gt; std::vector&lt; int &gt;</td></tr>
+<tr class="separator:af057a1fb628c89d02eb47c7cfa9ce0af"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:a069fb3355ab52d2e1914e72832cdcf46"><td class="memItemLeft" align="right" valign="top">static void&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#a069fb3355ab52d2e1914e72832cdcf46">load_from_config</a> (<a class="el" href="../../db/d7e/cudnn__frontend__Errata_8h.html#ab701e3ac61a85b337ec5c1abaad6742d">json</a> &amp;json_handle, const std::string &amp;errata_json)</td></tr>
+<tr class="separator:a069fb3355ab52d2e1914e72832cdcf46"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:a91f2627793be5d51db9b1473275d803d"><td class="memTemplParams" colspan="2">template&lt;typename T &gt; </td></tr>
+<tr class="memitem:a91f2627793be5d51db9b1473275d803d"><td class="memTemplItemLeft" align="right" valign="top">static bool&#160;</td><td class="memTemplItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#a91f2627793be5d51db9b1473275d803d">check_rule</a> (const <a class="el" href="../../db/d7e/cudnn__frontend__Errata_8h.html#ab701e3ac61a85b337ec5c1abaad6742d">json</a> &amp;json_handle, const std::string &amp;executionPlanTag, cudnnHandle_t handle, T fn)</td></tr>
+<tr class="separator:a91f2627793be5d51db9b1473275d803d"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:a8f4ddfcd38f15524ff0a35e14d21664c"><td class="memTemplParams" colspan="2">template&lt;typename T &gt; </td></tr>
+<tr class="memitem:a8f4ddfcd38f15524ff0a35e14d21664c"><td class="memTemplItemLeft" align="right" valign="top">static bool&#160;</td><td class="memTemplItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#a8f4ddfcd38f15524ff0a35e14d21664c">check_errata</a> (const <a class="el" href="../../db/d7e/cudnn__frontend__Errata_8h.html#ab701e3ac61a85b337ec5c1abaad6742d">json</a> &amp;json_handle, const std::string &amp;executionPlanTag, cudnnHandle_t handle, T fn)</td></tr>
+<tr class="separator:a8f4ddfcd38f15524ff0a35e14d21664c"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a4d18e44a57e30f9bf29157f742ba9c65"><td class="memItemLeft" align="right" valign="top">static void&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#a4d18e44a57e30f9bf29157f742ba9c65">filter</a> (<a class="el" href="../../df/de1/namespacecudnn__frontend.html#a84a5f004bdf17747bf7cf45d6fc754cd">EngineConfigList</a> &amp;from, <a class="el" href="../../df/de1/namespacecudnn__frontend.html#a84a5f004bdf17747bf7cf45d6fc754cd">EngineConfigList</a> &amp;to, std::function&lt; bool(cudnnBackendDescriptor_t)&gt; filter_fn)</td></tr>
 <tr class="separator:a4d18e44a57e30f9bf29157f742ba9c65"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a75bb541476d93b039f5fd9f9d29242e6"><td class="memTemplParams" colspan="2">template&lt;cudnnBackendNumericalNote_t NUMERIC_NOTE&gt; </td></tr>
@@ -263,7 +279,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00115">115</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00118">118</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -279,7 +295,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00116">116</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00119">119</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -295,7 +311,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00128">128</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00133">133</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -311,7 +327,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00127">127</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00132">132</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -327,7 +343,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00129">129</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00134">134</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -343,7 +359,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00130">130</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00135">135</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -376,7 +392,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00135">135</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00140">140</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -392,7 +408,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00136">136</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00141">141</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -408,7 +424,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00126">126</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00131">131</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -424,7 +440,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00125">125</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00130">130</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -458,7 +474,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00131">131</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00136">136</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -474,7 +490,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00132">132</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00137">137</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -538,7 +554,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00119">119</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00122">122</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -554,7 +570,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00120">120</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00123">123</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -570,7 +586,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00121">121</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00126">126</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -586,7 +602,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00122">122</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00127">127</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -602,7 +618,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00123">123</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00128">128</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -618,7 +634,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00124">124</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00129">129</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -634,7 +650,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00118">118</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00121">121</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -650,7 +666,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00117">117</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00120">120</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -670,6 +686,38 @@ Functions</h2></td></tr>
 
 </div>
 </div>
+<a id="a4b09ba4625f988c32edfc305b5397f48"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#a4b09ba4625f988c32edfc305b5397f48">&#9670;&nbsp;</a></span>ReductionDesc</h2>
+
+<div class="memitem">
+<div class="memproto">
+      <table class="memname">
+        <tr>
+          <td class="memname">using <a class="el" href="../../df/de1/namespacecudnn__frontend.html#a4b09ba4625f988c32edfc305b5397f48">cudnn_frontend::ReductionDesc</a> = typedef <a class="el" href="../../d4/df1/classcudnn__frontend_1_1ReductionDesc__v8.html">ReductionDesc_v8</a></td>
+        </tr>
+      </table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00124">124</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+
+</div>
+</div>
+<a id="aa5a388535aed6e36ef90002af0b80a80"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#aa5a388535aed6e36ef90002af0b80a80">&#9670;&nbsp;</a></span>ReductionDescBuilder</h2>
+
+<div class="memitem">
+<div class="memproto">
+      <table class="memname">
+        <tr>
+          <td class="memname">using <a class="el" href="../../df/de1/namespacecudnn__frontend.html#aa5a388535aed6e36ef90002af0b80a80">cudnn_frontend::ReductionDescBuilder</a> = typedef <a class="el" href="../../d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8.html">ReductionDescBuilder_v8</a></td>
+        </tr>
+      </table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00125">125</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+
+</div>
+</div>
 <a id="aa20fd945a531e0a3a5007e65fe917770"></a>
 <h2 class="memtitle"><span class="permalink"><a href="#aa20fd945a531e0a3a5007e65fe917770">&#9670;&nbsp;</a></span>Tensor</h2>
 
@@ -682,7 +730,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00113">113</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00116">116</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -698,7 +746,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00114">114</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00117">117</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -714,7 +762,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00133">133</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00138">138</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -730,7 +778,7 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00134">134</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html#l00139">139</a> of file <a class="el" href="../../de/d0c/cudnn__frontend_8h_source.html">cudnn_frontend.h</a>.</p>
 
 </div>
 </div>
@@ -768,6 +816,112 @@ Functions</h2></td></tr>
 </div>
 </div>
 <h2 class="groupheader">Function Documentation</h2>
+<a id="a8f4ddfcd38f15524ff0a35e14d21664c"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#a8f4ddfcd38f15524ff0a35e14d21664c">&#9670;&nbsp;</a></span>check_errata()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<div class="memtemplate">
+template&lt;typename T &gt; </div>
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">static bool cudnn_frontend::check_errata </td>
+          <td>(</td>
+          <td class="paramtype">const <a class="el" href="../../db/d7e/cudnn__frontend__Errata_8h.html#ab701e3ac61a85b337ec5c1abaad6742d">json</a> &amp;&#160;</td>
+          <td class="paramname"><em>json_handle</em>, </td>
+        </tr>
+        <tr>
+          <td class="paramkey"></td>
+          <td></td>
+          <td class="paramtype">const std::string &amp;&#160;</td>
+          <td class="paramname"><em>executionPlanTag</em>, </td>
+        </tr>
+        <tr>
+          <td class="paramkey"></td>
+          <td></td>
+          <td class="paramtype">cudnnHandle_t&#160;</td>
+          <td class="paramname"><em>handle</em>, </td>
+        </tr>
+        <tr>
+          <td class="paramkey"></td>
+          <td></td>
+          <td class="paramtype">T&#160;</td>
+          <td class="paramname"><em>fn</em>&#160;</td>
+        </tr>
+        <tr>
+          <td></td>
+          <td>)</td>
+          <td></td><td></td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">static</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../db/d7e/cudnn__frontend__Errata_8h_source.html#l00087">87</a> of file <a class="el" href="../../db/d7e/cudnn__frontend__Errata_8h_source.html">cudnn_frontend_Errata.h</a>.</p>
+
+</div>
+</div>
+<a id="a91f2627793be5d51db9b1473275d803d"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#a91f2627793be5d51db9b1473275d803d">&#9670;&nbsp;</a></span>check_rule()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<div class="memtemplate">
+template&lt;typename T &gt; </div>
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">static bool cudnn_frontend::check_rule </td>
+          <td>(</td>
+          <td class="paramtype">const <a class="el" href="../../db/d7e/cudnn__frontend__Errata_8h.html#ab701e3ac61a85b337ec5c1abaad6742d">json</a> &amp;&#160;</td>
+          <td class="paramname"><em>json_handle</em>, </td>
+        </tr>
+        <tr>
+          <td class="paramkey"></td>
+          <td></td>
+          <td class="paramtype">const std::string &amp;&#160;</td>
+          <td class="paramname"><em>executionPlanTag</em>, </td>
+        </tr>
+        <tr>
+          <td class="paramkey"></td>
+          <td></td>
+          <td class="paramtype">cudnnHandle_t&#160;</td>
+          <td class="paramname"><em>handle</em>, </td>
+        </tr>
+        <tr>
+          <td class="paramkey"></td>
+          <td></td>
+          <td class="paramtype">T&#160;</td>
+          <td class="paramname"><em>fn</em>&#160;</td>
+        </tr>
+        <tr>
+          <td></td>
+          <td>)</td>
+          <td></td><td></td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">static</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../db/d7e/cudnn__frontend__Errata_8h_source.html#l00051">51</a> of file <a class="el" href="../../db/d7e/cudnn__frontend__Errata_8h_source.html">cudnn_frontend_Errata.h</a>.</p>
+
+<p class="reference">References <a class="el" href="../../d5/db8/json_8hpp_source.html#l21558">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::contains()</a>, and <a class="el" href="../../d5/db8/json_8hpp_source.html#l04061">nlohmann::detail::void()</a>.</p>
+
+</div>
+</div>
 <a id="a4d18e44a57e30f9bf29157f742ba9c65"></a>
 <h2 class="memtitle"><span class="permalink"><a href="#a4d18e44a57e30f9bf29157f742ba9c65">&#9670;&nbsp;</a></span>filter() <span class="overload">[1/2]</span></h2>
 
@@ -847,8 +1001,8 @@ Functions</h2></td></tr>
 
 </div>
 </div>
-<a id="ad365eee23138df472d716d9dbf119f0e"></a>
-<h2 class="memtitle"><span class="permalink"><a href="#ad365eee23138df472d716d9dbf119f0e">&#9670;&nbsp;</a></span>get_fallback_engine_list()</h2>
+<a id="af057a1fb628c89d02eb47c7cfa9ce0af"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#af057a1fb628c89d02eb47c7cfa9ce0af">&#9670;&nbsp;</a></span>get_fallback_engine_list()</h2>
 
 <div class="memitem">
 <div class="memproto">
@@ -860,8 +1014,18 @@ Functions</h2></td></tr>
           <td class="memname">static auto cudnn_frontend::get_fallback_engine_list </td>
           <td>(</td>
           <td class="paramtype">cudnnBackendDescriptorType_t&#160;</td>
-          <td class="paramname"><em>mode</em></td><td>)</td>
-          <td> -&gt; std::vector&lt;int&gt; </td>
+          <td class="paramname"><em>mode</em>, </td>
+        </tr>
+        <tr>
+          <td class="paramkey"></td>
+          <td></td>
+          <td class="paramtype">const std::string &amp;&#160;</td>
+          <td class="paramname"><em>opGraphTag</em>&#160;</td>
+        </tr>
+        <tr>
+          <td></td>
+          <td>)</td>
+          <td></td><td> -&gt; std::vector&lt;int&gt; </td>
         </tr>
       </table>
   </td>
@@ -870,10 +1034,11 @@ Functions</h2></td></tr>
   </tr>
 </table>
 </div><div class="memdoc">
+<p>Here we are using the term "bias" in the operationGraph as a proxy for the conv*bias* operation graph. We are not strictly checking the order of the operations in the graph. We propose this as a temporary workaround until the backend API supports querying the fallback list directly from cudnn </p>
 
 <p class="definition">Definition at line <a class="el" href="../../df/d3e/cudnn__frontend__EngineFallbackList_8h_source.html#l00030">30</a> of file <a class="el" href="../../df/d3e/cudnn__frontend__EngineFallbackList_8h_source.html">cudnn_frontend_EngineFallbackList.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../df/d3e/cudnn__frontend__EngineFallbackList_8h_source.html#l00131">cudnn_frontend::EngineFallbackListBuilder_v8::build()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../df/d3e/cudnn__frontend__EngineFallbackList_8h_source.html#l00144">cudnn_frontend::EngineFallbackListBuilder_v8::build()</a>.</p>
 
 </div>
 </div>
@@ -898,6 +1063,44 @@ template&lt;cudnnBackendNumericalNote_t NUMERIC_NOTE&gt; </div>
 <p class="definition">Definition at line <a class="el" href="../../d5/d36/cudnn__frontend__Filters_8h_source.html#l00045">45</a> of file <a class="el" href="../../d5/d36/cudnn__frontend__Filters_8h_source.html">cudnn_frontend_Filters.h</a>.</p>
 
 <p class="reference">References <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00086">make_shared_backend_pointer()</a>.</p>
+
+</div>
+</div>
+<a id="a069fb3355ab52d2e1914e72832cdcf46"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#a069fb3355ab52d2e1914e72832cdcf46">&#9670;&nbsp;</a></span>load_from_config()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">static void cudnn_frontend::load_from_config </td>
+          <td>(</td>
+          <td class="paramtype"><a class="el" href="../../db/d7e/cudnn__frontend__Errata_8h.html#ab701e3ac61a85b337ec5c1abaad6742d">json</a> &amp;&#160;</td>
+          <td class="paramname"><em>json_handle</em>, </td>
+        </tr>
+        <tr>
+          <td class="paramkey"></td>
+          <td></td>
+          <td class="paramtype">const std::string &amp;&#160;</td>
+          <td class="paramname"><em>errata_json</em>&#160;</td>
+        </tr>
+        <tr>
+          <td></td>
+          <td>)</td>
+          <td></td><td></td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">static</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../db/d7e/cudnn__frontend__Errata_8h_source.html#l00039">39</a> of file <a class="el" href="../../db/d7e/cudnn__frontend__Errata_8h_source.html">cudnn_frontend_Errata.h</a>.</p>
 
 </div>
 </div>
@@ -973,9 +1176,9 @@ template&lt;cudnnBackendNumericalNote_t NUMERIC_NOTE&gt; </div>
 
 <p class="definition">Definition at line <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00060">60</a> of file <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html">cudnn_frontend_utils.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00034">cudnn_frontend::cudnnException::cudnnException()</a>, <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00124">cudnn_frontend::BackendDescriptor::set_error()</a>, and <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00118">cudnn_frontend::BackendDescriptor::set_status()</a>.</p>
+<p class="reference">References <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00034">cudnn_frontend::cudnnException::cudnnException()</a>, <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00124">cudnn_frontend::BackendDescriptor::set_error()</a>, <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00118">cudnn_frontend::BackendDescriptor::set_status()</a>, and <a class="el" href="../../d5/db8/json_8hpp_source.html#l25855">nlohmann::to_string()</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../d6/d32/cudnn__frontend__MatMulDesc_8h_source.html#l00093">cudnn_frontend::MatMulDescBuilder_v8::build()</a>, <a class="el" href="../../df/dc0/cudnn__frontend__VariantPack_8h_source.html#l00128">cudnn_frontend::VariantPackBuilder_v8::build()</a>, <a class="el" href="../../df/d3e/cudnn__frontend__EngineFallbackList_8h_source.html#l00131">cudnn_frontend::EngineFallbackListBuilder_v8::build()</a>, <a class="el" href="../../db/d7d/cudnn__frontend__OperationGraph_8h_source.html#l00141">cudnn_frontend::OperationGraphBuilder_v8::build()</a>, <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html#l00155">cudnn_frontend::TensorBuilder_v8::build()</a>, <a class="el" href="../../d6/d67/cudnn__frontend__EngineConfig_8h_source.html#l00159">cudnn_frontend::EngineConfigBuilder_v8::build()</a>, <a class="el" href="../../db/d66/cudnn__frontend__Heuristics_8h_source.html#l00161">cudnn_frontend::EngineHeuristicsBuilder_v8::build()</a>, <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00172">cudnn_frontend::ConvDescBuilder_v8::build()</a>, <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00206">cudnn_frontend::PointWiseDescBuilder_v8::build()</a>, <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00243">cudnn_frontend::ExecutionPlanBuilder_v8::build()</a>, <a class="el" href="../../de/d6d/cudnn__frontend__Engine_8h_source.html#l00262">cudnn_frontend::EngineBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00389">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../de/d6d/cudnn__frontend__Engine_8h_source.html#l00122">cudnn_frontend::Engine_v8::buildKnobs()</a>, <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00104">cudnn_frontend::ExecutionPlan_v8::computeTag()</a>, <a class="el" href="../../de/d6d/cudnn__frontend__Engine_8h_source.html#l00174">cudnn_frontend::Engine_v8::Engine_v8()</a>, <a class="el" href="../../d6/d67/cudnn__frontend__EngineConfig_8h_source.html#l00076">cudnn_frontend::EngineConfig_v8::EngineConfig_v8()</a>, <a class="el" href="../../db/d66/cudnn__frontend__Heuristics_8h_source.html#l00069">cudnn_frontend::EngineHeuristics_v8::getEngineConfig()</a>, <a class="el" href="../../db/d66/cudnn__frontend__Heuristics_8h_source.html#l00103">cudnn_frontend::EngineHeuristics_v8::getEngineConfigCount()</a>, <a class="el" href="../../db/d7d/cudnn__frontend__OperationGraph_8h_source.html#l00076">cudnn_frontend::OperationGraph_v8::getEngineCount()</a>, <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00067">cudnn_frontend::ExecutionPlan_v8::getWorkspaceSize()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00252">cudnn_frontend::OperationBuilder_v8::setaMatDesc()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00192">cudnn_frontend::OperationBuilder_v8::setbDesc()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00263">cudnn_frontend::OperationBuilder_v8::setbMatDesc()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00241">cudnn_frontend::OperationBuilder_v8::setcDesc()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00274">cudnn_frontend::OperationBuilder_v8::setcMatDesc()</a>, <a class="el" href="../../d6/d67/cudnn__frontend__EngineConfig_8h_source.html#l00111">cudnn_frontend::EngineConfigBuilder_v8::setEngine()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00285">cudnn_frontend::OperationBuilder_v8::setmatmulDesc()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00296">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00208">cudnn_frontend::OperationBuilder_v8::setwDesc()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../d6/d32/cudnn__frontend__MatMulDesc_8h_source.html#l00093">cudnn_frontend::MatMulDescBuilder_v8::build()</a>, <a class="el" href="../../db/da7/cudnn__frontend__ReductionDesc_8h_source.html#l00102">cudnn_frontend::ReductionDescBuilder_v8::build()</a>, <a class="el" href="../../df/dc0/cudnn__frontend__VariantPack_8h_source.html#l00128">cudnn_frontend::VariantPackBuilder_v8::build()</a>, <a class="el" href="../../df/d3e/cudnn__frontend__EngineFallbackList_8h_source.html#l00144">cudnn_frontend::EngineFallbackListBuilder_v8::build()</a>, <a class="el" href="../../db/d7d/cudnn__frontend__OperationGraph_8h_source.html#l00146">cudnn_frontend::OperationGraphBuilder_v8::build()</a>, <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html#l00155">cudnn_frontend::TensorBuilder_v8::build()</a>, <a class="el" href="../../d6/d67/cudnn__frontend__EngineConfig_8h_source.html#l00159">cudnn_frontend::EngineConfigBuilder_v8::build()</a>, <a class="el" href="../../db/d66/cudnn__frontend__Heuristics_8h_source.html#l00161">cudnn_frontend::EngineHeuristicsBuilder_v8::build()</a>, <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00172">cudnn_frontend::ConvDescBuilder_v8::build()</a>, <a class="el" href="../../da/d5f/cudnn__frontend__PointWiseDesc_8h_source.html#l00206">cudnn_frontend::PointWiseDescBuilder_v8::build()</a>, <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00243">cudnn_frontend::ExecutionPlanBuilder_v8::build()</a>, <a class="el" href="../../de/d6d/cudnn__frontend__Engine_8h_source.html#l00262">cudnn_frontend::EngineBuilder_v8::build()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00407">cudnn_frontend::OperationBuilder_v8::build()</a>, <a class="el" href="../../de/d6d/cudnn__frontend__Engine_8h_source.html#l00122">cudnn_frontend::Engine_v8::buildKnobs()</a>, <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00104">cudnn_frontend::ExecutionPlan_v8::computeTag()</a>, <a class="el" href="../../de/d6d/cudnn__frontend__Engine_8h_source.html#l00174">cudnn_frontend::Engine_v8::Engine_v8()</a>, <a class="el" href="../../d6/d67/cudnn__frontend__EngineConfig_8h_source.html#l00076">cudnn_frontend::EngineConfig_v8::EngineConfig_v8()</a>, <a class="el" href="../../db/d66/cudnn__frontend__Heuristics_8h_source.html#l00069">cudnn_frontend::EngineHeuristics_v8::getEngineConfig()</a>, <a class="el" href="../../db/d66/cudnn__frontend__Heuristics_8h_source.html#l00103">cudnn_frontend::EngineHeuristics_v8::getEngineConfigCount()</a>, <a class="el" href="../../db/d7d/cudnn__frontend__OperationGraph_8h_source.html#l00076">cudnn_frontend::OperationGraph_v8::getEngineCount()</a>, <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00067">cudnn_frontend::ExecutionPlan_v8::getWorkspaceSize()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00258">cudnn_frontend::OperationBuilder_v8::setaMatDesc()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00198">cudnn_frontend::OperationBuilder_v8::setbDesc()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00269">cudnn_frontend::OperationBuilder_v8::setbMatDesc()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00247">cudnn_frontend::OperationBuilder_v8::setcDesc()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00280">cudnn_frontend::OperationBuilder_v8::setcMatDesc()</a>, <a class="el" href="../../d6/d67/cudnn__frontend__EngineConfig_8h_source.html#l00111">cudnn_frontend::EngineConfigBuilder_v8::setEngine()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00291">cudnn_frontend::OperationBuilder_v8::setmatmulDesc()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00313">cudnn_frontend::OperationBuilder_v8::setpwDesc()</a>, <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00302">cudnn_frontend::OperationBuilder_v8::setreductionDesc()</a>, and <a class="el" href="../../da/d5a/cudnn__frontend__Operation_8h_source.html#l00214">cudnn_frontend::OperationBuilder_v8::setwDesc()</a>.</p>
 
 </div>
 </div>

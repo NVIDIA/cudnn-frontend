@@ -1,0 +1,1515 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d6/d30/classnlohmann_1_1detail_1_1binary__reader" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::binary_reader</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+      <param>
+        <type>typename InputAdapterType</type>
+      </param>
+      <param>
+        <type>typename SAX</type>
+        <defval><ref refid="dc/d68/classnlohmann_1_1detail_1_1json__sax__dom__parser" kindref="compound">json_sax_dom_parser</ref>&lt;BasicJsonType&gt;</defval>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="private-type">
+      <memberdef kind="typedef" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a2b46c2a929071fdb0b028befa77814bd" prot="private" static="no">
+        <type>typename BasicJsonType::number_integer_t</type>
+        <definition>using nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::number_integer_t =  typename BasicJsonType::number_integer_t</definition>
+        <argsstring></argsstring>
+        <name>number_integer_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8241" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8241" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a02a70f424099428d9a69606b7fb7074a" prot="private" static="no">
+        <type>typename BasicJsonType::number_unsigned_t</type>
+        <definition>using nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::number_unsigned_t =  typename BasicJsonType::number_unsigned_t</definition>
+        <argsstring></argsstring>
+        <name>number_unsigned_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8242" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8242" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ae4f1a7d10118d578ad03f7ee36df6fbe" prot="private" static="no">
+        <type>typename BasicJsonType::number_float_t</type>
+        <definition>using nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::number_float_t =  typename BasicJsonType::number_float_t</definition>
+        <argsstring></argsstring>
+        <name>number_float_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8243" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8243" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a823c244e5dbf1a8edae40819f9434237" prot="private" static="no">
+        <type>typename BasicJsonType::string_t</type>
+        <definition>using nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::string_t =  typename BasicJsonType::string_t</definition>
+        <argsstring></argsstring>
+        <name>string_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8244" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8244" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1acf127bb88e4147fb692edabc2a0f0663" prot="private" static="no">
+        <type>typename BasicJsonType::binary_t</type>
+        <definition>using nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::binary_t =  typename BasicJsonType::binary_t</definition>
+        <argsstring></argsstring>
+        <name>binary_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8245" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8245" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a4c33ab78a0df5afd524f16887550436d" prot="private" static="no">
+        <type>SAX</type>
+        <definition>using nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::json_sax_t =  SAX</definition>
+        <argsstring></argsstring>
+        <name>json_sax_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8246" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8246" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1abc20ff256868de6791b3646ab33fff76" prot="private" static="no">
+        <type>typename InputAdapterType::char_type</type>
+        <definition>using nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::char_type =  typename InputAdapterType::char_type</definition>
+        <argsstring></argsstring>
+        <name>char_type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8247" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8247" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aa12ade9a8c0acaebef6399e3d446b970" prot="private" static="no">
+        <type>typename std::char_traits&lt; <ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1abc20ff256868de6791b3646ab33fff76" kindref="member">char_type</ref> &gt;::int_type</type>
+        <definition>using nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::char_int_type =  typename std::char_traits&lt;char_type&gt;::int_type</definition>
+        <argsstring></argsstring>
+        <name>char_int_type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8248" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8248" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a548c770e60f2285a931de4b7333c1ab0" prot="private" static="no" mutable="no">
+        <type>InputAdapterType</type>
+        <definition>InputAdapterType nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::ia</definition>
+        <argsstring></argsstring>
+        <name>ia</name>
+        <briefdescription>
+<para>input adapter </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10628" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10628" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ab47df98119524e9c7d9ff0b820913883" prot="private" static="no" mutable="no">
+        <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aa12ade9a8c0acaebef6399e3d446b970" kindref="member">char_int_type</ref></type>
+        <definition>char_int_type nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::current</definition>
+        <argsstring></argsstring>
+        <name>current</name>
+        <initializer>= std::char_traits&lt;<ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1abc20ff256868de6791b3646ab33fff76" kindref="member">char_type</ref>&gt;::eof()</initializer>
+        <briefdescription>
+<para>the current character </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10631" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10631" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aa03c779d4512b5764895dc341b0ef902" prot="private" static="no" mutable="no">
+        <type>std::size_t</type>
+        <definition>std::size_t nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::chars_read</definition>
+        <argsstring></argsstring>
+        <name>chars_read</name>
+        <initializer>= 0</initializer>
+        <briefdescription>
+<para>the number of characters read </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10634" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10634" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ad615eba561e265165a80c95061af75b0" prot="private" static="no" mutable="no">
+        <type>const bool</type>
+        <definition>const bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::is_little_endian</definition>
+        <argsstring></argsstring>
+        <name>is_little_endian</name>
+        <initializer>= <ref refid="dc/df0/namespacenlohmann_1_1detail_1ad2860d9bcd96cd7b8258a5b94674508c" kindref="member">little_endianess</ref>()</initializer>
+        <briefdescription>
+<para>whether we can assume little endianess </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10637" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10637" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aba4d89d9d38235f72f60332d6c385222" prot="private" static="no" mutable="no">
+        <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a4c33ab78a0df5afd524f16887550436d" kindref="member">json_sax_t</ref> *</type>
+        <definition>json_sax_t* nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::sax</definition>
+        <argsstring></argsstring>
+        <name>sax</name>
+        <initializer>= nullptr</initializer>
+        <briefdescription>
+<para>the SAX parser </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10640" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10640" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a2aee4c3507eca623f7cec32544fdc5b2" prot="public" static="no" const="no" explicit="yes" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::binary_reader</definition>
+        <argsstring>(InputAdapterType &amp;&amp;adapter) noexcept</argsstring>
+        <name>binary_reader</name>
+        <param>
+          <type>InputAdapterType &amp;&amp;</type>
+          <declname>adapter</declname>
+        </param>
+        <briefdescription>
+<para>create a binary reader </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">adapter</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>input adapter to read from </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8256" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8256" bodyend="8259"/>
+        <references refid="d5/db8/json_8hpp_1a5338981b5ad9027c9e54b1c5597f4344" compoundref="d5/db8/json_8hpp" startline="1456">JSON_HEDLEY_NON_NULL</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" compoundref="d5/db8/json_8hpp" startline="4061" endline="4069">nlohmann::detail::void</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ab29d56b1e980a7b9a3383cf1ce862d1b" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::binary_reader</definition>
+        <argsstring>(const binary_reader &amp;)=delete</argsstring>
+        <name>binary_reader</name>
+        <param>
+          <type>const <ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader" kindref="compound">binary_reader</ref> &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8262" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1acca2c4076df85f27dc1c904475e05c26" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::binary_reader</definition>
+        <argsstring>(binary_reader &amp;&amp;)=default</argsstring>
+        <name>binary_reader</name>
+        <param>
+          <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader" kindref="compound">binary_reader</ref> &amp;&amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8263" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a35abcd6b3231a4c9d651f9c0eb610c96" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader" kindref="compound">binary_reader</ref> &amp;</type>
+        <definition>binary_reader&amp; nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::operator=</definition>
+        <argsstring>(const binary_reader &amp;)=delete</argsstring>
+        <name>operator=</name>
+        <param>
+          <type>const <ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader" kindref="compound">binary_reader</ref> &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8264" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ad3dc8b0f8ef6035465c14ed7dcbb67d4" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader" kindref="compound">binary_reader</ref> &amp;</type>
+        <definition>binary_reader&amp; nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::operator=</definition>
+        <argsstring>(binary_reader &amp;&amp;)=default</argsstring>
+        <name>operator=</name>
+        <param>
+          <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader" kindref="compound">binary_reader</ref> &amp;&amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8265" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a359031cba136452d9030ed9ab4517b74" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::~binary_reader</definition>
+        <argsstring>()=default</argsstring>
+        <name>~binary_reader</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8266" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ab4afd9ee276bbb15a0f898061aad94dd" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::sax_parse</definition>
+        <argsstring>(const input_format_t format, json_sax_t *sax_, const bool strict=true, const cbor_tag_handler_t tag_handler=cbor_tag_handler_t::error)</argsstring>
+        <name>sax_parse</name>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40" kindref="member">input_format_t</ref></type>
+          <declname>format</declname>
+        </param>
+        <param>
+          <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a4c33ab78a0df5afd524f16887550436d" kindref="member">json_sax_t</ref> *</type>
+          <declname>sax_</declname>
+        </param>
+        <param>
+          <type>const bool</type>
+          <declname>strict</declname>
+          <defval>true</defval>
+        </param>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1a58bb1ef1a9ad287a9cfaf1855784d9ac" kindref="member">cbor_tag_handler_t</ref></type>
+          <declname>tag_handler</declname>
+          <defval><ref refid="dc/df0/namespacenlohmann_1_1detail_1a58bb1ef1a9ad287a9cfaf1855784d9acacb5e100e5a9a3e7f6d1fd97512215282" kindref="member">cbor_tag_handler_t::error</ref></defval>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">format</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the binary format to parse </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">sax_</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>a SAX event processor </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">strict</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>whether to expect the input to be consumed completed </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">tag_handler</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>how to treat CBOR tags</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether parsing was successful </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8277" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8277" bodyend="8327"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a0b6879b186bfb2b1ec65d2460e4eccd4">nlohmann::detail::bson</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40aaf9de350d652f0c9055ddab514bd23ea">nlohmann::detail::cbor</references>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40ac40d516627022a54003ac2b74a82688a">nlohmann::detail::msgpack</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a5a76b60b26dc8c47256a996d18d967dfa2133fd717402a7966ee88d06f9e0b792">nlohmann::detail::strict</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a4537f20910e85437f6d07701864084e8">nlohmann::detail::ubjson</references>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-func">
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1abf2051ba57d9ea9b378a2e7c14e22b34" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::parse_bson_internal</definition>
+        <argsstring>()</argsstring>
+        <name>parse_bson_internal</name>
+        <briefdescription>
+<para>Reads in a BSON-object and passes it to the SAX-parser. </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>whether a valid BSON-value was passed to the SAX parser </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8338" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8338" bodyend="8354"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a0b6879b186bfb2b1ec65d2460e4eccd4">nlohmann::detail::bson</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a354cbbaaea672c024ac949e1801c4302" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_bson_cstr</definition>
+        <argsstring>(string_t &amp;result)</argsstring>
+        <name>get_bson_cstr</name>
+        <param>
+          <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a823c244e5dbf1a8edae40819f9434237" kindref="member">string_t</ref> &amp;</type>
+          <declname>result</declname>
+        </param>
+        <briefdescription>
+<para>Parses a C-style string from the BSON input. </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="inout">result</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>A reference to the string variable where the read string is to be stored. </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para><computeroutput>true</computeroutput> if the -byte indicating the end of the string was encountered before the EOF; false` indicates an unexpected EOF. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8363" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8363" bodyend="8379"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a0b6879b186bfb2b1ec65d2460e4eccd4">nlohmann::detail::bson</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a23921422802aa472360dd05023e20565" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename NumberType</type>
+          </param>
+        </templateparamlist>
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_bson_string</definition>
+        <argsstring>(const NumberType len, string_t &amp;result)</argsstring>
+        <name>get_bson_string</name>
+        <param>
+          <type>const NumberType</type>
+          <declname>len</declname>
+        </param>
+        <param>
+          <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a823c244e5dbf1a8edae40819f9434237" kindref="member">string_t</ref> &amp;</type>
+          <declname>result</declname>
+        </param>
+        <briefdescription>
+<para>Parses a zero-terminated string of length <emphasis>len</emphasis> from the BSON input. </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">len</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>The length (including the zero-byte at the end) of the string to be read. </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="inout">result</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>A reference to the string variable where the read string is to be stored. </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<parameterlist kind="templateparam"><parameteritem>
+<parameternamelist>
+<parametername>NumberType</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>The type of the length <emphasis>len</emphasis> </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="pre"><para>len &gt;= 1 </para></simplesect>
+<simplesect kind="return"><para><computeroutput>true</computeroutput> if the string was successfully parsed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8393" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8393" bodyend="8402"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a0b6879b186bfb2b1ec65d2460e4eccd4">nlohmann::detail::bson</references>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a9940f56290b9278c58772eda2931e599" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename NumberType</type>
+          </param>
+        </templateparamlist>
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_bson_binary</definition>
+        <argsstring>(const NumberType len, binary_t &amp;result)</argsstring>
+        <name>get_bson_binary</name>
+        <param>
+          <type>const NumberType</type>
+          <declname>len</declname>
+        </param>
+        <param>
+          <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1acf127bb88e4147fb692edabc2a0f0663" kindref="member">binary_t</ref> &amp;</type>
+          <declname>result</declname>
+        </param>
+        <briefdescription>
+<para>Parses a byte array input of length <emphasis>len</emphasis> from the BSON input. </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">len</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>The length of the byte array to be read. </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="inout">result</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>A reference to the binary variable where the read array is to be stored. </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<parameterlist kind="templateparam"><parameteritem>
+<parameternamelist>
+<parametername>NumberType</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>The type of the length <emphasis>len</emphasis> </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="pre"><para>len &gt;= 0 </para></simplesect>
+<simplesect kind="return"><para><computeroutput>true</computeroutput> if the byte array was successfully parsed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8414" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8414" bodyend="8428"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a0b6879b186bfb2b1ec65d2460e4eccd4">nlohmann::detail::bson</references>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a23bde2450d7a5772bf5051e36ff560a4" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::parse_bson_element_internal</definition>
+        <argsstring>(const char_int_type element_type, const std::size_t element_type_parse_position)</argsstring>
+        <name>parse_bson_element_internal</name>
+        <param>
+          <type>const <ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aa12ade9a8c0acaebef6399e3d446b970" kindref="member">char_int_type</ref></type>
+          <declname>element_type</declname>
+        </param>
+        <param>
+          <type>const std::size_t</type>
+          <declname>element_type_parse_position</declname>
+        </param>
+        <briefdescription>
+<para>Read a BSON document element of the given <emphasis>element_type</emphasis>. </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">element_type</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>The BSON element type, c.f. <ulink url="http://bsonspec.org/spec.html">http://bsonspec.org/spec.html</ulink> </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">element_type_parse_position</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>The position in the input stream, where the <computeroutput>element_type</computeroutput> was read. </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="warning"><para>Not all BSON element types are supported yet. An unsupported <emphasis>element_type</emphasis> will give rise to a parse_error.114: Unsupported BSON record type 0x... </para></simplesect>
+<simplesect kind="return"><para>whether a valid BSON-object/array was passed to the SAX parser </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8440" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8440" bodyend="8504"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a0b6879b186bfb2b1ec65d2460e4eccd4">nlohmann::detail::bson</references>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804">nlohmann::detail::value</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a4e07b75ccb2579d0e738b894f0fd8cf8" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::parse_bson_element_list</definition>
+        <argsstring>(const bool is_array)</argsstring>
+        <name>parse_bson_element_list</name>
+        <param>
+          <type>const bool</type>
+          <declname>is_array</declname>
+        </param>
+        <briefdescription>
+<para>Read a BSON element list (as specified in the BSON-spec) </para>        </briefdescription>
+        <detaileddescription>
+<para>The same binary layout is used for objects and arrays, hence it must be indicated with the argument <emphasis>is_array</emphasis> which one is expected (true <ndash/>&gt; array, false <ndash/>&gt; object).</para><para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">is_array</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>Determines if the element list being read is to be treated as an object (<emphasis>is_array</emphasis> == false), or as an array (<emphasis>is_array</emphasis> == true). </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether a valid BSON-object/array was passed to the SAX parser </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8518" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8518" bodyend="8550"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a0b6879b186bfb2b1ec65d2460e4eccd4">nlohmann::detail::bson</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa3c6e0b8a9c15224a8228b9a98ca1531d">nlohmann::detail::key</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a23eb89a222e22533e9fd43e76722f44f" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::parse_bson_array</definition>
+        <argsstring>()</argsstring>
+        <name>parse_bson_array</name>
+        <briefdescription>
+<para>Reads an array from the BSON input and passes it to the SAX-parser. </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>whether a valid BSON-array was passed to the SAX parser </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8556" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8556" bodyend="8572"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a0b6879b186bfb2b1ec65d2460e4eccd4">nlohmann::detail::bson</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a4e4accd5a2a41bfb2f18a8a0fcc9421c" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::parse_cbor_internal</definition>
+        <argsstring>(const bool get_char, const cbor_tag_handler_t tag_handler)</argsstring>
+        <name>parse_cbor_internal</name>
+        <param>
+          <type>const bool</type>
+          <declname>get_char</declname>
+        </param>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1a58bb1ef1a9ad287a9cfaf1855784d9ac" kindref="member">cbor_tag_handler_t</ref></type>
+          <declname>tag_handler</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">get_char</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>whether a new character should be retrieved from the input (true) or whether the last read character should be considered instead (false) </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">tag_handler</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>how CBOR tags should be treated</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether a valid CBOR value was passed to the SAX parser </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8586" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8586" bodyend="9019"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40aaf9de350d652f0c9055ddab514bd23ea">nlohmann::detail::cbor</references>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a58bb1ef1a9ad287a9cfaf1855784d9acacb5e100e5a9a3e7f6d1fd97512215282">nlohmann::detail::error</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a58bb1ef1a9ad287a9cfaf1855784d9aca567bc1d268f135496de3d5b946b691f3">nlohmann::detail::ignore</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a545a44ae4b3fa2b7a61d9e8517fb7154" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_cbor_string</definition>
+        <argsstring>(string_t &amp;result)</argsstring>
+        <name>get_cbor_string</name>
+        <param>
+          <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a823c244e5dbf1a8edae40819f9434237" kindref="member">string_t</ref> &amp;</type>
+          <declname>result</declname>
+        </param>
+        <briefdescription>
+<para>reads a CBOR string </para>        </briefdescription>
+        <detaileddescription>
+<para>This function first reads starting bytes to determine the expected string length and then copies this number of bytes into a string. Additionally, CBOR&apos;s strings with indefinite lengths are supported.</para><para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="out">result</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>created string</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether string creation completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="9032" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="9032" bodyend="9114"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40aaf9de350d652f0c9055ddab514bd23ea">nlohmann::detail::cbor</references>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1acb001d18095dc5bcf7336ae5122b8340" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_cbor_binary</definition>
+        <argsstring>(binary_t &amp;result)</argsstring>
+        <name>get_cbor_binary</name>
+        <param>
+          <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1acf127bb88e4147fb692edabc2a0f0663" kindref="member">binary_t</ref> &amp;</type>
+          <declname>result</declname>
+        </param>
+        <briefdescription>
+<para>reads a CBOR byte array </para>        </briefdescription>
+        <detaileddescription>
+<para>This function first reads starting bytes to determine the expected byte array length and then copies this number of bytes into the byte array. Additionally, CBOR&apos;s byte arrays with indefinite lengths are supported.</para><para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="out">result</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>created byte array</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether byte array creation completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="9127" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="9127" bodyend="9213"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40aaf9de350d652f0c9055ddab514bd23ea">nlohmann::detail::cbor</references>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a3750658328bf3ec3cf23f1626f9ec3af" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_cbor_array</definition>
+        <argsstring>(const std::size_t len, const cbor_tag_handler_t tag_handler)</argsstring>
+        <name>get_cbor_array</name>
+        <param>
+          <type>const std::size_t</type>
+          <declname>len</declname>
+        </param>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1a58bb1ef1a9ad287a9cfaf1855784d9ac" kindref="member">cbor_tag_handler_t</ref></type>
+          <declname>tag_handler</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">len</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the length of the array or std::size_t(-1) for an array of indefinite size </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">tag_handler</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>how CBOR tags should be treated </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether array creation completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="9221" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="9221" bodyend="9251"/>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a47092a2195bf9cd3cdb4dda67cc404ed" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_cbor_object</definition>
+        <argsstring>(const std::size_t len, const cbor_tag_handler_t tag_handler)</argsstring>
+        <name>get_cbor_object</name>
+        <param>
+          <type>const std::size_t</type>
+          <declname>len</declname>
+        </param>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1a58bb1ef1a9ad287a9cfaf1855784d9ac" kindref="member">cbor_tag_handler_t</ref></type>
+          <declname>tag_handler</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">len</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the length of the object or std::size_t(-1) for an object of indefinite size </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">tag_handler</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>how CBOR tags should be treated </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether object creation completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="9259" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="9259" bodyend="9303"/>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa3c6e0b8a9c15224a8228b9a98ca1531d">nlohmann::detail::key</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ae020385ce9424271d61f85d3842c02cb" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::parse_msgpack_internal</definition>
+        <argsstring>()</argsstring>
+        <name>parse_msgpack_internal</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>whether a valid MessagePack value was passed to the SAX parser </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="9312" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="9312" bodyend="9680"/>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40ac40d516627022a54003ac2b74a82688a">nlohmann::detail::msgpack</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ad8cba5585327caa550dd5b6dd25a64f8" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_msgpack_string</definition>
+        <argsstring>(string_t &amp;result)</argsstring>
+        <name>get_msgpack_string</name>
+        <param>
+          <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a823c244e5dbf1a8edae40819f9434237" kindref="member">string_t</ref> &amp;</type>
+          <declname>result</declname>
+        </param>
+        <briefdescription>
+<para>reads a MessagePack string </para>        </briefdescription>
+        <detaileddescription>
+<para>This function first reads starting bytes to determine the expected string length and then copies this number of bytes into a string.</para><para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="out">result</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>created string</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether string creation completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="9692" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="9692" bodyend="9762"/>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40ac40d516627022a54003ac2b74a82688a">nlohmann::detail::msgpack</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a389e550fd397a48121cb82d92bb7475a" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_msgpack_binary</definition>
+        <argsstring>(binary_t &amp;result)</argsstring>
+        <name>get_msgpack_binary</name>
+        <param>
+          <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1acf127bb88e4147fb692edabc2a0f0663" kindref="member">binary_t</ref> &amp;</type>
+          <declname>result</declname>
+        </param>
+        <briefdescription>
+<para>reads a MessagePack byte array </para>        </briefdescription>
+        <detaileddescription>
+<para>This function first reads starting bytes to determine the expected byte array length and then copies this number of bytes into a byte array.</para><para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="out">result</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>created byte array</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether byte array creation completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="9774" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="9774" bodyend="9879"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40ac40d516627022a54003ac2b74a82688a">nlohmann::detail::msgpack</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a0ce1d7066597952efb008aaf578b2bd6" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_msgpack_array</definition>
+        <argsstring>(const std::size_t len)</argsstring>
+        <name>get_msgpack_array</name>
+        <param>
+          <type>const std::size_t</type>
+          <declname>len</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">len</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the length of the array </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether array creation completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="9885" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="9885" bodyend="9901"/>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a8bebd21ceef09b6b2562e87861832700" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_msgpack_object</definition>
+        <argsstring>(const std::size_t len)</argsstring>
+        <name>get_msgpack_object</name>
+        <param>
+          <type>const std::size_t</type>
+          <declname>len</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">len</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the length of the object </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether object creation completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="9907" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="9907" bodyend="9931"/>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa3c6e0b8a9c15224a8228b9a98ca1531d">nlohmann::detail::key</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a5a79480d661019b0f3fc615ae12f7de7" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::parse_ubjson_internal</definition>
+        <argsstring>(const bool get_char=true)</argsstring>
+        <name>parse_ubjson_internal</name>
+        <param>
+          <type>const bool</type>
+          <declname>get_char</declname>
+          <defval>true</defval>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">get_char</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>whether a new character should be retrieved from the input (true, default) or whether the last read character should be considered instead</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether a valid UBJSON value was passed to the SAX parser </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="9944" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="9944" bodyend="9947"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a4ae90db51c102e912b7eac83c78733a6" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_ubjson_string</definition>
+        <argsstring>(string_t &amp;result, const bool get_char=true)</argsstring>
+        <name>get_ubjson_string</name>
+        <param>
+          <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a823c244e5dbf1a8edae40819f9434237" kindref="member">string_t</ref> &amp;</type>
+          <declname>result</declname>
+        </param>
+        <param>
+          <type>const bool</type>
+          <declname>get_char</declname>
+          <defval>true</defval>
+        </param>
+        <briefdescription>
+<para>reads a UBJSON string </para>        </briefdescription>
+        <detaileddescription>
+<para>This function is either called after reading the &apos;S&apos; byte explicitly indicating a string, or in case of an object key where the &apos;S&apos; byte can be left out.</para><para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="out">result</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>created string </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">get_char</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>whether a new character should be retrieved from the input (true, default) or whether the last read character should be considered instead</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether string creation completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="9963" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="9963" bodyend="10011"/>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a4537f20910e85437f6d07701864084e8">nlohmann::detail::ubjson</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aba7ba9ec9a52ad2bee8baff70176aa20" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_ubjson_size_value</definition>
+        <argsstring>(std::size_t &amp;result)</argsstring>
+        <name>get_ubjson_size_value</name>
+        <param>
+          <type>std::size_t &amp;</type>
+          <declname>result</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="out">result</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>determined size </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether size determination completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10017" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10017" bodyend="10082"/>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a4537f20910e85437f6d07701864084e8">nlohmann::detail::ubjson</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a7b6c2d4c95d56751e233e285a5f1fea7" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_ubjson_size_type</definition>
+        <argsstring>(std::pair&lt; std::size_t, char_int_type &gt; &amp;result)</argsstring>
+        <name>get_ubjson_size_type</name>
+        <param>
+          <type>std::pair&lt; std::size_t, <ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aa12ade9a8c0acaebef6399e3d446b970" kindref="member">char_int_type</ref> &gt; &amp;</type>
+          <declname>result</declname>
+        </param>
+        <briefdescription>
+<para>determine the type and size for a container </para>        </briefdescription>
+        <detaileddescription>
+<para>In the optimized UBJSON format, a type and a size can be provided to allow for a more compact representation.</para><para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="out">result</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>pair of the size and the type</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether pair creation completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10094" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10094" bodyend="10129"/>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a4537f20910e85437f6d07701864084e8">nlohmann::detail::ubjson</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a7e5e0b71548d0649ce4f131280d06c33" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_ubjson_value</definition>
+        <argsstring>(const char_int_type prefix)</argsstring>
+        <name>get_ubjson_value</name>
+        <param>
+          <type>const <ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aa12ade9a8c0acaebef6399e3d446b970" kindref="member">char_int_type</ref></type>
+          <declname>prefix</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername>prefix</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the previously read or set type prefix </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether value creation completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10135" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10135" bodyend="10231"/>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a4537f20910e85437f6d07701864084e8">nlohmann::detail::ubjson</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1afb36cb588b795efa513fc95e949493b7" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_ubjson_array</definition>
+        <argsstring>()</argsstring>
+        <name>get_ubjson_array</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>whether array creation completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10236" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10236" bodyend="10293"/>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1adcf64ad3207f4bf37a5a31c920a385c3" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_ubjson_object</definition>
+        <argsstring>()</argsstring>
+        <name>get_ubjson_object</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>whether object creation completed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10298" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10298" bodyend="10368"/>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa3c6e0b8a9c15224a8228b9a98ca1531d">nlohmann::detail::key</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a26c694413fb860057e1a839d5422b361" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_ubjson_high_precision_number</definition>
+        <argsstring>()</argsstring>
+        <name>get_ubjson_high_precision_number</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10373" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10373" bodyend="10420"/>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1ad11a087dbe66eade5af4056aef9600bf" compoundref="d5/db8/json_8hpp" startline="5594" endline="5598">nlohmann::detail::input_adapter</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+        <references refid="d8/d22/classnlohmann_1_1detail_1_1lexer_1a40320a8fef5f1f03b60c8b2f2f40af4d" compoundref="d5/db8/json_8hpp" startline="7924" endline="8010">nlohmann::detail::lexer&lt; BasicJsonType, InputAdapterType &gt;::scan</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a4537f20910e85437f6d07701864084e8">nlohmann::detail::ubjson</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ad222095c0b21a87824cb10629299629a" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aa12ade9a8c0acaebef6399e3d446b970" kindref="member">char_int_type</ref></type>
+        <definition>char_int_type nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get</definition>
+        <argsstring>()</argsstring>
+        <name>get</name>
+        <briefdescription>
+<para>get next character from the input </para>        </briefdescription>
+        <detaileddescription>
+<para>This function provides the interface to the used input adapter. It does not throw in case the input reached EOF, but returns a -&apos;ve valued <computeroutput>std::char_traits&lt;char_type&gt;::eof()</computeroutput> in that case.</para><para><simplesect kind="return"><para>character read from the input </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10435" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10435" bodyend="10439"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a252c1179651d22c5343bcf0b538ed26a" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aa12ade9a8c0acaebef6399e3d446b970" kindref="member">char_int_type</ref></type>
+        <definition>char_int_type nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_ignore_noop</definition>
+        <argsstring>()</argsstring>
+        <name>get_ignore_noop</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>character read from the input after ignoring all &apos;N&apos; entries </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10444" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10444" bodyend="10453"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ac356c6364fe0273d3303fb7a447f4ef6" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename NumberType</type>
+          </param>
+          <param>
+            <type>bool</type>
+            <declname>InputIsLittleEndian</declname>
+            <defname>InputIsLittleEndian</defname>
+            <defval>false</defval>
+          </param>
+        </templateparamlist>
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_number</definition>
+        <argsstring>(const input_format_t format, NumberType &amp;result)</argsstring>
+        <name>get_number</name>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40" kindref="member">input_format_t</ref></type>
+          <declname>format</declname>
+        </param>
+        <param>
+          <type>NumberType &amp;</type>
+          <declname>result</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10469" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10469" bodyend="10495"/>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a540919db22df36512f05a88945c13263" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename NumberType</type>
+          </param>
+        </templateparamlist>
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_string</definition>
+        <argsstring>(const input_format_t format, const NumberType len, string_t &amp;result)</argsstring>
+        <name>get_string</name>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40" kindref="member">input_format_t</ref></type>
+          <declname>format</declname>
+        </param>
+        <param>
+          <type>const NumberType</type>
+          <declname>len</declname>
+        </param>
+        <param>
+          <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a823c244e5dbf1a8edae40819f9434237" kindref="member">string_t</ref> &amp;</type>
+          <declname>result</declname>
+        </param>
+        <briefdescription>
+<para>create a string by reading characters from the input </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="templateparam"><parameteritem>
+<parameternamelist>
+<parametername>NumberType</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the type of the number </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">format</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the current format (for diagnostics) </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">len</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>number of characters to read </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="out">result</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>string created by reading <emphasis>len</emphasis> bytes</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether string creation completed</para></simplesect>
+<simplesect kind="note"><para>We can not reserve <emphasis>len</emphasis> bytes for the result, because <emphasis>len</emphasis> may be too large. Usually, <ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a61a0bd8bbe7b560bd429fa990ba3ba1a" kindref="member">unexpect_eof()</ref> detects the end of the input before we run out of string memory. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10512" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10512" bodyend="10528"/>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a55e13d567a53234573ab3833c0ca32e9" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename NumberType</type>
+          </param>
+        </templateparamlist>
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_binary</definition>
+        <argsstring>(const input_format_t format, const NumberType len, binary_t &amp;result)</argsstring>
+        <name>get_binary</name>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40" kindref="member">input_format_t</ref></type>
+          <declname>format</declname>
+        </param>
+        <param>
+          <type>const NumberType</type>
+          <declname>len</declname>
+        </param>
+        <param>
+          <type><ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1acf127bb88e4147fb692edabc2a0f0663" kindref="member">binary_t</ref> &amp;</type>
+          <declname>result</declname>
+        </param>
+        <briefdescription>
+<para>create a byte array by reading bytes from the input </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="templateparam"><parameteritem>
+<parameternamelist>
+<parametername>NumberType</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the type of the number </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">format</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the current format (for diagnostics) </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">len</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>number of bytes to read </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="out">result</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>byte array created by reading <emphasis>len</emphasis> bytes</para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether byte array creation completed</para></simplesect>
+<simplesect kind="note"><para>We can not reserve <emphasis>len</emphasis> bytes for the result, because <emphasis>len</emphasis> may be too large. Usually, <ref refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a61a0bd8bbe7b560bd429fa990ba3ba1a" kindref="member">unexpect_eof()</ref> detects the end of the input before we run out of memory. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10545" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10545" bodyend="10561"/>
+        <references refid="d5/db8/json_8hpp_1a5338981b5ad9027c9e54b1c5597f4344" compoundref="d5/db8/json_8hpp" startline="1456">JSON_HEDLEY_NON_NULL</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a61a0bd8bbe7b560bd429fa990ba3ba1a" prot="private" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::unexpect_eof</definition>
+        <argsstring>(const input_format_t format, const char *context) const</argsstring>
+        <name>unexpect_eof</name>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40" kindref="member">input_format_t</ref></type>
+          <declname>format</declname>
+        </param>
+        <param>
+          <type>const char *</type>
+          <declname>context</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">format</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the current format (for diagnostics) </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">context</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>further context information (for diagnostics) </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether the last read character is not EOF </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10569" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10569" bodyend="10577"/>
+        <references refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" compoundref="d5/db8/json_8hpp" startline="2782" endline="2787">nlohmann::detail::parse_error::create</references>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a7d323283c60a0b89ee5eeadf5cb9a5ad" prot="private" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21" kindref="member">std::string</ref></type>
+        <definition>std::string nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_token_string</definition>
+        <argsstring>() const</argsstring>
+        <name>get_token_string</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>a string representation of the last read byte </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10582" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10582" bodyend="10587"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a9c413c9a1bade1ce345740f4d69156f0" prot="private" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21" kindref="member">std::string</ref></type>
+        <definition>std::string nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::exception_message</definition>
+        <argsstring>(const input_format_t format, const std::string &amp;detail, const std::string &amp;context) const</argsstring>
+        <name>exception_message</name>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40" kindref="member">input_format_t</ref></type>
+          <declname>format</declname>
+        </param>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21" kindref="member">std::string</ref> &amp;</type>
+          <declname>detail</declname>
+        </param>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21" kindref="member">std::string</ref> &amp;</type>
+          <declname>context</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">format</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the current format </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">detail</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>a detailed error message </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">context</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>further context information </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>a message string to use in the <ref refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error" kindref="compound">parse_error</ref> exceptions </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="10595" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="10595" bodyend="10624"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a0b6879b186bfb2b1ec65d2460e4eccd4">nlohmann::detail::bson</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40aaf9de350d652f0c9055ddab514bd23ea">nlohmann::detail::cbor</references>
+        <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40ac40d516627022a54003ac2b74a82688a">nlohmann::detail::msgpack</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1aa554fc6a11519e4f347deb25a9f0db40a4537f20910e85437f6d07701864084e8">nlohmann::detail::ubjson</references>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>deserialization of CBOR, MessagePack, and UBJSON values </para>    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="44">
+        <label>size_t</label>
+      </node>
+      <node id="41">
+        <label>json_sax_t *</label>
+      </node>
+      <node id="39">
+        <label>nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;</label>
+        <link refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader"/>
+        <childnode refid="40" relation="usage">
+          <edgelabel>-ia</edgelabel>
+        </childnode>
+        <childnode refid="41" relation="usage">
+          <edgelabel>-sax</edgelabel>
+        </childnode>
+        <childnode refid="42" relation="usage">
+          <edgelabel>-current</edgelabel>
+        </childnode>
+        <childnode refid="43" relation="usage">
+          <edgelabel>-is_little_endian</edgelabel>
+        </childnode>
+        <childnode refid="44" relation="usage">
+          <edgelabel>-chars_read</edgelabel>
+        </childnode>
+      </node>
+      <node id="42">
+        <label>int_type</label>
+      </node>
+      <node id="40">
+        <label>InputAdapterType</label>
+      </node>
+      <node id="43">
+        <label>bool</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="8240" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="8239" bodyend="10641"/>
+    <listofallmembers>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a2aee4c3507eca623f7cec32544fdc5b2" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>binary_reader</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ab29d56b1e980a7b9a3383cf1ce862d1b" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>binary_reader</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1acca2c4076df85f27dc1c904475e05c26" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>binary_reader</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1acf127bb88e4147fb692edabc2a0f0663" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>binary_t</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aa12ade9a8c0acaebef6399e3d446b970" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>char_int_type</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1abc20ff256868de6791b3646ab33fff76" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>char_type</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aa03c779d4512b5764895dc341b0ef902" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>chars_read</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ab47df98119524e9c7d9ff0b820913883" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>current</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a9c413c9a1bade1ce345740f4d69156f0" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>exception_message</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ad222095c0b21a87824cb10629299629a" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a55e13d567a53234573ab3833c0ca32e9" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_binary</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a9940f56290b9278c58772eda2931e599" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_bson_binary</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a354cbbaaea672c024ac949e1801c4302" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_bson_cstr</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a23921422802aa472360dd05023e20565" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_bson_string</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a3750658328bf3ec3cf23f1626f9ec3af" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_cbor_array</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1acb001d18095dc5bcf7336ae5122b8340" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_cbor_binary</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a47092a2195bf9cd3cdb4dda67cc404ed" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_cbor_object</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a545a44ae4b3fa2b7a61d9e8517fb7154" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_cbor_string</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a252c1179651d22c5343bcf0b538ed26a" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_ignore_noop</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a0ce1d7066597952efb008aaf578b2bd6" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_msgpack_array</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a389e550fd397a48121cb82d92bb7475a" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_msgpack_binary</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a8bebd21ceef09b6b2562e87861832700" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_msgpack_object</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ad8cba5585327caa550dd5b6dd25a64f8" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_msgpack_string</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ac356c6364fe0273d3303fb7a447f4ef6" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_number</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a540919db22df36512f05a88945c13263" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_string</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a7d323283c60a0b89ee5eeadf5cb9a5ad" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_token_string</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1afb36cb588b795efa513fc95e949493b7" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_ubjson_array</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a26c694413fb860057e1a839d5422b361" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_ubjson_high_precision_number</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1adcf64ad3207f4bf37a5a31c920a385c3" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_ubjson_object</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a7b6c2d4c95d56751e233e285a5f1fea7" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_ubjson_size_type</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aba7ba9ec9a52ad2bee8baff70176aa20" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_ubjson_size_value</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a4ae90db51c102e912b7eac83c78733a6" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_ubjson_string</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a7e5e0b71548d0649ce4f131280d06c33" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>get_ubjson_value</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a548c770e60f2285a931de4b7333c1ab0" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>ia</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ad615eba561e265165a80c95061af75b0" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>is_little_endian</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a4c33ab78a0df5afd524f16887550436d" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>json_sax_t</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ae4f1a7d10118d578ad03f7ee36df6fbe" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>number_float_t</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a2b46c2a929071fdb0b028befa77814bd" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>number_integer_t</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a02a70f424099428d9a69606b7fb7074a" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>number_unsigned_t</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a35abcd6b3231a4c9d651f9c0eb610c96" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>operator=</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ad3dc8b0f8ef6035465c14ed7dcbb67d4" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>operator=</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a23eb89a222e22533e9fd43e76722f44f" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>parse_bson_array</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a23bde2450d7a5772bf5051e36ff560a4" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>parse_bson_element_internal</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a4e07b75ccb2579d0e738b894f0fd8cf8" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>parse_bson_element_list</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1abf2051ba57d9ea9b378a2e7c14e22b34" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>parse_bson_internal</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a4e4accd5a2a41bfb2f18a8a0fcc9421c" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>parse_cbor_internal</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ae020385ce9424271d61f85d3842c02cb" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>parse_msgpack_internal</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a5a79480d661019b0f3fc615ae12f7de7" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>parse_ubjson_internal</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aba4d89d9d38235f72f60332d6c385222" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>sax</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ab4afd9ee276bbb15a0f898061aad94dd" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>sax_parse</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a823c244e5dbf1a8edae40819f9434237" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>string_t</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a61a0bd8bbe7b560bd429fa990ba3ba1a" prot="private" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>unexpect_eof</name></member>
+      <member refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a359031cba136452d9030ed9ab4517b74" prot="public" virt="non-virtual"><scope>nlohmann::detail::binary_reader</scope><name>~binary_reader</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

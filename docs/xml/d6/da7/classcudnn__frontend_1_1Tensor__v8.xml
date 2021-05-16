@@ -146,6 +146,7 @@
         <references refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1ae4842fc7fcb87f5b60228fb6fa391b61" compoundref="d3/d98/cudnn__frontend__Tensor_8h" startline="96">btensor_strA</references>
         <references refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1ae9a3d128db54fa92d392e77044f30ca9" compoundref="d3/d98/cudnn__frontend__Tensor_8h" startline="94">data_type</references>
         <references refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a1370de050fc91e9d992995fae5f22011" compoundref="d3/d98/cudnn__frontend__Tensor_8h" startline="100">nDims</references>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
       </memberdef>
       <memberdef kind="function" id="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a9df78edb662e32a63680281eb33a14a8" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type></type>
@@ -241,71 +242,71 @@
 <listitem><para>dataType</para></listitem><listitem><para>alignment</para></listitem><listitem><para>unique identifier</para></listitem><listitem><para>tensor dimensions</para></listitem><listitem><para>tensor strides</para></listitem><listitem><para>isVirtual</para></listitem></itemizedlist>
 </para><para>Use <ref refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8" kindref="compound">TensorBuilder_v8</ref> to build this class. Describe returns a string describing the tensor class </para>    </detaileddescription>
     <inheritancegraph>
-      <node id="300">
+      <node id="995">
         <label>cudnn_frontend::Tensor_v8</label>
         <link refid="d6/da7/classcudnn__frontend_1_1Tensor__v8"/>
-        <childnode refid="301" relation="public-inheritance">
+        <childnode refid="996" relation="public-inheritance">
         </childnode>
       </node>
-      <node id="301">
+      <node id="996">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
       </node>
     </inheritancegraph>
     <collaborationgraph>
-      <node id="306">
+      <node id="1001">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="307">
+      <node id="1002">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="305">
+      <node id="1000">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="310">
+      <node id="1005">
         <label>cudnnDataType_t</label>
       </node>
-      <node id="309">
+      <node id="1004">
         <label>bool</label>
       </node>
-      <node id="308">
+      <node id="1003">
         <label>int64_t</label>
       </node>
-      <node id="302">
+      <node id="997">
         <label>cudnn_frontend::Tensor_v8</label>
         <link refid="d6/da7/classcudnn__frontend_1_1Tensor__v8"/>
-        <childnode refid="303" relation="public-inheritance">
+        <childnode refid="998" relation="public-inheritance">
         </childnode>
-        <childnode refid="308" relation="usage">
+        <childnode refid="1003" relation="usage">
           <edgelabel>-btensor_dimA</edgelabel>
           <edgelabel>-nDims</edgelabel>
           <edgelabel>-id</edgelabel>
           <edgelabel>-alignment</edgelabel>
           <edgelabel>-btensor_strA</edgelabel>
         </childnode>
-        <childnode refid="309" relation="usage">
+        <childnode refid="1004" relation="usage">
           <edgelabel>-isVirtual</edgelabel>
         </childnode>
-        <childnode refid="310" relation="usage">
+        <childnode refid="1005" relation="usage">
           <edgelabel>-data_type</edgelabel>
         </childnode>
       </node>
-      <node id="303">
+      <node id="998">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="304" relation="usage">
+        <childnode refid="999" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="306" relation="usage">
+        <childnode refid="1001" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="307" relation="usage">
+        <childnode refid="1002" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="304">
+      <node id="999">
         <label>std::string</label>
-        <childnode refid="305" relation="public-inheritance">
+        <childnode refid="1000" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>

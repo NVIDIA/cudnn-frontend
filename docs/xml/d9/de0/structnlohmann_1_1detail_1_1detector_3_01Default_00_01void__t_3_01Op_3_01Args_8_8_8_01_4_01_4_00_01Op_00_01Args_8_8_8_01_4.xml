@@ -1,0 +1,65 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d9/de0/structnlohmann_1_1detail_1_1detector_3_01Default_00_01void__t_3_01Op_3_01Args_8_8_8_01_4_01_4_00_01Op_00_01Args_8_8_8_01_4" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::detector&lt; Default, void_t&lt; Op&lt; Args... &gt; &gt;, Op, Args... &gt;</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>class Default</type>
+      </param>
+      <param>
+        <type>template&lt; class... &gt; class</type>
+        <declname>Op</declname>
+        <defname>Op</defname>
+      </param>
+      <param>
+        <type>class...</type>
+        <declname>Args</declname>
+        <defname>Args</defname>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="d9/de0/structnlohmann_1_1detail_1_1detector_3_01Default_00_01void__t_3_01Op_3_01Args_8_8_8_01_4_01_4_00_01Op_00_01Args_8_8_8_01_4_1ab748f9f00bb31bee4978a033589f8c85" prot="public" static="no">
+        <type>std::true_type</type>
+        <definition>using nlohmann::detail::detector&lt; Default, void_t&lt; Op&lt; Args... &gt; &gt;, Op, Args... &gt;::value_t =  std::true_type</definition>
+        <argsstring></argsstring>
+        <name>value_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3303" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3303" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d9/de0/structnlohmann_1_1detail_1_1detector_3_01Default_00_01void__t_3_01Op_3_01Args_8_8_8_01_4_01_4_00_01Op_00_01Args_8_8_8_01_4_1a5afd6a40e94dde21d120ac646468c495" prot="public" static="no">
+        <type>Op&lt; Args... &gt;</type>
+        <definition>using nlohmann::detail::detector&lt; Default, void_t&lt; Op&lt; Args... &gt; &gt;, Op, Args... &gt;::type =  Op&lt;Args...&gt;</definition>
+        <argsstring></argsstring>
+        <name>type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3304" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3304" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="127">
+        <label>nlohmann::detail::detector&lt; Default, void_t&lt; Op&lt; Args... &gt; &gt;, Op, Args... &gt;</label>
+        <link refid="d9/de0/structnlohmann_1_1detail_1_1detector_3_01Default_00_01void__t_3_01Op_3_01Args_8_8_8_01_4_01_4_00_01Op_00_01Args_8_8_8_01_4"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3302" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3301" bodyend="3305"/>
+    <listofallmembers>
+      <member refid="d9/de0/structnlohmann_1_1detail_1_1detector_3_01Default_00_01void__t_3_01Op_3_01Args_8_8_8_01_4_01_4_00_01Op_00_01Args_8_8_8_01_4_1a5afd6a40e94dde21d120ac646468c495" prot="public" virt="non-virtual"><scope>nlohmann::detail::detector&lt; Default, void_t&lt; Op&lt; Args... &gt; &gt;, Op, Args... &gt;</scope><name>type</name></member>
+      <member refid="d9/de0/structnlohmann_1_1detail_1_1detector_3_01Default_00_01void__t_3_01Op_3_01Args_8_8_8_01_4_01_4_00_01Op_00_01Args_8_8_8_01_4_1ab748f9f00bb31bee4978a033589f8c85" prot="public" virt="non-virtual"><scope>nlohmann::detail::detector&lt; Default, void_t&lt; Op&lt; Args... &gt; &gt;, Op, Args... &gt;</scope><name>value_t</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

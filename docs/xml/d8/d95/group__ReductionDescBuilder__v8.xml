@@ -1,0 +1,47 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d8/d95/group__ReductionDescBuilder__v8" kind="group">
+    <compoundname>ReductionDescBuilder_v8</compoundname>
+    <title>ReductionDescBuilder_v8</title>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d8/d95/group__ReductionDescBuilder__v8_1ga1822b91228b5f6b790cd7c2d77402cdb" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::ReductionDescBuilder_v8::setMathPrecision</definition>
+        <argsstring>(cudnnDataType_t data_type_) -&gt; ReductionDescBuilder_v8 &amp;</argsstring>
+        <name>setMathPrecision</name>
+        <param>
+          <type>cudnnDataType_t</type>
+          <declname>data_type_</declname>
+        </param>
+        <briefdescription>
+<para>Set Math Precision Data Type for the Reduction Operation. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" line="87" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" bodystart="87" bodyend="90"/>
+      </memberdef>
+      <memberdef kind="function" id="d8/d95/group__ReductionDescBuilder__v8_1gab00c3396fedc8b68356c426d19a54cf9" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::ReductionDescBuilder_v8::setReductionOp</definition>
+        <argsstring>(cudnnReduceTensorOp_t op_) -&gt; ReductionDescBuilder_v8 &amp;</argsstring>
+        <name>setReductionOp</name>
+        <param>
+          <type>cudnnReduceTensorOp_t</type>
+          <declname>op_</declname>
+        </param>
+        <briefdescription>
+<para>Set redution operator for the Reduction Operation. </para>        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" line="93" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" bodystart="93" bodyend="96"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para>Set individual property of <ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" kindref="compound">ReductionDesc_v8</ref> class </para>    </detaileddescription>
+  </compounddef>
+</doxygen>

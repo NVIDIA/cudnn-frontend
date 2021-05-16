@@ -1,0 +1,178 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::invalid_iterator</compoundname>
+    <basecompoundref refid="de/df2/classnlohmann_1_1detail_1_1exception" prot="public" virt="non-virtual">nlohmann::detail::exception</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+      <sectiondef kind="public-static-func">
+      <memberdef kind="function" id="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator_1a34104b98ab00564e564176b4d2ba7c3c" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename BasicJsonType</type>
+          </param>
+        </templateparamlist>
+        <type><ref refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator" kindref="compound">invalid_iterator</ref></type>
+        <definition>static invalid_iterator nlohmann::detail::invalid_iterator::create</definition>
+        <argsstring>(int id_, const std::string &amp;what_arg, const BasicJsonType &amp;context)</argsstring>
+        <name>create</name>
+        <param>
+          <type>int</type>
+          <declname>id_</declname>
+        </param>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21" kindref="member">std::string</ref> &amp;</type>
+          <declname>what_arg</declname>
+        </param>
+        <param>
+          <type>const BasicJsonType &amp;</type>
+          <declname>context</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2861" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2861" bodyend="2865"/>
+        <references refid="de/df2/classnlohmann_1_1detail_1_1exception_1aa353a7dba4fd179f7224b8a2a238a264" compoundref="d5/db8/json_8hpp" startline="2664" endline="2717">nlohmann::detail::exception::diagnostics</references>
+        <references refid="d5/db8/json_8hpp_1a5338981b5ad9027c9e54b1c5597f4344" compoundref="d5/db8/json_8hpp" startline="1456">JSON_HEDLEY_NON_NULL</references>
+        <references refid="de/df2/classnlohmann_1_1detail_1_1exception_1abf41a7e9178356314082284e6cfea278" compoundref="d5/db8/json_8hpp" startline="2658" endline="2661">nlohmann::detail::exception::name</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a23e540f473d32f1cf5d3243ea3ad495e" compoundref="d5/db8/json_8hpp" startline="19026" endline="19119">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::basic_json</referencedby>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a494632b69bbe1d0153d3bedad0901b8e" compoundref="d5/db8/json_8hpp" startline="21178" endline="21239">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::erase</referencedby>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1aeb86e8478e20d95970a8b61ff01dce3b" compoundref="d5/db8/json_8hpp" startline="22689" endline="22705">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::insert</referencedby>
+        <referencedby refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a15dfb2744fed2ef40c12a9e9a20d6dbc" compoundref="d5/db8/json_8hpp" startline="11927" endline="11937">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::key</referencedby>
+        <referencedby refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a5ca57856d9bba54a5fc51cee891de827" compoundref="d5/db8/json_8hpp" startline="11555" endline="11586">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator*</referencedby>
+        <referencedby refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a3eef94f9d167046e7f773aeb6b78090c" compoundref="d5/db8/json_8hpp" startline="11804" endline="11827">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator+=</referencedby>
+        <referencedby refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a49bf3e708a9c1c88c415011735962d06" compoundref="d5/db8/json_8hpp" startline="11875" endline="11890">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator-</referencedby>
+        <referencedby refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a6da3d2b34528aff328f3dcb513076dec" compoundref="d5/db8/json_8hpp" startline="11592" endline="11620">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator-&gt;</referencedby>
+        <referencedby refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1a0d14cd76203e00bdcef6a64a5d055cc7" compoundref="d5/db8/json_8hpp" startline="11750" endline="11771">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator&lt;</referencedby>
+        <referencedby refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1aaddab83c2b4023cb0f0fdbc757c54f65" compoundref="d5/db8/json_8hpp" startline="11713" endline="11734">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator==</referencedby>
+        <referencedby refid="d1/d7c/classnlohmann_1_1detail_1_1iter__impl_1ac0b9276f1102ed4b9cd3f5f56287e3ce" compoundref="d5/db8/json_8hpp" startline="11896" endline="11921">nlohmann::detail::iter_impl&lt; BasicJsonType &gt;::operator[]</referencedby>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a9f9e5f668474280acc9bd7f5410b9392" compoundref="d5/db8/json_8hpp" startline="22975" endline="23007">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::update</referencedby>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-func">
+      <memberdef kind="function" id="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator_1adf4a6697420f3bddb4addfc0b98f6ee2" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::invalid_iterator::invalid_iterator</definition>
+        <argsstring>(int id_, const char *what_arg)</argsstring>
+        <name>invalid_iterator</name>
+        <param>
+          <type>int</type>
+          <declname>id_</declname>
+        </param>
+        <param>
+          <type>const char *</type>
+          <declname>what_arg</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2869" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2869" bodyend="2870"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>exception indicating errors with iterators </para>    </briefdescription>
+    <detaileddescription>
+<para>This exception is thrown if iterators passed to a library function do not match the expected semantics.</para><para>Exceptions have ids 2xx.</para><para><table rows="15" cols="3"><row>
+<entry thead="yes"><para>name / id </para></entry><entry thead="yes"><para>example message </para></entry><entry thead="yes"><para>description  </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.201 </para></entry><entry thead="no"><para>iterators are not compatible </para></entry><entry thead="no"><para>The iterators passed to constructor basic_json(InputIT first, InputIT last) are not compatible, meaning they do not belong to the same container. Therefore, the range (<emphasis>first</emphasis>, <emphasis>last</emphasis>) is invalid. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.202 </para></entry><entry thead="no"><para>iterator does not fit current value </para></entry><entry thead="no"><para>In an erase or insert function, the passed iterator <emphasis>pos</emphasis> does not belong to the JSON value for which the function was called. It hence does not define a valid position for the deletion/insertion. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.203 </para></entry><entry thead="no"><para>iterators do not fit current value </para></entry><entry thead="no"><para>Either iterator passed to function erase(IteratorType first, IteratorType last) does not belong to the JSON value from which values shall be erased. It hence does not define a valid range to delete values from. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.204 </para></entry><entry thead="no"><para>iterators out of range </para></entry><entry thead="no"><para>When an iterator range for a primitive type (number, boolean, or string) is passed to a constructor or an erase function, this range has to be exactly (begin(), end()), because this is the only way the single stored value is expressed. All other ranges are invalid. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.205 </para></entry><entry thead="no"><para>iterator out of range </para></entry><entry thead="no"><para>When an iterator for a primitive type (number, boolean, or string) is passed to an erase function, the iterator has to be the begin() iterator, because it is the only way to address the stored value. All other iterators are invalid. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.206 </para></entry><entry thead="no"><para>cannot construct with iterators from null </para></entry><entry thead="no"><para>The iterators passed to constructor basic_json(InputIT first, InputIT last) belong to a JSON null value and hence to not define a valid range. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.207 </para></entry><entry thead="no"><para>cannot use <ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa3c6e0b8a9c15224a8228b9a98ca1531d" kindref="member">key()</ref> for non-object iterators </para></entry><entry thead="no"><para>The <ref refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa3c6e0b8a9c15224a8228b9a98ca1531d" kindref="member">key()</ref> member function can only be used on iterators belonging to a JSON object, because other types do not have a concept of a key. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.208 </para></entry><entry thead="no"><para>cannot use operator[] for object iterators </para></entry><entry thead="no"><para>The operator[] to specify a concrete offset cannot be used on iterators belonging to a JSON object, because JSON objects are unordered. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.209 </para></entry><entry thead="no"><para>cannot use offsets with object iterators </para></entry><entry thead="no"><para>The offset operators (+, -, +=, -=) cannot be used on iterators belonging to a JSON object, because JSON objects are unordered. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.210 </para></entry><entry thead="no"><para>iterators do not fit </para></entry><entry thead="no"><para>The iterator range passed to the insert function are not compatible, meaning they do not belong to the same container. Therefore, the range (<emphasis>first</emphasis>, <emphasis>last</emphasis>) is invalid. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.211 </para></entry><entry thead="no"><para>passed iterators may not belong to container </para></entry><entry thead="no"><para>The iterator range passed to the insert function must not be a subrange of the container to insert to. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.212 </para></entry><entry thead="no"><para>cannot compare iterators of different containers </para></entry><entry thead="no"><para>When two iterators are compared, they must belong to the same container. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.213 </para></entry><entry thead="no"><para>cannot compare order of object iterators </para></entry><entry thead="no"><para>The order of object iterators cannot be compared, because JSON objects are unordered. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.invalid_iterator.214 </para></entry><entry thead="no"><para>cannot get value </para></entry><entry thead="no"><para>Cannot get value for iterator: Either the iterator belongs to a null value or it is an iterator to a primitive type (number, boolean, or string), but the iterator is different to begin(). </para></entry></row>
+</table>
+{The following code shows how an <computeroutput><ref refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator" kindref="compound">invalid_iterator</ref></computeroutput> exception can be caught.,<ref refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator" kindref="compound">invalid_iterator</ref>}</para><para><simplesect kind="see"><para>- <ref refid="de/df2/classnlohmann_1_1detail_1_1exception" kindref="compound">exception</ref> for the base class of the library exceptions </para></simplesect>
+<simplesect kind="see"><para>- <ref refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error" kindref="compound">parse_error</ref> for exceptions indicating a parse <ref refid="dc/df0/namespacenlohmann_1_1detail_1a58bb1ef1a9ad287a9cfaf1855784d9acacb5e100e5a9a3e7f6d1fd97512215282" kindref="member">error</ref> </para></simplesect>
+<simplesect kind="see"><para>- <ref refid="da/d1c/classnlohmann_1_1detail_1_1type__error" kindref="compound">type_error</ref> for exceptions indicating executing a member function with a wrong type </para></simplesect>
+<simplesect kind="see"><para>- <ref refid="d2/d67/classnlohmann_1_1detail_1_1out__of__range" kindref="compound">out_of_range</ref> for exceptions indicating access out of the defined range </para></simplesect>
+<simplesect kind="see"><para>- <ref refid="d5/d1b/classnlohmann_1_1detail_1_1other__error" kindref="compound">other_error</ref> for exceptions indicating other library errors</para></simplesect>
+<simplesect kind="since"><para>version 3.0.0 </para></simplesect>
+</para>    </detaileddescription>
+    <inheritancegraph>
+      <node id="366">
+        <label>nlohmann::detail::invalid_iterator</label>
+        <link refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator"/>
+        <childnode refid="367" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="368">
+        <label>std::exception</label>
+      </node>
+      <node id="367">
+        <label>nlohmann::detail::exception</label>
+        <link refid="de/df2/classnlohmann_1_1detail_1_1exception"/>
+        <childnode refid="368" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="369">
+        <label>nlohmann::detail::invalid_iterator</label>
+        <link refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator"/>
+        <childnode refid="370" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="372">
+        <label>std::runtime_error</label>
+        <childnode refid="371" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="373">
+        <label>int</label>
+      </node>
+      <node id="371">
+        <label>std::exception</label>
+      </node>
+      <node id="370">
+        <label>nlohmann::detail::exception</label>
+        <link refid="de/df2/classnlohmann_1_1detail_1_1exception"/>
+        <childnode refid="371" relation="public-inheritance">
+        </childnode>
+        <childnode refid="372" relation="usage">
+          <edgelabel>-m</edgelabel>
+        </childnode>
+        <childnode refid="373" relation="usage">
+          <edgelabel>+id</edgelabel>
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2858" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2857" bodyend="2871"/>
+    <listofallmembers>
+      <member refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator_1a34104b98ab00564e564176b4d2ba7c3c" prot="public" virt="non-virtual"><scope>nlohmann::detail::invalid_iterator</scope><name>create</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1aa353a7dba4fd179f7224b8a2a238a264" prot="protected" virt="non-virtual"><scope>nlohmann::detail::invalid_iterator</scope><name>diagnostics</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1ae323ad0d53bc724414c2233164e65657" prot="protected" virt="non-virtual"><scope>nlohmann::detail::invalid_iterator</scope><name>exception</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1a0d4589a3fb54e81646d986c05efa3b9a" prot="public" virt="non-virtual"><scope>nlohmann::detail::invalid_iterator</scope><name>id</name></member>
+      <member refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator_1adf4a6697420f3bddb4addfc0b98f6ee2" prot="private" virt="non-virtual"><scope>nlohmann::detail::invalid_iterator</scope><name>invalid_iterator</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1abf41a7e9178356314082284e6cfea278" prot="protected" virt="non-virtual"><scope>nlohmann::detail::invalid_iterator</scope><name>name</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1a0672c25ecdf14d1a071d4d6478a65af0" prot="public" virt="non-virtual"><scope>nlohmann::detail::invalid_iterator</scope><name>what</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

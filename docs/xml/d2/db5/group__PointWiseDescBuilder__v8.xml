@@ -52,7 +52,7 @@
           <declname>mode_</declname>
         </param>
         <briefdescription>
-<para>Set upper and lower limits for the RELU activation. </para>        </briefdescription>
+<para>Set pointwise mode for the activation. </para>        </briefdescription>
         <detaileddescription>
         </detaileddescription>
         <inbodydescription>

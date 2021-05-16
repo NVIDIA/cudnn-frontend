@@ -1,0 +1,304 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d5/d1a/classnlohmann_1_1detail_1_1parse__error" kind="class" language="C++" prot="public">
+    <compoundname>nlohmann::detail::parse_error</compoundname>
+    <basecompoundref refid="de/df2/classnlohmann_1_1detail_1_1exception" prot="public" virt="non-virtual">nlohmann::detail::exception</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+      <sectiondef kind="public-attrib">
+      <memberdef kind="variable" id="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1a9505aaa1ca943be927eec7cc579592ff" prot="public" static="no" mutable="no">
+        <type>const std::size_t</type>
+        <definition>const std::size_t nlohmann::detail::parse_error::byte</definition>
+        <argsstring></argsstring>
+        <name>byte</name>
+        <briefdescription>
+<para>byte index of the parse error </para>        </briefdescription>
+        <detaileddescription>
+<para>The byte index of the last read character in the input file.</para><para><simplesect kind="note"><para>For an input with n bytes, 1 is the index of the first character and n+1 is the index of the terminating null byte or the end of file. This also holds true when reading a byte vector (CBOR or MessagePack). </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2807" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2807" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-static-func">
+      <memberdef kind="function" id="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename BasicJsonType</type>
+          </param>
+        </templateparamlist>
+        <type><ref refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error" kindref="compound">parse_error</ref></type>
+        <definition>static parse_error nlohmann::detail::parse_error::create</definition>
+        <argsstring>(int id_, const position_t &amp;pos, const std::string &amp;what_arg, const BasicJsonType &amp;context)</argsstring>
+        <name>create</name>
+        <param>
+          <type>int</type>
+          <declname>id_</declname>
+        </param>
+        <param>
+          <type>const <ref refid="d6/d02/structnlohmann_1_1detail_1_1position__t" kindref="compound">position_t</ref> &amp;</type>
+          <declname>pos</declname>
+        </param>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21" kindref="member">std::string</ref> &amp;</type>
+          <declname>what_arg</declname>
+        </param>
+        <param>
+          <type>const BasicJsonType &amp;</type>
+          <declname>context</declname>
+        </param>
+        <briefdescription>
+<para>create a parse error exception </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">id_</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the id of the exception </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">pos</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the position where the error occurred (or with chars_read_total=0 if the position cannot be determined) </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">what_arg</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the explanatory string </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para><ref refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error" kindref="compound">parse_error</ref> object </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2782" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2782" bodyend="2787"/>
+        <references refid="d6/d02/structnlohmann_1_1detail_1_1position__t_1a94cf85cd91d478c20ae143eba906ea1a" compoundref="d5/db8/json_8hpp" startline="2587">nlohmann::detail::position_t::chars_read_total</references>
+        <references refid="de/df2/classnlohmann_1_1detail_1_1exception_1aa353a7dba4fd179f7224b8a2a238a264" compoundref="d5/db8/json_8hpp" startline="2664" endline="2717">nlohmann::detail::exception::diagnostics</references>
+        <references refid="de/df2/classnlohmann_1_1detail_1_1exception_1abf41a7e9178356314082284e6cfea278" compoundref="d5/db8/json_8hpp" startline="2658" endline="2661">nlohmann::detail::exception::name</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+        <referencedby refid="da/de8/classnlohmann_1_1json__pointer_1ae28e4b79b9d4fac9e6dca29f47f946fa" compoundref="d5/db8/json_8hpp" startline="12420" endline="12461">nlohmann::json_pointer&lt; BasicJsonType &gt;::array_index</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a9940f56290b9278c58772eda2931e599" compoundref="d5/db8/json_8hpp" startline="8414" endline="8428">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_bson_binary</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a23921422802aa472360dd05023e20565" compoundref="d5/db8/json_8hpp" startline="8393" endline="8402">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_bson_string</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1acb001d18095dc5bcf7336ae5122b8340" compoundref="d5/db8/json_8hpp" startline="9127" endline="9213">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_cbor_binary</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a545a44ae4b3fa2b7a61d9e8517fb7154" compoundref="d5/db8/json_8hpp" startline="9032" endline="9114">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_cbor_string</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ad8cba5585327caa550dd5b6dd25a64f8" compoundref="d5/db8/json_8hpp" startline="9692" endline="9762">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_msgpack_string</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a26c694413fb860057e1a839d5422b361" compoundref="d5/db8/json_8hpp" startline="10373" endline="10420">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_ubjson_high_precision_number</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a7b6c2d4c95d56751e233e285a5f1fea7" compoundref="d5/db8/json_8hpp" startline="10094" endline="10129">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_ubjson_size_type</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1aba7ba9ec9a52ad2bee8baff70176aa20" compoundref="d5/db8/json_8hpp" startline="10017" endline="10082">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_ubjson_size_value</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a4ae90db51c102e912b7eac83c78733a6" compoundref="d5/db8/json_8hpp" startline="9963" endline="10011">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_ubjson_string</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a7e5e0b71548d0649ce4f131280d06c33" compoundref="d5/db8/json_8hpp" startline="10135" endline="10231">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_ubjson_value</referencedby>
+        <referencedby refid="df/d6b/classnlohmann_1_1detail_1_1parser_1a75fb9145ea85f1ad9cc14f61981e1111" compoundref="d5/db8/json_8hpp" startline="10741" endline="10793">nlohmann::detail::parser&lt; BasicJsonType, InputAdapterType &gt;::parse</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a23bde2450d7a5772bf5051e36ff560a4" compoundref="d5/db8/json_8hpp" startline="8440" endline="8504">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::parse_bson_element_internal</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a4e4accd5a2a41bfb2f18a8a0fcc9421c" compoundref="d5/db8/json_8hpp" startline="8586" endline="9019">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::parse_cbor_internal</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ae020385ce9424271d61f85d3842c02cb" compoundref="d5/db8/json_8hpp" startline="9312" endline="9680">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::parse_msgpack_internal</referencedby>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1adcc786998f220a5b3083ee8a37c4553e" compoundref="d5/db8/json_8hpp" startline="25343" endline="25605">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::patch</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1ab4afd9ee276bbb15a0f898061aad94dd" compoundref="d5/db8/json_8hpp" startline="8277" endline="8327">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::sax_parse</referencedby>
+        <referencedby refid="df/d6b/classnlohmann_1_1detail_1_1parser_1a073b8313a5194aac3a7d5da0d935788c" compoundref="d5/db8/json_8hpp" startline="10809" endline="10823">nlohmann::detail::parser&lt; BasicJsonType, InputAdapterType &gt;::sax_parse</referencedby>
+        <referencedby refid="df/d6b/classnlohmann_1_1detail_1_1parser_1a678fdebccc8ddd3242c67b6bce2f8f1a" compoundref="d5/db8/json_8hpp" startline="10828" endline="11099">nlohmann::detail::parser&lt; BasicJsonType, InputAdapterType &gt;::sax_parse_internal</referencedby>
+        <referencedby refid="da/de8/classnlohmann_1_1json__pointer_1ae01c32c6a071c2e5198d5dfcce290e50" compoundref="d5/db8/json_8hpp" startline="12825" endline="12883">nlohmann::json_pointer&lt; BasicJsonType &gt;::split</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a61a0bd8bbe7b560bd429fa990ba3ba1a" compoundref="d5/db8/json_8hpp" startline="10569" endline="10577">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::unexpect_eof</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1a90fbaaeeb00838e65b8d04885017ef0c" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename BasicJsonType</type>
+          </param>
+        </templateparamlist>
+        <type><ref refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error" kindref="compound">parse_error</ref></type>
+        <definition>static parse_error nlohmann::detail::parse_error::create</definition>
+        <argsstring>(int id_, std::size_t byte_, const std::string &amp;what_arg, const BasicJsonType &amp;context)</argsstring>
+        <name>create</name>
+        <param>
+          <type>int</type>
+          <declname>id_</declname>
+        </param>
+        <param>
+          <type>std::size_t</type>
+          <declname>byte_</declname>
+        </param>
+        <param>
+          <type>const <ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21" kindref="member">std::string</ref> &amp;</type>
+          <declname>what_arg</declname>
+        </param>
+        <param>
+          <type>const BasicJsonType &amp;</type>
+          <declname>context</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2790" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2790" bodyend="2796"/>
+        <references refid="de/df2/classnlohmann_1_1detail_1_1exception_1aa353a7dba4fd179f7224b8a2a238a264" compoundref="d5/db8/json_8hpp" startline="2664" endline="2717">nlohmann::detail::exception::diagnostics</references>
+        <references refid="de/df2/classnlohmann_1_1detail_1_1exception_1abf41a7e9178356314082284e6cfea278" compoundref="d5/db8/json_8hpp" startline="2658" endline="2661">nlohmann::detail::exception::name</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21">nlohmann::detail::string</references>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-func">
+      <memberdef kind="function" id="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1a0ea816ea3521d7109407948cb1b850f7" prot="private" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::detail::parse_error::parse_error</definition>
+        <argsstring>(int id_, std::size_t byte_, const char *what_arg)</argsstring>
+        <name>parse_error</name>
+        <param>
+          <type>int</type>
+          <declname>id_</declname>
+        </param>
+        <param>
+          <type>std::size_t</type>
+          <declname>byte_</declname>
+        </param>
+        <param>
+          <type>const char *</type>
+          <declname>what_arg</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2810" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2810" bodyend="2811"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-static-func">
+      <memberdef kind="function" id="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1aefe74adeaa48781464ba2fd2ec63d221" prot="private" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985ab45cffe084dd3d20d928bee85e7b0f21" kindref="member">std::string</ref></type>
+        <definition>static std::string nlohmann::detail::parse_error::position_string</definition>
+        <argsstring>(const position_t &amp;pos)</argsstring>
+        <name>position_string</name>
+        <param>
+          <type>const <ref refid="d6/d02/structnlohmann_1_1detail_1_1position__t" kindref="compound">position_t</ref> &amp;</type>
+          <declname>pos</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2813" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2813" bodyend="2817"/>
+        <references refid="d6/d02/structnlohmann_1_1detail_1_1position__t_1a74df94563dd32102152ceb8c6d9041d8" compoundref="d5/db8/json_8hpp" startline="2589">nlohmann::detail::position_t::chars_read_current_line</references>
+        <references refid="d6/d02/structnlohmann_1_1detail_1_1position__t_1a4bbad8bc2c0d17c1b61c3ce729908b71" compoundref="d5/db8/json_8hpp" startline="2591">nlohmann::detail::position_t::lines_read</references>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>exception indicating a parse error </para>    </briefdescription>
+    <detaileddescription>
+<para>This exception is thrown by the library when a parse error occurs. Parse errors can occur during the deserialization of JSON text, CBOR, MessagePack, as well as when using JSON Patch.</para><para>Member <emphasis>byte</emphasis> holds the byte index of the last read character in the input file.</para><para>Exceptions have ids 1xx.</para><para><table rows="15" cols="3"><row>
+<entry thead="yes"><para>name / id </para></entry><entry thead="yes"><para>example message </para></entry><entry thead="yes"><para>description  </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.101 </para></entry><entry thead="no"><para>parse error at 2: unexpected end of input; expected string literal </para></entry><entry thead="no"><para>This error indicates a syntax error while deserializing a JSON text. The error message describes that an unexpected token (character) was encountered, and the member <emphasis>byte</emphasis> indicates the error position. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.102 </para></entry><entry thead="no"><para>parse error at 14: missing or wrong low surrogate </para></entry><entry thead="no"><para>JSON uses the <computeroutput>\uxxxx</computeroutput> format to describe Unicode characters. Code points above above 0xFFFF are split into two <computeroutput>\uxxxx</computeroutput> entries (&quot;surrogate pairs&quot;). This error indicates that the surrogate pair is incomplete or contains an invalid code point. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.103 </para></entry><entry thead="no"><para>parse error: code points above 0x10FFFF are invalid </para></entry><entry thead="no"><para>Unicode supports code points up to 0x10FFFF. Code points above 0x10FFFF are invalid. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.104 </para></entry><entry thead="no"><para>parse error: JSON patch must be an array of objects </para></entry><entry thead="no"><para><ulink url="https://tools.ietf.org/html/rfc6902">RFC 6902</ulink> requires a JSON Patch document to be a JSON document that represents an array of objects. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.105 </para></entry><entry thead="no"><para>parse error: operation must have string member &apos;op&apos; </para></entry><entry thead="no"><para>An operation of a JSON Patch document must contain exactly one &quot;op&quot; member, whose value indicates the operation to perform. Its value must be one of &quot;add&quot;, &quot;remove&quot;, &quot;replace&quot;, &quot;move&quot;, &quot;copy&quot;, or &quot;test&quot;; other values are errors. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.106 </para></entry><entry thead="no"><para>parse error: array index &apos;01&apos; must not begin with &apos;0&apos; </para></entry><entry thead="no"><para>An array index in a JSON Pointer (<ulink url="https://tools.ietf.org/html/rfc6901">RFC 6901</ulink>) may be <computeroutput>0</computeroutput> or any number without a leading <computeroutput>0</computeroutput>. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.107 </para></entry><entry thead="no"><para>parse error: JSON pointer must be empty or begin with &apos;/&apos; - was: &apos;foo&apos; </para></entry><entry thead="no"><para>A JSON Pointer must be a Unicode string containing a sequence of zero or more reference tokens, each prefixed by a <computeroutput>/</computeroutput> character. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.108 </para></entry><entry thead="no"><para>parse error: escape character &apos;~&apos; must be followed with &apos;0&apos; or &apos;1&apos; </para></entry><entry thead="no"><para>In a JSON Pointer, only <computeroutput>~0</computeroutput> and <computeroutput>~1</computeroutput> are valid escape sequences. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.109 </para></entry><entry thead="no"><para>parse error: array index &apos;one&apos; is not a number </para></entry><entry thead="no"><para>A JSON Pointer array index must be a number. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.110 </para></entry><entry thead="no"><para>parse error at 1: cannot read 2 bytes from vector </para></entry><entry thead="no"><para>When parsing CBOR or MessagePack, the byte vector ends before the complete value has been read. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.112 </para></entry><entry thead="no"><para>parse error at 1: error reading CBOR; last byte: 0xF8 </para></entry><entry thead="no"><para>Not all types of CBOR or MessagePack are supported. This exception occurs if an unsupported byte was read. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.113 </para></entry><entry thead="no"><para>parse error at 2: expected a CBOR string; last byte: 0x98 </para></entry><entry thead="no"><para>While parsing a map key, a value that is not a string has been read. </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.114 </para></entry><entry thead="no"><para>parse error: Unsupported BSON record type 0x0F </para></entry><entry thead="no"><para>The parsing of the corresponding BSON record type is not implemented (yet). </para></entry></row>
+<row>
+<entry thead="no"><para>json.exception.parse_error.115 </para></entry><entry thead="no"><para>parse error at byte 5: syntax error while parsing UBJSON high-precision number: invalid number text: 1A </para></entry><entry thead="no"><para>A UBJSON high-precision number could not be parsed. </para></entry></row>
+</table>
+<simplesect kind="note"><para>For an input with n bytes, 1 is the index of the first character and n+1 is the index of the terminating null byte or the end of file. This also holds true when reading a byte vector (CBOR or MessagePack).</para></simplesect>
+{The following code shows how a <computeroutput><ref refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error" kindref="compound">parse_error</ref></computeroutput> exception can be caught.,<ref refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error" kindref="compound">parse_error</ref>}</para><para><simplesect kind="see"><para>- <ref refid="de/df2/classnlohmann_1_1detail_1_1exception" kindref="compound">exception</ref> for the base class of the library exceptions </para></simplesect>
+<simplesect kind="see"><para>- <ref refid="d4/d5f/classnlohmann_1_1detail_1_1invalid__iterator" kindref="compound">invalid_iterator</ref> for exceptions indicating errors with iterators </para></simplesect>
+<simplesect kind="see"><para>- <ref refid="da/d1c/classnlohmann_1_1detail_1_1type__error" kindref="compound">type_error</ref> for exceptions indicating executing a member function with a wrong type </para></simplesect>
+<simplesect kind="see"><para>- <ref refid="d2/d67/classnlohmann_1_1detail_1_1out__of__range" kindref="compound">out_of_range</ref> for exceptions indicating access out of the defined range </para></simplesect>
+<simplesect kind="see"><para>- <ref refid="d5/d1b/classnlohmann_1_1detail_1_1other__error" kindref="compound">other_error</ref> for exceptions indicating other library errors</para></simplesect>
+<simplesect kind="since"><para>version 3.0.0 </para></simplesect>
+</para>    </detaileddescription>
+    <inheritancegraph>
+      <node id="906">
+        <label>nlohmann::detail::parse_error</label>
+        <link refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error"/>
+        <childnode refid="907" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="908">
+        <label>std::exception</label>
+      </node>
+      <node id="907">
+        <label>nlohmann::detail::exception</label>
+        <link refid="de/df2/classnlohmann_1_1detail_1_1exception"/>
+        <childnode refid="908" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="914">
+        <label>size_t</label>
+      </node>
+      <node id="912">
+        <label>std::runtime_error</label>
+        <childnode refid="911" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="909">
+        <label>nlohmann::detail::parse_error</label>
+        <link refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error"/>
+        <childnode refid="910" relation="public-inheritance">
+        </childnode>
+        <childnode refid="914" relation="usage">
+          <edgelabel>+byte</edgelabel>
+        </childnode>
+      </node>
+      <node id="913">
+        <label>int</label>
+      </node>
+      <node id="911">
+        <label>std::exception</label>
+      </node>
+      <node id="910">
+        <label>nlohmann::detail::exception</label>
+        <link refid="de/df2/classnlohmann_1_1detail_1_1exception"/>
+        <childnode refid="911" relation="public-inheritance">
+        </childnode>
+        <childnode refid="912" relation="usage">
+          <edgelabel>-m</edgelabel>
+        </childnode>
+        <childnode refid="913" relation="usage">
+          <edgelabel>+id</edgelabel>
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="2770" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="2769" bodyend="2818"/>
+    <listofallmembers>
+      <member refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1a9505aaa1ca943be927eec7cc579592ff" prot="public" virt="non-virtual"><scope>nlohmann::detail::parse_error</scope><name>byte</name></member>
+      <member refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1ae77bd584cb9101140790219af7fec1ce" prot="public" virt="non-virtual"><scope>nlohmann::detail::parse_error</scope><name>create</name></member>
+      <member refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1a90fbaaeeb00838e65b8d04885017ef0c" prot="public" virt="non-virtual"><scope>nlohmann::detail::parse_error</scope><name>create</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1aa353a7dba4fd179f7224b8a2a238a264" prot="protected" virt="non-virtual"><scope>nlohmann::detail::parse_error</scope><name>diagnostics</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1ae323ad0d53bc724414c2233164e65657" prot="protected" virt="non-virtual"><scope>nlohmann::detail::parse_error</scope><name>exception</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1a0d4589a3fb54e81646d986c05efa3b9a" prot="public" virt="non-virtual"><scope>nlohmann::detail::parse_error</scope><name>id</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1abf41a7e9178356314082284e6cfea278" prot="protected" virt="non-virtual"><scope>nlohmann::detail::parse_error</scope><name>name</name></member>
+      <member refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1a0ea816ea3521d7109407948cb1b850f7" prot="private" virt="non-virtual"><scope>nlohmann::detail::parse_error</scope><name>parse_error</name></member>
+      <member refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1aefe74adeaa48781464ba2fd2ec63d221" prot="private" virt="non-virtual"><scope>nlohmann::detail::parse_error</scope><name>position_string</name></member>
+      <member refid="de/df2/classnlohmann_1_1detail_1_1exception_1a0672c25ecdf14d1a071d4d6478a65af0" prot="public" virt="non-virtual"><scope>nlohmann::detail::parse_error</scope><name>what</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

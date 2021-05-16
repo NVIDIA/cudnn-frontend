@@ -16,250 +16,274 @@
     <includedby refid="de/d6d/cudnn__frontend__Engine_8h" local="yes">cudnn_frontend_Engine.h</includedby>
     <includedby refid="de/d0c/cudnn__frontend_8h" local="yes">cudnn_frontend.h</includedby>
     <incdepgraph>
-      <node id="358">
+      <node id="511">
         <label>cudnn_backend_base.h</label>
         <link refid="dc/d11/cudnn__backend__base_8h"/>
-        <childnode refid="351" relation="include">
+        <childnode refid="504" relation="include">
         </childnode>
       </node>
-      <node id="347">
+      <node id="500">
         <label>functional</label>
       </node>
-      <node id="359">
+      <node id="512">
         <label>cudnn_frontend_PointWiseDesc.h</label>
         <link refid="da/d5f/cudnn__frontend__PointWiseDesc_8h"/>
-        <childnode refid="345" relation="include">
+        <childnode refid="498" relation="include">
         </childnode>
-        <childnode refid="346" relation="include">
+        <childnode refid="499" relation="include">
         </childnode>
-        <childnode refid="347" relation="include">
+        <childnode refid="500" relation="include">
         </childnode>
-        <childnode refid="348" relation="include">
+        <childnode refid="501" relation="include">
         </childnode>
-        <childnode refid="349" relation="include">
+        <childnode refid="502" relation="include">
         </childnode>
-        <childnode refid="350" relation="include">
+        <childnode refid="503" relation="include">
         </childnode>
-        <childnode refid="351" relation="include">
+        <childnode refid="504" relation="include">
         </childnode>
-        <childnode refid="352" relation="include">
+        <childnode refid="505" relation="include">
         </childnode>
-        <childnode refid="355" relation="include">
+        <childnode refid="508" relation="include">
         </childnode>
       </node>
-      <node id="351">
+      <node id="504">
         <label>cudnn.h</label>
       </node>
-      <node id="354">
+      <node id="507">
         <label>cudnn_frontend_ConvDesc.h</label>
         <link refid="d1/de7/cudnn__frontend__ConvDesc_8h"/>
-        <childnode refid="345" relation="include">
+        <childnode refid="498" relation="include">
         </childnode>
-        <childnode refid="346" relation="include">
+        <childnode refid="499" relation="include">
         </childnode>
-        <childnode refid="347" relation="include">
+        <childnode refid="500" relation="include">
         </childnode>
-        <childnode refid="348" relation="include">
+        <childnode refid="501" relation="include">
         </childnode>
-        <childnode refid="349" relation="include">
+        <childnode refid="502" relation="include">
         </childnode>
-        <childnode refid="350" relation="include">
+        <childnode refid="503" relation="include">
         </childnode>
-        <childnode refid="351" relation="include">
+        <childnode refid="504" relation="include">
         </childnode>
-        <childnode refid="352" relation="include">
+        <childnode refid="505" relation="include">
         </childnode>
-        <childnode refid="355" relation="include">
+        <childnode refid="508" relation="include">
         </childnode>
       </node>
-      <node id="360">
+      <node id="513">
         <label>cudnn_frontend_MatMulDesc.h</label>
         <link refid="d6/d32/cudnn__frontend__MatMulDesc_8h"/>
-        <childnode refid="345" relation="include">
+        <childnode refid="498" relation="include">
         </childnode>
-        <childnode refid="346" relation="include">
+        <childnode refid="499" relation="include">
         </childnode>
-        <childnode refid="347" relation="include">
+        <childnode refid="500" relation="include">
         </childnode>
-        <childnode refid="348" relation="include">
+        <childnode refid="501" relation="include">
         </childnode>
-        <childnode refid="349" relation="include">
+        <childnode refid="502" relation="include">
         </childnode>
-        <childnode refid="350" relation="include">
+        <childnode refid="503" relation="include">
         </childnode>
-        <childnode refid="351" relation="include">
+        <childnode refid="504" relation="include">
         </childnode>
-        <childnode refid="352" relation="include">
+        <childnode refid="505" relation="include">
         </childnode>
-        <childnode refid="355" relation="include">
+        <childnode refid="508" relation="include">
         </childnode>
       </node>
-      <node id="357">
+      <node id="510">
         <label>string</label>
       </node>
-      <node id="344">
+      <node id="497">
         <label>cudnn_frontend_OperationGraph.h</label>
         <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
-        <childnode refid="345" relation="include">
+        <childnode refid="498" relation="include">
         </childnode>
-        <childnode refid="346" relation="include">
+        <childnode refid="499" relation="include">
         </childnode>
-        <childnode refid="347" relation="include">
+        <childnode refid="500" relation="include">
         </childnode>
-        <childnode refid="348" relation="include">
+        <childnode refid="501" relation="include">
         </childnode>
-        <childnode refid="349" relation="include">
+        <childnode refid="502" relation="include">
         </childnode>
-        <childnode refid="350" relation="include">
+        <childnode refid="503" relation="include">
         </childnode>
-        <childnode refid="351" relation="include">
+        <childnode refid="504" relation="include">
         </childnode>
-        <childnode refid="352" relation="include">
+        <childnode refid="505" relation="include">
         </childnode>
-        <childnode refid="353" relation="include">
+        <childnode refid="506" relation="include">
         </childnode>
-        <childnode refid="355" relation="include">
+        <childnode refid="508" relation="include">
         </childnode>
       </node>
-      <node id="356">
+      <node id="509">
         <label>exception</label>
       </node>
-      <node id="361">
+      <node id="515">
         <label>cudnn_frontend_Tensor.h</label>
         <link refid="d3/d98/cudnn__frontend__Tensor_8h"/>
-        <childnode refid="345" relation="include">
+        <childnode refid="498" relation="include">
         </childnode>
-        <childnode refid="346" relation="include">
+        <childnode refid="499" relation="include">
         </childnode>
-        <childnode refid="347" relation="include">
+        <childnode refid="500" relation="include">
         </childnode>
-        <childnode refid="348" relation="include">
+        <childnode refid="501" relation="include">
         </childnode>
-        <childnode refid="349" relation="include">
+        <childnode refid="502" relation="include">
         </childnode>
-        <childnode refid="350" relation="include">
+        <childnode refid="503" relation="include">
         </childnode>
-        <childnode refid="355" relation="include">
+        <childnode refid="508" relation="include">
         </childnode>
       </node>
-      <node id="353">
+      <node id="506">
         <label>cudnn_frontend_Operation.h</label>
         <link refid="da/d5a/cudnn__frontend__Operation_8h"/>
-        <childnode refid="345" relation="include">
+        <childnode refid="498" relation="include">
         </childnode>
-        <childnode refid="346" relation="include">
+        <childnode refid="499" relation="include">
         </childnode>
-        <childnode refid="347" relation="include">
+        <childnode refid="500" relation="include">
         </childnode>
-        <childnode refid="348" relation="include">
+        <childnode refid="501" relation="include">
         </childnode>
-        <childnode refid="349" relation="include">
+        <childnode refid="502" relation="include">
         </childnode>
-        <childnode refid="350" relation="include">
+        <childnode refid="503" relation="include">
         </childnode>
-        <childnode refid="351" relation="include">
+        <childnode refid="504" relation="include">
         </childnode>
-        <childnode refid="352" relation="include">
+        <childnode refid="505" relation="include">
         </childnode>
-        <childnode refid="354" relation="include">
+        <childnode refid="507" relation="include">
         </childnode>
-        <childnode refid="359" relation="include">
+        <childnode refid="512" relation="include">
         </childnode>
-        <childnode refid="360" relation="include">
+        <childnode refid="513" relation="include">
         </childnode>
-        <childnode refid="361" relation="include">
+        <childnode refid="514" relation="include">
         </childnode>
-        <childnode refid="355" relation="include">
+        <childnode refid="515" relation="include">
+        </childnode>
+        <childnode refid="508" relation="include">
         </childnode>
       </node>
-      <node id="352">
+      <node id="505">
         <label>cudnn_backend.h</label>
       </node>
-      <node id="350">
+      <node id="503">
         <label>utility</label>
       </node>
-      <node id="346">
+      <node id="499">
         <label>array</label>
       </node>
-      <node id="349">
+      <node id="502">
         <label>sstream</label>
       </node>
-      <node id="355">
+      <node id="508">
         <label>cudnn_frontend_utils.h</label>
         <link refid="df/d17/cudnn__frontend__utils_8h"/>
-        <childnode refid="356" relation="include">
+        <childnode refid="509" relation="include">
         </childnode>
-        <childnode refid="357" relation="include">
+        <childnode refid="510" relation="include">
         </childnode>
-        <childnode refid="358" relation="include">
+        <childnode refid="511" relation="include">
         </childnode>
       </node>
-      <node id="345">
+      <node id="514">
+        <label>cudnn_frontend_ReductionDesc.h</label>
+        <link refid="db/da7/cudnn__frontend__ReductionDesc_8h"/>
+        <childnode refid="498" relation="include">
+        </childnode>
+        <childnode refid="499" relation="include">
+        </childnode>
+        <childnode refid="500" relation="include">
+        </childnode>
+        <childnode refid="501" relation="include">
+        </childnode>
+        <childnode refid="502" relation="include">
+        </childnode>
+        <childnode refid="503" relation="include">
+        </childnode>
+        <childnode refid="504" relation="include">
+        </childnode>
+        <childnode refid="505" relation="include">
+        </childnode>
+        <childnode refid="508" relation="include">
+        </childnode>
+      </node>
+      <node id="498">
         <label>algorithm</label>
       </node>
-      <node id="348">
+      <node id="501">
         <label>memory</label>
       </node>
     </incdepgraph>
     <invincdepgraph>
-      <node id="369">
+      <node id="523">
         <label>cudnn_frontend_EngineConfig.h</label>
         <link refid="d6/d67/cudnn__frontend__EngineConfig_8h"/>
-        <childnode refid="364" relation="include">
+        <childnode refid="518" relation="include">
         </childnode>
       </node>
-      <node id="367">
+      <node id="521">
         <label>cudnn_frontend_get_plan.h</label>
         <link refid="d2/d3b/cudnn__frontend__get__plan_8h"/>
       </node>
-      <node id="370">
+      <node id="524">
         <label>cudnn_frontend_ExecutionPlan.h</label>
         <link refid="d6/d51/cudnn__frontend__ExecutionPlan_8h"/>
-        <childnode refid="364" relation="include">
+        <childnode refid="518" relation="include">
         </childnode>
       </node>
-      <node id="362">
+      <node id="516">
         <label>cudnn_frontend_OperationGraph.h</label>
         <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
-        <childnode refid="363" relation="include">
+        <childnode refid="517" relation="include">
         </childnode>
-        <childnode refid="368" relation="include">
+        <childnode refid="522" relation="include">
         </childnode>
-        <childnode refid="364" relation="include">
+        <childnode refid="518" relation="include">
         </childnode>
       </node>
-      <node id="368">
+      <node id="522">
         <label>cudnn_frontend_Engine.h</label>
         <link refid="de/d6d/cudnn__frontend__Engine_8h"/>
-        <childnode refid="364" relation="include">
+        <childnode refid="518" relation="include">
         </childnode>
-        <childnode refid="369" relation="include">
+        <childnode refid="523" relation="include">
         </childnode>
-        <childnode refid="370" relation="include">
+        <childnode refid="524" relation="include">
         </childnode>
       </node>
-      <node id="365">
+      <node id="519">
         <label>cudnn_frontend_EngineConfigGenerator.h</label>
         <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
-        <childnode refid="366" relation="include">
+        <childnode refid="520" relation="include">
         </childnode>
-        <childnode refid="367" relation="include">
+        <childnode refid="521" relation="include">
         </childnode>
       </node>
-      <node id="364">
+      <node id="518">
         <label>cudnn_frontend.h</label>
         <link refid="de/d0c/cudnn__frontend_8h"/>
-        <childnode refid="365" relation="include">
+        <childnode refid="519" relation="include">
         </childnode>
       </node>
-      <node id="366">
+      <node id="520">
         <label>cudnn_frontend_find_plan.h</label>
         <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
       </node>
-      <node id="363">
+      <node id="517">
         <label>cudnn_frontend_Heuristics.h</label>
         <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
-        <childnode refid="364" relation="include">
+        <childnode refid="518" relation="include">
         </childnode>
       </node>
     </invincdepgraph>
@@ -346,123 +370,128 @@
 <codeline lineno="89"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
 <codeline lineno="90"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>global_count;</highlight></codeline>
 <codeline lineno="91"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="94"><highlight class="normal"><sp/><sp/><sp/><sp/>std::string<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;</highlight></codeline>
-<codeline lineno="95" refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a19fd5ed99ab4053c8a178bd33843460a" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a19fd5ed99ab4053c8a178bd33843460a" kindref="member">getTag</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
-<codeline lineno="96"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1ac8ca1ba29ac3f8e68ba1bf3e5e500338" kindref="member">opGraphTag</ref>;</highlight></codeline>
+<codeline lineno="94"><highlight class="normal"><sp/><sp/><sp/><sp/>uint64_t</highlight></codeline>
+<codeline lineno="95" refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1aa344863fca30448e6f3e139d69f62080" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1aa344863fca30448e6f3e139d69f62080" kindref="member">getOpCount</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="96"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a52c12bb0014a899c4c5201fb66301eb2" kindref="member">numOps</ref>;</highlight></codeline>
 <codeline lineno="97"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
 <codeline lineno="98"><highlight class="normal"></highlight></codeline>
-<codeline lineno="99"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">private</highlight><highlight class="normal">:</highlight></codeline>
-<codeline lineno="100"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5c029cff12e0e91406a8f88fd8a830f4" kindref="member">OperationGraph_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="101"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5c029cff12e0e91406a8f88fd8a830f4" kindref="member">OperationGraph_v8</ref>(<ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="102"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref><sp/>&amp;</highlight></codeline>
-<codeline lineno="103"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a87704bb46bb12bba977a21ed579a4ef3" kindref="member">operator=</ref>(<ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="104"><highlight class="normal"></highlight></codeline>
-<codeline lineno="105" refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1abd35d4e84bb6ee70e8df38de093fc376" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnHandle_t<sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1abd35d4e84bb6ee70e8df38de093fc376" kindref="member">handle</ref><sp/>=<sp/></highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="106" refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1ab2570d81fc01c1b6b9a76220b0abd717" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>std::array&lt;ManagedOpaqueDescriptor,<sp/>10&gt;<sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1ab2570d81fc01c1b6b9a76220b0abd717" kindref="member">ops</ref>{};</highlight></codeline>
-<codeline lineno="107" refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a52c12bb0014a899c4c5201fb66301eb2" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>int64_t<sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a52c12bb0014a899c4c5201fb66301eb2" kindref="member">numOps</ref><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/>-1;</highlight></codeline>
-<codeline lineno="108" refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1ac8ca1ba29ac3f8e68ba1bf3e5e500338" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>std::string<sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1ac8ca1ba29ac3f8e68ba1bf3e5e500338" kindref="member">opGraphTag</ref><sp/>=<sp/></highlight><highlight class="stringliteral">&quot;&quot;</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="109"><highlight class="normal">};</highlight></codeline>
-<codeline lineno="110"><highlight class="normal"></highlight></codeline>
-<codeline lineno="114" refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" refkind="compound"><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/>{</highlight></codeline>
-<codeline lineno="115"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal">:</highlight></codeline>
-<codeline lineno="120"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="122" refid="d2/df5/group__OperationGraphBuilder__v8_1ga5b5d8a3121e92a8a7d47341b424298f8" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d2/df5/group__OperationGraphBuilder__v8_1ga5b5d8a3121e92a8a7d47341b424298f8" kindref="member">setHandle</ref>(cudnnHandle_t<sp/>handle_)<sp/>-&gt;<sp/><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/>&amp;<sp/>{</highlight></codeline>
-<codeline lineno="123"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>m_operationGraph.handle<sp/>=<sp/>handle_;</highlight></codeline>
-<codeline lineno="124"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>*</highlight><highlight class="keyword">this</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="125"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="127"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="128" refid="d2/df5/group__OperationGraphBuilder__v8_1ga4e4cee8d631471478d5de420077a2182" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d2/df5/group__OperationGraphBuilder__v8_1ga4e4cee8d631471478d5de420077a2182" kindref="member">setOperationGraph</ref>(int64_t<sp/>numOps_,<sp/><ref refid="d4/d30/classcudnn__frontend_1_1Operation__v8" kindref="compound">Operation_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>**ops_)<sp/>-&gt;<sp/><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/>&amp;<sp/>{</highlight></codeline>
-<codeline lineno="129"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>m_operationGraph.numOps<sp/>=<sp/>numOps_;</highlight></codeline>
-<codeline lineno="130"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(</highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>i<sp/>=<sp/>0u;<sp/>i<sp/>&lt;<sp/>numOps_;<sp/>i++)<sp/>{</highlight></codeline>
-<codeline lineno="131"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>m_operationGraph.ops[i]<sp/>=<sp/>ops_[i]-&gt;get_desc();</highlight></codeline>
-<codeline lineno="132"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>m_operationGraph.opGraphTag<sp/>+=<sp/>ops_[i]-&gt;getTag()<sp/>+<sp/></highlight><highlight class="charliteral">&apos;_&apos;</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="133"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="134"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>*</highlight><highlight class="keyword">this</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="135"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="138"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref><sp/>&amp;&amp;</highlight></codeline>
-<codeline lineno="141" refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ac78945f424f254f0060d4c2e1184cf1f" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ac78945f424f254f0060d4c2e1184cf1f" kindref="member">build</ref>()<sp/>{</highlight></codeline>
-<codeline lineno="142"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(m_operationGraph.numOps<sp/>&lt;=<sp/>0)<sp/>{</highlight></codeline>
-<codeline lineno="143"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
-<codeline lineno="144"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,</highlight></codeline>
-<codeline lineno="145"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_STATUS_BAD_PARAM,</highlight></codeline>
-<codeline lineno="146"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>Check<sp/>and<sp/>Set<sp/>the<sp/>CUDNN_ATTR_OPERATIONGRAPH_OPS<sp/>Count<sp/>field&quot;</highlight><highlight class="normal">);</highlight></codeline>
-<codeline lineno="147"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
-<codeline lineno="148"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="149"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(m_operationGraph.ops[0]<sp/>==<sp/></highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">)<sp/>{</highlight></codeline>
-<codeline lineno="150"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
-<codeline lineno="151"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,</highlight></codeline>
-<codeline lineno="152"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_STATUS_BAD_PARAM,</highlight></codeline>
-<codeline lineno="153"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>Check<sp/>and<sp/>set<sp/>CUDNN_ATTR_OPERATIONGRAPH_OPS<sp/>field&quot;</highlight><highlight class="normal">);</highlight></codeline>
-<codeline lineno="154"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
-<codeline lineno="155"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="156"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(m_operationGraph.handle<sp/>==<sp/></highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">)<sp/>{</highlight></codeline>
-<codeline lineno="157"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
-<codeline lineno="158"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,</highlight></codeline>
-<codeline lineno="159"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_STATUS_BAD_PARAM,</highlight></codeline>
-<codeline lineno="160"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>Check<sp/>and<sp/>Set<sp/>CUDNN_ATTR_OPERATIONGRAPH_HANDLE&quot;</highlight><highlight class="normal">);</highlight></codeline>
-<codeline lineno="161"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
-<codeline lineno="162"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="163"><highlight class="normal"></highlight></codeline>
-<codeline lineno="164"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="comment">//<sp/>Create<sp/>a<sp/>descriptor.<sp/>Memory<sp/>allocation<sp/>happens<sp/>here.</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="165"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>=<sp/>m_operationGraph.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR);</highlight></codeline>
-<codeline lineno="166"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
-<codeline lineno="167"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
-<codeline lineno="168"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,<sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref>,<sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>cudnnCreate<sp/>Failed&quot;</highlight><highlight class="normal">);</highlight></codeline>
-<codeline lineno="169"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
-<codeline lineno="170"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="171"><highlight class="normal"></highlight></codeline>
-<codeline lineno="172"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>std::array&lt;cudnnBackendDescriptor_t,<sp/>10&gt;<sp/>ops_raw{</highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">};</highlight></codeline>
-<codeline lineno="173"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(</highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>i<sp/>=<sp/>0u;<sp/>i<sp/>&lt;<sp/>m_operationGraph.numOps;<sp/>i++)<sp/>{</highlight></codeline>
-<codeline lineno="174"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>ops_raw[i]<sp/>=<sp/>m_operationGraph.ops[i]-&gt;get_backend_descriptor();</highlight></codeline>
+<codeline lineno="99"><highlight class="normal"><sp/><sp/><sp/><sp/>std::string<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;</highlight></codeline>
+<codeline lineno="100" refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a19fd5ed99ab4053c8a178bd33843460a" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a19fd5ed99ab4053c8a178bd33843460a" kindref="member">getTag</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="101"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1ac8ca1ba29ac3f8e68ba1bf3e5e500338" kindref="member">opGraphTag</ref>;</highlight></codeline>
+<codeline lineno="102"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="103"><highlight class="normal"></highlight></codeline>
+<codeline lineno="104"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">private</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="105"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5c029cff12e0e91406a8f88fd8a830f4" kindref="member">OperationGraph_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="106"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5c029cff12e0e91406a8f88fd8a830f4" kindref="member">OperationGraph_v8</ref>(<ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="107"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref><sp/>&amp;</highlight></codeline>
+<codeline lineno="108"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a87704bb46bb12bba977a21ed579a4ef3" kindref="member">operator=</ref>(<ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="109"><highlight class="normal"></highlight></codeline>
+<codeline lineno="110" refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1abd35d4e84bb6ee70e8df38de093fc376" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnHandle_t<sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1abd35d4e84bb6ee70e8df38de093fc376" kindref="member">handle</ref><sp/>=<sp/></highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="111" refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1ab2570d81fc01c1b6b9a76220b0abd717" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>std::array&lt;ManagedOpaqueDescriptor,<sp/>10&gt;<sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1ab2570d81fc01c1b6b9a76220b0abd717" kindref="member">ops</ref>{};</highlight></codeline>
+<codeline lineno="112" refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a52c12bb0014a899c4c5201fb66301eb2" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>int64_t<sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a52c12bb0014a899c4c5201fb66301eb2" kindref="member">numOps</ref><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/>-1;</highlight></codeline>
+<codeline lineno="113" refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1ac8ca1ba29ac3f8e68ba1bf3e5e500338" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>std::string<sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1ac8ca1ba29ac3f8e68ba1bf3e5e500338" kindref="member">opGraphTag</ref><sp/>=<sp/></highlight><highlight class="stringliteral">&quot;&quot;</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="114"><highlight class="normal">};</highlight></codeline>
+<codeline lineno="115"><highlight class="normal"></highlight></codeline>
+<codeline lineno="119" refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" refkind="compound"><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/>{</highlight></codeline>
+<codeline lineno="120"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="125"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="127" refid="d2/df5/group__OperationGraphBuilder__v8_1ga5b5d8a3121e92a8a7d47341b424298f8" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d2/df5/group__OperationGraphBuilder__v8_1ga5b5d8a3121e92a8a7d47341b424298f8" kindref="member">setHandle</ref>(cudnnHandle_t<sp/>handle_)<sp/>-&gt;<sp/><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/>&amp;<sp/>{</highlight></codeline>
+<codeline lineno="128"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>m_operationGraph.handle<sp/>=<sp/>handle_;</highlight></codeline>
+<codeline lineno="129"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>*</highlight><highlight class="keyword">this</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="130"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="132"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="133" refid="d2/df5/group__OperationGraphBuilder__v8_1ga4e4cee8d631471478d5de420077a2182" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d2/df5/group__OperationGraphBuilder__v8_1ga4e4cee8d631471478d5de420077a2182" kindref="member">setOperationGraph</ref>(int64_t<sp/>numOps_,<sp/><ref refid="d4/d30/classcudnn__frontend_1_1Operation__v8" kindref="compound">Operation_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>**ops_)<sp/>-&gt;<sp/><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/>&amp;<sp/>{</highlight></codeline>
+<codeline lineno="134"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>m_operationGraph.numOps<sp/>=<sp/>numOps_;</highlight></codeline>
+<codeline lineno="135"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(</highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>i<sp/>=<sp/>0u;<sp/>i<sp/>&lt;<sp/>numOps_;<sp/>i++)<sp/>{</highlight></codeline>
+<codeline lineno="136"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>m_operationGraph.ops[i]<sp/>=<sp/>ops_[i]-&gt;get_desc();</highlight></codeline>
+<codeline lineno="137"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>m_operationGraph.opGraphTag<sp/>+=<sp/>ops_[i]-&gt;getTag()<sp/>+<sp/></highlight><highlight class="charliteral">&apos;_&apos;</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="138"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="139"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>*</highlight><highlight class="keyword">this</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="140"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="143"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref><sp/>&amp;&amp;</highlight></codeline>
+<codeline lineno="146" refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ac78945f424f254f0060d4c2e1184cf1f" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ac78945f424f254f0060d4c2e1184cf1f" kindref="member">build</ref>()<sp/>{</highlight></codeline>
+<codeline lineno="147"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(m_operationGraph.numOps<sp/>&lt;=<sp/>0)<sp/>{</highlight></codeline>
+<codeline lineno="148"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
+<codeline lineno="149"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,</highlight></codeline>
+<codeline lineno="150"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_STATUS_BAD_PARAM,</highlight></codeline>
+<codeline lineno="151"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>Check<sp/>and<sp/>Set<sp/>the<sp/>CUDNN_ATTR_OPERATIONGRAPH_OPS<sp/>Count<sp/>field&quot;</highlight><highlight class="normal">);</highlight></codeline>
+<codeline lineno="152"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
+<codeline lineno="153"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="154"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(m_operationGraph.ops[0]<sp/>==<sp/></highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">)<sp/>{</highlight></codeline>
+<codeline lineno="155"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
+<codeline lineno="156"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,</highlight></codeline>
+<codeline lineno="157"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_STATUS_BAD_PARAM,</highlight></codeline>
+<codeline lineno="158"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>Check<sp/>and<sp/>set<sp/>CUDNN_ATTR_OPERATIONGRAPH_OPS<sp/>field&quot;</highlight><highlight class="normal">);</highlight></codeline>
+<codeline lineno="159"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
+<codeline lineno="160"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="161"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(m_operationGraph.handle<sp/>==<sp/></highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">)<sp/>{</highlight></codeline>
+<codeline lineno="162"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
+<codeline lineno="163"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,</highlight></codeline>
+<codeline lineno="164"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_STATUS_BAD_PARAM,</highlight></codeline>
+<codeline lineno="165"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>Check<sp/>and<sp/>Set<sp/>CUDNN_ATTR_OPERATIONGRAPH_HANDLE&quot;</highlight><highlight class="normal">);</highlight></codeline>
+<codeline lineno="166"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
+<codeline lineno="167"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="168"><highlight class="normal"></highlight></codeline>
+<codeline lineno="169"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="comment">//<sp/>Create<sp/>a<sp/>descriptor.<sp/>Memory<sp/>allocation<sp/>happens<sp/>here.</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="170"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>=<sp/>m_operationGraph.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR);</highlight></codeline>
+<codeline lineno="171"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
+<codeline lineno="172"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
+<codeline lineno="173"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,<sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref>,<sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>cudnnCreate<sp/>Failed&quot;</highlight><highlight class="normal">);</highlight></codeline>
+<codeline lineno="174"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
 <codeline lineno="175"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
 <codeline lineno="176"><highlight class="normal"></highlight></codeline>
-<codeline lineno="177"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>=<sp/>cudnnBackendSetAttribute(m_operationGraph.pointer-&gt;get_backend_descriptor(),</highlight></codeline>
-<codeline lineno="178"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_ATTR_OPERATIONGRAPH_OPS,</highlight></codeline>
-<codeline lineno="179"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_TYPE_BACKEND_DESCRIPTOR,</highlight></codeline>
-<codeline lineno="180"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>m_operationGraph.numOps,</highlight></codeline>
-<codeline lineno="181"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>ops_raw.data());</highlight></codeline>
-<codeline lineno="182"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
-<codeline lineno="183"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
-<codeline lineno="184"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,</highlight></codeline>
-<codeline lineno="185"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref>,</highlight></codeline>
-<codeline lineno="186"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>SetAttribute<sp/>CUDNN_ATTR_OPERATIONGRAPH_OPS<sp/>Failed&quot;</highlight><highlight class="normal">);</highlight></codeline>
-<codeline lineno="187"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
-<codeline lineno="188"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="189"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>=<sp/>cudnnBackendSetAttribute(m_operationGraph.pointer-&gt;get_backend_descriptor(),</highlight></codeline>
-<codeline lineno="190"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_ATTR_OPERATIONGRAPH_HANDLE,</highlight></codeline>
-<codeline lineno="191"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_TYPE_HANDLE,</highlight></codeline>
-<codeline lineno="192"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>1,</highlight></codeline>
-<codeline lineno="193"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph.handle);</highlight></codeline>
-<codeline lineno="194"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
-<codeline lineno="195"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
-<codeline lineno="196"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,</highlight></codeline>
-<codeline lineno="197"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref>,</highlight></codeline>
-<codeline lineno="198"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>SetAttribute<sp/>CUDNN_ATTR_OPERATIONGRAPH_HANDLE<sp/>Failed&quot;</highlight><highlight class="normal">);</highlight></codeline>
-<codeline lineno="199"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
-<codeline lineno="200"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="201"><highlight class="normal"></highlight></codeline>
-<codeline lineno="202"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="comment">//<sp/>Finalizing<sp/>the<sp/>descriptor</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="203"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>=<sp/>cudnnBackendFinalize(m_operationGraph.pointer-&gt;get_backend_descriptor());</highlight></codeline>
-<codeline lineno="204"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
-<codeline lineno="205"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
-<codeline lineno="206"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,<sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref>,<sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>cudnnFinalize<sp/>Failed&quot;</highlight><highlight class="normal">);</highlight></codeline>
-<codeline lineno="207"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
-<codeline lineno="208"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="209"><highlight class="normal"></highlight></codeline>
-<codeline lineno="210"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
-<codeline lineno="211"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="212"><highlight class="normal"></highlight></codeline>
-<codeline lineno="213"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">explicit</highlight><highlight class="normal"><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5af59a099cc90eda429563e285b2907f" kindref="member">OperationGraphBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="214"><highlight class="normal"><sp/><sp/><sp/><sp/>~<ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="215"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5af59a099cc90eda429563e285b2907f" kindref="member">OperationGraphBuilder_v8</ref>(<ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/>&amp;&amp;)<sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="216"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5af59a099cc90eda429563e285b2907f" kindref="member">OperationGraphBuilder_v8</ref>(<ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="217"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/>&amp;</highlight></codeline>
-<codeline lineno="218"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a87704bb46bb12bba977a21ed579a4ef3" kindref="member">operator=</ref>(<ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="219"><highlight class="normal"></highlight></codeline>
-<codeline lineno="220"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">private</highlight><highlight class="normal">:</highlight></codeline>
-<codeline lineno="221" refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ad9cb3e166ab001b3b0c60ed2198cd6d9" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref><sp/><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ad9cb3e166ab001b3b0c60ed2198cd6d9" kindref="member">m_operationGraph</ref>;</highlight></codeline>
-<codeline lineno="222"><highlight class="normal">};</highlight></codeline>
-<codeline lineno="223"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="177"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>std::array&lt;cudnnBackendDescriptor_t,<sp/>10&gt;<sp/>ops_raw{</highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">};</highlight></codeline>
+<codeline lineno="178"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(</highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>i<sp/>=<sp/>0u;<sp/>i<sp/>&lt;<sp/>m_operationGraph.numOps;<sp/>i++)<sp/>{</highlight></codeline>
+<codeline lineno="179"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>ops_raw[i]<sp/>=<sp/>m_operationGraph.ops[i]-&gt;get_backend_descriptor();</highlight></codeline>
+<codeline lineno="180"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="181"><highlight class="normal"></highlight></codeline>
+<codeline lineno="182"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>=<sp/>cudnnBackendSetAttribute(m_operationGraph.pointer-&gt;get_backend_descriptor(),</highlight></codeline>
+<codeline lineno="183"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_ATTR_OPERATIONGRAPH_OPS,</highlight></codeline>
+<codeline lineno="184"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_TYPE_BACKEND_DESCRIPTOR,</highlight></codeline>
+<codeline lineno="185"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>m_operationGraph.numOps,</highlight></codeline>
+<codeline lineno="186"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>ops_raw.data());</highlight></codeline>
+<codeline lineno="187"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
+<codeline lineno="188"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
+<codeline lineno="189"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,</highlight></codeline>
+<codeline lineno="190"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref>,</highlight></codeline>
+<codeline lineno="191"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>SetAttribute<sp/>CUDNN_ATTR_OPERATIONGRAPH_OPS<sp/>Failed&quot;</highlight><highlight class="normal">);</highlight></codeline>
+<codeline lineno="192"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
+<codeline lineno="193"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="194"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>=<sp/>cudnnBackendSetAttribute(m_operationGraph.pointer-&gt;get_backend_descriptor(),</highlight></codeline>
+<codeline lineno="195"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_ATTR_OPERATIONGRAPH_HANDLE,</highlight></codeline>
+<codeline lineno="196"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>CUDNN_TYPE_HANDLE,</highlight></codeline>
+<codeline lineno="197"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>1,</highlight></codeline>
+<codeline lineno="198"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph.handle);</highlight></codeline>
+<codeline lineno="199"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
+<codeline lineno="200"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
+<codeline lineno="201"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,</highlight></codeline>
+<codeline lineno="202"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref>,</highlight></codeline>
+<codeline lineno="203"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>SetAttribute<sp/>CUDNN_ATTR_OPERATIONGRAPH_HANDLE<sp/>Failed&quot;</highlight><highlight class="normal">);</highlight></codeline>
+<codeline lineno="204"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
+<codeline lineno="205"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="206"><highlight class="normal"></highlight></codeline>
+<codeline lineno="207"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="comment">//<sp/>Finalizing<sp/>the<sp/>descriptor</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="208"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>=<sp/>cudnnBackendFinalize(m_operationGraph.pointer-&gt;get_backend_descriptor());</highlight></codeline>
+<codeline lineno="209"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref><sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
+<codeline lineno="210"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" kindref="member">set_error_and_throw_exception</ref>(</highlight></codeline>
+<codeline lineno="211"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>&amp;m_operationGraph,<sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" kindref="member">status</ref>,<sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:<sp/>cudnnFinalize<sp/>Failed&quot;</highlight><highlight class="normal">);</highlight></codeline>
+<codeline lineno="212"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
+<codeline lineno="213"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="214"><highlight class="normal"></highlight></codeline>
+<codeline lineno="215"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_operationGraph);</highlight></codeline>
+<codeline lineno="216"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="217"><highlight class="normal"></highlight></codeline>
+<codeline lineno="218"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">explicit</highlight><highlight class="normal"><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5af59a099cc90eda429563e285b2907f" kindref="member">OperationGraphBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="219"><highlight class="normal"><sp/><sp/><sp/><sp/>~<ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="220"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5af59a099cc90eda429563e285b2907f" kindref="member">OperationGraphBuilder_v8</ref>(<ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/>&amp;&amp;)<sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="221"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5af59a099cc90eda429563e285b2907f" kindref="member">OperationGraphBuilder_v8</ref>(<ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="222"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/>&amp;</highlight></codeline>
+<codeline lineno="223"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a87704bb46bb12bba977a21ed579a4ef3" kindref="member">operator=</ref>(<ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="224"><highlight class="normal"></highlight></codeline>
+<codeline lineno="225"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">private</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="226" refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ad9cb3e166ab001b3b0c60ed2198cd6d9" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref><sp/><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ad9cb3e166ab001b3b0c60ed2198cd6d9" kindref="member">m_operationGraph</ref>;</highlight></codeline>
+<codeline lineno="227"><highlight class="normal">};</highlight></codeline>
+<codeline lineno="228"><highlight class="normal">}</highlight></codeline>
     </programlisting>
     <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h"/>
   </compounddef>

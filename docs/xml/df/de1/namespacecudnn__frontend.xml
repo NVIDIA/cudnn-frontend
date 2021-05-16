@@ -27,6 +27,8 @@
     <innerclass refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" prot="public">cudnn_frontend::OperationGraphBuilder_v8</innerclass>
     <innerclass refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8" prot="public">cudnn_frontend::PointWiseDesc_v8</innerclass>
     <innerclass refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8" prot="public">cudnn_frontend::PointWiseDescBuilder_v8</innerclass>
+    <innerclass refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" prot="public">cudnn_frontend::ReductionDesc_v8</innerclass>
+    <innerclass refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" prot="public">cudnn_frontend::ReductionDescBuilder_v8</innerclass>
     <innerclass refid="d6/da7/classcudnn__frontend_1_1Tensor__v8" prot="public">cudnn_frontend::Tensor_v8</innerclass>
     <innerclass refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8" prot="public">cudnn_frontend::TensorBuilder_v8</innerclass>
     <innerclass refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" prot="public">cudnn_frontend::VariantPack_v8</innerclass>
@@ -89,7 +91,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="113" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="113" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="116" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="116" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a9fea2e22198aaf2ea11a0df46abd0749" prot="public" static="no">
         <type><ref refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8" kindref="compound">TensorBuilder_v8</ref></type>
@@ -102,7 +104,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="114" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="114" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="117" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="117" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ae24bc7541c87c642cdef8eaf83c8eacc" prot="public" static="no">
         <type><ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kindref="compound">ConvDesc_v8</ref></type>
@@ -115,7 +117,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="115" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="115" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="118" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="118" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a91b5e4e82a18d2212ad6be6d5398752c" prot="public" static="no">
         <type><ref refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8" kindref="compound">ConvDescBuilder_v8</ref></type>
@@ -128,7 +130,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="116" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="116" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="119" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="119" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a7f878662c40c287736343affc43f25dc" prot="public" static="no">
         <type><ref refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8" kindref="compound">PointWiseDescBuilder_v8</ref></type>
@@ -141,7 +143,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="117" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="117" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="120" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="120" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ada5353494ce649fc915154ced52dcceb" prot="public" static="no">
         <type><ref refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8" kindref="compound">PointWiseDesc_v8</ref></type>
@@ -154,7 +156,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="118" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="118" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="121" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="121" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ad809552e9ec400bcbfcfc0ea5acd4e56" prot="public" static="no">
         <type><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref></type>
@@ -167,7 +169,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="119" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="119" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="122" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="122" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a0c344e3bc1f332aa9f5b213eb1ae9ee6" prot="public" static="no">
         <type><ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" kindref="compound">MatMulDescBuilder_v8</ref></type>
@@ -180,7 +182,33 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="120" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="120" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="123" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="123" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a4b09ba4625f988c32edfc305b5397f48" prot="public" static="no">
+        <type><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" kindref="compound">ReductionDesc_v8</ref></type>
+        <definition>using cudnn_frontend::ReductionDesc = typedef ReductionDesc_v8</definition>
+        <argsstring></argsstring>
+        <name>ReductionDesc</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="124" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="124" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1aa5a388535aed6e36ef90002af0b80a80" prot="public" static="no">
+        <type><ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" kindref="compound">ReductionDescBuilder_v8</ref></type>
+        <definition>using cudnn_frontend::ReductionDescBuilder = typedef ReductionDescBuilder_v8</definition>
+        <argsstring></argsstring>
+        <name>ReductionDescBuilder</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="125" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="125" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a2f1497702504947953a0f5a69b6eeb2a" prot="public" static="no">
         <type><ref refid="d4/d30/classcudnn__frontend_1_1Operation__v8" kindref="compound">Operation_v8</ref></type>
@@ -193,7 +221,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="121" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="121" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="126" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="126" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ae6d02ff4c7922673ed3862145a4019d4" prot="public" static="no">
         <type><ref refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8" kindref="compound">OperationBuilder_v8</ref></type>
@@ -206,7 +234,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="122" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="122" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="127" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="127" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ac86ce924df5209c4ce1bc25856eea6e6" prot="public" static="no">
         <type><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref></type>
@@ -219,7 +247,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="123" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="123" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="128" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="128" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a0b7ba1175801c56d07d26785bcd8fb70" prot="public" static="no">
         <type><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref></type>
@@ -232,7 +260,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="124" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="124" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="129" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="129" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1aae6a627b67858b15afbc5656afa88123" prot="public" static="no">
         <type><ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref></type>
@@ -245,7 +273,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="125" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="125" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="130" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="130" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a147bbd62e1c7c6b3fbc6869ab776b125" prot="public" static="no">
         <type><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref></type>
@@ -258,7 +286,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="126" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="126" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="131" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="131" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a4f90ec150d149f8f0751daa3ad625839" prot="public" static="no">
         <type><ref refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8" kindref="compound">EngineBuilder_v8</ref></type>
@@ -271,7 +299,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="127" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="127" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="132" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="132" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a1ed8c535fea949a10acd26e279cc28a1" prot="public" static="no">
         <type><ref refid="dc/d3c/classcudnn__frontend_1_1Engine__v8" kindref="compound">Engine_v8</ref></type>
@@ -284,7 +312,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="128" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="128" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="133" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="133" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a2559dec72130bbdc95c02fb0df79fd42" prot="public" static="no">
         <type><ref refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8" kindref="compound">EngineConfig_v8</ref></type>
@@ -297,7 +325,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="129" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="129" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="134" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="134" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ac46e1785757fde7c10e3d527f697fde8" prot="public" static="no">
         <type><ref refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8" kindref="compound">EngineConfigBuilder_v8</ref></type>
@@ -310,7 +338,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="130" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="130" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="135" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="135" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a984c10aa29daac796444bda66bdef26e" prot="public" static="no">
         <type><ref refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" kindref="compound">ExecutionPlan_v8</ref></type>
@@ -323,7 +351,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="131" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="131" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="136" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="136" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1aa508b66c4de02f4aacae8029dbe422eb" prot="public" static="no">
         <type><ref refid="d1/d74/classcudnn__frontend_1_1ExecutionPlanBuilder__v8" kindref="compound">ExecutionPlanBuilder_v8</ref></type>
@@ -336,7 +364,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="132" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="132" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="137" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="137" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ad6ac8113b406ee2b6f20eff4dd2b4e01" prot="public" static="no">
         <type><ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">VariantPack_v8</ref></type>
@@ -349,7 +377,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="133" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="133" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="138" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="138" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1ab5b844f5de8ad3c056f0cb1cd0fb3ac1" prot="public" static="no">
         <type><ref refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8" kindref="compound">VariantPackBuilder_v8</ref></type>
@@ -362,7 +390,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="134" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="134" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="139" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="139" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a61fbd4506f1249c686164fb33d858999" prot="public" static="no">
         <type><ref refid="db/d99/classcudnn__frontend_1_1EngineFallbackList__v8" kindref="compound">EngineFallbackList_v8</ref></type>
@@ -375,7 +403,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="135" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="135" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="140" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="140" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1aeb6699f494fa895d402898dae554f5a9" prot="public" static="no">
         <type><ref refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8" kindref="compound">EngineFallbackListBuilder_v8</ref></type>
@@ -388,7 +416,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="136" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="136" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" line="141" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend.h" bodystart="141" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="df/de1/namespacecudnn__frontend_1a84a5f004bdf17747bf7cf45d6fc754cd" prot="public" static="no">
         <type>std::vector&lt; <ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref> &gt;</type>
@@ -504,14 +532,40 @@
         <referencedby refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1abd7cdd3a218623ffc5dfcbf9343aef85" compoundref="d3/d6b/cudnn__frontend__find__plan_8h" startline="99" endline="118">cudnn_frontend::EngineConfigGenerator::cudnnFindPlan</referencedby>
         <referencedby refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1ad6ca7e7263ed9b7597f94ca45505642f" compoundref="d2/d3b/cudnn__frontend__get__plan_8h" startline="30" endline="46">cudnn_frontend::EngineConfigGenerator::cudnnGetPlan</referencedby>
       </memberdef>
-      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1ad365eee23138df472d716d9dbf119f0e" prot="public" static="yes" const="no" explicit="no" inline="no" virt="non-virtual">
+      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1af057a1fb628c89d02eb47c7cfa9ce0af" prot="public" static="yes" const="no" explicit="no" inline="no" virt="non-virtual">
         <type>auto</type>
         <definition>static auto cudnn_frontend::get_fallback_engine_list</definition>
-        <argsstring>(cudnnBackendDescriptorType_t mode) -&gt; std::vector&lt; int &gt;</argsstring>
+        <argsstring>(cudnnBackendDescriptorType_t mode, const std::string &amp;opGraphTag) -&gt; std::vector&lt; int &gt;</argsstring>
         <name>get_fallback_engine_list</name>
         <param>
           <type>cudnnBackendDescriptorType_t</type>
           <declname>mode</declname>
+        </param>
+        <param>
+          <type>const std::string &amp;</type>
+          <declname>opGraphTag</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+<para>Here we are using the term &quot;bias&quot; in the operationGraph as a proxy for the conv*bias* operation graph. We are not strictly checking the order of the operations in the graph. We propose this as a temporary workaround until the backend API supports querying the fallback list directly from cudnn </para>        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" line="30" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" bodystart="30" bodyend="75"/>
+        <referencedby refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1aae1a36ace3278dbedcf0d743a7744d98" compoundref="df/d3e/cudnn__frontend__EngineFallbackList_8h" startline="144" endline="170">cudnn_frontend::EngineFallbackListBuilder_v8::build</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1a069fb3355ab52d2e1914e72832cdcf46" prot="public" static="yes" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type>void</type>
+        <definition>static void cudnn_frontend::load_from_config</definition>
+        <argsstring>(json &amp;json_handle, const std::string &amp;errata_json)</argsstring>
+        <name>load_from_config</name>
+        <param>
+          <type><ref refid="db/d7e/cudnn__frontend__Errata_8h_1ab701e3ac61a85b337ec5c1abaad6742d" kindref="member">json</ref> &amp;</type>
+          <declname>json_handle</declname>
+        </param>
+        <param>
+          <type>const std::string &amp;</type>
+          <declname>errata_json</declname>
         </param>
         <briefdescription>
         </briefdescription>
@@ -519,8 +573,77 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" line="30" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineFallbackList.h" bodystart="30" bodyend="65"/>
-        <referencedby refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1aae1a36ace3278dbedcf0d743a7744d98" compoundref="df/d3e/cudnn__frontend__EngineFallbackList_8h" startline="131" endline="157">cudnn_frontend::EngineFallbackListBuilder_v8::build</referencedby>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Errata.h" line="39" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Errata.h" bodystart="39" bodyend="47"/>
+      </memberdef>
+      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1a91f2627793be5d51db9b1473275d803d" prot="public" static="yes" const="no" explicit="no" inline="no" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename T</type>
+          </param>
+        </templateparamlist>
+        <type>bool</type>
+        <definition>static bool cudnn_frontend::check_rule</definition>
+        <argsstring>(const json &amp;json_handle, const std::string &amp;executionPlanTag, cudnnHandle_t handle, T fn)</argsstring>
+        <name>check_rule</name>
+        <param>
+          <type>const <ref refid="db/d7e/cudnn__frontend__Errata_8h_1ab701e3ac61a85b337ec5c1abaad6742d" kindref="member">json</ref> &amp;</type>
+          <declname>json_handle</declname>
+        </param>
+        <param>
+          <type>const std::string &amp;</type>
+          <declname>executionPlanTag</declname>
+        </param>
+        <param>
+          <type>cudnnHandle_t</type>
+          <declname>handle</declname>
+        </param>
+        <param>
+          <type>T</type>
+          <declname>fn</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Errata.h" line="51" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Errata.h" bodystart="51" bodyend="80"/>
+        <references refid="d9/dcc/classnlohmann_1_1basic__json_1a02c9bc4d0f33b7dec20b2798301d6971" compoundref="d5/db8/json_8hpp" startline="21558" endline="21561">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::contains</references>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" compoundref="d5/db8/json_8hpp" startline="4061" endline="4069">nlohmann::detail::void</references>
+      </memberdef>
+      <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1a8f4ddfcd38f15524ff0a35e14d21664c" prot="public" static="yes" const="no" explicit="no" inline="no" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename T</type>
+          </param>
+        </templateparamlist>
+        <type>bool</type>
+        <definition>static bool cudnn_frontend::check_errata</definition>
+        <argsstring>(const json &amp;json_handle, const std::string &amp;executionPlanTag, cudnnHandle_t handle, T fn)</argsstring>
+        <name>check_errata</name>
+        <param>
+          <type>const <ref refid="db/d7e/cudnn__frontend__Errata_8h_1ab701e3ac61a85b337ec5c1abaad6742d" kindref="member">json</ref> &amp;</type>
+          <declname>json_handle</declname>
+        </param>
+        <param>
+          <type>const std::string &amp;</type>
+          <declname>executionPlanTag</declname>
+        </param>
+        <param>
+          <type>cudnnHandle_t</type>
+          <declname>handle</declname>
+        </param>
+        <param>
+          <type>T</type>
+          <declname>fn</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Errata.h" line="87" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Errata.h" bodystart="87" bodyend="97"/>
       </memberdef>
       <memberdef kind="function" id="df/de1/namespacecudnn__frontend_1a4d18e44a57e30f9bf29157f742ba9c65" prot="public" static="yes" const="no" explicit="no" inline="no" virt="non-virtual">
         <type>void</type>
@@ -678,10 +801,12 @@
         <references refid="d9/dca/classcudnn__frontend_1_1cudnnException_1aa80c45a57ca091770572aaa5a1f7e322" compoundref="df/d17/cudnn__frontend__utils_8h" startline="34" endline="34">cudnn_frontend::cudnnException::cudnnException</references>
         <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a1748a5c560905314930c37b2ed1a54d2" compoundref="dc/d11/cudnn__backend__base_8h" startline="124" endline="126">cudnn_frontend::BackendDescriptor::set_error</references>
         <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3ef02443f20b90223baf5f1922505eab" compoundref="dc/d11/cudnn__backend__base_8h" startline="118" endline="120">cudnn_frontend::BackendDescriptor::set_status</references>
+        <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
         <referencedby refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1addc153acf5600781659a1a2ba891e59c" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="93" endline="123">cudnn_frontend::MatMulDescBuilder_v8::build</referencedby>
+        <referencedby refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8_1a84355923606ae86f66264fbcc5c305ad" compoundref="db/da7/cudnn__frontend__ReductionDesc_8h" startline="102" endline="147">cudnn_frontend::ReductionDescBuilder_v8::build</referencedby>
         <referencedby refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8_1abf794751941aa252c19e1879306375d3" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="128" endline="184">cudnn_frontend::VariantPackBuilder_v8::build</referencedby>
-        <referencedby refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1aae1a36ace3278dbedcf0d743a7744d98" compoundref="df/d3e/cudnn__frontend__EngineFallbackList_8h" startline="131" endline="157">cudnn_frontend::EngineFallbackListBuilder_v8::build</referencedby>
-        <referencedby refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ac78945f424f254f0060d4c2e1184cf1f" compoundref="db/d7d/cudnn__frontend__OperationGraph_8h" startline="141" endline="211">cudnn_frontend::OperationGraphBuilder_v8::build</referencedby>
+        <referencedby refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1aae1a36ace3278dbedcf0d743a7744d98" compoundref="df/d3e/cudnn__frontend__EngineFallbackList_8h" startline="144" endline="170">cudnn_frontend::EngineFallbackListBuilder_v8::build</referencedby>
+        <referencedby refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ac78945f424f254f0060d4c2e1184cf1f" compoundref="db/d7d/cudnn__frontend__OperationGraph_8h" startline="146" endline="216">cudnn_frontend::OperationGraphBuilder_v8::build</referencedby>
         <referencedby refid="db/dae/classcudnn__frontend_1_1TensorBuilder__v8_1a32876941f964b3fad2d123b9081b0af7" compoundref="d3/d98/cudnn__frontend__Tensor_8h" startline="155" endline="273">cudnn_frontend::TensorBuilder_v8::build</referencedby>
         <referencedby refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a639e1514ea8f283720e49fc18d7ad673" compoundref="d6/d67/cudnn__frontend__EngineConfig_8h" startline="159" endline="221">cudnn_frontend::EngineConfigBuilder_v8::build</referencedby>
         <referencedby refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1ab3ff1b538521fdea588d8ac155f6e88c" compoundref="db/d66/cudnn__frontend__Heuristics_8h" startline="161" endline="212">cudnn_frontend::EngineHeuristicsBuilder_v8::build</referencedby>
@@ -689,7 +814,7 @@
         <referencedby refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a5de642e4141705f8e06c4bf566f1d332" compoundref="da/d5f/cudnn__frontend__PointWiseDesc_8h" startline="206" endline="357">cudnn_frontend::PointWiseDescBuilder_v8::build</referencedby>
         <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="243" endline="302">cudnn_frontend::ExecutionPlanBuilder_v8::build</referencedby>
         <referencedby refid="d9/dfd/classcudnn__frontend_1_1EngineBuilder__v8_1a010b99c39d63121be78ec847fff433f8" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="262" endline="320">cudnn_frontend::EngineBuilder_v8::build</referencedby>
-        <referencedby refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1aa0df558c603d8316dd3eb2d5bfd67c9d" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="389" endline="1084">cudnn_frontend::OperationBuilder_v8::build</referencedby>
+        <referencedby refid="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8_1aa0df558c603d8316dd3eb2d5bfd67c9d" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="407" endline="1170">cudnn_frontend::OperationBuilder_v8::build</referencedby>
         <referencedby refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a0e6d7c12c261ad6c2f08e1249397b696" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="122" endline="162">cudnn_frontend::Engine_v8::buildKnobs</referencedby>
         <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga8a6517102f5c12e63e4417324a03180b" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="104" endline="196">cudnn_frontend::ExecutionPlan_v8::computeTag</referencedby>
         <referencedby refid="dc/d3c/classcudnn__frontend_1_1Engine__v8_1a7609e82ac3dc04b67e9e73beb0f7cdae" compoundref="de/d6d/cudnn__frontend__Engine_8h" startline="174" endline="207">cudnn_frontend::Engine_v8::Engine_v8</referencedby>
@@ -698,15 +823,16 @@
         <referencedby refid="d6/d46/group__EngineHeuristicsQuery_1ga10121605fc82ed225537210825fa3836" compoundref="db/d66/cudnn__frontend__Heuristics_8h" startline="103" endline="119">cudnn_frontend::EngineHeuristics_v8::getEngineConfigCount</referencedby>
         <referencedby refid="d1/df7/group__OperationGraphQuery_1ga7a7a8d03f5a3aa54f14b83be4abe2a26" compoundref="db/d7d/cudnn__frontend__OperationGraph_8h" startline="76" endline="91">cudnn_frontend::OperationGraph_v8::getEngineCount</referencedby>
         <referencedby refid="d7/d0d/group__ExecutionPlanQuery_1ga00d10a076c22e86354a789852c56c22f" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="67" endline="88">cudnn_frontend::ExecutionPlan_v8::getWorkspaceSize</referencedby>
-        <referencedby refid="d3/d92/group__OperationBuilder__v8_1ga095c52c8f1b01ebb224265f9000195c0" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="252" endline="261">cudnn_frontend::OperationBuilder_v8::setaMatDesc</referencedby>
-        <referencedby refid="d3/d92/group__OperationBuilder__v8_1ga17475846760b10ffdfa536cd92a5b135" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="192" endline="201">cudnn_frontend::OperationBuilder_v8::setbDesc</referencedby>
-        <referencedby refid="d3/d92/group__OperationBuilder__v8_1gaa8eed29a0181e044ea0263ba655127ec" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="263" endline="272">cudnn_frontend::OperationBuilder_v8::setbMatDesc</referencedby>
-        <referencedby refid="d3/d92/group__OperationBuilder__v8_1gaa82e018b6a9d514ad912b922f43adad2" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="241" endline="250">cudnn_frontend::OperationBuilder_v8::setcDesc</referencedby>
-        <referencedby refid="d3/d92/group__OperationBuilder__v8_1gaaf9d7cbc65c7c7526a6f15d4ad2952fa" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="274" endline="283">cudnn_frontend::OperationBuilder_v8::setcMatDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1ga095c52c8f1b01ebb224265f9000195c0" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="258" endline="267">cudnn_frontend::OperationBuilder_v8::setaMatDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1ga17475846760b10ffdfa536cd92a5b135" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="198" endline="207">cudnn_frontend::OperationBuilder_v8::setbDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1gaa8eed29a0181e044ea0263ba655127ec" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="269" endline="278">cudnn_frontend::OperationBuilder_v8::setbMatDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1gaa82e018b6a9d514ad912b922f43adad2" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="247" endline="256">cudnn_frontend::OperationBuilder_v8::setcDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1gaaf9d7cbc65c7c7526a6f15d4ad2952fa" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="280" endline="289">cudnn_frontend::OperationBuilder_v8::setcMatDesc</referencedby>
         <referencedby refid="d2/dbb/group__EngineConfigBuilder__v8_1ga9673b31268901dfcb97896958687a42a" compoundref="d6/d67/cudnn__frontend__EngineConfig_8h" startline="111" endline="153">cudnn_frontend::EngineConfigBuilder_v8::setEngine</referencedby>
-        <referencedby refid="d3/d92/group__OperationBuilder__v8_1ga3ca1f62832f998566c1b07b4b3c71db4" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="285" endline="294">cudnn_frontend::OperationBuilder_v8::setmatmulDesc</referencedby>
-        <referencedby refid="d3/d92/group__OperationBuilder__v8_1gae6b06877b2e675b2a390f0b122100669" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="296" endline="330">cudnn_frontend::OperationBuilder_v8::setpwDesc</referencedby>
-        <referencedby refid="d3/d92/group__OperationBuilder__v8_1ga80466e517e980ba4953e085b3d4e3498" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="208" endline="217">cudnn_frontend::OperationBuilder_v8::setwDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1ga3ca1f62832f998566c1b07b4b3c71db4" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="291" endline="300">cudnn_frontend::OperationBuilder_v8::setmatmulDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1gae6b06877b2e675b2a390f0b122100669" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="313" endline="347">cudnn_frontend::OperationBuilder_v8::setpwDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1ga904279a29c2c5c949a0e487dd573ae0a" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="302" endline="311">cudnn_frontend::OperationBuilder_v8::setreductionDesc</referencedby>
+        <referencedby refid="d3/d92/group__OperationBuilder__v8_1ga80466e517e980ba4953e085b3d4e3498" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="214" endline="223">cudnn_frontend::OperationBuilder_v8::setwDesc</referencedby>
       </memberdef>
       </sectiondef>
     <briefdescription>

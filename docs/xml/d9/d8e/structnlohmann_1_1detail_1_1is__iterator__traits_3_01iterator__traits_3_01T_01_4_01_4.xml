@@ -1,0 +1,69 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d9/d8e/structnlohmann_1_1detail_1_1is__iterator__traits_3_01iterator__traits_3_01T_01_4_01_4" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_iterator_traits&lt; iterator_traits&lt; T &gt; &gt;</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename T</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="private-type">
+      <memberdef kind="typedef" id="d9/d8e/structnlohmann_1_1detail_1_1is__iterator__traits_3_01iterator__traits_3_01T_01_4_01_4_1a1cbceaaa83a3ad294c3cb66b9df48e78" prot="private" static="no">
+        <type><ref refid="d8/db6/structnlohmann_1_1detail_1_1iterator__traits" kindref="compound">iterator_traits</ref>&lt; T &gt;</type>
+        <definition>using nlohmann::detail::is_iterator_traits&lt; iterator_traits&lt; T &gt; &gt;::traits =  iterator_traits&lt;T&gt;</definition>
+        <argsstring></argsstring>
+        <name>traits</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3601" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3601" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-static-attrib">
+      <memberdef kind="variable" id="d9/d8e/structnlohmann_1_1detail_1_1is__iterator__traits_3_01iterator__traits_3_01T_01_4_01_4_1ac2711760b352b8921accc6609957dc90" prot="public" static="yes" mutable="no">
+        <type>constexpr auto</type>
+        <definition>constexpr auto nlohmann::detail::is_iterator_traits&lt; iterator_traits&lt; T &gt; &gt;::value</definition>
+        <argsstring></argsstring>
+        <name>value</name>
+        <initializer>=
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a9135fcf616d6ac6e231a86e0a055ac44" kindref="member">is_detected</ref>&lt;<ref refid="dc/df0/namespacenlohmann_1_1detail_1af91beae90c2fb0f931079b3d50a343bc" kindref="member">value_type_t</ref>, <ref refid="d9/d8e/structnlohmann_1_1detail_1_1is__iterator__traits_3_01iterator__traits_3_01T_01_4_01_4_1a1cbceaaa83a3ad294c3cb66b9df48e78" kindref="member">traits</ref>&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a9135fcf616d6ac6e231a86e0a055ac44" kindref="member">is_detected</ref>&lt;<ref refid="dc/df0/namespacenlohmann_1_1detail_1a3603b59a17d1c5e15050743b847992f2" kindref="member">difference_type_t</ref>, <ref refid="d9/d8e/structnlohmann_1_1detail_1_1is__iterator__traits_3_01iterator__traits_3_01T_01_4_01_4_1a1cbceaaa83a3ad294c3cb66b9df48e78" kindref="member">traits</ref>&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a9135fcf616d6ac6e231a86e0a055ac44" kindref="member">is_detected</ref>&lt;<ref refid="dc/df0/namespacenlohmann_1_1detail_1a26dc71e2dd9336587e56062178f9abce" kindref="member">pointer_t</ref>, <ref refid="d9/d8e/structnlohmann_1_1detail_1_1is__iterator__traits_3_01iterator__traits_3_01T_01_4_01_4_1a1cbceaaa83a3ad294c3cb66b9df48e78" kindref="member">traits</ref>&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a9135fcf616d6ac6e231a86e0a055ac44" kindref="member">is_detected</ref>&lt;<ref refid="dc/df0/namespacenlohmann_1_1detail_1ad22d2aa3aab018050ae519f6754366e1" kindref="member">iterator_category_t</ref>, <ref refid="d9/d8e/structnlohmann_1_1detail_1_1is__iterator__traits_3_01iterator__traits_3_01T_01_4_01_4_1a1cbceaaa83a3ad294c3cb66b9df48e78" kindref="member">traits</ref>&gt;::value &amp;&amp;
+        <ref refid="dc/df0/namespacenlohmann_1_1detail_1a9135fcf616d6ac6e231a86e0a055ac44" kindref="member">is_detected</ref>&lt;<ref refid="dc/df0/namespacenlohmann_1_1detail_1a082bdafd3b4c61d9d1e92b35b8f75ee3" kindref="member">reference_t</ref>, <ref refid="d9/d8e/structnlohmann_1_1detail_1_1is__iterator__traits_3_01iterator__traits_3_01T_01_4_01_4_1a1cbceaaa83a3ad294c3cb66b9df48e78" kindref="member">traits</ref>&gt;::value</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3604" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3604" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="646">
+        <label>nlohmann::detail::is_iterator_traits&lt; iterator_traits&lt; T &gt; &gt;</label>
+        <link refid="d9/d8e/structnlohmann_1_1detail_1_1is__iterator__traits_3_01iterator__traits_3_01T_01_4_01_4"/>
+        <childnode refid="647" relation="usage">
+          <edgelabel>+value</edgelabel>
+        </childnode>
+      </node>
+      <node id="647">
+        <label>static constexpr auto</label>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3599" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3598" bodyend="3610"/>
+    <listofallmembers>
+      <member refid="d9/d8e/structnlohmann_1_1detail_1_1is__iterator__traits_3_01iterator__traits_3_01T_01_4_01_4_1a1cbceaaa83a3ad294c3cb66b9df48e78" prot="private" virt="non-virtual"><scope>nlohmann::detail::is_iterator_traits&lt; iterator_traits&lt; T &gt; &gt;</scope><name>traits</name></member>
+      <member refid="d9/d8e/structnlohmann_1_1detail_1_1is__iterator__traits_3_01iterator__traits_3_01T_01_4_01_4_1ac2711760b352b8921accc6609957dc90" prot="public" virt="non-virtual"><scope>nlohmann::detail::is_iterator_traits&lt; iterator_traits&lt; T &gt; &gt;</scope><name>value</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

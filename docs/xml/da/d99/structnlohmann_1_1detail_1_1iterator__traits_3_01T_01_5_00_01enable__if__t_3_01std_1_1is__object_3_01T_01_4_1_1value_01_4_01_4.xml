@@ -1,0 +1,97 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="da/d99/structnlohmann_1_1detail_1_1iterator__traits_3_01T_01_5_00_01enable__if__t_3_01std_1_1is__object_3_01T_01_4_1_1value_01_4_01_4" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::iterator_traits&lt; T *, enable_if_t&lt; std::is_object&lt; T &gt;::value &gt; &gt;</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename T</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="da/d99/structnlohmann_1_1detail_1_1iterator__traits_3_01T_01_5_00_01enable__if__t_3_01std_1_1is__object_3_01T_01_4_1_1value_01_4_01_4_1a9b043cfe0fdfb3e9665428fb2be9cea1" prot="public" static="no">
+        <type>std::random_access_iterator_tag</type>
+        <definition>using nlohmann::detail::iterator_traits&lt; T *, enable_if_t&lt; std::is_object&lt; T &gt;::value &gt; &gt;::iterator_category =  std::random_access_iterator_tag</definition>
+        <argsstring></argsstring>
+        <name>iterator_category</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3254" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3254" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="da/d99/structnlohmann_1_1detail_1_1iterator__traits_3_01T_01_5_00_01enable__if__t_3_01std_1_1is__object_3_01T_01_4_1_1value_01_4_01_4_1a443e6a62f5fb2c545fc71c751b98ca8d" prot="public" static="no">
+        <type>T</type>
+        <definition>using nlohmann::detail::iterator_traits&lt; T *, enable_if_t&lt; std::is_object&lt; T &gt;::value &gt; &gt;::value_type =  T</definition>
+        <argsstring></argsstring>
+        <name>value_type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3255" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3255" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="da/d99/structnlohmann_1_1detail_1_1iterator__traits_3_01T_01_5_00_01enable__if__t_3_01std_1_1is__object_3_01T_01_4_1_1value_01_4_01_4_1ae7be99eb434f5b5f34692874c272b759" prot="public" static="no">
+        <type>ptrdiff_t</type>
+        <definition>using nlohmann::detail::iterator_traits&lt; T *, enable_if_t&lt; std::is_object&lt; T &gt;::value &gt; &gt;::difference_type =  ptrdiff_t</definition>
+        <argsstring></argsstring>
+        <name>difference_type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3256" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3256" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="da/d99/structnlohmann_1_1detail_1_1iterator__traits_3_01T_01_5_00_01enable__if__t_3_01std_1_1is__object_3_01T_01_4_1_1value_01_4_01_4_1a33ee9a1beb8ee099f989fd4af15178a5" prot="public" static="no">
+        <type>T *</type>
+        <definition>using nlohmann::detail::iterator_traits&lt; T *, enable_if_t&lt; std::is_object&lt; T &gt;::value &gt; &gt;::pointer =  T*</definition>
+        <argsstring></argsstring>
+        <name>pointer</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3257" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3257" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="da/d99/structnlohmann_1_1detail_1_1iterator__traits_3_01T_01_5_00_01enable__if__t_3_01std_1_1is__object_3_01T_01_4_1_1value_01_4_01_4_1a0809c5949d22f08a993231d2fdf285f0" prot="public" static="no">
+        <type>T &amp;</type>
+        <definition>using nlohmann::detail::iterator_traits&lt; T *, enable_if_t&lt; std::is_object&lt; T &gt;::value &gt; &gt;::reference =  T&amp;</definition>
+        <argsstring></argsstring>
+        <name>reference</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3258" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3258" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="689">
+        <label>nlohmann::detail::iterator_traits&lt; T *, enable_if_t&lt; std::is_object&lt; T &gt;::value &gt; &gt;</label>
+        <link refid="da/d99/structnlohmann_1_1detail_1_1iterator__traits_3_01T_01_5_00_01enable__if__t_3_01std_1_1is__object_3_01T_01_4_1_1value_01_4_01_4"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3253" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3252" bodyend="3259"/>
+    <listofallmembers>
+      <member refid="da/d99/structnlohmann_1_1detail_1_1iterator__traits_3_01T_01_5_00_01enable__if__t_3_01std_1_1is__object_3_01T_01_4_1_1value_01_4_01_4_1ae7be99eb434f5b5f34692874c272b759" prot="public" virt="non-virtual"><scope>nlohmann::detail::iterator_traits&lt; T *, enable_if_t&lt; std::is_object&lt; T &gt;::value &gt; &gt;</scope><name>difference_type</name></member>
+      <member refid="da/d99/structnlohmann_1_1detail_1_1iterator__traits_3_01T_01_5_00_01enable__if__t_3_01std_1_1is__object_3_01T_01_4_1_1value_01_4_01_4_1a9b043cfe0fdfb3e9665428fb2be9cea1" prot="public" virt="non-virtual"><scope>nlohmann::detail::iterator_traits&lt; T *, enable_if_t&lt; std::is_object&lt; T &gt;::value &gt; &gt;</scope><name>iterator_category</name></member>
+      <member refid="da/d99/structnlohmann_1_1detail_1_1iterator__traits_3_01T_01_5_00_01enable__if__t_3_01std_1_1is__object_3_01T_01_4_1_1value_01_4_01_4_1a33ee9a1beb8ee099f989fd4af15178a5" prot="public" virt="non-virtual"><scope>nlohmann::detail::iterator_traits&lt; T *, enable_if_t&lt; std::is_object&lt; T &gt;::value &gt; &gt;</scope><name>pointer</name></member>
+      <member refid="da/d99/structnlohmann_1_1detail_1_1iterator__traits_3_01T_01_5_00_01enable__if__t_3_01std_1_1is__object_3_01T_01_4_1_1value_01_4_01_4_1a0809c5949d22f08a993231d2fdf285f0" prot="public" virt="non-virtual"><scope>nlohmann::detail::iterator_traits&lt; T *, enable_if_t&lt; std::is_object&lt; T &gt;::value &gt; &gt;</scope><name>reference</name></member>
+      <member refid="da/d99/structnlohmann_1_1detail_1_1iterator__traits_3_01T_01_5_00_01enable__if__t_3_01std_1_1is__object_3_01T_01_4_1_1value_01_4_01_4_1a443e6a62f5fb2c545fc71c751b98ca8d" prot="public" virt="non-virtual"><scope>nlohmann::detail::iterator_traits&lt; T *, enable_if_t&lt; std::is_object&lt; T &gt;::value &gt; &gt;</scope><name>value_type</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

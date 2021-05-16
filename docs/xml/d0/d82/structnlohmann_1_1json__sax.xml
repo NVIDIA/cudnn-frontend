@@ -1,0 +1,548 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d0/d82/structnlohmann_1_1json__sax" kind="struct" language="C++" prot="public" abstract="yes">
+    <compoundname>nlohmann::json_sax</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BasicJsonType</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="d0/d82/structnlohmann_1_1json__sax_1a0cef30121f02b7fee85e9708148ea0aa" prot="public" static="no">
+        <type>typename BasicJsonType::number_integer_t</type>
+        <definition>using nlohmann::json_sax&lt; BasicJsonType &gt;::number_integer_t =  typename BasicJsonType::number_integer_t</definition>
+        <argsstring></argsstring>
+        <name>number_integer_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5732" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5732" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d0/d82/structnlohmann_1_1json__sax_1a32028cc056ae0f43aaae331cdbbbf856" prot="public" static="no">
+        <type>typename BasicJsonType::number_unsigned_t</type>
+        <definition>using nlohmann::json_sax&lt; BasicJsonType &gt;::number_unsigned_t =  typename BasicJsonType::number_unsigned_t</definition>
+        <argsstring></argsstring>
+        <name>number_unsigned_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5733" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5733" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d0/d82/structnlohmann_1_1json__sax_1a390c209bffd8c4800c8f3076dc465a20" prot="public" static="no">
+        <type>typename BasicJsonType::number_float_t</type>
+        <definition>using nlohmann::json_sax&lt; BasicJsonType &gt;::number_float_t =  typename BasicJsonType::number_float_t</definition>
+        <argsstring></argsstring>
+        <name>number_float_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5734" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5734" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d0/d82/structnlohmann_1_1json__sax_1ae01977a9f3c5b3667b7a2929ed91061e" prot="public" static="no">
+        <type>typename BasicJsonType::string_t</type>
+        <definition>using nlohmann::json_sax&lt; BasicJsonType &gt;::string_t =  typename BasicJsonType::string_t</definition>
+        <argsstring></argsstring>
+        <name>string_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5735" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5735" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d0/d82/structnlohmann_1_1json__sax_1a0ef406ba81eef08aadf4a9ef48d742bd" prot="public" static="no">
+        <type>typename BasicJsonType::binary_t</type>
+        <definition>using nlohmann::json_sax&lt; BasicJsonType &gt;::binary_t =  typename BasicJsonType::binary_t</definition>
+        <argsstring></argsstring>
+        <name>binary_t</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5736" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5736" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1a0ad26edef3f8d530dcec3192bba82df6" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type>bool</type>
+        <definition>virtual bool nlohmann::json_sax&lt; BasicJsonType &gt;::null</definition>
+        <argsstring>()=0</argsstring>
+        <name>null</name>
+        <briefdescription>
+<para>a null value was read </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>whether parsing should proceed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5742" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1a82ed080814fa656191a537284bb0c575" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type>bool</type>
+        <definition>virtual bool nlohmann::json_sax&lt; BasicJsonType &gt;::boolean</definition>
+        <argsstring>(bool val)=0</argsstring>
+        <name>boolean</name>
+        <param>
+          <type>bool</type>
+          <declname>val</declname>
+        </param>
+        <briefdescription>
+<para>a boolean value was read </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">val</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>boolean value </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether parsing should proceed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5749" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1affa7a78b8e9cc9cc3ac99927143142a5" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type>bool</type>
+        <definition>virtual bool nlohmann::json_sax&lt; BasicJsonType &gt;::number_integer</definition>
+        <argsstring>(number_integer_t val)=0</argsstring>
+        <name>number_integer</name>
+        <param>
+          <type><ref refid="d0/d82/structnlohmann_1_1json__sax_1a0cef30121f02b7fee85e9708148ea0aa" kindref="member">number_integer_t</ref></type>
+          <declname>val</declname>
+        </param>
+        <briefdescription>
+<para>an integer number was read </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">val</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>integer value </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether parsing should proceed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5756" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1ad9b253083e0509923ba195136f49face" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type>bool</type>
+        <definition>virtual bool nlohmann::json_sax&lt; BasicJsonType &gt;::number_unsigned</definition>
+        <argsstring>(number_unsigned_t val)=0</argsstring>
+        <name>number_unsigned</name>
+        <param>
+          <type><ref refid="d0/d82/structnlohmann_1_1json__sax_1a32028cc056ae0f43aaae331cdbbbf856" kindref="member">number_unsigned_t</ref></type>
+          <declname>val</declname>
+        </param>
+        <briefdescription>
+<para>an unsigned integer number was read </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">val</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>unsigned integer value </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether parsing should proceed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5763" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1ae7c31614e8a82164d2d7f8dbf4671b25" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type>bool</type>
+        <definition>virtual bool nlohmann::json_sax&lt; BasicJsonType &gt;::number_float</definition>
+        <argsstring>(number_float_t val, const string_t &amp;s)=0</argsstring>
+        <name>number_float</name>
+        <param>
+          <type><ref refid="d0/d82/structnlohmann_1_1json__sax_1a390c209bffd8c4800c8f3076dc465a20" kindref="member">number_float_t</ref></type>
+          <declname>val</declname>
+        </param>
+        <param>
+          <type>const <ref refid="d0/d82/structnlohmann_1_1json__sax_1ae01977a9f3c5b3667b7a2929ed91061e" kindref="member">string_t</ref> &amp;</type>
+          <declname>s</declname>
+        </param>
+        <briefdescription>
+<para>an floating-point number was read </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">val</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>floating-point value </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">s</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>raw token value </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether parsing should proceed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5771" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1a07eab82f6c82d606787eee9ad73d2bda" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type>bool</type>
+        <definition>virtual bool nlohmann::json_sax&lt; BasicJsonType &gt;::string</definition>
+        <argsstring>(string_t &amp;val)=0</argsstring>
+        <name>string</name>
+        <param>
+          <type><ref refid="d0/d82/structnlohmann_1_1json__sax_1ae01977a9f3c5b3667b7a2929ed91061e" kindref="member">string_t</ref> &amp;</type>
+          <declname>val</declname>
+        </param>
+        <briefdescription>
+<para>a string was read </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">val</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>string value </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether parsing should proceed </para></simplesect>
+<simplesect kind="note"><para>It is safe to move the passed string. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5779" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1a38c2dbde07138cc436ea7fbf22c1e92d" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type>bool</type>
+        <definition>virtual bool nlohmann::json_sax&lt; BasicJsonType &gt;::binary</definition>
+        <argsstring>(binary_t &amp;val)=0</argsstring>
+        <name>binary</name>
+        <param>
+          <type><ref refid="d0/d82/structnlohmann_1_1json__sax_1a0ef406ba81eef08aadf4a9ef48d742bd" kindref="member">binary_t</ref> &amp;</type>
+          <declname>val</declname>
+        </param>
+        <briefdescription>
+<para>a binary string was read </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">val</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>binary value </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether parsing should proceed </para></simplesect>
+<simplesect kind="note"><para>It is safe to move the passed binary. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5787" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1a0671528b0debb5a348169d61f0382a0f" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type>bool</type>
+        <definition>virtual bool nlohmann::json_sax&lt; BasicJsonType &gt;::start_object</definition>
+        <argsstring>(std::size_t elements)=0</argsstring>
+        <name>start_object</name>
+        <param>
+          <type>std::size_t</type>
+          <declname>elements</declname>
+        </param>
+        <briefdescription>
+<para>the beginning of an object was read </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">elements</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>number of object elements or -1 if unknown </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether parsing should proceed </para></simplesect>
+<simplesect kind="note"><para>binary formats may report the number of elements </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5795" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1a2e0c7ecd80b18d18a8cc76f71cfc2028" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type>bool</type>
+        <definition>virtual bool nlohmann::json_sax&lt; BasicJsonType &gt;::key</definition>
+        <argsstring>(string_t &amp;val)=0</argsstring>
+        <name>key</name>
+        <param>
+          <type><ref refid="d0/d82/structnlohmann_1_1json__sax_1ae01977a9f3c5b3667b7a2929ed91061e" kindref="member">string_t</ref> &amp;</type>
+          <declname>val</declname>
+        </param>
+        <briefdescription>
+<para>an object key was read </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">val</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>object key </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether parsing should proceed </para></simplesect>
+<simplesect kind="note"><para>It is safe to move the passed string. </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5803" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1ad0c722d53ff97be700ccf6a9468bd456" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type>bool</type>
+        <definition>virtual bool nlohmann::json_sax&lt; BasicJsonType &gt;::end_object</definition>
+        <argsstring>()=0</argsstring>
+        <name>end_object</name>
+        <briefdescription>
+<para>the end of an object was read </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>whether parsing should proceed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5809" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1a5c53878cf08d463eb4e7ca0270532572" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type>bool</type>
+        <definition>virtual bool nlohmann::json_sax&lt; BasicJsonType &gt;::start_array</definition>
+        <argsstring>(std::size_t elements)=0</argsstring>
+        <name>start_array</name>
+        <param>
+          <type>std::size_t</type>
+          <declname>elements</declname>
+        </param>
+        <briefdescription>
+<para>the beginning of an array was read </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">elements</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>number of array elements or -1 if unknown </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether parsing should proceed </para></simplesect>
+<simplesect kind="note"><para>binary formats may report the number of elements </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5817" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1a235ee975617f28e6a996d1e36a282312" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type>bool</type>
+        <definition>virtual bool nlohmann::json_sax&lt; BasicJsonType &gt;::end_array</definition>
+        <argsstring>()=0</argsstring>
+        <name>end_array</name>
+        <briefdescription>
+<para>the end of an array was read </para>        </briefdescription>
+        <detaileddescription>
+<para><simplesect kind="return"><para>whether parsing should proceed </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5823" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1a60287e3bd85f489e04c83f7e3b76e613" prot="public" static="no" const="no" explicit="no" inline="no" virt="pure-virtual">
+        <type>bool</type>
+        <definition>virtual bool nlohmann::json_sax&lt; BasicJsonType &gt;::parse_error</definition>
+        <argsstring>(std::size_t position, const std::string &amp;last_token, const detail::exception &amp;ex)=0</argsstring>
+        <name>parse_error</name>
+        <param>
+          <type>std::size_t</type>
+          <declname>position</declname>
+        </param>
+        <param>
+          <type>const std::string &amp;</type>
+          <declname>last_token</declname>
+        </param>
+        <param>
+          <type>const <ref refid="de/df2/classnlohmann_1_1detail_1_1exception" kindref="compound">detail::exception</ref> &amp;</type>
+          <declname>ex</declname>
+        </param>
+        <briefdescription>
+<para>a parse error occurred </para>        </briefdescription>
+        <detaileddescription>
+<para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">position</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the position in the input where the error occurs </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">last_token</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>the last read token </para></parameterdescription>
+</parameteritem>
+<parameteritem>
+<parameternamelist>
+<parametername direction="in">ex</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>an exception object describing the error </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>whether parsing should proceed (must return false) </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5832" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1aac0f445c1173fa731104d93496a7e780" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::json_sax&lt; BasicJsonType &gt;::json_sax</definition>
+        <argsstring>()=default</argsstring>
+        <name>json_sax</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5836" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1a8358c063b2d7222b3aafa62fded04403" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::json_sax&lt; BasicJsonType &gt;::json_sax</definition>
+        <argsstring>(const json_sax &amp;)=default</argsstring>
+        <name>json_sax</name>
+        <param>
+          <type>const <ref refid="d0/d82/structnlohmann_1_1json__sax" kindref="compound">json_sax</ref> &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5837" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1a62dae3713ca4914265904e30cd6b6347" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::json_sax&lt; BasicJsonType &gt;::json_sax</definition>
+        <argsstring>(json_sax &amp;&amp;) noexcept=default</argsstring>
+        <name>json_sax</name>
+        <param>
+          <type><ref refid="d0/d82/structnlohmann_1_1json__sax" kindref="compound">json_sax</ref> &amp;&amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5838" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1a1a90dae111cf189ac9ad340a60b199b6" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="d0/d82/structnlohmann_1_1json__sax" kindref="compound">json_sax</ref> &amp;</type>
+        <definition>json_sax&amp; nlohmann::json_sax&lt; BasicJsonType &gt;::operator=</definition>
+        <argsstring>(const json_sax &amp;)=default</argsstring>
+        <name>operator=</name>
+        <param>
+          <type>const <ref refid="d0/d82/structnlohmann_1_1json__sax" kindref="compound">json_sax</ref> &amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5839" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1ac74584e3dc41f2465e69b37d7d2bf694" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="d0/d82/structnlohmann_1_1json__sax" kindref="compound">json_sax</ref> &amp;</type>
+        <definition>json_sax&amp; nlohmann::json_sax&lt; BasicJsonType &gt;::operator=</definition>
+        <argsstring>(json_sax &amp;&amp;) noexcept=default</argsstring>
+        <name>operator=</name>
+        <param>
+          <type><ref refid="d0/d82/structnlohmann_1_1json__sax" kindref="compound">json_sax</ref> &amp;&amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5840" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d82/structnlohmann_1_1json__sax_1af31bacfa81aa7818d8639d1da65c8eb5" prot="public" static="no" const="no" explicit="no" inline="no" virt="virtual">
+        <type></type>
+        <definition>virtual nlohmann::json_sax&lt; BasicJsonType &gt;::~json_sax</definition>
+        <argsstring>()=default</argsstring>
+        <name>~json_sax</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5841" column="1"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>SAX interface. </para>    </briefdescription>
+    <detaileddescription>
+<para>This class describes the SAX interface used by <ref refid="d9/dcc/classnlohmann_1_1basic__json_1a12b382c6407da5543827ce4b24bb5008" kindref="member">nlohmann::json::sax_parse</ref>. Each function is called in different situations while the input is parsed. The boolean return value informs the parser whether to continue processing the input. </para>    </detaileddescription>
+    <collaborationgraph>
+      <node id="721">
+        <label>nlohmann::json_sax&lt; BasicJsonType &gt;</label>
+        <link refid="d0/d82/structnlohmann_1_1json__sax"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5731" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5730" bodyend="5842"/>
+    <listofallmembers>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a38c2dbde07138cc436ea7fbf22c1e92d" prot="public" virt="pure-virtual"><scope>nlohmann::json_sax</scope><name>binary</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a0ef406ba81eef08aadf4a9ef48d742bd" prot="public" virt="non-virtual"><scope>nlohmann::json_sax</scope><name>binary_t</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a82ed080814fa656191a537284bb0c575" prot="public" virt="pure-virtual"><scope>nlohmann::json_sax</scope><name>boolean</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a235ee975617f28e6a996d1e36a282312" prot="public" virt="pure-virtual"><scope>nlohmann::json_sax</scope><name>end_array</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1ad0c722d53ff97be700ccf6a9468bd456" prot="public" virt="pure-virtual"><scope>nlohmann::json_sax</scope><name>end_object</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1aac0f445c1173fa731104d93496a7e780" prot="public" virt="non-virtual"><scope>nlohmann::json_sax</scope><name>json_sax</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a8358c063b2d7222b3aafa62fded04403" prot="public" virt="non-virtual"><scope>nlohmann::json_sax</scope><name>json_sax</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a62dae3713ca4914265904e30cd6b6347" prot="public" virt="non-virtual"><scope>nlohmann::json_sax</scope><name>json_sax</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a2e0c7ecd80b18d18a8cc76f71cfc2028" prot="public" virt="pure-virtual"><scope>nlohmann::json_sax</scope><name>key</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a0ad26edef3f8d530dcec3192bba82df6" prot="public" virt="pure-virtual"><scope>nlohmann::json_sax</scope><name>null</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1ae7c31614e8a82164d2d7f8dbf4671b25" prot="public" virt="pure-virtual"><scope>nlohmann::json_sax</scope><name>number_float</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a390c209bffd8c4800c8f3076dc465a20" prot="public" virt="non-virtual"><scope>nlohmann::json_sax</scope><name>number_float_t</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1affa7a78b8e9cc9cc3ac99927143142a5" prot="public" virt="pure-virtual"><scope>nlohmann::json_sax</scope><name>number_integer</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a0cef30121f02b7fee85e9708148ea0aa" prot="public" virt="non-virtual"><scope>nlohmann::json_sax</scope><name>number_integer_t</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1ad9b253083e0509923ba195136f49face" prot="public" virt="pure-virtual"><scope>nlohmann::json_sax</scope><name>number_unsigned</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a32028cc056ae0f43aaae331cdbbbf856" prot="public" virt="non-virtual"><scope>nlohmann::json_sax</scope><name>number_unsigned_t</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a1a90dae111cf189ac9ad340a60b199b6" prot="public" virt="non-virtual"><scope>nlohmann::json_sax</scope><name>operator=</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1ac74584e3dc41f2465e69b37d7d2bf694" prot="public" virt="non-virtual"><scope>nlohmann::json_sax</scope><name>operator=</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a60287e3bd85f489e04c83f7e3b76e613" prot="public" virt="pure-virtual"><scope>nlohmann::json_sax</scope><name>parse_error</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a5c53878cf08d463eb4e7ca0270532572" prot="public" virt="pure-virtual"><scope>nlohmann::json_sax</scope><name>start_array</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a0671528b0debb5a348169d61f0382a0f" prot="public" virt="pure-virtual"><scope>nlohmann::json_sax</scope><name>start_object</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1a07eab82f6c82d606787eee9ad73d2bda" prot="public" virt="pure-virtual"><scope>nlohmann::json_sax</scope><name>string</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1ae01977a9f3c5b3667b7a2929ed91061e" prot="public" virt="non-virtual"><scope>nlohmann::json_sax</scope><name>string_t</name></member>
+      <member refid="d0/d82/structnlohmann_1_1json__sax_1af31bacfa81aa7818d8639d1da65c8eb5" prot="public" virt="virtual"><scope>nlohmann::json_sax</scope><name>~json_sax</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

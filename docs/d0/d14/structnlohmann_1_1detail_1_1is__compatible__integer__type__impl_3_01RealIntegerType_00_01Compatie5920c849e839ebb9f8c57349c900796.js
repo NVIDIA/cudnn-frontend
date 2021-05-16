@@ -1,0 +1,6 @@
+var structnlohmann_1_1detail_1_1is__compatible__integer__type__impl_3_01RealIntegerType_00_01Compatie5920c849e839ebb9f8c57349c900796 =
+[
+    [ "CompatibleLimits", "d0/d14/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl_3_01RealIntegerType_00_01Compatie5920c849e839ebb9f8c57349c900796.html#a24d97696ca33fba8096e452b1901a8e6", null ],
+    [ "RealLimits", "d0/d14/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl_3_01RealIntegerType_00_01Compatie5920c849e839ebb9f8c57349c900796.html#ab267aabfe36c5b9c305c5e5faf06ea36", null ],
+    [ "value", "d0/d14/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl_3_01RealIntegerType_00_01Compatie5920c849e839ebb9f8c57349c900796.html#a8fd20d5e7d65d14b4e9f4ee181a3aded", null ]
+];

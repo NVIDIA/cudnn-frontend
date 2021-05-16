@@ -1,0 +1,3 @@
+<map id="Graphical Class Hierarchy" name="Graphical Class Hierarchy">
+<area shape="rect" id="node1" href="$d0/d14/structnlohmann_1_1detail_1_1is__compatible__integer__type__impl_3_01RealIntegerType_00_01Compatie5920c849e839ebb9f8c57349c900796.html" title="nlohmann::detail::is\l_compatible_integer_type\l_impl\&lt; RealIntegerType,\l CompatibleNumberIntegerType,\l enable_if_t\&lt; std::is_integral\l\&lt; RealIntegerType \&gt;::value &amp;&amp;std\l::is_integral\&lt; CompatibleNumberIntegerType\l \&gt;::value &amp;&amp;!std::is_same\&lt; bool, CompatibleNumberInteger\lType \&gt;::value \&gt; \&gt;" alt="" coords="5,5,376,149"/>
+</map>

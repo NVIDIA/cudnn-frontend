@@ -1,0 +1,82 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="da/dbd/structnlohmann_1_1detail_1_1is__default__constructible_3_01std_1_1pair_3_01T1_00_01T2_01_4_01_4" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::is_default_constructible&lt; std::pair&lt; T1, T2 &gt; &gt;</compoundname>
+    <basecompoundref refid="dd/dde/structnlohmann_1_1detail_1_1conjunction" prot="public" virt="non-virtual">nlohmann::detail::conjunction&lt; is_default_constructible&lt; T1 &gt;, is_default_constructible&lt; T2 &gt; &gt;</basecompoundref>
+    <derivedcompoundref refid="d4/df4/structnlohmann_1_1detail_1_1is__constructible_3_01std_1_1pair_3_01T1_00_01T2_01_4_01_4" prot="public" virt="non-virtual">nlohmann::detail::is_constructible&lt; std::pair&lt; T1, T2 &gt; &gt;</derivedcompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename T1</type>
+      </param>
+      <param>
+        <type>typename T2</type>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="617">
+        <label>nlohmann::detail::conjunction&lt; is_default_constructible&lt; T1 &gt;, is_default_constructible&lt; T2 &gt; &gt;</label>
+        <link refid="dd/dde/structnlohmann_1_1detail_1_1conjunction"/>
+        <childnode refid="618" relation="public-inheritance">
+        </childnode>
+        <childnode refid="619" relation="template-instance">
+          <edgelabel>&lt; is_default_constructible&lt; T1 &gt;, is_default_constructible&lt; T2 &gt; &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="618">
+        <label>true_type</label>
+      </node>
+      <node id="619">
+        <label>nlohmann::detail::conjunction&lt;... &gt;</label>
+        <link refid="dd/dde/structnlohmann_1_1detail_1_1conjunction"/>
+        <childnode refid="618" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="616">
+        <label>nlohmann::detail::is_default_constructible&lt; std::pair&lt; T1, T2 &gt; &gt;</label>
+        <link refid="da/dbd/structnlohmann_1_1detail_1_1is__default__constructible_3_01std_1_1pair_3_01T1_00_01T2_01_4_01_4"/>
+        <childnode refid="617" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="620">
+        <label>nlohmann::detail::is_constructible&lt; std::pair&lt; T1, T2 &gt; &gt;</label>
+        <link refid="d4/df4/structnlohmann_1_1detail_1_1is__constructible_3_01std_1_1pair_3_01T1_00_01T2_01_4_01_4"/>
+        <childnode refid="616" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="622">
+        <label>nlohmann::detail::conjunction&lt; is_default_constructible&lt; T1 &gt;, is_default_constructible&lt; T2 &gt; &gt;</label>
+        <link refid="dd/dde/structnlohmann_1_1detail_1_1conjunction"/>
+        <childnode refid="623" relation="public-inheritance">
+        </childnode>
+        <childnode refid="624" relation="template-instance">
+          <edgelabel>&lt; is_default_constructible&lt; T1 &gt;, is_default_constructible&lt; T2 &gt; &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="623">
+        <label>true_type</label>
+      </node>
+      <node id="624">
+        <label>nlohmann::detail::conjunction&lt;... &gt;</label>
+        <link refid="dd/dde/structnlohmann_1_1detail_1_1conjunction"/>
+        <childnode refid="623" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="621">
+        <label>nlohmann::detail::is_default_constructible&lt; std::pair&lt; T1, T2 &gt; &gt;</label>
+        <link refid="da/dbd/structnlohmann_1_1detail_1_1is__default__constructible_3_01std_1_1pair_3_01T1_00_01T2_01_4_01_4"/>
+        <childnode refid="622" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3563" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3562" bodyend="3563"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

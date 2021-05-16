@@ -2,6 +2,7 @@
 <doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
   <compounddef id="dir_d44c64559bbebec7f509842c48db8b23" kind="dir">
     <compoundname>include</compoundname>
+    <innerdir refid="dir_c47d0eb21c97e1d293e342b205a1975a">contrib</innerdir>
     <innerfile refid="dc/d11/cudnn__backend__base_8h">cudnn_backend_base.h</innerfile>
     <innerfile refid="de/d0c/cudnn__frontend_8h">cudnn_frontend.h</innerfile>
     <innerfile refid="d1/de7/cudnn__frontend__ConvDesc_8h">cudnn_frontend_ConvDesc.h</innerfile>
@@ -9,6 +10,7 @@
     <innerfile refid="d6/d67/cudnn__frontend__EngineConfig_8h">cudnn_frontend_EngineConfig.h</innerfile>
     <innerfile refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h">cudnn_frontend_EngineConfigGenerator.h</innerfile>
     <innerfile refid="df/d3e/cudnn__frontend__EngineFallbackList_8h">cudnn_frontend_EngineFallbackList.h</innerfile>
+    <innerfile refid="db/d7e/cudnn__frontend__Errata_8h">cudnn_frontend_Errata.h</innerfile>
     <innerfile refid="d6/d51/cudnn__frontend__ExecutionPlan_8h">cudnn_frontend_ExecutionPlan.h</innerfile>
     <innerfile refid="d5/d36/cudnn__frontend__Filters_8h">cudnn_frontend_Filters.h</innerfile>
     <innerfile refid="d3/d6b/cudnn__frontend__find__plan_8h">cudnn_frontend_find_plan.h</innerfile>
@@ -18,6 +20,7 @@
     <innerfile refid="da/d5a/cudnn__frontend__Operation_8h">cudnn_frontend_Operation.h</innerfile>
     <innerfile refid="db/d7d/cudnn__frontend__OperationGraph_8h">cudnn_frontend_OperationGraph.h</innerfile>
     <innerfile refid="da/d5f/cudnn__frontend__PointWiseDesc_8h">cudnn_frontend_PointWiseDesc.h</innerfile>
+    <innerfile refid="db/da7/cudnn__frontend__ReductionDesc_8h">cudnn_frontend_ReductionDesc.h</innerfile>
     <innerfile refid="d3/d98/cudnn__frontend__Tensor_8h">cudnn_frontend_Tensor.h</innerfile>
     <innerfile refid="df/d17/cudnn__frontend__utils_8h">cudnn_frontend_utils.h</innerfile>
     <innerfile refid="df/dc0/cudnn__frontend__VariantPack_8h">cudnn_frontend_VariantPack.h</innerfile>

@@ -252,66 +252,66 @@
     <detaileddescription>
 <para><ref refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8" kindref="compound">ConvDescBuilder_v8</ref> Class Helper class used to build <ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kindref="compound">ConvDesc_v8</ref> class </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="35">
+      <node id="113">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="38">
+      <node id="116">
         <label>cudnnConvolutionMode_t</label>
       </node>
-      <node id="31">
+      <node id="109">
         <label>cudnn_frontend::ConvDesc_v8</label>
         <link refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8"/>
-        <childnode refid="32" relation="public-inheritance">
+        <childnode refid="110" relation="public-inheritance">
         </childnode>
-        <childnode refid="37" relation="usage">
+        <childnode refid="115" relation="usage">
           <edgelabel>-padUpper</edgelabel>
           <edgelabel>-nDims</edgelabel>
           <edgelabel>-stride</edgelabel>
           <edgelabel>-dilation</edgelabel>
           <edgelabel>-padLower</edgelabel>
         </childnode>
-        <childnode refid="38" relation="usage">
+        <childnode refid="116" relation="usage">
           <edgelabel>-mode</edgelabel>
         </childnode>
-        <childnode refid="39" relation="usage">
+        <childnode refid="117" relation="usage">
           <edgelabel>-data_type</edgelabel>
         </childnode>
       </node>
-      <node id="36">
+      <node id="114">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="34">
+      <node id="112">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="39">
+      <node id="117">
         <label>cudnnDataType_t</label>
       </node>
-      <node id="30">
+      <node id="108">
         <label>cudnn_frontend::ConvDescBuilder_v8</label>
         <link refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8"/>
-        <childnode refid="31" relation="usage">
+        <childnode refid="109" relation="usage">
           <edgelabel>-m_convDesc</edgelabel>
         </childnode>
       </node>
-      <node id="37">
+      <node id="115">
         <label>int64_t</label>
       </node>
-      <node id="32">
+      <node id="110">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="33" relation="usage">
+        <childnode refid="111" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="35" relation="usage">
+        <childnode refid="113" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="36" relation="usage">
+        <childnode refid="114" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="33">
+      <node id="111">
         <label>std::string</label>
-        <childnode refid="34" relation="public-inheritance">
+        <childnode refid="112" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>

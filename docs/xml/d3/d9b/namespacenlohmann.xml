@@ -1,0 +1,108 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d3/d9b/namespacenlohmann" kind="namespace" language="C++">
+    <compoundname>nlohmann</compoundname>
+    <innerclass refid="dc/dc7/structnlohmann_1_1adl__serializer" prot="public">nlohmann::adl_serializer</innerclass>
+    <innerclass refid="d9/dcc/classnlohmann_1_1basic__json" prot="public">nlohmann::basic_json</innerclass>
+    <innerclass refid="dd/d0d/classnlohmann_1_1byte__container__with__subtype" prot="public">nlohmann::byte_container_with_subtype</innerclass>
+    <innerclass refid="da/de8/classnlohmann_1_1json__pointer" prot="public">nlohmann::json_pointer</innerclass>
+    <innerclass refid="d0/d82/structnlohmann_1_1json__sax" prot="public">nlohmann::json_sax</innerclass>
+    <innerclass refid="d6/da7/structnlohmann_1_1ordered__map" prot="public">nlohmann::ordered_map</innerclass>
+    <innernamespace refid="dc/df0/namespacenlohmann_1_1detail">nlohmann::detail</innernamespace>
+      <sectiondef kind="typedef">
+      <memberdef kind="typedef" id="d3/d9b/namespacenlohmann_1a2bfd99e845a2e5cd90aeaf1b1431f474" prot="public" static="no">
+        <type><ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">basic_json</ref>&lt;&gt;</type>
+        <definition>using nlohmann::json = typedef basic_json&lt;&gt;</definition>
+        <argsstring></argsstring>
+        <name>json</name>
+        <briefdescription>
+<para>default JSON class </para>        </briefdescription>
+        <detaileddescription>
+<para>This type is the default specialization of the <ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">basic_json</ref> class which uses the standard template types.</para><para><simplesect kind="since"><para>version 1.0.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3390" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3390" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d3/d9b/namespacenlohmann_1ad53cef358adfa7f07cea23eb1e28b9ea" prot="public" static="no">
+        <type><ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">basic_json</ref>&lt; <ref refid="d6/da7/structnlohmann_1_1ordered__map" kindref="compound">nlohmann::ordered_map</ref> &gt;</type>
+        <definition>using nlohmann::ordered_json = typedef basic_json&lt;nlohmann::ordered_map&gt;</definition>
+        <argsstring></argsstring>
+        <name>ordered_json</name>
+        <briefdescription>
+<para>ordered JSON class </para>        </briefdescription>
+        <detaileddescription>
+<para>This type preserves the insertion order of object keys.</para><para><simplesect kind="since"><para>version 3.9.0 </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3402" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3402" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="func">
+      <memberdef kind="function" id="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="d5/db8/json_8hpp_1a0643bd74c2dc6f0e4e420b8190ea8f0f" kindref="member">NLOHMANN_BASIC_JSON_TPL_DECLARATION</ref> std::string</type>
+        <definition>NLOHMANN_BASIC_JSON_TPL_DECLARATION std::string nlohmann::to_string</definition>
+        <argsstring>(const NLOHMANN_BASIC_JSON_TPL &amp;j)</argsstring>
+        <name>to_string</name>
+        <param>
+          <type>const <ref refid="d5/db8/json_8hpp_1a80b7254e63f199a1f656f07ae551f632" kindref="member">NLOHMANN_BASIC_JSON_TPL</ref> &amp;</type>
+          <declname>j</declname>
+        </param>
+        <briefdescription>
+<para>user-defined to_string function for JSON values </para>        </briefdescription>
+        <detaileddescription>
+<para>This function implements a user-defined to_string for JSON objects.</para><para><parameterlist kind="param"><parameteritem>
+<parameternamelist>
+<parametername direction="in">j</parametername>
+</parameternamelist>
+<parameterdescription>
+<para>a JSON object </para></parameterdescription>
+</parameteritem>
+</parameterlist>
+<simplesect kind="return"><para>a std::string object </para></simplesect>
+</para>        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="25855" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="25855" bodyend="25858"/>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a52b18a5b7e68652c65b070900c438c6e" compoundref="d5/db8/json_8hpp" startline="20448" endline="20467">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::at</referencedby>
+        <referencedby refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1af08f9302a02516ff8cf358a99aaa1ddf" compoundref="d5/db8/json_8hpp" startline="14285" endline="14295">nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::calc_bson_array_size</referencedby>
+        <referencedby refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a11637a023d22e57a7e7aff3f98b10f84" compoundref="d5/db8/json_8hpp" startline="14139" endline="14148">nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::calc_bson_entry_header_size</referencedby>
+        <referencedby refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1a90fbaaeeb00838e65b8d04885017ef0c" compoundref="d5/db8/json_8hpp" startline="2790" endline="2796">nlohmann::detail::parse_error::create</referencedby>
+        <referencedby refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a79cc1a752e6df2001b853f8c189b1f1f" compoundref="d3/d98/cudnn__frontend__Tensor_8h" startline="55" endline="73">cudnn_frontend::Tensor_v8::describe</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">cudnn_frontend::ConvDesc_v8::describe</referencedby>
+        <referencedby refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a3425a8550eb9f622dc4101d3d5d2c0e1" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="71" endline="94">cudnn_frontend::Operation_v8::describe</referencedby>
+        <referencedby refid="de/df2/classnlohmann_1_1detail_1_1exception_1aa353a7dba4fd179f7224b8a2a238a264" compoundref="d5/db8/json_8hpp" startline="2664" endline="2717">nlohmann::detail::exception::diagnostics</referencedby>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a1c1f21327df91a4dd6c5f5a107240385" compoundref="d5/db8/json_8hpp" startline="25641" endline="25763">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::diff</referencedby>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a221b943d3228488c14225e55f726cc26" compoundref="d5/db8/json_8hpp" startline="21421" endline="21437">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::erase</referencedby>
+        <referencedby refid="da/de8/classnlohmann_1_1json__pointer_1ab0d7759d0caa6a0c0187916da28e6ee7" compoundref="d5/db8/json_8hpp" startline="12893" endline="12943">nlohmann::json_pointer&lt; BasicJsonType &gt;::flatten</referencedby>
+        <referencedby refid="d4/d0a/classnlohmann_1_1detail_1_1serializer_1ab14b8ec1f8102aa4c7e3c349f317654e" compoundref="d5/db8/json_8hpp" startline="16333" endline="16522">nlohmann::detail::serializer&lt; BasicJsonType &gt;::for</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a9940f56290b9278c58772eda2931e599" compoundref="d5/db8/json_8hpp" startline="8414" endline="8428">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_bson_binary</referencedby>
+        <referencedby refid="d6/d30/classnlohmann_1_1detail_1_1binary__reader_1a23921422802aa472360dd05023e20565" compoundref="d5/db8/json_8hpp" startline="8393" endline="8402">nlohmann::detail::binary_reader&lt; BasicJsonType, InputAdapterType, SAX &gt;::get_bson_string</referencedby>
+        <referencedby refid="da/de8/classnlohmann_1_1json__pointer_1a366d68a67e40d86676d3bdb52e167294" compoundref="d5/db8/json_8hpp" startline="12616" endline="12650">nlohmann::json_pointer&lt; BasicJsonType &gt;::get_checked</referencedby>
+        <referencedby refid="da/de8/classnlohmann_1_1json__pointer_1ad6a01f8e1556eef68e5a49b33fef1548" compoundref="d5/db8/json_8hpp" startline="12665" endline="12697">nlohmann::json_pointer&lt; BasicJsonType &gt;::get_unchecked</referencedby>
+        <referencedby refid="dc/df0/namespacenlohmann_1_1detail_1a3c45286b0a2f15ea0a756cb87a76cf9b" compoundref="d5/db8/json_8hpp" startline="4300" endline="4305">nlohmann::detail::int_to_string</referencedby>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a351b4f65014f6c2b8b2832847d44bbd7" compoundref="d5/db8/json_8hpp" startline="17372" endline="17425">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::meta</referencedby>
+        <referencedby refid="de/df2/classnlohmann_1_1detail_1_1exception_1abf41a7e9178356314082284e6cfea278" compoundref="d5/db8/json_8hpp" startline="2658" endline="2661">nlohmann::detail::exception::name</referencedby>
+        <referencedby refid="da/de8/classnlohmann_1_1json__pointer_1ae9015c658f99cf3d48a8563accc79988" compoundref="d5/db8/json_8hpp" startline="12162" endline="12165">nlohmann::json_pointer&lt; BasicJsonType &gt;::operator std::string</referencedby>
+        <referencedby refid="da/de8/classnlohmann_1_1json__pointer_1a7de51480324eb1c5a89ed552cd699875" compoundref="d5/db8/json_8hpp" startline="12229" endline="12232">nlohmann::json_pointer&lt; BasicJsonType &gt;::operator/=</referencedby>
+        <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1adcc786998f220a5b3083ee8a37c4553e" compoundref="d5/db8/json_8hpp" startline="25343" endline="25605">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::patch</referencedby>
+        <referencedby refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1aefe74adeaa48781464ba2fd2ec63d221" compoundref="d5/db8/json_8hpp" startline="2813" endline="2817">nlohmann::detail::parse_error::position_string</referencedby>
+        <referencedby refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</referencedby>
+        <referencedby refid="dc/d68/classnlohmann_1_1detail_1_1json__sax__dom__parser_1a056b895d011efaf48ea096c024aca0d4" compoundref="d5/db8/json_8hpp" startline="5954" endline="5964">nlohmann::detail::json_sax_dom_parser&lt; BasicJsonType &gt;::start_array</referencedby>
+        <referencedby refid="d6/d69/classnlohmann_1_1detail_1_1json__sax__dom__callback__parser_1a5255b98ba8282e3625968f91cff9d3d0" compoundref="d5/db8/json_8hpp" startline="6174" endline="6189">nlohmann::detail::json_sax_dom_callback_parser&lt; BasicJsonType &gt;::start_array</referencedby>
+        <referencedby refid="dc/d68/classnlohmann_1_1detail_1_1json__sax__dom__parser_1a9929b4cc92d471c49bd0a92802629f90" compoundref="d5/db8/json_8hpp" startline="5928" endline="5938">nlohmann::detail::json_sax_dom_parser&lt; BasicJsonType &gt;::start_object</referencedby>
+        <referencedby refid="d6/d69/classnlohmann_1_1detail_1_1json__sax__dom__callback__parser_1a040e60243cc7c18a6078c6b83cdb4a81" compoundref="d5/db8/json_8hpp" startline="6103" endline="6119">nlohmann::detail::json_sax_dom_callback_parser&lt; BasicJsonType &gt;::start_object</referencedby>
+        <referencedby refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a025212bd170253638b9f05b3b6aa5bf9" compoundref="d5/db8/json_8hpp" startline="14308" endline="14322">nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_array</referencedby>
+        <referencedby refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1ac274e3d7a803e7223bb1a4fcb7cd594c" compoundref="d5/db8/json_8hpp" startline="14253" endline="14270">nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::write_bson_unsigned</referencedby>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+<para>namespace for Niels Lohmann </para>    </briefdescription>
+    <detaileddescription>
+<para><simplesect kind="see"><para><ulink url="https://github.com/nlohmann">https://github.com/nlohmann</ulink> </para></simplesect>
+<simplesect kind="since"><para>version 1.0.0</para></simplesect>
+namespace to hold default <computeroutput>to_json</computeroutput> function to see why this is required: <ulink url="http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2015/n4381.html">http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2015/n4381.html</ulink> </para>    </detaileddescription>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="87" column="1"/>
+  </compounddef>
+</doxygen>

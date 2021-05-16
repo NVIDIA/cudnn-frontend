@@ -289,58 +289,58 @@
 <listitem><para>math_precision</para></listitem><listitem><para>mode</para></listitem><listitem><para>nan_propagation</para></listitem><listitem><para>upper_clip</para></listitem><listitem><para>lower_clip</para></listitem><listitem><para>lower_clip_slope</para></listitem><listitem><para>elu_alpha</para></listitem><listitem><para>softplus_beta</para></listitem><listitem><para>swish_beta</para></listitem></itemizedlist>
 </para><para>Use <ref refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8" kindref="compound">PointWiseDesc_v8</ref> to build this class. Describe returns a string describing the PointWise operation </para>    </detaileddescription>
     <inheritancegraph>
-      <node id="277">
+      <node id="922">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
       </node>
-      <node id="276">
+      <node id="921">
         <label>cudnn_frontend::PointWiseDesc_v8</label>
         <link refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8"/>
-        <childnode refid="277" relation="public-inheritance">
+        <childnode refid="922" relation="public-inheritance">
         </childnode>
       </node>
     </inheritancegraph>
     <collaborationgraph>
-      <node id="282">
+      <node id="927">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="286">
+      <node id="931">
         <label>cudnnPointwiseMode_t</label>
       </node>
-      <node id="283">
+      <node id="928">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="281">
+      <node id="926">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="284">
+      <node id="929">
         <label>double</label>
       </node>
-      <node id="285">
+      <node id="930">
         <label>cudnnNanPropagation_t</label>
       </node>
-      <node id="287">
+      <node id="932">
         <label>cudnnDataType_t</label>
       </node>
-      <node id="279">
+      <node id="924">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="280" relation="usage">
+        <childnode refid="925" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="282" relation="usage">
+        <childnode refid="927" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="283" relation="usage">
+        <childnode refid="928" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="278">
+      <node id="923">
         <label>cudnn_frontend::PointWiseDesc_v8</label>
         <link refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8"/>
-        <childnode refid="279" relation="public-inheritance">
+        <childnode refid="924" relation="public-inheritance">
         </childnode>
-        <childnode refid="284" relation="usage">
+        <childnode refid="929" relation="usage">
           <edgelabel>-upper_clip</edgelabel>
           <edgelabel>-swish_beta</edgelabel>
           <edgelabel>-lower_clip_slope</edgelabel>
@@ -348,19 +348,19 @@
           <edgelabel>-elu_alpha</edgelabel>
           <edgelabel>-softplus_beta</edgelabel>
         </childnode>
-        <childnode refid="285" relation="usage">
+        <childnode refid="930" relation="usage">
           <edgelabel>-nan_propagation</edgelabel>
         </childnode>
-        <childnode refid="286" relation="usage">
+        <childnode refid="931" relation="usage">
           <edgelabel>-mode</edgelabel>
         </childnode>
-        <childnode refid="287" relation="usage">
+        <childnode refid="932" relation="usage">
           <edgelabel>-math_precision</edgelabel>
         </childnode>
       </node>
-      <node id="280">
+      <node id="925">
         <label>std::string</label>
-        <childnode refid="281" relation="public-inheritance">
+        <childnode refid="926" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>

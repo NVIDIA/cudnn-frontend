@@ -1,0 +1,449 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d6/da7/structnlohmann_1_1ordered__map" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::ordered_map</compoundname>
+    <basecompoundref prot="public" virt="non-virtual">std::vector&lt; std::pair&lt; const Key, T &gt;, Allocator &gt;</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>class Key</type>
+      </param>
+      <param>
+        <type>class T</type>
+      </param>
+      <param>
+        <type>class IgnoredLess</type>
+        <defval>std::less&lt;Key&gt;</defval>
+      </param>
+      <param>
+        <type>class Allocator</type>
+        <defval>std::allocator&lt;std::pair&lt;const Key, T&gt;&gt;</defval>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-type">
+      <memberdef kind="typedef" id="d6/da7/structnlohmann_1_1ordered__map_1a57095c6ed403f02e1bc2c240a13c9ed8" prot="public" static="no">
+        <type>Key</type>
+        <definition>using nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::key_type =  Key</definition>
+        <argsstring></argsstring>
+        <name>key_type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="16927" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="16927" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d6/da7/structnlohmann_1_1ordered__map_1a1c9c1509ee714a9814b45a8030c84ec7" prot="public" static="no">
+        <type>T</type>
+        <definition>using nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::mapped_type =  T</definition>
+        <argsstring></argsstring>
+        <name>mapped_type</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="16928" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="16928" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d6/da7/structnlohmann_1_1ordered__map_1a0cabe346c38a4f1ab1b8a396fbd2bbe2" prot="public" static="no">
+        <type>std::vector&lt; std::pair&lt; const Key, T &gt;, Allocator &gt;</type>
+        <definition>using nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::Container =  std::vector&lt;std::pair&lt;const Key, T&gt;, Allocator&gt;</definition>
+        <argsstring></argsstring>
+        <name>Container</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="16929" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="16929" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="typedef" id="d6/da7/structnlohmann_1_1ordered__map_1a89cc338e8466e74baaa138664c79ee98" prot="public" static="no">
+        <type>typename std::enable_if&lt; std::is_convertible&lt; typename std::iterator_traits&lt; InputIt &gt;::iterator_category, std::input_iterator_tag &gt;::value &gt;::<ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref></type>
+        <definition>using nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::require_input_iter =  typename std::enable_if&lt;std::is_convertible&lt;typename std::iterator_traits&lt;InputIt&gt;::iterator_category, std::input_iterator_tag&gt;::value&gt;::type</definition>
+        <argsstring></argsstring>
+        <name>require_input_iter</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="17081" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="17082" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1a87938c10b76510dac00412d2cb5fd1e4" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::ordered_map</definition>
+        <argsstring>(const Allocator &amp;alloc=Allocator())</argsstring>
+        <name>ordered_map</name>
+        <param>
+          <type>const Allocator &amp;</type>
+          <declname>alloc</declname>
+          <defval>Allocator()</defval>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="16937" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="16937" bodyend="16937"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1a9d25efb51325cc1be027b8ea00c1f8b8" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>class It</type>
+          </param>
+        </templateparamlist>
+        <type></type>
+        <definition>nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::ordered_map</definition>
+        <argsstring>(It first, It last, const Allocator &amp;alloc=Allocator())</argsstring>
+        <name>ordered_map</name>
+        <param>
+          <type>It</type>
+          <declname>first</declname>
+        </param>
+        <param>
+          <type>It</type>
+          <declname>last</declname>
+        </param>
+        <param>
+          <type>const Allocator &amp;</type>
+          <declname>alloc</declname>
+          <defval>Allocator()</defval>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="16939" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="16939" bodyend="16940"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1a0482ea79e7786367a2d9b5c789c091ce" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::ordered_map</definition>
+        <argsstring>(std::initializer_list&lt; T &gt; init, const Allocator &amp;alloc=Allocator())</argsstring>
+        <name>ordered_map</name>
+        <param>
+          <type>std::initializer_list&lt; T &gt;</type>
+          <declname>init</declname>
+        </param>
+        <param>
+          <type>const Allocator &amp;</type>
+          <declname>alloc</declname>
+          <defval>Allocator()</defval>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="16941" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="16941" bodyend="16942"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1a38834c948b844033caa7d5c76fee5866" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::pair&lt; iterator, bool &gt;</type>
+        <definition>std::pair&lt;iterator, bool&gt; nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::emplace</definition>
+        <argsstring>(const key_type &amp;key, T &amp;&amp;t)</argsstring>
+        <name>emplace</name>
+        <param>
+          <type>const <ref refid="d6/da7/structnlohmann_1_1ordered__map_1a57095c6ed403f02e1bc2c240a13c9ed8" kindref="member">key_type</ref> &amp;</type>
+          <declname>key</declname>
+        </param>
+        <param>
+          <type>T &amp;&amp;</type>
+          <declname>t</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="16944" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="16944" bodyend="16955"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1ae7a1ca8c1e234837d137471f73ae6012" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>T &amp;</type>
+        <definition>T&amp; nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::operator[]</definition>
+        <argsstring>(const Key &amp;key)</argsstring>
+        <name>operator[]</name>
+        <param>
+          <type>const Key &amp;</type>
+          <declname>key</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="16957" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="16957" bodyend="16960"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1a676082659d575e29bdb312bcde53023a" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>const T &amp;</type>
+        <definition>const T&amp; nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::operator[]</definition>
+        <argsstring>(const Key &amp;key) const</argsstring>
+        <name>operator[]</name>
+        <param>
+          <type>const Key &amp;</type>
+          <declname>key</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="16962" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="16962" bodyend="16965"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1ab7b4bb185fe7ea84f8f5f32fd230ff91" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>T &amp;</type>
+        <definition>T&amp; nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::at</definition>
+        <argsstring>(const Key &amp;key)</argsstring>
+        <name>at</name>
+        <param>
+          <type>const Key &amp;</type>
+          <declname>key</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="16967" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="16967" bodyend="16978"/>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1a8b7f27215180385b9b1e98adc4dd8ae7" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>const T &amp;</type>
+        <definition>const T&amp; nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::at</definition>
+        <argsstring>(const Key &amp;key) const</argsstring>
+        <name>at</name>
+        <param>
+          <type>const Key &amp;</type>
+          <declname>key</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="16980" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="16980" bodyend="16991"/>
+        <references refid="d5/db8/json_8hpp_1a6c274f6db2e65c1b66c7d41b06ad690f" compoundref="d5/db8/json_8hpp" startline="2263">JSON_THROW</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1a583c8976bbf0c137ff8e2439878f3058" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>size_type</type>
+        <definition>size_type nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::erase</definition>
+        <argsstring>(const Key &amp;key)</argsstring>
+        <name>erase</name>
+        <param>
+          <type>const Key &amp;</type>
+          <declname>key</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="16993" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="16993" bodyend="17010"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1a26053569acb0a858d87482b2fa3d5dc5" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>iterator</type>
+        <definition>iterator nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::erase</definition>
+        <argsstring>(iterator pos)</argsstring>
+        <name>erase</name>
+        <param>
+          <type>iterator</type>
+          <declname>pos</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="17012" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="17012" bodyend="17024"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1aee2c188dcc802d6b28910f707a5e637b" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>size_type</type>
+        <definition>size_type nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::count</definition>
+        <argsstring>(const Key &amp;key) const</argsstring>
+        <name>count</name>
+        <param>
+          <type>const Key &amp;</type>
+          <declname>key</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="17026" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="17026" bodyend="17036"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1a2486527ac56e07d58946ae9a93a46bc8" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>iterator</type>
+        <definition>iterator nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::find</definition>
+        <argsstring>(const Key &amp;key)</argsstring>
+        <name>find</name>
+        <param>
+          <type>const Key &amp;</type>
+          <declname>key</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="17038" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="17038" bodyend="17048"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1a41e6e34fa8a90b96cbe5c71fec10d2ee" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>const_iterator</type>
+        <definition>const_iterator nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::find</definition>
+        <argsstring>(const Key &amp;key) const</argsstring>
+        <name>find</name>
+        <param>
+          <type>const Key &amp;</type>
+          <declname>key</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="17050" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="17050" bodyend="17060"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1a48eceff729b80f3f4a023b737efccc5b" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::pair&lt; iterator, bool &gt;</type>
+        <definition>std::pair&lt;iterator, bool&gt; nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::insert</definition>
+        <argsstring>(value_type &amp;&amp;value)</argsstring>
+        <name>insert</name>
+        <param>
+          <type>value_type &amp;&amp;</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="17062" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="17062" bodyend="17065"/>
+        <references refid="dc/df0/namespacenlohmann_1_1detail_1a2fb6dae6578e06ae73ca0d7cc8512b1aa2063c1608d6e0baf80249c42e2be5804">nlohmann::detail::value</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1a0241433138719e477a3cbb0c4cf0a243" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>std::pair&lt; iterator, bool &gt;</type>
+        <definition>std::pair&lt;iterator, bool&gt; nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::insert</definition>
+        <argsstring>(const value_type &amp;value)</argsstring>
+        <name>insert</name>
+        <param>
+          <type>const value_type &amp;</type>
+          <declname>value</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="17067" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="17067" bodyend="17078"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/da7/structnlohmann_1_1ordered__map_1a2c8509f72bc33307661f1a0ed5763f9e" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename InputIt</type>
+          </param>
+          <param>
+            <type>typename</type>
+            <defval><ref refid="d6/da7/structnlohmann_1_1ordered__map_1a89cc338e8466e74baaa138664c79ee98" kindref="member">require_input_iter</ref>&lt;InputIt&gt;</defval>
+          </param>
+        </templateparamlist>
+        <type>void</type>
+        <definition>void nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;::insert</definition>
+        <argsstring>(InputIt first, InputIt last)</argsstring>
+        <name>insert</name>
+        <param>
+          <type>InputIt</type>
+          <declname>first</declname>
+        </param>
+        <param>
+          <type>InputIt</type>
+          <declname>last</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="17085" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="17085" bodyend="17091"/>
+        <references refid="d5/db8/json_8hpp_1a0643bd74c2dc6f0e4e420b8190ea8f0f" compoundref="d5/db8/json_8hpp" startline="2336">NLOHMANN_BASIC_JSON_TPL_DECLARATION</references>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+<para><ref refid="d6/da7/structnlohmann_1_1ordered__map" kindref="compound">ordered_map</ref>: a minimal map-like container that preserves insertion order for use within nlohmann::basic_json&lt;ordered_map&gt; </para>    </detaileddescription>
+    <inheritancegraph>
+      <node id="856">
+        <label>std::vector&lt; std::pair&lt; const Key, T &gt;, Allocator &gt;</label>
+      </node>
+      <node id="855">
+        <label>nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;</label>
+        <link refid="d6/da7/structnlohmann_1_1ordered__map"/>
+        <childnode refid="856" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="859">
+        <label>T</label>
+      </node>
+      <node id="858">
+        <label>std::vector&lt; std::pair&lt; const Key, T &gt;, Allocator &gt;</label>
+        <childnode refid="859" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+      </node>
+      <node id="857">
+        <label>nlohmann::ordered_map&lt; Key, T, IgnoredLess, Allocator &gt;</label>
+        <link refid="d6/da7/structnlohmann_1_1ordered__map"/>
+        <childnode refid="858" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3393" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3393" bodyend="-1"/>
+    <listofallmembers>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1ab7b4bb185fe7ea84f8f5f32fd230ff91" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>at</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a8b7f27215180385b9b1e98adc4dd8ae7" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>at</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a0cabe346c38a4f1ab1b8a396fbd2bbe2" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>Container</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1aee2c188dcc802d6b28910f707a5e637b" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>count</name></member>
+      <member refid="dd/d4e/classstd_1_1vector_1a2396209900e8f592db1f0b2467f7d899" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>elements</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a38834c948b844033caa7d5c76fee5866" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>emplace</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a583c8976bbf0c137ff8e2439878f3058" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>erase</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a26053569acb0a858d87482b2fa3d5dc5" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>erase</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a2486527ac56e07d58946ae9a93a46bc8" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>find</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a41e6e34fa8a90b96cbe5c71fec10d2ee" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>find</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a48eceff729b80f3f4a023b737efccc5b" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>insert</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a0241433138719e477a3cbb0c4cf0a243" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>insert</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a2c8509f72bc33307661f1a0ed5763f9e" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>insert</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a57095c6ed403f02e1bc2c240a13c9ed8" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>key_type</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a1c9c1509ee714a9814b45a8030c84ec7" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>mapped_type</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1ae7a1ca8c1e234837d137471f73ae6012" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>operator[]</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a676082659d575e29bdb312bcde53023a" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>operator[]</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a87938c10b76510dac00412d2cb5fd1e4" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>ordered_map</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a9d25efb51325cc1be027b8ea00c1f8b8" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>ordered_map</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a0482ea79e7786367a2d9b5c789c091ce" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>ordered_map</name></member>
+      <member refid="d6/da7/structnlohmann_1_1ordered__map_1a89cc338e8466e74baaa138664c79ee98" prot="public" virt="non-virtual"><scope>nlohmann::ordered_map</scope><name>require_input_iter</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

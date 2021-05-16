@@ -1,4 +1,4 @@
 var searchData=
 [
-  ['backenddescriptor',['BackendDescriptor',['../d6/d88/classcudnn__frontend_1_1BackendDescriptor.html',1,'cudnn_frontend']]]
+  ['adl_5fserializer',['adl_serializer',['../dc/dc7/structnlohmann_1_1adl__serializer.html',1,'nlohmann']]]
 ];

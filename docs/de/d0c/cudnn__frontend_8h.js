@@ -20,6 +20,8 @@ var cudnn__frontend_8h =
     [ "OperationGraphBuilder", "de/d0c/cudnn__frontend_8h.html#a0b7ba1175801c56d07d26785bcd8fb70", null ],
     [ "PointWiseDesc", "de/d0c/cudnn__frontend_8h.html#ada5353494ce649fc915154ced52dcceb", null ],
     [ "PointWiseDescBuilder", "de/d0c/cudnn__frontend_8h.html#a7f878662c40c287736343affc43f25dc", null ],
+    [ "ReductionDesc", "de/d0c/cudnn__frontend_8h.html#a4b09ba4625f988c32edfc305b5397f48", null ],
+    [ "ReductionDescBuilder", "de/d0c/cudnn__frontend_8h.html#aa5a388535aed6e36ef90002af0b80a80", null ],
     [ "Tensor", "de/d0c/cudnn__frontend_8h.html#aa20fd945a531e0a3a5007e65fe917770", null ],
     [ "TensorBuilder", "de/d0c/cudnn__frontend_8h.html#a9fea2e22198aaf2ea11a0df46abd0749", null ],
     [ "VariantPack", "de/d0c/cudnn__frontend_8h.html#ad6ac8113b406ee2b6f20eff4dd2b4e01", null ],

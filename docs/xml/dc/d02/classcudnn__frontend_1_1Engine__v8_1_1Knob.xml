@@ -229,19 +229,19 @@
     <detaileddescription>
 <para>Internal class which controls the different knobs for a given engine Has min-max and stride as the options. User has the option to set the required value as a choice. </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="195">
+      <node id="746">
         <label>int64_t</label>
       </node>
-      <node id="194">
+      <node id="745">
         <label>cudnnBackendKnobType_t</label>
       </node>
-      <node id="193">
+      <node id="744">
         <label>cudnn_frontend::Engine_v8::Knob</label>
         <link refid="dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob"/>
-        <childnode refid="194" relation="usage">
+        <childnode refid="745" relation="usage">
           <edgelabel>-knobType</edgelabel>
         </childnode>
-        <childnode refid="195" relation="usage">
+        <childnode refid="746" relation="usage">
           <edgelabel>-minValue</edgelabel>
           <edgelabel>-maxValue</edgelabel>
           <edgelabel>-stride</edgelabel>

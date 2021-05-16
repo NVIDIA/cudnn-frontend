@@ -1,0 +1,58 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d5/d14/structnlohmann_1_1detail_1_1wide__string__input__helper_3_01BaseInputAdapter_00_014_01_4" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::wide_string_input_helper&lt; BaseInputAdapter, 4 &gt;</compoundname>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>typename BaseInputAdapter</type>
+      </param>
+    </templateparamlist>
+      <sectiondef kind="public-static-func">
+      <memberdef kind="function" id="d5/d14/structnlohmann_1_1detail_1_1wide__string__input__helper_3_01BaseInputAdapter_00_014_01_4_1a0ff95d2f31684b6477abcd783975b7c1" prot="public" static="yes" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref></type>
+        <definition>static void nlohmann::detail::wide_string_input_helper&lt; BaseInputAdapter, 4 &gt;::fill_buffer</definition>
+        <argsstring>(BaseInputAdapter &amp;input, std::array&lt; std::char_traits&lt; char &gt;::int_type, 4 &gt; &amp;utf8_bytes, size_t &amp;utf8_bytes_index, size_t &amp;utf8_bytes_filled)</argsstring>
+        <name>fill_buffer</name>
+        <param>
+          <type>BaseInputAdapter &amp;</type>
+          <declname>input</declname>
+        </param>
+        <param>
+          <type><ref refid="dc/df0/namespacenlohmann_1_1detail_1a1ed8fc6239da25abcaf681d30ace4985af1f713c9e000f5d3f280adbd124df4f5" kindref="member">std::array</ref>&lt; std::char_traits&lt; char &gt;::int_type, 4 &gt; &amp;</type>
+          <declname>utf8_bytes</declname>
+        </param>
+        <param>
+          <type>size_t &amp;</type>
+          <declname>utf8_bytes_index</declname>
+        </param>
+        <param>
+          <type>size_t &amp;</type>
+          <declname>utf8_bytes_filled</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5393" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5393" bodyend="5444"/>
+        <references refid="d5/db8/json_8hpp_1a8df7de76ab3c9445f46f6994ec205bcd" compoundref="d5/db8/json_8hpp" startline="1564">JSON_HEDLEY_UNLIKELY</references>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="1069">
+        <label>nlohmann::detail::wide_string_input_helper&lt; BaseInputAdapter, 4 &gt;</label>
+        <link refid="d5/d14/structnlohmann_1_1detail_1_1wide__string__input__helper_3_01BaseInputAdapter_00_014_01_4"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5391" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5390" bodyend="5445"/>
+    <listofallmembers>
+      <member refid="d5/d14/structnlohmann_1_1detail_1_1wide__string__input__helper_3_01BaseInputAdapter_00_014_01_4_1a0ff95d2f31684b6477abcd783975b7c1" prot="public" virt="non-virtual"><scope>nlohmann::detail::wide_string_input_helper&lt; BaseInputAdapter, 4 &gt;</scope><name>fill_buffer</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

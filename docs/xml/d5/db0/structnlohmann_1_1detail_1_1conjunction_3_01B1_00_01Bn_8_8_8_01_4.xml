@@ -1,0 +1,49 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d5/db0/structnlohmann_1_1detail_1_1conjunction_3_01B1_00_01Bn_8_8_8_01_4" kind="struct" language="C++" prot="public">
+    <compoundname>nlohmann::detail::conjunction&lt; B1, Bn... &gt;</compoundname>
+    <basecompoundref refid="db/d0a/classstd_1_1conditional_1_1type" prot="public" virt="non-virtual">std::conditional::type&lt; bool(B1::value), conjunction&lt; Bn... &gt;, B1 &gt;</basecompoundref>
+    <includes refid="d5/db8/json_8hpp" local="no">json.hpp</includes>
+    <templateparamlist>
+      <param>
+        <type>class <ref refid="d3/ddb/classB1" kindref="compound">B1</ref></type>
+      </param>
+      <param>
+        <type>class...</type>
+        <declname>Bn</declname>
+        <defname>Bn</defname>
+      </param>
+    </templateparamlist>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="89">
+        <label>std::conditional&lt; bool(B1::value), conjunction&lt; Bn... &gt;, B1 &gt;::type</label>
+        <link refid="db/d0a/classstd_1_1conditional_1_1type"/>
+      </node>
+      <node id="88">
+        <label>nlohmann::detail::conjunction&lt; B1, Bn... &gt;</label>
+        <link refid="d5/db0/structnlohmann_1_1detail_1_1conjunction_3_01B1_00_01Bn_8_8_8_01_4"/>
+        <childnode refid="89" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="91">
+        <label>std::conditional&lt; bool(B1::value), conjunction&lt; Bn... &gt;, B1 &gt;::type</label>
+        <link refid="db/d0a/classstd_1_1conditional_1_1type"/>
+      </node>
+      <node id="90">
+        <label>nlohmann::detail::conjunction&lt; B1, Bn... &gt;</label>
+        <link refid="d5/db0/structnlohmann_1_1detail_1_1conjunction_3_01B1_00_01Bn_8_8_8_01_4"/>
+        <childnode refid="91" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3553" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3552" bodyend="3553"/>
+    <listofallmembers>
+    </listofallmembers>
+  </compounddef>
+</doxygen>
