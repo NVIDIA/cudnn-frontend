@@ -81,4 +81,6 @@ Documentation can be found at https://nvidia.github.io/cudnn-frontend/
 ## Feedback
 Support, resources, and information about cuDNN can be found online at https://developer.nvidia.com/cudnn. 
 
+New issues can be logged at https://github.com/NVIDIA/cudnn-frontend/issues
+
 For questions or to provide feedback, please contact cuDNN@nvidia.com.
