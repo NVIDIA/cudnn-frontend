@@ -55,7 +55,10 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack &vari
         float min_time_ms   = std::numeric_limits<float>::max();
 
         // Warm-up run
-        ::cudnnBackendExecute(handle, plan.get_raw_desc(), variantPack.get_raw_desc());
+        cudnnStatus_t stat = ::cudnnBackendExecute(handle, plan.get_raw_desc(), variantPack.get_raw_desc());
+        if (stat != CUDNN_STATUS_SUCCESS) {
+            continue;
+        }
         cudaDeviceSynchronize();
 
         for (int i = 0; i < maxIterCount; i++) {
