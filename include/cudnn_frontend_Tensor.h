@@ -56,18 +56,19 @@ class Tensor_v8 : public BackendDescriptor {
         std::stringstream ss;
         char sep = ' ';
         ss << "CUDNN_BACKEND_TENSOR_DESCRIPTOR :"
-           << " Datatype: " << std::to_string(data_type) << " Id: " << std::to_string(id)
-           << " Alignment: " << std::to_string(alignment) << " nDims " << nDims;
+           << " Datatype: " << to_string(data_type) << " Id: " << std::to_string(id)
+           << " Alignment: " << alignment << " nDims " << nDims
+           << " VectorCount: " << vectorCount << " vectorDimension " << vectorDimension;
         ss << " Dim [";
-        std::for_each(std::begin(btensor_dimA), std::end(btensor_dimA), [&ss, sep](int x) mutable {
-            ss << sep << x;
+        for (auto i = 0; i < nDims; i++) {
+            ss << sep << btensor_dimA[i];
             sep = ',';
-        });
+        }
         ss << " ] Str [";
-        std::for_each(std::begin(btensor_strA), std::end(btensor_strA), [&ss, sep](int x) mutable {
-            ss << sep << x;
+        for (auto i = 0; i < nDims; i++) {
+            ss << sep << btensor_strA[i];
             sep = ',';
-        });
+        }
         ss << "]";
         return ss.str();
     }
@@ -97,7 +98,9 @@ class Tensor_v8 : public BackendDescriptor {
     int64_t id                              = -1;                //! Unique id of the tensor
     int64_t alignment                       = -1;                //! Alignment of the tensor.
     //! Certain engine config expect minimum alignment of 16B
-    int64_t nDims  = -1;     //! Number of Dimensions of the tensor
+    int64_t nDims            = -1;     //! Number of Dimensions of the tensor
+    int64_t vectorDimension  = -1;     //! Which dimension of the tensor is vectorized (Generally the c dim)
+    int64_t vectorCount      = 1;     //! What is the vectorization count (4 or 32)
     bool isVirtual = false;  //! Whether it is an intermediate tensor of an op graph
 };
 
@@ -145,6 +148,12 @@ class TensorBuilder_v8 {
     auto
     setVirtual(bool virtual_ = true) -> TensorBuilder_v8 & {
         m_tensor.isVirtual = virtual_;
+        return *this;
+    }
+    auto
+    setVectorCountAndDimension(int64_t vectorCount_, int64_t vectorDimension_) -> TensorBuilder_v8 & {
+        m_tensor.vectorCount = vectorCount_;
+        m_tensor.vectorDimension = vectorDimension_;
         return *this;
     }
     /** @} */
@@ -259,6 +268,35 @@ class TensorBuilder_v8 {
                     &m_tensor,
                     status,
                     "CUDNN_BACKEND_TENSOR_DESCRIPTOR: SetAttribute CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT Failed");
+                return std::move(m_tensor);
+            }
+        }
+
+        if (m_tensor.vectorCount > 1) {
+            cudnnBackendSetAttribute(m_tensor.pointer->get_backend_descriptor(),
+                                     CUDNN_ATTR_TENSOR_VECTOR_COUNT,
+                                     CUDNN_TYPE_INT64,
+                                     1,
+                                     &m_tensor.vectorCount);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_tensor,
+                    status,
+                    "CUDNN_BACKEND_TENSOR_DESCRIPTOR: SetAttribute CUDNN_ATTR_TENSOR_VECTOR_COUNT Failed");
+                return std::move(m_tensor);
+            }
+        }
+        if (m_tensor.vectorDimension >= 0) {
+            cudnnBackendSetAttribute(m_tensor.pointer->get_backend_descriptor(),
+                                     CUDNN_ATTR_TENSOR_VECTORIZED_DIMENSION,
+                                     CUDNN_TYPE_INT64,
+                                     1,
+                                     &m_tensor.vectorDimension);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_tensor,
+                    status,
+                    "CUDNN_BACKEND_TENSOR_DESCRIPTOR: SetAttribute CUDNN_ATTR_TENSOR_VECTORIZED_DIMENSION Failed");
                 return std::move(m_tensor);
             }
         }

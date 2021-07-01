@@ -65,13 +65,13 @@ Errata filter gives the cuDNN team an opportunity to block certain faulty kernel
 #### Json format
     version             : 1    - Mandatory. Tells the format version of the json.
     rules               : []   - Mandatory. Array of rule object which identifies the engine config
-        rule_id             : ""   - Optional.  Used to uniquely identify a rule. Has no purpose other than being easy to debug.
-        operation           : ""   - Mandatory. Stringified version of the operation graph.
-        engine              : ""   - Mandatory. Stringified version of the engine ID.
-        knob                : [""] - Optional.  Stringified version of the knob. If specified only the engineConfig for the engine matching the knobs will be blocked. Else, all possible combination of knobs for the engine will be blocked.
-        cudnn_version_start : 0    - Optional. Denotes the cudnn version after which the engine started having issues.
-        cudnn_version_end   : -1   - Optional. Denotes the cudnn_version when the issue was fixed. "-1" denotes its an ongoing issue.
-        arch                : ""   - Optional. Architectures where this kernel might be faulty.
+    rule_id             : ""   - Optional.  Used to uniquely identify a rule. Has no purpose other than being easy to debug.
+    operation           : ""   - Mandatory. Stringified version of the operation graph.
+    engine              : ""   - Mandatory. Stringified version of the engine ID.
+    knob                : ""   - Optional.  Stringified version of the knob. If specified only the engineConfig for the engine matching the knobs will be blocked. Else, all possible combination of knobs for the engine will be blocked.
+    cudnn_version_start : 0    - Optional. Denotes the cudnn version after which the engine started having issues.
+    cudnn_version_end   : -1   - Optional. Denotes the cudnn_version when the issue was fixed. "-1" denotes its an ongoing issue.
+    arch                : ""   - Optional. Architectures where this kernel might be faulty.
 
 PS: The errata filter note is still in beta version. We may add/modify certain features as necessary.
 
@@ -80,7 +80,5 @@ Documentation can be found at https://nvidia.github.io/cudnn-frontend/
 
 ## Feedback
 Support, resources, and information about cuDNN can be found online at https://developer.nvidia.com/cudnn. 
-
-New issues can be logged at https://github.com/NVIDIA/cudnn-frontend/issues
 
 For questions or to provide feedback, please contact cuDNN@nvidia.com.

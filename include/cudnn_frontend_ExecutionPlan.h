@@ -56,7 +56,8 @@ class ExecutionPlan_v8 : public BackendDescriptor {
         : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
           engine_config(from.engine_config),
           handle(from.handle),
-          planTag(from.planTag) {}
+          planTag(from.planTag),
+          execution_time_ms(from.execution_time_ms) {}
     ~ExecutionPlan_v8() = default;
     /** @defgroup ExecutionPlanQuery
      *  Query individual property of ExecutionPlan_v8 class
@@ -97,6 +98,16 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     std::string const &
     getTag() const {
         return planTag;
+    }
+
+    void
+    setExecutionTime(float time_) {
+        execution_time_ms = time_;
+    }
+
+    float
+    getExecutionTime() const {
+        return execution_time_ms;
     }
 
    private:
@@ -203,6 +214,9 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     ManagedOpaqueDescriptor engine_config = nullptr;
     cudnnHandle_t handle                  = nullptr;
     std::string planTag;
+
+    float execution_time_ms    = 0.0f;
+
 };
 
 ///

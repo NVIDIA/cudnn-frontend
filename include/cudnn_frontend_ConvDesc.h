@@ -59,35 +59,35 @@ class ConvDesc_v8 : public BackendDescriptor {
         std::stringstream ss;
         char sep = ' ';
         ss << "CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR :"
-           << " Datatype: " << std::to_string(data_type) << " Mode: " << std::to_string(mode)
+           << " Datatype: " << to_string(compute_precision) << " Mode: " << std::to_string(mode)
            << " Num Dimensions: " << std::to_string(nDims);
         ss << " PadLower [";
-        std::for_each(std::begin(padLower), std::end(padLower), [&ss, sep](int x) mutable {
-            ss << sep << x;
+        for (auto i = 0; i < nDims; i++) {
+            ss << sep << padLower[i];
             sep = ',';
-        });
+        }
         ss << " ] PadUpper [";
-        std::for_each(std::begin(padUpper), std::end(padUpper), [&ss, sep](int x) mutable {
-            ss << sep << x;
+        for (auto i = 0; i < nDims; i++) {
+            ss << sep << padUpper[i];
             sep = ',';
-        });
+        }
         ss << " ] Dilation [";
-        std::for_each(std::begin(dilation), std::end(dilation), [&ss, sep](int x) mutable {
-            ss << sep << x;
+        for (auto i = 0; i < nDims; i++) {
+            ss << sep << dilation[i];
             sep = ',';
-        });
+        }
         ss << " ] Stride [";
-        std::for_each(std::begin(stride), std::end(stride), [&ss, sep](int x) mutable {
-            ss << sep << x;
+        for (auto i = 0; i < nDims; i++) {
+            ss << sep << stride[i];
             sep = ',';
-        });
+        }
         ss << "]";
         return ss.str();
     }
 
     ConvDesc_v8(ConvDesc_v8 &&from)
         : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
-          data_type(from.data_type),
+          compute_precision(from.compute_precision),
           mode(from.mode),
           nDims(from.nDims) {
         std::copy(std::begin(from.padLower), std::end(from.padLower), padLower);
@@ -98,13 +98,18 @@ class ConvDesc_v8 : public BackendDescriptor {
 
     ~ConvDesc_v8() = default;
 
+    cudnnDataType_t
+    getComputePrecision() const {
+        return compute_precision;
+    }
+
    private:
     ConvDesc_v8()                    = default;
     ConvDesc_v8(ConvDesc_v8 const &) = delete;
     ConvDesc_v8 &
     operator=(ConvDesc_v8 const &) = delete;
 
-    cudnnDataType_t data_type           = CUDNN_DATA_FLOAT;   //! Convolution operation data type
+    cudnnDataType_t compute_precision   = CUDNN_DATA_FLOAT;   //! Convolution operation data type
     cudnnConvolutionMode_t mode         = CUDNN_CONVOLUTION;  //! Convolution vs cross correlation
     int64_t nDims                       = -1;                 //! number of dimensions
     int64_t padLower[CUDNN_DIM_MAX + 1] = {0};                //! n, g, c, d, h, w
@@ -125,7 +130,11 @@ class ConvDescBuilder_v8 {
     //! Set Datatype for the Convolution Operation
     auto
     setDataType(cudnnDataType_t data_type_) -> ConvDescBuilder_v8 & {
-        m_convDesc.data_type = data_type_;
+        return setComputePrecision(data_type_);
+    }
+    auto
+    setComputePrecision(cudnnDataType_t data_type_) ->  ConvDescBuilder_v8 & {
+        m_convDesc.compute_precision = data_type_;
         return *this;
     }
     //! Set Padding Lower of the convDesc
@@ -205,7 +214,7 @@ class ConvDescBuilder_v8 {
                                           CUDNN_ATTR_CONVOLUTION_COMP_TYPE,
                                           CUDNN_TYPE_DATA_TYPE,
                                           1,
-                                          &m_convDesc.data_type);
+                                          &m_convDesc.compute_precision);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_convDesc,

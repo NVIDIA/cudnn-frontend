@@ -25,15 +25,8 @@
 #include <cudnn_frontend.h>
 
 namespace cudnn_frontend {
-/// A pair of execution plan and its run time.
-/// Necessary to return a sorted executionPlan
-struct executionOption {
-    cudnn_frontend::ExecutionPlan plan;  //! One can get the underlying EngineConfig from the ExecutionPlan
-    float time_ms;                       //! Time taken to execute the above plan
-};
 
 /// Variety of renames.
-using executionOptions_t = std::vector<struct executionOption>;
 using executionPlans_t   = std::vector<cudnn_frontend::ExecutionPlan>;
 using Predicate          = std::function<bool(cudnn_frontend::ExecutionPlan const &plan)>;
 using GeneratorSource    = std::function<cudnn_frontend::EngineConfigList(cudnn_frontend::OperationGraph &)>;
@@ -75,16 +68,25 @@ class EngineConfigGenerator {
 
     /// Returns the concatenated plan in the order of heuristic results.
     auto
-    cudnnGetPlan(cudnnHandle_t handle, cudnn_frontend::OperationGraph &&opGraph, Predicate pred) -> executionPlans_t;
+    cudnnGetPlan(cudnnHandle_t handle, cudnn_frontend::OperationGraph &opGraph, Predicate pred) -> executionPlans_t;
+    auto
+    cudnnGetPlan(cudnnHandle_t handle, cudnn_frontend::OperationGraph &opGraph) -> executionPlans_t;
+
 
     /// Reruns the concatenated plans and measures the execution time following which
     /// a sorted order of executionPlans are return to the user.
     template <CudnnFindSamplingTechnique samplingTechnique>
     auto
     cudnnFindPlan(cudnnHandle_t handle,
-                  cudnn_frontend::OperationGraph &&opGraph,
-                  cudnn_frontend::VariantPack &variantPack,
-                  Predicate pred) -> executionOptions_t;
+                  cudnn_frontend::OperationGraph &opGraph,
+                  cudnn_frontend::VariantPack const &variantPack,
+                  Predicate pred) -> executionPlans_t;
+
+    template <CudnnFindSamplingTechnique samplingTechnique>
+    auto
+    cudnnFindPlan(cudnnHandle_t handle,
+                  cudnn_frontend::OperationGraph &opGraph,
+                  cudnn_frontend::VariantPack const &variantPack) -> executionPlans_t;
 };
 
 /// Filter out the execution plan based on the prerequisite conditions.

@@ -23,7 +23,7 @@
 #pragma once
 
 #include <cudnn_frontend_EngineConfigGenerator.h>
-#include <map>
+#include <set>
 
 namespace cudnn_frontend {
 
@@ -34,9 +34,11 @@ namespace cudnn_frontend {
 /// time further.
 template <CudnnFindSamplingTechnique samplingTechnique>
 auto
-time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack &variantPack) -> executionOptions_t {
-    executionOptions_t time_sorted_plans;
-    std::map<float, ExecutionPlan &> timed_execution_plans;
+time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const &variantPack) -> executionPlans_t {
+    executionPlans_t time_sorted_plans;
+
+    auto plan_cmp = [](const ExecutionPlan& a, const ExecutionPlan& b) {return a.getExecutionTime() < b.getExecutionTime();};
+    std::set<std::reference_wrapper<ExecutionPlan>, decltype(plan_cmp)> timed_execution_plans(plan_cmp);
 
     const int maxIterCount =
         (samplingTechnique == CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_ONCE)
@@ -57,7 +59,6 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack &vari
         // Warm-up run
         auto warmup_status = ::cudnnBackendExecute(handle, plan.get_raw_desc(), variantPack.get_raw_desc());
         if (warmup_status != CUDNN_STATUS_SUCCESS) {continue;}
-
         cudaDeviceSynchronize();
 
         for (int i = 0; i < maxIterCount; i++) {
@@ -80,15 +81,13 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack &vari
                 final_time_ms = i == (maxIterCount / 2) ? time_ms : final_time_ms;
             }
         }
-        timed_execution_plans.insert({final_time_ms, plan});
+        plan.setExecutionTime(final_time_ms);
+        timed_execution_plans.insert(plan);
     }
-    std::transform(
-        timed_execution_plans.begin(),
-        timed_execution_plans.end(),
-        std::back_inserter(time_sorted_plans),
-        [](const std::map<float, cudnn_frontend::ExecutionPlan &>::value_type &pair) -> struct executionOption {
-            return {std::move(pair.second), pair.first};
-        });
+
+    for (ExecutionPlan &plan : timed_execution_plans) {
+        time_sorted_plans.emplace_back(std::move(plan));
+    }
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -99,23 +98,21 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack &vari
 template <CudnnFindSamplingTechnique samplingTechnique>
 auto
 EngineConfigGenerator::cudnnFindPlan(cudnnHandle_t handle,
-                                     cudnn_frontend::OperationGraph &&opGraph,
-                                     cudnn_frontend::VariantPack &variantPack,
-                                     Predicate pred) -> executionOptions_t {
+                                     cudnn_frontend::OperationGraph &opGraph,
+                                     cudnn_frontend::VariantPack const &variantPack) -> executionPlans_t {
     /// Creating a set of execution plans that are supported.
-    executionPlans_t plans;
-    for (auto &engine_config : generate_engine_config(opGraph)) {
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
-        try {
-#endif
-            plans.push_back(
-                cudnn_frontend::ExecutionPlanBuilder().setHandle(handle).setEngineConfig(engine_config, opGraph.getTag()).build());
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
-        } catch (cudnnException &e) {
-            continue;
-        }
-#endif
-    }
-    return time_sorted_plan<samplingTechnique>(handle, filter(pred, plans), variantPack);
+    executionPlans_t plans = cudnnGetPlan(handle, opGraph);
+    return time_sorted_plan<samplingTechnique>(handle, std::move(plans), variantPack);
+}
+
+template <CudnnFindSamplingTechnique samplingTechnique>
+auto
+EngineConfigGenerator::cudnnFindPlan(cudnnHandle_t handle,
+                                     cudnn_frontend::OperationGraph &opGraph,
+                                     cudnn_frontend::VariantPack const &variantPack,
+                                     Predicate pred) -> executionPlans_t {
+    /// Creating a set of execution plans that are supported.
+    executionPlans_t plans = cudnnGetPlan(handle, opGraph, pred);
+    return time_sorted_plan<samplingTechnique>(handle, std::move(plans), variantPack);
 }
 }

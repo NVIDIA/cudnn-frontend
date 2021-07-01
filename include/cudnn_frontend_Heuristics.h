@@ -28,7 +28,9 @@
 #include <cudnn_backend.h>
 
 #include "cudnn_frontend_OperationGraph.h"
+#include "cudnn_frontend_EngineConfig.h"
 #include "cudnn_frontend_utils.h"
+#include "cudnn_frontend_Filters.h"
 
 namespace cudnn_frontend {
 ///
@@ -221,4 +223,26 @@ class EngineHeuristicsBuilder_v8 {
    private:
     EngineHeuristics_v8 m_heuristics;
 };
+
+template<std::size_t SIZE>
+EngineConfigList
+get_heuristics_list(std::array<cudnnBackendHeurMode_t, SIZE> modes,
+    OperationGraph_v8 &opGraph,
+    std::function<bool(cudnnBackendDescriptor_t)> filter_fn) {
+    (void) modes;
+    EngineConfigList filtered_configs;
+
+
+    for (auto mode : modes) {
+        auto heuristics = EngineHeuristicsBuilder_v8()
+            .setOperationGraph(opGraph)
+            .setHeurMode(mode)
+            .build();
+
+        auto& engine_config = heuristics.getEngineConfig(heuristics.getEngineConfigCount());
+        cudnn_frontend::filter(engine_config, filtered_configs, filter_fn);
+    }
+
+    return filtered_configs;
+}
 }

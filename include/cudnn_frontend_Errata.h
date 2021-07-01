@@ -51,7 +51,7 @@ static bool
 check_rule(const json &json_handle, const std::string & executionPlanTag,
     cudnnHandle_t handle, T fn) {
     std::string operation = json_handle["operation"];
-    std::string engine    =  json_handle["engine"];
+    int64_t engine        =  json_handle["engine"];
     uint64_t cudnn_start     =  0;
     uint64_t cudnn_end       =  -1;
     if (json_handle.contains("cudnn_version_start")) {
@@ -60,9 +60,10 @@ check_rule(const json &json_handle, const std::string & executionPlanTag,
     if (json_handle.contains("cudnn_version_end")) {
         cudnn_end     =  json_handle["cudnn_version_end"];
     }
-    std::string tag_prefix = operation + "_" + engine; 
+    std::string tag_prefix = operation + "_eng" + std::to_string(engine) + "_"; 
+    std::string mod_tag    = executionPlanTag + "_";
     bool blocked = 
-        std::equal(tag_prefix.begin(), tag_prefix.end(), executionPlanTag.begin()) &&
+        std::equal(tag_prefix.begin(), tag_prefix.end(), mod_tag.begin()) &&
         CUDNN_VERSION >= cudnn_start &&
         CUDNN_VERSION < cudnn_end;
 

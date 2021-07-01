@@ -108,9 +108,9 @@ void run_from_cudnn_find(
     int64_t* outdimA_padded,
     cudnnDataType_t dataType,
     cudnnConvolutionMode_t mode,
-    float * devPtrI,
-    float * devPtrF,
-    float * devPtrO);
+    void * devPtrI,
+    void * devPtrF,
+    void * devPtrO);
 
 void run_conv_add_bias_activation_with_cudnn_find(
     int64_t* x_dim_padded,
@@ -151,3 +151,18 @@ void block_using_errata(
     float * devPtrI,
     float * devPtrF,
     float * devPtrO);
+
+void run_dp4a(
+    int64_t* dimA_padded,
+    int64_t* padA,
+    int64_t* convstrideA,
+    int64_t* dilationA,
+    int64_t* filterdimA_padded,
+    int64_t* outdimA_padded,
+    cudnnConvolutionMode_t mode,
+    void * devPtrI,
+    void * devPtrF,
+    void * devPtrO,
+    int64_t vectorCount,
+    int64_t vectorDimension);
+
