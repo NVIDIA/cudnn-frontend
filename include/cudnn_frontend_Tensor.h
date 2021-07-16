@@ -73,16 +73,9 @@ class Tensor_v8 : public BackendDescriptor {
         return ss.str();
     }
 
-    Tensor_v8(Tensor_v8 &&from)
-        : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
-          data_type(from.data_type),
-          id(from.id),
-          alignment(from.alignment),
-          nDims(from.nDims),
-          isVirtual(from.isVirtual) {
-        std::copy(std::begin(from.btensor_dimA), std::end(from.btensor_dimA), btensor_dimA);
-        std::copy(std::begin(from.btensor_strA), std::end(from.btensor_strA), btensor_strA);
-    }
+    Tensor_v8(Tensor_v8 &&) = default;
+    Tensor_v8 &
+    operator=(Tensor_v8 &&) = default;
 
     ~Tensor_v8() = default;
 
