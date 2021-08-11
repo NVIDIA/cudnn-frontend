@@ -57,6 +57,10 @@ bool allowErrata(int64_t *padA) {
             return pad == 0;});
 }
 
+bool isInt8Errata(cudnnDataType_t type) {
+    return type == CUDNN_DATA_INT8;
+}
+
 }
 enum {
     X_TENSOR,
@@ -93,7 +97,7 @@ create_conv_add_bias_act_descriptors(int64_t* x_dim,
     (void)convstrideA;
     (void)dilationA;
     int64_t b_dim[4];
-    b_dim[0] = y_dim[0];
+    b_dim[0] = 1;
     b_dim[1] = y_dim[1];
     b_dim[2] = 1;
     b_dim[3] = 1;
@@ -1175,3 +1179,169 @@ run_dp4a(
     } 
     if (handle_) cudnnDestroy(handle_);
 }
+
+void
+run_imma(
+    int64_t* x_dim_padded,
+    int64_t* padA,
+    int64_t* convstrideA,
+    int64_t* dilationA,
+    int64_t* w_dim_padded,
+    int64_t* y_dim_padded,
+    cudnnConvolutionMode_t mode,
+    void * devPtrX,
+    void * devPtrW,
+    void * devPtrY,
+    int64_t vectorCount,
+    int64_t vectorDimension) {
+    cudnnHandle_t handle_;
+
+    try {
+        checkCudnnErr(cudnnCreate(&handle_));
+        const int convDim = 2;
+        (void) convDim;
+
+        int64_t strideA_padded[4];
+        int64_t outstrideA_padded[4];
+        int64_t filterstrideA_padded[4];
+
+        generateStrides(w_dim_padded, filterstrideA_padded, 4, CUDNN_TENSOR_NCHW);
+        generateStrides(x_dim_padded, strideA_padded, 4, CUDNN_TENSOR_NCHW);
+        generateStrides(y_dim_padded, outstrideA_padded, 4, CUDNN_TENSOR_NCHW);
+
+        auto tensor_x = cudnn_frontend::TensorBuilder()
+                                       .setDim(4, x_dim_padded)
+                                       .setStrides(4, strideA_padded)
+                                       .setId('x')
+                                       .setAlignment(16)
+                                       .setDataType(CUDNN_DATA_INT8)
+                                       .setVectorCountAndDimension(vectorCount, vectorDimension)
+                                       .build();
+        auto tensor_y = cudnn_frontend::TensorBuilder()
+                                       .setDim(4, y_dim_padded)
+                                       .setStrides(4, outstrideA_padded)
+                                       .setId('y')
+                                       .setAlignment(16)
+                                       .setDataType(CUDNN_DATA_INT8)
+                                       .setVectorCountAndDimension(vectorCount, vectorDimension)
+                                       .build();
+        auto tensor_w = cudnn_frontend::TensorBuilder()
+                                       .setDim(4, w_dim_padded)
+                                       .setStrides(4, filterstrideA_padded)
+                                       .setId('w')
+                                       .setAlignment(16)
+                                       .setDataType(CUDNN_DATA_INT8)
+                                       .setVectorCountAndDimension(vectorCount, vectorDimension)
+                                       .build();
+        auto conv_desc = cudnn_frontend::ConvDescBuilder()
+                                       .setDataType(CUDNN_DATA_INT32)
+                                       .setMathMode(mode)
+                                       .setNDims(convDim)
+                                       .setStrides(convDim, convstrideA)
+                                       .setPrePadding(convDim, padA)
+                                       .setPostPadding(convDim, padA)
+                                       .setDilation(convDim, dilationA)
+                                       .build();
+        std::cout << tensor_x.describe() << std::endl;
+        std::cout << tensor_w.describe() << std::endl;
+        std::cout << tensor_y.describe() << std::endl;
+        float alpha = 1.0f;
+        float beta  = 0.0f;
+        auto op = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR)
+                      .setxDesc(tensor_x)
+                      .setyDesc(tensor_y)
+                      .setwDesc(tensor_w)
+                      .setcDesc(conv_desc)
+                      .setAlpha(alpha)
+                      .setBeta(beta)
+                      .build();
+        std::array<cudnn_frontend::Operation const*, 1> ops = {&op};
+        auto opGraph = cudnn_frontend::OperationGraphBuilder().setHandle(handle_).setOperationGraph(ops.size(), ops.data()).build();
+        std::cout << opGraph.describe() << std::endl;
+
+        auto max_workspace_size = 1024 * 1024 * 1024;  // 1 GB
+        void* workspace_ptr = nullptr;
+        checkCudaErr(cudaMalloc(&workspace_ptr, max_workspace_size));
+
+        auto engine_configs_h = heurgen_method(opGraph);
+        auto engine_configs_f = fallback_method(opGraph);
+
+        cudnn_frontend::EngineConfigList filtered_configs;
+        cudnn_frontend::filter(engine_configs_h, filtered_configs, ::allowAll);
+        cudnn_frontend::filter(engine_configs_f, filtered_configs, ::allowAll);
+        std::cout << "filtered_configs " << filtered_configs.size() << std::endl;
+
+        cudnn_frontend::executionPlans_t options;
+        for (auto &cfg : filtered_configs) {
+            try {
+                options.emplace_back(cudnn_frontend::ExecutionPlanBuilder()
+                                      .setHandle(handle_).setEngineConfig(cfg, opGraph.getTag())
+                                      .build());
+            } catch (cudnn_frontend::cudnnException &e) {
+                continue;
+            }
+        }
+
+        std::for_each(options.begin(), options.end(), [](cudnn_frontend::ExecutionPlan& opt) {
+            std::cout << "Plan tag: " << opt.getTag() << " finished in " << opt.getExecutionTime() << " ms,"
+                      << " workspace: " << opt.getWorkspaceSize() << " bytes."
+                      << std::endl;
+        });
+
+        int64_t filter_size = tensor_w.getPackedElementCount();
+        void *reorderedData = nullptr;
+
+        auto cuda_status = cudaMalloc(&reorderedData, filter_size);
+        CHECK(cuda_status == cudaSuccess); 
+
+        auto reorder_status = cudnn_frontend::cudnnReorderFilterAndBiasInt8x32(handle_, tensor_w, conv_desc, devPtrW, reorderedData, nullptr, nullptr);
+        CHECK(reorder_status == CUDNN_STATUS_SUCCESS);
+
+        void* data_ptrs[] = {devPtrX, devPtrY, reorderedData};
+        int64_t uids[]    = {'x', 'y', 'w'};
+        auto variantPack  = cudnn_frontend::VariantPackBuilder()
+            .setDataPointers(3, data_ptrs)
+            .setUids(3, uids)
+            .setWorkspacePointer(workspace_ptr)
+            .build();
+        std::cout << "variantPack " << variantPack.describe() << std::endl;
+
+        CHECK(options.size() > 0);
+        if (options.size() == 0) {return;}
+
+        auto json_handle = json::parse(R"(
+            { "version" : 1, 
+              "rules"   : 
+                [ 
+                    { "rule_id"             : "ConvFwd_eng0", 
+                      "operation"           : "ConvFwd",
+                      "engine"              : 0, 
+                      "knob"                : [],
+                      "cudnn_version_start" : 8000, 
+                      "cudnn_version_end"   : -1 
+                    }
+                ] 
+            })");
+
+        auto fn = std::bind(::isInt8Errata, CUDNN_DATA_INT8);
+
+        cudnnStatus_t status = CUDNN_STATUS_SUCCESS;
+
+        for (auto &option : options) {
+            bool is_plan_blocked = cudnn_frontend::check_errata<decltype(fn)>(json_handle, option.getTag(), handle_, fn);
+            if (is_plan_blocked) {continue;}
+
+            std::cout << "Executing " << option.getTag() << std::endl;
+            status = cudnnBackendExecute(handle_, option.get_raw_desc(), variantPack.get_raw_desc());
+        }
+
+
+        cudaFree(reorderedData);
+        cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
+    } catch (cudnn_frontend::cudnnException &e) {
+        std::cout << "[ERROR] Exception " << e.what() << std::endl;
+        CHECK(false);
+    } 
+    if (handle_) cudnnDestroy(handle_);
+}
+

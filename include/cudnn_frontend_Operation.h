@@ -92,33 +92,10 @@ class Operation_v8 : public BackendDescriptor {
         ss << " Beta: " << beta_s << " " << beta_d;
         return ss.str();
     }
-    Operation_v8(Operation_v8 &&from)
-        : BackendDescriptor(from.pointer, from.get_status(), from.get_error()),
-          op_mode(from.op_mode),
-          xdesc(from.xdesc),
-          ydesc(from.ydesc),
-          wdesc(from.wdesc),
-          bdesc(from.bdesc),
-          dydesc(from.dydesc),
-          dxdesc(from.dxdesc),
-          dwdesc(from.dwdesc),
-          cdesc(from.cdesc),
-          amatdesc(from.amatdesc),
-          bmatdesc(from.bmatdesc),
-          cmatdesc(from.cmatdesc),
-          pwdesc(from.pwdesc),
-          matmuldesc(from.matmuldesc),
-          reductiondesc(from.reductiondesc),
-          alphabetaType(from.alphabetaType),
-          alpha_s(from.alpha_s),
-          beta_s(from.beta_s),
-          alpha2_s(from.alpha2_s),
-          alpha_d(from.alpha_d),
-          beta_d(from.beta_d),
-          alpha2_d(from.alpha2_d),
-          pointwise_port_count(from.pointwise_port_count),
-          pointwise_mode(from.pointwise_mode),
-          operationTag(from.operationTag) {}
+
+    Operation_v8(Operation_v8 &&from) = default;
+    Operation_v8 &
+    operator= (Operation_v8 &&from) = default;
 
     ManagedOpaqueDescriptor
     getOutputTensor() {

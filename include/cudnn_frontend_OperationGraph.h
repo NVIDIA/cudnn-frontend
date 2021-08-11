@@ -58,12 +58,9 @@ class OperationGraph_v8 : public BackendDescriptor {
         return ss.str();
     }
 
-    OperationGraph_v8(OperationGraph_v8 &&from)
-        : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
-          handle(from.handle),
-          ops(from.ops),
-          numOps(from.numOps),
-          opGraphTag(from.opGraphTag) {}
+    OperationGraph_v8(OperationGraph_v8 &&from) = default;
+    OperationGraph_v8 &
+    operator= (OperationGraph_v8 &&from) = default;
 
     ~OperationGraph_v8() = default;
 

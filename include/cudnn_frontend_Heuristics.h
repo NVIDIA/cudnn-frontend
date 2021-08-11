@@ -54,11 +54,9 @@ class EngineHeuristics_v8 : public BackendDescriptor {
         return ss.str();
     }
 
-    EngineHeuristics_v8(EngineHeuristics_v8 &&from)
-        : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
-          mode(from.mode),
-          opGraph(from.opGraph),
-          opGraphTag(from.opGraphTag) {}
+    EngineHeuristics_v8(EngineHeuristics_v8 &&from) = default;
+    EngineHeuristics_v8 &
+    operator= (EngineHeuristics_v8 &&from) = default;
 
     ~EngineHeuristics_v8() = default;
 

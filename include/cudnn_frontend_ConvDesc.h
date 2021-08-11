@@ -85,22 +85,20 @@ class ConvDesc_v8 : public BackendDescriptor {
         return ss.str();
     }
 
-    ConvDesc_v8(ConvDesc_v8 &&from)
-        : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
-          compute_precision(from.compute_precision),
-          mode(from.mode),
-          nDims(from.nDims) {
-        std::copy(std::begin(from.padLower), std::end(from.padLower), padLower);
-        std::copy(std::begin(from.padUpper), std::end(from.padUpper), padUpper);
-        std::copy(std::begin(from.dilation), std::end(from.dilation), dilation);
-        std::copy(std::begin(from.stride), std::end(from.stride), stride);
-    }
+    ConvDesc_v8(ConvDesc_v8 &&from) = default;
+    ConvDesc_v8 &
+    operator=(ConvDesc_v8 &&) = default;
 
     ~ConvDesc_v8() = default;
 
     cudnnDataType_t
     getComputePrecision() const {
         return compute_precision;
+    }
+
+    int64_t
+    getDimensionCount() const {
+        return nDims;
     }
 
    private:

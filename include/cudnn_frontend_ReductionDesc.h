@@ -56,10 +56,9 @@ class ReductionDesc_v8 : public BackendDescriptor {
         return ss.str();
     }
 
-    ReductionDesc_v8(ReductionDesc_v8 &&from)
-        : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
-          math_precision(from.math_precision),
-          reduction_op(from.reduction_op) {}
+    ReductionDesc_v8(ReductionDesc_v8 &&from) = default;
+    ReductionDesc_v8 &
+    operator= (ReductionDesc_v8 &&from) = default; 
 
     ~ReductionDesc_v8() = default;
 

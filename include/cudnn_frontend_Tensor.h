@@ -73,16 +73,28 @@ class Tensor_v8 : public BackendDescriptor {
         return ss.str();
     }
 
-    Tensor_v8(Tensor_v8 &&from)
-        : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
-          data_type(from.data_type),
-          id(from.id),
-          alignment(from.alignment),
-          nDims(from.nDims),
-          isVirtual(from.isVirtual) {
-        std::copy(std::begin(from.btensor_dimA), std::end(from.btensor_dimA), btensor_dimA);
-        std::copy(std::begin(from.btensor_strA), std::end(from.btensor_strA), btensor_strA);
+    int64_t
+    getPackedElementCount() const {
+        int64_t count = vectorCount;
+        for (auto i = 0; i < nDims; i++) {
+            count = count * btensor_dimA[i];
+        }
+        return count;
+    };
+
+    int64_t
+    getDimensionCount() const {
+        return nDims;
     }
+
+    int64_t const *
+    getDimArray() const {
+        return btensor_dimA;
+    }
+
+    Tensor_v8(Tensor_v8 &&from) = default;
+    Tensor_v8 &
+    operator=(Tensor_v8 &&) = default;
 
     ~Tensor_v8() = default;
 
@@ -320,4 +332,5 @@ class TensorBuilder_v8 {
    private:
     Tensor_v8 m_tensor;  //! Tensor built by the TensorBuilder class.
 };
+
 }

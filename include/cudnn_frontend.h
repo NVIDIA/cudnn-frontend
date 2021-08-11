@@ -111,6 +111,7 @@
 #include "cudnn_frontend_VariantPack.h"
 #include "cudnn_frontend_PointWiseDesc.h"
 #include "cudnn_frontend_MatMulDesc.h"
+#include "cudnn_frontend_Reorder_Tensor.h"
 
 namespace cudnn_frontend {
 using Tensor                    = Tensor_v8;
