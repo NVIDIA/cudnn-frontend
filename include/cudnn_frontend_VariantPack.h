@@ -59,13 +59,11 @@ class VariantPack_v8 : public BackendDescriptor {
            << " has " << num_ptrs << " data pointers";
         return ss.str();
     }
-    VariantPack_v8(VariantPack_v8 &&from)
-        : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
-          workspace(from.workspace),
-          num_ptrs(from.num_ptrs) {
-        std::copy(std::begin(from.data_pointers), std::end(from.data_pointers), data_pointers);
-        std::copy(std::begin(from.uid), std::end(from.uid), uid);
-    }
+
+    VariantPack_v8(VariantPack_v8 &&from) = default;
+    VariantPack_v8 &
+    operator=(VariantPack_v8 &&from) = default;
+
     ~VariantPack_v8() = default;
 
    private:

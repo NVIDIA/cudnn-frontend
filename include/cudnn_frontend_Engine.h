@@ -205,6 +205,8 @@ class Engine_v8 : public BackendDescriptor {
         }
         buildKnobs();
     }
+    Engine_v8 &
+    operator=(Engine_v8 &&) = default;
     ~Engine_v8() = default;
 
     std::string const &

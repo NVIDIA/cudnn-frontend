@@ -58,13 +58,11 @@ class EngineConfig_v8 : public BackendDescriptor {
         ss << " Number of knobs: " << numKnobs;
         return ss.str();
     }
-    EngineConfig_v8(EngineConfig_v8 &&from)
-        : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
-          engine(from.engine),
-          numKnobs(from.numKnobs),
-          opGraphTag(from.opGraphTag) {
-        bChoices = from.bChoices;
-    }
+    EngineConfig_v8 &
+    operator=(EngineConfig_v8 &&from) = default;
+
+    EngineConfig_v8(EngineConfig_v8 &&from) = default;
+
     ~EngineConfig_v8() = default;
 
     std::string const &

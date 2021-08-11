@@ -825,7 +825,7 @@ TEST_CASE("Use errata to block global(index) for execution", "[frontend][errata]
     REQUIRE(numErrors == 0);
 }
 
-TEST_CASE("IMMA execution with cudnnFindPlan", "[frontend][cudnnFindPlan][conv]" ) {
+TEST_CASE("DP4A execution with cudnnFindPlan", "[frontend][cudnnFindPlan][conv]" ) {
     std::cout << "TEST_CASE :: Use cudnnFindPlan for plan generation" << std::endl;
     INFO("TEST_CASE :: Use cudnnFindPlan for plan generation");
     int64_t vectorCount       = 4;
@@ -869,3 +869,46 @@ TEST_CASE("IMMA execution with cudnnFindPlan", "[frontend][cudnnFindPlan][conv]"
     REQUIRE(numErrors == 0);
 }
 
+TEST_CASE("IMMA execution with manual autotuning", "[frontend][cudnnGetPlan][conv]" ) {
+    std::cout << "TEST_CASE :: Use manual autotuning for plan generation" << std::endl;
+    INFO("TEST_CASE :: Use manual autotuning for plan generation");
+    int64_t vectorCount       = 32;
+    int64_t vectorDimension   = 1;
+    int64_t dimA[]            = {7, 64/32, 21, 21};
+    int64_t filterdimA[]      = {32, 64/32, 3, 3};
+    int64_t outdimA[]         = {0, 0, 0, 0}; // Computed Below
+    int64_t padA[]            = {0, 0};
+    int64_t dilationA[]       = {1, 1};
+    int64_t convstrideA[]     = {1, 1};
+
+    int numErrors = 0;
+
+    outdimA[0] = dimA[0];
+    outdimA[1] = filterdimA[0] / vectorCount;
+    for (int dim = 0; dim < 2; dim++) {
+        outdimA[dim + 2] = getFwdConvOutputDim(dimA[dim + 2], padA[dim], filterdimA[dim + 2], convstrideA[dim], dilationA[dim]);
+    }
+
+
+    cudnnConvolutionMode_t mode      = CUDNN_CONVOLUTION;
+
+    printf("====DIMENSIONS====\n");
+    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dimA[0], dimA[1], dimA[2], dimA[3]);
+    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", filterdimA[0], filterdimA[1], filterdimA[2], filterdimA[3]);
+    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", outdimA[0], outdimA[1], outdimA[2], outdimA[3]);
+
+
+    int Xsize = vectorCount * dimA[0] * dimA[1] * dimA[2] * dimA[3];
+    int Wsize = vectorCount * filterdimA[0] * filterdimA[1] * filterdimA[2] * filterdimA[3];
+    int Ysize = vectorCount * outdimA[0] * outdimA[1] * outdimA[2] * outdimA[3];
+
+    SurfaceManager<int8_t> sm(Xsize, Wsize, Ysize, Ysize);
+
+    run_imma(dimA, padA, convstrideA, dilationA, filterdimA, outdimA, mode, sm.devPtrX, sm.devPtrW, sm.devPtrY, vectorCount, vectorDimension);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(sm.hostY, sm.devPtrY, sizeof(sm.hostY[0]) * Ysize, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    REQUIRE(numErrors == 0);
+}

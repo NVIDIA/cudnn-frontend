@@ -97,17 +97,9 @@ class PointWiseDesc_v8 : public BackendDescriptor {
         return mode;
     }
 
-    PointWiseDesc_v8(PointWiseDesc_v8 &&from)
-        : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
-          math_precision(from.math_precision),
-          mode(from.mode),
-          nan_propagation(from.nan_propagation),
-          upper_clip(from.upper_clip),
-          lower_clip(from.lower_clip),
-          lower_clip_slope(from.lower_clip_slope),
-          elu_alpha(from.elu_alpha),
-          softplus_beta(from.softplus_beta),
-          swish_beta(from.swish_beta) {}
+    PointWiseDesc_v8(PointWiseDesc_v8 &&from) = default;
+    PointWiseDesc_v8 &
+    operator= (PointWiseDesc_v8 &&from) = default; 
 
     ~PointWiseDesc_v8() = default;
 

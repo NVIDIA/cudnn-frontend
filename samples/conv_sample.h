@@ -166,3 +166,16 @@ void run_dp4a(
     int64_t vectorCount,
     int64_t vectorDimension);
 
+void run_imma(
+    int64_t* dimA_padded,
+    int64_t* padA,
+    int64_t* convstrideA,
+    int64_t* dilationA,
+    int64_t* filterdimA_padded,
+    int64_t* outdimA_padded,
+    cudnnConvolutionMode_t mode,
+    void * devPtrI,
+    void * devPtrF,
+    void * devPtrO,
+    int64_t vectorCount,
+    int64_t vectorDimension);

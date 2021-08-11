@@ -55,9 +55,9 @@ class MatMulDesc_v8 : public BackendDescriptor {
         return ss.str();
     }
 
-    MatMulDesc_v8(MatMulDesc_v8 &&from)
-        : BackendDescriptor(from.get_desc(), from.get_status(), from.get_error()),
-          math_precision(from.math_precision) {}
+    MatMulDesc_v8(MatMulDesc_v8 &&from) = default;
+    MatMulDesc_v8 &
+    operator= (MatMulDesc_v8 &&from) = default;
 
     ~MatMulDesc_v8() = default;
 
