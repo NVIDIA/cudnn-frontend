@@ -97,7 +97,7 @@ class ConvDesc_v8 : public BackendDescriptor {
     }
 
     int64_t
-    getDimensionCount() const {
+    getSpatialDimensionCount() const {
         return nDims;
     }
 
