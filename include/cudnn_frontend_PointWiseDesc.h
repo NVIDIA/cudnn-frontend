@@ -28,6 +28,7 @@
 #include <memory>
 #include <sstream>
 #include <utility>
+#include <limits>
 
 #include <cudnn.h>
 #include <cudnn_backend.h>
