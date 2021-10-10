@@ -63,6 +63,7 @@ check_rule(const json &json_handle, const std::string & executionPlanTag,
     std::string tag_prefix = operation + "_eng" + std::to_string(engine) + "_"; 
     std::string mod_tag    = executionPlanTag + "_";
     bool blocked = 
+        tag_prefix.size() <= mod_tag.size() &&
         std::equal(tag_prefix.begin(), tag_prefix.end(), mod_tag.begin()) &&
         CUDNN_VERSION >= cudnn_start &&
         CUDNN_VERSION < cudnn_end;
