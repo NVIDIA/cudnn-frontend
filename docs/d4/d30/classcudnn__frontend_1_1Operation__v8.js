@@ -1,12 +1,14 @@
 var classcudnn__frontend_1_1Operation__v8 =
 [
-    [ "Operation_v8", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#ad45e7200660f993615e34ceeb9ec49c6", null ],
+    [ "Operation_v8", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a50038975d0a49e079330a7d32ebe4512", null ],
     [ "~Operation_v8", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a67d82f53ecbdfe2416d2a26410138d78", null ],
     [ "Operation_v8", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a810b2f50d53d6655c2048d3c3afbcfc4", null ],
     [ "Operation_v8", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a091bf74144eaec6149d610faa289160e", null ],
     [ "describe", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a3425a8550eb9f622dc4101d3d5d2c0e1", null ],
+    [ "getFeatureVector", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#af94bdd7b70091a88c1ad4e2d1d40581d", null ],
     [ "getOutputTensor", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#ae5cba10d789e4d08b45339a702ba75f3", null ],
     [ "getTag", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#ab2692d9f28861a73d590a53f979d26fa", null ],
+    [ "operator=", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a1ed7bd01616e2514c25b4c47a55ed831", null ],
     [ "operator=", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a5012e920483271f655bc04d6f52dc41f", null ],
     [ "OperationBuilder_v8", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#ac708bb46683440effd2f46b3888e378f", null ],
     [ "alpha2_d", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a4f533db7bc67978d1ec1a475f4ab9e1c", null ],
@@ -24,6 +26,7 @@ var classcudnn__frontend_1_1Operation__v8 =
     [ "dwdesc", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a4f565db1b8b85ea43d60631cd3414f47", null ],
     [ "dxdesc", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a4f30409838436d0c4dea5271af86f9b7", null ],
     [ "dydesc", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#adf6b55205eac4c52c0ab70e4758e33da", null ],
+    [ "feature_vector", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a3cc97ff55ff04eae1fc40e38cbf0fc36", null ],
     [ "is_pointwise_activation_bwd_op", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#ab8c4c8c81e8cebc44cb725f4a4b4add9", null ],
     [ "is_pointwise_activation_fwd_op", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a12d0d0fa40152f5205570f40e681795f", null ],
     [ "is_pointwise_math_op", "d4/d30/classcudnn__frontend_1_1Operation__v8.html#a2e1e0fb15b7df300945cae2347db635a", null ],

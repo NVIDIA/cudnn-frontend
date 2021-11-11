@@ -1,5 +1,6 @@
 <map id="cudnn_frontend::Operation_v8" name="cudnn_frontend::Operation_v8">
-<area shape="rect" id="node2" href="$d6/d88/classcudnn__frontend_1_1BackendDescriptor.html" title="{cudnn_frontend::BackendDescriptor\n||+ describe()\l+ get_raw_desc()\l+ get_status()\l+ set_status()\l+ set_error()\l+ get_error()\l+ get_desc()\l+ initialize_managed\l_backend_pointer()\l# BackendDescriptor()\l# BackendDescriptor()\l}" alt="" coords="132,301,362,525"/>
-<area shape="rect" id="node3" title="STL class. " alt="" coords="32,154,112,231"/>
+<area shape="rect" id="node2" href="$d6/d88/classcudnn__frontend_1_1BackendDescriptor.html" title="{cudnn_frontend::BackendDescriptor\n||+ describe()\l+ get_raw_desc()\l+ get_status()\l+ set_status()\l+ set_error()\l+ get_error()\l+ get_desc()\l+ initialize_managed\l_backend_pointer()\l# BackendDescriptor()\l# BackendDescriptor()\l}" alt="" coords="132,315,362,539"/>
+<area shape="rect" id="node3" title="STL class. " alt="" coords="32,167,112,245"/>
 <area shape="rect" id="node4" title="STL class. " alt="" coords="9,5,136,97"/>
+<area shape="rect" id="node13" title="STL class. " alt="" coords="1276,167,1392,245"/>
 </map>

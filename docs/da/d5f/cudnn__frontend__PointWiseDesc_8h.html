@@ -29,7 +29,7 @@
  <tr style="height: 56px;">
   <td id="projectalign" style="padding-left: 0.5em;">
    <div id="projectname">CUDNN Frontend API
-   &#160;<span id="projectnumber">8.2.0</span>
+   &#160;<span id="projectnumber">8.3.0</span>
    </div>
   </td>
  </tr>
@@ -93,6 +93,7 @@ $(document).ready(function(){initNavTree('da/d5f/cudnn__frontend__PointWiseDesc_
 <code>#include &lt;memory&gt;</code><br />
 <code>#include &lt;sstream&gt;</code><br />
 <code>#include &lt;utility&gt;</code><br />
+<code>#include &lt;limits&gt;</code><br />
 <code>#include &lt;cudnn.h&gt;</code><br />
 <code>#include &lt;cudnn_backend.h&gt;</code><br />
 <code>#include &quot;<a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html">cudnn_frontend_utils.h</a>&quot;</code><br />
@@ -101,8 +102,9 @@ Include dependency graph for cudnn_frontend_PointWiseDesc.h:</div>
 <div class="dyncontent">
 <div class="center"><img src="../../d7/d50/cudnn__frontend__PointWiseDesc_8h__incl.png" border="0" usemap="#cudnn__frontend__PointWiseDesc_8h" alt=""/></div>
 <map name="cudnn__frontend__PointWiseDesc_8h" id="cudnn__frontend__PointWiseDesc_8h">
-<area shape="rect" id="node10" href="../../df/d17/cudnn__frontend__utils_8h.html" title="cudnn_frontend_utils.h" alt="" coords="746,95,899,121"/>
-<area shape="rect" id="node13" href="../../dc/d11/cudnn__backend__base_8h.html" title="cudnn_backend_base.h" alt="" coords="826,169,985,196"/>
+<area shape="rect" id="node11" href="../../df/d17/cudnn__frontend__utils_8h.html" title="cudnn_frontend_utils.h" alt="" coords="823,95,977,121"/>
+<area shape="rect" id="node15" href="../../dc/d11/cudnn__backend__base_8h.html" title="cudnn_backend_base.h" alt="" coords="819,244,978,271"/>
+<area shape="rect" id="node17" href="../../d8/dc4/cudnn__frontend__Logging_8h.html" title="cudnn_frontend_Logging.h" alt="" coords="998,169,1173,196"/>
 </map>
 </div>
 </div><div class="textblock"><div class="dynheader">
@@ -110,16 +112,17 @@ This graph shows which files directly or indirectly include this file:</div>
 <div class="dyncontent">
 <div class="center"><img src="../../d1/d10/cudnn__frontend__PointWiseDesc_8h__dep__incl.png" border="0" usemap="#cudnn__frontend__PointWiseDesc_8hdep" alt=""/></div>
 <map name="cudnn__frontend__PointWiseDesc_8hdep" id="cudnn__frontend__PointWiseDesc_8hdep">
-<area shape="rect" id="node2" href="../../da/d5a/cudnn__frontend__Operation_8h.html" title="cudnn_frontend_Operation.h" alt="" coords="592,95,777,121"/>
-<area shape="rect" id="node5" href="../../de/d0c/cudnn__frontend_8h.html" title="cudnn_frontend.h" alt="" coords="362,423,485,449"/>
-<area shape="rect" id="node3" href="../../db/d7d/cudnn__frontend__OperationGraph_8h.html" title="cudnn_frontend_Operation\lGraph.h" alt="" coords="205,169,380,211"/>
-<area shape="rect" id="node4" href="../../db/d66/cudnn__frontend__Heuristics_8h.html" title="cudnn_frontend_Heuristics.h" alt="" coords="5,259,193,285"/>
-<area shape="rect" id="node9" href="../../de/d6d/cudnn__frontend__Engine_8h.html" title="cudnn_frontend_Engine.h" alt="" coords="304,259,473,285"/>
-<area shape="rect" id="node6" href="../../de/d1e/cudnn__frontend__EngineConfigGenerator_8h.html" title="cudnn_frontend_EngineConfig\lGenerator.h" alt="" coords="325,497,521,539"/>
-<area shape="rect" id="node7" href="../../d3/d6b/cudnn__frontend__find__plan_8h.html" title="cudnn_frontend_find\l_plan.h" alt="" coords="274,587,413,628"/>
-<area shape="rect" id="node8" href="../../d2/d3b/cudnn__frontend__get__plan_8h.html" title="cudnn_frontend_get\l_plan.h" alt="" coords="437,587,573,628"/>
-<area shape="rect" id="node10" href="../../d6/d67/cudnn__frontend__EngineConfig_8h.html" title="cudnn_frontend_EngineConfig.h" alt="" coords="320,341,527,367"/>
-<area shape="rect" id="node11" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h.html" title="cudnn_frontend_Execution\lPlan.h" alt="" coords="551,333,727,375"/>
+<area shape="rect" id="node2" href="../../da/d5a/cudnn__frontend__Operation_8h.html" title="cudnn_frontend_Operation.h" alt="" coords="67,95,253,121"/>
+<area shape="rect" id="node5" href="../../de/d0c/cudnn__frontend_8h.html" title="cudnn_frontend.h" alt="" coords="267,512,389,539"/>
+<area shape="rect" id="node3" href="../../db/d7d/cudnn__frontend__OperationGraph_8h.html" title="cudnn_frontend_Operation\lGraph.h" alt="" coords="118,169,293,211"/>
+<area shape="rect" id="node4" href="../../db/d66/cudnn__frontend__Heuristics_8h.html" title="cudnn_frontend_Heuristics.h" alt="" coords="169,430,357,457"/>
+<area shape="rect" id="node9" href="../../de/d6d/cudnn__frontend__Engine_8h.html" title="cudnn_frontend_Engine.h" alt="" coords="309,259,478,285"/>
+<area shape="rect" id="node12" href="../../d9/dd3/cudnn__frontend__ExecutionPlanCache_8h.html" title="cudnn_frontend_Execution\lPlanCache.h" alt="" coords="552,423,728,464"/>
+<area shape="rect" id="node6" href="../../de/d1e/cudnn__frontend__EngineConfigGenerator_8h.html" title="cudnn_frontend_EngineConfig\lGenerator.h" alt="" coords="230,587,426,628"/>
+<area shape="rect" id="node7" href="../../d3/d6b/cudnn__frontend__find__plan_8h.html" title="cudnn_frontend_find\l_plan.h" alt="" coords="179,676,317,717"/>
+<area shape="rect" id="node8" href="../../d2/d3b/cudnn__frontend__get__plan_8h.html" title="cudnn_frontend_get\l_plan.h" alt="" coords="341,676,477,717"/>
+<area shape="rect" id="node10" href="../../d6/d67/cudnn__frontend__EngineConfig_8h.html" title="cudnn_frontend_EngineConfig.h" alt="" coords="219,341,426,367"/>
+<area shape="rect" id="node11" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h.html" title="cudnn_frontend_Execution\lPlan.h" alt="" coords="501,333,677,375"/>
 </map>
 </div>
 </div>

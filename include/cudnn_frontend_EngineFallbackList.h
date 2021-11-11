@@ -166,6 +166,7 @@ class EngineFallbackListBuilder_v8 {
             }
 #endif
         }
+        getLogger() << "[cudnn_frontend] " << m_fallback_list << std::endl;
         return std::move(m_fallback_list);
     }
 

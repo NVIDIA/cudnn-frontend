@@ -19,12 +19,17 @@ Each `cudnnBackendDescriptorType_t` documented in the enum is organized into its
 - cudnn_frontend_Engine.h         -> CUDNN_BACKEND_ENGINE_DESCRIPTOR
 - cudnn_frontend_EngineConfig.h   -> CUDNN_BACKEND_ENGINECFG_DESCRIPTOR
 - cudnn_frontend_ExecutionPlan.h  -> CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR
+- cudnn_frontend_ExecutionPlan.h  -> CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR
 - cudnn_frontend_VariantPack.h    -> CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR
 
 ### Utility Functions
-- cudnn_frontend_find_plan.h -> Implements the `cudnnFindPlan` function
-- cudnn_frontend_get_plan.h  -> Implements the `cudnnGetPlan` function
-- cudnn_frontend_Filters.h   -> List of helpful utility functions to filter out execution plans
+- cudnn_frontend_find_plan.h          -> Implements the `cudnnFindPlan` function
+- cudnn_frontend_get_plan.h           -> Implements the `cudnnGetPlan` function
+- cudnn_frontend_Filters.h            -> List of helpful utility functions to filter out execution plans
+- cudnn_frontend_ExecutionPlanCache.h -> Describes and implements the execution plan caching.
+
+### Logging
+- cudnn_frontend_Logging.h -> Implements a basic logging framework for cudnn_frontend
 
 ### Error Handling 
 - cudnn_frontend_utils.h
@@ -42,9 +47,11 @@ Sample tests are written using the [Catch2](https://github.com/catchorg/Catch2) 
      - CUDA_PATH has the cuda installation. 
         - Include files are in CUDA_PATH/include
         - Link files are in CUDA_PATH/lib64
-     - CUDNN_WRAP_PATH has the wrapper header files.
+        - CUDNN_FRONTEND_PATH has the cudnn frontend header files.
 
-     make CUDA_PATH=/usr/local/cuda CUDNN_WRAP_PATH=/usr/local/include/
+     mkdir build; cd build
+     cmake ..
+     ./Samples
     
 ## cudnnFindPlan and cudnnGetPlan:
 Prior to cuDNN V8, cuDNN provided `cudnnFindConvolution*` and `cudnnGetConvolution*` functions, which provided a way to sample all the algorithms for a given problem and study the run times. This can be further used to cache the best algorithms for a given problem.  In cuDNN V8, this has been replaced with `cudnnFindPlan` and `cudnnGetPlan`.
@@ -74,6 +81,33 @@ Errata filter gives the cuDNN team an opportunity to block certain faulty kernel
     arch                : ""   - Optional. Architectures where this kernel might be faulty.
 
 PS: The errata filter note is still in beta version. We may add/modify certain features as necessary.
+
+## Execution Plan Caching
+cuDNN through heuristics provides a way to query a list of good engine configs. Based on this query we build the cudnn_frontend_find_plan function which runs all the engineConfig(s) on the given user system and returns a sorted list of plans. This process of running multiple plans through several iterations is time consuming. The ExecutionPlanCache allows the user to build a cache with operation graph as the key to query an execution plan. It is the responsibilty of the user to maintain different caches for different types of operation_graphs (For eg. different cache for convolutionForward compared to Dgrad or Wgrad). The `is_fastest_plan_stable` builds on top of this by making sure the same plan is chosen by the cudnnFind multiple times.
+
+### API:
+    - void add_plan_to_cache(const cudnn_frontend::OperationGraph &op_graph, const cudnn_frontend::ExecutionPlan &plan) : Creates a mapping between the operation graph and executionPlan
+    - bool get_plan_from_cache(const cudnn_frontend::OperationGraph &op_graph, const cudnn_frontend::ExecutionPlan *&plan) : Sets the executionPlan in the plan pointer and returns true if found.
+    - cudnnFindPlanAndCache(cudnnHandle_t handle, cudnn_frontend::OperationGraph &opGraph, cudnn_frontend::VariantPack const &variantPack, cudnn_frontend::ExecutionPlanCache &cache, Predicate pred) -> cudnn_frontend::ExecutionPlan
+      The above API chains the output of cudnn_frontend_find_plan and caches the result for future usage. 
+
+
+PS: ExecutionPlanCaching today supports only single operation operation_graphs.
+
+## Logging
+cuDNN Frontend API logging records execution flow through cuDNN frontend API. This functionality is disabled by default, and can be enabled through methods described in this section.
+
+### Method 1: Using Environment Variables:
+| Environment variables                             | CUDNN_FRONTEND_LOG_INFO=0 | CUDNN_FRONTEND_LOG_INFO=1 |
+| ------------------------------------------------- | ------------------------- | -----------               |
+| CUDNN_FRONTEND_LOG_FILE not set                   | No Logging                | No Logging                |
+| CUDNN_FRONTEND_LOG_FILE set to stdout or stderr   | No Logging                | Logging to cout or cerr   |
+| CUDNN_FRONTEND_LOG_FILE set to filename.txt       | No Logging                | Logging to the filename   |
+
+### Method 2: Using API calls:
+Calling `cudnn_frontend::isLoggingEnabled() = true|false` has same effect of setting the environment variable.
+Calling `cudnn_frontend::getStream() = stream_name` can be used to assign the output stream directly. 
+
 
 ## Documentation
 Documentation can be found at https://nvidia.github.io/cudnn-frontend/

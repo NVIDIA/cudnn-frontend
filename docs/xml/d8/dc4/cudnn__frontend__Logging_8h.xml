@@ -1,0 +1,322 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d8/dc4/cudnn__frontend__Logging_8h" kind="file" language="C++">
+    <compoundname>cudnn_frontend_Logging.h</compoundname>
+    <includes local="no">iostream</includes>
+    <includes local="no">fstream</includes>
+    <includes local="no">cstring</includes>
+    <includes refid="dc/d11/cudnn__backend__base_8h" local="yes">cudnn_backend_base.h</includes>
+    <includedby refid="df/d17/cudnn__frontend__utils_8h" local="yes">cudnn_frontend_utils.h</includedby>
+    <includedby refid="db/d7e/cudnn__frontend__Errata_8h" local="yes">cudnn_frontend_Errata.h</includedby>
+    <includedby refid="de/d0c/cudnn__frontend_8h" local="yes">cudnn_frontend.h</includedby>
+    <incdepgraph>
+      <node id="559">
+        <label>cudnn.h</label>
+      </node>
+      <node id="553">
+        <label>cudnn_frontend_Logging.h</label>
+        <link refid="d8/dc4/cudnn__frontend__Logging_8h"/>
+        <childnode refid="554" relation="include">
+        </childnode>
+        <childnode refid="555" relation="include">
+        </childnode>
+        <childnode refid="556" relation="include">
+        </childnode>
+        <childnode refid="557" relation="include">
+        </childnode>
+      </node>
+      <node id="555">
+        <label>fstream</label>
+      </node>
+      <node id="558">
+        <label>ostream</label>
+      </node>
+      <node id="554">
+        <label>iostream</label>
+      </node>
+      <node id="556">
+        <label>cstring</label>
+      </node>
+      <node id="557">
+        <label>cudnn_backend_base.h</label>
+        <link refid="dc/d11/cudnn__backend__base_8h"/>
+        <childnode refid="558" relation="include">
+        </childnode>
+        <childnode refid="559" relation="include">
+        </childnode>
+      </node>
+    </incdepgraph>
+    <invincdepgraph>
+      <node id="579">
+        <label>cudnn_frontend_VariantPack.h</label>
+        <link refid="df/dc0/cudnn__frontend__VariantPack_8h"/>
+        <childnode refid="563" relation="include">
+        </childnode>
+      </node>
+      <node id="570">
+        <label>cudnn_frontend_Engine.h</label>
+        <link refid="de/d6d/cudnn__frontend__Engine_8h"/>
+        <childnode refid="571" relation="include">
+        </childnode>
+        <childnode refid="563" relation="include">
+        </childnode>
+        <childnode refid="572" relation="include">
+        </childnode>
+      </node>
+      <node id="571">
+        <label>cudnn_frontend_EngineConfig.h</label>
+        <link refid="d6/d67/cudnn__frontend__EngineConfig_8h"/>
+        <childnode refid="569" relation="include">
+        </childnode>
+        <childnode refid="563" relation="include">
+        </childnode>
+      </node>
+      <node id="576">
+        <label>cudnn_frontend_MatMulDesc.h</label>
+        <link refid="d6/d32/cudnn__frontend__MatMulDesc_8h"/>
+        <childnode refid="567" relation="include">
+        </childnode>
+        <childnode refid="563" relation="include">
+        </childnode>
+      </node>
+      <node id="569">
+        <label>cudnn_frontend_Heuristics.h</label>
+        <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
+        <childnode refid="563" relation="include">
+        </childnode>
+      </node>
+      <node id="575">
+        <label>cudnn_frontend_PointWiseDesc.h</label>
+        <link refid="da/d5f/cudnn__frontend__PointWiseDesc_8h"/>
+        <childnode refid="567" relation="include">
+        </childnode>
+        <childnode refid="563" relation="include">
+        </childnode>
+      </node>
+      <node id="566">
+        <label>cudnn_frontend_get_plan.h</label>
+        <link refid="d2/d3b/cudnn__frontend__get__plan_8h"/>
+      </node>
+      <node id="580">
+        <label>cudnn_frontend_Errata.h</label>
+        <link refid="db/d7e/cudnn__frontend__Errata_8h"/>
+        <childnode refid="563" relation="include">
+        </childnode>
+      </node>
+      <node id="560">
+        <label>cudnn_frontend_Logging.h</label>
+        <link refid="d8/dc4/cudnn__frontend__Logging_8h"/>
+        <childnode refid="561" relation="include">
+        </childnode>
+        <childnode refid="580" relation="include">
+        </childnode>
+        <childnode refid="563" relation="include">
+        </childnode>
+      </node>
+      <node id="578">
+        <label>cudnn_frontend_Tensor.h</label>
+        <link refid="d3/d98/cudnn__frontend__Tensor_8h"/>
+        <childnode refid="567" relation="include">
+        </childnode>
+        <childnode refid="563" relation="include">
+        </childnode>
+        <childnode refid="574" relation="include">
+        </childnode>
+      </node>
+      <node id="564">
+        <label>cudnn_frontend_EngineConfigGenerator.h</label>
+        <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
+        <childnode refid="565" relation="include">
+        </childnode>
+        <childnode refid="566" relation="include">
+        </childnode>
+      </node>
+      <node id="573">
+        <label>cudnn_frontend_ExecutionPlanCache.h</label>
+        <link refid="d9/dd3/cudnn__frontend__ExecutionPlanCache_8h"/>
+        <childnode refid="563" relation="include">
+        </childnode>
+      </node>
+      <node id="567">
+        <label>cudnn_frontend_Operation.h</label>
+        <link refid="da/d5a/cudnn__frontend__Operation_8h"/>
+        <childnode refid="568" relation="include">
+        </childnode>
+        <childnode refid="563" relation="include">
+        </childnode>
+      </node>
+      <node id="574">
+        <label>cudnn_frontend_Reorder_Tensor.h</label>
+        <link refid="d9/da8/cudnn__frontend__Reorder__Tensor_8h"/>
+        <childnode refid="563" relation="include">
+        </childnode>
+      </node>
+      <node id="572">
+        <label>cudnn_frontend_ExecutionPlan.h</label>
+        <link refid="d6/d51/cudnn__frontend__ExecutionPlan_8h"/>
+        <childnode refid="563" relation="include">
+        </childnode>
+        <childnode refid="573" relation="include">
+        </childnode>
+      </node>
+      <node id="562">
+        <label>cudnn_frontend_ConvDesc.h</label>
+        <link refid="d1/de7/cudnn__frontend__ConvDesc_8h"/>
+        <childnode refid="563" relation="include">
+        </childnode>
+        <childnode refid="567" relation="include">
+        </childnode>
+        <childnode refid="574" relation="include">
+        </childnode>
+      </node>
+      <node id="568">
+        <label>cudnn_frontend_OperationGraph.h</label>
+        <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
+        <childnode refid="569" relation="include">
+        </childnode>
+        <childnode refid="570" relation="include">
+        </childnode>
+        <childnode refid="563" relation="include">
+        </childnode>
+        <childnode refid="573" relation="include">
+        </childnode>
+      </node>
+      <node id="563">
+        <label>cudnn_frontend.h</label>
+        <link refid="de/d0c/cudnn__frontend_8h"/>
+        <childnode refid="564" relation="include">
+        </childnode>
+      </node>
+      <node id="565">
+        <label>cudnn_frontend_find_plan.h</label>
+        <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
+      </node>
+      <node id="577">
+        <label>cudnn_frontend_ReductionDesc.h</label>
+        <link refid="db/da7/cudnn__frontend__ReductionDesc_8h"/>
+        <childnode refid="567" relation="include">
+        </childnode>
+      </node>
+      <node id="561">
+        <label>cudnn_frontend_utils.h</label>
+        <link refid="df/d17/cudnn__frontend__utils_8h"/>
+        <childnode refid="562" relation="include">
+        </childnode>
+        <childnode refid="575" relation="include">
+        </childnode>
+        <childnode refid="576" relation="include">
+        </childnode>
+        <childnode refid="577" relation="include">
+        </childnode>
+        <childnode refid="578" relation="include">
+        </childnode>
+        <childnode refid="567" relation="include">
+        </childnode>
+        <childnode refid="568" relation="include">
+        </childnode>
+        <childnode refid="570" relation="include">
+        </childnode>
+        <childnode refid="571" relation="include">
+        </childnode>
+        <childnode refid="569" relation="include">
+        </childnode>
+        <childnode refid="572" relation="include">
+        </childnode>
+        <childnode refid="579" relation="include">
+        </childnode>
+      </node>
+    </invincdepgraph>
+    <innerclass refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer" prot="public">cudnn_frontend::ConditionalStreamer</innerclass>
+    <innernamespace refid="df/de1/namespacecudnn__frontend">cudnn_frontend</innernamespace>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <programlisting>
+<codeline lineno="1"><highlight class="comment">/*</highlight></codeline>
+<codeline lineno="2"><highlight class="comment"><sp/>*<sp/>Copyright<sp/>(c)<sp/>2021,<sp/>NVIDIA<sp/>CORPORATION.<sp/>All<sp/>rights<sp/>reserved.</highlight></codeline>
+<codeline lineno="3"><highlight class="comment"><sp/>*</highlight></codeline>
+<codeline lineno="4"><highlight class="comment"><sp/>*<sp/>Permission<sp/>is<sp/>hereby<sp/>granted,<sp/>free<sp/>of<sp/>charge,<sp/>to<sp/>any<sp/>person<sp/>obtaining<sp/>a</highlight></codeline>
+<codeline lineno="5"><highlight class="comment"><sp/>*<sp/>copy<sp/>of<sp/>this<sp/>software<sp/>and<sp/>associated<sp/>documentation<sp/>files<sp/>(the<sp/>&quot;Software&quot;),</highlight></codeline>
+<codeline lineno="6"><highlight class="comment"><sp/>*<sp/>to<sp/>deal<sp/>in<sp/>the<sp/>Software<sp/>without<sp/>restriction,<sp/>including<sp/>without<sp/>limitation</highlight></codeline>
+<codeline lineno="7"><highlight class="comment"><sp/>*<sp/>the<sp/>rights<sp/>to<sp/>use,<sp/>copy,<sp/>modify,<sp/>merge,<sp/>publish,<sp/>distribute,<sp/>sublicense,</highlight></codeline>
+<codeline lineno="8"><highlight class="comment"><sp/>*<sp/>and/or<sp/>sell<sp/>copies<sp/>of<sp/>the<sp/>Software,<sp/>and<sp/>to<sp/>permit<sp/>persons<sp/>to<sp/>whom<sp/>the</highlight></codeline>
+<codeline lineno="9"><highlight class="comment"><sp/>*<sp/>Software<sp/>is<sp/>furnished<sp/>to<sp/>do<sp/>so,<sp/>subject<sp/>to<sp/>the<sp/>following<sp/>conditions:</highlight></codeline>
+<codeline lineno="10"><highlight class="comment"><sp/>*</highlight></codeline>
+<codeline lineno="11"><highlight class="comment"><sp/>*<sp/>The<sp/>above<sp/>copyright<sp/>notice<sp/>and<sp/>this<sp/>permission<sp/>notice<sp/>shall<sp/>be<sp/>included<sp/>in</highlight></codeline>
+<codeline lineno="12"><highlight class="comment"><sp/>*<sp/>all<sp/>copies<sp/>or<sp/>substantial<sp/>portions<sp/>of<sp/>the<sp/>Software.</highlight></codeline>
+<codeline lineno="13"><highlight class="comment"><sp/>*</highlight></codeline>
+<codeline lineno="14"><highlight class="comment"><sp/>*<sp/>THE<sp/>SOFTWARE<sp/>IS<sp/>PROVIDED<sp/>&quot;AS<sp/>IS&quot;,<sp/>WITHOUT<sp/>WARRANTY<sp/>OF<sp/>ANY<sp/>KIND,<sp/>EXPRESS<sp/>OR</highlight></codeline>
+<codeline lineno="15"><highlight class="comment"><sp/>*<sp/>IMPLIED,<sp/>INCLUDING<sp/>BUT<sp/>NOT<sp/>LIMITED<sp/>TO<sp/>THE<sp/>WARRANTIES<sp/>OF<sp/>MERCHANTABILITY,</highlight></codeline>
+<codeline lineno="16"><highlight class="comment"><sp/>*<sp/>FITNESS<sp/>FOR<sp/>A<sp/>PARTICULAR<sp/>PURPOSE<sp/>AND<sp/>NONINFRINGEMENT.<sp/><sp/>IN<sp/>NO<sp/>EVENT<sp/>SHALL</highlight></codeline>
+<codeline lineno="17"><highlight class="comment"><sp/>*<sp/>THE<sp/>AUTHORS<sp/>OR<sp/>COPYRIGHT<sp/>HOLDERS<sp/>BE<sp/>LIABLE<sp/>FOR<sp/>ANY<sp/>CLAIM,<sp/>DAMAGES<sp/>OR<sp/>OTHER</highlight></codeline>
+<codeline lineno="18"><highlight class="comment"><sp/>*<sp/>LIABILITY,<sp/>WHETHER<sp/>IN<sp/>AN<sp/>ACTION<sp/>OF<sp/>CONTRACT,<sp/>TORT<sp/>OR<sp/>OTHERWISE,<sp/>ARISING</highlight></codeline>
+<codeline lineno="19"><highlight class="comment"><sp/>*<sp/>FROM,<sp/>OUT<sp/>OF<sp/>OR<sp/>IN<sp/>CONNECTION<sp/>WITH<sp/>THE<sp/>SOFTWARE<sp/>OR<sp/>THE<sp/>USE<sp/>OR<sp/>OTHER</highlight></codeline>
+<codeline lineno="20"><highlight class="comment"><sp/>*<sp/>DEALINGS<sp/>IN<sp/>THE<sp/>SOFTWARE.</highlight></codeline>
+<codeline lineno="21"><highlight class="comment"><sp/>*/</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="22"><highlight class="normal"></highlight></codeline>
+<codeline lineno="23"><highlight class="normal"></highlight><highlight class="preprocessor">#pragma<sp/>once</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="24"><highlight class="normal"></highlight></codeline>
+<codeline lineno="25"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;iostream&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="26"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;fstream&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="27"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;cstring&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="28"><highlight class="normal"></highlight></codeline>
+<codeline lineno="29"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&quot;<ref refid="dc/d11/cudnn__backend__base_8h" kindref="compound">cudnn_backend_base.h</ref>&quot;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="30"><highlight class="normal"></highlight><highlight class="keyword">namespace<sp/><sp/></highlight><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend" kindref="compound">cudnn_frontend</ref><sp/>{</highlight></codeline>
+<codeline lineno="31"><highlight class="normal"></highlight><highlight class="keyword">inline</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">bool</highlight><highlight class="normal"><sp/>&amp;</highlight></codeline>
+<codeline lineno="32" refid="df/de1/namespacecudnn__frontend_1a9f71d168e0b8ae9c8756fae01d2aff42" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1a9f71d168e0b8ae9c8756fae01d2aff42" kindref="member">isLoggingEnabled</ref>()<sp/>{</highlight></codeline>
+<codeline lineno="33"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">static</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">bool</highlight><highlight class="normal"><sp/>log_enabled<sp/>=<sp/>std::getenv(</highlight><highlight class="stringliteral">&quot;CUDNN_FRONTEND_LOG_INFO&quot;</highlight><highlight class="normal">)<sp/>&amp;&amp;<sp/>std::strncmp(std::getenv(</highlight><highlight class="stringliteral">&quot;CUDNN_FRONTEND_LOG_INFO&quot;</highlight><highlight class="normal">),<sp/></highlight><highlight class="stringliteral">&quot;0&quot;</highlight><highlight class="normal">,1);</highlight></codeline>
+<codeline lineno="34"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>log_enabled;</highlight></codeline>
+<codeline lineno="35"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="36"><highlight class="normal"><sp/></highlight></codeline>
+<codeline lineno="37"><highlight class="normal"><sp/></highlight></codeline>
+<codeline lineno="38"><highlight class="normal"></highlight><highlight class="keyword">inline</highlight><highlight class="normal"><sp/>std::ostream<sp/>&amp;</highlight></codeline>
+<codeline lineno="39" refid="df/de1/namespacecudnn__frontend_1afb2964ae3e29ca3be70d42123e69873c" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1afb2964ae3e29ca3be70d42123e69873c" kindref="member">getStream</ref>()<sp/>{<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight></codeline>
+<codeline lineno="40"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">static</highlight><highlight class="normal"><sp/>std::ofstream<sp/>outFile;</highlight></codeline>
+<codeline lineno="41"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">static</highlight><highlight class="normal"><sp/>std::ostream<sp/>&amp;<sp/>stream<sp/><sp/>=<sp/>std::getenv(</highlight><highlight class="stringliteral">&quot;CUDNN_FRONTEND_LOG_FILE&quot;</highlight><highlight class="normal">)</highlight></codeline>
+<codeline lineno="42"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>?<sp/><sp/>(std::strncmp(std::getenv(</highlight><highlight class="stringliteral">&quot;CUDNN_FRONTEND_LOG_FILE&quot;</highlight><highlight class="normal">),<sp/></highlight><highlight class="stringliteral">&quot;stdout&quot;</highlight><highlight class="normal">,<sp/>6)<sp/>==<sp/>0<sp/></highlight></codeline>
+<codeline lineno="43"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>?<sp/>std::cout<sp/>:<sp/>(std::strncmp(std::getenv(</highlight><highlight class="stringliteral">&quot;CUDNN_FRONTEND_LOG_FILE&quot;</highlight><highlight class="normal">),<sp/></highlight><highlight class="stringliteral">&quot;stderr&quot;</highlight><highlight class="normal">,<sp/>6)<sp/>==<sp/>0<sp/></highlight></codeline>
+<codeline lineno="44"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>?<sp/>std::cerr<sp/>:<sp/>(outFile.open(std::getenv(</highlight><highlight class="stringliteral">&quot;CUDNN_FRONTEND_LOG_FILE&quot;</highlight><highlight class="normal">),<sp/>std::ios::out),<sp/>outFile)))</highlight></codeline>
+<codeline lineno="45"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>:<sp/>(<ref refid="df/de1/namespacecudnn__frontend_1a9f71d168e0b8ae9c8756fae01d2aff42" kindref="member">isLoggingEnabled</ref>()<sp/>=<sp/></highlight><highlight class="keyword">false</highlight><highlight class="normal">,<sp/>std::cout);</highlight></codeline>
+<codeline lineno="46"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>stream;</highlight></codeline>
+<codeline lineno="47"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="48"><highlight class="normal"></highlight></codeline>
+<codeline lineno="49"><highlight class="normal"></highlight></codeline>
+<codeline lineno="50" refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer" refkind="compound"><highlight class="normal"></highlight><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer" kindref="compound">ConditionalStreamer</ref><sp/>{</highlight></codeline>
+<codeline lineno="51"><highlight class="normal"><sp/><sp/></highlight><highlight class="keyword">private</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="52" refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1aa2bd02647c39251cb7f11b01948aca43" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>std::ostream<sp/>&amp;<ref refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1aa2bd02647c39251cb7f11b01948aca43" kindref="member">stream</ref>;</highlight></codeline>
+<codeline lineno="53"><highlight class="normal"><sp/><sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="54" refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1af0e01afa50813ff4c76b57566a47cd25" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1af0e01afa50813ff4c76b57566a47cd25" kindref="member">ConditionalStreamer</ref>(std::ostream<sp/>&amp;stream_)<sp/>:<sp/>stream(stream_){}</highlight></codeline>
+<codeline lineno="55"><highlight class="normal"><sp/><sp/></highlight></codeline>
+<codeline lineno="56"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">template</highlight><highlight class="normal"><sp/>&lt;</highlight><highlight class="keyword">typename</highlight><highlight class="normal"><sp/>T&gt;</highlight></codeline>
+<codeline lineno="57"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer" kindref="compound">ConditionalStreamer</ref><sp/>&amp;</highlight></codeline>
+<codeline lineno="58" refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1a7be351ca01c5d3d8425bfc9df99e339c" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1a7be351ca01c5d3d8425bfc9df99e339c" kindref="member">operator&lt;&lt; </ref>(</highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>T<sp/>&amp;t)</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="59"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="df/de1/namespacecudnn__frontend_1a9f71d168e0b8ae9c8756fae01d2aff42" kindref="member">isLoggingEnabled</ref>())<sp/>{stream<sp/>&lt;&lt;<sp/>t;}<sp/><sp/></highlight></codeline>
+<codeline lineno="60"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>*</highlight><highlight class="keyword">this</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="61"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="62"><highlight class="normal"><sp/><sp/></highlight></codeline>
+<codeline lineno="63"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer" kindref="compound">ConditionalStreamer</ref><sp/>&amp;</highlight></codeline>
+<codeline lineno="64" refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1a43d1ad7c28584c69056d1ad2f45fb3c8" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1a7be351ca01c5d3d8425bfc9df99e339c" kindref="member">operator&lt;&lt; </ref>(std::ostream<sp/>&amp;(*spl)(std::ostream<sp/>&amp;))</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="65"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="df/de1/namespacecudnn__frontend_1a9f71d168e0b8ae9c8756fae01d2aff42" kindref="member">isLoggingEnabled</ref>())<sp/>{stream<sp/>&lt;&lt;<sp/>spl;}</highlight></codeline>
+<codeline lineno="66"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>*</highlight><highlight class="keyword">this</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="67"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="68"><highlight class="normal">};</highlight></codeline>
+<codeline lineno="69"><highlight class="normal"></highlight></codeline>
+<codeline lineno="70"><highlight class="normal"></highlight></codeline>
+<codeline lineno="71"><highlight class="normal"></highlight><highlight class="keyword">inline</highlight><highlight class="normal"><sp/><ref refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer" kindref="compound">ConditionalStreamer</ref><sp/>&amp;</highlight></codeline>
+<codeline lineno="72" refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" kindref="member">getLogger</ref>()<sp/>{<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight></codeline>
+<codeline lineno="73"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">static</highlight><highlight class="normal"><sp/><ref refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer" kindref="compound">ConditionalStreamer</ref><sp/>opt(<ref refid="df/de1/namespacecudnn__frontend_1afb2964ae3e29ca3be70d42123e69873c" kindref="member">getStream</ref>());</highlight></codeline>
+<codeline lineno="74"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>opt;</highlight></codeline>
+<codeline lineno="75"><highlight class="normal">}<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight></codeline>
+<codeline lineno="76"><highlight class="normal"></highlight></codeline>
+<codeline lineno="77"><highlight class="normal"></highlight><highlight class="keyword">static</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="78"><highlight class="normal">std::ostream<sp/>&amp;</highlight></codeline>
+<codeline lineno="79" refid="df/de1/namespacecudnn__frontend_1a2c3daf3c0a5c4d328ccd42d0a4ba6f13" refkind="member"><highlight class="normal"><ref refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1a7be351ca01c5d3d8425bfc9df99e339c" kindref="member">operator &lt;&lt; </ref>(std::ostream<sp/>&amp;os,<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" kindref="compound">BackendDescriptor</ref><sp/>&amp;<sp/>desc)<sp/>{</highlight></codeline>
+<codeline lineno="80"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(<ref refid="df/de1/namespacecudnn__frontend_1a9f71d168e0b8ae9c8756fae01d2aff42" kindref="member">isLoggingEnabled</ref>())<sp/>{os<sp/>&lt;&lt;<sp/>desc.<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1ab652fb3e9a58092fbb137b0e959a9478" kindref="member">describe</ref>();}</highlight></codeline>
+<codeline lineno="81"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>os;</highlight></codeline>
+<codeline lineno="82"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="83"><highlight class="normal">}</highlight></codeline>
+    </programlisting>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Logging.h"/>
+  </compounddef>
+</doxygen>

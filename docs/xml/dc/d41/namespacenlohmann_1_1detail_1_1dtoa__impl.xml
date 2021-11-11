@@ -18,7 +18,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15151" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15151" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="15151" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="15151" bodyend="-1"/>
       </memberdef>
       <memberdef kind="variable" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a4a750fcc38da1ce68b7e25ab3a230e20" prot="public" static="no" mutable="no">
         <type>constexpr int</type>
@@ -32,7 +32,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15152" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15152" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="15152" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="15152" bodyend="-1"/>
       </memberdef>
       </sectiondef>
       <sectiondef kind="func">
@@ -59,7 +59,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14888" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="14888" bodyend="14895"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="14888" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="14888" bodyend="14895"/>
       </memberdef>
       <memberdef kind="function" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a22b6e37654ac93c6d0d9c06ec1bf5ded" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <templateparamlist>
@@ -82,7 +82,7 @@
 </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15029" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15029" bodyend="15094"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="15029" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="15029" bodyend="15094"/>
         <references refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1ae22e170815983961447c429f324c944d" compoundref="d5/db8/json_8hpp" startline="14902">nlohmann::detail::dtoa_impl::diyfp::e</references>
         <references refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1aea90459e340a231ca31d46946803ef51" compoundref="d5/db8/json_8hpp" startline="14901">nlohmann::detail::dtoa_impl::diyfp::f</references>
         <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
@@ -104,7 +104,7 @@
 <para>For a normalized diyfp w = f * 2^e, this function returns a (normalized) cached power-of-ten c = f_c * 2^e_c, such that the exponent of the product w * c satisfies (Definition 3.2 from [1]) <verbatim> alpha &lt;= e_c + e + q &lt;= gamma.</verbatim> </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15168" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15168" bodyend="15326"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="15168" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="15168" bodyend="15326"/>
         <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
         <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a05b681dcb8569b9784c6dccfadb01633" compoundref="d5/db8/json_8hpp" startline="15668" endline="15719">grisu2</referencedby>
       </memberdef>
@@ -127,7 +127,7 @@
 <para>For n != 0, returns k, such that pow10 := 10^(k-1) &lt;= n &lt; 10^k. For n == 0, returns 1 and sets pow10 := 1. </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15332" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15332" bodyend="15384"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="15332" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="15332" bodyend="15384"/>
         <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a9b899c72b0e1e3dd46d75c2b4e6bcdfb" compoundref="d5/db8/json_8hpp" startline="15427" endline="15660">grisu2_digit_gen</referencedby>
       </memberdef>
       <memberdef kind="function" id="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a5bc841e0bee12fd6489d49cf7bd07bb4" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
@@ -165,7 +165,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15386" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15386" bodyend="15421"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="15386" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="15386" bodyend="15421"/>
         <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
         <referencedby refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a9b899c72b0e1e3dd46d75c2b4e6bcdfb" compoundref="d5/db8/json_8hpp" startline="15427" endline="15660">grisu2_digit_gen</referencedby>
       </memberdef>
@@ -204,7 +204,7 @@
 <para>Generates V = buffer * 10^decimal_exponent, such that M- &lt;= V &lt;= M+. M- and M+ must be normalized and share the same exponent -60 &lt;= e &lt;= -32. </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15427" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15427" bodyend="15660"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="15427" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="15427" bodyend="15660"/>
         <references refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1ae22e170815983961447c429f324c944d" compoundref="d5/db8/json_8hpp" startline="14902">nlohmann::detail::dtoa_impl::diyfp::e</references>
         <references refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1aea90459e340a231ca31d46946803ef51" compoundref="d5/db8/json_8hpp" startline="14901">nlohmann::detail::dtoa_impl::diyfp::f</references>
         <references refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a36ded358763b5dbcea9867660fbe4e28" compoundref="d5/db8/json_8hpp" startline="15332" endline="15384">find_largest_pow10</references>
@@ -248,7 +248,7 @@
 <para>v = buf * 10^decimal_exponent len is the length of the buffer (number of decimal digits) The buffer must be large enough, i.e. &gt;= max_digits10. </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15668" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15668" bodyend="15719"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="15668" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="15668" bodyend="15719"/>
         <references refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1ae22e170815983961447c429f324c944d" compoundref="d5/db8/json_8hpp" startline="14902">nlohmann::detail::dtoa_impl::diyfp::e</references>
         <references refid="d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power_1a9e89bc89bb7bf4361f43ea27eed91d23" compoundref="d5/db8/json_8hpp" startline="15157">nlohmann::detail::dtoa_impl::cached_power::e</references>
         <references refid="d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp_1aea90459e340a231ca31d46946803ef51" compoundref="d5/db8/json_8hpp" startline="14901">nlohmann::detail::dtoa_impl::diyfp::f</references>
@@ -292,7 +292,7 @@
 <para>v = buf * 10^decimal_exponent len is the length of the buffer (number of decimal digits) The buffer must be large enough, i.e. &gt;= max_digits10. </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15728" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15728" bodyend="15759"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="15728" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="15728" bodyend="15759"/>
         <references refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1a22b6e37654ac93c6d0d9c06ec1bf5ded" compoundref="d5/db8/json_8hpp" startline="15029" endline="15094">compute_boundaries</references>
         <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
         <references refid="d5/db8/json_8hpp_1a5338981b5ad9027c9e54b1c5597f4344" compoundref="d5/db8/json_8hpp" startline="1456">JSON_HEDLEY_NON_NULL</references>
@@ -322,7 +322,7 @@
 </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15768" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15768" bodyend="15807"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="15768" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="15768" bodyend="15807"/>
         <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
         <references refid="d5/db8/json_8hpp_1a5338981b5ad9027c9e54b1c5597f4344" compoundref="d5/db8/json_8hpp" startline="1456">JSON_HEDLEY_NON_NULL</references>
         <references refid="d5/db8/json_8hpp_1a5f2aaec3b681d0a72f7d6e90b70cdcd1" compoundref="d5/db8/json_8hpp" startline="1897">JSON_HEDLEY_RETURNS_NON_NULL</references>
@@ -361,7 +361,7 @@
 </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="15820" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="15820" bodyend="15888"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="15820" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="15820" bodyend="15888"/>
         <references refid="dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl_1ad90f19ed10d8133b727df4b9bc5ddf5c" compoundref="d5/db8/json_8hpp" startline="15768" endline="15807">append_exponent</references>
         <references refid="d5/db8/json_8hpp_1a69f131cff49da1989667220173fbeae6" compoundref="d5/db8/json_8hpp" startline="2292">JSON_ASSERT</references>
         <references refid="d5/db8/json_8hpp_1a5338981b5ad9027c9e54b1c5597f4344" compoundref="d5/db8/json_8hpp" startline="1456">JSON_HEDLEY_NON_NULL</references>
@@ -374,6 +374,6 @@
     <detaileddescription>
 <para>This implementation is a slightly modified version of the reference implementation which may be obtained from <ulink url="http://florian.loitsch.com/publications">http://florian.loitsch.com/publications</ulink> (bench.tar.gz).</para><para>The code is distributed under the MIT license, Copyright (c) 2009 Florian Loitsch.</para><para>For a detailed description of the algorithm see:</para><para>[1] Loitsch, &quot;Printing Floating-Point Numbers Quickly and Accurately with
     Integers&quot;, Proceedings of the ACM SIGPLAN 2010 Conference on Programming Language Design and Implementation, PLDI 2010 [2] Burger, Dybvig, &quot;Printing Floating-Point Numbers Quickly and Accurately&quot;, Proceedings of the ACM SIGPLAN 1996 Conference on Programming Language Design and Implementation, PLDI 1996 </para>    </detaileddescription>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="14885" column="1"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="14885" column="1"/>
   </compounddef>
 </doxygen>

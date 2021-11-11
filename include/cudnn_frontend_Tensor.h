@@ -44,6 +44,7 @@ namespace cudnn_frontend {
 ///    - tensor dimensions
 ///    - tensor strides
 ///    - isVirtual
+///    - isByValue
 ///
 /// Use TensorBuilder_v8 to build this class.
 /// Describe returns a string describing the tensor class
@@ -56,9 +57,8 @@ class Tensor_v8 : public BackendDescriptor {
         std::stringstream ss;
         char sep = ' ';
         ss << "CUDNN_BACKEND_TENSOR_DESCRIPTOR :"
-           << " Datatype: " << to_string(data_type) << " Id: " << std::to_string(id)
-           << " Alignment: " << alignment << " nDims " << nDims
-           << " VectorCount: " << vectorCount << " vectorDimension " << vectorDimension;
+           << " Datatype: " << to_string(data_type) << " Id: " << std::to_string(id) << " Alignment: " << alignment
+           << " nDims " << nDims << " VectorCount: " << vectorCount << " vectorDimension " << vectorDimension;
         ss << " Dim [";
         for (auto i = 0; i < nDims; i++) {
             ss << sep << btensor_dimA[i];
@@ -70,6 +70,10 @@ class Tensor_v8 : public BackendDescriptor {
             sep = ',';
         }
         ss << "]";
+        ss << " isVirtual: " << std::to_string(isVirtual) << " isByValue: " << std::to_string(isByValue);
+#if (CUDNN_VERSION >= 8300)
+        ss << " reorder_type: " << reorder_type;
+#endif
         return ss.str();
     }
 
@@ -92,6 +96,16 @@ class Tensor_v8 : public BackendDescriptor {
         return btensor_dimA;
     }
 
+    int64_t const *
+    getStrideArray() const {
+        return btensor_strA;
+    }
+
+    int64_t
+    getDataType() const {
+        return static_cast<int64_t>(data_type);
+    }
+
     Tensor_v8(Tensor_v8 &&from) = default;
     Tensor_v8 &
     operator=(Tensor_v8 &&) = default;
@@ -110,10 +124,14 @@ class Tensor_v8 : public BackendDescriptor {
     int64_t id                              = -1;                //! Unique id of the tensor
     int64_t alignment                       = -1;                //! Alignment of the tensor.
     //! Certain engine config expect minimum alignment of 16B
-    int64_t nDims            = -1;     //! Number of Dimensions of the tensor
-    int64_t vectorDimension  = -1;     //! Which dimension of the tensor is vectorized (Generally the c dim)
-    int64_t vectorCount      = 1;     //! What is the vectorization count (4 or 32)
-    bool isVirtual = false;  //! Whether it is an intermediate tensor of an op graph
+    int64_t nDims           = -1;     //! Number of Dimensions of the tensor
+    int64_t vectorDimension = -1;     //! Which dimension of the tensor is vectorized (Generally the c dim)
+    int64_t vectorCount     = 1;      //! What is the vectorization count (4 or 32)
+    bool isVirtual          = false;  //! Whether it is an intermediate tensor of an op graph
+    bool isByValue          = false;  //! Whether the tensor is in host memory that needs to be passed to the kernel by value
+#if (CUDNN_VERSION >= 8300)
+    cudnnBackendTensorReordering_t reorder_type = CUDNN_TENSOR_REORDERING_NONE; //! Type of reordering in the tensor
+#endif
 };
 
 ///
@@ -163,11 +181,24 @@ class TensorBuilder_v8 {
         return *this;
     }
     auto
+    setByValue(bool isByValue_ = true) -> TensorBuilder_v8 & {
+        m_tensor.isByValue = isByValue_;
+        return *this;
+    }
+    auto
     setVectorCountAndDimension(int64_t vectorCount_, int64_t vectorDimension_) -> TensorBuilder_v8 & {
-        m_tensor.vectorCount = vectorCount_;
+        m_tensor.vectorCount     = vectorCount_;
         m_tensor.vectorDimension = vectorDimension_;
         return *this;
     }
+
+#if (CUDNN_VERSION >= 8300)
+    auto
+    setReorderType(cudnnBackendTensorReordering_t type_) -> TensorBuilder_v8 & {
+        m_tensor.reorder_type = type_;
+        return *this;
+    }
+#endif
     /** @} */
 
     //! constructs the Tensor_v8 by calling the cudnn API
@@ -283,6 +314,20 @@ class TensorBuilder_v8 {
                 return std::move(m_tensor);
             }
         }
+        if (m_tensor.isByValue) {
+            cudnnBackendSetAttribute(m_tensor.pointer->get_backend_descriptor(),
+                                     CUDNN_ATTR_TENSOR_IS_BY_VALUE,
+                                     CUDNN_TYPE_BOOLEAN,
+                                     1,
+                                     &m_tensor.isByValue);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_tensor,
+                    status,
+                    "CUDNN_BACKEND_TENSOR_DESCRIPTOR: SetAttribute CUDNN_ATTR_TENSOR_IS_BY_VALUE Failed");
+                return std::move(m_tensor);
+            }
+        }
 
         if (m_tensor.vectorCount > 1) {
             cudnnBackendSetAttribute(m_tensor.pointer->get_backend_descriptor(),
@@ -313,12 +358,30 @@ class TensorBuilder_v8 {
             }
         }
 
+        // Set the reorder_type
+#if (CUDNN_VERSION >= 8300)
+        if (m_tensor.reorder_type != CUDNN_TENSOR_REORDERING_NONE) {
+            cudnnBackendSetAttribute(m_tensor.pointer->get_backend_descriptor(),
+                                     CUDNN_ATTR_TENSOR_REORDERING_MODE,
+                                     CUDNN_TYPE_TENSOR_REORDERING_MODE,
+                                     1,
+                                     &m_tensor.reorder_type);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_tensor,
+                    status,
+                    "CUDNN_BACKEND_TENSOR_DESCRIPTOR: SetAttribute CUDNN_ATTR_TENSOR_REORDERING_MODE Failed");
+                return std::move(m_tensor);
+            }
+        }
+#endif
         // Finalizing the descriptor
         status = cudnnBackendFinalize(m_tensor.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_tensor, status, "CUDNN_BACKEND_TENSOR_DESCRIPTOR cudnnFinalize failed");
             return std::move(m_tensor);
         }
+        getLogger() << "[cudnn_frontend] " << m_tensor << std::endl;
         return std::move(m_tensor);
     }
 

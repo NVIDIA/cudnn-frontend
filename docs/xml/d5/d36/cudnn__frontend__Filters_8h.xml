@@ -3,44 +3,53 @@
   <compounddef id="d5/d36/cudnn__frontend__Filters_8h" kind="file" language="C++">
     <compoundname>cudnn_frontend_Filters.h</compoundname>
     <includes local="no">cudnn.h</includes>
+    <includedby refid="db/d66/cudnn__frontend__Heuristics_8h" local="yes">cudnn_frontend_Heuristics.h</includedby>
     <includedby refid="de/d0c/cudnn__frontend_8h" local="yes">cudnn_frontend.h</includedby>
     <incdepgraph>
-      <node id="295">
+      <node id="382">
         <label>cudnn.h</label>
       </node>
-      <node id="294">
+      <node id="381">
         <label>cudnn_frontend_Filters.h</label>
         <link refid="d5/d36/cudnn__frontend__Filters_8h"/>
-        <childnode refid="295" relation="include">
+        <childnode refid="382" relation="include">
         </childnode>
       </node>
     </incdepgraph>
     <invincdepgraph>
-      <node id="300">
+      <node id="384">
+        <label>cudnn_frontend_Heuristics.h</label>
+        <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
+        <childnode refid="385" relation="include">
+        </childnode>
+      </node>
+      <node id="388">
         <label>cudnn_frontend_get_plan.h</label>
         <link refid="d2/d3b/cudnn__frontend__get__plan_8h"/>
       </node>
-      <node id="296">
-        <label>cudnn_frontend_Filters.h</label>
-        <link refid="d5/d36/cudnn__frontend__Filters_8h"/>
-        <childnode refid="297" relation="include">
-        </childnode>
-      </node>
-      <node id="298">
+      <node id="386">
         <label>cudnn_frontend_EngineConfigGenerator.h</label>
         <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
-        <childnode refid="299" relation="include">
+        <childnode refid="387" relation="include">
         </childnode>
-        <childnode refid="300" relation="include">
+        <childnode refid="388" relation="include">
         </childnode>
       </node>
-      <node id="297">
+      <node id="383">
+        <label>cudnn_frontend_Filters.h</label>
+        <link refid="d5/d36/cudnn__frontend__Filters_8h"/>
+        <childnode refid="384" relation="include">
+        </childnode>
+        <childnode refid="385" relation="include">
+        </childnode>
+      </node>
+      <node id="385">
         <label>cudnn_frontend.h</label>
         <link refid="de/d0c/cudnn__frontend_8h"/>
-        <childnode refid="298" relation="include">
+        <childnode refid="386" relation="include">
         </childnode>
       </node>
-      <node id="299">
+      <node id="387">
         <label>cudnn_frontend_find_plan.h</label>
         <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
       </node>
@@ -83,7 +92,7 @@
 <codeline lineno="30"><highlight class="normal"></highlight><highlight class="comment">//<sp/>The<sp/>engine<sp/>config<sp/>will<sp/>be<sp/>filtered<sp/>out<sp/>and<sp/>will</highlight><highlight class="normal"></highlight></codeline>
 <codeline lineno="31"><highlight class="normal"></highlight><highlight class="comment">//<sp/>not<sp/>be<sp/>part<sp/>of<sp/>the<sp/>to<sp/>list.</highlight><highlight class="normal"></highlight></codeline>
 <codeline lineno="32"><highlight class="normal"></highlight><highlight class="keyword">static</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">void</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="33" refid="df/de1/namespacecudnn__frontend_1a4d18e44a57e30f9bf29157f742ba9c65" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1a0f52559baeb4e9ee8835d95ea50a875e" kindref="member">filter</ref>(<ref refid="df/de1/namespacecudnn__frontend_1a84a5f004bdf17747bf7cf45d6fc754cd" kindref="member">EngineConfigList</ref><sp/>&amp;from,<sp/><ref refid="df/de1/namespacecudnn__frontend_1a84a5f004bdf17747bf7cf45d6fc754cd" kindref="member">EngineConfigList</ref><sp/>&amp;to,<sp/>std::function&lt;</highlight><highlight class="keywordtype">bool</highlight><highlight class="normal">(cudnnBackendDescriptor_t)&gt;<sp/>filter_fn)<sp/>{</highlight></codeline>
+<codeline lineno="33" refid="df/de1/namespacecudnn__frontend_1a4d18e44a57e30f9bf29157f742ba9c65" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1abcaf76bd6c7d8c59082fd53d2a8c897a" kindref="member">filter</ref>(<ref refid="df/de1/namespacecudnn__frontend_1a84a5f004bdf17747bf7cf45d6fc754cd" kindref="member">EngineConfigList</ref><sp/>&amp;from,<sp/><ref refid="df/de1/namespacecudnn__frontend_1a84a5f004bdf17747bf7cf45d6fc754cd" kindref="member">EngineConfigList</ref><sp/>&amp;to,<sp/>std::function&lt;</highlight><highlight class="keywordtype">bool</highlight><highlight class="normal">(cudnnBackendDescriptor_t)&gt;<sp/>filter_fn)<sp/>{</highlight></codeline>
 <codeline lineno="34"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>p<sp/>=<sp/>std::stable_partition(from.begin(),<sp/>from.end(),<sp/>[filter_fn](<ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref><sp/>&amp;p)<sp/>{</highlight></codeline>
 <codeline lineno="35"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>filter_fn(const_cast&lt;cudnnBackendDescriptor_t&gt;(p-&gt;get_backend_descriptor()));</highlight></codeline>
 <codeline lineno="36"><highlight class="normal"><sp/><sp/><sp/><sp/>});</highlight></codeline>
@@ -150,6 +159,6 @@
 <codeline lineno="97"><highlight class="normal"></highlight><highlight class="preprocessor">#endif</highlight><highlight class="normal"></highlight></codeline>
 <codeline lineno="98"><highlight class="normal">}</highlight></codeline>
     </programlisting>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Filters.h"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Filters.h"/>
   </compounddef>
 </doxygen>

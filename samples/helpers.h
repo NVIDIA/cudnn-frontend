@@ -104,17 +104,13 @@ static float doFma(int8_t fval, int8_t ival, float tmp) {
 #define checkCudaErr(...)                                                        \
     do {                                                                         \
         int err = checkCudaError(__VA_ARGS__, #__VA_ARGS__, __FILE__, __LINE__); \
-        if (err) {                                                               \
-            return;                                                          \
-        }                                                                        \
+        REQUIRE(err == 0);                                                       \
     } while (0)
 
 #define checkCudnnErr(...)                                                        \
     do {                                                                          \
         int err = checkCudnnError(__VA_ARGS__, #__VA_ARGS__, __FILE__, __LINE__); \
-        if (err) {                                                                \
-            return;                                                    \
-        }                                                                         \
+        REQUIRE(err == 0);                                                        \
     } while (0)
 
 

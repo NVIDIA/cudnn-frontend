@@ -15,7 +15,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="367" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="367" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="387" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" bodystart="387" bodyend="-1"/>
       </memberdef>
       </sectiondef>
       <sectiondef kind="public-func">
@@ -34,7 +34,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="142" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="142" bodyend="145"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="161" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" bodystart="161" bodyend="164"/>
       </memberdef>
       <memberdef kind="function" id="d2/db5/group__PointWiseDescBuilder__v8_1ga124ebb4a416c645cd0b68f59545c62a8" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -55,7 +55,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="148" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="148" bodyend="152"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="167" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" bodystart="167" bodyend="171"/>
       </memberdef>
       <memberdef kind="function" id="d2/db5/group__PointWiseDescBuilder__v8_1ga48264536e68f952e92a0bdbaa84d9363" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -72,7 +72,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="155" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="155" bodyend="158"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="174" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" bodystart="174" bodyend="177"/>
       </memberdef>
       <memberdef kind="function" id="d2/db5/group__PointWiseDescBuilder__v8_1gae5240136e19e0a4094036d48c6b1a3b7" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -89,7 +89,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="161" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="161" bodyend="164"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="180" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" bodystart="180" bodyend="183"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1afdbe0ce3f7fb2f0d23251ccb7507bc69" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -106,7 +106,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="168" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="168" bodyend="171"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="187" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" bodystart="187" bodyend="190"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a0514e70d05a21a9c46bc66d1e61c28f5" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -123,7 +123,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="174" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="174" bodyend="177"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="193" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" bodystart="193" bodyend="196"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1aa93615adf69e7a87a06d0cea687794a6" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -140,7 +140,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="180" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="180" bodyend="183"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="199" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" bodystart="199" bodyend="202"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a8bdbf27c37334f5b61a65eb1bd4b6a98" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -157,7 +157,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="186" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="186" bodyend="189"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="205" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" bodystart="205" bodyend="208"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1ab692e5a2b3970346f68af33530ef98e8" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -174,7 +174,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="192" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="192" bodyend="195"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="211" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" bodystart="211" bodyend="214"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1aad41d0f7b6667383fd9012bc492a13c3" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -191,7 +191,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="198" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="198" bodyend="201"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="217" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" bodystart="217" bodyend="220"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a5de642e4141705f8e06c4bf566f1d332" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type><ref refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8" kindref="compound">PointWiseDesc_v8</ref> &amp;&amp;</type>
@@ -204,11 +204,12 @@
 <para>constructs the <ref refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8" kindref="compound">PointWiseDesc_v8</ref> by calling the cudnn API Throws the appropriate error message </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="206" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="206" bodyend="357"/>
-        <references refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1ae3cd0c0051c7e29a9ad86b80308429f3">cudnn_frontend::PointWiseDesc_v8::operator=</references>
-        <references refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1a1407b6ad40df9af7b191fdf636c2c508" compoundref="da/d5f/cudnn__frontend__PointWiseDesc_8h" startline="57">cudnn_frontend::PointWiseDesc_v8::PointWiseDescBuilder_v8</references>
-        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
-        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="158">cudnn_frontend::BackendDescriptor::status</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="225" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" bodystart="225" bodyend="377"/>
+        <references refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" compoundref="d8/dc4/cudnn__frontend__Logging_8h" startline="72" endline="75">cudnn_frontend::getLogger</references>
+        <references refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1aebb5f72b43b33a8163edf8c09f21b7dd">cudnn_frontend::PointWiseDesc_v8::operator=</references>
+        <references refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8_1a1407b6ad40df9af7b191fdf636c2c508" compoundref="da/d5f/cudnn__frontend__PointWiseDesc_8h" startline="58">cudnn_frontend::PointWiseDesc_v8::PointWiseDescBuilder_v8</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="138" endline="147">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="160">cudnn_frontend::BackendDescriptor::status</references>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a6f5605f25897bba7afc6baf76228828c" prot="public" static="no" const="no" explicit="yes" inline="no" virt="non-virtual">
         <type></type>
@@ -221,7 +222,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="359" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="379" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1af976fab4a7726609a1b10dc2a8bcdf65" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -234,7 +235,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="360" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="380" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1ad6a7549d62410d3de87040586b49b815" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -250,7 +251,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="361" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="381" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1aeccd727adb1d3b0b8d9d95b7f6e1b9ce" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -266,7 +267,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="362" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="382" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1ac0d140493e21b164bc21dd0bcbeeaa65" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type><ref refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8" kindref="compound">PointWiseDescBuilder_v8</ref> &amp;</type>
@@ -282,7 +283,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="364" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="384" column="1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -290,53 +291,53 @@
     <detaileddescription>
 <para><ref refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8" kindref="compound">PointWiseDescBuilder_v8</ref> Class Helper class used to build <ref refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8" kindref="compound">PointWiseDesc_v8</ref> class </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="939">
+      <node id="1012">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="943">
+      <node id="1016">
         <label>cudnnPointwiseMode_t</label>
       </node>
-      <node id="940">
+      <node id="1013">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="938">
+      <node id="1011">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="941">
+      <node id="1014">
         <label>double</label>
       </node>
-      <node id="942">
+      <node id="1015">
         <label>cudnnNanPropagation_t</label>
       </node>
-      <node id="944">
+      <node id="1017">
         <label>cudnnDataType_t</label>
       </node>
-      <node id="936">
+      <node id="1009">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="937" relation="usage">
+        <childnode refid="1010" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="939" relation="usage">
+        <childnode refid="1012" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="940" relation="usage">
+        <childnode refid="1013" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="934">
+      <node id="1007">
         <label>cudnn_frontend::PointWiseDescBuilder_v8</label>
         <link refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8"/>
-        <childnode refid="935" relation="usage">
+        <childnode refid="1008" relation="usage">
           <edgelabel>-m_pointWiseDesc</edgelabel>
         </childnode>
       </node>
-      <node id="935">
+      <node id="1008">
         <label>cudnn_frontend::PointWiseDesc_v8</label>
         <link refid="d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8"/>
-        <childnode refid="936" relation="public-inheritance">
+        <childnode refid="1009" relation="public-inheritance">
         </childnode>
-        <childnode refid="941" relation="usage">
+        <childnode refid="1014" relation="usage">
           <edgelabel>-upper_clip</edgelabel>
           <edgelabel>-swish_beta</edgelabel>
           <edgelabel>-lower_clip_slope</edgelabel>
@@ -344,23 +345,23 @@
           <edgelabel>-elu_alpha</edgelabel>
           <edgelabel>-softplus_beta</edgelabel>
         </childnode>
-        <childnode refid="942" relation="usage">
+        <childnode refid="1015" relation="usage">
           <edgelabel>-nan_propagation</edgelabel>
         </childnode>
-        <childnode refid="943" relation="usage">
+        <childnode refid="1016" relation="usage">
           <edgelabel>-mode</edgelabel>
         </childnode>
-        <childnode refid="944" relation="usage">
+        <childnode refid="1017" relation="usage">
           <edgelabel>-math_precision</edgelabel>
         </childnode>
       </node>
-      <node id="937">
+      <node id="1010">
         <label>std::string</label>
-        <childnode refid="938" relation="public-inheritance">
+        <childnode refid="1011" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" line="134" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_PointWiseDesc.h" bodystart="134" bodyend="368"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" line="153" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_PointWiseDesc.h" bodystart="153" bodyend="388"/>
     <listofallmembers>
       <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a5de642e4141705f8e06c4bf566f1d332" prot="public" virt="non-virtual"><scope>cudnn_frontend::PointWiseDescBuilder_v8</scope><name>build</name></member>
       <member refid="d5/d02/classcudnn__frontend_1_1PointWiseDescBuilder__v8_1a804a2b5438f464185b16a4652fc14cf5" prot="private" virt="non-virtual"><scope>cudnn_frontend::PointWiseDescBuilder_v8</scope><name>m_pointWiseDesc</name></member>

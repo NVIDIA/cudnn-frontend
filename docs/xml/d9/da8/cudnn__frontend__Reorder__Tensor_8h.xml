@@ -1,0 +1,290 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d9/da8/cudnn__frontend__Reorder__Tensor_8h" kind="file" language="C++">
+    <compoundname>cudnn_frontend_Reorder_Tensor.h</compoundname>
+    <includes local="no">algorithm</includes>
+    <includes local="no">array</includes>
+    <includes local="no">functional</includes>
+    <includes local="no">memory</includes>
+    <includes local="no">sstream</includes>
+    <includes local="no">iostream</includes>
+    <includes local="no">utility</includes>
+    <includes refid="d3/d98/cudnn__frontend__Tensor_8h" local="yes">cudnn_frontend_Tensor.h</includes>
+    <includes refid="d1/de7/cudnn__frontend__ConvDesc_8h" local="yes">cudnn_frontend_ConvDesc.h</includes>
+    <includedby refid="de/d0c/cudnn__frontend_8h" local="yes">cudnn_frontend.h</includedby>
+    <incdepgraph>
+      <node id="750">
+        <label>functional</label>
+      </node>
+      <node id="762">
+        <label>cudnn.h</label>
+      </node>
+      <node id="758">
+        <label>string</label>
+      </node>
+      <node id="763">
+        <label>cudnn_frontend_Logging.h</label>
+        <link refid="d8/dc4/cudnn__frontend__Logging_8h"/>
+        <childnode refid="753" relation="include">
+        </childnode>
+        <childnode refid="764" relation="include">
+        </childnode>
+        <childnode refid="765" relation="include">
+        </childnode>
+        <childnode refid="760" relation="include">
+        </childnode>
+      </node>
+      <node id="755">
+        <label>cudnn_frontend_Tensor.h</label>
+        <link refid="d3/d98/cudnn__frontend__Tensor_8h"/>
+        <childnode refid="748" relation="include">
+        </childnode>
+        <childnode refid="749" relation="include">
+        </childnode>
+        <childnode refid="750" relation="include">
+        </childnode>
+        <childnode refid="751" relation="include">
+        </childnode>
+        <childnode refid="752" relation="include">
+        </childnode>
+        <childnode refid="754" relation="include">
+        </childnode>
+        <childnode refid="756" relation="include">
+        </childnode>
+      </node>
+      <node id="757">
+        <label>exception</label>
+      </node>
+      <node id="764">
+        <label>fstream</label>
+      </node>
+      <node id="761">
+        <label>ostream</label>
+      </node>
+      <node id="747">
+        <label>cudnn_frontend_Reorder_Tensor.h</label>
+        <link refid="d9/da8/cudnn__frontend__Reorder__Tensor_8h"/>
+        <childnode refid="748" relation="include">
+        </childnode>
+        <childnode refid="749" relation="include">
+        </childnode>
+        <childnode refid="750" relation="include">
+        </childnode>
+        <childnode refid="751" relation="include">
+        </childnode>
+        <childnode refid="752" relation="include">
+        </childnode>
+        <childnode refid="753" relation="include">
+        </childnode>
+        <childnode refid="754" relation="include">
+        </childnode>
+        <childnode refid="755" relation="include">
+        </childnode>
+        <childnode refid="766" relation="include">
+        </childnode>
+      </node>
+      <node id="759">
+        <label>vector</label>
+      </node>
+      <node id="766">
+        <label>cudnn_frontend_ConvDesc.h</label>
+        <link refid="d1/de7/cudnn__frontend__ConvDesc_8h"/>
+        <childnode refid="748" relation="include">
+        </childnode>
+        <childnode refid="749" relation="include">
+        </childnode>
+        <childnode refid="750" relation="include">
+        </childnode>
+        <childnode refid="751" relation="include">
+        </childnode>
+        <childnode refid="752" relation="include">
+        </childnode>
+        <childnode refid="754" relation="include">
+        </childnode>
+        <childnode refid="762" relation="include">
+        </childnode>
+        <childnode refid="767" relation="include">
+        </childnode>
+        <childnode refid="756" relation="include">
+        </childnode>
+      </node>
+      <node id="767">
+        <label>cudnn_backend.h</label>
+      </node>
+      <node id="754">
+        <label>utility</label>
+      </node>
+      <node id="749">
+        <label>array</label>
+      </node>
+      <node id="752">
+        <label>sstream</label>
+      </node>
+      <node id="753">
+        <label>iostream</label>
+      </node>
+      <node id="748">
+        <label>algorithm</label>
+      </node>
+      <node id="765">
+        <label>cstring</label>
+      </node>
+      <node id="756">
+        <label>cudnn_frontend_utils.h</label>
+        <link refid="df/d17/cudnn__frontend__utils_8h"/>
+        <childnode refid="757" relation="include">
+        </childnode>
+        <childnode refid="758" relation="include">
+        </childnode>
+        <childnode refid="759" relation="include">
+        </childnode>
+        <childnode refid="760" relation="include">
+        </childnode>
+        <childnode refid="763" relation="include">
+        </childnode>
+      </node>
+      <node id="751">
+        <label>memory</label>
+      </node>
+      <node id="760">
+        <label>cudnn_backend_base.h</label>
+        <link refid="dc/d11/cudnn__backend__base_8h"/>
+        <childnode refid="761" relation="include">
+        </childnode>
+        <childnode refid="762" relation="include">
+        </childnode>
+      </node>
+    </incdepgraph>
+    <invincdepgraph>
+      <node id="772">
+        <label>cudnn_frontend_get_plan.h</label>
+        <link refid="d2/d3b/cudnn__frontend__get__plan_8h"/>
+      </node>
+      <node id="770">
+        <label>cudnn_frontend_EngineConfigGenerator.h</label>
+        <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
+        <childnode refid="771" relation="include">
+        </childnode>
+        <childnode refid="772" relation="include">
+        </childnode>
+      </node>
+      <node id="768">
+        <label>cudnn_frontend_Reorder_Tensor.h</label>
+        <link refid="d9/da8/cudnn__frontend__Reorder__Tensor_8h"/>
+        <childnode refid="769" relation="include">
+        </childnode>
+      </node>
+      <node id="769">
+        <label>cudnn_frontend.h</label>
+        <link refid="de/d0c/cudnn__frontend_8h"/>
+        <childnode refid="770" relation="include">
+        </childnode>
+      </node>
+      <node id="771">
+        <label>cudnn_frontend_find_plan.h</label>
+        <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
+      </node>
+    </invincdepgraph>
+    <innernamespace refid="df/de1/namespacecudnn__frontend">cudnn_frontend</innernamespace>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <programlisting>
+<codeline lineno="1"><highlight class="comment">/*</highlight></codeline>
+<codeline lineno="2"><highlight class="comment"><sp/>*<sp/>Copyright<sp/>(c)<sp/>2021,<sp/>NVIDIA<sp/>CORPORATION.<sp/>All<sp/>rights<sp/>reserved.</highlight></codeline>
+<codeline lineno="3"><highlight class="comment"><sp/>*</highlight></codeline>
+<codeline lineno="4"><highlight class="comment"><sp/>*<sp/>Permission<sp/>is<sp/>hereby<sp/>granted,<sp/>free<sp/>of<sp/>charge,<sp/>to<sp/>any<sp/>person<sp/>obtaining<sp/>a</highlight></codeline>
+<codeline lineno="5"><highlight class="comment"><sp/>*<sp/>copy<sp/>of<sp/>this<sp/>software<sp/>and<sp/>associated<sp/>documentation<sp/>files<sp/>(the<sp/>&quot;Software&quot;),</highlight></codeline>
+<codeline lineno="6"><highlight class="comment"><sp/>*<sp/>to<sp/>deal<sp/>in<sp/>the<sp/>Software<sp/>without<sp/>restriction,<sp/>including<sp/>without<sp/>limitation</highlight></codeline>
+<codeline lineno="7"><highlight class="comment"><sp/>*<sp/>the<sp/>rights<sp/>to<sp/>use,<sp/>copy,<sp/>modify,<sp/>merge,<sp/>publish,<sp/>distribute,<sp/>sublicense,</highlight></codeline>
+<codeline lineno="8"><highlight class="comment"><sp/>*<sp/>and/or<sp/>sell<sp/>copies<sp/>of<sp/>the<sp/>Software,<sp/>and<sp/>to<sp/>permit<sp/>persons<sp/>to<sp/>whom<sp/>the</highlight></codeline>
+<codeline lineno="9"><highlight class="comment"><sp/>*<sp/>Software<sp/>is<sp/>furnished<sp/>to<sp/>do<sp/>so,<sp/>subject<sp/>to<sp/>the<sp/>following<sp/>conditions:</highlight></codeline>
+<codeline lineno="10"><highlight class="comment"><sp/>*</highlight></codeline>
+<codeline lineno="11"><highlight class="comment"><sp/>*<sp/>The<sp/>above<sp/>copyright<sp/>notice<sp/>and<sp/>this<sp/>permission<sp/>notice<sp/>shall<sp/>be<sp/>included<sp/>in</highlight></codeline>
+<codeline lineno="12"><highlight class="comment"><sp/>*<sp/>all<sp/>copies<sp/>or<sp/>substantial<sp/>portions<sp/>of<sp/>the<sp/>Software.</highlight></codeline>
+<codeline lineno="13"><highlight class="comment"><sp/>*</highlight></codeline>
+<codeline lineno="14"><highlight class="comment"><sp/>*<sp/>THE<sp/>SOFTWARE<sp/>IS<sp/>PROVIDED<sp/>&quot;AS<sp/>IS&quot;,<sp/>WITHOUT<sp/>WARRANTY<sp/>OF<sp/>ANY<sp/>KIND,<sp/>EXPRESS<sp/>OR</highlight></codeline>
+<codeline lineno="15"><highlight class="comment"><sp/>*<sp/>IMPLIED,<sp/>INCLUDING<sp/>BUT<sp/>NOT<sp/>LIMITED<sp/>TO<sp/>THE<sp/>WARRANTIES<sp/>OF<sp/>MERCHANTABILITY,</highlight></codeline>
+<codeline lineno="16"><highlight class="comment"><sp/>*<sp/>FITNESS<sp/>FOR<sp/>A<sp/>PARTICULAR<sp/>PURPOSE<sp/>AND<sp/>NONINFRINGEMENT.<sp/><sp/>IN<sp/>NO<sp/>EVENT<sp/>SHALL</highlight></codeline>
+<codeline lineno="17"><highlight class="comment"><sp/>*<sp/>THE<sp/>AUTHORS<sp/>OR<sp/>COPYRIGHT<sp/>HOLDERS<sp/>BE<sp/>LIABLE<sp/>FOR<sp/>ANY<sp/>CLAIM,<sp/>DAMAGES<sp/>OR<sp/>OTHER</highlight></codeline>
+<codeline lineno="18"><highlight class="comment"><sp/>*<sp/>LIABILITY,<sp/>WHETHER<sp/>IN<sp/>AN<sp/>ACTION<sp/>OF<sp/>CONTRACT,<sp/>TORT<sp/>OR<sp/>OTHERWISE,<sp/>ARISING</highlight></codeline>
+<codeline lineno="19"><highlight class="comment"><sp/>*<sp/>FROM,<sp/>OUT<sp/>OF<sp/>OR<sp/>IN<sp/>CONNECTION<sp/>WITH<sp/>THE<sp/>SOFTWARE<sp/>OR<sp/>THE<sp/>USE<sp/>OR<sp/>OTHER</highlight></codeline>
+<codeline lineno="20"><highlight class="comment"><sp/>*<sp/>DEALINGS<sp/>IN<sp/>THE<sp/>SOFTWARE.</highlight></codeline>
+<codeline lineno="21"><highlight class="comment"><sp/>*/</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="22"><highlight class="normal"></highlight></codeline>
+<codeline lineno="23"><highlight class="normal"></highlight><highlight class="preprocessor">#pragma<sp/>once</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="24"><highlight class="normal"></highlight></codeline>
+<codeline lineno="25"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;algorithm&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="26"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;array&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="27"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;functional&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="28"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;memory&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="29"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;sstream&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="30"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;iostream&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="31"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;utility&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="32"><highlight class="normal"></highlight></codeline>
+<codeline lineno="33"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&quot;<ref refid="d3/d98/cudnn__frontend__Tensor_8h" kindref="compound">cudnn_frontend_Tensor.h</ref>&quot;</highlight><highlight class="normal"><sp/></highlight></codeline>
+<codeline lineno="34"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&quot;<ref refid="d1/de7/cudnn__frontend__ConvDesc_8h" kindref="compound">cudnn_frontend_ConvDesc.h</ref>&quot;</highlight><highlight class="normal"><sp/></highlight></codeline>
+<codeline lineno="35"><highlight class="normal"></highlight></codeline>
+<codeline lineno="36"><highlight class="normal"></highlight><highlight class="keyword">namespace<sp/></highlight><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend" kindref="compound">cudnn_frontend</ref><sp/>{</highlight></codeline>
+<codeline lineno="37"><highlight class="normal"></highlight></codeline>
+<codeline lineno="38"><highlight class="normal"></highlight><highlight class="keyword">static</highlight><highlight class="normal"><sp/>cudnnStatus_t<sp/></highlight></codeline>
+<codeline lineno="39" refid="df/de1/namespacecudnn__frontend_1a5db7b16691678ccc7926338faf2023af" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1a5db7b16691678ccc7926338faf2023af" kindref="member">cudnnReorderFilterAndBiasInt8x32</ref>(cudnnHandle_t<sp/>handle,<sp/></highlight></codeline>
+<codeline lineno="40"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d6/da7/classcudnn__frontend_1_1Tensor__v8" kindref="compound">Tensor_v8</ref><sp/>&amp;tensor,<sp/></highlight></codeline>
+<codeline lineno="41"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kindref="compound">ConvDesc_v8</ref><sp/>&amp;conv_desc,</highlight></codeline>
+<codeline lineno="42"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">void</highlight><highlight class="normal"><sp/>*dev_filter_ptr,<sp/></highlight><highlight class="keywordtype">void</highlight><highlight class="normal"><sp/>*reordered_filter_ptr,</highlight></codeline>
+<codeline lineno="43"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">void</highlight><highlight class="normal"><sp/>*dev_bias_ptr,<sp/><sp/><sp/></highlight><highlight class="keywordtype">void</highlight><highlight class="normal"><sp/>*reordered_bias_ptr)<sp/>{</highlight></codeline>
+<codeline lineno="44"><highlight class="normal"></highlight></codeline>
+<codeline lineno="45"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>cudnn_status<sp/>=<sp/>CUDNN_STATUS_SUCCESS;</highlight></codeline>
+<codeline lineno="46"><highlight class="normal"></highlight></codeline>
+<codeline lineno="47"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(dev_filter_ptr<sp/>&amp;&amp;<sp/>reordered_filter_ptr<sp/>==<sp/></highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">)<sp/>{</highlight></codeline>
+<codeline lineno="48"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>CUDNN_STATUS_BAD_PARAM;</highlight></codeline>
+<codeline lineno="49"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="50"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(dev_bias_ptr<sp/>&amp;&amp;<sp/>reordered_bias_ptr<sp/>==<sp/></highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">)<sp/>{</highlight></codeline>
+<codeline lineno="51"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>CUDNN_STATUS_BAD_PARAM;</highlight></codeline>
+<codeline lineno="52"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="53"><highlight class="normal"></highlight></codeline>
+<codeline lineno="54"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnFilterDescriptor_t<sp/>filterDesc<sp/>=<sp/></highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="55"><highlight class="normal"></highlight></codeline>
+<codeline lineno="56"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnn_status<sp/>=<sp/>cudnnCreateFilterDescriptor(&amp;filterDesc);</highlight></codeline>
+<codeline lineno="57"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(cudnn_status<sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>cudnn_status;}</highlight></codeline>
+<codeline lineno="58"><highlight class="normal"></highlight></codeline>
+<codeline lineno="59"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>conv_dims<sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/>conv_desc.<ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac964fa8d073d71590a775a878b96a9bc" kindref="member">getDimensionCount</ref>();</highlight></codeline>
+<codeline lineno="60"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>tensor_dims<sp/><sp/><sp/><sp/><sp/>=<sp/>tensor.<ref refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1adc7efe51d66614f5fa06c2d0690bd474" kindref="member">getDimensionCount</ref>();</highlight></codeline>
+<codeline lineno="61"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>non_shape_dims<sp/><sp/>=<sp/>tensor_dims<sp/>-<sp/>conv_dims;</highlight></codeline>
+<codeline lineno="62"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight></codeline>
+<codeline lineno="63"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(non_shape_dims<sp/>!=<sp/>2<sp/>&amp;&amp;<sp/>non_shape_dims<sp/>!=<sp/>3)<sp/>{</highlight></codeline>
+<codeline lineno="64"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>CUDNN_STATUS_BAD_PARAM;</highlight></codeline>
+<codeline lineno="65"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="66"><highlight class="normal"></highlight></codeline>
+<codeline lineno="67"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(conv_dims<sp/>!=<sp/>2<sp/>&amp;&amp;<sp/>conv_dims<sp/>!=<sp/>3)<sp/>{</highlight></codeline>
+<codeline lineno="68"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>CUDNN_STATUS_BAD_PARAM;</highlight></codeline>
+<codeline lineno="69"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="70"><highlight class="normal"></highlight></codeline>
+<codeline lineno="71"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">int</highlight><highlight class="normal"><sp/>filter_dims_[5]<sp/>=<sp/>{1,1,1,1,1};</highlight></codeline>
+<codeline lineno="72"><highlight class="normal"><sp/><sp/><sp/><sp/>int64_t<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>*<sp/>filter_dims<sp/>=<sp/>tensor.<ref refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1abd8b2029dd25fee10cee12c8552da96b" kindref="member">getDimArray</ref>();</highlight></codeline>
+<codeline lineno="73"><highlight class="normal"><sp/><sp/><sp/><sp/>filter_dims_[0]<sp/>=<sp/></highlight><highlight class="keyword">static_cast&lt;</highlight><highlight class="keywordtype">int</highlight><highlight class="keyword">&gt;</highlight><highlight class="normal"><sp/>(filter_dims[0]);<sp/></highlight><highlight class="comment">//<sp/>n</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="74"><highlight class="normal"><sp/><sp/><sp/><sp/>filter_dims_[1]<sp/>=<sp/></highlight><highlight class="keyword">static_cast&lt;</highlight><highlight class="keywordtype">int</highlight><highlight class="keyword">&gt;</highlight><highlight class="normal"><sp/>((non_shape_dims<sp/>==<sp/>2)<sp/>?<sp/>filter_dims[1]<sp/>:<sp/>filter_dims[2])<sp/>*<sp/>32;<sp/></highlight><highlight class="comment">//<sp/>c</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="75"><highlight class="normal"><sp/><sp/><sp/><sp/>filter_dims_[2]<sp/>=<sp/></highlight><highlight class="keyword">static_cast&lt;</highlight><highlight class="keywordtype">int</highlight><highlight class="keyword">&gt;</highlight><highlight class="normal"><sp/>((non_shape_dims<sp/>==<sp/>2)<sp/>?<sp/>filter_dims[2]<sp/>:<sp/>filter_dims[3]);<sp/></highlight><highlight class="comment">//<sp/>d/h</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="76"><highlight class="normal"><sp/><sp/><sp/><sp/>filter_dims_[3]<sp/>=<sp/></highlight><highlight class="keyword">static_cast&lt;</highlight><highlight class="keywordtype">int</highlight><highlight class="keyword">&gt;</highlight><highlight class="normal"><sp/>((non_shape_dims<sp/>==<sp/>2)<sp/>?<sp/>filter_dims[3]<sp/>:<sp/>filter_dims[4]);<sp/></highlight><highlight class="comment">//<sp/>h/w</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="77"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(conv_dims<sp/>==<sp/>3)<sp/>{</highlight></codeline>
+<codeline lineno="78"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>filter_dims_[4]<sp/>=<sp/></highlight><highlight class="keyword">static_cast&lt;</highlight><highlight class="keywordtype">int</highlight><highlight class="keyword">&gt;</highlight><highlight class="normal"><sp/>((non_shape_dims<sp/>==<sp/>2)<sp/>?<sp/>filter_dims[4]<sp/>:<sp/>filter_dims[5]);<sp/></highlight><highlight class="comment">//<sp/>w</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="79"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="80"><highlight class="normal"></highlight></codeline>
+<codeline lineno="81"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnn_status<sp/>=<sp/>cudnnSetFilterNdDescriptor(filterDesc,<sp/>CUDNN_DATA_INT8x32,<sp/>CUDNN_TENSOR_NCHW_VECT_C,<sp/>conv_dims<sp/>+<sp/>2,<sp/>filter_dims_);</highlight></codeline>
+<codeline lineno="82"><highlight class="normal"></highlight></codeline>
+<codeline lineno="83"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(cudnn_status<sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>cudnn_status;}</highlight></codeline>
+<codeline lineno="84"><highlight class="normal"></highlight></codeline>
+<codeline lineno="85"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">int</highlight><highlight class="normal"><sp/>reorderBias<sp/>=<sp/>(dev_bias_ptr<sp/>!=<sp/></highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">);</highlight></codeline>
+<codeline lineno="86"><highlight class="normal"></highlight></codeline>
+<codeline lineno="87"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnn_status<sp/>=<sp/>cudnnReorderFilterAndBias(handle,</highlight></codeline>
+<codeline lineno="88"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>filterDesc,<sp/>CUDNN_DEFAULT_REORDER,<sp/>dev_filter_ptr,<sp/>reordered_filter_ptr,<sp/>reorderBias,<sp/>dev_bias_ptr,<sp/>reordered_bias_ptr);</highlight></codeline>
+<codeline lineno="89"><highlight class="normal"></highlight></codeline>
+<codeline lineno="90"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnDestroyFilterDescriptor(filterDesc);</highlight></codeline>
+<codeline lineno="91"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>cudnn_status;</highlight></codeline>
+<codeline lineno="92"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="93"><highlight class="normal">}</highlight></codeline>
+    </programlisting>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Reorder_Tensor.h"/>
+  </compounddef>
+</doxygen>

@@ -15,8 +15,8 @@ var searchData=
   ['error_5fhandler_5ft',['error_handler_t',['../d9/dcc/classnlohmann_1_1basic__json.html#a1e7ca76cc3f62626b380be5e18a002d5',1,'nlohmann::basic_json']]],
   ['exception',['exception',['../d9/dcc/classnlohmann_1_1basic__json.html#a14824c27188d2fee4861806cd5f23d22',1,'nlohmann::basic_json']]],
   ['exception_5ft',['exception_t',['../dc/dc3/structnlohmann_1_1detail_1_1is__sax.html#a6efa516f35d544cc8ce9a954f849fed1',1,'nlohmann::detail::is_sax::exception_t()'],['../d1/d2d/structnlohmann_1_1detail_1_1is__sax__static__asserts.html#a34e1bc8ab7adbbab5f7d8c45a964020b',1,'nlohmann::detail::is_sax_static_asserts::exception_t()']]],
-  ['executionoptions_5ft',['executionOptions_t',['../df/de1/namespacecudnn__frontend.html#ad5f0f0c892b009e34aa59f67de1b5535',1,'cudnn_frontend']]],
   ['executionplan',['ExecutionPlan',['../df/de1/namespacecudnn__frontend.html#a984c10aa29daac796444bda66bdef26e',1,'cudnn_frontend']]],
   ['executionplanbuilder',['ExecutionPlanBuilder',['../df/de1/namespacecudnn__frontend.html#aa508b66c4de02f4aacae8029dbe422eb',1,'cudnn_frontend']]],
+  ['executionplancache',['ExecutionPlanCache',['../df/de1/namespacecudnn__frontend.html#ab36c7aba5bedf33ef3b51c955685d1ce',1,'cudnn_frontend']]],
   ['executionplans_5ft',['executionPlans_t',['../df/de1/namespacecudnn__frontend.html#a560644a5c1e6016c509a379ca6e03f05',1,'cudnn_frontend']]]
 ];

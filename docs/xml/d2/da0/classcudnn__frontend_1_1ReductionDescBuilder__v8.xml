@@ -15,7 +15,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" line="157" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" bodystart="157" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" line="157" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" bodystart="157" bodyend="-1"/>
       </memberdef>
       </sectiondef>
       <sectiondef kind="public-func">
@@ -34,7 +34,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" line="87" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" bodystart="87" bodyend="90"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" line="86" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" bodystart="86" bodyend="89"/>
       </memberdef>
       <memberdef kind="function" id="d8/d95/group__ReductionDescBuilder__v8_1gab00c3396fedc8b68356c426d19a54cf9" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -51,7 +51,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" line="93" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" bodystart="93" bodyend="96"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" line="92" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" bodystart="92" bodyend="95"/>
       </memberdef>
       <memberdef kind="function" id="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8_1a84355923606ae86f66264fbcc5c305ad" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type><ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" kindref="compound">ReductionDesc_v8</ref> &amp;&amp;</type>
@@ -64,11 +64,12 @@
 <para>constructs the <ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" kindref="compound">ReductionDesc_v8</ref> by calling the cudnn API Throws the appropriate error message </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" line="102" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" bodystart="102" bodyend="147"/>
-        <references refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a51f082e952ed5e01ddc9ef3f02f32f3b">cudnn_frontend::ReductionDesc_v8::operator=</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" line="101" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" bodystart="101" bodyend="147"/>
+        <references refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" compoundref="d8/dc4/cudnn__frontend__Logging_8h" startline="72" endline="75">cudnn_frontend::getLogger</references>
+        <references refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1ad6401829cd5e411a5deb301610e98700">cudnn_frontend::ReductionDesc_v8::operator=</references>
         <references refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8_1a2d40c33ae24254be60d002d429637d22" compoundref="db/da7/cudnn__frontend__ReductionDesc_8h" startline="50">cudnn_frontend::ReductionDesc_v8::ReductionDescBuilder_v8</references>
-        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
-        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="158">cudnn_frontend::BackendDescriptor::status</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="138" endline="147">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="160">cudnn_frontend::BackendDescriptor::status</references>
       </memberdef>
       <memberdef kind="function" id="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8_1a07842acadad9d64d44edef4c30535130" prot="public" static="no" const="no" explicit="yes" inline="no" virt="non-virtual">
         <type></type>
@@ -81,7 +82,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" line="149" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" line="149" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8_1a76e541ac766ba434f144ce05c172c9eb" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -94,7 +95,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" line="150" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" line="150" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8_1a65ccc3c8414add4b95186deb3cdf60c4" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -110,7 +111,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" line="151" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" line="151" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8_1aef47d530613f74da45eccf4cd21be982" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -126,7 +127,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" line="152" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" line="152" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8_1af003aa5121b4433e5aa3efc1b53e9086" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type><ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" kindref="compound">ReductionDescBuilder_v8</ref> &amp;</type>
@@ -142,7 +143,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" line="154" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" line="154" column="1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -150,60 +151,60 @@
     <detaileddescription>
 <para><ref refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8" kindref="compound">ReductionDescBuilder_v8</ref> Class Helper class used to build <ref refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8" kindref="compound">ReductionDesc_v8</ref> class </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="967">
+      <node id="1040">
         <label>cudnn_frontend::ReductionDescBuilder_v8</label>
         <link refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8"/>
-        <childnode refid="968" relation="usage">
+        <childnode refid="1041" relation="usage">
           <edgelabel>-m_reductionDesc</edgelabel>
         </childnode>
       </node>
-      <node id="972">
+      <node id="1045">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="974">
+      <node id="1047">
         <label>cudnnReduceTensorOp_t</label>
       </node>
-      <node id="968">
+      <node id="1041">
         <label>cudnn_frontend::ReductionDesc_v8</label>
         <link refid="d4/df1/classcudnn__frontend_1_1ReductionDesc__v8"/>
-        <childnode refid="969" relation="public-inheritance">
+        <childnode refid="1042" relation="public-inheritance">
         </childnode>
-        <childnode refid="974" relation="usage">
+        <childnode refid="1047" relation="usage">
           <edgelabel>-reduction_op</edgelabel>
         </childnode>
-        <childnode refid="975" relation="usage">
+        <childnode refid="1048" relation="usage">
           <edgelabel>-math_precision</edgelabel>
         </childnode>
       </node>
-      <node id="973">
+      <node id="1046">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="971">
+      <node id="1044">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="975">
+      <node id="1048">
         <label>cudnnDataType_t</label>
       </node>
-      <node id="969">
+      <node id="1042">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="970" relation="usage">
+        <childnode refid="1043" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="972" relation="usage">
+        <childnode refid="1045" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="973" relation="usage">
+        <childnode refid="1046" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="970">
+      <node id="1043">
         <label>std::string</label>
-        <childnode refid="971" relation="public-inheritance">
+        <childnode refid="1044" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" line="79" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ReductionDesc.h" bodystart="79" bodyend="158"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" line="78" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ReductionDesc.h" bodystart="78" bodyend="158"/>
     <listofallmembers>
       <member refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8_1a84355923606ae86f66264fbcc5c305ad" prot="public" virt="non-virtual"><scope>cudnn_frontend::ReductionDescBuilder_v8</scope><name>build</name></member>
       <member refid="d2/da0/classcudnn__frontend_1_1ReductionDescBuilder__v8_1a462f9f96ab258f9dfdb490de30ca9d22" prot="private" virt="non-virtual"><scope>cudnn_frontend::ReductionDescBuilder_v8</scope><name>m_reductionDesc</name></member>

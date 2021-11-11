@@ -15,7 +15,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" line="52" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="52" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfigGenerator.h" line="45" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="45" bodyend="-1"/>
       </memberdef>
       </sectiondef>
       <sectiondef kind="public-func">
@@ -38,7 +38,7 @@
 <para>Constructor that takes int a array of function pointers that will be called later. in the generate_engine_config function. </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" line="57" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="57" bodyend="61"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfigGenerator.h" line="50" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="50" bodyend="54"/>
       </memberdef>
       <memberdef kind="function" id="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a4b07b958f03daf033c30b9182fee372b" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -55,19 +55,20 @@
 <para>Calls the vector of engine_config_generators one by one and concatenates the generated engine together into a single list. </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" line="66" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="66" bodyend="74"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfigGenerator.h" line="59" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="59" bodyend="69"/>
+        <references refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" compoundref="d8/dc4/cudnn__frontend__Logging_8h" startline="72" endline="75">cudnn_frontend::getLogger</references>
       </memberdef>
-      <memberdef kind="function" id="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1ad6ca7e7263ed9b7597f94ca45505642f" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+      <memberdef kind="function" id="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a549f36645ef6134ff99909ca428dfc9c" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type>auto</type>
         <definition>auto cudnn_frontend::EngineConfigGenerator::cudnnGetPlan</definition>
-        <argsstring>(cudnnHandle_t handle, cudnn_frontend::OperationGraph &amp;&amp;opGraph, Predicate pred) -&gt; executionPlans_t</argsstring>
+        <argsstring>(cudnnHandle_t handle, cudnn_frontend::OperationGraph &amp;opGraph, Predicate pred) -&gt; executionPlans_t</argsstring>
         <name>cudnnGetPlan</name>
         <param>
           <type>cudnnHandle_t</type>
           <declname>handle</declname>
         </param>
         <param>
-          <type><ref refid="df/de1/namespacecudnn__frontend_1ac86ce924df5209c4ce1bc25856eea6e6" kindref="member">cudnn_frontend::OperationGraph</ref> &amp;&amp;</type>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1ac86ce924df5209c4ce1bc25856eea6e6" kindref="member">cudnn_frontend::OperationGraph</ref> &amp;</type>
           <declname>opGraph</declname>
         </param>
         <param>
@@ -80,10 +81,33 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" line="78" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_get_plan.h" bodystart="30" bodyend="46"/>
-        <references refid="df/de1/namespacecudnn__frontend_1a0f52559baeb4e9ee8835d95ea50a875e" compoundref="de/d1e/cudnn__frontend__EngineConfigGenerator_8h" startline="94" endline="102">cudnn_frontend::filter</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfigGenerator.h" line="73" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_get_plan.h" bodystart="50" bodyend="55"/>
+        <references refid="df/de1/namespacecudnn__frontend_1abcaf76bd6c7d8c59082fd53d2a8c897a" compoundref="de/d1e/cudnn__frontend__EngineConfigGenerator_8h" startline="106" endline="118">cudnn_frontend::filter</references>
       </memberdef>
-      <memberdef kind="function" id="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1abd7cdd3a218623ffc5dfcbf9343aef85" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+      <memberdef kind="function" id="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a8a43bb0f3643de138921a3a6c2908f45" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type>auto</type>
+        <definition>auto cudnn_frontend::EngineConfigGenerator::cudnnGetPlan</definition>
+        <argsstring>(cudnnHandle_t handle, cudnn_frontend::OperationGraph &amp;opGraph) -&gt; executionPlans_t</argsstring>
+        <name>cudnnGetPlan</name>
+        <param>
+          <type>cudnnHandle_t</type>
+          <declname>handle</declname>
+        </param>
+        <param>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1ac86ce924df5209c4ce1bc25856eea6e6" kindref="member">cudnn_frontend::OperationGraph</ref> &amp;</type>
+          <declname>opGraph</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfigGenerator.h" line="75" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_get_plan.h" bodystart="30" bodyend="47"/>
+        <references refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" compoundref="d8/dc4/cudnn__frontend__Logging_8h" startline="72" endline="75">cudnn_frontend::getLogger</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a939cf4181f94bc235363cc485beb1ce8" compoundref="df/d17/cudnn__frontend__utils_8h" startline="72" endline="98">cudnn_frontend::to_string</references>
+      </memberdef>
+      <memberdef kind="function" id="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a3b291ce5e552bf0c736be227065cd8ad" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <templateparamlist>
           <param>
             <type><ref refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3" kindref="member">CudnnFindSamplingTechnique</ref></type>
@@ -93,18 +117,18 @@
         </templateparamlist>
         <type>auto</type>
         <definition>auto cudnn_frontend::EngineConfigGenerator::cudnnFindPlan</definition>
-        <argsstring>(cudnnHandle_t handle, cudnn_frontend::OperationGraph &amp;&amp;opGraph, cudnn_frontend::VariantPack &amp;variantPack, Predicate pred) -&gt; executionOptions_t</argsstring>
+        <argsstring>(cudnnHandle_t handle, cudnn_frontend::OperationGraph &amp;opGraph, cudnn_frontend::VariantPack const &amp;variantPack, Predicate pred) -&gt; executionPlans_t</argsstring>
         <name>cudnnFindPlan</name>
         <param>
           <type>cudnnHandle_t</type>
           <declname>handle</declname>
         </param>
         <param>
-          <type><ref refid="df/de1/namespacecudnn__frontend_1ac86ce924df5209c4ce1bc25856eea6e6" kindref="member">cudnn_frontend::OperationGraph</ref> &amp;&amp;</type>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1ac86ce924df5209c4ce1bc25856eea6e6" kindref="member">cudnn_frontend::OperationGraph</ref> &amp;</type>
           <declname>opGraph</declname>
         </param>
         <param>
-          <type><ref refid="df/de1/namespacecudnn__frontend_1ad6ac8113b406ee2b6f20eff4dd2b4e01" kindref="member">cudnn_frontend::VariantPack</ref> &amp;</type>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1ad6ac8113b406ee2b6f20eff4dd2b4e01" kindref="member">cudnn_frontend::VariantPack</ref> const &amp;</type>
           <declname>variantPack</declname>
         </param>
         <param>
@@ -117,8 +141,80 @@
 <para>Reruns the concatenated plans and measures the execution time following which a sorted order of executionPlans are return to the user. </para>        </detaileddescription>
         <inbodydescription>
 <para>Creating a set of execution plans that are supported. </para>        </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" line="84" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_find_plan.h" bodystart="99" bodyend="118"/>
-        <references refid="df/de1/namespacecudnn__frontend_1a0f52559baeb4e9ee8835d95ea50a875e" compoundref="de/d1e/cudnn__frontend__EngineConfigGenerator_8h" startline="94" endline="102">cudnn_frontend::filter</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfigGenerator.h" line="82" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_find_plan.h" bodystart="117" bodyend="124"/>
+      </memberdef>
+      <memberdef kind="function" id="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a380e8426e6855e8e86405719aefeb905" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type><ref refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3" kindref="member">CudnnFindSamplingTechnique</ref></type>
+            <declname>samplingTechnique</declname>
+            <defname>samplingTechnique</defname>
+          </param>
+        </templateparamlist>
+        <type>auto</type>
+        <definition>auto cudnn_frontend::EngineConfigGenerator::cudnnFindPlan</definition>
+        <argsstring>(cudnnHandle_t handle, cudnn_frontend::OperationGraph &amp;opGraph, cudnn_frontend::VariantPack const &amp;variantPack) -&gt; executionPlans_t</argsstring>
+        <name>cudnnFindPlan</name>
+        <param>
+          <type>cudnnHandle_t</type>
+          <declname>handle</declname>
+        </param>
+        <param>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1ac86ce924df5209c4ce1bc25856eea6e6" kindref="member">cudnn_frontend::OperationGraph</ref> &amp;</type>
+          <declname>opGraph</declname>
+        </param>
+        <param>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1ad6ac8113b406ee2b6f20eff4dd2b4e01" kindref="member">cudnn_frontend::VariantPack</ref> const &amp;</type>
+          <declname>variantPack</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+<para>Creating a set of execution plans that are supported. </para>        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfigGenerator.h" line="89" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_find_plan.h" bodystart="107" bodyend="113"/>
+      </memberdef>
+      <memberdef kind="function" id="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a4c600ea0cacb969cb0d7168debc5ebc6" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type><ref refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3" kindref="member">CudnnFindSamplingTechnique</ref></type>
+            <declname>samplingTechnique</declname>
+            <defname>samplingTechnique</defname>
+          </param>
+        </templateparamlist>
+        <type>auto</type>
+        <definition>auto cudnn_frontend::EngineConfigGenerator::cudnnFindPlanAndCache</definition>
+        <argsstring>(cudnnHandle_t handle, cudnn_frontend::OperationGraph &amp;opGraph, cudnn_frontend::VariantPack const &amp;variantPack, cudnn_frontend::ExecutionPlanCache &amp;cache, Predicate pred=[](const cudnn_frontend::ExecutionPlan &amp;) {return false;}) -&gt; cudnn_frontend::ExecutionPlan</argsstring>
+        <name>cudnnFindPlanAndCache</name>
+        <param>
+          <type>cudnnHandle_t</type>
+          <declname>handle</declname>
+        </param>
+        <param>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1ac86ce924df5209c4ce1bc25856eea6e6" kindref="member">cudnn_frontend::OperationGraph</ref> &amp;</type>
+          <declname>opGraph</declname>
+        </param>
+        <param>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1ad6ac8113b406ee2b6f20eff4dd2b4e01" kindref="member">cudnn_frontend::VariantPack</ref> const &amp;</type>
+          <declname>variantPack</declname>
+        </param>
+        <param>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1ab36c7aba5bedf33ef3b51c955685d1ce" kindref="member">cudnn_frontend::ExecutionPlanCache</ref> &amp;</type>
+          <declname>cache</declname>
+        </param>
+        <param>
+          <type><ref refid="df/de1/namespacecudnn__frontend_1ad31f040777311d1d1a7a2490f23e026e" kindref="member">Predicate</ref></type>
+          <declname>pred</declname>
+          <defval>[](const <ref refid="df/de1/namespacecudnn__frontend_1a984c10aa29daac796444bda66bdef26e" kindref="member">cudnn_frontend::ExecutionPlan</ref> &amp;) {return false;}</defval>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+<para>Creating a set of execution plans that are supported.</para><para>Check if the fastest plan is stable enough to be added to the plan cache </para>        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfigGenerator.h" line="95" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_find_plan.h" bodystart="128" bodyend="140"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -126,39 +222,42 @@
     <detaileddescription>
 <para><ref refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator" kindref="compound">EngineConfigGenerator</ref> class Contains a vector of methods that generate a vector of backend descriptor that can be used to create a plan for the method. </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="195">
+      <node id="206">
         <label>std::vector&lt; GeneratorSource &gt;</label>
-        <childnode refid="196" relation="usage">
+        <childnode refid="207" relation="usage">
           <edgelabel>+elements</edgelabel>
         </childnode>
-        <childnode refid="197" relation="template-instance">
+        <childnode refid="208" relation="template-instance">
           <edgelabel>&lt; GeneratorSource &gt;</edgelabel>
         </childnode>
       </node>
-      <node id="198">
+      <node id="209">
         <label>T</label>
       </node>
-      <node id="197">
+      <node id="208">
         <label>std::vector&lt; T &gt;</label>
-        <childnode refid="198" relation="usage">
+        <childnode refid="209" relation="usage">
           <edgelabel>+elements</edgelabel>
         </childnode>
       </node>
-      <node id="196">
+      <node id="207">
         <label>GeneratorSource</label>
       </node>
-      <node id="194">
+      <node id="205">
         <label>cudnn_frontend::EngineConfigGenerator</label>
         <link refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator"/>
-        <childnode refid="195" relation="usage">
+        <childnode refid="206" relation="usage">
           <edgelabel>-engine_config_generators</edgelabel>
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" line="50" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="50" bodyend="88"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfigGenerator.h" line="43" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfigGenerator.h" bodystart="43" bodyend="100"/>
     <listofallmembers>
-      <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1abd7cdd3a218623ffc5dfcbf9343aef85" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineConfigGenerator</scope><name>cudnnFindPlan</name></member>
-      <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1ad6ca7e7263ed9b7597f94ca45505642f" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineConfigGenerator</scope><name>cudnnGetPlan</name></member>
+      <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a3b291ce5e552bf0c736be227065cd8ad" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineConfigGenerator</scope><name>cudnnFindPlan</name></member>
+      <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a380e8426e6855e8e86405719aefeb905" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineConfigGenerator</scope><name>cudnnFindPlan</name></member>
+      <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a4c600ea0cacb969cb0d7168debc5ebc6" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineConfigGenerator</scope><name>cudnnFindPlanAndCache</name></member>
+      <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a549f36645ef6134ff99909ca428dfc9c" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineConfigGenerator</scope><name>cudnnGetPlan</name></member>
+      <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a8a43bb0f3643de138921a3a6c2908f45" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineConfigGenerator</scope><name>cudnnGetPlan</name></member>
       <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a1a06febdf947e151276bf09947c62436" prot="private" virt="non-virtual"><scope>cudnn_frontend::EngineConfigGenerator</scope><name>engine_config_generators</name></member>
       <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a322221ec9a28f1f48c5a3edf60adff1d" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineConfigGenerator</scope><name>EngineConfigGenerator</name></member>
       <member refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a4b07b958f03daf033c30b9182fee372b" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineConfigGenerator</scope><name>generate_engine_config</name></member>

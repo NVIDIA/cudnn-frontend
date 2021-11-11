@@ -15,7 +15,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="222" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" bodystart="222" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" line="223" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" bodystart="223" bodyend="-1"/>
       </memberdef>
       </sectiondef>
       <sectiondef kind="public-func">
@@ -34,7 +34,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="145" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" bodystart="145" bodyend="149"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" line="145" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" bodystart="145" bodyend="149"/>
       </memberdef>
       <memberdef kind="function" id="dc/d99/group__EngineHeuristicsBuilder__v8_1gaf2d783ca6a663aa50ffed2ccbc164812" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -51,7 +51,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="152" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" bodystart="152" bodyend="155"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" line="152" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" bodystart="152" bodyend="155"/>
       </memberdef>
       <memberdef kind="function" id="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1ab3ff1b538521fdea588d8ac155f6e88c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref> &amp;&amp;</type>
@@ -64,11 +64,12 @@
 <para>constructs the <ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref> by calling the cudnn API Throws the appropriate error message </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="161" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" bodystart="161" bodyend="212"/>
-        <references refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a44df29e58afe4b8fdc894574eb5efb9e" compoundref="db/d66/cudnn__frontend__Heuristics_8h" startline="47">cudnn_frontend::EngineHeuristics_v8::EngineHeuristicsBuilder_v8</references>
-        <references refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a2301c5b006fa6e341bc88ece066f8ea2">cudnn_frontend::EngineHeuristics_v8::operator=</references>
-        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
-        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="158">cudnn_frontend::BackendDescriptor::status</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" line="161" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" bodystart="161" bodyend="213"/>
+        <references refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a44df29e58afe4b8fdc894574eb5efb9e" compoundref="db/d66/cudnn__frontend__Heuristics_8h" startline="49">cudnn_frontend::EngineHeuristics_v8::EngineHeuristicsBuilder_v8</references>
+        <references refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" compoundref="d8/dc4/cudnn__frontend__Logging_8h" startline="72" endline="75">cudnn_frontend::getLogger</references>
+        <references refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a9f9a992e9b0e287d9c1e068e63f3640b">cudnn_frontend::EngineHeuristics_v8::operator=</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="138" endline="147">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="160">cudnn_frontend::BackendDescriptor::status</references>
       </memberdef>
       <memberdef kind="function" id="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1a5667e4567520189eaa96fcd6e934cb29" prot="public" static="no" const="no" explicit="yes" inline="no" virt="non-virtual">
         <type></type>
@@ -81,7 +82,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="214" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" line="215" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1a8740e967b981abf94dc2c53eb8786ceb" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -94,7 +95,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="215" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" line="216" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1af5318bb3e2700f53e299f8526e7a524f" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -110,7 +111,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="216" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" line="217" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1a19d632b9f96c91bad2b18446cf32f491" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -126,7 +127,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="217" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" line="218" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1a5228a4a3af391fad0141f30a24be730b" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type><ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref> &amp;</type>
@@ -142,7 +143,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="219" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" line="220" column="1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -150,84 +151,84 @@
     <detaileddescription>
 <para><ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref> Class Helper class used to build <ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref> class </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="246">
+      <node id="257">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="251">
+      <node id="262">
         <label>T</label>
       </node>
-      <node id="250">
+      <node id="261">
         <label>std::vector&lt; T &gt;</label>
-        <childnode refid="251" relation="usage">
+        <childnode refid="262" relation="usage">
           <edgelabel>+elements</edgelabel>
-        </childnode>
-      </node>
-      <node id="241">
-        <label>cudnn_frontend::EngineHeuristicsBuilder_v8</label>
-        <link refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8"/>
-        <childnode refid="242" relation="usage">
-          <edgelabel>-m_heuristics</edgelabel>
-        </childnode>
-      </node>
-      <node id="247">
-        <label>cudnnStatus_t</label>
-      </node>
-      <node id="248">
-        <label>std::vector&lt; ManagedOpaqueDescriptor &gt;</label>
-        <childnode refid="249" relation="usage">
-          <edgelabel>+elements</edgelabel>
-        </childnode>
-        <childnode refid="250" relation="template-instance">
-          <edgelabel>&lt; ManagedOpaqueDescriptor &gt;</edgelabel>
-        </childnode>
-      </node>
-      <node id="245">
-        <label>std::basic_string&lt; char &gt;</label>
-      </node>
-      <node id="242">
-        <label>cudnn_frontend::EngineHeuristics_v8</label>
-        <link refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8"/>
-        <childnode refid="243" relation="public-inheritance">
-        </childnode>
-        <childnode refid="248" relation="usage">
-          <edgelabel>-m_heuristic_results</edgelabel>
-        </childnode>
-        <childnode refid="252" relation="usage">
-          <edgelabel>-mode</edgelabel>
-        </childnode>
-        <childnode refid="244" relation="usage">
-          <edgelabel>-opGraphTag</edgelabel>
-        </childnode>
-        <childnode refid="246" relation="usage">
-          <edgelabel>-opGraph</edgelabel>
-        </childnode>
-      </node>
-      <node id="249">
-        <label>ManagedOpaqueDescriptor</label>
-      </node>
-      <node id="243">
-        <label>cudnn_frontend::BackendDescriptor</label>
-        <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="244" relation="usage">
-          <edgelabel>#err_msg</edgelabel>
-        </childnode>
-        <childnode refid="246" relation="usage">
-          <edgelabel>#pointer</edgelabel>
-        </childnode>
-        <childnode refid="247" relation="usage">
-          <edgelabel>#status</edgelabel>
         </childnode>
       </node>
       <node id="252">
+        <label>cudnn_frontend::EngineHeuristicsBuilder_v8</label>
+        <link refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8"/>
+        <childnode refid="253" relation="usage">
+          <edgelabel>-m_heuristics</edgelabel>
+        </childnode>
+      </node>
+      <node id="258">
+        <label>cudnnStatus_t</label>
+      </node>
+      <node id="259">
+        <label>std::vector&lt; ManagedOpaqueDescriptor &gt;</label>
+        <childnode refid="260" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+        <childnode refid="261" relation="template-instance">
+          <edgelabel>&lt; ManagedOpaqueDescriptor &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="256">
+        <label>std::basic_string&lt; char &gt;</label>
+      </node>
+      <node id="253">
+        <label>cudnn_frontend::EngineHeuristics_v8</label>
+        <link refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8"/>
+        <childnode refid="254" relation="public-inheritance">
+        </childnode>
+        <childnode refid="259" relation="usage">
+          <edgelabel>-m_heuristic_results</edgelabel>
+        </childnode>
+        <childnode refid="263" relation="usage">
+          <edgelabel>-mode</edgelabel>
+        </childnode>
+        <childnode refid="255" relation="usage">
+          <edgelabel>-opGraphTag</edgelabel>
+        </childnode>
+        <childnode refid="257" relation="usage">
+          <edgelabel>-opGraph</edgelabel>
+        </childnode>
+      </node>
+      <node id="260">
+        <label>ManagedOpaqueDescriptor</label>
+      </node>
+      <node id="254">
+        <label>cudnn_frontend::BackendDescriptor</label>
+        <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
+        <childnode refid="255" relation="usage">
+          <edgelabel>#err_msg</edgelabel>
+        </childnode>
+        <childnode refid="257" relation="usage">
+          <edgelabel>#pointer</edgelabel>
+        </childnode>
+        <childnode refid="258" relation="usage">
+          <edgelabel>#status</edgelabel>
+        </childnode>
+      </node>
+      <node id="263">
         <label>cudnnBackendHeurMode_t</label>
       </node>
-      <node id="244">
+      <node id="255">
         <label>std::string</label>
-        <childnode refid="245" relation="public-inheritance">
+        <childnode refid="256" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="137" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" bodystart="137" bodyend="223"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" line="137" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" bodystart="137" bodyend="224"/>
     <listofallmembers>
       <member refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1ab3ff1b538521fdea588d8ac155f6e88c" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineHeuristicsBuilder_v8</scope><name>build</name></member>
       <member refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1a5667e4567520189eaa96fcd6e934cb29" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineHeuristicsBuilder_v8</scope><name>EngineHeuristicsBuilder_v8</name></member>

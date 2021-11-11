@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cudnn_frontend_EngineConfigGenerator.h>
+#include <iomanip>
 #include <set>
 
 namespace cudnn_frontend {
@@ -58,7 +59,10 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const
 
         // Warm-up run
         auto warmup_status = ::cudnnBackendExecute(handle, plan.get_raw_desc(), variantPack.get_raw_desc());
-        if (warmup_status != CUDNN_STATUS_SUCCESS) {continue;}
+        if (warmup_status != CUDNN_STATUS_SUCCESS) {
+            getLogger() << "[cudnn_frontend] Plan " << plan.getTag() << " failed with " << to_string(warmup_status) << std::endl;
+            continue;
+        }
         cudaDeviceSynchronize();
 
         for (int i = 0; i < maxIterCount; i++) {
@@ -81,6 +85,7 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const
                 final_time_ms = i == (maxIterCount / 2) ? time_ms : final_time_ms;
             }
         }
+        getLogger() << "[cudnn_frontend] Plan " << plan.getTag() << " took " << std::setw(10) << final_time_ms << std::endl;
         plan.setExecutionTime(final_time_ms);
         timed_execution_plans.insert(plan);
     }
@@ -91,6 +96,8 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
+    
+    getLogger() << "[cudnn_frontend] Auto-tuning returns " << time_sorted_plans.size() << " plans." << std::endl;
 
     return time_sorted_plans;
 }
@@ -115,4 +122,21 @@ EngineConfigGenerator::cudnnFindPlan(cudnnHandle_t handle,
     executionPlans_t plans = cudnnGetPlan(handle, opGraph, pred);
     return time_sorted_plan<samplingTechnique>(handle, std::move(plans), variantPack);
 }
+
+template <CudnnFindSamplingTechnique samplingTechnique>
+auto
+EngineConfigGenerator::cudnnFindPlanAndCache(cudnnHandle_t handle,
+                                     cudnn_frontend::OperationGraph &opGraph,
+                                     cudnn_frontend::VariantPack const &variantPack,
+                                     cudnn_frontend::ExecutionPlanCache &cache,
+                                     Predicate pred) -> cudnn_frontend::ExecutionPlan {
+    /// Creating a set of execution plans that are supported.
+    auto sorted_plans = cudnnFindPlan<samplingTechnique>(handle, opGraph, variantPack, pred);
+    /// Check if the fastest plan is stable enough to be added to the plan cache
+    if (cache.is_fastest_plan_stable(opGraph, sorted_plans.front().getTag())) {
+        cache.add_plan_to_cache(opGraph, sorted_plans.front());
+    }
+    return sorted_plans.front();
+}
+
 }

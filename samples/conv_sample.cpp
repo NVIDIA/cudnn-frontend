@@ -287,9 +287,10 @@ run_from_heuristics(int64_t* x_dim,
                     float* devPtrX,
                     float* devPtrW,
                     float* devPtrY,
-                    cudnnBackendHeurMode_t heur_mode) {
+                    cudnnBackendHeurMode_t heur_mode,
+                    bool expect_in_cache) {
     cudnnHandle_t handle_;
-
+    static cudnn_frontend::ExecutionPlanCache plan_cache("sample_cache");
     try {
         checkCudnnErr(cudnnCreate(&handle_));
         common_conv_descriptors descriptors = create_common_descriptors(
@@ -303,51 +304,61 @@ run_from_heuristics(int64_t* x_dim,
         auto opGraph =
             create_operation_graph(descriptors, CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR, handle_);
         std::cout << opGraph.describe() << std::endl;
-
-        auto heuristics = cudnn_frontend::EngineHeuristicsBuilder()
-                              .setOperationGraph(opGraph)
-                              .setHeurMode(heur_mode)
-                              .build();
-
-        std::cout << "Heuristic has " << heuristics.getEngineConfigCount() << " configurations " << std::endl;
-        auto& engine_config = heuristics.getEngineConfig(heuristics.getEngineConfigCount());
-
-        auto plan_builder = [&]() -> cudnn_frontend::ExecutionPlan {
-            for (auto &ecfg : engine_config) {
-                try {
-                    auto plan = cudnn_frontend::ExecutionPlanBuilder().setHandle(handle_).setEngineConfig(ecfg, opGraph.getTag()).build();
-                    return plan;
-                } catch (cudnn_frontend::cudnnException &e) {
-                    continue;
-                }
-            }
-            return cudnn_frontend::ExecutionPlanBuilder().setHandle(handle_).setEngineConfig(engine_config[0], opGraph.getTag()).build();
-        };
-
-        auto plan = plan_builder();
-       
-        std::cout << "Plan tag: " << plan.getTag() << std::endl;
-
-        auto workspace_size = plan.getWorkspaceSize();
-        std::cout << plan.describe() << " requires workspace " << workspace_size << std::endl;
-        void* workspace_ptr = nullptr;
-        if (workspace_size > 0) {
-            checkCudaErr(cudaMalloc(&workspace_ptr, workspace_size));
-        }
         void* data_ptrs[] = {devPtrX, devPtrY, devPtrW};
         int64_t uids[]    = {'x', 'y', 'w'};
-        auto variantPack  = cudnn_frontend::VariantPackBuilder()
-                               .setWorkspacePointer(workspace_ptr)
-                               .setDataPointers(3, data_ptrs)
-                               .setUids(3, uids)
-                               .build();
-        std::cout << "variantPack " << variantPack.describe() << std::endl;
-        cudnnStatus_t status = cudnnBackendExecute(handle_, plan.get_raw_desc(), variantPack.get_raw_desc());
-        if (workspace_size > 0) {
-            checkCudaErr(cudaFree(workspace_ptr));
-        }
-        cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
+        const cudnn_frontend::ExecutionPlan *cached_plan;
+        if (plan_cache.get_plan_from_cache(opGraph, cached_plan)) {
+            std::cout << "Cached execution plan found." << cached_plan->getTag() << std::endl;
+            auto workspace_size = cached_plan->getWorkspaceSize();
+            std::cout << cached_plan->describe() << " requires workspace " << workspace_size << std::endl;
+            void* workspace_ptr = nullptr;
+            if (workspace_size > 0) {
+                checkCudaErr(cudaMalloc(&workspace_ptr, workspace_size));
+            }
+            auto variantPack  = cudnn_frontend::VariantPackBuilder()
+                    .setWorkspacePointer(workspace_ptr)
+                    .setDataPointers(3, data_ptrs)
+                    .setUids(3, uids)
+                    .build();
+            std::cout << "variantPack " << variantPack.describe() << std::endl;
+            cudnnStatus_t status = cudnnBackendExecute(handle_, cached_plan->get_raw_desc(), variantPack.get_raw_desc());
+
+            if (workspace_size > 0) {
+                checkCudaErr(cudaFree(workspace_ptr));
+            }
+            cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
+        } else { 
+            REQUIRE(false == expect_in_cache);
+            std::array<cudnn_frontend::GeneratorSource const, 1> sources = {heurgen_method};
+            cudnn_frontend::EngineConfigGenerator generator(sources.size(), sources.data());
+
+            auto workspace_size = 100 * 1024 * 1024; // 100 MB
+            void* workspace_ptr = nullptr;
+            if (workspace_size > 0) {
+                checkCudaErr(cudaMalloc(&workspace_ptr, workspace_size));
+            }
+
+            auto variantPack  = cudnn_frontend::VariantPackBuilder()
+                                .setWorkspacePointer(workspace_ptr)
+                                .setDataPointers(3, data_ptrs)
+                                .setUids(3, uids)
+                                .build();
+            std::cout << "variantPack " << variantPack.describe() << std::endl;
+
+            auto plan = generator.cudnnFindPlanAndCache<cudnn_frontend::CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_MEDIAN_OF_THREE>(
+                handle_, opGraph, variantPack, plan_cache);
+
+            std::cout << "Plan tag: " << plan.getTag() << " finished in " << plan.getExecutionTime() << " ms,"
+                    << " workspace: " << plan.getWorkspaceSize() << " bytes" << std::endl;
+
+            cudnnStatus_t status = cudnnBackendExecute(handle_, plan.get_raw_desc(), variantPack.get_raw_desc());
+
+            if (workspace_size > 0) {
+                checkCudaErr(cudaFree(workspace_ptr));
+            }
+            cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
+        }
     } catch (cudnn_frontend::cudnnException &e) {
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
         CHECK(false);
@@ -1231,6 +1242,9 @@ run_imma(
                                        .setId('w')
                                        .setAlignment(16)
                                        .setDataType(CUDNN_DATA_INT8)
+#if (CUDNN_VERSION >= 8300)
+                                       .setReorderType(CUDNN_TENSOR_REORDERING_INT8x32)
+#endif
                                        .setVectorCountAndDimension(vectorCount, vectorDimension)
                                        .build();
         auto conv_desc = cudnn_frontend::ConvDescBuilder()
@@ -1318,7 +1332,7 @@ run_imma(
                       "engine"              : 0, 
                       "knob"                : [],
                       "cudnn_version_start" : 8000, 
-                      "cudnn_version_end"   : -1 
+                      "cudnn_version_end"   : 8300 
                     }
                 ] 
             })");

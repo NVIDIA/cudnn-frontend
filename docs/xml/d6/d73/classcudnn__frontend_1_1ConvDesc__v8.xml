@@ -16,16 +16,16 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="56" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="56" bodyend="-1"/>
-        <referencedby refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1a01f709a3efafaca70de6565817c43beb" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="172" endline="304">cudnn_frontend::ConvDescBuilder_v8::build</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="56" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="56" bodyend="-1"/>
+        <referencedby refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1a01f709a3efafaca70de6565817c43beb" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="198" endline="331">cudnn_frontend::ConvDescBuilder_v8::build</referencedby>
       </memberdef>
       </sectiondef>
       <sectiondef kind="private-attrib">
-      <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a4a0249ac1d094f9a70967dd69b824f2e" prot="private" static="no" mutable="no">
+      <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a1fca959ebca6cf2f1c90c7df019bb375" prot="private" static="no" mutable="no">
         <type>cudnnDataType_t</type>
-        <definition>cudnnDataType_t cudnn_frontend::ConvDesc_v8::data_type</definition>
+        <definition>cudnnDataType_t cudnn_frontend::ConvDesc_v8::compute_precision</definition>
         <argsstring></argsstring>
-        <name>data_type</name>
+        <name>compute_precision</name>
         <initializer>= CUDNN_DATA_FLOAT</initializer>
         <briefdescription>
         </briefdescription>
@@ -33,8 +33,9 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="107" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="107" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="129" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="129" bodyend="-1"/>
         <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a7693d45cf5cac83296ba06489f9fe3b2" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="95" endline="97">getComputePrecision</referencedby>
       </memberdef>
       <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1adcb7e5f546b83bbdab63773030e3b909" prot="private" static="no" mutable="no">
         <type>cudnnConvolutionMode_t</type>
@@ -48,8 +49,9 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="108" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="108" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="130" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="130" bodyend="-1"/>
         <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a94dffd0ad95a582e6a143fa6f43ac604" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="118" endline="120">getMathMode</referencedby>
       </memberdef>
       <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a9b478d1207d8241ff67cc931754cd6cf" prot="private" static="no" mutable="no">
         <type>int64_t</type>
@@ -63,8 +65,9 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="109" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="109" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="131" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="131" bodyend="-1"/>
         <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac964fa8d073d71590a775a878b96a9bc" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="100" endline="102">getDimensionCount</referencedby>
       </memberdef>
       <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aff824fb1cf44c188a7400b017458327e" prot="private" static="no" mutable="no">
         <type>int64_t</type>
@@ -78,9 +81,9 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="110" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="110" bodyend="-1"/>
-        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="132" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="132" bodyend="-1"/>
         <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a4866bd1b4246d0f86916c947a3e7b674" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="105" endline="107">getPadding</referencedby>
       </memberdef>
       <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a28e6ad906bf25653c87525f9f8e90a28" prot="private" static="no" mutable="no">
         <type>int64_t</type>
@@ -89,13 +92,12 @@
         <name>padUpper</name>
         <initializer>= {0}</initializer>
         <briefdescription>
-<para>n, g, c, d, h, w </para>        </briefdescription>
+<para>d, h, w </para>        </briefdescription>
         <detaileddescription>
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="111" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="111" bodyend="-1"/>
-        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="133" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="133" bodyend="-1"/>
         <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
       </memberdef>
       <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a81e03a2a385d24a2faaf3db249580ac6" prot="private" static="no" mutable="no">
@@ -105,15 +107,15 @@
         <name>dilation</name>
         <initializer>= {0}</initializer>
         <briefdescription>
-<para>n, g, c, d, h, w </para>        </briefdescription>
+<para>d, h, w </para>        </briefdescription>
         <detaileddescription>
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="112" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="112" bodyend="-1"/>
-        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="134" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="134" bodyend="-1"/>
         <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
-        <referencedby refid="d3/ddd/group__ConvDescBuilder__v8_1gaa41e2cbbebc9d2fd19fa990a48b39d08" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="145" endline="148">cudnn_frontend::ConvDescBuilder_v8::setDilation</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a58682b1a0b0d1b0977f1bc60012fee6b" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="113" endline="115">getDilation</referencedby>
+        <referencedby refid="d3/ddd/group__ConvDescBuilder__v8_1gaa41e2cbbebc9d2fd19fa990a48b39d08" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="171" endline="174">cudnn_frontend::ConvDescBuilder_v8::setDilation</referencedby>
       </memberdef>
       <memberdef kind="variable" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac513728c785a54ef86612a0bd6fa0f1a" prot="private" static="no" mutable="no">
         <type>int64_t</type>
@@ -122,14 +124,14 @@
         <name>stride</name>
         <initializer>= {-1}</initializer>
         <briefdescription>
-<para>n, g, c, d, h, w </para>        </briefdescription>
+<para>d, h, w </para>        </briefdescription>
         <detaileddescription>
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="113" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="113" bodyend="-1"/>
-        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="135" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="135" bodyend="-1"/>
         <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a886df2a3df06170c1f086d4ebed0284c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="109" endline="111">getStride</referencedby>
       </memberdef>
       </sectiondef>
       <sectiondef kind="public-func">
@@ -145,20 +147,24 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="58" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="58" bodyend="86"/>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a4a0249ac1d094f9a70967dd69b824f2e" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="107">data_type</references>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a81e03a2a385d24a2faaf3db249580ac6" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="112">dilation</references>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1adcb7e5f546b83bbdab63773030e3b909" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="108">mode</references>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a9b478d1207d8241ff67cc931754cd6cf" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="109">nDims</references>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aff824fb1cf44c188a7400b017458327e" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="110">padLower</references>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a28e6ad906bf25653c87525f9f8e90a28" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="111">padUpper</references>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac513728c785a54ef86612a0bd6fa0f1a" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="113">stride</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="58" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="58" bodyend="86"/>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a1fca959ebca6cf2f1c90c7df019bb375" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="129">compute_precision</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a5c892fb76fbf9e4bfffdb5288f9d60ad">ConvDesc_v8</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a81e03a2a385d24a2faaf3db249580ac6" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="134">dilation</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1adcb7e5f546b83bbdab63773030e3b909" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="130">mode</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a9b478d1207d8241ff67cc931754cd6cf" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="131">nDims</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a9572980b24824da18aa82da4ad6c3052">operator=</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aff824fb1cf44c188a7400b017458327e" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="132">padLower</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a28e6ad906bf25653c87525f9f8e90a28" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="133">padUpper</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac513728c785a54ef86612a0bd6fa0f1a" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="135">stride</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a939cf4181f94bc235363cc485beb1ce8" compoundref="df/d17/cudnn__frontend__utils_8h" startline="72" endline="98">cudnn_frontend::to_string</references>
         <references refid="d3/d9b/namespacenlohmann_1a6ce645a0b8717757e096a5b5773b7a16" compoundref="d5/db8/json_8hpp" startline="25855" endline="25858">nlohmann::to_string</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d930ada709a855c86b2857a1b155d02">~ConvDesc_v8</references>
       </memberdef>
-      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a8733eb0efcbcd8a30535445372675837" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
         <definition>cudnn_frontend::ConvDesc_v8::ConvDesc_v8</definition>
-        <argsstring>(ConvDesc_v8 &amp;&amp;from)</argsstring>
+        <argsstring>(ConvDesc_v8 &amp;&amp;from)=default</argsstring>
         <name>ConvDesc_v8</name>
         <param>
           <type><ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kindref="compound">ConvDesc_v8</ref> &amp;&amp;</type>
@@ -170,14 +176,26 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="88" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="88" bodyend="97"/>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a5c892fb76fbf9e4bfffdb5288f9d60ad">ConvDesc_v8</references>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a81e03a2a385d24a2faaf3db249580ac6" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="112">dilation</references>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aa8ea272eaf26ae7f7ad2d625253ea62f">operator=</references>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aff824fb1cf44c188a7400b017458327e" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="110">padLower</references>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a28e6ad906bf25653c87525f9f8e90a28" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="111">padUpper</references>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac513728c785a54ef86612a0bd6fa0f1a" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="113">stride</references>
-        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d930ada709a855c86b2857a1b155d02">~ConvDesc_v8</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="88" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a9572980b24824da18aa82da4ad6c3052" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kindref="compound">ConvDesc_v8</ref> &amp;</type>
+        <definition>ConvDesc_v8&amp; cudnn_frontend::ConvDesc_v8::operator=</definition>
+        <argsstring>(ConvDesc_v8 &amp;&amp;)=default</argsstring>
+        <name>operator=</name>
+        <param>
+          <type><ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kindref="compound">ConvDesc_v8</ref> &amp;&amp;</type>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="90" column="1"/>
+        <referencedby refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1a01f709a3efafaca70de6565817c43beb" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="198" endline="331">cudnn_frontend::ConvDescBuilder_v8::build</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a94dffd0ad95a582e6a143fa6f43ac604" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="118" endline="120">getMathMode</referencedby>
       </memberdef>
       <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d930ada709a855c86b2857a1b155d02" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -190,8 +208,95 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="99" column="1"/>
-        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="92" column="1"/>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a7693d45cf5cac83296ba06489f9fe3b2" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>cudnnDataType_t</type>
+        <definition>cudnnDataType_t cudnn_frontend::ConvDesc_v8::getComputePrecision</definition>
+        <argsstring>() const</argsstring>
+        <name>getComputePrecision</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="95" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="95" bodyend="97"/>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a1fca959ebca6cf2f1c90c7df019bb375" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="129">compute_precision</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac964fa8d073d71590a775a878b96a9bc" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>int64_t</type>
+        <definition>int64_t cudnn_frontend::ConvDesc_v8::getDimensionCount</definition>
+        <argsstring>() const</argsstring>
+        <name>getDimensionCount</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="100" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="100" bodyend="102"/>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a9b478d1207d8241ff67cc931754cd6cf" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="131">nDims</references>
+        <referencedby refid="df/de1/namespacecudnn__frontend_1a5db7b16691678ccc7926338faf2023af" compoundref="d9/da8/cudnn__frontend__Reorder__Tensor_8h" startline="39" endline="92">cudnn_frontend::cudnnReorderFilterAndBiasInt8x32</referencedby>
+      </memberdef>
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a4866bd1b4246d0f86916c947a3e7b674" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>int64_t const  *</type>
+        <definition>int64_t const* cudnn_frontend::ConvDesc_v8::getPadding</definition>
+        <argsstring>() const</argsstring>
+        <name>getPadding</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="105" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="105" bodyend="107"/>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aff824fb1cf44c188a7400b017458327e" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="132">padLower</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a886df2a3df06170c1f086d4ebed0284c" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>int64_t const  *</type>
+        <definition>int64_t const* cudnn_frontend::ConvDesc_v8::getStride</definition>
+        <argsstring>() const</argsstring>
+        <name>getStride</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="109" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="109" bodyend="111"/>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac513728c785a54ef86612a0bd6fa0f1a" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="135">stride</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a58682b1a0b0d1b0977f1bc60012fee6b" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>int64_t const  *</type>
+        <definition>int64_t const* cudnn_frontend::ConvDesc_v8::getDilation</definition>
+        <argsstring>() const</argsstring>
+        <name>getDilation</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="113" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="113" bodyend="115"/>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a81e03a2a385d24a2faaf3db249580ac6" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="134">dilation</references>
+      </memberdef>
+      <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a94dffd0ad95a582e6a143fa6f43ac604" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>cudnnConvolutionMode_t</type>
+        <definition>cudnnConvolutionMode_t cudnn_frontend::ConvDesc_v8::getMathMode</definition>
+        <argsstring>() const</argsstring>
+        <name>getMathMode</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="118" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="118" bodyend="120"/>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a5c892fb76fbf9e4bfffdb5288f9d60ad">ConvDesc_v8</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1adcb7e5f546b83bbdab63773030e3b909" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="130">mode</references>
+        <references refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a9572980b24824da18aa82da4ad6c3052">operator=</references>
       </memberdef>
       </sectiondef>
       <sectiondef kind="private-func">
@@ -206,8 +311,9 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="102" column="1"/>
-        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="124" column="1"/>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">describe</referencedby>
+        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a94dffd0ad95a582e6a143fa6f43ac604" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="118" endline="120">getMathMode</referencedby>
       </memberdef>
       <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a061ef887bdf383d416ee143a35d5c334" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -223,7 +329,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="103" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="125" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aa8ea272eaf26ae7f7ad2d625253ea62f" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type><ref refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8" kindref="compound">ConvDesc_v8</ref> &amp;</type>
@@ -239,9 +345,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="105" column="1"/>
-        <referencedby refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8_1a01f709a3efafaca70de6565817c43beb" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="172" endline="304">cudnn_frontend::ConvDescBuilder_v8::build</referencedby>
-        <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="88" endline="97">ConvDesc_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="127" column="1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -251,83 +355,83 @@
 <listitem><para>padLower</para></listitem><listitem><para>padUpper</para></listitem><listitem><para>Dilation</para></listitem><listitem><para>Stride</para></listitem><listitem><para>Math Operation Data Type</para></listitem><listitem><para>Convolution Mode</para></listitem><listitem><para>Convolution spatial dimensions</para></listitem></itemizedlist>
 </para><para>Use <ref refid="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8" kindref="compound">ConvDescBuilder_v8</ref> to build this class. Describe returns a string describing the convolution operation </para>    </detaileddescription>
     <inheritancegraph>
-      <node id="96">
+      <node id="104">
         <label>cudnn_frontend::ConvDesc_v8</label>
         <link refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8"/>
-        <childnode refid="97" relation="public-inheritance">
+        <childnode refid="105" relation="public-inheritance">
         </childnode>
       </node>
-      <node id="97">
+      <node id="105">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
       </node>
     </inheritancegraph>
     <collaborationgraph>
-      <node id="102">
+      <node id="110">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="105">
+      <node id="113">
         <label>cudnnConvolutionMode_t</label>
       </node>
-      <node id="98">
+      <node id="106">
         <label>cudnn_frontend::ConvDesc_v8</label>
         <link refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8"/>
-        <childnode refid="99" relation="public-inheritance">
+        <childnode refid="107" relation="public-inheritance">
         </childnode>
-        <childnode refid="104" relation="usage">
+        <childnode refid="112" relation="usage">
           <edgelabel>-padUpper</edgelabel>
           <edgelabel>-nDims</edgelabel>
           <edgelabel>-stride</edgelabel>
           <edgelabel>-dilation</edgelabel>
           <edgelabel>-padLower</edgelabel>
         </childnode>
-        <childnode refid="105" relation="usage">
+        <childnode refid="113" relation="usage">
           <edgelabel>-mode</edgelabel>
         </childnode>
-        <childnode refid="106" relation="usage">
-          <edgelabel>-data_type</edgelabel>
+        <childnode refid="114" relation="usage">
+          <edgelabel>-compute_precision</edgelabel>
         </childnode>
       </node>
-      <node id="103">
+      <node id="111">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="101">
+      <node id="109">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="106">
+      <node id="114">
         <label>cudnnDataType_t</label>
       </node>
-      <node id="104">
+      <node id="112">
         <label>int64_t</label>
       </node>
-      <node id="99">
+      <node id="107">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="100" relation="usage">
+        <childnode refid="108" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="102" relation="usage">
+        <childnode refid="110" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="103" relation="usage">
+        <childnode refid="111" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="100">
+      <node id="108">
         <label>std::string</label>
-        <childnode refid="101" relation="public-inheritance">
+        <childnode refid="109" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" line="54" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ConvDesc.h" bodystart="54" bodyend="114"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" line="54" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ConvDesc.h" bodystart="54" bodyend="136"/>
     <listofallmembers>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8aa93686ca88410fc048b05155148183" prot="protected" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>BackendDescriptor</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a5765369a5739c2ea81c4f39ce2d1c46e" prot="protected" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>BackendDescriptor</name></member>
-      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a592e3a28fd7a8b2553789801d9bd276c" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>ConvDesc_v8</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a1fca959ebca6cf2f1c90c7df019bb375" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>compute_precision</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a8733eb0efcbcd8a30535445372675837" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>ConvDesc_v8</name></member>
       <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a5c892fb76fbf9e4bfffdb5288f9d60ad" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>ConvDesc_v8</name></member>
       <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a061ef887bdf383d416ee143a35d5c334" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>ConvDesc_v8</name></member>
       <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a00c454e18392653a023f75275553a4e7" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>ConvDescBuilder_v8</name></member>
-      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a4a0249ac1d094f9a70967dd69b824f2e" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>data_type</name></member>
       <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" prot="public" virt="virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>describe</name></member>
       <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a81e03a2a385d24a2faaf3db249580ac6" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>dilation</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a0d416655dab2b5a675fecb5df9ea8521" prot="protected" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>err_msg</name></member>
@@ -335,9 +439,16 @@
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1abfde0f34b0bf49c45d3d9c0408284f6f" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>get_error</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3aa1ab42ab96471092185f15e22c1e9f" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>get_raw_desc</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>get_status</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a7693d45cf5cac83296ba06489f9fe3b2" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>getComputePrecision</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a58682b1a0b0d1b0977f1bc60012fee6b" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>getDilation</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1ac964fa8d073d71590a775a878b96a9bc" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>getDimensionCount</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a94dffd0ad95a582e6a143fa6f43ac604" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>getMathMode</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a4866bd1b4246d0f86916c947a3e7b674" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>getPadding</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a886df2a3df06170c1f086d4ebed0284c" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>getStride</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>initialize_managed_backend_pointer</name></member>
       <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1adcb7e5f546b83bbdab63773030e3b909" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>mode</name></member>
       <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a9b478d1207d8241ff67cc931754cd6cf" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>nDims</name></member>
+      <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a9572980b24824da18aa82da4ad6c3052" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>operator=</name></member>
       <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aa8ea272eaf26ae7f7ad2d625253ea62f" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>operator=</name></member>
       <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1aff824fb1cf44c188a7400b017458327e" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>padLower</name></member>
       <member refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a28e6ad906bf25653c87525f9f8e90a28" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConvDesc_v8</scope><name>padUpper</name></member>

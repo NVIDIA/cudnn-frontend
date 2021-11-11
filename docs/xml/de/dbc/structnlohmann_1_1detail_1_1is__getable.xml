@@ -24,7 +24,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3500" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3500" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="3500" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="3500" bodyend="-1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -32,18 +32,18 @@
     <detaileddescription>
     </detaileddescription>
     <collaborationgraph>
-      <node id="637">
+      <node id="698">
         <label>nlohmann::detail::is_getable&lt; BasicJsonType, T &gt;</label>
         <link refid="de/dbc/structnlohmann_1_1detail_1_1is__getable"/>
-        <childnode refid="638" relation="usage">
+        <childnode refid="699" relation="usage">
           <edgelabel>+value</edgelabel>
         </childnode>
       </node>
-      <node id="638">
+      <node id="699">
         <label>bool</label>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3499" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3498" bodyend="3501"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="3499" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="3498" bodyend="3501"/>
     <listofallmembers>
       <member refid="de/dbc/structnlohmann_1_1detail_1_1is__getable_1a2150b5b5398683147928a61c99cd0070" prot="public" virt="non-virtual"><scope>nlohmann::detail::is_getable</scope><name>value</name></member>
     </listofallmembers>

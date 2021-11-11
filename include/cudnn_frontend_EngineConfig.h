@@ -51,6 +51,7 @@ namespace cudnn_frontend {
 class EngineConfig_v8 : public BackendDescriptor {
    public:
     friend class EngineConfigBuilder_v8;
+
     std::string
     describe() const override {
         std::stringstream ss;
@@ -58,6 +59,7 @@ class EngineConfig_v8 : public BackendDescriptor {
         ss << " Number of knobs: " << numKnobs;
         return ss.str();
     }
+
     EngineConfig_v8 &
     operator=(EngineConfig_v8 &&from) = default;
 
@@ -92,6 +94,7 @@ class EngineConfig_v8 : public BackendDescriptor {
     ManagedOpaqueDescriptor engine = nullptr;
     int64_t numKnobs               = 0;
     std::string opGraphTag;
+    bool set_knobs_attr = false;
     std::array<ManagedOpaqueDescriptor, CUDNN_KNOB_TYPE_COUNTS> bChoices = {};  //!< Opaque pointer to the backend knobs
 };
 
@@ -111,6 +114,9 @@ class EngineConfigBuilder_v8 {
         m_engine_config.opGraphTag = engine_.getTag();
         auto &knobs                = engine_.getFinalizedKnobs();
         m_engine_config.numKnobs   = knobs.size();
+
+        m_engine_config.set_knobs_attr = engine_.knobs_set();
+
         for (std::uint32_t i = 0; i < knobs.size(); i++) {
             cudnnStatus_t status;
             cudnnBackendKnobType_t type = knobs[i].getKnobType();
@@ -147,6 +153,7 @@ class EngineConfigBuilder_v8 {
                     "CUDNN_BACKEND_ENGINECFG_DESCRIPTOR: CUDNN_BACKEND_KNOB_CHOICE_DESCRIPTOR cudnnFinalize Failed");
             }
         }
+
         return *this;
     }
     /** @} */
@@ -189,7 +196,7 @@ class EngineConfigBuilder_v8 {
             return std::move(m_engine_config);
         }
 
-        if (m_engine_config.numKnobs > 0) {
+        if (m_engine_config.set_knobs_attr && m_engine_config.numKnobs > 0) {
             std::array<cudnnBackendDescriptor_t, CUDNN_KNOB_TYPE_COUNTS> bChoices_;
             for (auto i = 0; i < m_engine_config.numKnobs; i++) {
                 bChoices_[i] = m_engine_config.bChoices[i]->get_backend_descriptor();
@@ -215,6 +222,7 @@ class EngineConfigBuilder_v8 {
                 &m_engine_config, status, "CUDNN_BACKEND_ENGINECFG_DESCRIPTOR: cudnnFinalize Failed");
             return std::move(m_engine_config);
         }
+        getLogger() << "[cudnn_frontend] " << m_engine_config << std::endl;
         return std::move(m_engine_config);
     }
 

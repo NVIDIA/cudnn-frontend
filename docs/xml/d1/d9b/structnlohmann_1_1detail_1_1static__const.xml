@@ -21,7 +21,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3166" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3166" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="3166" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="3166" bodyend="-1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -29,18 +29,18 @@
     <detaileddescription>
     </detaileddescription>
     <collaborationgraph>
-      <node id="994">
+      <node id="1067">
         <label>static constexpr T</label>
       </node>
-      <node id="993">
+      <node id="1066">
         <label>nlohmann::detail::static_const&lt; T &gt;</label>
         <link refid="d1/d9b/structnlohmann_1_1detail_1_1static__const"/>
-        <childnode refid="994" relation="usage">
+        <childnode refid="1067" relation="usage">
           <edgelabel>+value</edgelabel>
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3165" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3164" bodyend="3167"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="3165" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="3164" bodyend="3167"/>
     <listofallmembers>
       <member refid="d1/d9b/structnlohmann_1_1detail_1_1static__const_1a6bb7ab2ddd6abc41fb4ffb7c6dfa237e" prot="public" virt="non-virtual"><scope>nlohmann::detail::static_const</scope><name>value</name></member>
     </listofallmembers>

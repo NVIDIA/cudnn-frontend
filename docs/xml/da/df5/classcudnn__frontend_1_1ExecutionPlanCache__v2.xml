@@ -1,0 +1,317 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2" kind="class" language="C++" prot="public">
+    <compoundname>cudnn_frontend::ExecutionPlanCache_v2</compoundname>
+    <basecompoundref refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1" prot="public" virt="non-virtual">cudnn_frontend::ExecutionPlanCache_v1</basecompoundref>
+    <includes refid="d9/dd3/cudnn__frontend__ExecutionPlanCache_8h" local="no">cudnn_frontend_ExecutionPlanCache.h</includes>
+      <sectiondef kind="private-type">
+      <memberdef kind="typedef" id="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2_1a284ee8506331e454a8f42550197b88cd" prot="private" static="no">
+        <type>std::map&lt; std::pair&lt; <ref refid="df/de1/namespacecudnn__frontend_1a360ee0c724a479660a6bd0815af46ac1" kindref="member">cudnn_frontend::feature_vector_t</ref>, std::string &gt;, int32_t &gt;</type>
+        <definition>using cudnn_frontend::ExecutionPlanCache_v2::SaturationTracker =  std::map&lt;std::pair&lt;cudnn_frontend::feature_vector_t, std::string&gt;, int32_t&gt;</definition>
+        <argsstring></argsstring>
+        <name>SaturationTracker</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" line="143" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" bodystart="143" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2_1a41550a4eec664cb3df6d9a676af0a110" prot="private" static="no" mutable="no">
+        <type><ref refid="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2_1a284ee8506331e454a8f42550197b88cd" kindref="member">SaturationTracker</ref></type>
+        <definition>SaturationTracker cudnn_frontend::ExecutionPlanCache_v2::tracker</definition>
+        <argsstring></argsstring>
+        <name>tracker</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" line="144" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" bodystart="144" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2_1ac1dbd7a4c056ab5b1225672c39bf69d0" prot="private" static="no" mutable="no">
+        <type>int32_t</type>
+        <definition>int32_t cudnn_frontend::ExecutionPlanCache_v2::saturationCount</definition>
+        <argsstring></argsstring>
+        <name>saturationCount</name>
+        <initializer>= 1</initializer>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" line="146" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" bodystart="146" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2_1a75f65c7d922d206acf28d88bff53e4fe" prot="public" static="no" const="no" explicit="no" inline="yes" virt="virtual">
+        <type>bool</type>
+        <definition>virtual bool cudnn_frontend::ExecutionPlanCache_v2::is_fastest_plan_stable</definition>
+        <argsstring>(const cudnn_frontend::OperationGraph &amp;op_graph, const std::string &amp;tag)</argsstring>
+        <name>is_fastest_plan_stable</name>
+        <reimplements refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1_1a3cf1a9252e9f57d933f6b1918bf26571">is_fastest_plan_stable</reimplements>
+        <param>
+          <type>const <ref refid="df/de1/namespacecudnn__frontend_1ac86ce924df5209c4ce1bc25856eea6e6" kindref="member">cudnn_frontend::OperationGraph</ref> &amp;</type>
+          <declname>op_graph</declname>
+        </param>
+        <param>
+          <type>const std::string &amp;</type>
+          <declname>tag</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" line="150" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" bodystart="150" bodyend="167"/>
+        <references refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1_1a43ca7f73d6656423a3c0fc232d6ab4b5" compoundref="d9/dd3/cudnn__frontend__ExecutionPlanCache_8h" startline="99">cudnn_frontend::ExecutionPlanCache_v1::cache_mutex</references>
+        <references refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1_1a86e9eeaddb1da051c26f386469a3e293" compoundref="d9/dd3/cudnn__frontend__ExecutionPlanCache_8h" startline="124" endline="138">cudnn_frontend::ExecutionPlanCache_v1::get_plan_from_cache</references>
+        <references refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a323f652e94a96660d0186be02561d09f" compoundref="db/d7d/cudnn__frontend__OperationGraph_8h" startline="103" endline="110">cudnn_frontend::OperationGraph_v8::getFeatureVector</references>
+        <references refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" compoundref="d8/dc4/cudnn__frontend__Logging_8h" startline="72" endline="75">cudnn_frontend::getLogger</references>
+        <references refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a19fd5ed99ab4053c8a178bd33843460a" compoundref="db/d7d/cudnn__frontend__OperationGraph_8h" startline="98" endline="100">cudnn_frontend::OperationGraph_v8::getTag</references>
+        <references refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1_1a968bccc60a1acf84c58befe06da7c553" compoundref="d9/dd3/cudnn__frontend__ExecutionPlanCache_8h" startline="92">cudnn_frontend::ExecutionPlanCache_v1::name</references>
+      </memberdef>
+      <memberdef kind="function" id="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2_1a6caf67e9fbf0ab2349634eca4e5f939b" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type>void</type>
+        <definition>void cudnn_frontend::ExecutionPlanCache_v2::set_saturation_count</definition>
+        <argsstring>(int32_t count)</argsstring>
+        <name>set_saturation_count</name>
+        <param>
+          <type>int32_t</type>
+          <declname>count</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" line="169" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" bodystart="169" bodyend="171"/>
+      </memberdef>
+      <memberdef kind="function" id="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2_1a3f315c2f2ef109db63cfb16965931652" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::ExecutionPlanCache_v2::ExecutionPlanCache_v2</definition>
+        <argsstring>(const char *name_)</argsstring>
+        <name>ExecutionPlanCache_v2</name>
+        <param>
+          <type>const char *</type>
+          <declname>name_</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" line="173" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" bodystart="173" bodyend="174"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <inheritancegraph>
+      <node id="328">
+        <label>cudnn_frontend::ExecutionPlanCache_v1</label>
+        <link refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1"/>
+      </node>
+      <node id="327">
+        <label>cudnn_frontend::ExecutionPlanCache_v2</label>
+        <link refid="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2"/>
+        <childnode refid="328" relation="public-inheritance">
+        </childnode>
+      </node>
+    </inheritancegraph>
+    <collaborationgraph>
+      <node id="336">
+        <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
+      </node>
+      <node id="348">
+        <label>K</label>
+      </node>
+      <node id="342">
+        <label>T</label>
+      </node>
+      <node id="343">
+        <label>cudnnHandle_t</label>
+      </node>
+      <node id="351">
+        <label>pair&lt; cudnn_frontend::feature_vector_t, std::string &gt;</label>
+      </node>
+      <node id="346">
+        <label>std::vector&lt; T &gt;</label>
+        <childnode refid="342" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+      </node>
+      <node id="341">
+        <label>std::array&lt; T &gt;</label>
+        <childnode refid="342" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+      </node>
+      <node id="352">
+        <label>int32_t</label>
+      </node>
+      <node id="350">
+        <label>std::map&lt; std::pair&lt; cudnn_frontend::feature_vector_t, std::string &gt;, int32_t &gt;</label>
+        <childnode refid="351" relation="usage">
+          <edgelabel>+keys</edgelabel>
+        </childnode>
+        <childnode refid="352" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+        <childnode refid="347" relation="template-instance">
+          <edgelabel>&lt; std::pair&lt; cudnn_frontend::feature_vector_t, std::string &gt;, int32_t &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="347">
+        <label>std::map&lt; K, T &gt;</label>
+        <childnode refid="348" relation="usage">
+          <edgelabel>+keys</edgelabel>
+        </childnode>
+        <childnode refid="342" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+      </node>
+      <node id="345">
+        <label>std::vector&lt; int64_t &gt;</label>
+        <childnode refid="344" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+        <childnode refid="346" relation="template-instance">
+          <edgelabel>&lt; int64_t &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="338">
+        <label>float</label>
+      </node>
+      <node id="340">
+        <label>cudnnBackendNumericalNote_t</label>
+      </node>
+      <node id="337">
+        <label>cudnnStatus_t</label>
+      </node>
+      <node id="335">
+        <label>std::basic_string&lt; char &gt;</label>
+      </node>
+      <node id="339">
+        <label>std::array&lt; cudnnBackendNumericalNote_t, CUDNN_NUMERICAL_NOTE_TYPE_COUNT &gt;</label>
+        <childnode refid="340" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+        <childnode refid="341" relation="template-instance">
+          <edgelabel>&lt; cudnnBackendNumericalNote_t, CUDNN_NUMERICAL_NOTE_TYPE_COUNT &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="330">
+        <label>cudnn_frontend::ExecutionPlanCache_v1</label>
+        <link refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1"/>
+        <childnode refid="331" relation="usage">
+          <edgelabel>#cache</edgelabel>
+        </childnode>
+        <childnode refid="349" relation="usage">
+          <edgelabel>#cache_mutex</edgelabel>
+        </childnode>
+        <childnode refid="334" relation="usage">
+          <edgelabel>#name</edgelabel>
+        </childnode>
+      </node>
+      <node id="329">
+        <label>cudnn_frontend::ExecutionPlanCache_v2</label>
+        <link refid="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2"/>
+        <childnode refid="330" relation="public-inheritance">
+        </childnode>
+        <childnode refid="350" relation="usage">
+          <edgelabel>-tracker</edgelabel>
+        </childnode>
+        <childnode refid="352" relation="usage">
+          <edgelabel>-saturationCount</edgelabel>
+        </childnode>
+      </node>
+      <node id="332">
+        <label>cudnn_frontend::ExecutionPlan_v8</label>
+        <link refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8"/>
+        <childnode refid="333" relation="public-inheritance">
+        </childnode>
+        <childnode refid="338" relation="usage">
+          <edgelabel>-execution_time_ms</edgelabel>
+        </childnode>
+        <childnode refid="339" relation="usage">
+          <edgelabel>-numeric_notes</edgelabel>
+        </childnode>
+        <childnode refid="334" relation="usage">
+          <edgelabel>-planTag</edgelabel>
+        </childnode>
+        <childnode refid="343" relation="usage">
+          <edgelabel>-handle</edgelabel>
+        </childnode>
+        <childnode refid="336" relation="usage">
+          <edgelabel>-engine_config</edgelabel>
+        </childnode>
+        <childnode refid="344" relation="usage">
+          <edgelabel>-workSpaceSize</edgelabel>
+        </childnode>
+      </node>
+      <node id="349">
+        <label>mutex</label>
+      </node>
+      <node id="344">
+        <label>int64_t</label>
+      </node>
+      <node id="333">
+        <label>cudnn_frontend::BackendDescriptor</label>
+        <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
+        <childnode refid="334" relation="usage">
+          <edgelabel>#err_msg</edgelabel>
+        </childnode>
+        <childnode refid="336" relation="usage">
+          <edgelabel>#pointer</edgelabel>
+        </childnode>
+        <childnode refid="337" relation="usage">
+          <edgelabel>#status</edgelabel>
+        </childnode>
+      </node>
+      <node id="331">
+        <label>std::map&lt; cudnn_frontend::feature_vector_t, cudnn_frontend::ExecutionPlan, cudnn_frontend::ExecutionPlanCache_v1::compare &gt;</label>
+        <childnode refid="332" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+        <childnode refid="345" relation="usage">
+          <edgelabel>+keys</edgelabel>
+        </childnode>
+        <childnode refid="347" relation="template-instance">
+          <edgelabel>&lt; cudnn_frontend::feature_vector_t, cudnn_frontend::ExecutionPlan, cudnn_frontend::ExecutionPlanCache_v1::compare &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="334">
+        <label>std::string</label>
+        <childnode refid="335" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" line="141" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" bodystart="141" bodyend="176"/>
+    <listofallmembers>
+      <member refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1_1a0a60f67637646017b056301c3d1424db" prot="public" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>add_plan_to_cache</name></member>
+      <member refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1_1a13e174d7eceaa7b06b7e206683d084c5" prot="protected" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>cache</name></member>
+      <member refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1_1a43ca7f73d6656423a3c0fc232d6ab4b5" prot="protected" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>cache_mutex</name></member>
+      <member refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1_1aa5bc2d3bd9e86b2f17cfea2d3ee41d65" prot="public" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>ExecutionPlanCache_v1</name></member>
+      <member refid="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2_1a3f315c2f2ef109db63cfb16965931652" prot="public" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>ExecutionPlanCache_v2</name></member>
+      <member refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1_1a48b14498b68c2ad2030e38a6ccb98c15" prot="protected" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>FeatureVectorToPlanMap</name></member>
+      <member refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1_1a818a43f69d0fe6068a0cbfe623367753" prot="public" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>get_name</name></member>
+      <member refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1_1a86e9eeaddb1da051c26f386469a3e293" prot="public" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>get_plan_from_cache</name></member>
+      <member refid="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2_1a75f65c7d922d206acf28d88bff53e4fe" prot="public" virt="virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>is_fastest_plan_stable</name></member>
+      <member refid="dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1_1a968bccc60a1acf84c58befe06da7c553" prot="protected" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>name</name></member>
+      <member refid="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2_1ac1dbd7a4c056ab5b1225672c39bf69d0" prot="private" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>saturationCount</name></member>
+      <member refid="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2_1a284ee8506331e454a8f42550197b88cd" prot="private" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>SaturationTracker</name></member>
+      <member refid="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2_1a6caf67e9fbf0ab2349634eca4e5f939b" prot="public" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>set_saturation_count</name></member>
+      <member refid="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2_1a41550a4eec664cb3df6d9a676af0a110" prot="private" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v2</scope><name>tracker</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

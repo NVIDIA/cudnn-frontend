@@ -1,6 +1,7 @@
 <map id="cudnn_frontend::OperationBuilder_v8" name="cudnn_frontend::OperationBuilder_v8">
-<area shape="rect" id="node3" href="$d4/d30/classcudnn__frontend_1_1Operation__v8.html" title="{cudnn_frontend::Operation_v8\n|&#45; amatdesc\l&#45; bmatdesc\l&#45; cmatdesc\l&#45; matmuldesc\l|+ describe()\l+ Operation_v8()\l+ getOutputTensor()\l+ getTag()\l+ ~Operation_v8()\l&#45; Operation_v8()\l&#45; Operation_v8()\l&#45; operator=()\l}" alt="" coords="705,661,901,885"/>
-<area shape="rect" id="node4" href="$d6/d88/classcudnn__frontend_1_1BackendDescriptor.html" title="{cudnn_frontend::BackendDescriptor\n||+ describe()\l+ get_raw_desc()\l+ get_status()\l+ set_status()\l+ set_error()\l+ get_error()\l+ get_desc()\l+ initialize_managed\l_backend_pointer()\l# BackendDescriptor()\l# BackendDescriptor()\l}" alt="" coords="384,301,615,525"/>
-<area shape="rect" id="node5" title="STL class. " alt="" coords="285,154,365,231"/>
-<area shape="rect" id="node6" title="STL class. " alt="" coords="261,5,388,97"/>
+<area shape="rect" id="node4" href="$d4/d30/classcudnn__frontend_1_1Operation__v8.html" title="{cudnn_frontend::Operation_v8\n|&#45; amatdesc\l&#45; bmatdesc\l&#45; cmatdesc\l&#45; matmuldesc\l|+ describe()\l+ Operation_v8()\l+ operator=()\l+ getOutputTensor()\l+ getTag()\l+ getFeatureVector()\l+ ~Operation_v8()\l&#45; Operation_v8()\l&#45; Operation_v8()\l&#45; operator=()\l}" alt="" coords="730,748,926,1001"/>
+<area shape="rect" id="node5" href="$d6/d88/classcudnn__frontend_1_1BackendDescriptor.html" title="{cudnn_frontend::BackendDescriptor\n||+ describe()\l+ get_raw_desc()\l+ get_status()\l+ set_status()\l+ set_error()\l+ get_error()\l+ get_desc()\l+ initialize_managed\l_backend_pointer()\l# BackendDescriptor()\l# BackendDescriptor()\l}" alt="" coords="1514,315,1745,539"/>
+<area shape="rect" id="node6" title="STL class. " alt="" coords="1729,167,1809,245"/>
+<area shape="rect" id="node7" title="STL class. " alt="" coords="1706,5,1833,97"/>
+<area shape="rect" id="node15" title="STL class. " alt="" coords="433,167,549,245"/>
 </map>

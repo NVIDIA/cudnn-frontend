@@ -28,6 +28,7 @@
 #include <memory>
 #include <sstream>
 #include <utility>
+#include <limits>
 
 #include <cudnn.h>
 #include <cudnn_backend.h>
@@ -68,6 +69,19 @@ class PointWiseDesc_v8 : public BackendDescriptor {
         switch (mode) {
             case CUDNN_POINTWISE_ADD:
             case CUDNN_POINTWISE_MUL:
+#if (CUDNN_VERSION >= 8300)
+            case CUDNN_POINTWISE_DIV:
+            case CUDNN_POINTWISE_ADD_SQUARE:
+            case CUDNN_POINTWISE_SUB:
+            case CUDNN_POINTWISE_CMP_EQ:
+            case CUDNN_POINTWISE_CMP_NEQ:
+            case CUDNN_POINTWISE_CMP_GT:
+            case CUDNN_POINTWISE_CMP_GE:
+            case CUDNN_POINTWISE_CMP_LT:
+            case CUDNN_POINTWISE_CMP_LE:
+            case CUDNN_POINTWISE_LOGICAL_AND:
+            case CUDNN_POINTWISE_LOGICAL_OR:
+#endif
             case CUDNN_POINTWISE_MIN:
             case CUDNN_POINTWISE_MAX:
             case CUDNN_POINTWISE_RELU_BWD:
@@ -86,9 +100,22 @@ class PointWiseDesc_v8 : public BackendDescriptor {
             case CUDNN_POINTWISE_GELU_FWD:
             case CUDNN_POINTWISE_SOFTPLUS_FWD:
             case CUDNN_POINTWISE_SWISH_FWD:
+#if (CUDNN_VERSION >= 8300)
+            case CUDNN_POINTWISE_EXP:
+            case CUDNN_POINTWISE_LOG:
+            case CUDNN_POINTWISE_NEG:
+            case CUDNN_POINTWISE_MOD:
+            case CUDNN_POINTWISE_POW:
+            case CUDNN_POINTWISE_ABS:
+            case CUDNN_POINTWISE_CEIL:
+            case CUDNN_POINTWISE_FLOOR:
+            case CUDNN_POINTWISE_COS:
+            case CUDNN_POINTWISE_TAN:
+            case CUDNN_POINTWISE_SIN:
+            case CUDNN_POINTWISE_RSQRT:
+            case CUDNN_POINTWISE_LOGICAL_NOT:
+#endif
                 return 2;
-            default:
-                return -1;
         }
     }
 
@@ -345,6 +372,7 @@ class PointWiseDescBuilder_v8 {
             return std::move(m_pointWiseDesc);
         }
 
+        getLogger() << "[cudnn_frontend] " << m_pointWiseDesc << std::endl;
         return std::move(m_pointWiseDesc);
     }
 

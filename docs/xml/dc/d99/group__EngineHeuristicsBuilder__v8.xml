@@ -19,7 +19,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="145" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" bodystart="145" bodyend="149"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" line="145" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" bodystart="145" bodyend="149"/>
       </memberdef>
       <memberdef kind="function" id="dc/d99/group__EngineHeuristicsBuilder__v8_1gaf2d783ca6a663aa50ffed2ccbc164812" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -36,7 +36,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" line="152" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h" bodystart="152" bodyend="155"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" line="152" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h" bodystart="152" bodyend="155"/>
       </memberdef>
       </sectiondef>
     <briefdescription>

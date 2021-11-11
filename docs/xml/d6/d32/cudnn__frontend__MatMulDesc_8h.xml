@@ -14,151 +14,196 @@
     <includedby refid="da/d5a/cudnn__frontend__Operation_8h" local="yes">cudnn_frontend_Operation.h</includedby>
     <includedby refid="de/d0c/cudnn__frontend_8h" local="yes">cudnn_frontend.h</includedby>
     <incdepgraph>
-      <node id="457">
-        <label>cudnn_backend_base.h</label>
-        <link refid="dc/d11/cudnn__backend__base_8h"/>
-        <childnode refid="452" relation="include">
-        </childnode>
-      </node>
-      <node id="448">
+      <node id="584">
         <label>functional</label>
       </node>
-      <node id="452">
-        <label>cudnn.h</label>
-      </node>
-      <node id="445">
+      <node id="581">
         <label>cudnn_frontend_MatMulDesc.h</label>
         <link refid="d6/d32/cudnn__frontend__MatMulDesc_8h"/>
-        <childnode refid="446" relation="include">
+        <childnode refid="582" relation="include">
         </childnode>
-        <childnode refid="447" relation="include">
+        <childnode refid="583" relation="include">
         </childnode>
-        <childnode refid="448" relation="include">
+        <childnode refid="584" relation="include">
         </childnode>
-        <childnode refid="449" relation="include">
+        <childnode refid="585" relation="include">
         </childnode>
-        <childnode refid="450" relation="include">
+        <childnode refid="586" relation="include">
         </childnode>
-        <childnode refid="451" relation="include">
+        <childnode refid="587" relation="include">
         </childnode>
-        <childnode refid="452" relation="include">
+        <childnode refid="588" relation="include">
         </childnode>
-        <childnode refid="453" relation="include">
+        <childnode refid="589" relation="include">
         </childnode>
-        <childnode refid="454" relation="include">
+        <childnode refid="590" relation="include">
         </childnode>
       </node>
-      <node id="456">
+      <node id="588">
+        <label>cudnn.h</label>
+      </node>
+      <node id="592">
         <label>string</label>
       </node>
-      <node id="455">
+      <node id="596">
+        <label>cudnn_frontend_Logging.h</label>
+        <link refid="d8/dc4/cudnn__frontend__Logging_8h"/>
+        <childnode refid="597" relation="include">
+        </childnode>
+        <childnode refid="598" relation="include">
+        </childnode>
+        <childnode refid="599" relation="include">
+        </childnode>
+        <childnode refid="594" relation="include">
+        </childnode>
+      </node>
+      <node id="591">
         <label>exception</label>
       </node>
-      <node id="453">
+      <node id="598">
+        <label>fstream</label>
+      </node>
+      <node id="595">
+        <label>ostream</label>
+      </node>
+      <node id="593">
+        <label>vector</label>
+      </node>
+      <node id="589">
         <label>cudnn_backend.h</label>
       </node>
-      <node id="451">
+      <node id="587">
         <label>utility</label>
       </node>
-      <node id="447">
+      <node id="583">
         <label>array</label>
       </node>
-      <node id="450">
+      <node id="586">
         <label>sstream</label>
       </node>
-      <node id="454">
-        <label>cudnn_frontend_utils.h</label>
-        <link refid="df/d17/cudnn__frontend__utils_8h"/>
-        <childnode refid="455" relation="include">
-        </childnode>
-        <childnode refid="456" relation="include">
-        </childnode>
-        <childnode refid="457" relation="include">
-        </childnode>
+      <node id="597">
+        <label>iostream</label>
       </node>
-      <node id="446">
+      <node id="582">
         <label>algorithm</label>
       </node>
-      <node id="449">
+      <node id="599">
+        <label>cstring</label>
+      </node>
+      <node id="590">
+        <label>cudnn_frontend_utils.h</label>
+        <link refid="df/d17/cudnn__frontend__utils_8h"/>
+        <childnode refid="591" relation="include">
+        </childnode>
+        <childnode refid="592" relation="include">
+        </childnode>
+        <childnode refid="593" relation="include">
+        </childnode>
+        <childnode refid="594" relation="include">
+        </childnode>
+        <childnode refid="596" relation="include">
+        </childnode>
+      </node>
+      <node id="585">
         <label>memory</label>
+      </node>
+      <node id="594">
+        <label>cudnn_backend_base.h</label>
+        <link refid="dc/d11/cudnn__backend__base_8h"/>
+        <childnode refid="595" relation="include">
+        </childnode>
+        <childnode refid="588" relation="include">
+        </childnode>
       </node>
     </incdepgraph>
     <invincdepgraph>
-      <node id="467">
-        <label>cudnn_frontend_EngineConfig.h</label>
-        <link refid="d6/d67/cudnn__frontend__EngineConfig_8h"/>
-        <childnode refid="462" relation="include">
+      <node id="608">
+        <label>cudnn_frontend_Engine.h</label>
+        <link refid="de/d6d/cudnn__frontend__Engine_8h"/>
+        <childnode refid="609" relation="include">
+        </childnode>
+        <childnode refid="604" relation="include">
+        </childnode>
+        <childnode refid="610" relation="include">
         </childnode>
       </node>
-      <node id="465">
+      <node id="609">
+        <label>cudnn_frontend_EngineConfig.h</label>
+        <link refid="d6/d67/cudnn__frontend__EngineConfig_8h"/>
+        <childnode refid="603" relation="include">
+        </childnode>
+        <childnode refid="604" relation="include">
+        </childnode>
+      </node>
+      <node id="600">
+        <label>cudnn_frontend_MatMulDesc.h</label>
+        <link refid="d6/d32/cudnn__frontend__MatMulDesc_8h"/>
+        <childnode refid="601" relation="include">
+        </childnode>
+        <childnode refid="604" relation="include">
+        </childnode>
+      </node>
+      <node id="603">
+        <label>cudnn_frontend_Heuristics.h</label>
+        <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
+        <childnode refid="604" relation="include">
+        </childnode>
+      </node>
+      <node id="607">
         <label>cudnn_frontend_get_plan.h</label>
         <link refid="d2/d3b/cudnn__frontend__get__plan_8h"/>
       </node>
-      <node id="468">
-        <label>cudnn_frontend_ExecutionPlan.h</label>
-        <link refid="d6/d51/cudnn__frontend__ExecutionPlan_8h"/>
-        <childnode refid="462" relation="include">
-        </childnode>
-      </node>
-      <node id="458">
-        <label>cudnn_frontend_MatMulDesc.h</label>
-        <link refid="d6/d32/cudnn__frontend__MatMulDesc_8h"/>
-        <childnode refid="459" relation="include">
-        </childnode>
-        <childnode refid="462" relation="include">
-        </childnode>
-      </node>
-      <node id="460">
-        <label>cudnn_frontend_OperationGraph.h</label>
-        <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
-        <childnode refid="461" relation="include">
-        </childnode>
-        <childnode refid="466" relation="include">
-        </childnode>
-        <childnode refid="462" relation="include">
-        </childnode>
-      </node>
-      <node id="466">
-        <label>cudnn_frontend_Engine.h</label>
-        <link refid="de/d6d/cudnn__frontend__Engine_8h"/>
-        <childnode refid="462" relation="include">
-        </childnode>
-        <childnode refid="467" relation="include">
-        </childnode>
-        <childnode refid="468" relation="include">
-        </childnode>
-      </node>
-      <node id="459">
-        <label>cudnn_frontend_Operation.h</label>
-        <link refid="da/d5a/cudnn__frontend__Operation_8h"/>
-        <childnode refid="460" relation="include">
-        </childnode>
-        <childnode refid="462" relation="include">
-        </childnode>
-      </node>
-      <node id="463">
+      <node id="605">
         <label>cudnn_frontend_EngineConfigGenerator.h</label>
         <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
-        <childnode refid="464" relation="include">
+        <childnode refid="606" relation="include">
         </childnode>
-        <childnode refid="465" relation="include">
+        <childnode refid="607" relation="include">
         </childnode>
       </node>
-      <node id="462">
+      <node id="611">
+        <label>cudnn_frontend_ExecutionPlanCache.h</label>
+        <link refid="d9/dd3/cudnn__frontend__ExecutionPlanCache_8h"/>
+        <childnode refid="604" relation="include">
+        </childnode>
+      </node>
+      <node id="601">
+        <label>cudnn_frontend_Operation.h</label>
+        <link refid="da/d5a/cudnn__frontend__Operation_8h"/>
+        <childnode refid="602" relation="include">
+        </childnode>
+        <childnode refid="604" relation="include">
+        </childnode>
+      </node>
+      <node id="610">
+        <label>cudnn_frontend_ExecutionPlan.h</label>
+        <link refid="d6/d51/cudnn__frontend__ExecutionPlan_8h"/>
+        <childnode refid="604" relation="include">
+        </childnode>
+        <childnode refid="611" relation="include">
+        </childnode>
+      </node>
+      <node id="602">
+        <label>cudnn_frontend_OperationGraph.h</label>
+        <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
+        <childnode refid="603" relation="include">
+        </childnode>
+        <childnode refid="608" relation="include">
+        </childnode>
+        <childnode refid="604" relation="include">
+        </childnode>
+        <childnode refid="611" relation="include">
+        </childnode>
+      </node>
+      <node id="604">
         <label>cudnn_frontend.h</label>
         <link refid="de/d0c/cudnn__frontend_8h"/>
-        <childnode refid="463" relation="include">
+        <childnode refid="605" relation="include">
         </childnode>
       </node>
-      <node id="464">
+      <node id="606">
         <label>cudnn_frontend_find_plan.h</label>
         <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
-      </node>
-      <node id="461">
-        <label>cudnn_frontend_Heuristics.h</label>
-        <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
-        <childnode refid="462" relation="include">
-        </childnode>
       </node>
     </invincdepgraph>
     <innerclass refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" prot="public">cudnn_frontend::MatMulDesc_v8</innerclass>
@@ -217,9 +262,9 @@
 <codeline lineno="55"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>ss.str();</highlight></codeline>
 <codeline lineno="56"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
 <codeline lineno="57"><highlight class="normal"></highlight></codeline>
-<codeline lineno="58" refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ab725a8e47331aca6310155f6d55c0a02" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ab725a8e47331aca6310155f6d55c0a02" kindref="member">MatMulDesc_v8</ref>(<ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref><sp/>&amp;&amp;from)</highlight></codeline>
-<codeline lineno="59"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>:<sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" kindref="compound">BackendDescriptor</ref>(from.<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a57c83e78374bac747b5660fb271b947a" kindref="member">get_desc</ref>(),<sp/>from.<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" kindref="member">get_status</ref>(),<sp/>from.<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1abfde0f34b0bf49c45d3d9c0408284f6f" kindref="member">get_error</ref>()),</highlight></codeline>
-<codeline lineno="60"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a1dd13143c85b67f2c0da90f02884fab1" kindref="member">math_precision</ref>(from.<ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a1dd13143c85b67f2c0da90f02884fab1" kindref="member">math_precision</ref>)<sp/>{}</highlight></codeline>
+<codeline lineno="58"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a5e060b83ea1e1ed59a66e15fdba91227" kindref="member">MatMulDesc_v8</ref>(<ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref><sp/>&amp;&amp;from)<sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="59"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref><sp/>&amp;</highlight></codeline>
+<codeline lineno="60"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a60981584b3c7be9737acaa0f0a55611f" kindref="member">operator= </ref>(<ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref><sp/>&amp;&amp;from)<sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
 <codeline lineno="61"><highlight class="normal"></highlight></codeline>
 <codeline lineno="62"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ad27b038b19b218067bd30e60d94fd672" kindref="member">~MatMulDesc_v8</ref>()<sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
 <codeline lineno="63"><highlight class="normal"></highlight></codeline>
@@ -227,7 +272,7 @@
 <codeline lineno="65"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a5e060b83ea1e1ed59a66e15fdba91227" kindref="member">MatMulDesc_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
 <codeline lineno="66"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a5e060b83ea1e1ed59a66e15fdba91227" kindref="member">MatMulDesc_v8</ref>(<ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
 <codeline lineno="67"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref><sp/>&amp;</highlight></codeline>
-<codeline lineno="68"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ac1257a1ca1261961fc99123988552911" kindref="member">operator=</ref>(<ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="68"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a60981584b3c7be9737acaa0f0a55611f" kindref="member">operator=</ref>(<ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
 <codeline lineno="69"><highlight class="normal"></highlight></codeline>
 <codeline lineno="70" refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a1dd13143c85b67f2c0da90f02884fab1" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnDataType_t<sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a1dd13143c85b67f2c0da90f02884fab1" kindref="member">math_precision</ref><sp/>=<sp/>CUDNN_DATA_FLOAT;</highlight></codeline>
 <codeline lineno="71"><highlight class="normal">};</highlight></codeline>
@@ -269,21 +314,22 @@
 <codeline lineno="119"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_matMulDesc);</highlight></codeline>
 <codeline lineno="120"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
 <codeline lineno="121"><highlight class="normal"></highlight></codeline>
-<codeline lineno="122"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_matMulDesc);</highlight></codeline>
-<codeline lineno="123"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="124"><highlight class="normal"></highlight></codeline>
-<codeline lineno="125"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">explicit</highlight><highlight class="normal"><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1aa99cc0548322d7298b9ca664a976281f" kindref="member">MatMulDescBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="126"><highlight class="normal"><sp/><sp/><sp/><sp/>~<ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" kindref="compound">MatMulDescBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="127"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1aa99cc0548322d7298b9ca664a976281f" kindref="member">MatMulDescBuilder_v8</ref>(<ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" kindref="compound">MatMulDescBuilder_v8</ref><sp/>&amp;&amp;)<sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="128"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1aa99cc0548322d7298b9ca664a976281f" kindref="member">MatMulDescBuilder_v8</ref>(<ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" kindref="compound">MatMulDescBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="129"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" kindref="compound">MatMulDescBuilder_v8</ref><sp/>&amp;</highlight></codeline>
-<codeline lineno="130"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ac1257a1ca1261961fc99123988552911" kindref="member">operator=</ref>(<ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" kindref="compound">MatMulDescBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="131"><highlight class="normal"></highlight></codeline>
-<codeline lineno="132"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">private</highlight><highlight class="normal">:</highlight></codeline>
-<codeline lineno="133" refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1aa71bc8242df4035ff5d6b4d54083db4b" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref><sp/><ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1aa71bc8242df4035ff5d6b4d54083db4b" kindref="member">m_matMulDesc</ref>;</highlight></codeline>
-<codeline lineno="134"><highlight class="normal">};</highlight></codeline>
-<codeline lineno="135"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="122"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" kindref="member">getLogger</ref>()<sp/>&lt;&lt;<sp/></highlight><highlight class="stringliteral">&quot;[cudnn_frontend]<sp/>&quot;</highlight><highlight class="normal"><sp/>&lt;&lt;<sp/>m_matMulDesc<sp/>&lt;&lt;<sp/>std::endl;</highlight></codeline>
+<codeline lineno="123"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_matMulDesc);</highlight></codeline>
+<codeline lineno="124"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="125"><highlight class="normal"></highlight></codeline>
+<codeline lineno="126"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">explicit</highlight><highlight class="normal"><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1aa99cc0548322d7298b9ca664a976281f" kindref="member">MatMulDescBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="127"><highlight class="normal"><sp/><sp/><sp/><sp/>~<ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" kindref="compound">MatMulDescBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="128"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1aa99cc0548322d7298b9ca664a976281f" kindref="member">MatMulDescBuilder_v8</ref>(<ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" kindref="compound">MatMulDescBuilder_v8</ref><sp/>&amp;&amp;)<sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="129"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1aa99cc0548322d7298b9ca664a976281f" kindref="member">MatMulDescBuilder_v8</ref>(<ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" kindref="compound">MatMulDescBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="130"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" kindref="compound">MatMulDescBuilder_v8</ref><sp/>&amp;</highlight></codeline>
+<codeline lineno="131"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a60981584b3c7be9737acaa0f0a55611f" kindref="member">operator=</ref>(<ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" kindref="compound">MatMulDescBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="132"><highlight class="normal"></highlight></codeline>
+<codeline lineno="133"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">private</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="134" refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1aa71bc8242df4035ff5d6b4d54083db4b" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref><sp/><ref refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1aa71bc8242df4035ff5d6b4d54083db4b" kindref="member">m_matMulDesc</ref>;</highlight></codeline>
+<codeline lineno="135"><highlight class="normal">};</highlight></codeline>
+<codeline lineno="136"><highlight class="normal">}</highlight></codeline>
     </programlisting>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h"/>
   </compounddef>
 </doxygen>

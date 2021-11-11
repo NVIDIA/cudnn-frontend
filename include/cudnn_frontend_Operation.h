@@ -107,6 +107,11 @@ class Operation_v8 : public BackendDescriptor {
         return operationTag;
     }
 
+    feature_vector_t
+    getFeatureVector() const {
+        return feature_vector;
+    }
+
     ~Operation_v8() = default;
 
    private:
@@ -141,6 +146,7 @@ class Operation_v8 : public BackendDescriptor {
     bool is_pointwise_activation_bwd_op = false;
     bool is_pointwise_math_op           = false;
     std::string operationTag;
+    feature_vector_t feature_vector;
 };
 
 ///
@@ -156,6 +162,23 @@ class OperationBuilder_v8 {
     bool is_reduction_op   = false;
 
     using Message_t = const char *;
+
+    int64_t xTensor_dimA[CUDNN_DIM_MAX + 1];
+    int64_t xTensor_strA[CUDNN_DIM_MAX + 1];
+    int64_t wTensor_dimA[CUDNN_DIM_MAX + 1];
+    int64_t wTensor_strA[CUDNN_DIM_MAX + 1];
+    int64_t yTensor_dimA[CUDNN_DIM_MAX + 1];
+    int64_t yTensor_strA[CUDNN_DIM_MAX + 1];
+
+    bool is2D = true;
+
+    int64_t conv_padding [CUDNN_DIM_MAX];
+    int64_t conv_dilation[CUDNN_DIM_MAX];
+    int64_t conv_stride  [CUDNN_DIM_MAX];
+    int64_t mode;
+    int64_t xType, yType, wType, cType /* compute_precision */;
+
+    int64_t tensor_dims = 0;
 
     Operation_v8 && 
     build_reduction_op() {
@@ -284,6 +307,80 @@ class OperationBuilder_v8 {
             case CUDNN_POINTWISE_MUL:
                 m_operation.operationTag = "Mul";
                 break;
+#if (CUDNN_VERSION >= 8300)
+            case CUDNN_POINTWISE_DIV:
+                m_operation.operationTag = "Div";
+                break;
+            case CUDNN_POINTWISE_ADD_SQUARE:
+                m_operation.operationTag = "AddSquare";
+                break;
+            case CUDNN_POINTWISE_EXP:
+                m_operation.operationTag = "Exp";
+                break;
+            case CUDNN_POINTWISE_SUB:
+                m_operation.operationTag = "Sub";
+                break;
+            case CUDNN_POINTWISE_CMP_EQ:
+                m_operation.operationTag = "CmpEq";
+                break;
+            case CUDNN_POINTWISE_CMP_NEQ:
+                m_operation.operationTag = "CmpNeq";
+                break;
+            case CUDNN_POINTWISE_CMP_GT:
+                m_operation.operationTag = "CmpGT";
+                break;
+            case CUDNN_POINTWISE_CMP_GE:
+                m_operation.operationTag = "CmpGE";
+                break;
+            case CUDNN_POINTWISE_CMP_LT:
+                m_operation.operationTag = "CmpLT";
+                break;
+            case CUDNN_POINTWISE_CMP_LE:
+                m_operation.operationTag = "CmpLE";
+                break;
+            case CUDNN_POINTWISE_LOGICAL_OR:
+                m_operation.operationTag = "LogicalOr";
+                break;
+            case CUDNN_POINTWISE_LOGICAL_AND:
+                m_operation.operationTag = "LogicalAnd";
+                break;
+            case CUDNN_POINTWISE_LOGICAL_NOT:
+                m_operation.operationTag = "LogicalNot";
+                break;
+            case CUDNN_POINTWISE_LOG:
+                m_operation.operationTag = "Log";
+                break;
+            case CUDNN_POINTWISE_NEG:
+                m_operation.operationTag = "Neg";
+                break;
+            case CUDNN_POINTWISE_MOD:
+                m_operation.operationTag = "Mod";
+                break;
+            case CUDNN_POINTWISE_POW:
+                m_operation.operationTag = "Pow";
+                break;
+            case CUDNN_POINTWISE_ABS:
+                m_operation.operationTag = "Abs";
+                break;
+            case CUDNN_POINTWISE_CEIL:
+                m_operation.operationTag = "Ceil";
+                break;
+            case CUDNN_POINTWISE_FLOOR:
+                m_operation.operationTag = "Floor";
+                break;
+            case CUDNN_POINTWISE_SIN:
+                m_operation.operationTag = "Sine";
+                break;
+            case CUDNN_POINTWISE_COS:
+                m_operation.operationTag = "Cosine";
+                break;
+            case CUDNN_POINTWISE_TAN:
+                m_operation.operationTag = "Tan";
+                break;
+            case CUDNN_POINTWISE_RSQRT:
+                m_operation.operationTag = "RSqrt";
+                break;
+#endif
             case CUDNN_POINTWISE_MIN:
                 m_operation.operationTag = "Min";
                 break;
@@ -334,9 +431,6 @@ class OperationBuilder_v8 {
                 break;
             case CUDNN_POINTWISE_SWISH_BWD:
                 m_operation.operationTag = "SwishBwd";
-                break;
-            default:
-                m_operation.operationTag = "OtherOp";
                 break;
         }
 
@@ -552,9 +646,10 @@ class OperationBuilder_v8 {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
         }
+        getLogger() << "Extracting the feature vector" << std::endl;
+        extract_feature_vector(CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR);
         return std::move(m_operation);
     }
-
 
     Operation_v8 && 
     build_conv_backward_filter() {
@@ -649,6 +744,8 @@ class OperationBuilder_v8 {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
         }
+        getLogger() << "Extracting the feature vector" << std::endl;
+        extract_feature_vector(CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR);
         return std::move(m_operation);
     }
 
@@ -739,7 +836,68 @@ class OperationBuilder_v8 {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
         }
+
+        getLogger() << "Extracting the feature vector" << std::endl;
+        extract_feature_vector(CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR);
         return std::move(m_operation);
+    }
+
+    void extract_feature_vector(cudnnBackendDescriptorType_t op_type) {
+        /// Build the feature vector of this operation now.
+        m_operation.feature_vector.reserve(50);
+        
+        m_operation.feature_vector.push_back(op_type);
+        for (auto i = 0; i < tensor_dims; i++) {
+            m_operation.feature_vector.push_back(xTensor_dimA[i]); // n, c, (g), d, h , w 
+        }
+        for (auto i = 0; i < tensor_dims; i++) {
+            m_operation.feature_vector.push_back(wTensor_dimA[i]); // n, c, (g), d, h , w 
+        }
+        for (auto i = 0; i < tensor_dims; i++) {
+            m_operation.feature_vector.push_back(yTensor_dimA[i]); // n, c, (g), d, h , w 
+        }
+        const int max_spatial_dim = 3;
+
+        /// Padding
+        for (auto i = 0; i < max_spatial_dim; i++) {
+            if (i == 0 && is2D) {
+                m_operation.feature_vector.push_back(0);
+            } else {
+                m_operation.feature_vector.push_back(conv_padding[i]);
+            }
+        }
+        /// Dilation
+        for (auto i = 0; i < max_spatial_dim; i++) {
+            if (i == 0 && is2D) {
+                m_operation.feature_vector.push_back(0);
+            } else {
+                m_operation.feature_vector.push_back(conv_dilation[i]);
+            }
+        }
+        /// Strides
+        for (auto i = 0; i < max_spatial_dim; i++) {
+            if (i == 0 && is2D) {
+                m_operation.feature_vector.push_back(0);
+            } else {
+                m_operation.feature_vector.push_back(conv_stride[i]);
+            }
+        }
+        
+        m_operation.feature_vector.push_back(xType);
+        m_operation.feature_vector.push_back(wType);
+        m_operation.feature_vector.push_back(yType);
+        m_operation.feature_vector.push_back(cType);
+        m_operation.feature_vector.push_back(mode);
+
+        for (auto i = 0; i < tensor_dims; i++) {
+            m_operation.feature_vector.push_back(xTensor_strA[i]); // n, c, (g), d, h , w 
+        }
+        for (auto i = 0; i < tensor_dims; i++) {
+            m_operation.feature_vector.push_back(wTensor_strA[i]); // n, c, (g), d, h , w 
+        }
+        for (auto i = 0; i < tensor_dims; i++) {
+            m_operation.feature_vector.push_back(yTensor_strA[i]); // n, c, (g), d, h , w 
+        }
     }
 
     cudnnStatus_t
@@ -885,14 +1043,19 @@ class OperationBuilder_v8 {
         return CUDNN_STATUS_SUCCESS;
     }
 
-
-    
+    void 
+    copy_dims_and_strides(const int64_t *from, int64_t *to) const {
+        for (auto i = 0; i < CUDNN_DIM_MAX + 1; i++) {
+            to[i] = from[i];
+        }
+    }
 
    public:
     /** @defgroup OperationBuilder_v8
      *  Set individual property of Operation_v8 class
      *  @{
      */
+    /// Will be Deprecated Do not use
     auto
     setxDesc(ManagedOpaqueDescriptor const &raw_tensor) -> OperationBuilder_v8 & {
         m_operation.xdesc = raw_tensor;
@@ -902,6 +1065,10 @@ class OperationBuilder_v8 {
     auto
     setxDesc(Tensor_v8 const &tensor) -> OperationBuilder_v8 & {
         m_operation.xdesc = tensor.get_desc();
+        copy_dims_and_strides(tensor.getDimArray(), xTensor_dimA);
+        copy_dims_and_strides(tensor.getStrideArray(), xTensor_strA);
+        tensor_dims = tensor.getDimensionCount();
+        xType = tensor.getDataType();
         return *this;
     }
     auto
@@ -918,6 +1085,9 @@ class OperationBuilder_v8 {
     auto
     setyDesc(Tensor_v8 const &tensor) -> OperationBuilder_v8 & {
         m_operation.ydesc = tensor.get_desc();
+        copy_dims_and_strides(tensor.getDimArray(), yTensor_dimA);
+        copy_dims_and_strides(tensor.getStrideArray(), yTensor_strA);
+        yType = tensor.getDataType();
         return *this;
     }
     auto
@@ -929,9 +1099,13 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION_*_DESCRIPTOR: Non Convolution operation does not need wTensor");
         }
         m_operation.wdesc = tensor.get_desc();
+        copy_dims_and_strides(tensor.getDimArray(), wTensor_dimA);
+        copy_dims_and_strides(tensor.getStrideArray(), wTensor_strA);
+        wType = tensor.getDataType();
         return *this;
     }
 
+    /// Will be Deprecated Do not use
     auto
     setdyDesc(ManagedOpaqueDescriptor const &raw_tensor) -> OperationBuilder_v8 & {
         m_operation.dydesc = raw_tensor;
@@ -940,16 +1114,26 @@ class OperationBuilder_v8 {
     auto
     setdyDesc(Tensor_v8 const &tensor) -> OperationBuilder_v8 & {
         m_operation.dydesc = tensor.get_desc();
+        copy_dims_and_strides(tensor.getDimArray(), yTensor_dimA);
+        copy_dims_and_strides(tensor.getStrideArray(), yTensor_strA);
+        yType = tensor.getDataType();
         return *this;
     }
     auto
     setdxDesc(Tensor_v8 const &tensor) -> OperationBuilder_v8 & {
         m_operation.dxdesc = tensor.get_desc();
+        copy_dims_and_strides(tensor.getDimArray(), xTensor_dimA);
+        copy_dims_and_strides(tensor.getStrideArray(), xTensor_strA);
+        tensor_dims = tensor.getDimensionCount();
+        xType = tensor.getDataType();
         return *this;
     }
     auto
     setdwDesc(Tensor_v8 const &tensor) -> OperationBuilder_v8 & {
         m_operation.dwdesc = tensor.get_desc();
+        copy_dims_and_strides(tensor.getDimArray(), wTensor_dimA);
+        copy_dims_and_strides(tensor.getStrideArray(), wTensor_strA);
+        wType = tensor.getDataType();
         return *this;
     }
 
@@ -965,6 +1149,12 @@ class OperationBuilder_v8 {
         if (conv.getComputePrecision() == CUDNN_DATA_DOUBLE) {
             m_operation.alphabetaType = CUDNN_TYPE_DOUBLE;
         }
+        is2D = conv.getDimensionCount() == 2;
+        copy_dims_and_strides(conv.getPadding(), conv_padding);
+        copy_dims_and_strides(conv.getDilation(), conv_dilation);
+        copy_dims_and_strides(conv.getStride(), conv_stride);
+        cType = conv.getComputePrecision();
+        mode  = conv.getMathMode();
         return *this;
     }
     auto
@@ -1036,6 +1226,31 @@ class OperationBuilder_v8 {
 
         m_operation.is_pointwise_math_op = ((m_operation.pointwise_mode == CUDNN_POINTWISE_ADD) ||
                                             (m_operation.pointwise_mode == CUDNN_POINTWISE_MUL) ||
+#if (CUDNN_VERSION >= 8300)
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_DIV) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_SUB) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_ADD_SQUARE) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_RSQRT) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_SIN) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_COS) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_TAN) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_LOGICAL_OR) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_LOGICAL_AND) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_LOGICAL_NOT) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_CMP_EQ) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_CMP_NEQ) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_CMP_GT) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_CMP_GE) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_CMP_LT) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_CMP_LE) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_LOG) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_NEG) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_MOD) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_POW) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_ABS) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_CEIL) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_FLOOR) ||
+#endif
                                             (m_operation.pointwise_mode == CUDNN_POINTWISE_MIN) ||
                                             (m_operation.pointwise_mode == CUDNN_POINTWISE_MAX) ||
                                             (m_operation.pointwise_mode == CUDNN_POINTWISE_SQRT));
@@ -1046,6 +1261,9 @@ class OperationBuilder_v8 {
                                                       (m_operation.pointwise_mode == CUDNN_POINTWISE_ELU_FWD) ||
                                                       (m_operation.pointwise_mode == CUDNN_POINTWISE_GELU_FWD) ||
                                                       (m_operation.pointwise_mode == CUDNN_POINTWISE_SOFTPLUS_FWD) ||
+#if (CUDNN_VERSION >= 8300)
+                                                      (m_operation.pointwise_mode == CUDNN_POINTWISE_EXP) ||
+#endif
                                                       (m_operation.pointwise_mode == CUDNN_POINTWISE_SWISH_FWD));
 
         m_operation.is_pointwise_activation_bwd_op = ((m_operation.pointwise_mode == CUDNN_POINTWISE_RELU_BWD) ||
@@ -1157,6 +1375,7 @@ class OperationBuilder_v8 {
         } else if (m_operation.op_mode == CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR) {
             return build_reduction_op();
         }
+        getLogger() << "[cudnn_frontend] " << m_operation << std::endl;
         return std::move(m_operation);
     }
 };

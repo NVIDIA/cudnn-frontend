@@ -27,6 +27,7 @@
 #include "cpu_references.h"
 #include "conv_sample.h"
 #include "fusion_sample.h"
+#include "mha_sample.h"
 
 TEST_CASE("Tensor creation comparison", "[frontend][comparison][backend]") {
     // Consider creation of a 2d Tensor
@@ -48,8 +49,6 @@ TEST_CASE("Tensor creation comparison", "[frontend][comparison][backend]") {
                                     .setAlignment(alignment)
                                     .setDataType(data_type)
                                     .build();
-    
-        std::cout << "Created Tensor" << tensor.describe() << std::endl;
     } catch (cudnn_frontend::cudnnException &e) {
         std::cout << "Exception in tensor creation " << e.what() << std::endl;
     }
@@ -102,7 +101,7 @@ TEST_CASE("Tensor creation comparison", "[frontend][comparison][backend]") {
         check_status (cudnnBackendDestroyDescriptor(tensor));
     }
 
-
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("Use global(index) for execution", "[frontend][global_index][wgrad]" ) {
@@ -153,6 +152,8 @@ TEST_CASE("Use global(index) for execution", "[frontend][global_index][wgrad]" )
         if (diff > THRESHOLD) { numErrors++; }
     }
     REQUIRE(numErrors == 0);
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("Use heuristics for execution", "[frontend][heuristics][conv]" ) {
@@ -202,6 +203,8 @@ TEST_CASE("Use heuristics for execution", "[frontend][heuristics][conv]" ) {
         if (diff > THRESHOLD) { numErrors++;}
     }
     REQUIRE(numErrors == 0);
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("Use DNN based heuristics for execution", "[frontend][dnn_heuristics][conv]" ) {
@@ -251,6 +254,8 @@ TEST_CASE("Use DNN based heuristics for execution", "[frontend][dnn_heuristics][
         if (diff > THRESHOLD) { numErrors++;}
     }
     REQUIRE(numErrors == 0);
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("Use fallback for execution", "[frontend][global_index][dgrad]" ) {
@@ -300,6 +305,8 @@ TEST_CASE("Use fallback for execution", "[frontend][global_index][dgrad]" ) {
         if (diff > THRESHOLD) { numErrors++; }
     }
     REQUIRE(numErrors == 0);
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("ConvBiasAct sample", "[frontend][convAddBiasAct]") {
@@ -337,6 +344,8 @@ TEST_CASE("ConvBiasAct sample", "[frontend][convAddBiasAct]") {
     checkCudaErr(cudaDeviceSynchronize());
     checkCudaErr(cudaMemcpy(sm.hostY, sm.devPtrY, sizeof(sm.hostY[0]) * Ysize, cudaMemcpyDeviceToHost));
     checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("Use cudnnFindPlan for execution", "[frontend][cudnnFindPlan][conv]" ) {
@@ -386,6 +395,8 @@ TEST_CASE("Use cudnnFindPlan for execution", "[frontend][cudnnFindPlan][conv]" )
         if (diff > THRESHOLD) { numErrors++;}
     }
     REQUIRE(numErrors == 0);
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("ConvBiasAct sample with cudnnFindPlan", "[frontend][cudnnFindPlan][convAddBiasAct]") {
@@ -423,6 +434,8 @@ TEST_CASE("ConvBiasAct sample with cudnnFindPlan", "[frontend][cudnnFindPlan][co
     checkCudaErr(cudaDeviceSynchronize());
     checkCudaErr(cudaMemcpy(sm.hostY, sm.devPtrY, sizeof(sm.hostY[0]) * Ysize, cudaMemcpyDeviceToHost));
     checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("Use cudnnGetPlan for execution", "[frontend][cudnnGetPlan][conv]" ) {
@@ -473,6 +486,8 @@ TEST_CASE("Use cudnnGetPlan for execution", "[frontend][cudnnGetPlan][conv]" ) {
         if (diff > THRESHOLD) { numErrors++;}
     }
     REQUIRE(numErrors == 0);
+
+    std::cout << "\n========================================================================================\n";
 }
 
 
@@ -508,13 +523,58 @@ TEST_CASE("ConvScaleBiasAddAct sample", "[frontend][fusion][ConvScaleBiasAddAct]
     Surface<half> B(bTensorDim[0] * bTensorDim[1] * bTensorDim[2] * bTensorDim[3], false);
     Surface<half> A(aTensorDim[0] * aTensorDim[1] * aTensorDim[2] * aTensorDim[3], false);
 
-    run_conv_scale_bias_add_relu(xTensorDim, wTensorDim, yTensorDim, sTensorDim, bTensorDim, aTensorDim, CUDNN_DATA_HALF, 
-                                2, conv_padA, conv_dilationA, conv_strideA, 
-                                X.devPtr, W.devPtr, Y.devPtr, S.devPtr, B.devPtr, A.devPtr);
+    run_conv_scale_bias_add_leaky_relu(xTensorDim, wTensorDim, yTensorDim, sTensorDim, bTensorDim, aTensorDim, CUDNN_DATA_HALF, 
+                                       2, conv_padA, conv_dilationA, conv_strideA, 
+                                       X.devPtr, W.devPtr, Y.devPtr, S.devPtr, B.devPtr, A.devPtr);
 
     checkCudaErr(cudaDeviceSynchronize());
     checkCudaErr(cudaMemcpy(Y.hostPtr, Y.devPtr, sizeof(Y.hostPtr[0]) * Ysize, cudaMemcpyDeviceToHost));
     checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
+}
+
+TEST_CASE("ConvScaleBiasAddAct sample_float", "[frontend][fusion][ConvScaleBiasAddAct]") {
+    std::cout << "TEST_CASE :: Sample runtime fusion code with backend API" << std::endl;
+    INFO("TEST_CASE :: Sample runtime fusion code with backend API");
+    int64_t xTensorDim[]      = { 4, 24, 31, 31};
+    int64_t wTensorDim[]      = {32, 24,  9,  9};
+    int64_t yTensorDim[]      = { 4, 32,  5,  5}; 
+    
+    int64_t conv_padA[]        = {3, 3};
+    int64_t conv_dilationA[] = {1, 1};
+    int64_t conv_strideA[] = {7, 7};
+
+    int64_t sTensorDim[]      = {1, 32, 1, 1};  //scale
+    int64_t bTensorDim[]      = {1, 32, 1, 1};  //bias
+    int64_t aTensorDim[]      = {4, 32, 5, 5}; //add
+
+    
+
+    printf("====DIMENSIONS====\n");
+    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", xTensorDim[0], xTensorDim[1], xTensorDim[2], xTensorDim[3]);
+    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", wTensorDim[0], wTensorDim[1], wTensorDim[2], wTensorDim[3]);
+    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", yTensorDim[0], yTensorDim[1], yTensorDim[2], yTensorDim[3]);
+
+    int Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
+
+    Surface<float> X(xTensorDim[0] * xTensorDim[1] * xTensorDim[2] * xTensorDim[3], false);
+    Surface<float> W(wTensorDim[0] * wTensorDim[1] * wTensorDim[2] * wTensorDim[3], false);
+    Surface<float> Y(Ysize, true);
+
+    Surface<float> S(sTensorDim[0] * sTensorDim[1] * sTensorDim[2] * sTensorDim[3], false);
+    Surface<float> B(bTensorDim[0] * bTensorDim[1] * bTensorDim[2] * bTensorDim[3], false);
+    Surface<float> A(aTensorDim[0] * aTensorDim[1] * aTensorDim[2] * aTensorDim[3], false);
+
+    run_conv_scale_bias_add_leaky_relu(xTensorDim, wTensorDim, yTensorDim, sTensorDim, bTensorDim, aTensorDim, CUDNN_DATA_FLOAT, 
+                                       2, conv_padA, conv_dilationA, conv_strideA, 
+                                       X.devPtr, W.devPtr, Y.devPtr, S.devPtr, B.devPtr, A.devPtr);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(Y.hostPtr, Y.devPtr, sizeof(Y.hostPtr[0]) * Ysize, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("ConvBiasScaleAct sample", "[frontend][fusion][ConvBiasScaleAct]") {
@@ -576,6 +636,70 @@ TEST_CASE("ConvBiasScaleAct sample", "[frontend][fusion][ConvBiasScaleAct]") {
     checkCudaErr(cudaDeviceSynchronize());
     checkCudaErr(cudaMemcpy(Y.hostPtr, Y.devPtr, sizeof(Y.hostPtr[0]) * Ysize, cudaMemcpyDeviceToHost));
     checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
+}
+
+TEST_CASE("ConvScaleBiasAct_int8 sample", "[frontend][fusion][ConvScaleBiasAct_int8]") {
+    std::cout << "TEST_CASE ConvScaleBiasAct_int8 :: Sample runtime fusion code with backend API" << std::endl;
+    INFO("TEST_CASE :: Sample runtime fusion code with backend API");
+    int64_t xTensorDim[] = {16, 128, 16, 16};
+    int64_t wTensorDim[] = {256, 128, 1, 1};
+    int64_t yTensorDim[] = {16, 256, 16, 16};
+
+    int64_t conv_padA[]      = {0, 0};
+    int64_t conv_dilationA[] = {1, 1};
+    int64_t conv_strideA[]   = {1, 1};
+
+    int64_t bTensorDim[] = {1, 256, 1, 1};  // bias
+    int64_t sTensorDim[] = {1, 256, 1, 1};  // scale
+
+    printf("====DIMENSIONS====\n");
+    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
+           xTensorDim[0],
+           xTensorDim[1],
+           xTensorDim[2],
+           xTensorDim[3]);
+    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
+           wTensorDim[0],
+           wTensorDim[1],
+           wTensorDim[2],
+           wTensorDim[3]);
+    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
+           yTensorDim[0],
+           yTensorDim[1],
+           yTensorDim[2],
+           yTensorDim[3]);
+
+    int Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
+
+    Surface<int8_t> X(xTensorDim[0] * xTensorDim[1] * xTensorDim[2] * xTensorDim[3], false);
+    Surface<int8_t> W(wTensorDim[0] * wTensorDim[1] * wTensorDim[2] * wTensorDim[3], false);
+    Surface<int8_t> Y(Ysize, true);
+
+    Surface<float> B(bTensorDim[0] * bTensorDim[1] * bTensorDim[2] * bTensorDim[3], false);
+    Surface<float> S(sTensorDim[0] * sTensorDim[1] * sTensorDim[2] * sTensorDim[3], false);
+
+    run_conv_scale_bias_relu_int8(xTensorDim,
+                                  wTensorDim,
+                                  yTensorDim,
+                                  bTensorDim,
+                                  sTensorDim,
+                                  2,
+                                  conv_padA,
+                                  conv_dilationA,
+                                  conv_strideA,
+                                  X.devPtr,
+                                  W.devPtr,
+                                  Y.devPtr,
+                                  B.devPtr,
+                                  S.devPtr);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(Y.hostPtr, Y.devPtr, sizeof(Y.hostPtr[0]) * Ysize, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
 }
 
 
@@ -607,6 +731,40 @@ TEST_CASE("MatmulBiasAct sample", "[frontend][fusion][MatmulBiasAct]") {
     checkCudaErr(cudaDeviceSynchronize());
     checkCudaErr(cudaMemcpy(C.hostPtr, C.devPtr, sizeof(C.hostPtr[0]) * Csize, cudaMemcpyDeviceToHost));
     checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
+}
+
+TEST_CASE("MatmulBiasAct sample_float", "[frontend][fusion][MatmulBiasAct]") {
+    std::cout << "TEST_CASE :: Sample matmul runtime fusion code with backend API" << std::endl;
+    INFO("TEST_CASE :: Sample matmul runtime fusion code with backend API");
+    int64_t aTensorDim[]      = {1, 64, 32}; //batch M K
+    int64_t bTensorDim[]      = {1, 32, 64}; //batch K N
+    int64_t cTensorDim[]      = {1, 64, 64}; //batch M N
+
+    int64_t zTensorDim[]      = {1, 1, 64};  //bias
+    
+
+    printf("====DIMENSIONS====\n");
+    printf("a matrix dims are %" PRId64 ", %" PRId64 ", %" PRId64 "\n", aTensorDim[0], aTensorDim[1], aTensorDim[2]);
+    printf("b matrix dims are %" PRId64 ", %" PRId64 ", %" PRId64 "\n", bTensorDim[0], bTensorDim[1], bTensorDim[2]);
+    printf("c matrix dims are %" PRId64 ", %" PRId64 ", %" PRId64 "\n", cTensorDim[0], cTensorDim[1], cTensorDim[2]);
+
+    int Csize = cTensorDim[0] * cTensorDim[1] * cTensorDim[2];
+
+    Surface<float> A(aTensorDim[0] * aTensorDim[1] * aTensorDim[2], false);
+    Surface<float> B(bTensorDim[0] * bTensorDim[1] * bTensorDim[2], false);
+    Surface<float> C(Csize, true);
+
+    Surface<float> Z(zTensorDim[0] * zTensorDim[1] * zTensorDim[2], false);
+
+    run_matmul_bias_gelu(aTensorDim, bTensorDim, cTensorDim, zTensorDim, CUDNN_DATA_FLOAT, A.devPtr, B.devPtr, C.devPtr, Z.devPtr);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(C.hostPtr, C.devPtr, sizeof(C.hostPtr[0]) * Csize, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("ConvDrelu sample", "[frontend][convDrelu][drelu]") {
@@ -677,6 +835,8 @@ TEST_CASE("ConvDrelu sample", "[frontend][convDrelu][drelu]") {
     checkCudaErr(cudaDeviceSynchronize());
     checkCudaErr(cudaMemcpy(y_mem.hostPtr, y_mem.devPtr, sizeof(y_mem.hostPtr[0]) * Ysize, cudaMemcpyDeviceToHost));
     checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("DgradDrelu sample", "[frontend][dgradDrelu][drelu]") {
@@ -747,6 +907,8 @@ TEST_CASE("DgradDrelu sample", "[frontend][dgradDrelu][drelu]") {
     checkCudaErr(cudaDeviceSynchronize());
     checkCudaErr(cudaMemcpy(x_mem.hostPtr, x_mem.devPtr, sizeof(x_mem.hostPtr[0]) * Xsize, cudaMemcpyDeviceToHost));
     checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("ConvColReduction sample", "[frontend][fusion][ConvColReduction]") {
@@ -784,6 +946,8 @@ TEST_CASE("ConvColReduction sample", "[frontend][fusion][ConvColReduction]") {
     checkCudaErr(cudaDeviceSynchronize());
     checkCudaErr(cudaMemcpy(Reduced.hostPtr, Reduced.devPtr, sizeof(Reduced.hostPtr[0]) * outputSize, cudaMemcpyDeviceToHost));
     checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("Use errata to block global(index) for execution", "[frontend][errata][wgrad]" ) {
@@ -823,6 +987,8 @@ TEST_CASE("Use errata to block global(index) for execution", "[frontend][errata]
     block_using_errata(dimA, padA, convstrideA, dilationA, filterdimA, outdimA, CUDNN_DATA_FLOAT, mode, sm.devPtrX, sm.devPtrW, sm.devPtrY);
 
     REQUIRE(numErrors == 0);
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("DP4A execution with cudnnFindPlan", "[frontend][cudnnFindPlan][conv]" ) {
@@ -867,6 +1033,8 @@ TEST_CASE("DP4A execution with cudnnFindPlan", "[frontend][cudnnFindPlan][conv]"
     checkCudaErr(cudaDeviceSynchronize());
 
     REQUIRE(numErrors == 0);
+
+    std::cout << "\n========================================================================================\n";
 }
 
 TEST_CASE("IMMA execution with manual autotuning", "[frontend][cudnnGetPlan][conv]" ) {
@@ -910,5 +1078,121 @@ TEST_CASE("IMMA execution with manual autotuning", "[frontend][cudnnGetPlan][con
     checkCudaErr(cudaMemcpy(sm.hostY, sm.devPtrY, sizeof(sm.hostY[0]) * Ysize, cudaMemcpyDeviceToHost));
     checkCudaErr(cudaDeviceSynchronize());
 
+    REQUIRE(numErrors == 0);
+
+    std::cout << "\n========================================================================================\n";
+}
+
+TEST_CASE("Use Plan cache for rerunning the same convolution", "[frontend][dnn_heuristics][conv]" ) {
+    std::cout << "Use Plan cache for rerunning the same convolution" << std::endl;
+    INFO("Use Plan cache for rerunning the same convolution");
+    int64_t dimA[]        = {8, 32, 4, 4};
+    int64_t filterdimA[]  = {32, 32, 1, 1};
+    int64_t outdimA[]     = {0, 0, 0, 0}; // Computed Below
+    int64_t padA[]        = {0, 0};
+    int64_t dilationA[] = {1, 1};
+    int64_t convstrideA[] = {1, 1};
+
+    int numErrors = 0;
+
+    outdimA[0] = dimA[0];
+    outdimA[1] = filterdimA[0];
+    for (int dim = 0; dim < 2; dim++) {
+        outdimA[dim + 2] = getFwdConvOutputDim(dimA[dim + 2], padA[dim], filterdimA[dim + 2], convstrideA[dim], dilationA[dim]);
+    }
+
+    cudnnConvolutionMode_t mode      = CUDNN_CONVOLUTION;
+
+    printf("====DIMENSIONS====\n");
+    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dimA[0], dimA[1], dimA[2], dimA[3]);
+    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", filterdimA[0], filterdimA[1], filterdimA[2], filterdimA[3]);
+    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", outdimA[0], outdimA[1], outdimA[2], outdimA[3]);
+
+    int Xsize = dimA[0] * dimA[1] * dimA[2] * dimA[3];
+    int Wsize = filterdimA[0] * filterdimA[1] * filterdimA[2] * filterdimA[3];
+    int Ysize = outdimA[0] * outdimA[1] * outdimA[2] * outdimA[3];
+
+    SurfaceManager<float> sm_0(Xsize, Wsize, Ysize, Ysize);
+    SurfaceManager<float> sm_1(Xsize, Wsize, Ysize, Ysize);
+
+    // In the first call the plan is derived from heuristics.
+    run_from_heuristics(dimA, padA, convstrideA, dilationA, filterdimA, outdimA, CUDNN_DATA_FLOAT, mode, sm_0.devPtrX, sm_0.devPtrW, sm_0.devPtrY, CUDNN_HEUR_MODE_B);
+
+    // In the second call the plan is expected to be in the cache
+    run_from_heuristics(dimA, padA, convstrideA, dilationA, filterdimA, outdimA, CUDNN_DATA_FLOAT, mode, sm_0.devPtrX, sm_0.devPtrW, sm_1.devPtrY, CUDNN_HEUR_MODE_B, true);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(sm_0.hostY, sm_0.devPtrY, sizeof(sm_0.hostY[0]) * Ysize, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaMemcpy(sm_1.hostY, sm_1.devPtrY, sizeof(sm_1.hostY[0]) * Ysize, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    conv_cpu_ref<float,float>(sm_0.hostX, sm_0.hostW, sm_0.host_ref, 1, CUDNN_TENSOR_NCHW, dimA, filterdimA, outdimA, convstrideA, padA, dilationA, 4/*Dims*/);
+
+    for (int index = 0; index < Ysize; index++) {  // assuming in data is packed
+        float diff         = getError(sm_0.hostY[index], sm_0.host_ref[index]);
+        if (diff < 0) diff = -diff;
+        if (diff > THRESHOLD) { numErrors++;}
+        diff         = getError(sm_1.hostY[index], sm_0.host_ref[index]);
+        if (diff < 0) diff = -diff;
+        if (diff > THRESHOLD) { numErrors++;}
+    }
+    REQUIRE(numErrors == 0);
+}
+
+TEST_CASE("Multihead attention sample", "[frontend][fusion][MultiHeadAttention]") {
+    std::cout << "TEST_CASE :: Sample Multihead Attention runtime fusion code with backend API" << std::endl;
+    INFO("TEST_CASE :: Sample Multihead Attention runtime fusion code with backend API");
+
+    int numErrors = 0;
+
+#if (CUDNN_VERSION >= 8310)
+    const int64_t inputSize  = 16; // 1024;
+    const int64_t outputSize = 16; // 1024;
+    const int64_t headSize   = 8;  // 64;
+    const int64_t seqLength  = 8;  // 128;
+    const int64_t numHeads   = 2;  // 16;
+    const int64_t batchSize  = 2;  // 32;
+
+    const int64_t inputTensorSize     = inputSize * seqLength * batchSize;
+    const int64_t outputTensorSize    = outputSize * seqLength * batchSize;
+    const int64_t QKVWeightTensorSize = inputSize * headSize * numHeads;    // To generate Q, K, V
+    const int64_t QKVBiasTensorSize   = headSize * numHeads;                // Add to Q, K, V
+    const int64_t OWeightTensorSize   = outputSize * headSize * numHeads;   // To generate final output
+    const int64_t OBiasTensorSize     = outputSize;                         // Add to final output
+
+    const int64_t totalWeightsAndBiasesSize = (QKVWeightTensorSize + QKVBiasTensorSize) * 3 + OWeightTensorSize + OBiasTensorSize;
+
+    Surface<half> input(inputTensorSize, false);
+    Surface<half> output(outputTensorSize, true);
+    Surface<half> weightsAndBiases(totalWeightsAndBiasesSize, false);
+
+    half const *QKVWeight = reinterpret_cast<half const *>(weightsAndBiases.devPtr);
+    half const *OWeight = reinterpret_cast<half const *>(weightsAndBiases.devPtr) + QKVWeightTensorSize * 3;
+    half const *QKVBias   = reinterpret_cast<half const *>(weightsAndBiases.devPtr) + QKVWeightTensorSize * 3 + OWeightTensorSize;
+    half const *OBias   = reinterpret_cast<half const *>(weightsAndBiases.devPtr) + QKVWeightTensorSize * 3 + OWeightTensorSize + QKVBiasTensorSize * 3;
+
+    cudaMemset(output.devPtr, 0, sizeof(output.hostPtr[0]) * outputTensorSize);
+
+    checkCudaErr(cudaDeviceSynchronize());
+
+    // Call multiHeadAttention sample
+    multiHeadAttention(inputSize,
+                       headSize,
+                       seqLength,
+                       numHeads,
+                       batchSize,
+                       outputSize,
+                       CUDNN_DATA_HALF,
+                       input.devPtr,
+                       QKVWeight,
+                       OWeight,
+                       QKVBias,
+                       OBias,
+                       output.devPtr);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(output.hostPtr, output.devPtr, sizeof(output.hostPtr[0]) * outputTensorSize, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+#endif
     REQUIRE(numErrors == 0);
 }

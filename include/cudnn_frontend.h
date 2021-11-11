@@ -111,7 +111,9 @@
 #include "cudnn_frontend_VariantPack.h"
 #include "cudnn_frontend_PointWiseDesc.h"
 #include "cudnn_frontend_MatMulDesc.h"
+#include "cudnn_frontend_Logging.h"
 #include "cudnn_frontend_Reorder_Tensor.h"
+#include "cudnn_frontend_ExecutionPlanCache.h"
 
 namespace cudnn_frontend {
 using Tensor                    = Tensor_v8;
@@ -126,16 +128,12 @@ using ReductionDesc             = ReductionDesc_v8;
 using ReductionDescBuilder      = ReductionDescBuilder_v8;
 using Operation                 = Operation_v8;
 using OperationBuilder          = OperationBuilder_v8;
-using OperationGraph            = OperationGraph_v8;
-using OperationGraphBuilder     = OperationGraphBuilder_v8;
 using EngineHeuristicsBuilder   = EngineHeuristicsBuilder_v8;
 using EngineHeuristics          = EngineHeuristics_v8;
 using EngineBuilder             = EngineBuilder_v8;
 using Engine                    = Engine_v8;
 using EngineConfig              = EngineConfig_v8;
 using EngineConfigBuilder       = EngineConfigBuilder_v8;
-using ExecutionPlan             = ExecutionPlan_v8;
-using ExecutionPlanBuilder      = ExecutionPlanBuilder_v8;
 using VariantPack               = VariantPack_v8;
 using VariantPackBuilder        = VariantPackBuilder_v8;
 using EngineFallbackList        = EngineFallbackList_v8;

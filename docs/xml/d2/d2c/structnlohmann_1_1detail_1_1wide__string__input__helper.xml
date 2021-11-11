@@ -18,12 +18,12 @@
     <detaileddescription>
     </detaileddescription>
     <collaborationgraph>
-      <node id="1065">
+      <node id="1138">
         <label>nlohmann::detail::wide_string_input_helper&lt; BaseInputAdapter, T &gt;</label>
         <link refid="d2/d2c/structnlohmann_1_1detail_1_1wide__string__input__helper"/>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5387" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5387" bodyend="-1"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="5387" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="5387" bodyend="-1"/>
     <listofallmembers>
     </listofallmembers>
   </compounddef>

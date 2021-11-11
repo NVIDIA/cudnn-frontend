@@ -19,7 +19,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="219" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="219" bodyend="222"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="274" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" bodystart="274" bodyend="277"/>
       </memberdef>
       <memberdef kind="function" id="d4/de1/group__ExecutionPlanBuilder__v8_1gac5c23cff8c1424f71ef2cee2dc66cd3c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -36,7 +36,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="225" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="225" bodyend="229"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="280" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" bodystart="280" bodyend="284"/>
       </memberdef>
       <memberdef kind="function" id="d4/de1/group__ExecutionPlanBuilder__v8_1gae0f92d5445da53253ff3460ac6aefffa" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -58,7 +58,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="233" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="233" bodyend="237"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="288" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" bodystart="288" bodyend="292"/>
       </memberdef>
       </sectiondef>
     <briefdescription>

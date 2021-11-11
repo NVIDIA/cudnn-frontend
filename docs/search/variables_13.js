@@ -5,5 +5,7 @@ var searchData=
   ['value_5ffloat',['value_float',['../d8/d22/classnlohmann_1_1detail_1_1lexer.html#a0d74bb18ba7d32ea7e7c9d9a7d6c2e70',1,'nlohmann::detail::lexer']]],
   ['value_5finteger',['value_integer',['../d8/d22/classnlohmann_1_1detail_1_1lexer.html#a5134de850fab8f41474a36ae07998088',1,'nlohmann::detail::lexer']]],
   ['value_5fref',['value_ref',['../da/d10/classnlohmann_1_1detail_1_1json__ref.html#a45391e581543480fc02007de08d95705',1,'nlohmann::detail::json_ref']]],
-  ['value_5funsigned',['value_unsigned',['../d8/d22/classnlohmann_1_1detail_1_1lexer.html#ae84cbf312215c15d79783380b1592f74',1,'nlohmann::detail::lexer']]]
+  ['value_5funsigned',['value_unsigned',['../d8/d22/classnlohmann_1_1detail_1_1lexer.html#ae84cbf312215c15d79783380b1592f74',1,'nlohmann::detail::lexer']]],
+  ['vectorcount',['vectorCount',['../d6/da7/classcudnn__frontend_1_1Tensor__v8.html#a2afdff65c7b389a4da5d9e4825db3e85',1,'cudnn_frontend::Tensor_v8']]],
+  ['vectordimension',['vectorDimension',['../d6/da7/classcudnn__frontend_1_1Tensor__v8.html#ac645129e72b917e030320398802d7b73',1,'cudnn_frontend::Tensor_v8']]]
 ];

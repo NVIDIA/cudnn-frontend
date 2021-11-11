@@ -29,7 +29,7 @@
  <tr style="height: 56px;">
   <td id="projectalign" style="padding-left: 0.5em;">
    <div id="projectname">CUDNN Frontend API
-   &#160;<span id="projectnumber">8.2.0</span>
+   &#160;<span id="projectnumber">8.3.0</span>
    </div>
   </td>
  </tr>
@@ -92,6 +92,8 @@ Functions</h2></td></tr>
 <tr class="memitem:gad8de00b0e7a86bdda61749e7572a35ac"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d3/ddd/group__ConvDescBuilder__v8.html#gad8de00b0e7a86bdda61749e7572a35ac">cudnn_frontend::ConvDescBuilder_v8::setDataType</a> (cudnnDataType_t data_type_) -&gt; <a class="el" href="../../db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html">ConvDescBuilder_v8</a> &amp;</td></tr>
 <tr class="memdesc:gad8de00b0e7a86bdda61749e7572a35ac"><td class="mdescLeft">&#160;</td><td class="mdescRight">Set Datatype for the Convolution Operation.  <a href="#gad8de00b0e7a86bdda61749e7572a35ac">More...</a><br /></td></tr>
 <tr class="separator:gad8de00b0e7a86bdda61749e7572a35ac"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ga8f4b0d58c7213ce6be6e341afa56c654"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d3/ddd/group__ConvDescBuilder__v8.html#ga8f4b0d58c7213ce6be6e341afa56c654">cudnn_frontend::ConvDescBuilder_v8::setComputePrecision</a> (cudnnDataType_t data_type_) -&gt; <a class="el" href="../../db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html">ConvDescBuilder_v8</a> &amp;</td></tr>
+<tr class="separator:ga8f4b0d58c7213ce6be6e341afa56c654"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:gab07bf6292e69d19e6324d3073a86d58c"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d3/ddd/group__ConvDescBuilder__v8.html#gab07bf6292e69d19e6324d3073a86d58c">cudnn_frontend::ConvDescBuilder_v8::setPrePadding</a> (int64_t ndims, int64_t const *padding) -&gt; <a class="el" href="../../db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html">ConvDescBuilder_v8</a> &amp;</td></tr>
 <tr class="memdesc:gab07bf6292e69d19e6324d3073a86d58c"><td class="mdescLeft">&#160;</td><td class="mdescRight">Set Padding Lower of the convDesc.  <a href="#gab07bf6292e69d19e6324d3073a86d58c">More...</a><br /></td></tr>
 <tr class="separator:gab07bf6292e69d19e6324d3073a86d58c"><td class="memSeparator" colspan="2">&#160;</td></tr>
@@ -114,6 +116,34 @@ Functions</h2></td></tr>
 <a name="details" id="details"></a><h2 class="groupheader">Detailed Description</h2>
 <p>Set individual property of <a class="el" href="../../d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html">ConvDesc_v8</a> class </p>
 <h2 class="groupheader">Function Documentation</h2>
+<a id="ga8f4b0d58c7213ce6be6e341afa56c654"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#ga8f4b0d58c7213ce6be6e341afa56c654">&#9670;&nbsp;</a></span>setComputePrecision()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">auto cudnn_frontend::ConvDescBuilder_v8::setComputePrecision </td>
+          <td>(</td>
+          <td class="paramtype">cudnnDataType_t&#160;</td>
+          <td class="paramname"><em>data_type_</em></td><td>)</td>
+          <td> -&gt; <a class="el" href="../../db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html">ConvDescBuilder_v8</a> &amp; </td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">inline</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00153">153</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
+
+</div>
+</div>
 <a id="gad8de00b0e7a86bdda61749e7572a35ac"></a>
 <h2 class="memtitle"><span class="permalink"><a href="#gad8de00b0e7a86bdda61749e7572a35ac">&#9670;&nbsp;</a></span>setDataType()</h2>
 
@@ -140,7 +170,7 @@ Functions</h2></td></tr>
 
 <p>Set Datatype for the Convolution Operation. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00127">127</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00149">149</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
 
 </div>
 </div>
@@ -180,9 +210,9 @@ Functions</h2></td></tr>
 
 <p>Set Dilation of the convDesc. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00145">145</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00171">171</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00112">cudnn_frontend::ConvDesc_v8::dilation</a>.</p>
+<p class="reference">References <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00134">cudnn_frontend::ConvDesc_v8::dilation</a>.</p>
 
 </div>
 </div>
@@ -212,7 +242,7 @@ Functions</h2></td></tr>
 
 <p>Set Convolution Mode of the convolution Operation. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00163">163</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00189">189</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
 
 </div>
 </div>
@@ -242,7 +272,7 @@ Functions</h2></td></tr>
 
 <p>Set Num Spatial Dimensions of the convolution Operation. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00157">157</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00183">183</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
 
 </div>
 </div>
@@ -282,7 +312,7 @@ Functions</h2></td></tr>
 
 <p>Set Padding Upper of the convDesc. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00139">139</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00165">165</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
 
 </div>
 </div>
@@ -322,7 +352,7 @@ Functions</h2></td></tr>
 
 <p>Set Padding Lower of the convDesc. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00133">133</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00159">159</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
 
 </div>
 </div>
@@ -362,7 +392,7 @@ Functions</h2></td></tr>
 
 <p>Set Strides of the convDesc. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00151">151</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00177">177</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
 
 </div>
 </div>

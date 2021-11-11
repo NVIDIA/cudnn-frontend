@@ -12,15 +12,18 @@
     <innerfile refid="df/d3e/cudnn__frontend__EngineFallbackList_8h">cudnn_frontend_EngineFallbackList.h</innerfile>
     <innerfile refid="db/d7e/cudnn__frontend__Errata_8h">cudnn_frontend_Errata.h</innerfile>
     <innerfile refid="d6/d51/cudnn__frontend__ExecutionPlan_8h">cudnn_frontend_ExecutionPlan.h</innerfile>
+    <innerfile refid="d9/dd3/cudnn__frontend__ExecutionPlanCache_8h">cudnn_frontend_ExecutionPlanCache.h</innerfile>
     <innerfile refid="d5/d36/cudnn__frontend__Filters_8h">cudnn_frontend_Filters.h</innerfile>
     <innerfile refid="d3/d6b/cudnn__frontend__find__plan_8h">cudnn_frontend_find_plan.h</innerfile>
     <innerfile refid="d2/d3b/cudnn__frontend__get__plan_8h">cudnn_frontend_get_plan.h</innerfile>
     <innerfile refid="db/d66/cudnn__frontend__Heuristics_8h">cudnn_frontend_Heuristics.h</innerfile>
+    <innerfile refid="d8/dc4/cudnn__frontend__Logging_8h">cudnn_frontend_Logging.h</innerfile>
     <innerfile refid="d6/d32/cudnn__frontend__MatMulDesc_8h">cudnn_frontend_MatMulDesc.h</innerfile>
     <innerfile refid="da/d5a/cudnn__frontend__Operation_8h">cudnn_frontend_Operation.h</innerfile>
     <innerfile refid="db/d7d/cudnn__frontend__OperationGraph_8h">cudnn_frontend_OperationGraph.h</innerfile>
     <innerfile refid="da/d5f/cudnn__frontend__PointWiseDesc_8h">cudnn_frontend_PointWiseDesc.h</innerfile>
     <innerfile refid="db/da7/cudnn__frontend__ReductionDesc_8h">cudnn_frontend_ReductionDesc.h</innerfile>
+    <innerfile refid="d9/da8/cudnn__frontend__Reorder__Tensor_8h">cudnn_frontend_Reorder_Tensor.h</innerfile>
     <innerfile refid="d3/d98/cudnn__frontend__Tensor_8h">cudnn_frontend_Tensor.h</innerfile>
     <innerfile refid="df/d17/cudnn__frontend__utils_8h">cudnn_frontend_utils.h</innerfile>
     <innerfile refid="df/dc0/cudnn__frontend__VariantPack_8h">cudnn_frontend_VariantPack.h</innerfile>
@@ -28,6 +31,6 @@
     </briefdescription>
     <detaileddescription>
     </detaileddescription>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/"/>
   </compounddef>
 </doxygen>

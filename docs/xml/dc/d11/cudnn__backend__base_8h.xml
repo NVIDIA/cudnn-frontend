@@ -2,164 +2,211 @@
 <doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
   <compounddef id="dc/d11/cudnn__backend__base_8h" kind="file" language="C++">
     <compoundname>cudnn_backend_base.h</compoundname>
+    <includes local="no">ostream</includes>
     <includes local="no">cudnn.h</includes>
     <includedby refid="df/d17/cudnn__frontend__utils_8h" local="yes">cudnn_frontend_utils.h</includedby>
+    <includedby refid="d8/dc4/cudnn__frontend__Logging_8h" local="yes">cudnn_frontend_Logging.h</includedby>
     <incdepgraph>
+      <node id="2">
+        <label>cudnn.h</label>
+      </node>
+      <node id="1">
+        <label>ostream</label>
+      </node>
       <node id="0">
         <label>cudnn_backend_base.h</label>
         <link refid="dc/d11/cudnn__backend__base_8h"/>
         <childnode refid="1" relation="include">
         </childnode>
-      </node>
-      <node id="1">
-        <label>cudnn.h</label>
+        <childnode refid="2" relation="include">
+        </childnode>
       </node>
     </incdepgraph>
     <invincdepgraph>
-      <node id="13">
-        <label>cudnn_frontend_EngineConfig.h</label>
-        <link refid="d6/d67/cudnn__frontend__EngineConfig_8h"/>
-        <childnode refid="5" relation="include">
-        </childnode>
-      </node>
-      <node id="2">
-        <label>cudnn_backend_base.h</label>
-        <link refid="dc/d11/cudnn__backend__base_8h"/>
-        <childnode refid="3" relation="include">
-        </childnode>
-      </node>
-      <node id="8">
-        <label>cudnn_frontend_get_plan.h</label>
-        <link refid="d2/d3b/cudnn__frontend__get__plan_8h"/>
-      </node>
-      <node id="15">
-        <label>cudnn_frontend_PointWiseDesc.h</label>
-        <link refid="da/d5f/cudnn__frontend__PointWiseDesc_8h"/>
-        <childnode refid="9" relation="include">
-        </childnode>
-        <childnode refid="5" relation="include">
-        </childnode>
-      </node>
-      <node id="4">
-        <label>cudnn_frontend_ConvDesc.h</label>
-        <link refid="d1/de7/cudnn__frontend__ConvDesc_8h"/>
-        <childnode refid="5" relation="include">
-        </childnode>
-        <childnode refid="9" relation="include">
-        </childnode>
-      </node>
-      <node id="14">
-        <label>cudnn_frontend_ExecutionPlan.h</label>
-        <link refid="d6/d51/cudnn__frontend__ExecutionPlan_8h"/>
-        <childnode refid="5" relation="include">
-        </childnode>
-      </node>
-      <node id="16">
-        <label>cudnn_frontend_MatMulDesc.h</label>
-        <link refid="d6/d32/cudnn__frontend__MatMulDesc_8h"/>
-        <childnode refid="9" relation="include">
-        </childnode>
-        <childnode refid="5" relation="include">
-        </childnode>
-      </node>
-      <node id="10">
-        <label>cudnn_frontend_OperationGraph.h</label>
-        <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
-        <childnode refid="11" relation="include">
-        </childnode>
-        <childnode refid="12" relation="include">
-        </childnode>
-        <childnode refid="5" relation="include">
-        </childnode>
-      </node>
-      <node id="12">
-        <label>cudnn_frontend_Engine.h</label>
-        <link refid="de/d6d/cudnn__frontend__Engine_8h"/>
-        <childnode refid="5" relation="include">
-        </childnode>
-        <childnode refid="13" relation="include">
-        </childnode>
-        <childnode refid="14" relation="include">
-        </childnode>
-      </node>
-      <node id="18">
-        <label>cudnn_frontend_Tensor.h</label>
-        <link refid="d3/d98/cudnn__frontend__Tensor_8h"/>
-        <childnode refid="9" relation="include">
-        </childnode>
-        <childnode refid="5" relation="include">
-        </childnode>
-      </node>
-      <node id="9">
-        <label>cudnn_frontend_Operation.h</label>
-        <link refid="da/d5a/cudnn__frontend__Operation_8h"/>
-        <childnode refid="10" relation="include">
-        </childnode>
-        <childnode refid="5" relation="include">
-        </childnode>
-      </node>
-      <node id="6">
-        <label>cudnn_frontend_EngineConfigGenerator.h</label>
-        <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
-        <childnode refid="7" relation="include">
-        </childnode>
-        <childnode refid="8" relation="include">
-        </childnode>
-      </node>
-      <node id="19">
+      <node id="22">
         <label>cudnn_frontend_VariantPack.h</label>
         <link refid="df/dc0/cudnn__frontend__VariantPack_8h"/>
-        <childnode refid="5" relation="include">
-        </childnode>
-      </node>
-      <node id="5">
-        <label>cudnn_frontend.h</label>
-        <link refid="de/d0c/cudnn__frontend_8h"/>
         <childnode refid="6" relation="include">
         </childnode>
       </node>
-      <node id="3">
-        <label>cudnn_frontend_utils.h</label>
-        <link refid="df/d17/cudnn__frontend__utils_8h"/>
-        <childnode refid="4" relation="include">
+      <node id="13">
+        <label>cudnn_frontend_Engine.h</label>
+        <link refid="de/d6d/cudnn__frontend__Engine_8h"/>
+        <childnode refid="14" relation="include">
+        </childnode>
+        <childnode refid="6" relation="include">
         </childnode>
         <childnode refid="15" relation="include">
         </childnode>
-        <childnode refid="16" relation="include">
+      </node>
+      <node id="14">
+        <label>cudnn_frontend_EngineConfig.h</label>
+        <link refid="d6/d67/cudnn__frontend__EngineConfig_8h"/>
+        <childnode refid="12" relation="include">
+        </childnode>
+        <childnode refid="6" relation="include">
+        </childnode>
+      </node>
+      <node id="19">
+        <label>cudnn_frontend_MatMulDesc.h</label>
+        <link refid="d6/d32/cudnn__frontend__MatMulDesc_8h"/>
+        <childnode refid="10" relation="include">
+        </childnode>
+        <childnode refid="6" relation="include">
+        </childnode>
+      </node>
+      <node id="12">
+        <label>cudnn_frontend_Heuristics.h</label>
+        <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
+        <childnode refid="6" relation="include">
+        </childnode>
+      </node>
+      <node id="18">
+        <label>cudnn_frontend_PointWiseDesc.h</label>
+        <link refid="da/d5f/cudnn__frontend__PointWiseDesc_8h"/>
+        <childnode refid="10" relation="include">
+        </childnode>
+        <childnode refid="6" relation="include">
+        </childnode>
+      </node>
+      <node id="9">
+        <label>cudnn_frontend_get_plan.h</label>
+        <link refid="d2/d3b/cudnn__frontend__get__plan_8h"/>
+      </node>
+      <node id="24">
+        <label>cudnn_frontend_Errata.h</label>
+        <link refid="db/d7e/cudnn__frontend__Errata_8h"/>
+        <childnode refid="6" relation="include">
+        </childnode>
+      </node>
+      <node id="23">
+        <label>cudnn_frontend_Logging.h</label>
+        <link refid="d8/dc4/cudnn__frontend__Logging_8h"/>
+        <childnode refid="4" relation="include">
+        </childnode>
+        <childnode refid="24" relation="include">
+        </childnode>
+        <childnode refid="6" relation="include">
+        </childnode>
+      </node>
+      <node id="21">
+        <label>cudnn_frontend_Tensor.h</label>
+        <link refid="d3/d98/cudnn__frontend__Tensor_8h"/>
+        <childnode refid="10" relation="include">
+        </childnode>
+        <childnode refid="6" relation="include">
         </childnode>
         <childnode refid="17" relation="include">
         </childnode>
-        <childnode refid="18" relation="include">
+      </node>
+      <node id="7">
+        <label>cudnn_frontend_EngineConfigGenerator.h</label>
+        <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
+        <childnode refid="8" relation="include">
         </childnode>
         <childnode refid="9" relation="include">
+        </childnode>
+      </node>
+      <node id="16">
+        <label>cudnn_frontend_ExecutionPlanCache.h</label>
+        <link refid="d9/dd3/cudnn__frontend__ExecutionPlanCache_8h"/>
+        <childnode refid="6" relation="include">
+        </childnode>
+      </node>
+      <node id="10">
+        <label>cudnn_frontend_Operation.h</label>
+        <link refid="da/d5a/cudnn__frontend__Operation_8h"/>
+        <childnode refid="11" relation="include">
+        </childnode>
+        <childnode refid="6" relation="include">
+        </childnode>
+      </node>
+      <node id="17">
+        <label>cudnn_frontend_Reorder_Tensor.h</label>
+        <link refid="d9/da8/cudnn__frontend__Reorder__Tensor_8h"/>
+        <childnode refid="6" relation="include">
+        </childnode>
+      </node>
+      <node id="15">
+        <label>cudnn_frontend_ExecutionPlan.h</label>
+        <link refid="d6/d51/cudnn__frontend__ExecutionPlan_8h"/>
+        <childnode refid="6" relation="include">
+        </childnode>
+        <childnode refid="16" relation="include">
+        </childnode>
+      </node>
+      <node id="5">
+        <label>cudnn_frontend_ConvDesc.h</label>
+        <link refid="d1/de7/cudnn__frontend__ConvDesc_8h"/>
+        <childnode refid="6" relation="include">
+        </childnode>
+        <childnode refid="10" relation="include">
+        </childnode>
+        <childnode refid="17" relation="include">
+        </childnode>
+      </node>
+      <node id="11">
+        <label>cudnn_frontend_OperationGraph.h</label>
+        <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
+        <childnode refid="12" relation="include">
+        </childnode>
+        <childnode refid="13" relation="include">
+        </childnode>
+        <childnode refid="6" relation="include">
+        </childnode>
+        <childnode refid="16" relation="include">
+        </childnode>
+      </node>
+      <node id="6">
+        <label>cudnn_frontend.h</label>
+        <link refid="de/d0c/cudnn__frontend_8h"/>
+        <childnode refid="7" relation="include">
+        </childnode>
+      </node>
+      <node id="8">
+        <label>cudnn_frontend_find_plan.h</label>
+        <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
+      </node>
+      <node id="20">
+        <label>cudnn_frontend_ReductionDesc.h</label>
+        <link refid="db/da7/cudnn__frontend__ReductionDesc_8h"/>
+        <childnode refid="10" relation="include">
+        </childnode>
+      </node>
+      <node id="4">
+        <label>cudnn_frontend_utils.h</label>
+        <link refid="df/d17/cudnn__frontend__utils_8h"/>
+        <childnode refid="5" relation="include">
+        </childnode>
+        <childnode refid="18" relation="include">
+        </childnode>
+        <childnode refid="19" relation="include">
+        </childnode>
+        <childnode refid="20" relation="include">
+        </childnode>
+        <childnode refid="21" relation="include">
         </childnode>
         <childnode refid="10" relation="include">
         </childnode>
         <childnode refid="11" relation="include">
         </childnode>
-        <childnode refid="12" relation="include">
-        </childnode>
         <childnode refid="13" relation="include">
         </childnode>
         <childnode refid="14" relation="include">
         </childnode>
-        <childnode refid="19" relation="include">
+        <childnode refid="12" relation="include">
+        </childnode>
+        <childnode refid="15" relation="include">
+        </childnode>
+        <childnode refid="22" relation="include">
         </childnode>
       </node>
-      <node id="17">
-        <label>cudnn_frontend_ReductionDesc.h</label>
-        <link refid="db/da7/cudnn__frontend__ReductionDesc_8h"/>
-        <childnode refid="9" relation="include">
+      <node id="3">
+        <label>cudnn_backend_base.h</label>
+        <link refid="dc/d11/cudnn__backend__base_8h"/>
+        <childnode refid="4" relation="include">
         </childnode>
-      </node>
-      <node id="7">
-        <label>cudnn_frontend_find_plan.h</label>
-        <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
-      </node>
-      <node id="11">
-        <label>cudnn_frontend_Heuristics.h</label>
-        <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
-        <childnode refid="5" relation="include">
+        <childnode refid="23" relation="include">
         </childnode>
       </node>
     </invincdepgraph>
@@ -195,96 +242,98 @@
 <codeline lineno="22"><highlight class="normal"></highlight></codeline>
 <codeline lineno="23"><highlight class="normal"></highlight><highlight class="preprocessor">#pragma<sp/>once</highlight><highlight class="normal"></highlight></codeline>
 <codeline lineno="24"><highlight class="normal"></highlight></codeline>
-<codeline lineno="25"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;cudnn.h&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="25"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;ostream&gt;</highlight><highlight class="normal"></highlight></codeline>
 <codeline lineno="26"><highlight class="normal"></highlight></codeline>
-<codeline lineno="27" refid="df/de1/namespacecudnn__frontend" refkind="compound"><highlight class="normal"></highlight><highlight class="keyword">namespace<sp/></highlight><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend" kindref="compound">cudnn_frontend</ref><sp/>{</highlight></codeline>
+<codeline lineno="27"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;cudnn.h&gt;</highlight><highlight class="normal"></highlight></codeline>
 <codeline lineno="28"><highlight class="normal"></highlight></codeline>
-<codeline lineno="34" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" refkind="compound"><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref><sp/>{</highlight></codeline>
-<codeline lineno="35" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a47968d641c0da8d33882f86d8afa30b4" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnBackendDescriptor_t<sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a47968d641c0da8d33882f86d8afa30b4" kindref="member">m_desc</ref><sp/>=<sp/></highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">;<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight></codeline>
-<codeline lineno="36" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnStatus_t<sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" kindref="member">status</ref><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/>CUDNN_STATUS_SUCCESS;<sp/><sp/></highlight></codeline>
-<codeline lineno="37"><highlight class="normal"></highlight></codeline>
-<codeline lineno="38"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal">:</highlight></codeline>
-<codeline lineno="39"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a42a928eb5b2524d1c3f67b7200dd53c9" kindref="member">OpaqueBackendPointer</ref>(</highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;<sp/><sp/></highlight></codeline>
-<codeline lineno="40"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref>&amp;</highlight></codeline>
-<codeline lineno="41"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1adf5bf20f5bdfbfdecd05360830b34b89" kindref="member">operator=</ref>(</highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref>&amp;)<sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="42"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a42a928eb5b2524d1c3f67b7200dd53c9" kindref="member">OpaqueBackendPointer</ref>(<ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref>&amp;&amp;)<sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="43"><highlight class="normal"></highlight></codeline>
-<codeline lineno="48" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aadf0c53d7aedb1c6c121b2736e98b2dd" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aadf0c53d7aedb1c6c121b2736e98b2dd" kindref="member">OpaqueBackendPointer</ref>(cudnnBackendDescriptorType_t<sp/><ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref>)<sp/>{<sp/>status<sp/>=<sp/>cudnnBackendCreateDescriptor(type,<sp/>&amp;m_desc);<sp/>}</highlight></codeline>
-<codeline lineno="53" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a9f549dd95873ac3a02689ef97f4a6c75" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a9f549dd95873ac3a02689ef97f4a6c75" kindref="member">~OpaqueBackendPointer</ref>()<sp/>{<sp/>cudnnBackendDestroyDescriptor(m_desc);<sp/>};</highlight></codeline>
-<codeline lineno="59"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnBackendDescriptor_t<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal">&amp;</highlight></codeline>
-<codeline lineno="60" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1ac1700c7d96af0250e5721f5e5f9d95bc" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1ac1700c7d96af0250e5721f5e5f9d95bc" kindref="member">get_backend_descriptor</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
-<codeline lineno="61"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a47968d641c0da8d33882f86d8afa30b4" kindref="member">m_desc</ref>;</highlight></codeline>
-<codeline lineno="62"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="67"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnStatus_t</highlight></codeline>
-<codeline lineno="68" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1abd4f69554da364008f3780e9dc3a5bfc" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1abd4f69554da364008f3780e9dc3a5bfc" kindref="member">get_status</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
-<codeline lineno="69"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" kindref="member">status</ref>;</highlight></codeline>
-<codeline lineno="70"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="75"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">bool</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="76" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aa9059097bb9161d454c6e17b03ca236c" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aa9059097bb9161d454c6e17b03ca236c" kindref="member">is_good</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
-<codeline lineno="77"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>status<sp/>==<sp/>CUDNN_STATUS_SUCCESS;</highlight></codeline>
-<codeline lineno="78"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="79"><highlight class="normal">};</highlight></codeline>
-<codeline lineno="80"><highlight class="normal"></highlight></codeline>
-<codeline lineno="82" refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" refkind="member"><highlight class="keyword">using</highlight><highlight class="normal"><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref><sp/>=<sp/>std::shared_ptr&lt;OpaqueBackendPointer&gt;;</highlight></codeline>
-<codeline lineno="83"><highlight class="normal"></highlight></codeline>
-<codeline lineno="85"><highlight class="keyword">static</highlight><highlight class="normal"><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref></highlight></codeline>
-<codeline lineno="86" refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" kindref="member">make_shared_backend_pointer</ref>(cudnnBackendDescriptorType_t<sp/><ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref>)<sp/>{</highlight></codeline>
-<codeline lineno="87"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::make_shared&lt;OpaqueBackendPointer&gt;(type);</highlight></codeline>
-<codeline lineno="88"><highlight class="normal">}</highlight></codeline>
-<codeline lineno="89"><highlight class="normal"></highlight></codeline>
-<codeline lineno="97" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" refkind="compound"><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" kindref="compound">BackendDescriptor</ref><sp/>{</highlight></codeline>
-<codeline lineno="98"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal">:</highlight></codeline>
-<codeline lineno="100"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">virtual</highlight><highlight class="normal"><sp/>std::string</highlight></codeline>
-<codeline lineno="101"><highlight class="normal"><sp/><sp/><sp/><sp/>describe()<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>=<sp/>0;</highlight></codeline>
-<codeline lineno="102"><highlight class="normal"></highlight></codeline>
-<codeline lineno="105"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnBackendDescriptor_t</highlight></codeline>
-<codeline lineno="106" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3aa1ab42ab96471092185f15e22c1e9f" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3aa1ab42ab96471092185f15e22c1e9f" kindref="member">get_raw_desc</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
-<codeline lineno="107"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>pointer-&gt;get_backend_descriptor();</highlight></codeline>
-<codeline lineno="108"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="109"><highlight class="normal"></highlight></codeline>
-<codeline lineno="111"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnStatus_t</highlight></codeline>
-<codeline lineno="112" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" kindref="member">get_status</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
-<codeline lineno="113"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" kindref="member">status</ref>;</highlight></codeline>
-<codeline lineno="114"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="115"><highlight class="normal"></highlight></codeline>
-<codeline lineno="117"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">void</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="118" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3ef02443f20b90223baf5f1922505eab" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3ef02443f20b90223baf5f1922505eab" kindref="member">set_status</ref>(cudnnStatus_t<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>status_)</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
-<codeline lineno="119"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" kindref="member">status</ref><sp/>=<sp/>status_;</highlight></codeline>
-<codeline lineno="120"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="121"><highlight class="normal"></highlight></codeline>
-<codeline lineno="123"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">void</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="124" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a1748a5c560905314930c37b2ed1a54d2" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a1748a5c560905314930c37b2ed1a54d2" kindref="member">set_error</ref>(</highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">char</highlight><highlight class="normal">*<sp/>message)</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
-<codeline lineno="125"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>err_msg<sp/>=<sp/>message;</highlight></codeline>
-<codeline lineno="126"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="127"><highlight class="normal"></highlight></codeline>
-<codeline lineno="129"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">char</highlight><highlight class="normal">*</highlight></codeline>
-<codeline lineno="130" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1abfde0f34b0bf49c45d3d9c0408284f6f" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1abfde0f34b0bf49c45d3d9c0408284f6f" kindref="member">get_error</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
-<codeline lineno="131"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>err_msg.c_str();</highlight></codeline>
-<codeline lineno="132"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="133"><highlight class="normal"></highlight></codeline>
-<codeline lineno="135"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref></highlight></codeline>
-<codeline lineno="136" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a57c83e78374bac747b5660fb271b947a" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a57c83e78374bac747b5660fb271b947a" kindref="member">get_desc</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
-<codeline lineno="137"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>pointer;</highlight></codeline>
-<codeline lineno="138"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="139"><highlight class="normal"></highlight></codeline>
-<codeline lineno="141"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnStatus_t</highlight></codeline>
-<codeline lineno="142" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" kindref="member">initialize_managed_backend_pointer</ref>(cudnnBackendDescriptorType_t<sp/><ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref>)<sp/>{</highlight></codeline>
-<codeline lineno="143"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>pointer<sp/>=<sp/><ref refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" kindref="member">make_shared_backend_pointer</ref>(type);</highlight></codeline>
-<codeline lineno="144"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>pointer-&gt;get_status();</highlight></codeline>
-<codeline lineno="145"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="146"><highlight class="normal"></highlight></codeline>
-<codeline lineno="147"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">protected</highlight><highlight class="normal">:</highlight></codeline>
-<codeline lineno="152" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8aa93686ca88410fc048b05155148183" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8aa93686ca88410fc048b05155148183" kindref="member">BackendDescriptor</ref>(<ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref><sp/>pointer_,<sp/>cudnnStatus_t<sp/>status_,<sp/>std::string<sp/>err_msg_)</highlight></codeline>
-<codeline lineno="153"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>:<sp/>pointer(pointer_),<sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" kindref="member">status</ref>(status_),<sp/>err_msg(err_msg_)<sp/>{}</highlight></codeline>
-<codeline lineno="154"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" kindref="compound">BackendDescriptor</ref>()<sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="155"><highlight class="normal"></highlight></codeline>
-<codeline lineno="156" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a62312f29dbbc7c11c1da54a2ad41c52f" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a62312f29dbbc7c11c1da54a2ad41c52f" kindref="member">pointer</ref>;<sp/><sp/></highlight></codeline>
+<codeline lineno="29" refid="df/de1/namespacecudnn__frontend" refkind="compound"><highlight class="normal"></highlight><highlight class="keyword">namespace<sp/></highlight><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend" kindref="compound">cudnn_frontend</ref><sp/>{</highlight></codeline>
+<codeline lineno="30"><highlight class="normal"></highlight></codeline>
+<codeline lineno="36" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" refkind="compound"><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref><sp/>{</highlight></codeline>
+<codeline lineno="37" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a47968d641c0da8d33882f86d8afa30b4" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnBackendDescriptor_t<sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a47968d641c0da8d33882f86d8afa30b4" kindref="member">m_desc</ref><sp/>=<sp/></highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">;<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight></codeline>
+<codeline lineno="38" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnStatus_t<sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" kindref="member">status</ref><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/>CUDNN_STATUS_SUCCESS;<sp/><sp/></highlight></codeline>
+<codeline lineno="39"><highlight class="normal"></highlight></codeline>
+<codeline lineno="40"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="41"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a42a928eb5b2524d1c3f67b7200dd53c9" kindref="member">OpaqueBackendPointer</ref>(</highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;<sp/><sp/></highlight></codeline>
+<codeline lineno="42"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref>&amp;</highlight></codeline>
+<codeline lineno="43"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1adf5bf20f5bdfbfdecd05360830b34b89" kindref="member">operator=</ref>(</highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref>&amp;)<sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="44"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a42a928eb5b2524d1c3f67b7200dd53c9" kindref="member">OpaqueBackendPointer</ref>(<ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref>&amp;&amp;)<sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="45"><highlight class="normal"></highlight></codeline>
+<codeline lineno="50" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aadf0c53d7aedb1c6c121b2736e98b2dd" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aadf0c53d7aedb1c6c121b2736e98b2dd" kindref="member">OpaqueBackendPointer</ref>(cudnnBackendDescriptorType_t<sp/><ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref>)<sp/>{<sp/>status<sp/>=<sp/>cudnnBackendCreateDescriptor(type,<sp/>&amp;m_desc);<sp/>}</highlight></codeline>
+<codeline lineno="55" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a9f549dd95873ac3a02689ef97f4a6c75" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a9f549dd95873ac3a02689ef97f4a6c75" kindref="member">~OpaqueBackendPointer</ref>()<sp/>{<sp/>cudnnBackendDestroyDescriptor(m_desc);<sp/>};</highlight></codeline>
+<codeline lineno="61"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnBackendDescriptor_t<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal">&amp;</highlight></codeline>
+<codeline lineno="62" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1ac1700c7d96af0250e5721f5e5f9d95bc" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1ac1700c7d96af0250e5721f5e5f9d95bc" kindref="member">get_backend_descriptor</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="63"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a47968d641c0da8d33882f86d8afa30b4" kindref="member">m_desc</ref>;</highlight></codeline>
+<codeline lineno="64"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="69"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnStatus_t</highlight></codeline>
+<codeline lineno="70" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1abd4f69554da364008f3780e9dc3a5bfc" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1abd4f69554da364008f3780e9dc3a5bfc" kindref="member">get_status</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="71"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" kindref="member">status</ref>;</highlight></codeline>
+<codeline lineno="72"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="77"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">bool</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="78" refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aa9059097bb9161d454c6e17b03ca236c" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aa9059097bb9161d454c6e17b03ca236c" kindref="member">is_good</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="79"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>status<sp/>==<sp/>CUDNN_STATUS_SUCCESS;</highlight></codeline>
+<codeline lineno="80"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="81"><highlight class="normal">};</highlight></codeline>
+<codeline lineno="82"><highlight class="normal"></highlight></codeline>
+<codeline lineno="84" refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" refkind="member"><highlight class="keyword">using</highlight><highlight class="normal"><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref><sp/>=<sp/>std::shared_ptr&lt;OpaqueBackendPointer&gt;;</highlight></codeline>
+<codeline lineno="85"><highlight class="normal"></highlight></codeline>
+<codeline lineno="87"><highlight class="keyword">static</highlight><highlight class="normal"><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref></highlight></codeline>
+<codeline lineno="88" refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" kindref="member">make_shared_backend_pointer</ref>(cudnnBackendDescriptorType_t<sp/><ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref>)<sp/>{</highlight></codeline>
+<codeline lineno="89"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::make_shared&lt;OpaqueBackendPointer&gt;(type);</highlight></codeline>
+<codeline lineno="90"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="91"><highlight class="normal"></highlight></codeline>
+<codeline lineno="99" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" refkind="compound"><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" kindref="compound">BackendDescriptor</ref><sp/>{</highlight></codeline>
+<codeline lineno="100"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="102"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">virtual</highlight><highlight class="normal"><sp/>std::string</highlight></codeline>
+<codeline lineno="103"><highlight class="normal"><sp/><sp/><sp/><sp/>describe()<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>=<sp/>0;</highlight></codeline>
+<codeline lineno="104"><highlight class="normal"></highlight></codeline>
+<codeline lineno="107"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnBackendDescriptor_t</highlight></codeline>
+<codeline lineno="108" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3aa1ab42ab96471092185f15e22c1e9f" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3aa1ab42ab96471092185f15e22c1e9f" kindref="member">get_raw_desc</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="109"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>pointer-&gt;get_backend_descriptor();</highlight></codeline>
+<codeline lineno="110"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="111"><highlight class="normal"></highlight></codeline>
+<codeline lineno="113"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnStatus_t</highlight></codeline>
+<codeline lineno="114" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" kindref="member">get_status</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="115"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" kindref="member">status</ref>;</highlight></codeline>
+<codeline lineno="116"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="117"><highlight class="normal"></highlight></codeline>
+<codeline lineno="119"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">void</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="120" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3ef02443f20b90223baf5f1922505eab" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3ef02443f20b90223baf5f1922505eab" kindref="member">set_status</ref>(cudnnStatus_t<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>status_)</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="121"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" kindref="member">status</ref><sp/>=<sp/>status_;</highlight></codeline>
+<codeline lineno="122"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="123"><highlight class="normal"></highlight></codeline>
+<codeline lineno="125"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">void</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="126" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a1748a5c560905314930c37b2ed1a54d2" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a1748a5c560905314930c37b2ed1a54d2" kindref="member">set_error</ref>(</highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">char</highlight><highlight class="normal">*<sp/>message)</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="127"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>err_msg<sp/>=<sp/>message;</highlight></codeline>
+<codeline lineno="128"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="129"><highlight class="normal"></highlight></codeline>
+<codeline lineno="131"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">char</highlight><highlight class="normal">*</highlight></codeline>
+<codeline lineno="132" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1abfde0f34b0bf49c45d3d9c0408284f6f" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1abfde0f34b0bf49c45d3d9c0408284f6f" kindref="member">get_error</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="133"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>err_msg.c_str();</highlight></codeline>
+<codeline lineno="134"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="135"><highlight class="normal"></highlight></codeline>
+<codeline lineno="137"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref></highlight></codeline>
+<codeline lineno="138" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a57c83e78374bac747b5660fb271b947a" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a57c83e78374bac747b5660fb271b947a" kindref="member">get_desc</ref>()</highlight><highlight class="keyword"><sp/>const<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="139"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>pointer;</highlight></codeline>
+<codeline lineno="140"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="141"><highlight class="normal"></highlight></codeline>
+<codeline lineno="143"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnStatus_t</highlight></codeline>
+<codeline lineno="144" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" kindref="member">initialize_managed_backend_pointer</ref>(cudnnBackendDescriptorType_t<sp/><ref refid="db/d0a/classstd_1_1conditional_1_1type" kindref="compound">type</ref>)<sp/>{</highlight></codeline>
+<codeline lineno="145"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>pointer<sp/>=<sp/><ref refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" kindref="member">make_shared_backend_pointer</ref>(type);</highlight></codeline>
+<codeline lineno="146"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>pointer-&gt;get_status();</highlight></codeline>
+<codeline lineno="147"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="148"><highlight class="normal"></highlight></codeline>
+<codeline lineno="149"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">protected</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="154" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8aa93686ca88410fc048b05155148183" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8aa93686ca88410fc048b05155148183" kindref="member">BackendDescriptor</ref>(<ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref><sp/>pointer_,<sp/>cudnnStatus_t<sp/>status_,<sp/>std::string<sp/>err_msg_)</highlight></codeline>
+<codeline lineno="155"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>:<sp/>pointer(pointer_),<sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" kindref="member">status</ref>(status_),<sp/>err_msg(err_msg_)<sp/>{}</highlight></codeline>
+<codeline lineno="156"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" kindref="compound">BackendDescriptor</ref>()<sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
 <codeline lineno="157"><highlight class="normal"></highlight></codeline>
-<codeline lineno="158" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">mutable</highlight><highlight class="normal"><sp/>cudnnStatus_t<sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" kindref="member">status</ref><sp/>=<sp/>CUDNN_STATUS_SUCCESS;<sp/><sp/></highlight></codeline>
-<codeline lineno="159" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a0d416655dab2b5a675fecb5df9ea8521" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">mutable</highlight><highlight class="normal"><sp/>std::string<sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a0d416655dab2b5a675fecb5df9ea8521" kindref="member">err_msg</ref>;<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight></codeline>
-<codeline lineno="160"><highlight class="normal">};</highlight></codeline>
-<codeline lineno="161"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="158" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a62312f29dbbc7c11c1da54a2ad41c52f" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a62312f29dbbc7c11c1da54a2ad41c52f" kindref="member">pointer</ref>;<sp/><sp/></highlight></codeline>
+<codeline lineno="159"><highlight class="normal"></highlight></codeline>
+<codeline lineno="160" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">mutable</highlight><highlight class="normal"><sp/>cudnnStatus_t<sp/><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" kindref="member">status</ref><sp/>=<sp/>CUDNN_STATUS_SUCCESS;<sp/><sp/></highlight></codeline>
+<codeline lineno="161" refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a0d416655dab2b5a675fecb5df9ea8521" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">mutable</highlight><highlight class="normal"><sp/>std::string<sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a0d416655dab2b5a675fecb5df9ea8521" kindref="member">err_msg</ref>;<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight></codeline>
+<codeline lineno="162"><highlight class="normal">};</highlight></codeline>
+<codeline lineno="163"><highlight class="normal">}</highlight></codeline>
     </programlisting>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h"/>
   </compounddef>
 </doxygen>

@@ -23,10 +23,15 @@
 #pragma once
 #include <exception>
 #include <string>
+#include <vector>
 
 #include "cudnn_backend_base.h"
+#include "cudnn_frontend_Logging.h"
 
 namespace cudnn_frontend {
+
+/// Detailed feature_vector. Generally the Tensor and Operation properties
+using feature_vector_t = std::vector<int64_t>;
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
 class cudnnException : public std::runtime_error {

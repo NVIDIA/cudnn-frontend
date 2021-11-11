@@ -15,7 +15,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" line="226" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" bodystart="226" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" line="238" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" bodystart="238" bodyend="-1"/>
       </memberdef>
       </sectiondef>
       <sectiondef kind="public-func">
@@ -34,7 +34,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" line="127" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" bodystart="127" bodyend="130"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" line="136" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" bodystart="136" bodyend="139"/>
       </memberdef>
       <memberdef kind="function" id="d2/df5/group__OperationGraphBuilder__v8_1ga4e4cee8d631471478d5de420077a2182" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -55,7 +55,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" line="133" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" bodystart="133" bodyend="140"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" line="142" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" bodystart="142" bodyend="151"/>
       </memberdef>
       <memberdef kind="function" id="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ac78945f424f254f0060d4c2e1184cf1f" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref> &amp;&amp;</type>
@@ -68,11 +68,12 @@
 <para>constructs the <ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref> by calling the cudnn API Throws the appropriate error message </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" line="146" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" bodystart="146" bodyend="216"/>
-        <references refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5af59a099cc90eda429563e285b2907f" compoundref="db/d7d/cudnn__frontend__OperationGraph_8h" startline="53">cudnn_frontend::OperationGraph_v8::OperationGraphBuilder_v8</references>
-        <references refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a87704bb46bb12bba977a21ed579a4ef3">cudnn_frontend::OperationGraph_v8::operator=</references>
-        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
-        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="158">cudnn_frontend::BackendDescriptor::status</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" line="157" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" bodystart="157" bodyend="228"/>
+        <references refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" compoundref="d8/dc4/cudnn__frontend__Logging_8h" startline="72" endline="75">cudnn_frontend::getLogger</references>
+        <references refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a5af59a099cc90eda429563e285b2907f" compoundref="db/d7d/cudnn__frontend__OperationGraph_8h" startline="54">cudnn_frontend::OperationGraph_v8::OperationGraphBuilder_v8</references>
+        <references refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8_1a9d2dba7012638617e9c6c1016665ff16">cudnn_frontend::OperationGraph_v8::operator=</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="138" endline="147">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="160">cudnn_frontend::BackendDescriptor::status</references>
       </memberdef>
       <memberdef kind="function" id="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1a101b6c9515fdb333cdd3499f08774cf4" prot="public" static="no" const="no" explicit="yes" inline="no" virt="non-virtual">
         <type></type>
@@ -85,7 +86,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" line="218" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" line="230" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1a45e8a324d62146f592b049f51d2e4552" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -98,7 +99,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" line="219" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" line="231" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1a40e8f7825f75c35c40d9938532a81d02" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -114,7 +115,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" line="220" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" line="232" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1a589dedb418679abda7f64e6b9e2800a1" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -130,7 +131,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" line="221" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" line="233" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1a75dae8a911e005b960565d4a1a0024ba" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref> &amp;</type>
@@ -146,7 +147,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" line="223" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" line="235" column="1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -154,87 +155,114 @@
     <detaileddescription>
 <para><ref refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8" kindref="compound">OperationGraphBuilder_v8</ref> Class Helper class used to build <ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref> class </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="847">
+      <node id="917">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="853">
+      <node id="923">
         <label>T</label>
       </node>
-      <node id="854">
+      <node id="924">
         <label>cudnnHandle_t</label>
       </node>
-      <node id="852">
-        <label>std::array&lt; T &gt;</label>
-        <childnode refid="853" relation="usage">
+      <node id="927">
+        <label>std::vector&lt; T &gt;</label>
+        <childnode refid="923" relation="usage">
           <edgelabel>+elements</edgelabel>
         </childnode>
       </node>
-      <node id="842">
+      <node id="922">
+        <label>std::array&lt; T &gt;</label>
+        <childnode refid="923" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+      </node>
+      <node id="912">
         <label>cudnn_frontend::OperationGraphBuilder_v8</label>
         <link refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8"/>
-        <childnode refid="843" relation="usage">
+        <childnode refid="913" relation="usage">
           <edgelabel>-m_operationGraph</edgelabel>
         </childnode>
       </node>
-      <node id="850">
+      <node id="920">
         <label>std::array&lt; ManagedOpaqueDescriptor, 10 &gt;</label>
-        <childnode refid="851" relation="usage">
+        <childnode refid="921" relation="usage">
           <edgelabel>+elements</edgelabel>
         </childnode>
-        <childnode refid="852" relation="template-instance">
+        <childnode refid="922" relation="template-instance">
           <edgelabel>&lt; ManagedOpaqueDescriptor, 10 &gt;</edgelabel>
         </childnode>
       </node>
-      <node id="848">
+      <node id="926">
+        <label>std::vector&lt; int64_t &gt;</label>
+        <childnode refid="919" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+        <childnode refid="927" relation="template-instance">
+          <edgelabel>&lt; int64_t &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="918">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="846">
+      <node id="916">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="843">
+      <node id="925">
+        <label>std::vector&lt; feature_vector_t &gt;</label>
+        <childnode refid="926" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+        <childnode refid="927" relation="template-instance">
+          <edgelabel>&lt; feature_vector_t &gt;</edgelabel>
+        </childnode>
+      </node>
+      <node id="913">
         <label>cudnn_frontend::OperationGraph_v8</label>
         <link refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8"/>
-        <childnode refid="844" relation="public-inheritance">
+        <childnode refid="914" relation="public-inheritance">
         </childnode>
-        <childnode refid="849" relation="usage">
+        <childnode refid="919" relation="usage">
           <edgelabel>-numOps</edgelabel>
         </childnode>
-        <childnode refid="850" relation="usage">
+        <childnode refid="920" relation="usage">
           <edgelabel>-ops</edgelabel>
         </childnode>
-        <childnode refid="845" relation="usage">
+        <childnode refid="915" relation="usage">
           <edgelabel>-opGraphTag</edgelabel>
         </childnode>
-        <childnode refid="854" relation="usage">
+        <childnode refid="924" relation="usage">
           <edgelabel>-handle</edgelabel>
         </childnode>
+        <childnode refid="925" relation="usage">
+          <edgelabel>-feature_vectors</edgelabel>
+        </childnode>
       </node>
-      <node id="851">
+      <node id="921">
         <label>ManagedOpaqueDescriptor</label>
       </node>
-      <node id="849">
+      <node id="919">
         <label>int64_t</label>
       </node>
-      <node id="844">
+      <node id="914">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="845" relation="usage">
+        <childnode refid="915" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="847" relation="usage">
+        <childnode refid="917" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="848" relation="usage">
+        <childnode refid="918" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="845">
+      <node id="915">
         <label>std::string</label>
-        <childnode refid="846" relation="public-inheritance">
+        <childnode refid="916" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" line="119" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_OperationGraph.h" bodystart="119" bodyend="227"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" line="128" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_OperationGraph.h" bodystart="128" bodyend="239"/>
     <listofallmembers>
       <member refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ac78945f424f254f0060d4c2e1184cf1f" prot="public" virt="non-virtual"><scope>cudnn_frontend::OperationGraphBuilder_v8</scope><name>build</name></member>
       <member refid="d4/d39/classcudnn__frontend_1_1OperationGraphBuilder__v8_1ad9cb3e166ab001b3b0c60ed2198cd6d9" prot="private" virt="non-virtual"><scope>cudnn_frontend::OperationGraphBuilder_v8</scope><name>m_operationGraph</name></member>

@@ -17,58 +17,58 @@
     <detaileddescription>
     </detaileddescription>
     <inheritancegraph>
-      <node id="435">
+      <node id="496">
         <label>false_type</label>
       </node>
-      <node id="434">
+      <node id="495">
         <label>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, ConstructibleStringType &gt;</label>
         <link refid="d2/d3a/structnlohmann_1_1detail_1_1is__compatible__string__type__impl"/>
-        <childnode refid="435" relation="public-inheritance">
+        <childnode refid="496" relation="public-inheritance">
         </childnode>
-        <childnode refid="436" relation="template-instance">
+        <childnode refid="497" relation="template-instance">
           <edgelabel>&lt; BasicJsonType, ConstructibleStringType &gt;</edgelabel>
         </childnode>
       </node>
-      <node id="433">
+      <node id="494">
         <label>nlohmann::detail::is_compatible_string_type&lt; BasicJsonType, ConstructibleStringType &gt;</label>
         <link refid="db/d4e/structnlohmann_1_1detail_1_1is__compatible__string__type"/>
-        <childnode refid="434" relation="public-inheritance">
+        <childnode refid="495" relation="public-inheritance">
         </childnode>
       </node>
-      <node id="436">
+      <node id="497">
         <label>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, CompatibleStringType, typename &gt;</label>
         <link refid="d2/d3a/structnlohmann_1_1detail_1_1is__compatible__string__type__impl"/>
-        <childnode refid="435" relation="public-inheritance">
+        <childnode refid="496" relation="public-inheritance">
         </childnode>
       </node>
     </inheritancegraph>
     <collaborationgraph>
-      <node id="439">
+      <node id="500">
         <label>false_type</label>
       </node>
-      <node id="438">
+      <node id="499">
         <label>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, ConstructibleStringType &gt;</label>
         <link refid="d2/d3a/structnlohmann_1_1detail_1_1is__compatible__string__type__impl"/>
-        <childnode refid="439" relation="public-inheritance">
+        <childnode refid="500" relation="public-inheritance">
         </childnode>
-        <childnode refid="440" relation="template-instance">
+        <childnode refid="501" relation="template-instance">
           <edgelabel>&lt; BasicJsonType, ConstructibleStringType &gt;</edgelabel>
         </childnode>
       </node>
-      <node id="437">
+      <node id="498">
         <label>nlohmann::detail::is_compatible_string_type&lt; BasicJsonType, ConstructibleStringType &gt;</label>
         <link refid="db/d4e/structnlohmann_1_1detail_1_1is__compatible__string__type"/>
-        <childnode refid="438" relation="public-inheritance">
+        <childnode refid="499" relation="public-inheritance">
         </childnode>
       </node>
-      <node id="440">
+      <node id="501">
         <label>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, CompatibleStringType, typename &gt;</label>
         <link refid="d2/d3a/structnlohmann_1_1detail_1_1is__compatible__string__type__impl"/>
-        <childnode refid="439" relation="public-inheritance">
+        <childnode refid="500" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3695" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3694" bodyend="3695"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="3695" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="3694" bodyend="3695"/>
     <listofallmembers>
     </listofallmembers>
   </compounddef>

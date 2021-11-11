@@ -22,7 +22,7 @@
 </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3390" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3390" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="3390" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="3390" bodyend="-1"/>
       </memberdef>
       <memberdef kind="typedef" id="d3/d9b/namespacenlohmann_1ad53cef358adfa7f07cea23eb1e28b9ea" prot="public" static="no">
         <type><ref refid="d9/dcc/classnlohmann_1_1basic__json" kindref="compound">basic_json</ref>&lt; <ref refid="d6/da7/structnlohmann_1_1ordered__map" kindref="compound">nlohmann::ordered_map</ref> &gt;</type>
@@ -36,7 +36,7 @@
 </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3402" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3402" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="3402" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="3402" bodyend="-1"/>
       </memberdef>
       </sectiondef>
       <sectiondef kind="func">
@@ -64,12 +64,13 @@
 </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="25855" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="25855" bodyend="25858"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="25855" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="25855" bodyend="25858"/>
         <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1a52b18a5b7e68652c65b070900c438c6e" compoundref="d5/db8/json_8hpp" startline="20448" endline="20467">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::at</referencedby>
         <referencedby refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1af08f9302a02516ff8cf358a99aaa1ddf" compoundref="d5/db8/json_8hpp" startline="14285" endline="14295">nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::calc_bson_array_size</referencedby>
         <referencedby refid="df/d1a/classnlohmann_1_1detail_1_1binary__writer_1a11637a023d22e57a7e7aff3f98b10f84" compoundref="d5/db8/json_8hpp" startline="14139" endline="14148">nlohmann::detail::binary_writer&lt; BasicJsonType, CharType &gt;::calc_bson_entry_header_size</referencedby>
+        <referencedby refid="df/de1/namespacecudnn__frontend_1a91f2627793be5d51db9b1473275d803d" compoundref="db/d7e/cudnn__frontend__Errata_8h" startline="52" endline="83">cudnn_frontend::check_rule</referencedby>
         <referencedby refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1a90fbaaeeb00838e65b8d04885017ef0c" compoundref="d5/db8/json_8hpp" startline="2790" endline="2796">nlohmann::detail::parse_error::create</referencedby>
-        <referencedby refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a79cc1a752e6df2001b853f8c189b1f1f" compoundref="d3/d98/cudnn__frontend__Tensor_8h" startline="55" endline="73">cudnn_frontend::Tensor_v8::describe</referencedby>
+        <referencedby refid="d6/da7/classcudnn__frontend_1_1Tensor__v8_1a79cc1a752e6df2001b853f8c189b1f1f" compoundref="d3/d98/cudnn__frontend__Tensor_8h" startline="56" endline="78">cudnn_frontend::Tensor_v8::describe</referencedby>
         <referencedby refid="d6/d73/classcudnn__frontend_1_1ConvDesc__v8_1a0d36a97abb2d36a0148ce8e8833baff8" compoundref="d1/de7/cudnn__frontend__ConvDesc_8h" startline="58" endline="86">cudnn_frontend::ConvDesc_v8::describe</referencedby>
         <referencedby refid="d4/d30/classcudnn__frontend_1_1Operation__v8_1a3425a8550eb9f622dc4101d3d5d2c0e1" compoundref="da/d5a/cudnn__frontend__Operation_8h" startline="71" endline="94">cudnn_frontend::Operation_v8::describe</referencedby>
         <referencedby refid="de/df2/classnlohmann_1_1detail_1_1exception_1aa353a7dba4fd179f7224b8a2a238a264" compoundref="d5/db8/json_8hpp" startline="2664" endline="2717">nlohmann::detail::exception::diagnostics</referencedby>
@@ -88,7 +89,6 @@
         <referencedby refid="da/de8/classnlohmann_1_1json__pointer_1a7de51480324eb1c5a89ed552cd699875" compoundref="d5/db8/json_8hpp" startline="12229" endline="12232">nlohmann::json_pointer&lt; BasicJsonType &gt;::operator/=</referencedby>
         <referencedby refid="d9/dcc/classnlohmann_1_1basic__json_1adcc786998f220a5b3083ee8a37c4553e" compoundref="d5/db8/json_8hpp" startline="25343" endline="25605">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;::patch</referencedby>
         <referencedby refid="d5/d1a/classnlohmann_1_1detail_1_1parse__error_1aefe74adeaa48781464ba2fd2ec63d221" compoundref="d5/db8/json_8hpp" startline="2813" endline="2817">nlohmann::detail::parse_error::position_string</referencedby>
-        <referencedby refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</referencedby>
         <referencedby refid="dc/d68/classnlohmann_1_1detail_1_1json__sax__dom__parser_1a056b895d011efaf48ea096c024aca0d4" compoundref="d5/db8/json_8hpp" startline="5954" endline="5964">nlohmann::detail::json_sax_dom_parser&lt; BasicJsonType &gt;::start_array</referencedby>
         <referencedby refid="d6/d69/classnlohmann_1_1detail_1_1json__sax__dom__callback__parser_1a5255b98ba8282e3625968f91cff9d3d0" compoundref="d5/db8/json_8hpp" startline="6174" endline="6189">nlohmann::detail::json_sax_dom_callback_parser&lt; BasicJsonType &gt;::start_array</referencedby>
         <referencedby refid="dc/d68/classnlohmann_1_1detail_1_1json__sax__dom__parser_1a9929b4cc92d471c49bd0a92802629f90" compoundref="d5/db8/json_8hpp" startline="5928" endline="5938">nlohmann::detail::json_sax_dom_parser&lt; BasicJsonType &gt;::start_object</referencedby>
@@ -103,6 +103,6 @@
 <para><simplesect kind="see"><para><ulink url="https://github.com/nlohmann">https://github.com/nlohmann</ulink> </para></simplesect>
 <simplesect kind="since"><para>version 1.0.0</para></simplesect>
 namespace to hold default <computeroutput>to_json</computeroutput> function to see why this is required: <ulink url="http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2015/n4381.html">http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2015/n4381.html</ulink> </para>    </detaileddescription>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="87" column="1"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="87" column="1"/>
   </compounddef>
 </doxygen>

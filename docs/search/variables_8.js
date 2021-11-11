@@ -7,6 +7,7 @@ var searchData=
   ['indent_5fchar',['indent_char',['../d4/d0a/classnlohmann_1_1detail_1_1serializer.html#a9a55e6b028d09676fe35aefa0c72ea5b',1,'nlohmann::detail::serializer']]],
   ['indent_5fstring',['indent_string',['../d4/d0a/classnlohmann_1_1detail_1_1serializer.html#ae9268a10d88a5526e32735a55a132fc6',1,'nlohmann::detail::serializer']]],
   ['is',['is',['../db/df0/classnlohmann_1_1detail_1_1input__stream__adapter.html#a55893bf84cb17d877464984942df9632',1,'nlohmann::detail::input_stream_adapter']]],
+  ['is2d',['is2D',['../d1/d29/classcudnn__frontend_1_1OperationBuilder__v8.html#a01e557588806a3bad57e28aea3b6d3c4',1,'cudnn_frontend::OperationBuilder_v8']]],
   ['is_5fconvolution_5fop',['is_convolution_op',['../d1/d29/classcudnn__frontend_1_1OperationBuilder__v8.html#ad82e287889be2ebef348a00479ce3bc0',1,'cudnn_frontend::OperationBuilder_v8']]],
   ['is_5flittle_5fendian',['is_little_endian',['../d6/d30/classnlohmann_1_1detail_1_1binary__reader.html#ad615eba561e265165a80c95061af75b0',1,'nlohmann::detail::binary_reader::is_little_endian()'],['../df/d1a/classnlohmann_1_1detail_1_1binary__writer.html#a048887c907afe39759b777e8c888414c',1,'nlohmann::detail::binary_writer::is_little_endian()']]],
   ['is_5fmatmul_5fop',['is_matmul_op',['../d1/d29/classcudnn__frontend_1_1OperationBuilder__v8.html#ac806a488b58cc78e338ba96eccee70fd',1,'cudnn_frontend::OperationBuilder_v8']]],
@@ -15,6 +16,7 @@ var searchData=
   ['is_5fpointwise_5fmath_5fop',['is_pointwise_math_op',['../d4/d30/classcudnn__frontend_1_1Operation__v8.html#a2e1e0fb15b7df300945cae2347db635a',1,'cudnn_frontend::Operation_v8']]],
   ['is_5fpointwise_5fop',['is_pointwise_op',['../d1/d29/classcudnn__frontend_1_1OperationBuilder__v8.html#a98044359c005b796e35fba1a5b689f3d',1,'cudnn_frontend::OperationBuilder_v8']]],
   ['is_5freduction_5fop',['is_reduction_op',['../d1/d29/classcudnn__frontend_1_1OperationBuilder__v8.html#a65bf6693a5952e65b856dfdf9ad68770',1,'cudnn_frontend::OperationBuilder_v8']]],
+  ['isbyvalue',['isByValue',['../d6/da7/classcudnn__frontend_1_1Tensor__v8.html#aabaaacf9ea82fc1ff2f5b8ed97e23420',1,'cudnn_frontend::Tensor_v8']]],
   ['isvirtual',['isVirtual',['../d6/da7/classcudnn__frontend_1_1Tensor__v8.html#a611fc05f3c7b6ca90d0e3c0f6ef07d84',1,'cudnn_frontend::Tensor_v8']]],
   ['iteration_5fproxy_3c_20iter_5fimpl_20_3e',['iteration_proxy&lt; iter_impl &gt;',['../d1/d7c/classnlohmann_1_1detail_1_1iter__impl.html#a28328d17a18d9754c89c5c8159677a6f',1,'nlohmann::detail::iter_impl']]],
   ['iteration_5fproxy_5fvalue_3c_20iter_5fimpl_20_3e',['iteration_proxy_value&lt; iter_impl &gt;',['../d1/d7c/classnlohmann_1_1detail_1_1iter__impl.html#ac501dc2374b4d17a884fc9a656e80d5a',1,'nlohmann::detail::iter_impl']]]

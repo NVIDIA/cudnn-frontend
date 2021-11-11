@@ -29,7 +29,7 @@
  <tr style="height: 56px;">
   <td id="projectalign" style="padding-left: 0.5em;">
    <div id="projectname">CUDNN Frontend API
-   &#160;<span id="projectnumber">8.2.0</span>
+   &#160;<span id="projectnumber">8.3.0</span>
    </div>
   </td>
  </tr>
@@ -124,7 +124,7 @@ Private Attributes</h2></td></tr>
 <tr class="memitem:a8342ab30dbe0e86d8d060983f14aba87"><td class="memItemLeft" align="right" valign="top">int64_t&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob.html#a8342ab30dbe0e86d8d060983f14aba87">stride</a> = 0</td></tr>
 <tr class="memdesc:a8342ab30dbe0e86d8d060983f14aba87"><td class="mdescLeft">&#160;</td><td class="mdescRight">min, max and stride of the knob value  <a href="#a8342ab30dbe0e86d8d060983f14aba87">More...</a><br /></td></tr>
 <tr class="separator:a8342ab30dbe0e86d8d060983f14aba87"><td class="memSeparator" colspan="2">&#160;</td></tr>
-<tr class="memitem:aee3bbc2a558893309d6882a0e30d439a"><td class="memItemLeft" align="right" valign="top">int64_t&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob.html#aee3bbc2a558893309d6882a0e30d439a">choice</a> = 0</td></tr>
+<tr class="memitem:aee3bbc2a558893309d6882a0e30d439a"><td class="memItemLeft" align="right" valign="top">int64_t&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob.html#aee3bbc2a558893309d6882a0e30d439a">choice</a> = -1</td></tr>
 <tr class="memdesc:aee3bbc2a558893309d6882a0e30d439a"><td class="mdescLeft">&#160;</td><td class="mdescRight">Choice set by the user.  <a href="#aee3bbc2a558893309d6882a0e30d439a">More...</a><br /></td></tr>
 <tr class="separator:aee3bbc2a558893309d6882a0e30d439a"><td class="memSeparator" colspan="2">&#160;</td></tr>
 </table>
@@ -241,6 +241,8 @@ Private Attributes</h2></td></tr>
 <p class="definition">Definition at line <a class="el" href="../../de/d6d/cudnn__frontend__Engine_8h_source.html#l00083">83</a> of file <a class="el" href="../../de/d6d/cudnn__frontend__Engine_8h_source.html">cudnn_frontend_Engine.h</a>.</p>
 
 <p class="reference">References <a class="el" href="../../de/d6d/cudnn__frontend__Engine_8h_source.html#l00110">choice</a>.</p>
+
+<p class="reference">Referenced by <a class="el" href="../../de/d6d/cudnn__frontend__Engine_8h_source.html#l00229">cudnn_frontend::Engine_v8::knobs_set()</a>.</p>
 
 </div>
 </div>
@@ -401,7 +403,7 @@ Private Attributes</h2></td></tr>
   <td class="mlabels-left">
       <table class="memname">
         <tr>
-          <td class="memname">int64_t cudnn_frontend::Engine_v8::Knob::choice = 0</td>
+          <td class="memname">int64_t cudnn_frontend::Engine_v8::Knob::choice = -1</td>
         </tr>
       </table>
   </td>

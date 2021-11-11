@@ -1,16 +1,25 @@
 var classcudnn__frontend_1_1ExecutionPlan__v8 =
 [
-    [ "ExecutionPlan_v8", "d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html#ac388ed7f6911f704ed2618a3867fad72", null ],
+    [ "ExecutionPlan_v8", "d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html#a7ad63741e293b6a96d4584964ddd409c", null ],
     [ "~ExecutionPlan_v8", "d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html#a8a8ac13b1c639dd9b87c280a598446af", null ],
+    [ "ExecutionPlan_v8", "d7/d0d/group__ExecutionPlanQuery.html#ga20a9ecf9902ac8bc280c713a9735322d", null ],
     [ "ExecutionPlan_v8", "d7/d0d/group__ExecutionPlanQuery.html#ga2c011aa14563ef96417ce599f0c83d89", null ],
-    [ "ExecutionPlan_v8", "d7/d0d/group__ExecutionPlanQuery.html#ga51c4b75729ab066f0686729896741c5d", null ],
-    [ "computeTag", "d7/d0d/group__ExecutionPlanQuery.html#ga8a6517102f5c12e63e4417324a03180b", null ],
+    [ "buildTag", "d7/d0d/group__ExecutionPlanQuery.html#ga093a562caa7f8a906a362d9f70496020", null ],
+    [ "computeWorkSpaceSize", "d7/d0d/group__ExecutionPlanQuery.html#gafec2d06137cf97fef71d5ae17f178ce3", null ],
     [ "describe", "d7/d0d/group__ExecutionPlanQuery.html#gad80aa2980d915449d05db4c71041e2e0", null ],
+    [ "fetchNotes", "d7/d0d/group__ExecutionPlanQuery.html#ga7305ab3de5d0790c77492e47cbdbb593", null ],
+    [ "getExecutionTime", "d7/d0d/group__ExecutionPlanQuery.html#ga74f24a0cc255a72af695056c2f559af7", null ],
+    [ "getNumericNotes", "d7/d0d/group__ExecutionPlanQuery.html#gaa30b7ca096b12ebaf84178f88b00366b", null ],
     [ "getTag", "d7/d0d/group__ExecutionPlanQuery.html#ga2ff1340409f8834fe9ae68ff4c00281a", null ],
     [ "getWorkspaceSize", "d7/d0d/group__ExecutionPlanQuery.html#ga00d10a076c22e86354a789852c56c22f", null ],
-    [ "operator=", "d7/d0d/group__ExecutionPlanQuery.html#ga0705e60cee62d3d196751517d545a7b0", null ],
+    [ "operator=", "d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html#a48865439534090da7c9b261bd77313c7", null ],
+    [ "operator=", "d7/d0d/group__ExecutionPlanQuery.html#ga3698990163856e1ab9d1f6f23a13cc0e", null ],
+    [ "setExecutionTime", "d7/d0d/group__ExecutionPlanQuery.html#ga5dba05b9e657dde5c551e24f752c2955", null ],
     [ "ExecutionPlanBuilder_v8", "d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html#a00c29ad02430927df9260c7e57ae7c7a", null ],
     [ "engine_config", "d7/d0d/group__ExecutionPlanQuery.html#ga5e3dd6d441474ac5ab94aaaf9c45bc5b", null ],
+    [ "execution_time_ms", "d7/d0d/group__ExecutionPlanQuery.html#ga4cc1f2284941f48a122a54afff98caff", null ],
     [ "handle", "d7/d0d/group__ExecutionPlanQuery.html#ga4c36108c6511420d81fcda5292761726", null ],
-    [ "planTag", "d7/d0d/group__ExecutionPlanQuery.html#gaf732b37c9c05a2a8bd1a76289c740c4a", null ]
+    [ "numeric_notes", "d7/d0d/group__ExecutionPlanQuery.html#ga09c8d1d462a0f779ec10f10b285e5114", null ],
+    [ "planTag", "d7/d0d/group__ExecutionPlanQuery.html#gaf732b37c9c05a2a8bd1a76289c740c4a", null ],
+    [ "workSpaceSize", "d7/d0d/group__ExecutionPlanQuery.html#ga9a2005cc54fdc473faad5a1ae2f47661", null ]
 ];

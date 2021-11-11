@@ -17,12 +17,12 @@
     <detaileddescription>
     </detaileddescription>
     <collaborationgraph>
-      <node id="93">
+      <node id="101">
         <label>nlohmann::detail::container_input_adapter_factory_impl::container_input_adapter_factory&lt; ContainerType, Enable &gt;</label>
         <link refid="d1/d62/structnlohmann_1_1detail_1_1container__input__adapter__factory__impl_1_1container__input__adapter__factory"/>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="5611" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="5611" bodyend="5611"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="5611" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="5611" bodyend="5611"/>
     <listofallmembers>
     </listofallmembers>
   </compounddef>

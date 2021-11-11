@@ -28,6 +28,7 @@
 #include <memory>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #include <cudnn.h>
 #include <cudnn_backend.h>
@@ -98,6 +99,16 @@ class OperationGraph_v8 : public BackendDescriptor {
         return opGraphTag;
     }
 
+    feature_vector_t
+    getFeatureVector() const {
+        if (numOps != 1) {
+            return {}; /// We do not support multiop opGraph at this point of time.
+        } else {
+            return feature_vectors[0];
+        }
+
+    }
+
    private:
     OperationGraph_v8()                          = default;
     OperationGraph_v8(OperationGraph_v8 const &) = delete;
@@ -108,6 +119,7 @@ class OperationGraph_v8 : public BackendDescriptor {
     std::array<ManagedOpaqueDescriptor, 10> ops{};
     int64_t numOps         = -1;
     std::string opGraphTag = "";
+    std::vector<feature_vector_t> feature_vectors;
 };
 
 ///
@@ -129,9 +141,11 @@ class OperationGraphBuilder_v8 {
     auto
     setOperationGraph(int64_t numOps_, Operation_v8 const **ops_) -> OperationGraphBuilder_v8 & {
         m_operationGraph.numOps = numOps_;
+        m_operationGraph.feature_vectors.resize(numOps_);
         for (auto i = 0u; i < numOps_; i++) {
             m_operationGraph.ops[i] = ops_[i]->get_desc();
             m_operationGraph.opGraphTag += ops_[i]->getTag() + '_';
+            m_operationGraph.feature_vectors[i] = ops_[i]->getFeatureVector();
         }
         return *this;
     }
@@ -209,6 +223,7 @@ class OperationGraphBuilder_v8 {
             return std::move(m_operationGraph);
         }
 
+        getLogger() << "[cudnn_frontend] " << m_operationGraph << std::endl;
         return std::move(m_operationGraph);
     }
 
@@ -222,4 +237,7 @@ class OperationGraphBuilder_v8 {
    private:
     OperationGraph_v8 m_operationGraph;
 };
+
+using OperationGraph            = OperationGraph_v8;
+using OperationGraphBuilder     = OperationGraphBuilder_v8;
 }

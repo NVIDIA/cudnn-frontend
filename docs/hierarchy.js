@@ -27,6 +27,8 @@ var hierarchy =
     ] ],
     [ "nlohmann::detail::dtoa_impl::boundaries", "df/ddb/structnlohmann_1_1detail_1_1dtoa__impl_1_1boundaries.html", null ],
     [ "nlohmann::detail::dtoa_impl::cached_power", "d5/dfe/structnlohmann_1_1detail_1_1dtoa__impl_1_1cached__power.html", null ],
+    [ "cudnn_frontend::ExecutionPlanCache_v1::compare", "d4/d73/structcudnn__frontend_1_1ExecutionPlanCache__v1_1_1compare.html", null ],
+    [ "cudnn_frontend::ConditionalStreamer", "d0/d92/classcudnn__frontend_1_1ConditionalStreamer.html", null ],
     [ "nlohmann::detail::container_input_adapter_factory_impl::container_input_adapter_factory< ContainerType, Enable >", "d1/d62/structnlohmann_1_1detail_1_1container__input__adapter__factory__impl_1_1container__input__adapter__factory.html", null ],
     [ "nlohmann::detail::container_input_adapter_factory_impl::container_input_adapter_factory< ContainerType, void_t< decltype(begin(std::declval< ContainerType >()), end(std::declval< ContainerType >()))> >", "d0/dc6/structnlohmann_1_1detail_1_1container__input__adapter__factory__impl_1_1container__input__adapte602516bdb0b70b8ee5c6d4ff825368be.html", null ],
     [ "cudnn_frontend::ConvDescBuilder_v8", "db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html", null ],
@@ -50,8 +52,10 @@ var hierarchy =
         [ "cudnn_frontend::cudnnException", "d9/dca/classcudnn__frontend_1_1cudnnException.html", null ]
       ] ]
     ] ],
-    [ "cudnn_frontend::executionOption", "d6/d1b/structcudnn__frontend_1_1executionOption.html", null ],
     [ "cudnn_frontend::ExecutionPlanBuilder_v8", "d1/d74/classcudnn__frontend_1_1ExecutionPlanBuilder__v8.html", null ],
+    [ "cudnn_frontend::ExecutionPlanCache_v1", "dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1.html", [
+      [ "cudnn_frontend::ExecutionPlanCache_v2", "da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2.html", null ]
+    ] ],
     [ "nlohmann::detail::utility_internal::Extend< Seq, SeqSize, Rem >", "d7/d3c/structnlohmann_1_1detail_1_1utility__internal_1_1Extend.html", null ],
     [ "nlohmann::detail::utility_internal::Extend< integer_sequence< T, Ints... >, SeqSize, 0 >", "de/dbf/structnlohmann_1_1detail_1_1utility__internal_1_1Extend_3_01integer__sequence_3_01T_00_01Ints_8_453fbce128d545e87778192b2e607842.html", null ],
     [ "nlohmann::detail::utility_internal::Extend< integer_sequence< T, Ints... >, SeqSize, 1 >", "d2/d5f/structnlohmann_1_1detail_1_1utility__internal_1_1Extend_3_01integer__sequence_3_01T_00_01Ints_8_011635d85b816e1c1a7e948fa832c519.html", null ],

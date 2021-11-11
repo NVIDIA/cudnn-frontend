@@ -25,41 +25,41 @@
     <detaileddescription>
     </detaileddescription>
     <inheritancegraph>
-      <node id="442">
+      <node id="503">
         <label>false_type</label>
       </node>
-      <node id="443">
+      <node id="504">
         <label>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, ConstructibleStringType &gt;</label>
         <link refid="d2/d3a/structnlohmann_1_1detail_1_1is__compatible__string__type__impl"/>
-        <childnode refid="441" relation="template-instance">
+        <childnode refid="502" relation="template-instance">
           <edgelabel>&lt; BasicJsonType, ConstructibleStringType &gt;</edgelabel>
         </childnode>
       </node>
-      <node id="444">
+      <node id="505">
         <label>nlohmann::detail::is_compatible_string_type&lt; BasicJsonType, ConstructibleStringType &gt;</label>
         <link refid="db/d4e/structnlohmann_1_1detail_1_1is__compatible__string__type"/>
-        <childnode refid="443" relation="public-inheritance">
+        <childnode refid="504" relation="public-inheritance">
         </childnode>
       </node>
-      <node id="441">
+      <node id="502">
         <label>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, CompatibleStringType, typename &gt;</label>
         <link refid="d2/d3a/structnlohmann_1_1detail_1_1is__compatible__string__type__impl"/>
-        <childnode refid="442" relation="public-inheritance">
+        <childnode refid="503" relation="public-inheritance">
         </childnode>
       </node>
     </inheritancegraph>
     <collaborationgraph>
-      <node id="446">
+      <node id="507">
         <label>false_type</label>
       </node>
-      <node id="445">
+      <node id="506">
         <label>nlohmann::detail::is_compatible_string_type_impl&lt; BasicJsonType, CompatibleStringType, typename &gt;</label>
         <link refid="d2/d3a/structnlohmann_1_1detail_1_1is__compatible__string__type__impl"/>
-        <childnode refid="446" relation="public-inheritance">
+        <childnode refid="507" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3681" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="3681" bodyend="3681"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="3681" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="3681" bodyend="3681"/>
     <listofallmembers>
     </listofallmembers>
   </compounddef>

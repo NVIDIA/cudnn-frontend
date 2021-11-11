@@ -22,6 +22,8 @@
 
 #pragma once
 
+#include <ostream>
+
 #include <cudnn.h>
 
 namespace cudnn_frontend {

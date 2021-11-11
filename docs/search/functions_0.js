@@ -2,6 +2,7 @@ var searchData=
 [
   ['accept',['accept',['../df/d6b/classnlohmann_1_1detail_1_1parser.html#a39784a586867c05388cb0adca0fd72b5',1,'nlohmann::detail::parser::accept()'],['../d9/dcc/classnlohmann_1_1basic__json.html#a32872afe5bfd040777e3e2bb85f0ca55',1,'nlohmann::basic_json::accept(InputType &amp;&amp;i, const bool ignore_comments=false)'],['../d9/dcc/classnlohmann_1_1basic__json.html#a47fb596473649332185aedb0a8a6ccc5',1,'nlohmann::basic_json::accept(IteratorType first, IteratorType last, const bool ignore_comments=false)'],['../d9/dcc/classnlohmann_1_1basic__json.html#a6d9e85910b91d02f6807b69b61690a4b',1,'nlohmann::basic_json::accept(detail::span_input_adapter &amp;&amp;i, const bool ignore_comments=false)']]],
   ['add',['add',['../d8/d22/classnlohmann_1_1detail_1_1lexer.html#a36ffc3c33c3aea18291ead7a30fa7cc6',1,'nlohmann::detail::lexer']]],
+  ['add_5fplan_5fto_5fcache',['add_plan_to_cache',['../dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1.html#a0a60f67637646017b056301c3d1424db',1,'cudnn_frontend::ExecutionPlanCache_v1']]],
   ['append_5fexponent',['append_exponent',['../dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl.html#ad90f19ed10d8133b727df4b9bc5ddf5c',1,'nlohmann::detail::dtoa_impl']]],
   ['array',['array',['../d9/dcc/classnlohmann_1_1basic__json.html#a2c8d8f5741aedadac8f3bffd8f2ce13e',1,'nlohmann::basic_json']]],
   ['array_5findex',['array_index',['../da/de8/classnlohmann_1_1json__pointer.html#ae28e4b79b9d4fac9e6dca29f47f946fa',1,'nlohmann::json_pointer']]],

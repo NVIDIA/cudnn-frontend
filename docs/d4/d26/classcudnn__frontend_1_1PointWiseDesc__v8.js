@@ -1,12 +1,13 @@
 var classcudnn__frontend_1_1PointWiseDesc__v8 =
 [
-    [ "PointWiseDesc_v8", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#ac2e07a514ec114222b65948960ba76a3", null ],
+    [ "PointWiseDesc_v8", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#afd8d5f863f8ab989873ed0544f038adc", null ],
     [ "~PointWiseDesc_v8", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#a44917fdd66ea262687c0f0af3ef3b424", null ],
     [ "PointWiseDesc_v8", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#ac00ed56ba83a04edca3f55125332646b", null ],
     [ "PointWiseDesc_v8", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#ae4f638eb928772c13c314f4a022d4978", null ],
     [ "describe", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#a66ada0a9313ced7ed2801097ef523de8", null ],
     [ "getPointWiseMode", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#a963d8bd60aa5d7c5385d5d41595c2cf3", null ],
     [ "getPortCount", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#a81b0fa4b9ff8bfd2c23ae704f7211962", null ],
+    [ "operator=", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#aebb5f72b43b33a8163edf8c09f21b7dd", null ],
     [ "operator=", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#ae3cd0c0051c7e29a9ad86b80308429f3", null ],
     [ "PointWiseDescBuilder_v8", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#a1407b6ad40df9af7b191fdf636c2c508", null ],
     [ "elu_alpha", "d4/d26/classcudnn__frontend_1_1PointWiseDesc__v8.html#a246795e9bc43f846f701ae4214953412", null ],

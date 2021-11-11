@@ -119,6 +119,7 @@ class MatMulDescBuilder_v8 {
             return std::move(m_matMulDesc);
         }
 
+        getLogger() << "[cudnn_frontend] " << m_matMulDesc << std::endl;
         return std::move(m_matMulDesc);
     }
 
