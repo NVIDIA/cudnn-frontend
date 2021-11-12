@@ -16,8 +16,8 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="54" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="54" bodyend="-1"/>
-        <referencedby refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8_1abf794751941aa252c19e1879306375d3" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="128" endline="184">cudnn_frontend::VariantPackBuilder_v8::build</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="54" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" bodystart="54" bodyend="-1"/>
+        <referencedby refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8_1abf794751941aa252c19e1879306375d3" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="126" endline="183">cudnn_frontend::VariantPackBuilder_v8::build</referencedby>
       </memberdef>
       </sectiondef>
       <sectiondef kind="private-attrib">
@@ -33,7 +33,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="77" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="77" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="75" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" bodystart="75" bodyend="-1"/>
       </memberdef>
       <memberdef kind="variable" id="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a3a03ddd893f41a9ce6ca674bbfae7434" prot="private" static="no" mutable="no">
         <type>void *</type>
@@ -47,9 +47,8 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="78" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="78" bodyend="-1"/>
-        <referencedby refid="d5/def/group__VariantPackBuilder__v8_1ga14d3ac479fd01c48a97583adfb567090" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="107" endline="116">cudnn_frontend::VariantPackBuilder_v8::setDataPointers</referencedby>
-        <referencedby refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1aa9ce6c30e5e3c2df4d1e9fe2fb4cd6f5" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="62" endline="68">VariantPack_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="76" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" bodystart="76" bodyend="-1"/>
+        <referencedby refid="d5/def/group__VariantPackBuilder__v8_1ga14d3ac479fd01c48a97583adfb567090" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="105" endline="114">cudnn_frontend::VariantPackBuilder_v8::setDataPointers</referencedby>
       </memberdef>
       <memberdef kind="variable" id="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a5c3371913fd88b20557bcc4d8ef93219" prot="private" static="no" mutable="no">
         <type>int64_t</type>
@@ -63,9 +62,8 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="79" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="79" bodyend="-1"/>
-        <referencedby refid="d5/def/group__VariantPackBuilder__v8_1gad6dc5c5087c2724ca88cc2668d7f829d" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="101" endline="104">cudnn_frontend::VariantPackBuilder_v8::setUids</referencedby>
-        <referencedby refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1aa9ce6c30e5e3c2df4d1e9fe2fb4cd6f5" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="62" endline="68">VariantPack_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="77" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" bodystart="77" bodyend="-1"/>
+        <referencedby refid="d5/def/group__VariantPackBuilder__v8_1gad6dc5c5087c2724ca88cc2668d7f829d" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="99" endline="102">cudnn_frontend::VariantPackBuilder_v8::setUids</referencedby>
       </memberdef>
       <memberdef kind="variable" id="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1afeaea07e176fa0c943704285f258ba28" prot="private" static="no" mutable="no">
         <type>int64_t</type>
@@ -79,7 +77,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="80" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="80" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="78" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" bodystart="78" bodyend="-1"/>
         <referencedby refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a7ba1c4736d3b0f187dc06344ca4e2032" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="56" endline="61">describe</referencedby>
       </memberdef>
       </sectiondef>
@@ -96,13 +94,16 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="56" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="56" bodyend="61"/>
-        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1afeaea07e176fa0c943704285f258ba28" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="80">num_ptrs</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="56" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" bodystart="56" bodyend="61"/>
+        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1afeaea07e176fa0c943704285f258ba28" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="78">num_ptrs</references>
+        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1ab793e848c95ee7bc24a4885471092741">operator=</references>
+        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1ab2712c9ad5eeaf561408d7245938d0c6">VariantPack_v8</references>
+        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a55a7b12efe39ed7a24631ed05630721d">~VariantPack_v8</references>
       </memberdef>
-      <memberdef kind="function" id="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1aa9ce6c30e5e3c2df4d1e9fe2fb4cd6f5" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+      <memberdef kind="function" id="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a66cd4457f8608ac191b24b7f74ee758d" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
         <definition>cudnn_frontend::VariantPack_v8::VariantPack_v8</definition>
-        <argsstring>(VariantPack_v8 &amp;&amp;from)</argsstring>
+        <argsstring>(VariantPack_v8 &amp;&amp;from)=default</argsstring>
         <name>VariantPack_v8</name>
         <param>
           <type><ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">VariantPack_v8</ref> &amp;&amp;</type>
@@ -114,12 +115,26 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="62" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="62" bodyend="68"/>
-        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a3a03ddd893f41a9ce6ca674bbfae7434" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="78">data_pointers</references>
-        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a3f85d13ac1341b67d85f18761f8dcb35">operator=</references>
-        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a5c3371913fd88b20557bcc4d8ef93219" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="79">uid</references>
-        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1ab2712c9ad5eeaf561408d7245938d0c6">VariantPack_v8</references>
-        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a55a7b12efe39ed7a24631ed05630721d">~VariantPack_v8</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="63" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1ab793e848c95ee7bc24a4885471092741" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">VariantPack_v8</ref> &amp;</type>
+        <definition>VariantPack_v8&amp; cudnn_frontend::VariantPack_v8::operator=</definition>
+        <argsstring>(VariantPack_v8 &amp;&amp;from)=default</argsstring>
+        <name>operator=</name>
+        <param>
+          <type><ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">VariantPack_v8</ref> &amp;&amp;</type>
+          <declname>from</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="65" column="1"/>
+        <referencedby refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8_1abf794751941aa252c19e1879306375d3" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="126" endline="183">cudnn_frontend::VariantPackBuilder_v8::build</referencedby>
+        <referencedby refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a7ba1c4736d3b0f187dc06344ca4e2032" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="56" endline="61">describe</referencedby>
       </memberdef>
       <memberdef kind="function" id="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a55a7b12efe39ed7a24631ed05630721d" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -132,8 +147,8 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="69" column="1"/>
-        <referencedby refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1aa9ce6c30e5e3c2df4d1e9fe2fb4cd6f5" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="62" endline="68">VariantPack_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="67" column="1"/>
+        <referencedby refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a7ba1c4736d3b0f187dc06344ca4e2032" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="56" endline="61">describe</referencedby>
       </memberdef>
       </sectiondef>
       <sectiondef kind="private-func">
@@ -148,8 +163,8 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="72" column="1"/>
-        <referencedby refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1aa9ce6c30e5e3c2df4d1e9fe2fb4cd6f5" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="62" endline="68">VariantPack_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="70" column="1"/>
+        <referencedby refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a7ba1c4736d3b0f187dc06344ca4e2032" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="56" endline="61">describe</referencedby>
       </memberdef>
       <memberdef kind="function" id="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a7d3416a4e2f6a67e1988e3b3cb77e88b" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -165,7 +180,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="73" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="71" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a3f85d13ac1341b67d85f18761f8dcb35" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type><ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">VariantPack_v8</ref> &amp;</type>
@@ -181,9 +196,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="75" column="1"/>
-        <referencedby refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8_1abf794751941aa252c19e1879306375d3" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="128" endline="184">cudnn_frontend::VariantPackBuilder_v8::build</referencedby>
-        <referencedby refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1aa9ce6c30e5e3c2df4d1e9fe2fb4cd6f5" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="62" endline="68">VariantPack_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="73" column="1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -193,67 +206,67 @@
 <listitem><para>num knobs</para></listitem><listitem><para>Choice</para></listitem><listitem><para>Engine</para></listitem></itemizedlist>
 </para><para>Use <ref refid="d4/dce/classcudnn__frontend_1_1VariantPackBuilder__v8" kindref="compound">VariantPackBuilder_v8</ref> to build this class. Describe returns a string describing the tensor class </para>    </detaileddescription>
     <inheritancegraph>
-      <node id="1036">
+      <node id="1109">
         <label>cudnn_frontend::VariantPack_v8</label>
         <link refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8"/>
-        <childnode refid="1037" relation="public-inheritance">
+        <childnode refid="1110" relation="public-inheritance">
         </childnode>
       </node>
-      <node id="1037">
+      <node id="1110">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
       </node>
     </inheritancegraph>
     <collaborationgraph>
-      <node id="1042">
+      <node id="1115">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="1045">
+      <node id="1118">
         <label>void *</label>
       </node>
-      <node id="1043">
+      <node id="1116">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="1041">
+      <node id="1114">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="1038">
+      <node id="1111">
         <label>cudnn_frontend::VariantPack_v8</label>
         <link refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8"/>
-        <childnode refid="1039" relation="public-inheritance">
+        <childnode refid="1112" relation="public-inheritance">
         </childnode>
-        <childnode refid="1044" relation="usage">
+        <childnode refid="1117" relation="usage">
           <edgelabel>-num_ptrs</edgelabel>
           <edgelabel>-uid</edgelabel>
         </childnode>
-        <childnode refid="1045" relation="usage">
+        <childnode refid="1118" relation="usage">
           <edgelabel>-data_pointers</edgelabel>
           <edgelabel>-workspace</edgelabel>
         </childnode>
       </node>
-      <node id="1044">
+      <node id="1117">
         <label>int64_t</label>
       </node>
-      <node id="1039">
+      <node id="1112">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="1040" relation="usage">
+        <childnode refid="1113" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="1042" relation="usage">
+        <childnode refid="1115" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="1043" relation="usage">
+        <childnode refid="1116" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="1040">
+      <node id="1113">
         <label>std::string</label>
-        <childnode refid="1041" relation="public-inheritance">
+        <childnode refid="1114" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="52" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="52" bodyend="81"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="52" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" bodystart="52" bodyend="79"/>
     <listofallmembers>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8aa93686ca88410fc048b05155148183" prot="protected" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>BackendDescriptor</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a5765369a5739c2ea81c4f39ce2d1c46e" prot="protected" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>BackendDescriptor</name></member>
@@ -266,13 +279,14 @@
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" prot="public" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>get_status</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" prot="public" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>initialize_managed_backend_pointer</name></member>
       <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1afeaea07e176fa0c943704285f258ba28" prot="private" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>num_ptrs</name></member>
+      <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1ab793e848c95ee7bc24a4885471092741" prot="public" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>operator=</name></member>
       <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a3f85d13ac1341b67d85f18761f8dcb35" prot="private" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>operator=</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a62312f29dbbc7c11c1da54a2ad41c52f" prot="protected" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>pointer</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a1748a5c560905314930c37b2ed1a54d2" prot="public" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>set_error</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3ef02443f20b90223baf5f1922505eab" prot="public" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>set_status</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" prot="protected" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>status</name></member>
       <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a5c3371913fd88b20557bcc4d8ef93219" prot="private" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>uid</name></member>
-      <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1aa9ce6c30e5e3c2df4d1e9fe2fb4cd6f5" prot="public" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>VariantPack_v8</name></member>
+      <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a66cd4457f8608ac191b24b7f74ee758d" prot="public" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>VariantPack_v8</name></member>
       <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1ab2712c9ad5eeaf561408d7245938d0c6" prot="private" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>VariantPack_v8</name></member>
       <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a7d3416a4e2f6a67e1988e3b3cb77e88b" prot="private" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>VariantPack_v8</name></member>
       <member refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a8fcb5ec8a09de5a6f1f326f2e623cbdf" prot="public" virt="non-virtual"><scope>cudnn_frontend::VariantPack_v8</scope><name>VariantPackBuilder_v8</name></member>

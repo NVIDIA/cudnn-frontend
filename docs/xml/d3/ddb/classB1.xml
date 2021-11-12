@@ -25,7 +25,7 @@
         <link refid="d3/ddb/classB1"/>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="3550" column="1"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="3550" column="1"/>
     <listofallmembers>
     </listofallmembers>
   </compounddef>

@@ -26,7 +26,7 @@
 </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="25894" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="25894" bodyend="25898"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="25894" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="25894" bodyend="25898"/>
         <references refid="dc/df0/namespacenlohmann_1_1detail_1a09169efff3bd1771fff29bd92cea19e0" compoundref="d5/db8/json_8hpp" startline="145" endline="157">nlohmann::detail::operator&lt;</references>
       </memberdef>
       </sectiondef>
@@ -36,12 +36,12 @@
 <para>specialization for std::less&lt;value_t&gt; <simplesect kind="note"><para>: do not remove the space after &apos;&lt;&apos;, see <ulink url="https://github.com/nlohmann/json/pull/679">https://github.com/nlohmann/json/pull/679</ulink> </para></simplesect>
 </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="748">
+      <node id="809">
         <label>std::less&lt;::nlohmann::detail::value_t &gt;</label>
         <link refid="df/d4e/structstd_1_1less_3_1_1nlohmann_1_1detail_1_1value__t_01_4"/>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" line="25889" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/contrib/nlohmann/json/json.hpp" bodystart="25888" bodyend="25899"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="25889" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="25888" bodyend="25899"/>
     <listofallmembers>
       <member refid="df/d4e/structstd_1_1less_3_1_1nlohmann_1_1detail_1_1value__t_01_4_1a10d3fea50edf7b15ead8f4ceeb006000" prot="public" virt="non-virtual"><scope>std::less&lt;::nlohmann::detail::value_t &gt;</scope><name>operator()</name></member>
     </listofallmembers>

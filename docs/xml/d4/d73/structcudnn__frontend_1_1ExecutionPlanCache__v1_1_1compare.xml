@@ -1,0 +1,44 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d4/d73/structcudnn__frontend_1_1ExecutionPlanCache__v1_1_1compare" kind="struct" language="C++" prot="protected">
+    <compoundname>cudnn_frontend::ExecutionPlanCache_v1::compare</compoundname>
+    <includes refid="d9/dd3/cudnn__frontend__ExecutionPlanCache_8h" local="no">cudnn_frontend_ExecutionPlanCache.h</includes>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d4/d73/structcudnn__frontend_1_1ExecutionPlanCache__v1_1_1compare_1a7b5136a809e5d8f70b5bcc4cc1a1449e" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>bool</type>
+        <definition>bool cudnn_frontend::ExecutionPlanCache_v1::compare::operator()</definition>
+        <argsstring>(const feature_vector_t &amp;fv1, const feature_vector_t &amp;fv2) const</argsstring>
+        <name>operator()</name>
+        <param>
+          <type>const <ref refid="df/de1/namespacecudnn__frontend_1a360ee0c724a479660a6bd0815af46ac1" kindref="member">feature_vector_t</ref> &amp;</type>
+          <declname>fv1</declname>
+        </param>
+        <param>
+          <type>const <ref refid="df/de1/namespacecudnn__frontend_1a360ee0c724a479660a6bd0815af46ac1" kindref="member">feature_vector_t</ref> &amp;</type>
+          <declname>fv2</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" line="83" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" bodystart="83" bodyend="89"/>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="69">
+        <label>cudnn_frontend::ExecutionPlanCache_v1::compare</label>
+        <link refid="d4/d73/structcudnn__frontend_1_1ExecutionPlanCache__v1_1_1compare"/>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" line="82" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlanCache.h" bodystart="82" bodyend="90"/>
+    <listofallmembers>
+      <member refid="d4/d73/structcudnn__frontend_1_1ExecutionPlanCache__v1_1_1compare_1a7b5136a809e5d8f70b5bcc4cc1a1449e" prot="public" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanCache_v1::compare</scope><name>operator()</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

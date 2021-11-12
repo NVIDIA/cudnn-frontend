@@ -6,263 +6,362 @@
     <includes local="no">cudnn.h</includes>
     <includes local="no">cudnn_backend.h</includes>
     <includes refid="db/d7d/cudnn__frontend__OperationGraph_8h" local="yes">cudnn_frontend_OperationGraph.h</includes>
+    <includes refid="d6/d67/cudnn__frontend__EngineConfig_8h" local="yes">cudnn_frontend_EngineConfig.h</includes>
     <includes refid="df/d17/cudnn__frontend__utils_8h" local="yes">cudnn_frontend_utils.h</includes>
+    <includes refid="d5/d36/cudnn__frontend__Filters_8h" local="yes">cudnn_frontend_Filters.h</includes>
     <includedby refid="de/d0c/cudnn__frontend_8h" local="yes">cudnn_frontend.h</includedby>
     <incdepgraph>
-      <node id="435">
-        <label>cudnn_backend_base.h</label>
-        <link refid="dc/d11/cudnn__backend__base_8h"/>
-        <childnode refid="421" relation="include">
-        </childnode>
-      </node>
-      <node id="426">
+      <node id="525">
         <label>functional</label>
       </node>
-      <node id="436">
-        <label>cudnn_frontend_PointWiseDesc.h</label>
-        <link refid="da/d5f/cudnn__frontend__PointWiseDesc_8h"/>
-        <childnode refid="424" relation="include">
+      <node id="541">
+        <label>limits</label>
+      </node>
+      <node id="546">
+        <label>cudnn_frontend_Engine.h</label>
+        <link refid="de/d6d/cudnn__frontend__Engine_8h"/>
+        <childnode refid="523" relation="include">
         </childnode>
-        <childnode refid="425" relation="include">
+        <childnode refid="524" relation="include">
         </childnode>
-        <childnode refid="426" relation="include">
+        <childnode refid="525" relation="include">
         </childnode>
-        <childnode refid="427" relation="include">
+        <childnode refid="526" relation="include">
         </childnode>
-        <childnode refid="428" relation="include">
+        <childnode refid="527" relation="include">
         </childnode>
-        <childnode refid="429" relation="include">
+        <childnode refid="528" relation="include">
         </childnode>
-        <childnode refid="421" relation="include">
+        <childnode refid="519" relation="include">
         </childnode>
-        <childnode refid="422" relation="include">
+        <childnode refid="520" relation="include">
         </childnode>
-        <childnode refid="432" relation="include">
+        <childnode refid="521" relation="include">
+        </childnode>
+        <childnode refid="522" relation="include">
+        </childnode>
+        <childnode refid="531" relation="include">
         </childnode>
       </node>
-      <node id="421">
-        <label>cudnn.h</label>
+      <node id="545">
+        <label>cudnn_frontend_EngineConfig.h</label>
+        <link refid="d6/d67/cudnn__frontend__EngineConfig_8h"/>
+        <childnode refid="523" relation="include">
+        </childnode>
+        <childnode refid="524" relation="include">
+        </childnode>
+        <childnode refid="525" relation="include">
+        </childnode>
+        <childnode refid="526" relation="include">
+        </childnode>
+        <childnode refid="527" relation="include">
+        </childnode>
+        <childnode refid="528" relation="include">
+        </childnode>
+        <childnode refid="520" relation="include">
+        </childnode>
+        <childnode refid="521" relation="include">
+        </childnode>
+        <childnode refid="546" relation="include">
+        </childnode>
+        <childnode refid="531" relation="include">
+        </childnode>
       </node>
-      <node id="431">
-        <label>cudnn_frontend_ConvDesc.h</label>
-        <link refid="d1/de7/cudnn__frontend__ConvDesc_8h"/>
-        <childnode refid="424" relation="include">
-        </childnode>
-        <childnode refid="425" relation="include">
-        </childnode>
-        <childnode refid="426" relation="include">
-        </childnode>
-        <childnode refid="427" relation="include">
-        </childnode>
-        <childnode refid="428" relation="include">
-        </childnode>
-        <childnode refid="429" relation="include">
-        </childnode>
-        <childnode refid="421" relation="include">
-        </childnode>
-        <childnode refid="422" relation="include">
-        </childnode>
-        <childnode refid="432" relation="include">
-        </childnode>
-      </node>
-      <node id="437">
+      <node id="542">
         <label>cudnn_frontend_MatMulDesc.h</label>
         <link refid="d6/d32/cudnn__frontend__MatMulDesc_8h"/>
-        <childnode refid="424" relation="include">
+        <childnode refid="523" relation="include">
         </childnode>
-        <childnode refid="425" relation="include">
+        <childnode refid="524" relation="include">
         </childnode>
-        <childnode refid="426" relation="include">
+        <childnode refid="525" relation="include">
         </childnode>
-        <childnode refid="427" relation="include">
+        <childnode refid="526" relation="include">
         </childnode>
-        <childnode refid="428" relation="include">
+        <childnode refid="527" relation="include">
         </childnode>
-        <childnode refid="429" relation="include">
+        <childnode refid="528" relation="include">
         </childnode>
-        <childnode refid="421" relation="include">
+        <childnode refid="520" relation="include">
         </childnode>
-        <childnode refid="422" relation="include">
+        <childnode refid="521" relation="include">
         </childnode>
-        <childnode refid="432" relation="include">
-        </childnode>
-      </node>
-      <node id="434">
-        <label>string</label>
-      </node>
-      <node id="423">
-        <label>cudnn_frontend_OperationGraph.h</label>
-        <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
-        <childnode refid="424" relation="include">
-        </childnode>
-        <childnode refid="425" relation="include">
-        </childnode>
-        <childnode refid="426" relation="include">
-        </childnode>
-        <childnode refid="427" relation="include">
-        </childnode>
-        <childnode refid="428" relation="include">
-        </childnode>
-        <childnode refid="429" relation="include">
-        </childnode>
-        <childnode refid="421" relation="include">
-        </childnode>
-        <childnode refid="422" relation="include">
-        </childnode>
-        <childnode refid="430" relation="include">
-        </childnode>
-        <childnode refid="432" relation="include">
+        <childnode refid="531" relation="include">
         </childnode>
       </node>
-      <node id="433">
-        <label>exception</label>
-      </node>
-      <node id="439">
-        <label>cudnn_frontend_Tensor.h</label>
-        <link refid="d3/d98/cudnn__frontend__Tensor_8h"/>
-        <childnode refid="424" relation="include">
-        </childnode>
-        <childnode refid="425" relation="include">
-        </childnode>
-        <childnode refid="426" relation="include">
-        </childnode>
-        <childnode refid="427" relation="include">
-        </childnode>
-        <childnode refid="428" relation="include">
-        </childnode>
-        <childnode refid="429" relation="include">
-        </childnode>
-        <childnode refid="432" relation="include">
-        </childnode>
-      </node>
-      <node id="430">
-        <label>cudnn_frontend_Operation.h</label>
-        <link refid="da/d5a/cudnn__frontend__Operation_8h"/>
-        <childnode refid="424" relation="include">
-        </childnode>
-        <childnode refid="425" relation="include">
-        </childnode>
-        <childnode refid="426" relation="include">
-        </childnode>
-        <childnode refid="427" relation="include">
-        </childnode>
-        <childnode refid="428" relation="include">
-        </childnode>
-        <childnode refid="429" relation="include">
-        </childnode>
-        <childnode refid="421" relation="include">
-        </childnode>
-        <childnode refid="422" relation="include">
-        </childnode>
-        <childnode refid="431" relation="include">
-        </childnode>
-        <childnode refid="436" relation="include">
-        </childnode>
-        <childnode refid="437" relation="include">
-        </childnode>
-        <childnode refid="438" relation="include">
-        </childnode>
-        <childnode refid="439" relation="include">
-        </childnode>
-        <childnode refid="432" relation="include">
-        </childnode>
-      </node>
-      <node id="420">
-        <label>vector</label>
-      </node>
-      <node id="422">
-        <label>cudnn_backend.h</label>
-      </node>
-      <node id="429">
-        <label>utility</label>
-      </node>
-      <node id="425">
-        <label>array</label>
-      </node>
-      <node id="428">
-        <label>sstream</label>
-      </node>
-      <node id="432">
-        <label>cudnn_frontend_utils.h</label>
-        <link refid="df/d17/cudnn__frontend__utils_8h"/>
-        <childnode refid="433" relation="include">
-        </childnode>
-        <childnode refid="434" relation="include">
-        </childnode>
-        <childnode refid="435" relation="include">
-        </childnode>
-      </node>
-      <node id="438">
-        <label>cudnn_frontend_ReductionDesc.h</label>
-        <link refid="db/da7/cudnn__frontend__ReductionDesc_8h"/>
-        <childnode refid="424" relation="include">
-        </childnode>
-        <childnode refid="425" relation="include">
-        </childnode>
-        <childnode refid="426" relation="include">
-        </childnode>
-        <childnode refid="427" relation="include">
-        </childnode>
-        <childnode refid="428" relation="include">
-        </childnode>
-        <childnode refid="429" relation="include">
-        </childnode>
-        <childnode refid="421" relation="include">
-        </childnode>
-        <childnode refid="422" relation="include">
-        </childnode>
-        <childnode refid="432" relation="include">
-        </childnode>
-      </node>
-      <node id="419">
+      <node id="518">
         <label>cudnn_frontend_Heuristics.h</label>
         <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
-        <childnode refid="420" relation="include">
+        <childnode refid="519" relation="include">
         </childnode>
-        <childnode refid="421" relation="include">
+        <childnode refid="520" relation="include">
         </childnode>
-        <childnode refid="422" relation="include">
+        <childnode refid="521" relation="include">
         </childnode>
-        <childnode refid="423" relation="include">
+        <childnode refid="522" relation="include">
         </childnode>
-        <childnode refid="432" relation="include">
+        <childnode refid="545" relation="include">
+        </childnode>
+        <childnode refid="531" relation="include">
+        </childnode>
+        <childnode refid="547" relation="include">
         </childnode>
       </node>
-      <node id="424">
+      <node id="520">
+        <label>cudnn.h</label>
+      </node>
+      <node id="540">
+        <label>cudnn_frontend_PointWiseDesc.h</label>
+        <link refid="da/d5f/cudnn__frontend__PointWiseDesc_8h"/>
+        <childnode refid="523" relation="include">
+        </childnode>
+        <childnode refid="524" relation="include">
+        </childnode>
+        <childnode refid="525" relation="include">
+        </childnode>
+        <childnode refid="526" relation="include">
+        </childnode>
+        <childnode refid="527" relation="include">
+        </childnode>
+        <childnode refid="528" relation="include">
+        </childnode>
+        <childnode refid="541" relation="include">
+        </childnode>
+        <childnode refid="520" relation="include">
+        </childnode>
+        <childnode refid="521" relation="include">
+        </childnode>
+        <childnode refid="531" relation="include">
+        </childnode>
+      </node>
+      <node id="533">
+        <label>string</label>
+      </node>
+      <node id="536">
+        <label>cudnn_frontend_Logging.h</label>
+        <link refid="d8/dc4/cudnn__frontend__Logging_8h"/>
+        <childnode refid="537" relation="include">
+        </childnode>
+        <childnode refid="538" relation="include">
+        </childnode>
+        <childnode refid="539" relation="include">
+        </childnode>
+        <childnode refid="534" relation="include">
+        </childnode>
+      </node>
+      <node id="544">
+        <label>cudnn_frontend_Tensor.h</label>
+        <link refid="d3/d98/cudnn__frontend__Tensor_8h"/>
+        <childnode refid="523" relation="include">
+        </childnode>
+        <childnode refid="524" relation="include">
+        </childnode>
+        <childnode refid="525" relation="include">
+        </childnode>
+        <childnode refid="526" relation="include">
+        </childnode>
+        <childnode refid="527" relation="include">
+        </childnode>
+        <childnode refid="528" relation="include">
+        </childnode>
+        <childnode refid="531" relation="include">
+        </childnode>
+      </node>
+      <node id="532">
+        <label>exception</label>
+      </node>
+      <node id="538">
+        <label>fstream</label>
+      </node>
+      <node id="547">
+        <label>cudnn_frontend_Filters.h</label>
+        <link refid="d5/d36/cudnn__frontend__Filters_8h"/>
+        <childnode refid="520" relation="include">
+        </childnode>
+      </node>
+      <node id="535">
+        <label>ostream</label>
+      </node>
+      <node id="529">
+        <label>cudnn_frontend_Operation.h</label>
+        <link refid="da/d5a/cudnn__frontend__Operation_8h"/>
+        <childnode refid="523" relation="include">
+        </childnode>
+        <childnode refid="524" relation="include">
+        </childnode>
+        <childnode refid="525" relation="include">
+        </childnode>
+        <childnode refid="526" relation="include">
+        </childnode>
+        <childnode refid="527" relation="include">
+        </childnode>
+        <childnode refid="528" relation="include">
+        </childnode>
+        <childnode refid="520" relation="include">
+        </childnode>
+        <childnode refid="521" relation="include">
+        </childnode>
+        <childnode refid="530" relation="include">
+        </childnode>
+        <childnode refid="540" relation="include">
+        </childnode>
+        <childnode refid="542" relation="include">
+        </childnode>
+        <childnode refid="543" relation="include">
+        </childnode>
+        <childnode refid="544" relation="include">
+        </childnode>
+        <childnode refid="531" relation="include">
+        </childnode>
+      </node>
+      <node id="519">
+        <label>vector</label>
+      </node>
+      <node id="530">
+        <label>cudnn_frontend_ConvDesc.h</label>
+        <link refid="d1/de7/cudnn__frontend__ConvDesc_8h"/>
+        <childnode refid="523" relation="include">
+        </childnode>
+        <childnode refid="524" relation="include">
+        </childnode>
+        <childnode refid="525" relation="include">
+        </childnode>
+        <childnode refid="526" relation="include">
+        </childnode>
+        <childnode refid="527" relation="include">
+        </childnode>
+        <childnode refid="528" relation="include">
+        </childnode>
+        <childnode refid="520" relation="include">
+        </childnode>
+        <childnode refid="521" relation="include">
+        </childnode>
+        <childnode refid="531" relation="include">
+        </childnode>
+      </node>
+      <node id="522">
+        <label>cudnn_frontend_OperationGraph.h</label>
+        <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
+        <childnode refid="523" relation="include">
+        </childnode>
+        <childnode refid="524" relation="include">
+        </childnode>
+        <childnode refid="525" relation="include">
+        </childnode>
+        <childnode refid="526" relation="include">
+        </childnode>
+        <childnode refid="527" relation="include">
+        </childnode>
+        <childnode refid="528" relation="include">
+        </childnode>
+        <childnode refid="519" relation="include">
+        </childnode>
+        <childnode refid="520" relation="include">
+        </childnode>
+        <childnode refid="521" relation="include">
+        </childnode>
+        <childnode refid="529" relation="include">
+        </childnode>
+        <childnode refid="531" relation="include">
+        </childnode>
+      </node>
+      <node id="521">
+        <label>cudnn_backend.h</label>
+      </node>
+      <node id="528">
+        <label>utility</label>
+      </node>
+      <node id="524">
+        <label>array</label>
+      </node>
+      <node id="527">
+        <label>sstream</label>
+      </node>
+      <node id="543">
+        <label>cudnn_frontend_ReductionDesc.h</label>
+        <link refid="db/da7/cudnn__frontend__ReductionDesc_8h"/>
+        <childnode refid="523" relation="include">
+        </childnode>
+        <childnode refid="524" relation="include">
+        </childnode>
+        <childnode refid="525" relation="include">
+        </childnode>
+        <childnode refid="526" relation="include">
+        </childnode>
+        <childnode refid="527" relation="include">
+        </childnode>
+        <childnode refid="528" relation="include">
+        </childnode>
+        <childnode refid="520" relation="include">
+        </childnode>
+        <childnode refid="521" relation="include">
+        </childnode>
+        <childnode refid="531" relation="include">
+        </childnode>
+      </node>
+      <node id="537">
+        <label>iostream</label>
+      </node>
+      <node id="523">
         <label>algorithm</label>
       </node>
-      <node id="427">
+      <node id="539">
+        <label>cstring</label>
+      </node>
+      <node id="531">
+        <label>cudnn_frontend_utils.h</label>
+        <link refid="df/d17/cudnn__frontend__utils_8h"/>
+        <childnode refid="532" relation="include">
+        </childnode>
+        <childnode refid="533" relation="include">
+        </childnode>
+        <childnode refid="519" relation="include">
+        </childnode>
+        <childnode refid="534" relation="include">
+        </childnode>
+        <childnode refid="536" relation="include">
+        </childnode>
+      </node>
+      <node id="526">
         <label>memory</label>
+      </node>
+      <node id="534">
+        <label>cudnn_backend_base.h</label>
+        <link refid="dc/d11/cudnn__backend__base_8h"/>
+        <childnode refid="535" relation="include">
+        </childnode>
+        <childnode refid="520" relation="include">
+        </childnode>
       </node>
     </incdepgraph>
     <invincdepgraph>
-      <node id="444">
+      <node id="548">
+        <label>cudnn_frontend_Heuristics.h</label>
+        <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
+        <childnode refid="549" relation="include">
+        </childnode>
+      </node>
+      <node id="552">
         <label>cudnn_frontend_get_plan.h</label>
         <link refid="d2/d3b/cudnn__frontend__get__plan_8h"/>
       </node>
-      <node id="442">
+      <node id="550">
         <label>cudnn_frontend_EngineConfigGenerator.h</label>
         <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
-        <childnode refid="443" relation="include">
+        <childnode refid="551" relation="include">
         </childnode>
-        <childnode refid="444" relation="include">
+        <childnode refid="552" relation="include">
         </childnode>
       </node>
-      <node id="441">
+      <node id="549">
         <label>cudnn_frontend.h</label>
         <link refid="de/d0c/cudnn__frontend_8h"/>
-        <childnode refid="442" relation="include">
+        <childnode refid="550" relation="include">
         </childnode>
       </node>
-      <node id="443">
+      <node id="551">
         <label>cudnn_frontend_find_plan.h</label>
         <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
-      </node>
-      <node id="440">
-        <label>cudnn_frontend_Heuristics.h</label>
-        <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
-        <childnode refid="441" relation="include">
-        </childnode>
       </node>
     </invincdepgraph>
     <innerclass refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" prot="public">cudnn_frontend::EngineHeuristics_v8</innerclass>
@@ -303,24 +402,24 @@
 <codeline lineno="28"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;cudnn_backend.h&gt;</highlight><highlight class="normal"></highlight></codeline>
 <codeline lineno="29"><highlight class="normal"></highlight></codeline>
 <codeline lineno="30"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&quot;<ref refid="db/d7d/cudnn__frontend__OperationGraph_8h" kindref="compound">cudnn_frontend_OperationGraph.h</ref>&quot;</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="31"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&quot;<ref refid="df/d17/cudnn__frontend__utils_8h" kindref="compound">cudnn_frontend_utils.h</ref>&quot;</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="32"><highlight class="normal"></highlight></codeline>
-<codeline lineno="33"><highlight class="normal"></highlight><highlight class="keyword">namespace<sp/></highlight><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend" kindref="compound">cudnn_frontend</ref><sp/>{</highlight></codeline>
-<codeline lineno="45" refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" refkind="compound"><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref><sp/>:<sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal"><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" kindref="compound">BackendDescriptor</ref><sp/>{</highlight></codeline>
-<codeline lineno="46"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal">:</highlight></codeline>
-<codeline lineno="47" refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a44df29e58afe4b8fdc894574eb5efb9e" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">friend</highlight><highlight class="normal"><sp/></highlight><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref>;</highlight></codeline>
-<codeline lineno="48"><highlight class="normal"><sp/><sp/><sp/><sp/>std::string</highlight></codeline>
-<codeline lineno="49" refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1ac223cc9438a0442bd3b48881f71a4b40" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1ac223cc9438a0442bd3b48881f71a4b40" kindref="member">describe</ref>()</highlight><highlight class="keyword"><sp/>const<sp/>override<sp/></highlight><highlight class="normal">{</highlight></codeline>
-<codeline lineno="50"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>std::stringstream<sp/>ss;</highlight></codeline>
-<codeline lineno="51"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>ss<sp/>&lt;&lt;<sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR<sp/>:&quot;</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="52"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>ss.str();</highlight></codeline>
-<codeline lineno="53"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="54"><highlight class="normal"></highlight></codeline>
-<codeline lineno="55" refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a298d4a89c8e9ed80526a6cccf33d716c" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a298d4a89c8e9ed80526a6cccf33d716c" kindref="member">EngineHeuristics_v8</ref>(<ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref><sp/>&amp;&amp;from)</highlight></codeline>
-<codeline lineno="56"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>:<sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" kindref="compound">BackendDescriptor</ref>(from.<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a57c83e78374bac747b5660fb271b947a" kindref="member">get_desc</ref>(),<sp/>from.<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" kindref="member">get_status</ref>(),<sp/>from.<ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1abfde0f34b0bf49c45d3d9c0408284f6f" kindref="member">get_error</ref>()),</highlight></codeline>
-<codeline lineno="57"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a71e7822002502874f6b2dfec4ede7e01" kindref="member">mode</ref>(from.<ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a71e7822002502874f6b2dfec4ede7e01" kindref="member">mode</ref>),</highlight></codeline>
-<codeline lineno="58"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a081860775bfc5626bd57066066eb4299" kindref="member">opGraph</ref>(from.<ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a081860775bfc5626bd57066066eb4299" kindref="member">opGraph</ref>),</highlight></codeline>
-<codeline lineno="59"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a7c958bd4b97b4a77694d2bee01acec4c" kindref="member">opGraphTag</ref>(from.<ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a7c958bd4b97b4a77694d2bee01acec4c" kindref="member">opGraphTag</ref>)<sp/>{}</highlight></codeline>
+<codeline lineno="31"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&quot;<ref refid="d6/d67/cudnn__frontend__EngineConfig_8h" kindref="compound">cudnn_frontend_EngineConfig.h</ref>&quot;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="32"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&quot;<ref refid="df/d17/cudnn__frontend__utils_8h" kindref="compound">cudnn_frontend_utils.h</ref>&quot;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="33"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&quot;<ref refid="d5/d36/cudnn__frontend__Filters_8h" kindref="compound">cudnn_frontend_Filters.h</ref>&quot;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="34"><highlight class="normal"></highlight></codeline>
+<codeline lineno="35"><highlight class="normal"></highlight><highlight class="keyword">namespace<sp/></highlight><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend" kindref="compound">cudnn_frontend</ref><sp/>{</highlight></codeline>
+<codeline lineno="47" refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" refkind="compound"><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref><sp/>:<sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal"><sp/><ref refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor" kindref="compound">BackendDescriptor</ref><sp/>{</highlight></codeline>
+<codeline lineno="48"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">public</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="49" refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a44df29e58afe4b8fdc894574eb5efb9e" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">friend</highlight><highlight class="normal"><sp/></highlight><highlight class="keyword">class<sp/></highlight><highlight class="normal"><ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref>;</highlight></codeline>
+<codeline lineno="50"><highlight class="normal"><sp/><sp/><sp/><sp/>std::string</highlight></codeline>
+<codeline lineno="51" refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1ac223cc9438a0442bd3b48881f71a4b40" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1ac223cc9438a0442bd3b48881f71a4b40" kindref="member">describe</ref>()</highlight><highlight class="keyword"><sp/>const<sp/>override<sp/></highlight><highlight class="normal">{</highlight></codeline>
+<codeline lineno="52"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>std::stringstream<sp/>ss;</highlight></codeline>
+<codeline lineno="53"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>ss<sp/>&lt;&lt;<sp/></highlight><highlight class="stringliteral">&quot;CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR<sp/>:&quot;</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="54"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>ss.str();</highlight></codeline>
+<codeline lineno="55"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="56"><highlight class="normal"></highlight></codeline>
+<codeline lineno="57"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1aaa983e31e1a22bfebb639865e4514d82" kindref="member">EngineHeuristics_v8</ref>(<ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref><sp/>&amp;&amp;from)<sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="58"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref><sp/>&amp;</highlight></codeline>
+<codeline lineno="59"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a9f9a992e9b0e287d9c1e068e63f3640b" kindref="member">operator= </ref>(<ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref><sp/>&amp;&amp;from)<sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
 <codeline lineno="60"><highlight class="normal"></highlight></codeline>
 <codeline lineno="61"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a2261e27dacfdad755d625692aa20f290" kindref="member">~EngineHeuristics_v8</ref>()<sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
 <codeline lineno="62"><highlight class="normal"></highlight></codeline>
@@ -379,7 +478,7 @@
 <codeline lineno="123"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1aaa983e31e1a22bfebb639865e4514d82" kindref="member">EngineHeuristics_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
 <codeline lineno="124"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1aaa983e31e1a22bfebb639865e4514d82" kindref="member">EngineHeuristics_v8</ref>(<ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
 <codeline lineno="125"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref><sp/>&amp;</highlight></codeline>
-<codeline lineno="126"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a2301c5b006fa6e341bc88ece066f8ea2" kindref="member">operator=</ref>(<ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="126"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a9f9a992e9b0e287d9c1e068e63f3640b" kindref="member">operator=</ref>(<ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
 <codeline lineno="127"><highlight class="normal"></highlight></codeline>
 <codeline lineno="128" refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a71e7822002502874f6b2dfec4ede7e01" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/>cudnnBackendHeurMode_t<sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a71e7822002502874f6b2dfec4ede7e01" kindref="member">mode</ref><sp/><sp/><sp/><sp/><sp/>=<sp/>CUDNN_HEUR_MODE_INSTANT;</highlight></codeline>
 <codeline lineno="129" refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a081860775bfc5626bd57066066eb4299" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac94d582cdfa2adf3d68a4e675e5d69aa" kindref="member">ManagedOpaqueDescriptor</ref><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a081860775bfc5626bd57066066eb4299" kindref="member">opGraph</ref><sp/>=<sp/></highlight><highlight class="keyword">nullptr</highlight><highlight class="normal">;</highlight></codeline>
@@ -451,21 +550,44 @@
 <codeline lineno="208"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_heuristics);</highlight></codeline>
 <codeline lineno="209"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>};</highlight></codeline>
 <codeline lineno="210"><highlight class="normal"></highlight></codeline>
-<codeline lineno="211"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_heuristics);</highlight></codeline>
-<codeline lineno="212"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="213"><highlight class="normal"></highlight></codeline>
-<codeline lineno="214"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">explicit</highlight><highlight class="normal"><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a44df29e58afe4b8fdc894574eb5efb9e" kindref="member">EngineHeuristicsBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="215"><highlight class="normal"><sp/><sp/><sp/><sp/>~<ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="216"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a44df29e58afe4b8fdc894574eb5efb9e" kindref="member">EngineHeuristicsBuilder_v8</ref>(<ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref><sp/>&amp;&amp;)<sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="217"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a44df29e58afe4b8fdc894574eb5efb9e" kindref="member">EngineHeuristicsBuilder_v8</ref>(<ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="218"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref><sp/>&amp;</highlight></codeline>
-<codeline lineno="219"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a2301c5b006fa6e341bc88ece066f8ea2" kindref="member">operator=</ref>(<ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="220"><highlight class="normal"></highlight></codeline>
-<codeline lineno="221"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">private</highlight><highlight class="normal">:</highlight></codeline>
-<codeline lineno="222" refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1aa046a778075f260f7950ee5a51c2addb" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref><sp/><ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1aa046a778075f260f7950ee5a51c2addb" kindref="member">m_heuristics</ref>;</highlight></codeline>
-<codeline lineno="223"><highlight class="normal">};</highlight></codeline>
-<codeline lineno="224"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="211"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" kindref="member">getLogger</ref>()<sp/>&lt;&lt;<sp/></highlight><highlight class="stringliteral">&quot;[cudnn_frontend]<sp/>&quot;</highlight><highlight class="normal"><sp/>&lt;&lt;<sp/>m_heuristics<sp/>&lt;&lt;<sp/>std::endl;</highlight></codeline>
+<codeline lineno="212"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>std::move(m_heuristics);</highlight></codeline>
+<codeline lineno="213"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="214"><highlight class="normal"></highlight></codeline>
+<codeline lineno="215"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">explicit</highlight><highlight class="normal"><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a44df29e58afe4b8fdc894574eb5efb9e" kindref="member">EngineHeuristicsBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="216"><highlight class="normal"><sp/><sp/><sp/><sp/>~<ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref>()<sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keywordflow">default</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="217"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a44df29e58afe4b8fdc894574eb5efb9e" kindref="member">EngineHeuristicsBuilder_v8</ref>(<ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref><sp/>&amp;&amp;)<sp/><sp/><sp/><sp/><sp/><sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="218"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a44df29e58afe4b8fdc894574eb5efb9e" kindref="member">EngineHeuristicsBuilder_v8</ref>(<ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="219"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref><sp/>&amp;</highlight></codeline>
+<codeline lineno="220"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a9f9a992e9b0e287d9c1e068e63f3640b" kindref="member">operator=</ref>(<ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" kindref="compound">EngineHeuristicsBuilder_v8</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;)<sp/>=<sp/></highlight><highlight class="keyword">delete</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="221"><highlight class="normal"></highlight></codeline>
+<codeline lineno="222"><highlight class="normal"><sp/><sp/><sp/></highlight><highlight class="keyword">private</highlight><highlight class="normal">:</highlight></codeline>
+<codeline lineno="223" refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1aa046a778075f260f7950ee5a51c2addb" refkind="member"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" kindref="compound">EngineHeuristics_v8</ref><sp/><ref refid="d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8_1aa046a778075f260f7950ee5a51c2addb" kindref="member">m_heuristics</ref>;</highlight></codeline>
+<codeline lineno="224"><highlight class="normal">};</highlight></codeline>
+<codeline lineno="225"><highlight class="normal"></highlight></codeline>
+<codeline lineno="226"><highlight class="normal"></highlight><highlight class="keyword">template</highlight><highlight class="normal">&lt;std::</highlight><highlight class="keywordtype">size_t</highlight><highlight class="normal"><sp/>SIZE&gt;</highlight></codeline>
+<codeline lineno="227"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1a84a5f004bdf17747bf7cf45d6fc754cd" kindref="member">EngineConfigList</ref></highlight></codeline>
+<codeline lineno="228" refid="df/de1/namespacecudnn__frontend_1a387b9a5a9cfdb5290ff5729852714f0d" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1a387b9a5a9cfdb5290ff5729852714f0d" kindref="member">get_heuristics_list</ref>(std::array&lt;cudnnBackendHeurMode_t,<sp/>SIZE&gt;<sp/>modes,</highlight></codeline>
+<codeline lineno="229"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">OperationGraph_v8</ref><sp/>&amp;<ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a081860775bfc5626bd57066066eb4299" kindref="member">opGraph</ref>,</highlight></codeline>
+<codeline lineno="230"><highlight class="normal"><sp/><sp/><sp/><sp/>std::function&lt;</highlight><highlight class="keywordtype">bool</highlight><highlight class="normal">(cudnnBackendDescriptor_t)&gt;<sp/>filter_fn)<sp/>{</highlight></codeline>
+<codeline lineno="231"><highlight class="normal"><sp/><sp/><sp/><sp/>(<ref refid="dc/df0/namespacenlohmann_1_1detail_1a59fca69799f6b9e366710cb9043aa77d" kindref="member">void</ref>)<sp/>modes;</highlight></codeline>
+<codeline lineno="232"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a84a5f004bdf17747bf7cf45d6fc754cd" kindref="member">EngineConfigList</ref><sp/>filtered_configs;</highlight></codeline>
+<codeline lineno="233"><highlight class="normal"></highlight></codeline>
+<codeline lineno="234"><highlight class="normal"></highlight></codeline>
+<codeline lineno="235"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(</highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a71e7822002502874f6b2dfec4ede7e01" kindref="member">mode</ref><sp/>:<sp/>modes)<sp/>{</highlight></codeline>
+<codeline lineno="236"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>heuristics<sp/>=<sp/><ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a44df29e58afe4b8fdc894574eb5efb9e" kindref="member">EngineHeuristicsBuilder_v8</ref>()</highlight></codeline>
+<codeline lineno="237"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>.setOperationGraph(opGraph)</highlight></codeline>
+<codeline lineno="238"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>.setHeurMode(<ref refid="db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8_1a71e7822002502874f6b2dfec4ede7e01" kindref="member">mode</ref>)</highlight></codeline>
+<codeline lineno="239"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>.build();</highlight></codeline>
+<codeline lineno="240"><highlight class="normal"></highlight></codeline>
+<codeline lineno="241"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal">&amp;<sp/>engine_config<sp/>=<sp/>heuristics.getEngineConfig(heuristics.getEngineConfigCount());</highlight></codeline>
+<codeline lineno="242"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1abcaf76bd6c7d8c59082fd53d2a8c897a" kindref="member">cudnn_frontend::filter</ref>(engine_config,<sp/>filtered_configs,<sp/>filter_fn);</highlight></codeline>
+<codeline lineno="243"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="244"><highlight class="normal"></highlight></codeline>
+<codeline lineno="245"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>filtered_configs;</highlight></codeline>
+<codeline lineno="246"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="247"><highlight class="normal">}</highlight></codeline>
     </programlisting>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_Heuristics.h"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Heuristics.h"/>
   </compounddef>
 </doxygen>

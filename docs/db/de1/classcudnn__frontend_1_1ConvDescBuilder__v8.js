@@ -6,6 +6,7 @@ var classcudnn__frontend_1_1ConvDescBuilder__v8 =
     [ "ConvDescBuilder_v8", "db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html#a99c1c90149cee07a26124fe32bdcfe03", null ],
     [ "build", "db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html#a01f709a3efafaca70de6565817c43beb", null ],
     [ "operator=", "db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html#a5fba7029429a093b36fd201219315a1f", null ],
+    [ "setComputePrecision", "d3/ddd/group__ConvDescBuilder__v8.html#ga8f4b0d58c7213ce6be6e341afa56c654", null ],
     [ "setDataType", "d3/ddd/group__ConvDescBuilder__v8.html#gad8de00b0e7a86bdda61749e7572a35ac", null ],
     [ "setDilation", "d3/ddd/group__ConvDescBuilder__v8.html#gaa41e2cbbebc9d2fd19fa990a48b39d08", null ],
     [ "setMathMode", "d3/ddd/group__ConvDescBuilder__v8.html#ga3b752afba659c8e92e7ad1ca71d62f2f", null ],

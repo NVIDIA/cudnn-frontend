@@ -11,6 +11,7 @@ var searchData=
   ['kgamma',['kGamma',['../dc/d41/namespacenlohmann_1_1detail_1_1dtoa__impl.html#a4a750fcc38da1ce68b7e25ab3a230e20',1,'nlohmann::detail::dtoa_impl']]],
   ['knob',['Knob',['../dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob.html',1,'cudnn_frontend::Engine_v8::Knob'],['../dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob.html#aaf0d313c5491b599537422694eb83b82',1,'cudnn_frontend::Engine_v8::Knob::Knob()']]],
   ['knobs',['knobs',['../dc/d3c/classcudnn__frontend_1_1Engine__v8.html#add2d5998a38944fd0dba03fce96fe7aa',1,'cudnn_frontend::Engine_v8']]],
+  ['knobs_5fset',['knobs_set',['../dc/d3c/classcudnn__frontend_1_1Engine__v8.html#ad755935840f0f82167a9ebe2122b6eee',1,'cudnn_frontend::Engine_v8']]],
   ['knobtype',['knobType',['../dc/d02/classcudnn__frontend_1_1Engine__v8_1_1Knob.html#adc13c98616305cd23d86dc5dc1dfe86e',1,'cudnn_frontend::Engine_v8::Knob']]],
   ['kprecision',['kPrecision',['../d4/d54/structnlohmann_1_1detail_1_1dtoa__impl_1_1diyfp.html#a03682754b06ed4f30b263119eecc2d52',1,'nlohmann::detail::dtoa_impl::diyfp']]]
 ];

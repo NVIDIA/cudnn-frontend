@@ -16,8 +16,8 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" line="49" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" bodystart="49" bodyend="-1"/>
-        <referencedby refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1addc153acf5600781659a1a2ba891e59c" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="93" endline="123">cudnn_frontend::MatMulDescBuilder_v8::build</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" line="49" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" bodystart="49" bodyend="-1"/>
+        <referencedby refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1addc153acf5600781659a1a2ba891e59c" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="93" endline="124">cudnn_frontend::MatMulDescBuilder_v8::build</referencedby>
       </memberdef>
       </sectiondef>
       <sectiondef kind="private-attrib">
@@ -33,7 +33,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" line="70" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" bodystart="70" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" line="70" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" bodystart="70" bodyend="-1"/>
         <referencedby refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a2931e4d0b21e6986a3f5a1697ca4bae0" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="51" endline="56">describe</referencedby>
       </memberdef>
       </sectiondef>
@@ -50,13 +50,16 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" line="51" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" bodystart="51" bodyend="56"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" line="51" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" bodystart="51" bodyend="56"/>
         <references refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a1dd13143c85b67f2c0da90f02884fab1" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="70">math_precision</references>
+        <references refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a5e060b83ea1e1ed59a66e15fdba91227">MatMulDesc_v8</references>
+        <references refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a60981584b3c7be9737acaa0f0a55611f">operator=</references>
+        <references refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ad27b038b19b218067bd30e60d94fd672">~MatMulDesc_v8</references>
       </memberdef>
-      <memberdef kind="function" id="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ab725a8e47331aca6310155f6d55c0a02" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+      <memberdef kind="function" id="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a2d35d2b137f01bdd1560461510b36968" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
         <definition>cudnn_frontend::MatMulDesc_v8::MatMulDesc_v8</definition>
-        <argsstring>(MatMulDesc_v8 &amp;&amp;from)</argsstring>
+        <argsstring>(MatMulDesc_v8 &amp;&amp;from)=default</argsstring>
         <name>MatMulDesc_v8</name>
         <param>
           <type><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref> &amp;&amp;</type>
@@ -68,10 +71,26 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" line="58" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" bodystart="58" bodyend="60"/>
-        <references refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a5e060b83ea1e1ed59a66e15fdba91227">MatMulDesc_v8</references>
-        <references refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ac1257a1ca1261961fc99123988552911">operator=</references>
-        <references refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ad27b038b19b218067bd30e60d94fd672">~MatMulDesc_v8</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" line="58" column="1"/>
+      </memberdef>
+      <memberdef kind="function" id="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a60981584b3c7be9737acaa0f0a55611f" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
+        <type><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref> &amp;</type>
+        <definition>MatMulDesc_v8&amp; cudnn_frontend::MatMulDesc_v8::operator=</definition>
+        <argsstring>(MatMulDesc_v8 &amp;&amp;from)=default</argsstring>
+        <name>operator=</name>
+        <param>
+          <type><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref> &amp;&amp;</type>
+          <declname>from</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" line="60" column="1"/>
+        <referencedby refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1addc153acf5600781659a1a2ba891e59c" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="93" endline="124">cudnn_frontend::MatMulDescBuilder_v8::build</referencedby>
+        <referencedby refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a2931e4d0b21e6986a3f5a1697ca4bae0" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="51" endline="56">describe</referencedby>
       </memberdef>
       <memberdef kind="function" id="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ad27b038b19b218067bd30e60d94fd672" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -84,8 +103,8 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" line="62" column="1"/>
-        <referencedby refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ab725a8e47331aca6310155f6d55c0a02" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="58" endline="60">MatMulDesc_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" line="62" column="1"/>
+        <referencedby refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a2931e4d0b21e6986a3f5a1697ca4bae0" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="51" endline="56">describe</referencedby>
       </memberdef>
       </sectiondef>
       <sectiondef kind="private-func">
@@ -100,8 +119,8 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" line="65" column="1"/>
-        <referencedby refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ab725a8e47331aca6310155f6d55c0a02" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="58" endline="60">MatMulDesc_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" line="65" column="1"/>
+        <referencedby refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a2931e4d0b21e6986a3f5a1697ca4bae0" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="51" endline="56">describe</referencedby>
       </memberdef>
       <memberdef kind="function" id="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a48aa29d5df9a717e63c5146ac48c4543" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -117,7 +136,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" line="66" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" line="66" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ac1257a1ca1261961fc99123988552911" prot="private" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type><ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref> &amp;</type>
@@ -133,9 +152,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" line="68" column="1"/>
-        <referencedby refid="de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8_1addc153acf5600781659a1a2ba891e59c" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="93" endline="123">cudnn_frontend::MatMulDescBuilder_v8::build</referencedby>
-        <referencedby refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ab725a8e47331aca6310155f6d55c0a02" compoundref="d6/d32/cudnn__frontend__MatMulDesc_8h" startline="58" endline="60">MatMulDesc_v8</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" line="68" column="1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -145,59 +162,59 @@
 <listitem><para>math_precision</para></listitem></itemizedlist>
 </para><para>Use <ref refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" kindref="compound">MatMulDesc_v8</ref> to build this class. Describe returns a string describing the MatMul operation </para>    </detaileddescription>
     <inheritancegraph>
-      <node id="773">
+      <node id="834">
         <label>cudnn_frontend::MatMulDesc_v8</label>
         <link refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8"/>
-        <childnode refid="774" relation="public-inheritance">
+        <childnode refid="835" relation="public-inheritance">
         </childnode>
       </node>
-      <node id="774">
+      <node id="835">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
       </node>
     </inheritancegraph>
     <collaborationgraph>
-      <node id="779">
+      <node id="840">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="780">
+      <node id="841">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="778">
+      <node id="839">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="781">
+      <node id="842">
         <label>cudnnDataType_t</label>
       </node>
-      <node id="775">
+      <node id="836">
         <label>cudnn_frontend::MatMulDesc_v8</label>
         <link refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8"/>
-        <childnode refid="776" relation="public-inheritance">
+        <childnode refid="837" relation="public-inheritance">
         </childnode>
-        <childnode refid="781" relation="usage">
+        <childnode refid="842" relation="usage">
           <edgelabel>-math_precision</edgelabel>
         </childnode>
       </node>
-      <node id="776">
+      <node id="837">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="777" relation="usage">
+        <childnode refid="838" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="779" relation="usage">
+        <childnode refid="840" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="780" relation="usage">
+        <childnode refid="841" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="777">
+      <node id="838">
         <label>std::string</label>
-        <childnode refid="778" relation="public-inheritance">
+        <childnode refid="839" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" line="47" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_MatMulDesc.h" bodystart="47" bodyend="71"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" line="47" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_MatMulDesc.h" bodystart="47" bodyend="71"/>
     <listofallmembers>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8aa93686ca88410fc048b05155148183" prot="protected" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>BackendDescriptor</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a5765369a5739c2ea81c4f39ce2d1c46e" prot="protected" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>BackendDescriptor</name></member>
@@ -209,10 +226,11 @@
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" prot="public" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>get_status</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a070df0d11a52793ce9480dbdcee0c24e" prot="public" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>initialize_managed_backend_pointer</name></member>
       <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a1dd13143c85b67f2c0da90f02884fab1" prot="private" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>math_precision</name></member>
-      <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ab725a8e47331aca6310155f6d55c0a02" prot="public" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>MatMulDesc_v8</name></member>
+      <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a2d35d2b137f01bdd1560461510b36968" prot="public" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>MatMulDesc_v8</name></member>
       <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a5e060b83ea1e1ed59a66e15fdba91227" prot="private" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>MatMulDesc_v8</name></member>
       <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a48aa29d5df9a717e63c5146ac48c4543" prot="private" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>MatMulDesc_v8</name></member>
       <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1aa99cc0548322d7298b9ca664a976281f" prot="public" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>MatMulDescBuilder_v8</name></member>
+      <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1a60981584b3c7be9737acaa0f0a55611f" prot="public" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>operator=</name></member>
       <member refid="d6/db7/classcudnn__frontend_1_1MatMulDesc__v8_1ac1257a1ca1261961fc99123988552911" prot="private" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>operator=</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a62312f29dbbc7c11c1da54a2ad41c52f" prot="protected" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>pointer</name></member>
       <member refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a1748a5c560905314930c37b2ed1a54d2" prot="public" virt="non-virtual"><scope>cudnn_frontend::MatMulDesc_v8</scope><name>set_error</name></member>

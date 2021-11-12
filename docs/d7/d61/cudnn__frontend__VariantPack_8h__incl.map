@@ -1,4 +1,5 @@
 <map id="cudnn_frontend_VariantPack.h" name="cudnn_frontend_VariantPack.h">
 <area shape="rect" id="node11" href="$df/d17/cudnn__frontend__utils_8h.html" title="cudnn_frontend_utils.h" alt="" coords="810,80,963,107"/>
-<area shape="rect" id="node14" href="$dc/d11/cudnn__backend__base_8h.html" title="cudnn_backend_base.h" alt="" coords="890,155,1049,181"/>
+<area shape="rect" id="node15" href="$dc/d11/cudnn__backend__base_8h.html" title="cudnn_backend_base.h" alt="" coords="806,229,965,256"/>
+<area shape="rect" id="node17" href="$d8/dc4/cudnn__frontend__Logging_8h.html" title="cudnn_frontend_Logging.h" alt="" coords="985,155,1159,181"/>
 </map>

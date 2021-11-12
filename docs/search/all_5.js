@@ -1,7 +1,7 @@
 var searchData=
 [
   ['data_5fpointers',['data_pointers',['../d0/d20/classcudnn__frontend_1_1VariantPack__v8.html#a3a03ddd893f41a9ce6ca674bbfae7434',1,'cudnn_frontend::VariantPack_v8']]],
-  ['data_5ftype',['data_type',['../d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html#a4a0249ac1d094f9a70967dd69b824f2e',1,'cudnn_frontend::ConvDesc_v8::data_type()'],['../d6/da7/classcudnn__frontend_1_1Tensor__v8.html#ae9a3d128db54fa92d392e77044f30ca9',1,'cudnn_frontend::Tensor_v8::data_type()']]],
+  ['data_5ftype',['data_type',['../d6/da7/classcudnn__frontend_1_1Tensor__v8.html#ae9a3d128db54fa92d392e77044f30ca9',1,'cudnn_frontend::Tensor_v8']]],
   ['decimal_5fpoint',['decimal_point',['../d4/d0a/classnlohmann_1_1detail_1_1serializer.html#a311e5d6f4b31d5be0eb3c0cb20b6965a',1,'nlohmann::detail::serializer']]],
   ['decimal_5fpoint_5fchar',['decimal_point_char',['../d8/d22/classnlohmann_1_1detail_1_1lexer.html#a6f2fd5b4b6b153f11fc8f77213350073',1,'nlohmann::detail::lexer']]],
   ['deprecated_20list',['Deprecated List',['../da/d58/deprecated.html',1,'']]],

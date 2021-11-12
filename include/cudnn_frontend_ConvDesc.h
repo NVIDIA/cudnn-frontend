@@ -60,7 +60,7 @@ class ConvDesc_v8 : public BackendDescriptor {
         char sep = ' ';
         ss << "CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR :"
            << " Datatype: " << to_string(compute_precision) << " Mode: " << std::to_string(mode)
-           << " Num Dimensions: " << std::to_string(nDims);
+           << " Num Dimensions: " << nDims;
         ss << " PadLower [";
         for (auto i = 0; i < nDims; i++) {
             ss << sep << padLower[i];
@@ -97,9 +97,28 @@ class ConvDesc_v8 : public BackendDescriptor {
     }
 
     int64_t
-    getSpatialDimensionCount() const {
+    getDimensionCount() const {
         return nDims;
     }
+
+    int64_t const *
+    getPadding() const {
+        return padLower;
+    }
+    int64_t const *
+    getStride() const {
+        return stride;
+    }
+    int64_t const *
+    getDilation() const {
+        return dilation;
+    }
+
+    cudnnConvolutionMode_t
+    getMathMode() const {
+        return mode;
+    }
+
 
    private:
     ConvDesc_v8()                    = default;
@@ -110,10 +129,10 @@ class ConvDesc_v8 : public BackendDescriptor {
     cudnnDataType_t compute_precision   = CUDNN_DATA_FLOAT;   //! Convolution operation data type
     cudnnConvolutionMode_t mode         = CUDNN_CONVOLUTION;  //! Convolution vs cross correlation
     int64_t nDims                       = -1;                 //! number of dimensions
-    int64_t padLower[CUDNN_DIM_MAX + 1] = {0};                //! n, g, c, d, h, w
-    int64_t padUpper[CUDNN_DIM_MAX + 1] = {0};                //! n, g, c, d, h, w
-    int64_t dilation[CUDNN_DIM_MAX + 1] = {0};                //! n, g, c, d, h, w
-    int64_t stride[CUDNN_DIM_MAX + 1]   = {-1};               //! n, g, c, d, h, w
+    int64_t padLower[CUDNN_DIM_MAX + 1] = {0};                //! d, h, w
+    int64_t padUpper[CUDNN_DIM_MAX + 1] = {0};                //! d, h, w
+    int64_t dilation[CUDNN_DIM_MAX + 1] = {0};                //! d, h, w
+    int64_t stride[CUDNN_DIM_MAX + 1]   = {-1};               //! d, h, w
 };
 
 ///
@@ -307,6 +326,7 @@ class ConvDescBuilder_v8 {
             return std::move(m_convDesc);
         }
 
+        getLogger() << "[cudnn_frontend] " << m_convDesc << std::endl;
         return std::move(m_convDesc);
     }
 

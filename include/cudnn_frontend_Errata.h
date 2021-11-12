@@ -1,4 +1,3 @@
-
 /*
  * Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
  *
@@ -22,6 +21,8 @@
  */
 
 #include "contrib/nlohmann/json/json.hpp"
+
+#include "../include/cudnn_frontend_Logging.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -63,6 +64,7 @@ check_rule(const json &json_handle, const std::string & executionPlanTag,
     std::string tag_prefix = operation + "_eng" + std::to_string(engine) + "_"; 
     std::string mod_tag    = executionPlanTag + "_";
     bool blocked = 
+        tag_prefix.size() <= mod_tag.size() &&
         std::equal(tag_prefix.begin(), tag_prefix.end(), mod_tag.begin()) &&
         CUDNN_VERSION >= cudnn_start &&
         CUDNN_VERSION < cudnn_end;
@@ -88,12 +90,15 @@ static bool
 check_errata(const json &json_handle, const std::string & executionPlanTag,
     cudnnHandle_t handle, T fn) {
 
+    cudnn_frontend::getLogger() << "[cudnn_frontend] " << "Verifying " << executionPlanTag;
     for (auto const &rule : json_handle["rules"]) {
         if (check_rule<T>(rule, executionPlanTag, handle, fn)) {
+            cudnn_frontend::getLogger() << ". Blocking." << std::endl;
             return true;
         }
     }
 
+    cudnn_frontend::getLogger() << ". Passed." << std::endl;
     return false;
 }
 

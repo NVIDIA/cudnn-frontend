@@ -16,8 +16,8 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="35" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" bodystart="35" bodyend="-1"/>
-        <referencedby refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1ac1700c7d96af0250e5721f5e5f9d95bc" compoundref="dc/d11/cudnn__backend__base_8h" startline="60" endline="62">get_backend_descriptor</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" line="37" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" bodystart="37" bodyend="-1"/>
+        <referencedby refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1ac1700c7d96af0250e5721f5e5f9d95bc" compoundref="dc/d11/cudnn__backend__base_8h" startline="62" endline="64">get_backend_descriptor</referencedby>
       </memberdef>
       <memberdef kind="variable" id="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" prot="private" static="no" mutable="no">
         <type>cudnnStatus_t</type>
@@ -31,10 +31,10 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="36" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" bodystart="36" bodyend="-1"/>
-        <referencedby refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1abd4f69554da364008f3780e9dc3a5bfc" compoundref="dc/d11/cudnn__backend__base_8h" startline="68" endline="70">get_status</referencedby>
-        <referencedby refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" compoundref="dc/d11/cudnn__backend__base_8h" startline="112" endline="114">cudnn_frontend::BackendDescriptor::get_status</referencedby>
-        <referencedby refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3ef02443f20b90223baf5f1922505eab" compoundref="dc/d11/cudnn__backend__base_8h" startline="118" endline="120">cudnn_frontend::BackendDescriptor::set_status</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" line="38" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" bodystart="38" bodyend="-1"/>
+        <referencedby refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1abd4f69554da364008f3780e9dc3a5bfc" compoundref="dc/d11/cudnn__backend__base_8h" startline="70" endline="72">get_status</referencedby>
+        <referencedby refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1af34344e365e6422ee86955349bf80b49" compoundref="dc/d11/cudnn__backend__base_8h" startline="114" endline="116">cudnn_frontend::BackendDescriptor::get_status</referencedby>
+        <referencedby refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a3ef02443f20b90223baf5f1922505eab" compoundref="dc/d11/cudnn__backend__base_8h" startline="120" endline="122">cudnn_frontend::BackendDescriptor::set_status</referencedby>
       </memberdef>
       </sectiondef>
       <sectiondef kind="public-func">
@@ -52,7 +52,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="39" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" line="41" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1adf5bf20f5bdfbfdecd05360830b34b89" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref> &amp;</type>
@@ -68,7 +68,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="41" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" line="43" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a997d733607e747516eb2334c51c48f29" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -84,7 +84,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="42" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" line="44" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aadf0c53d7aedb1c6c121b2736e98b2dd" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type></type>
@@ -101,7 +101,7 @@
 <para><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref> constructor. Calls the cudnnBackendCreateDescriptor. Allocates memory according to the type. </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="48" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" bodystart="48" bodyend="48"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" line="50" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" bodystart="50" bodyend="50"/>
       </memberdef>
       <memberdef kind="function" id="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a9f549dd95873ac3a02689ef97f4a6c75" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type></type>
@@ -114,7 +114,7 @@
 <para><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref> destructor. Calls the cudnnBackendDestroyDescriptor. Frees memory allocated in the constructor. </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="53" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" bodystart="53" bodyend="53"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" line="55" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" bodystart="55" bodyend="55"/>
       </memberdef>
       <memberdef kind="function" id="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1ac1700c7d96af0250e5721f5e5f9d95bc" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
         <type>cudnnBackendDescriptor_t const  &amp;</type>
@@ -127,8 +127,8 @@
 <para>Accessor. Returns the const reference to raw underlying descriptor. Treat it like the data() function of a smart pointer. Can be freed behind the back. </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="60" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" bodystart="60" bodyend="62"/>
-        <references refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a47968d641c0da8d33882f86d8afa30b4" compoundref="dc/d11/cudnn__backend__base_8h" startline="35">m_desc</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" line="62" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" bodystart="62" bodyend="64"/>
+        <references refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a47968d641c0da8d33882f86d8afa30b4" compoundref="dc/d11/cudnn__backend__base_8h" startline="37">m_desc</references>
       </memberdef>
       <memberdef kind="function" id="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1abd4f69554da364008f3780e9dc3a5bfc" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
         <type>cudnnStatus_t</type>
@@ -141,8 +141,8 @@
 <para>Accessor. Queries the status of the descriptor after calling the cudnnCreate. </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="68" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" bodystart="68" bodyend="70"/>
-        <references refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" compoundref="dc/d11/cudnn__backend__base_8h" startline="36">status</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" line="70" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" bodystart="70" bodyend="72"/>
+        <references refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1a10487abe0a45d35824ec75b0d3894f21" compoundref="dc/d11/cudnn__backend__base_8h" startline="38">status</references>
       </memberdef>
       <memberdef kind="function" id="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1aa9059097bb9161d454c6e17b03ca236c" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
         <type>bool</type>
@@ -155,7 +155,7 @@
 <para>Accessor. Queries the status of the descriptor returns true if all good. </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="76" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" bodystart="76" bodyend="78"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" line="78" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" bodystart="78" bodyend="80"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -163,24 +163,24 @@
     <detaileddescription>
 <para><ref refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" kindref="compound">OpaqueBackendPointer</ref> class Holds the raws pointer to backend_descriptor Usage is to wrap this into a smart pointer as it helps to create and destroy the backencpointer </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="794">
+      <node id="855">
         <label>cudnn_frontend::OpaqueBackendPointer</label>
         <link refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer"/>
-        <childnode refid="795" relation="usage">
+        <childnode refid="856" relation="usage">
           <edgelabel>-m_desc</edgelabel>
         </childnode>
-        <childnode refid="796" relation="usage">
+        <childnode refid="857" relation="usage">
           <edgelabel>-status</edgelabel>
         </childnode>
       </node>
-      <node id="795">
+      <node id="856">
         <label>cudnnBackendDescriptor_t</label>
       </node>
-      <node id="796">
+      <node id="857">
         <label>cudnnStatus_t</label>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" line="34" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_backend_base.h" bodystart="34" bodyend="79"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" line="36" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_backend_base.h" bodystart="36" bodyend="81"/>
     <listofallmembers>
       <member refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1ac1700c7d96af0250e5721f5e5f9d95bc" prot="public" virt="non-virtual"><scope>cudnn_frontend::OpaqueBackendPointer</scope><name>get_backend_descriptor</name></member>
       <member refid="d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer_1abd4f69554da364008f3780e9dc3a5bfc" prot="public" virt="non-virtual"><scope>cudnn_frontend::OpaqueBackendPointer</scope><name>get_status</name></member>

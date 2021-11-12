@@ -29,7 +29,7 @@
  <tr style="height: 56px;">
   <td id="projectalign" style="padding-left: 0.5em;">
    <div id="projectname">CUDNN Frontend API
-   &#160;<span id="projectnumber">8.2.0</span>
+   &#160;<span id="projectnumber">8.3.0</span>
    </div>
   </td>
  </tr>
@@ -95,7 +95,7 @@ Collaboration diagram for cudnn_frontend::TensorBuilder_v8:</div>
 <div class="dyncontent">
 <div class="center"><img src="../../d7/db9/classcudnn__frontend_1_1TensorBuilder__v8__coll__graph.png" border="0" usemap="#cudnn__frontend_1_1TensorBuilder__v8_coll__map" alt="Collaboration graph"/></div>
 <map name="cudnn__frontend_1_1TensorBuilder__v8_coll__map" id="cudnn__frontend_1_1TensorBuilder__v8_coll__map">
-<area shape="rect" id="node2" href="../../d6/da7/classcudnn__frontend_1_1Tensor__v8.html" title="{cudnn_frontend::Tensor_v8\n||+ describe()\l+ Tensor_v8()\l+ ~Tensor_v8()\l&#45; Tensor_v8()\l&#45; Tensor_v8()\l&#45; operator=()\l}" alt="" coords="369,647,549,797"/>
+<area shape="rect" id="node2" href="../../d6/da7/classcudnn__frontend_1_1Tensor__v8.html" title="{cudnn_frontend::Tensor_v8\n||+ describe()\l+ getPackedElementCount()\l+ getDimensionCount()\l+ getDimArray()\l+ getStrideArray()\l+ getDataType()\l+ Tensor_v8()\l+ operator=()\l+ ~Tensor_v8()\l&#45; Tensor_v8()\l&#45; Tensor_v8()\l&#45; operator=()\l}" alt="" coords="373,676,559,915"/>
 <area shape="rect" id="node3" href="../../d6/d88/classcudnn__frontend_1_1BackendDescriptor.html" title="{cudnn_frontend::BackendDescriptor\n||+ describe()\l+ get_raw_desc()\l+ get_status()\l+ set_status()\l+ set_error()\l+ get_error()\l+ get_desc()\l+ initialize_managed\l_backend_pointer()\l# BackendDescriptor()\l# BackendDescriptor()\l}" alt="" coords="113,301,344,525"/>
 <area shape="rect" id="node4" title="STL class. " alt="" coords="29,154,109,231"/>
 <area shape="rect" id="node5" title="STL class. " alt="" coords="5,5,132,97"/>
@@ -122,6 +122,10 @@ Public Member Functions</h2></td></tr>
 <tr class="memitem:ga7d5d978de243e47938eb1f224a38d02d"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d3/d3c/group__TensorBuilder__v8.html#ga7d5d978de243e47938eb1f224a38d02d">setVirtual</a> (bool virtual_=true) -&gt; <a class="el" href="../../db/dae/classcudnn__frontend_1_1TensorBuilder__v8.html">TensorBuilder_v8</a> &amp;</td></tr>
 <tr class="memdesc:ga7d5d978de243e47938eb1f224a38d02d"><td class="mdescLeft">&#160;</td><td class="mdescRight">Set Alignment of the tensor.  <a href="../../d3/d3c/group__TensorBuilder__v8.html#ga7d5d978de243e47938eb1f224a38d02d">More...</a><br /></td></tr>
 <tr class="separator:ga7d5d978de243e47938eb1f224a38d02d"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ga6a405f1260ec3246b743def7bf6e6cb9"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d3/d3c/group__TensorBuilder__v8.html#ga6a405f1260ec3246b743def7bf6e6cb9">setByValue</a> (bool isByValue_=true) -&gt; <a class="el" href="../../db/dae/classcudnn__frontend_1_1TensorBuilder__v8.html">TensorBuilder_v8</a> &amp;</td></tr>
+<tr class="separator:ga6a405f1260ec3246b743def7bf6e6cb9"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ga271e5f9ec1ce8ec231021219f5899315"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d3/d3c/group__TensorBuilder__v8.html#ga271e5f9ec1ce8ec231021219f5899315">setVectorCountAndDimension</a> (int64_t vectorCount_, int64_t vectorDimension_) -&gt; <a class="el" href="../../db/dae/classcudnn__frontend_1_1TensorBuilder__v8.html">TensorBuilder_v8</a> &amp;</td></tr>
+<tr class="separator:ga271e5f9ec1ce8ec231021219f5899315"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a32876941f964b3fad2d123b9081b0af7"><td class="memItemLeft" align="right" valign="top"><a class="el" href="../../d6/da7/classcudnn__frontend_1_1Tensor__v8.html">Tensor_v8</a> &amp;&amp;&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../db/dae/classcudnn__frontend_1_1TensorBuilder__v8.html#a32876941f964b3fad2d123b9081b0af7">build</a> ()</td></tr>
 <tr class="separator:a32876941f964b3fad2d123b9081b0af7"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a9d57810fb6d58f5152e5a1bbc55fc5dd"><td class="memItemLeft" align="right" valign="top">&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../db/dae/classcudnn__frontend_1_1TensorBuilder__v8.html#a9d57810fb6d58f5152e5a1bbc55fc5dd">TensorBuilder_v8</a> ()=default</td></tr>
@@ -143,7 +147,7 @@ Private Attributes</h2></td></tr>
 <a name="details" id="details"></a><h2 class="groupheader">Detailed Description</h2>
 <div class="textblock"><p><a class="el" href="../../db/dae/classcudnn__frontend_1_1TensorBuilder__v8.html">TensorBuilder_v8</a> Class Helper class used to build <a class="el" href="../../d6/da7/classcudnn__frontend_1_1Tensor__v8.html">Tensor_v8</a> class </p>
 
-<p class="definition">Definition at line <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html#l00107">107</a> of file <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html">cudnn_frontend_Tensor.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html#l00140">140</a> of file <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html">cudnn_frontend_Tensor.h</a>.</p>
 </div><h2 class="groupheader">Constructor &amp; Destructor Documentation</h2>
 <a id="a9d57810fb6d58f5152e5a1bbc55fc5dd"></a>
 <h2 class="memtitle"><span class="permalink"><a href="#a9d57810fb6d58f5152e5a1bbc55fc5dd">&#9670;&nbsp;</a></span>TensorBuilder_v8() <span class="overload">[1/3]</span></h2>
@@ -272,9 +276,9 @@ Private Attributes</h2></td></tr>
 </div><div class="memdoc">
 <p>constructs the <a class="el" href="../../d6/da7/classcudnn__frontend_1_1Tensor__v8.html">Tensor_v8</a> by calling the cudnn API Throws the appropriate error message </p>
 
-<p class="definition">Definition at line <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html#l00155">155</a> of file <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html">cudnn_frontend_Tensor.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html#l00207">207</a> of file <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html">cudnn_frontend_Tensor.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../d6/da7/classcudnn__frontend_1_1Tensor__v8.html#a4f5c1e95de9419cb1904e0cbad570c63">cudnn_frontend::Tensor_v8::operator=()</a>, <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00060">cudnn_frontend::set_error_and_throw_exception()</a>, <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00158">cudnn_frontend::BackendDescriptor::status</a>, and <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html#l00053">cudnn_frontend::Tensor_v8::TensorBuilder_v8</a>.</p>
+<p class="reference">References <a class="el" href="../../d8/dc4/cudnn__frontend__Logging_8h_source.html#l00072">cudnn_frontend::getLogger()</a>, <a class="el" href="../../d6/da7/classcudnn__frontend_1_1Tensor__v8.html#ab6c9d81fd9d18995fc67bdfafca49443">cudnn_frontend::Tensor_v8::operator=()</a>, <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00138">cudnn_frontend::set_error_and_throw_exception()</a>, <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00160">cudnn_frontend::BackendDescriptor::status</a>, and <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html#l00054">cudnn_frontend::Tensor_v8::TensorBuilder_v8</a>.</p>
 
 </div>
 </div>
@@ -325,7 +329,7 @@ Private Attributes</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html#l00283">283</a> of file <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html">cudnn_frontend_Tensor.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html#l00396">396</a> of file <a class="el" href="../../d3/d98/cudnn__frontend__Tensor_8h_source.html">cudnn_frontend_Tensor.h</a>.</p>
 
 </div>
 </div>

@@ -29,7 +29,7 @@
  <tr style="height: 56px;">
   <td id="projectalign" style="padding-left: 0.5em;">
    <div id="projectname">CUDNN Frontend API
-   &#160;<span id="projectnumber">8.2.0</span>
+   &#160;<span id="projectnumber">8.3.0</span>
    </div>
   </td>
  </tr>
@@ -128,7 +128,7 @@ Private Attributes</h2></td></tr>
 <a name="details" id="details"></a><h2 class="groupheader">Detailed Description</h2>
 <div class="textblock"><p><a class="el" href="../../d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer.html">OpaqueBackendPointer</a> class Holds the raws pointer to backend_descriptor Usage is to wrap this into a smart pointer as it helps to create and destroy the backencpointer </p>
 
-<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00034">34</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00036">36</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
 </div><h2 class="groupheader">Constructor &amp; Destructor Documentation</h2>
 <a id="a42a928eb5b2524d1c3f67b7200dd53c9"></a>
 <h2 class="memtitle"><span class="permalink"><a href="#a42a928eb5b2524d1c3f67b7200dd53c9">&#9670;&nbsp;</a></span>OpaqueBackendPointer() <span class="overload">[1/3]</span></h2>
@@ -209,7 +209,7 @@ Private Attributes</h2></td></tr>
 </div><div class="memdoc">
 <p><a class="el" href="../../d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer.html">OpaqueBackendPointer</a> constructor. Calls the cudnnBackendCreateDescriptor. Allocates memory according to the type. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00048">48</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00050">50</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
 
 </div>
 </div>
@@ -237,7 +237,7 @@ Private Attributes</h2></td></tr>
 </div><div class="memdoc">
 <p><a class="el" href="../../d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer.html">OpaqueBackendPointer</a> destructor. Calls the cudnnBackendDestroyDescriptor. Frees memory allocated in the constructor. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00053">53</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00055">55</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
 
 </div>
 </div>
@@ -266,9 +266,9 @@ Private Attributes</h2></td></tr>
 </div><div class="memdoc">
 <p>Accessor. Returns the const reference to raw underlying descriptor. Treat it like the data() function of a smart pointer. Can be freed behind the back. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00060">60</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00062">62</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00035">m_desc</a>.</p>
+<p class="reference">References <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00037">m_desc</a>.</p>
 
 </div>
 </div>
@@ -296,9 +296,9 @@ Private Attributes</h2></td></tr>
 </div><div class="memdoc">
 <p>Accessor. Queries the status of the descriptor after calling the cudnnCreate. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00068">68</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00070">70</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00036">status</a>.</p>
+<p class="reference">References <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00038">status</a>.</p>
 
 </div>
 </div>
@@ -326,7 +326,7 @@ Private Attributes</h2></td></tr>
 </div><div class="memdoc">
 <p>Accessor. Queries the status of the descriptor returns true if all good. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00076">76</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00078">78</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
 
 </div>
 </div>
@@ -379,9 +379,9 @@ Private Attributes</h2></td></tr>
 
 <p>Raw void pointer. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00035">35</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00037">37</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00060">get_backend_descriptor()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00062">get_backend_descriptor()</a>.</p>
 
 </div>
 </div>
@@ -407,9 +407,9 @@ Private Attributes</h2></td></tr>
 
 <p>status of creation of the Descriptor </p>
 
-<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00036">36</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00038">38</a> of file <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html">cudnn_backend_base.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00068">get_status()</a>, <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00112">cudnn_frontend::BackendDescriptor::get_status()</a>, and <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00118">cudnn_frontend::BackendDescriptor::set_status()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00070">get_status()</a>, <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00114">cudnn_frontend::BackendDescriptor::get_status()</a>, and <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00120">cudnn_frontend::BackendDescriptor::set_status()</a>.</p>
 
 </div>
 </div>

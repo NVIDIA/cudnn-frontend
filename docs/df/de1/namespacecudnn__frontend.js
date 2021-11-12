@@ -1,6 +1,7 @@
 var namespacecudnn__frontend =
 [
     [ "BackendDescriptor", "d6/d88/classcudnn__frontend_1_1BackendDescriptor.html", "d6/d88/classcudnn__frontend_1_1BackendDescriptor" ],
+    [ "ConditionalStreamer", "d0/d92/classcudnn__frontend_1_1ConditionalStreamer.html", "d0/d92/classcudnn__frontend_1_1ConditionalStreamer" ],
     [ "ConvDesc_v8", "d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html", "d6/d73/classcudnn__frontend_1_1ConvDesc__v8" ],
     [ "ConvDescBuilder_v8", "db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html", "db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8" ],
     [ "cudnnException", "d9/dca/classcudnn__frontend_1_1cudnnException.html", "d9/dca/classcudnn__frontend_1_1cudnnException" ],
@@ -13,9 +14,10 @@ var namespacecudnn__frontend =
     [ "EngineFallbackListBuilder_v8", "d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8.html", "d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8" ],
     [ "EngineHeuristics_v8", "db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8.html", "db/ddb/classcudnn__frontend_1_1EngineHeuristics__v8" ],
     [ "EngineHeuristicsBuilder_v8", "d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8.html", "d1/d28/classcudnn__frontend_1_1EngineHeuristicsBuilder__v8" ],
-    [ "executionOption", "d6/d1b/structcudnn__frontend_1_1executionOption.html", "d6/d1b/structcudnn__frontend_1_1executionOption" ],
     [ "ExecutionPlan_v8", "d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html", "d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" ],
     [ "ExecutionPlanBuilder_v8", "d1/d74/classcudnn__frontend_1_1ExecutionPlanBuilder__v8.html", "d1/d74/classcudnn__frontend_1_1ExecutionPlanBuilder__v8" ],
+    [ "ExecutionPlanCache_v1", "dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1.html", "dc/d6e/classcudnn__frontend_1_1ExecutionPlanCache__v1" ],
+    [ "ExecutionPlanCache_v2", "da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2.html", "da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2" ],
     [ "MatMulDesc_v8", "d6/db7/classcudnn__frontend_1_1MatMulDesc__v8.html", "d6/db7/classcudnn__frontend_1_1MatMulDesc__v8" ],
     [ "MatMulDescBuilder_v8", "de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8.html", "de/d00/classcudnn__frontend_1_1MatMulDescBuilder__v8" ],
     [ "OpaqueBackendPointer", "d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer.html", "d5/d14/classcudnn__frontend_1_1OpaqueBackendPointer" ],

@@ -29,7 +29,7 @@
  <tr style="height: 56px;">
   <td id="projectalign" style="padding-left: 0.5em;">
    <div id="projectname">CUDNN Frontend API
-   &#160;<span id="projectnumber">8.2.0</span>
+   &#160;<span id="projectnumber">8.3.0</span>
    </div>
   </td>
  </tr>
@@ -119,8 +119,11 @@ $(document).ready(function(){initNavTree('functions_func_c.html','');});
 <li>clear_subtype()
 : <a class="el" href="dd/d0d/classnlohmann_1_1byte__container__with__subtype.html#a7b122b28ff2b8680557ca44ac9748e49">nlohmann::byte_container_with_subtype&lt; BinaryType &gt;</a>
 </li>
-<li>computeTag()
-: <a class="el" href="d7/d0d/group__ExecutionPlanQuery.html#ga8a6517102f5c12e63e4417324a03180b">cudnn_frontend::ExecutionPlan_v8</a>
+<li>computeWorkSpaceSize()
+: <a class="el" href="d7/d0d/group__ExecutionPlanQuery.html#gafec2d06137cf97fef71d5ae17f178ce3">cudnn_frontend::ExecutionPlan_v8</a>
+</li>
+<li>ConditionalStreamer()
+: <a class="el" href="d0/d92/classcudnn__frontend_1_1ConditionalStreamer.html#af0e01afa50813ff4c76b57566a47cd25">cudnn_frontend::ConditionalStreamer</a>
 </li>
 <li>construct()
 : <a class="el" href="d4/d91/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1array_01_4.html#abfb2a6eec0bc21e8a7438546aebc55d8">nlohmann::detail::external_constructor&lt; value_t::array &gt;</a>
@@ -130,17 +133,20 @@ $(document).ready(function(){initNavTree('functions_func_c.html','');});
 , <a class="el" href="dc/dd7/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1number__integer_01_4.html#a7c3949672ddb45095cc2527635feef0b">nlohmann::detail::external_constructor&lt; value_t::number_integer &gt;</a>
 , <a class="el" href="d5/df9/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1number__unsigned_01_4.html#a17969b14852f43e04353858c87b0f539">nlohmann::detail::external_constructor&lt; value_t::number_unsigned &gt;</a>
 , <a class="el" href="d7/d38/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1object_01_4.html#a3a369c5d49596dd4411e368425f9ac7a">nlohmann::detail::external_constructor&lt; value_t::object &gt;</a>
-, <a class="el" href="da/dac/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1string_01_4.html#a74f56b9ca1d4e8db9751353d76668322">nlohmann::detail::external_constructor&lt; value_t::string &gt;</a>
+, <a class="el" href="da/dac/structnlohmann_1_1detail_1_1external__constructor_3_01value__t_1_1string_01_4.html#ad88d0b4b7ea01ea20e12cc1b82fe0d92">nlohmann::detail::external_constructor&lt; value_t::string &gt;</a>
 </li>
 <li>contains()
 : <a class="el" href="d9/dcc/classnlohmann_1_1basic__json.html#a02c9bc4d0f33b7dec20b2798301d6971">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;</a>
 , <a class="el" href="da/de8/classnlohmann_1_1json__pointer.html#a90d38e45e2d3add52d824bc55da8f772">nlohmann::json_pointer&lt; BasicJsonType &gt;</a>
 </li>
 <li>ConvDesc_v8()
-: <a class="el" href="d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html#a592e3a28fd7a8b2553789801d9bd276c">cudnn_frontend::ConvDesc_v8</a>
+: <a class="el" href="d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html#a5c892fb76fbf9e4bfffdb5288f9d60ad">cudnn_frontend::ConvDesc_v8</a>
 </li>
 <li>ConvDescBuilder_v8()
 : <a class="el" href="db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html#ae7b3fb50c7866c50ac1a170e137f38af">cudnn_frontend::ConvDescBuilder_v8</a>
+</li>
+<li>copy_dims_and_strides()
+: <a class="el" href="d1/d29/classcudnn__frontend_1_1OperationBuilder__v8.html#a4ec3fadfd086e33be85cf1e9a157008a">cudnn_frontend::OperationBuilder_v8</a>
 </li>
 <li>count()
 : <a class="el" href="d9/dcc/classnlohmann_1_1basic__json.html#aba5ec6d1e37eda6b11eba491a1e5237e">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;</a>
@@ -157,20 +163,23 @@ $(document).ready(function(){initNavTree('functions_func_c.html','');});
 , <a class="el" href="da/d6d/structnlohmann_1_1detail_1_1iterator__input__adapter__factory_3_01IteratorType_00_01enable__if__0e86378a778d78dd2284e92dc30f4902.html#aae2354d80ae95214a9da99c495003f6c">nlohmann::detail::iterator_input_adapter_factory&lt; IteratorType, enable_if_t&lt; is_iterator_of_multibyte&lt; IteratorType &gt;::value &gt; &gt;</a>
 , <a class="el" href="d5/d1b/classnlohmann_1_1detail_1_1other__error.html#a3a25fa67a0ec36b5d36cbc4424eb901d">nlohmann::detail::other_error</a>
 , <a class="el" href="d2/d67/classnlohmann_1_1detail_1_1out__of__range.html#a238f1bda3b6c92b5970fbf9187ccd325">nlohmann::detail::out_of_range</a>
-, <a class="el" href="d5/d1a/classnlohmann_1_1detail_1_1parse__error.html#a90fbaaeeb00838e65b8d04885017ef0c">nlohmann::detail::parse_error</a>
+, <a class="el" href="d5/d1a/classnlohmann_1_1detail_1_1parse__error.html#ae77bd584cb9101140790219af7fec1ce">nlohmann::detail::parse_error</a>
 , <a class="el" href="da/d1c/classnlohmann_1_1detail_1_1type__error.html#a838a5e301cf97289c2d106b9ace1470f">nlohmann::detail::type_error</a>
 </li>
 <li>crend()
 : <a class="el" href="d9/dcc/classnlohmann_1_1basic__json.html#a223480466a0922267d680ec8f0722d58">nlohmann::basic_json&lt; ObjectType, ArrayType, StringType, BooleanType, NumberIntegerType, NumberUnsignedType, NumberFloatType, AllocatorType, JSONSerializer, BinaryType &gt;</a>
 </li>
 <li>cudnnException()
-: <a class="el" href="d9/dca/classcudnn__frontend_1_1cudnnException.html#aa80c45a57ca091770572aaa5a1f7e322">cudnn_frontend::cudnnException</a>
+: <a class="el" href="d9/dca/classcudnn__frontend_1_1cudnnException.html#a4fe24bc811a1f1e3bb05e3c9086883dd">cudnn_frontend::cudnnException</a>
 </li>
 <li>cudnnFindPlan()
-: <a class="el" href="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator.html#abd7cdd3a218623ffc5dfcbf9343aef85">cudnn_frontend::EngineConfigGenerator</a>
+: <a class="el" href="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator.html#a3b291ce5e552bf0c736be227065cd8ad">cudnn_frontend::EngineConfigGenerator</a>
+</li>
+<li>cudnnFindPlanAndCache()
+: <a class="el" href="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator.html#a4c600ea0cacb969cb0d7168debc5ebc6">cudnn_frontend::EngineConfigGenerator</a>
 </li>
 <li>cudnnGetPlan()
-: <a class="el" href="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator.html#ad6ca7e7263ed9b7597f94ca45505642f">cudnn_frontend::EngineConfigGenerator</a>
+: <a class="el" href="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator.html#a8a43bb0f3643de138921a3a6c2908f45">cudnn_frontend::EngineConfigGenerator</a>
 </li>
 </ul>
 </div><!-- contents -->

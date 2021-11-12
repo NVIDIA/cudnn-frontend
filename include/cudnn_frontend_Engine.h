@@ -107,7 +107,7 @@ class Engine_v8 : public BackendDescriptor {
        private:
         cudnnBackendKnobType_t knobType = CUDNN_KNOB_TYPE_COUNTS;
         int64_t maxValue = 0, minValue = 0, stride = 0;  //!< min, max and stride of the knob value
-        int64_t choice = 0;                              //!< Choice set by the user
+        int64_t choice = -1;                              //!< Choice set by the user
     };
 
     ManagedOpaqueDescriptor opGraph = nullptr;
@@ -225,6 +225,17 @@ class Engine_v8 : public BackendDescriptor {
     getFinalizedKnobs() const {
         return knobs;
     }
+
+    bool knobs_set() const {
+        bool is_knob_set = false;
+        for (auto i = 0; i < numKnobs; i++) {
+            if(knobs[i].getChoice() != -1) {
+                is_knob_set = true;
+                break;
+            }
+        }
+        return is_knob_set;
+    }
 };
 
 ///
@@ -318,6 +329,7 @@ class EngineBuilder_v8 {
             return std::move(m_engine);
         }
 
+        getLogger() << "[cudnn_frontend] " << m_engine << std::endl;
         return std::move(m_engine);
     }
 

@@ -1,0 +1,120 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
+  <compounddef id="d0/d92/classcudnn__frontend_1_1ConditionalStreamer" kind="class" language="C++" prot="public">
+    <compoundname>cudnn_frontend::ConditionalStreamer</compoundname>
+    <includes refid="d8/dc4/cudnn__frontend__Logging_8h" local="no">cudnn_frontend_Logging.h</includes>
+      <sectiondef kind="private-attrib">
+      <memberdef kind="variable" id="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1aa2bd02647c39251cb7f11b01948aca43" prot="private" static="no" mutable="no">
+        <type>std::ostream &amp;</type>
+        <definition>std::ostream&amp; cudnn_frontend::ConditionalStreamer::stream</definition>
+        <argsstring></argsstring>
+        <name>stream</name>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Logging.h" line="52" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Logging.h" bodystart="52" bodyend="-1"/>
+      </memberdef>
+      </sectiondef>
+      <sectiondef kind="public-func">
+      <memberdef kind="function" id="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1af0e01afa50813ff4c76b57566a47cd25" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
+        <type></type>
+        <definition>cudnn_frontend::ConditionalStreamer::ConditionalStreamer</definition>
+        <argsstring>(std::ostream &amp;stream_)</argsstring>
+        <name>ConditionalStreamer</name>
+        <param>
+          <type>std::ostream &amp;</type>
+          <declname>stream_</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Logging.h" line="54" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Logging.h" bodystart="54" bodyend="54"/>
+      </memberdef>
+      <memberdef kind="function" id="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1a7be351ca01c5d3d8425bfc9df99e339c" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <templateparamlist>
+          <param>
+            <type>typename T</type>
+          </param>
+        </templateparamlist>
+        <type>const <ref refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer" kindref="compound">ConditionalStreamer</ref> &amp;</type>
+        <definition>const ConditionalStreamer&amp; cudnn_frontend::ConditionalStreamer::operator&lt;&lt;</definition>
+        <argsstring>(const T &amp;t) const</argsstring>
+        <name>operator&lt;&lt;</name>
+        <param>
+          <type>const T &amp;</type>
+          <declname>t</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Logging.h" line="57" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Logging.h" bodystart="58" bodyend="61"/>
+        <references refid="df/de1/namespacecudnn__frontend_1a9f71d168e0b8ae9c8756fae01d2aff42" compoundref="d8/dc4/cudnn__frontend__Logging_8h" startline="32" endline="35">cudnn_frontend::isLoggingEnabled</references>
+      </memberdef>
+      <memberdef kind="function" id="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1a43d1ad7c28584c69056d1ad2f45fb3c8" prot="public" static="no" const="yes" explicit="no" inline="yes" virt="non-virtual">
+        <type>const <ref refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer" kindref="compound">ConditionalStreamer</ref> &amp;</type>
+        <definition>const ConditionalStreamer&amp; cudnn_frontend::ConditionalStreamer::operator&lt;&lt;</definition>
+        <argsstring>(std::ostream &amp;(*spl)(std::ostream &amp;)) const</argsstring>
+        <name>operator&lt;&lt;</name>
+        <param>
+          <type>std::ostream &amp;(*)(std::ostream &amp;)</type>
+          <declname>spl</declname>
+        </param>
+        <briefdescription>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Logging.h" line="63" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Logging.h" bodystart="64" bodyend="67"/>
+        <references refid="df/de1/namespacecudnn__frontend_1a9f71d168e0b8ae9c8756fae01d2aff42" compoundref="d8/dc4/cudnn__frontend__Logging_8h" startline="32" endline="35">cudnn_frontend::isLoggingEnabled</references>
+      </memberdef>
+      </sectiondef>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="71">
+        <label>cudnn_frontend::ConditionalStreamer</label>
+        <link refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer"/>
+        <childnode refid="72" relation="usage">
+          <edgelabel>-stream</edgelabel>
+        </childnode>
+      </node>
+      <node id="74">
+        <label>std::basic_ios&lt; Char &gt;</label>
+        <childnode refid="75" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="75">
+        <label>std::ios_base</label>
+      </node>
+      <node id="72">
+        <label>std::ostream</label>
+        <childnode refid="73" relation="public-inheritance">
+        </childnode>
+      </node>
+      <node id="73">
+        <label>std::basic_ostream&lt; char &gt;</label>
+        <childnode refid="74" relation="public-inheritance">
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Logging.h" line="50" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_Logging.h" bodystart="50" bodyend="68"/>
+    <listofallmembers>
+      <member refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1af0e01afa50813ff4c76b57566a47cd25" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConditionalStreamer</scope><name>ConditionalStreamer</name></member>
+      <member refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1a7be351ca01c5d3d8425bfc9df99e339c" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConditionalStreamer</scope><name>operator&lt;&lt;</name></member>
+      <member refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1a43d1ad7c28584c69056d1ad2f45fb3c8" prot="public" virt="non-virtual"><scope>cudnn_frontend::ConditionalStreamer</scope><name>operator&lt;&lt;</name></member>
+      <member refid="d0/d92/classcudnn__frontend_1_1ConditionalStreamer_1aa2bd02647c39251cb7f11b01948aca43" prot="private" virt="non-virtual"><scope>cudnn_frontend::ConditionalStreamer</scope><name>stream</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>

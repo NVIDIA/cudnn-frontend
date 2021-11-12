@@ -3,546 +3,632 @@
   <compounddef id="d3/d6b/cudnn__frontend__find__plan_8h" kind="file" language="C++">
     <compoundname>cudnn_frontend_find_plan.h</compoundname>
     <includes refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h" local="no">cudnn_frontend_EngineConfigGenerator.h</includes>
-    <includes local="no">map</includes>
+    <includes local="no">iomanip</includes>
+    <includes local="no">set</includes>
     <incdepgraph>
-      <node id="327">
-        <label>cudnn_frontend_EngineFallbackList.h</label>
-        <link refid="df/d3e/cudnn__frontend__EngineFallbackList_8h"/>
-        <childnode refid="311" relation="include">
-        </childnode>
-        <childnode refid="328" relation="include">
-        </childnode>
-      </node>
-      <node id="326">
-        <label>cudnn_frontend_EngineConfig.h</label>
-        <link refid="d6/d67/cudnn__frontend__EngineConfig_8h"/>
-        <childnode refid="305" relation="include">
-        </childnode>
-        <childnode refid="306" relation="include">
-        </childnode>
-        <childnode refid="307" relation="include">
-        </childnode>
-        <childnode refid="308" relation="include">
-        </childnode>
-        <childnode refid="309" relation="include">
-        </childnode>
-        <childnode refid="310" relation="include">
-        </childnode>
-        <childnode refid="311" relation="include">
-        </childnode>
-        <childnode refid="312" relation="include">
-        </childnode>
-        <childnode refid="325" relation="include">
-        </childnode>
-        <childnode refid="313" relation="include">
-        </childnode>
-      </node>
-      <node id="316">
-        <label>cudnn_backend_base.h</label>
-        <link refid="dc/d11/cudnn__backend__base_8h"/>
-        <childnode refid="311" relation="include">
-        </childnode>
-      </node>
-      <node id="340">
+      <node id="435">
         <label>valarray</label>
       </node>
-      <node id="307">
+      <node id="452">
+        <label>iomanip</label>
+      </node>
+      <node id="395">
         <label>functional</label>
       </node>
-      <node id="345">
-        <label>limits</label>
-      </node>
-      <node id="330">
-        <label>contrib/nlohmann/json/json.hpp</label>
-        <link refid="d5/db8/json_8hpp"/>
-        <childnode refid="305" relation="include">
-        </childnode>
-        <childnode refid="331" relation="include">
-        </childnode>
-        <childnode refid="307" relation="include">
-        </childnode>
-        <childnode refid="332" relation="include">
-        </childnode>
-        <childnode refid="333" relation="include">
-        </childnode>
-        <childnode refid="334" relation="include">
-        </childnode>
-        <childnode refid="308" relation="include">
-        </childnode>
-        <childnode refid="328" relation="include">
-        </childnode>
-        <childnode refid="315" relation="include">
-        </childnode>
-        <childnode refid="310" relation="include">
-        </childnode>
-        <childnode refid="318" relation="include">
-        </childnode>
-        <childnode refid="335" relation="include">
-        </childnode>
-        <childnode refid="306" relation="include">
-        </childnode>
-        <childnode refid="336" relation="include">
-        </childnode>
-        <childnode refid="337" relation="include">
-        </childnode>
-        <childnode refid="338" relation="include">
-        </childnode>
-        <childnode refid="339" relation="include">
-        </childnode>
-        <childnode refid="340" relation="include">
-        </childnode>
-        <childnode refid="314" relation="include">
-        </childnode>
-        <childnode refid="341" relation="include">
-        </childnode>
-        <childnode refid="342" relation="include">
-        </childnode>
-        <childnode refid="343" relation="include">
-        </childnode>
-        <childnode refid="344" relation="include">
-        </childnode>
-        <childnode refid="345" relation="include">
-        </childnode>
-        <childnode refid="346" relation="include">
-        </childnode>
-        <childnode refid="347" relation="include">
-        </childnode>
-        <childnode refid="348" relation="include">
-        </childnode>
-        <childnode refid="349" relation="include">
-        </childnode>
-        <childnode refid="350" relation="include">
-        </childnode>
-        <childnode refid="351" relation="include">
-        </childnode>
-        <childnode refid="352" relation="include">
-        </childnode>
-        <childnode refid="353" relation="include">
-        </childnode>
-      </node>
-      <node id="334">
-        <label>iterator</label>
-      </node>
-      <node id="321">
-        <label>cudnn_frontend_PointWiseDesc.h</label>
-        <link refid="da/d5f/cudnn__frontend__PointWiseDesc_8h"/>
-        <childnode refid="305" relation="include">
-        </childnode>
-        <childnode refid="306" relation="include">
-        </childnode>
-        <childnode refid="307" relation="include">
-        </childnode>
-        <childnode refid="308" relation="include">
-        </childnode>
-        <childnode refid="309" relation="include">
-        </childnode>
-        <childnode refid="310" relation="include">
-        </childnode>
-        <childnode refid="311" relation="include">
-        </childnode>
-        <childnode refid="312" relation="include">
-        </childnode>
-        <childnode refid="313" relation="include">
-        </childnode>
-      </node>
-      <node id="342">
-        <label>cstdint</label>
-      </node>
-      <node id="311">
-        <label>cudnn.h</label>
-      </node>
-      <node id="304">
-        <label>cudnn_frontend_ConvDesc.h</label>
-        <link refid="d1/de7/cudnn__frontend__ConvDesc_8h"/>
-        <childnode refid="305" relation="include">
-        </childnode>
-        <childnode refid="306" relation="include">
-        </childnode>
-        <childnode refid="307" relation="include">
-        </childnode>
-        <childnode refid="308" relation="include">
-        </childnode>
-        <childnode refid="309" relation="include">
-        </childnode>
-        <childnode refid="310" relation="include">
-        </childnode>
-        <childnode refid="311" relation="include">
-        </childnode>
-        <childnode refid="312" relation="include">
-        </childnode>
-        <childnode refid="313" relation="include">
-        </childnode>
-      </node>
-      <node id="355">
-        <label>cudnn_frontend_ExecutionPlan.h</label>
-        <link refid="d6/d51/cudnn__frontend__ExecutionPlan_8h"/>
-        <childnode refid="305" relation="include">
-        </childnode>
-        <childnode refid="306" relation="include">
-        </childnode>
-        <childnode refid="307" relation="include">
-        </childnode>
-        <childnode refid="308" relation="include">
-        </childnode>
-        <childnode refid="309" relation="include">
-        </childnode>
-        <childnode refid="310" relation="include">
-        </childnode>
-        <childnode refid="311" relation="include">
-        </childnode>
-        <childnode refid="312" relation="include">
-        </childnode>
-        <childnode refid="325" relation="include">
-        </childnode>
-        <childnode refid="313" relation="include">
-        </childnode>
-      </node>
-      <node id="346">
-        <label>cmath</label>
-      </node>
-      <node id="344">
-        <label>cassert</label>
-      </node>
-      <node id="341">
-        <label>stdexcept</label>
-      </node>
-      <node id="328">
-        <label>numeric</label>
-      </node>
-      <node id="322">
-        <label>cudnn_frontend_MatMulDesc.h</label>
-        <link refid="d6/d32/cudnn__frontend__MatMulDesc_8h"/>
-        <childnode refid="305" relation="include">
-        </childnode>
-        <childnode refid="306" relation="include">
-        </childnode>
-        <childnode refid="307" relation="include">
-        </childnode>
-        <childnode refid="308" relation="include">
-        </childnode>
-        <childnode refid="309" relation="include">
-        </childnode>
-        <childnode refid="310" relation="include">
-        </childnode>
-        <childnode refid="311" relation="include">
-        </childnode>
-        <childnode refid="312" relation="include">
-        </childnode>
-        <childnode refid="313" relation="include">
-        </childnode>
-      </node>
-      <node id="315">
-        <label>string</label>
-      </node>
-      <node id="337">
-        <label>map</label>
-      </node>
-      <node id="319">
-        <label>cudnn_frontend_OperationGraph.h</label>
-        <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
-        <childnode refid="305" relation="include">
-        </childnode>
-        <childnode refid="306" relation="include">
-        </childnode>
-        <childnode refid="307" relation="include">
-        </childnode>
-        <childnode refid="308" relation="include">
-        </childnode>
-        <childnode refid="309" relation="include">
-        </childnode>
-        <childnode refid="310" relation="include">
-        </childnode>
-        <childnode refid="311" relation="include">
-        </childnode>
-        <childnode refid="312" relation="include">
-        </childnode>
-        <childnode refid="320" relation="include">
-        </childnode>
-        <childnode refid="313" relation="include">
-        </childnode>
-      </node>
-      <node id="314">
-        <label>exception</label>
-      </node>
-      <node id="354">
-        <label>fstream</label>
-      </node>
-      <node id="353">
-        <label>ostream</label>
-      </node>
-      <node id="325">
-        <label>cudnn_frontend_Engine.h</label>
-        <link refid="de/d6d/cudnn__frontend__Engine_8h"/>
-        <childnode refid="305" relation="include">
-        </childnode>
-        <childnode refid="306" relation="include">
-        </childnode>
-        <childnode refid="307" relation="include">
-        </childnode>
-        <childnode refid="308" relation="include">
-        </childnode>
-        <childnode refid="309" relation="include">
-        </childnode>
-        <childnode refid="310" relation="include">
-        </childnode>
-        <childnode refid="318" relation="include">
-        </childnode>
-        <childnode refid="311" relation="include">
-        </childnode>
-        <childnode refid="312" relation="include">
-        </childnode>
-        <childnode refid="319" relation="include">
-        </childnode>
-        <childnode refid="313" relation="include">
-        </childnode>
-      </node>
-      <node id="352">
-        <label>ios</label>
-      </node>
-      <node id="347">
-        <label>cstdio</label>
-      </node>
-      <node id="324">
-        <label>cudnn_frontend_Tensor.h</label>
-        <link refid="d3/d98/cudnn__frontend__Tensor_8h"/>
-        <childnode refid="305" relation="include">
-        </childnode>
-        <childnode refid="306" relation="include">
-        </childnode>
-        <childnode refid="307" relation="include">
-        </childnode>
-        <childnode refid="308" relation="include">
-        </childnode>
-        <childnode refid="309" relation="include">
-        </childnode>
-        <childnode refid="310" relation="include">
-        </childnode>
-        <childnode refid="313" relation="include">
-        </childnode>
-      </node>
-      <node id="338">
-        <label>tuple</label>
-      </node>
-      <node id="320">
-        <label>cudnn_frontend_Operation.h</label>
-        <link refid="da/d5a/cudnn__frontend__Operation_8h"/>
-        <childnode refid="305" relation="include">
-        </childnode>
-        <childnode refid="306" relation="include">
-        </childnode>
-        <childnode refid="307" relation="include">
-        </childnode>
-        <childnode refid="308" relation="include">
-        </childnode>
-        <childnode refid="309" relation="include">
-        </childnode>
-        <childnode refid="310" relation="include">
-        </childnode>
-        <childnode refid="311" relation="include">
-        </childnode>
-        <childnode refid="312" relation="include">
-        </childnode>
-        <childnode refid="304" relation="include">
-        </childnode>
-        <childnode refid="321" relation="include">
-        </childnode>
-        <childnode refid="322" relation="include">
-        </childnode>
-        <childnode refid="323" relation="include">
-        </childnode>
-        <childnode refid="324" relation="include">
-        </childnode>
-        <childnode refid="313" relation="include">
-        </childnode>
-      </node>
-      <node id="356">
-        <label>cudnn_frontend_Filters.h</label>
-        <link refid="d5/d36/cudnn__frontend__Filters_8h"/>
-        <childnode refid="311" relation="include">
-        </childnode>
-      </node>
-      <node id="318">
-        <label>vector</label>
-      </node>
-      <node id="302">
-        <label>cudnn_frontend_EngineConfigGenerator.h</label>
-        <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
-        <childnode refid="303" relation="include">
-        </childnode>
-      </node>
-      <node id="312">
-        <label>cudnn_backend.h</label>
-      </node>
-      <node id="310">
-        <label>utility</label>
-      </node>
-      <node id="306">
-        <label>array</label>
-      </node>
-      <node id="309">
-        <label>sstream</label>
-      </node>
-      <node id="329">
-        <label>cudnn_frontend_Errata.h</label>
-        <link refid="db/d7e/cudnn__frontend__Errata_8h"/>
-        <childnode refid="330" relation="include">
-        </childnode>
-        <childnode refid="343" relation="include">
-        </childnode>
-        <childnode refid="354" relation="include">
-        </childnode>
-      </node>
-      <node id="333">
-        <label>iosfwd</label>
-      </node>
-      <node id="343">
-        <label>cstdlib</label>
-      </node>
-      <node id="357">
+      <node id="447">
         <label>cudnn_frontend_VariantPack.h</label>
         <link refid="df/dc0/cudnn__frontend__VariantPack_8h"/>
-        <childnode refid="305" relation="include">
+        <childnode refid="393" relation="include">
         </childnode>
-        <childnode refid="306" relation="include">
+        <childnode refid="394" relation="include">
         </childnode>
-        <childnode refid="307" relation="include">
+        <childnode refid="395" relation="include">
         </childnode>
-        <childnode refid="308" relation="include">
+        <childnode refid="396" relation="include">
         </childnode>
-        <childnode refid="358" relation="include">
+        <childnode refid="448" relation="include">
         </childnode>
-        <childnode refid="309" relation="include">
+        <childnode refid="397" relation="include">
         </childnode>
-        <childnode refid="310" relation="include">
+        <childnode refid="398" relation="include">
         </childnode>
-        <childnode refid="311" relation="include">
+        <childnode refid="399" relation="include">
         </childnode>
-        <childnode refid="312" relation="include">
+        <childnode refid="400" relation="include">
         </childnode>
-        <childnode refid="313" relation="include">
-        </childnode>
-      </node>
-      <node id="350">
-        <label>clocale</label>
-      </node>
-      <node id="351">
-        <label>cctype</label>
-      </node>
-      <node id="331">
-        <label>cstddef</label>
-      </node>
-      <node id="339">
-        <label>unordered_map</label>
-      </node>
-      <node id="303">
-        <label>cudnn_frontend.h</label>
-        <link refid="de/d0c/cudnn__frontend_8h"/>
-        <childnode refid="304" relation="include">
-        </childnode>
-        <childnode refid="317" relation="include">
-        </childnode>
-        <childnode refid="325" relation="include">
-        </childnode>
-        <childnode refid="326" relation="include">
-        </childnode>
-        <childnode refid="327" relation="include">
-        </childnode>
-        <childnode refid="329" relation="include">
-        </childnode>
-        <childnode refid="355" relation="include">
-        </childnode>
-        <childnode refid="356" relation="include">
-        </childnode>
-        <childnode refid="320" relation="include">
-        </childnode>
-        <childnode refid="319" relation="include">
-        </childnode>
-        <childnode refid="324" relation="include">
-        </childnode>
-        <childnode refid="357" relation="include">
-        </childnode>
-        <childnode refid="321" relation="include">
-        </childnode>
-        <childnode refid="322" relation="include">
+        <childnode refid="401" relation="include">
         </childnode>
       </node>
-      <node id="313">
-        <label>cudnn_frontend_utils.h</label>
-        <link refid="df/d17/cudnn__frontend__utils_8h"/>
-        <childnode refid="314" relation="include">
+      <node id="415">
+        <label>limits</label>
+      </node>
+      <node id="429">
+        <label>iterator</label>
+      </node>
+      <node id="420">
+        <label>cudnn_frontend_Engine.h</label>
+        <link refid="de/d6d/cudnn__frontend__Engine_8h"/>
+        <childnode refid="393" relation="include">
         </childnode>
-        <childnode refid="315" relation="include">
+        <childnode refid="394" relation="include">
         </childnode>
-        <childnode refid="316" relation="include">
+        <childnode refid="395" relation="include">
+        </childnode>
+        <childnode refid="396" relation="include">
+        </childnode>
+        <childnode refid="397" relation="include">
+        </childnode>
+        <childnode refid="398" relation="include">
+        </childnode>
+        <childnode refid="404" relation="include">
+        </childnode>
+        <childnode refid="399" relation="include">
+        </childnode>
+        <childnode refid="400" relation="include">
+        </childnode>
+        <childnode refid="412" relation="include">
+        </childnode>
+        <childnode refid="401" relation="include">
         </childnode>
       </node>
-      <node id="323">
-        <label>cudnn_frontend_ReductionDesc.h</label>
-        <link refid="db/da7/cudnn__frontend__ReductionDesc_8h"/>
-        <childnode refid="305" relation="include">
+      <node id="437">
+        <label>cstdint</label>
+      </node>
+      <node id="419">
+        <label>cudnn_frontend_EngineConfig.h</label>
+        <link refid="d6/d67/cudnn__frontend__EngineConfig_8h"/>
+        <childnode refid="393" relation="include">
         </childnode>
-        <childnode refid="306" relation="include">
+        <childnode refid="394" relation="include">
         </childnode>
-        <childnode refid="307" relation="include">
+        <childnode refid="395" relation="include">
         </childnode>
-        <childnode refid="308" relation="include">
+        <childnode refid="396" relation="include">
         </childnode>
-        <childnode refid="309" relation="include">
+        <childnode refid="397" relation="include">
         </childnode>
-        <childnode refid="310" relation="include">
+        <childnode refid="398" relation="include">
         </childnode>
-        <childnode refid="311" relation="include">
+        <childnode refid="399" relation="include">
         </childnode>
-        <childnode refid="312" relation="include">
+        <childnode refid="400" relation="include">
         </childnode>
-        <childnode refid="313" relation="include">
+        <childnode refid="420" relation="include">
+        </childnode>
+        <childnode refid="401" relation="include">
         </childnode>
       </node>
-      <node id="301">
-        <label>cudnn_frontend_find_plan.h</label>
-        <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
-        <childnode refid="302" relation="include">
+      <node id="416">
+        <label>cudnn_frontend_MatMulDesc.h</label>
+        <link refid="d6/d32/cudnn__frontend__MatMulDesc_8h"/>
+        <childnode refid="393" relation="include">
         </childnode>
-        <childnode refid="337" relation="include">
+        <childnode refid="394" relation="include">
+        </childnode>
+        <childnode refid="395" relation="include">
+        </childnode>
+        <childnode refid="396" relation="include">
+        </childnode>
+        <childnode refid="397" relation="include">
+        </childnode>
+        <childnode refid="398" relation="include">
+        </childnode>
+        <childnode refid="399" relation="include">
+        </childnode>
+        <childnode refid="400" relation="include">
+        </childnode>
+        <childnode refid="401" relation="include">
         </childnode>
       </node>
-      <node id="335">
-        <label>type_traits</label>
-      </node>
-      <node id="317">
+      <node id="411">
         <label>cudnn_frontend_Heuristics.h</label>
         <link refid="db/d66/cudnn__frontend__Heuristics_8h"/>
-        <childnode refid="318" relation="include">
+        <childnode refid="404" relation="include">
         </childnode>
-        <childnode refid="311" relation="include">
+        <childnode refid="399" relation="include">
         </childnode>
-        <childnode refid="312" relation="include">
+        <childnode refid="400" relation="include">
         </childnode>
-        <childnode refid="319" relation="include">
+        <childnode refid="412" relation="include">
         </childnode>
-        <childnode refid="313" relation="include">
+        <childnode refid="419" relation="include">
+        </childnode>
+        <childnode refid="401" relation="include">
+        </childnode>
+        <childnode refid="421" relation="include">
         </childnode>
       </node>
-      <node id="358">
+      <node id="399">
+        <label>cudnn.h</label>
+      </node>
+      <node id="440">
+        <label>cmath</label>
+      </node>
+      <node id="439">
+        <label>cassert</label>
+      </node>
+      <node id="414">
+        <label>cudnn_frontend_PointWiseDesc.h</label>
+        <link refid="da/d5f/cudnn__frontend__PointWiseDesc_8h"/>
+        <childnode refid="393" relation="include">
+        </childnode>
+        <childnode refid="394" relation="include">
+        </childnode>
+        <childnode refid="395" relation="include">
+        </childnode>
+        <childnode refid="396" relation="include">
+        </childnode>
+        <childnode refid="397" relation="include">
+        </childnode>
+        <childnode refid="398" relation="include">
+        </childnode>
+        <childnode refid="415" relation="include">
+        </childnode>
+        <childnode refid="399" relation="include">
+        </childnode>
+        <childnode refid="400" relation="include">
+        </childnode>
+        <childnode refid="401" relation="include">
+        </childnode>
+      </node>
+      <node id="436">
+        <label>stdexcept</label>
+      </node>
+      <node id="423">
+        <label>numeric</label>
+      </node>
+      <node id="403">
+        <label>string</label>
+      </node>
+      <node id="432">
+        <label>map</label>
+      </node>
+      <node id="424">
+        <label>cudnn_frontend_Errata.h</label>
+        <link refid="db/d7e/cudnn__frontend__Errata_8h"/>
+        <childnode refid="425" relation="include">
+        </childnode>
+        <childnode refid="407" relation="include">
+        </childnode>
+        <childnode refid="438" relation="include">
+        </childnode>
+        <childnode refid="409" relation="include">
+        </childnode>
+      </node>
+      <node id="407">
+        <label>cudnn_frontend_Logging.h</label>
+        <link refid="d8/dc4/cudnn__frontend__Logging_8h"/>
+        <childnode refid="408" relation="include">
+        </childnode>
+        <childnode refid="409" relation="include">
+        </childnode>
+        <childnode refid="410" relation="include">
+        </childnode>
+        <childnode refid="405" relation="include">
+        </childnode>
+      </node>
+      <node id="418">
+        <label>cudnn_frontend_Tensor.h</label>
+        <link refid="d3/d98/cudnn__frontend__Tensor_8h"/>
+        <childnode refid="393" relation="include">
+        </childnode>
+        <childnode refid="394" relation="include">
+        </childnode>
+        <childnode refid="395" relation="include">
+        </childnode>
+        <childnode refid="396" relation="include">
+        </childnode>
+        <childnode refid="397" relation="include">
+        </childnode>
+        <childnode refid="398" relation="include">
+        </childnode>
+        <childnode refid="401" relation="include">
+        </childnode>
+      </node>
+      <node id="390">
+        <label>cudnn_frontend_EngineConfigGenerator.h</label>
+        <link refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h"/>
+        <childnode refid="391" relation="include">
+        </childnode>
+      </node>
+      <node id="402">
+        <label>exception</label>
+      </node>
+      <node id="409">
+        <label>fstream</label>
+      </node>
+      <node id="421">
+        <label>cudnn_frontend_Filters.h</label>
+        <link refid="d5/d36/cudnn__frontend__Filters_8h"/>
+        <childnode refid="399" relation="include">
+        </childnode>
+      </node>
+      <node id="406">
+        <label>ostream</label>
+      </node>
+      <node id="450">
+        <label>cudnn_frontend_ExecutionPlanCache.h</label>
+        <link refid="d9/dd3/cudnn__frontend__ExecutionPlanCache_8h"/>
+        <childnode refid="433" relation="include">
+        </childnode>
+        <childnode refid="434" relation="include">
+        </childnode>
+        <childnode refid="432" relation="include">
+        </childnode>
+        <childnode refid="396" relation="include">
+        </childnode>
+        <childnode refid="451" relation="include">
+        </childnode>
+        <childnode refid="412" relation="include">
+        </childnode>
+        <childnode refid="446" relation="include">
+        </childnode>
+      </node>
+      <node id="413">
+        <label>cudnn_frontend_Operation.h</label>
+        <link refid="da/d5a/cudnn__frontend__Operation_8h"/>
+        <childnode refid="393" relation="include">
+        </childnode>
+        <childnode refid="394" relation="include">
+        </childnode>
+        <childnode refid="395" relation="include">
+        </childnode>
+        <childnode refid="396" relation="include">
+        </childnode>
+        <childnode refid="397" relation="include">
+        </childnode>
+        <childnode refid="398" relation="include">
+        </childnode>
+        <childnode refid="399" relation="include">
+        </childnode>
+        <childnode refid="400" relation="include">
+        </childnode>
+        <childnode refid="392" relation="include">
+        </childnode>
+        <childnode refid="414" relation="include">
+        </childnode>
+        <childnode refid="416" relation="include">
+        </childnode>
+        <childnode refid="417" relation="include">
+        </childnode>
+        <childnode refid="418" relation="include">
+        </childnode>
+        <childnode refid="401" relation="include">
+        </childnode>
+      </node>
+      <node id="449">
+        <label>cudnn_frontend_Reorder_Tensor.h</label>
+        <link refid="d9/da8/cudnn__frontend__Reorder__Tensor_8h"/>
+        <childnode refid="393" relation="include">
+        </childnode>
+        <childnode refid="394" relation="include">
+        </childnode>
+        <childnode refid="395" relation="include">
+        </childnode>
+        <childnode refid="396" relation="include">
+        </childnode>
+        <childnode refid="397" relation="include">
+        </childnode>
+        <childnode refid="408" relation="include">
+        </childnode>
+        <childnode refid="398" relation="include">
+        </childnode>
+        <childnode refid="418" relation="include">
+        </childnode>
+        <childnode refid="392" relation="include">
+        </childnode>
+      </node>
+      <node id="445">
+        <label>ios</label>
+      </node>
+      <node id="441">
+        <label>cstdio</label>
+      </node>
+      <node id="446">
+        <label>cudnn_frontend_ExecutionPlan.h</label>
+        <link refid="d6/d51/cudnn__frontend__ExecutionPlan_8h"/>
+        <childnode refid="393" relation="include">
+        </childnode>
+        <childnode refid="394" relation="include">
+        </childnode>
+        <childnode refid="395" relation="include">
+        </childnode>
+        <childnode refid="396" relation="include">
+        </childnode>
+        <childnode refid="397" relation="include">
+        </childnode>
+        <childnode refid="398" relation="include">
+        </childnode>
+        <childnode refid="399" relation="include">
+        </childnode>
+        <childnode refid="400" relation="include">
+        </childnode>
+        <childnode refid="420" relation="include">
+        </childnode>
+        <childnode refid="401" relation="include">
+        </childnode>
+      </node>
+      <node id="425">
+        <label>contrib/nlohmann/json/json.hpp</label>
+        <link refid="d5/db8/json_8hpp"/>
+        <childnode refid="393" relation="include">
+        </childnode>
+        <childnode refid="426" relation="include">
+        </childnode>
+        <childnode refid="395" relation="include">
+        </childnode>
+        <childnode refid="427" relation="include">
+        </childnode>
+        <childnode refid="428" relation="include">
+        </childnode>
+        <childnode refid="429" relation="include">
+        </childnode>
+        <childnode refid="396" relation="include">
+        </childnode>
+        <childnode refid="423" relation="include">
+        </childnode>
+        <childnode refid="403" relation="include">
+        </childnode>
+        <childnode refid="398" relation="include">
+        </childnode>
+        <childnode refid="404" relation="include">
+        </childnode>
+        <childnode refid="430" relation="include">
+        </childnode>
+        <childnode refid="394" relation="include">
+        </childnode>
+        <childnode refid="431" relation="include">
+        </childnode>
+        <childnode refid="432" relation="include">
+        </childnode>
+        <childnode refid="433" relation="include">
+        </childnode>
+        <childnode refid="434" relation="include">
+        </childnode>
+        <childnode refid="435" relation="include">
+        </childnode>
+        <childnode refid="402" relation="include">
+        </childnode>
+        <childnode refid="436" relation="include">
+        </childnode>
+        <childnode refid="437" relation="include">
+        </childnode>
+        <childnode refid="438" relation="include">
+        </childnode>
+        <childnode refid="439" relation="include">
+        </childnode>
+        <childnode refid="415" relation="include">
+        </childnode>
+        <childnode refid="440" relation="include">
+        </childnode>
+        <childnode refid="441" relation="include">
+        </childnode>
+        <childnode refid="410" relation="include">
+        </childnode>
+        <childnode refid="442" relation="include">
+        </childnode>
+        <childnode refid="443" relation="include">
+        </childnode>
+        <childnode refid="444" relation="include">
+        </childnode>
+        <childnode refid="445" relation="include">
+        </childnode>
+        <childnode refid="406" relation="include">
+        </childnode>
+      </node>
+      <node id="433">
+        <label>tuple</label>
+      </node>
+      <node id="404">
+        <label>vector</label>
+      </node>
+      <node id="392">
+        <label>cudnn_frontend_ConvDesc.h</label>
+        <link refid="d1/de7/cudnn__frontend__ConvDesc_8h"/>
+        <childnode refid="393" relation="include">
+        </childnode>
+        <childnode refid="394" relation="include">
+        </childnode>
+        <childnode refid="395" relation="include">
+        </childnode>
+        <childnode refid="396" relation="include">
+        </childnode>
+        <childnode refid="397" relation="include">
+        </childnode>
+        <childnode refid="398" relation="include">
+        </childnode>
+        <childnode refid="399" relation="include">
+        </childnode>
+        <childnode refid="400" relation="include">
+        </childnode>
+        <childnode refid="401" relation="include">
+        </childnode>
+      </node>
+      <node id="412">
+        <label>cudnn_frontend_OperationGraph.h</label>
+        <link refid="db/d7d/cudnn__frontend__OperationGraph_8h"/>
+        <childnode refid="393" relation="include">
+        </childnode>
+        <childnode refid="394" relation="include">
+        </childnode>
+        <childnode refid="395" relation="include">
+        </childnode>
+        <childnode refid="396" relation="include">
+        </childnode>
+        <childnode refid="397" relation="include">
+        </childnode>
+        <childnode refid="398" relation="include">
+        </childnode>
+        <childnode refid="404" relation="include">
+        </childnode>
+        <childnode refid="399" relation="include">
+        </childnode>
+        <childnode refid="400" relation="include">
+        </childnode>
+        <childnode refid="413" relation="include">
+        </childnode>
+        <childnode refid="401" relation="include">
+        </childnode>
+      </node>
+      <node id="400">
+        <label>cudnn_backend.h</label>
+      </node>
+      <node id="398">
+        <label>utility</label>
+      </node>
+      <node id="394">
+        <label>array</label>
+      </node>
+      <node id="397">
+        <label>sstream</label>
+      </node>
+      <node id="391">
+        <label>cudnn_frontend.h</label>
+        <link refid="de/d0c/cudnn__frontend_8h"/>
+        <childnode refid="392" relation="include">
+        </childnode>
+        <childnode refid="411" relation="include">
+        </childnode>
+        <childnode refid="420" relation="include">
+        </childnode>
+        <childnode refid="419" relation="include">
+        </childnode>
+        <childnode refid="422" relation="include">
+        </childnode>
+        <childnode refid="424" relation="include">
+        </childnode>
+        <childnode refid="446" relation="include">
+        </childnode>
+        <childnode refid="421" relation="include">
+        </childnode>
+        <childnode refid="413" relation="include">
+        </childnode>
+        <childnode refid="412" relation="include">
+        </childnode>
+        <childnode refid="418" relation="include">
+        </childnode>
+        <childnode refid="447" relation="include">
+        </childnode>
+        <childnode refid="414" relation="include">
+        </childnode>
+        <childnode refid="416" relation="include">
+        </childnode>
+        <childnode refid="407" relation="include">
+        </childnode>
+        <childnode refid="449" relation="include">
+        </childnode>
+        <childnode refid="450" relation="include">
+        </childnode>
+      </node>
+      <node id="389">
+        <label>cudnn_frontend_find_plan.h</label>
+        <link refid="d3/d6b/cudnn__frontend__find__plan_8h"/>
+        <childnode refid="390" relation="include">
+        </childnode>
+        <childnode refid="452" relation="include">
+        </childnode>
+        <childnode refid="448" relation="include">
+        </childnode>
+      </node>
+      <node id="417">
+        <label>cudnn_frontend_ReductionDesc.h</label>
+        <link refid="db/da7/cudnn__frontend__ReductionDesc_8h"/>
+        <childnode refid="393" relation="include">
+        </childnode>
+        <childnode refid="394" relation="include">
+        </childnode>
+        <childnode refid="395" relation="include">
+        </childnode>
+        <childnode refid="396" relation="include">
+        </childnode>
+        <childnode refid="397" relation="include">
+        </childnode>
+        <childnode refid="398" relation="include">
+        </childnode>
+        <childnode refid="399" relation="include">
+        </childnode>
+        <childnode refid="400" relation="include">
+        </childnode>
+        <childnode refid="401" relation="include">
+        </childnode>
+      </node>
+      <node id="428">
+        <label>iosfwd</label>
+      </node>
+      <node id="438">
+        <label>cstdlib</label>
+      </node>
+      <node id="443">
+        <label>clocale</label>
+      </node>
+      <node id="444">
+        <label>cctype</label>
+      </node>
+      <node id="408">
+        <label>iostream</label>
+      </node>
+      <node id="426">
+        <label>cstddef</label>
+      </node>
+      <node id="434">
+        <label>unordered_map</label>
+      </node>
+      <node id="451">
+        <label>mutex</label>
+      </node>
+      <node id="430">
+        <label>type_traits</label>
+      </node>
+      <node id="448">
         <label>set</label>
       </node>
-      <node id="336">
+      <node id="431">
         <label>forward_list</label>
       </node>
-      <node id="305">
+      <node id="393">
         <label>algorithm</label>
       </node>
-      <node id="348">
+      <node id="410">
         <label>cstring</label>
       </node>
-      <node id="308">
+      <node id="401">
+        <label>cudnn_frontend_utils.h</label>
+        <link refid="df/d17/cudnn__frontend__utils_8h"/>
+        <childnode refid="402" relation="include">
+        </childnode>
+        <childnode refid="403" relation="include">
+        </childnode>
+        <childnode refid="404" relation="include">
+        </childnode>
+        <childnode refid="405" relation="include">
+        </childnode>
+        <childnode refid="407" relation="include">
+        </childnode>
+      </node>
+      <node id="396">
         <label>memory</label>
       </node>
-      <node id="349">
+      <node id="442">
         <label>istream</label>
       </node>
-      <node id="332">
+      <node id="427">
         <label>initializer_list</label>
+      </node>
+      <node id="422">
+        <label>cudnn_frontend_EngineFallbackList.h</label>
+        <link refid="df/d3e/cudnn__frontend__EngineFallbackList_8h"/>
+        <childnode refid="399" relation="include">
+        </childnode>
+        <childnode refid="423" relation="include">
+        </childnode>
+      </node>
+      <node id="405">
+        <label>cudnn_backend_base.h</label>
+        <link refid="dc/d11/cudnn__backend__base_8h"/>
+        <childnode refid="406" relation="include">
+        </childnode>
+        <childnode refid="399" relation="include">
+        </childnode>
       </node>
     </incdepgraph>
     <innernamespace refid="df/de1/namespacecudnn__frontend">cudnn_frontend</innernamespace>
@@ -576,95 +662,115 @@
 <codeline lineno="23"><highlight class="normal"></highlight><highlight class="preprocessor">#pragma<sp/>once</highlight><highlight class="normal"></highlight></codeline>
 <codeline lineno="24"><highlight class="normal"></highlight></codeline>
 <codeline lineno="25"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;<ref refid="de/d1e/cudnn__frontend__EngineConfigGenerator_8h" kindref="compound">cudnn_frontend_EngineConfigGenerator.h</ref>&gt;</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="26"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;map&gt;</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="27"><highlight class="normal"></highlight></codeline>
-<codeline lineno="28"><highlight class="normal"></highlight><highlight class="keyword">namespace<sp/></highlight><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend" kindref="compound">cudnn_frontend</ref><sp/>{</highlight></codeline>
-<codeline lineno="29"><highlight class="normal"></highlight></codeline>
-<codeline lineno="35"><highlight class="keyword">template</highlight><highlight class="normal"><sp/>&lt;CudnnFindSamplingTechnique<sp/>samplingTechnique&gt;</highlight></codeline>
-<codeline lineno="36"><highlight class="normal"></highlight><highlight class="keyword">auto</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="37" refid="df/de1/namespacecudnn__frontend_1a148478701949f58a44912cc61dbda1e4" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1a148478701949f58a44912cc61dbda1e4" kindref="member">time_sorted_plan</ref>(cudnnHandle_t<sp/>handle,<sp/><ref refid="df/de1/namespacecudnn__frontend_1a560644a5c1e6016c509a379ca6e03f05" kindref="member">executionPlans_t</ref><sp/>plans,<sp/><ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">VariantPack</ref><sp/>&amp;variantPack)<sp/>-&gt;<sp/><ref refid="df/de1/namespacecudnn__frontend_1ad5f0f0c892b009e34aa59f67de1b5535" kindref="member">executionOptions_t</ref><sp/>{</highlight></codeline>
-<codeline lineno="38"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ad5f0f0c892b009e34aa59f67de1b5535" kindref="member">executionOptions_t</ref><sp/>time_sorted_plans;</highlight></codeline>
-<codeline lineno="39"><highlight class="normal"><sp/><sp/><sp/><sp/>std::map&lt;float,<sp/>ExecutionPlan<sp/>&amp;&gt;<sp/>timed_execution_plans;</highlight></codeline>
+<codeline lineno="26"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;iomanip&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="27"><highlight class="normal"></highlight><highlight class="preprocessor">#include<sp/>&lt;set&gt;</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="28"><highlight class="normal"></highlight></codeline>
+<codeline lineno="29"><highlight class="normal"></highlight><highlight class="keyword">namespace<sp/></highlight><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend" kindref="compound">cudnn_frontend</ref><sp/>{</highlight></codeline>
+<codeline lineno="30"><highlight class="normal"></highlight></codeline>
+<codeline lineno="36"><highlight class="keyword">template</highlight><highlight class="normal"><sp/>&lt;CudnnFindSamplingTechnique<sp/>samplingTechnique&gt;</highlight></codeline>
+<codeline lineno="37"><highlight class="normal"></highlight><highlight class="keyword">auto</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="38" refid="df/de1/namespacecudnn__frontend_1a55c20886fc567d350a36f84ead282af7" refkind="member"><highlight class="normal"><ref refid="df/de1/namespacecudnn__frontend_1a55c20886fc567d350a36f84ead282af7" kindref="member">time_sorted_plan</ref>(cudnnHandle_t<sp/>handle,<sp/><ref refid="df/de1/namespacecudnn__frontend_1a560644a5c1e6016c509a379ca6e03f05" kindref="member">executionPlans_t</ref><sp/>plans,<sp/><ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">VariantPack</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;variantPack)<sp/>-&gt;<sp/><ref refid="df/de1/namespacecudnn__frontend_1a560644a5c1e6016c509a379ca6e03f05" kindref="member">executionPlans_t</ref><sp/>{</highlight></codeline>
+<codeline lineno="39"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a560644a5c1e6016c509a379ca6e03f05" kindref="member">executionPlans_t</ref><sp/>time_sorted_plans;</highlight></codeline>
 <codeline lineno="40"><highlight class="normal"></highlight></codeline>
-<codeline lineno="41"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">int</highlight><highlight class="normal"><sp/>maxIterCount<sp/>=</highlight></codeline>
-<codeline lineno="42"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>(samplingTechnique<sp/>==<sp/><ref refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3ac8ab707d81df65503b6b0ecc67675158" kindref="member">CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_ONCE</ref>)</highlight></codeline>
-<codeline lineno="43"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>?<sp/>1</highlight></codeline>
-<codeline lineno="44"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>:<sp/>(samplingTechnique<sp/>==<sp/><ref refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3a903bfd2e4d1b8ab2a7197be752c618a6" kindref="member">CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_MEDIAN_OF_THREE</ref>)<sp/>?<sp/>3<sp/>:<sp/>100;</highlight></codeline>
-<codeline lineno="45"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">float</highlight><highlight class="normal"><sp/>threshhold<sp/>=<sp/>0.95f;</highlight></codeline>
-<codeline lineno="46"><highlight class="normal"></highlight></codeline>
-<codeline lineno="47"><highlight class="normal"><sp/><sp/><sp/><sp/>cudaEvent_t<sp/>start,<sp/>stop;</highlight></codeline>
-<codeline lineno="48"><highlight class="normal"><sp/><sp/><sp/><sp/>cudaEventCreate(&amp;start);</highlight></codeline>
-<codeline lineno="49"><highlight class="normal"><sp/><sp/><sp/><sp/>cudaEventCreate(&amp;stop);</highlight></codeline>
-<codeline lineno="50"><highlight class="normal"><sp/><sp/><sp/><sp/>cudaDeviceSynchronize();</highlight></codeline>
-<codeline lineno="51"><highlight class="normal"></highlight></codeline>
-<codeline lineno="52"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(</highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>&amp;plan<sp/>:<sp/>plans)<sp/>{</highlight></codeline>
-<codeline lineno="53"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">float</highlight><highlight class="normal"><sp/>time_ms<sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/>0.0f;</highlight></codeline>
-<codeline lineno="54"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">float</highlight><highlight class="normal"><sp/>final_time_ms<sp/>=<sp/>0.0f;</highlight></codeline>
-<codeline lineno="55"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">float</highlight><highlight class="normal"><sp/>min_time_ms<sp/><sp/><sp/>=<sp/>std::numeric_limits&lt;float&gt;::max();</highlight></codeline>
-<codeline lineno="56"><highlight class="normal"></highlight></codeline>
-<codeline lineno="57"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="comment">//<sp/>Warm-up<sp/>run</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="58"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>::cudnnBackendExecute(handle,<sp/>plan.get_raw_desc(),<sp/>variantPack.get_raw_desc());</highlight></codeline>
-<codeline lineno="59"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudaDeviceSynchronize();</highlight></codeline>
-<codeline lineno="60"><highlight class="normal"></highlight></codeline>
-<codeline lineno="61"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(</highlight><highlight class="keywordtype">int</highlight><highlight class="normal"><sp/>i<sp/>=<sp/>0;<sp/>i<sp/>&lt;<sp/>maxIterCount;<sp/>i++)<sp/>{</highlight></codeline>
-<codeline lineno="62"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudaEventRecord(start);</highlight></codeline>
-<codeline lineno="63"><highlight class="normal"></highlight></codeline>
-<codeline lineno="64"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>::cudnnBackendExecute(handle,<sp/>plan.get_raw_desc(),<sp/>variantPack.get_raw_desc());</highlight></codeline>
-<codeline lineno="65"><highlight class="normal"></highlight></codeline>
-<codeline lineno="66"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudaEventRecord(stop);</highlight></codeline>
-<codeline lineno="67"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudaEventSynchronize(stop);</highlight></codeline>
-<codeline lineno="68"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudaEventElapsedTime(&amp;time_ms,<sp/>start,<sp/>stop);</highlight></codeline>
-<codeline lineno="69"><highlight class="normal"></highlight></codeline>
-<codeline lineno="70"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(samplingTechnique<sp/>==<sp/><ref refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3a8199dfa6701edb38f52a74d9e229b43d" kindref="member">CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_TILL_STABLE</ref>)<sp/>{</highlight></codeline>
-<codeline lineno="71"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>final_time_ms<sp/>=<sp/>std::min(min_time_ms,<sp/>time_ms);</highlight></codeline>
-<codeline lineno="72"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(time_ms<sp/>/<sp/>min_time_ms<sp/>&lt;<sp/>threshhold)<sp/>{</highlight></codeline>
-<codeline lineno="73"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>min_time_ms<sp/>=<sp/>final_time_ms;</highlight></codeline>
-<codeline lineno="74"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}<sp/></highlight><highlight class="keywordflow">else</highlight><highlight class="normal"><sp/>{</highlight></codeline>
-<codeline lineno="75"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">break</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="76"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="77"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}<sp/></highlight><highlight class="keywordflow">else</highlight><highlight class="normal"><sp/>{</highlight></codeline>
-<codeline lineno="78"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>final_time_ms<sp/>=<sp/>i<sp/>==<sp/>(maxIterCount<sp/>/<sp/>2)<sp/>?<sp/>time_ms<sp/>:<sp/>final_time_ms;</highlight></codeline>
-<codeline lineno="79"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="80"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="81"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>timed_execution_plans.insert({final_time_ms,<sp/>plan});</highlight></codeline>
-<codeline lineno="82"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="83"><highlight class="normal"><sp/><sp/><sp/><sp/>std::transform(</highlight></codeline>
-<codeline lineno="84"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>timed_execution_plans.begin(),</highlight></codeline>
-<codeline lineno="85"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>timed_execution_plans.end(),</highlight></codeline>
-<codeline lineno="86"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>std::back_inserter(time_sorted_plans),</highlight></codeline>
-<codeline lineno="87"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>[](</highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>std::map&lt;float,<sp/>cudnn_frontend::ExecutionPlan<sp/>&amp;&gt;::value_type<sp/>&amp;pair)<sp/>-&gt;<sp/></highlight><highlight class="keyword">struct</highlight><highlight class="normal"><sp/><ref refid="d6/d1b/structcudnn__frontend_1_1executionOption" kindref="compound">executionOption</ref><sp/>{</highlight></codeline>
-<codeline lineno="88"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>{std::move(pair.second),<sp/>pair.first};</highlight></codeline>
-<codeline lineno="89"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>});</highlight></codeline>
-<codeline lineno="90"><highlight class="normal"></highlight></codeline>
-<codeline lineno="91"><highlight class="normal"><sp/><sp/><sp/><sp/>cudaEventDestroy(start);</highlight></codeline>
-<codeline lineno="92"><highlight class="normal"><sp/><sp/><sp/><sp/>cudaEventDestroy(stop);</highlight></codeline>
-<codeline lineno="93"><highlight class="normal"></highlight></codeline>
-<codeline lineno="94"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>time_sorted_plans;</highlight></codeline>
-<codeline lineno="95"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="41"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>plan_cmp<sp/>=<sp/>[](</highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" kindref="compound">ExecutionPlan</ref>&amp;<sp/>a,<sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/><ref refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" kindref="compound">ExecutionPlan</ref>&amp;<sp/>b)<sp/>{</highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>a.<ref refid="d7/d0d/group__ExecutionPlanQuery_1ga74f24a0cc255a72af695056c2f559af7" kindref="member">getExecutionTime</ref>()<sp/>&lt;<sp/>b.getExecutionTime();};</highlight></codeline>
+<codeline lineno="42"><highlight class="normal"><sp/><sp/><sp/><sp/>std::set&lt;std::reference_wrapper&lt;ExecutionPlan&gt;,<sp/>decltype(plan_cmp)&gt;<sp/>timed_execution_plans(plan_cmp);</highlight></codeline>
+<codeline lineno="43"><highlight class="normal"></highlight></codeline>
+<codeline lineno="44"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">int</highlight><highlight class="normal"><sp/>maxIterCount<sp/>=</highlight></codeline>
+<codeline lineno="45"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>(samplingTechnique<sp/>==<sp/><ref refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3ac8ab707d81df65503b6b0ecc67675158" kindref="member">CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_ONCE</ref>)</highlight></codeline>
+<codeline lineno="46"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>?<sp/>1</highlight></codeline>
+<codeline lineno="47"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>:<sp/>(samplingTechnique<sp/>==<sp/><ref refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3a903bfd2e4d1b8ab2a7197be752c618a6" kindref="member">CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_MEDIAN_OF_THREE</ref>)<sp/>?<sp/>3<sp/>:<sp/>100;</highlight></codeline>
+<codeline lineno="48"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/></highlight><highlight class="keywordtype">float</highlight><highlight class="normal"><sp/>threshhold<sp/>=<sp/>0.95f;</highlight></codeline>
+<codeline lineno="49"><highlight class="normal"></highlight></codeline>
+<codeline lineno="50"><highlight class="normal"><sp/><sp/><sp/><sp/>cudaEvent_t<sp/>start,<sp/>stop;</highlight></codeline>
+<codeline lineno="51"><highlight class="normal"><sp/><sp/><sp/><sp/>cudaEventCreate(&amp;start);</highlight></codeline>
+<codeline lineno="52"><highlight class="normal"><sp/><sp/><sp/><sp/>cudaEventCreate(&amp;stop);</highlight></codeline>
+<codeline lineno="53"><highlight class="normal"><sp/><sp/><sp/><sp/>cudaDeviceSynchronize();</highlight></codeline>
+<codeline lineno="54"><highlight class="normal"></highlight></codeline>
+<codeline lineno="55"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(</highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>&amp;plan<sp/>:<sp/>plans)<sp/>{</highlight></codeline>
+<codeline lineno="56"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">float</highlight><highlight class="normal"><sp/>time_ms<sp/><sp/><sp/><sp/><sp/><sp/><sp/>=<sp/>0.0f;</highlight></codeline>
+<codeline lineno="57"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">float</highlight><highlight class="normal"><sp/>final_time_ms<sp/>=<sp/>0.0f;</highlight></codeline>
+<codeline lineno="58"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordtype">float</highlight><highlight class="normal"><sp/>min_time_ms<sp/><sp/><sp/>=<sp/>std::numeric_limits&lt;float&gt;::max();</highlight></codeline>
+<codeline lineno="59"><highlight class="normal"></highlight></codeline>
+<codeline lineno="60"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="comment">//<sp/>Warm-up<sp/>run</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="61"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>warmup_status<sp/>=<sp/>::cudnnBackendExecute(handle,<sp/>plan.get_raw_desc(),<sp/>variantPack.get_raw_desc());</highlight></codeline>
+<codeline lineno="62"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(warmup_status<sp/>!=<sp/>CUDNN_STATUS_SUCCESS)<sp/>{</highlight></codeline>
+<codeline lineno="63"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" kindref="member">getLogger</ref>()<sp/>&lt;&lt;<sp/></highlight><highlight class="stringliteral">&quot;[cudnn_frontend]<sp/>Plan<sp/>&quot;</highlight><highlight class="normal"><sp/>&lt;&lt;<sp/>plan.getTag()<sp/>&lt;&lt;<sp/></highlight><highlight class="stringliteral">&quot;<sp/>failed<sp/>with<sp/>&quot;</highlight><highlight class="normal"><sp/>&lt;&lt;<sp/><ref refid="df/de1/namespacecudnn__frontend_1a939cf4181f94bc235363cc485beb1ce8" kindref="member">to_string</ref>(warmup_status)<sp/>&lt;&lt;<sp/>std::endl;</highlight></codeline>
+<codeline lineno="64"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">continue</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="65"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="66"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudaDeviceSynchronize();</highlight></codeline>
+<codeline lineno="67"><highlight class="normal"></highlight></codeline>
+<codeline lineno="68"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(</highlight><highlight class="keywordtype">int</highlight><highlight class="normal"><sp/>i<sp/>=<sp/>0;<sp/>i<sp/>&lt;<sp/>maxIterCount;<sp/>i++)<sp/>{</highlight></codeline>
+<codeline lineno="69"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudaEventRecord(start);</highlight></codeline>
+<codeline lineno="70"><highlight class="normal"></highlight></codeline>
+<codeline lineno="71"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>::cudnnBackendExecute(handle,<sp/>plan.get_raw_desc(),<sp/>variantPack.get_raw_desc());</highlight></codeline>
+<codeline lineno="72"><highlight class="normal"></highlight></codeline>
+<codeline lineno="73"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudaEventRecord(stop);</highlight></codeline>
+<codeline lineno="74"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudaEventSynchronize(stop);</highlight></codeline>
+<codeline lineno="75"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cudaEventElapsedTime(&amp;time_ms,<sp/>start,<sp/>stop);</highlight></codeline>
+<codeline lineno="76"><highlight class="normal"></highlight></codeline>
+<codeline lineno="77"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(samplingTechnique<sp/>==<sp/><ref refid="df/de1/namespacecudnn__frontend_1ab3748fa00b36beec790db7201fdd2ef3a8199dfa6701edb38f52a74d9e229b43d" kindref="member">CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_TILL_STABLE</ref>)<sp/>{</highlight></codeline>
+<codeline lineno="78"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>final_time_ms<sp/>=<sp/>std::min(min_time_ms,<sp/>time_ms);</highlight></codeline>
+<codeline lineno="79"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(time_ms<sp/>/<sp/>min_time_ms<sp/>&lt;<sp/>threshhold)<sp/>{</highlight></codeline>
+<codeline lineno="80"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>min_time_ms<sp/>=<sp/>final_time_ms;</highlight></codeline>
+<codeline lineno="81"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}<sp/></highlight><highlight class="keywordflow">else</highlight><highlight class="normal"><sp/>{</highlight></codeline>
+<codeline lineno="82"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">break</highlight><highlight class="normal">;</highlight></codeline>
+<codeline lineno="83"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="84"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}<sp/></highlight><highlight class="keywordflow">else</highlight><highlight class="normal"><sp/>{</highlight></codeline>
+<codeline lineno="85"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>final_time_ms<sp/>=<sp/>i<sp/>==<sp/>(maxIterCount<sp/>/<sp/>2)<sp/>?<sp/>time_ms<sp/>:<sp/>final_time_ms;</highlight></codeline>
+<codeline lineno="86"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="87"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="88"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" kindref="member">getLogger</ref>()<sp/>&lt;&lt;<sp/></highlight><highlight class="stringliteral">&quot;[cudnn_frontend]<sp/>Plan<sp/>&quot;</highlight><highlight class="normal"><sp/>&lt;&lt;<sp/>plan.getTag()<sp/>&lt;&lt;<sp/></highlight><highlight class="stringliteral">&quot;<sp/>took<sp/>&quot;</highlight><highlight class="normal"><sp/>&lt;&lt;<sp/>std::setw(10)<sp/>&lt;&lt;<sp/>final_time_ms<sp/>&lt;&lt;<sp/>std::endl;</highlight></codeline>
+<codeline lineno="89"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>plan.setExecutionTime(final_time_ms);</highlight></codeline>
+<codeline lineno="90"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>timed_execution_plans.insert(plan);</highlight></codeline>
+<codeline lineno="91"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="92"><highlight class="normal"></highlight></codeline>
+<codeline lineno="93"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(<ref refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" kindref="compound">ExecutionPlan</ref><sp/>&amp;plan<sp/>:<sp/>timed_execution_plans)<sp/>{</highlight></codeline>
+<codeline lineno="94"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>time_sorted_plans.emplace_back(std::move(plan));</highlight></codeline>
+<codeline lineno="95"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
 <codeline lineno="96"><highlight class="normal"></highlight></codeline>
-<codeline lineno="97"><highlight class="normal"></highlight><highlight class="keyword">template</highlight><highlight class="normal"><sp/>&lt;CudnnFindSamplingTechnique<sp/>samplingTechnique&gt;</highlight></codeline>
-<codeline lineno="98"><highlight class="normal"></highlight><highlight class="keyword">auto</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="99" refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1abd7cdd3a218623ffc5dfcbf9343aef85" refkind="member"><highlight class="normal"><ref refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1abd7cdd3a218623ffc5dfcbf9343aef85" kindref="member">EngineConfigGenerator::cudnnFindPlan</ref>(cudnnHandle_t<sp/>handle,</highlight></codeline>
-<codeline lineno="100"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">cudnn_frontend::OperationGraph</ref><sp/>&amp;&amp;opGraph,</highlight></codeline>
-<codeline lineno="101"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">cudnn_frontend::VariantPack</ref><sp/>&amp;variantPack,</highlight></codeline>
-<codeline lineno="102"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ad31f040777311d1d1a7a2490f23e026e" kindref="member">Predicate</ref><sp/>pred)<sp/>-&gt;<sp/><ref refid="df/de1/namespacecudnn__frontend_1ad5f0f0c892b009e34aa59f67de1b5535" kindref="member">executionOptions_t</ref><sp/>{</highlight></codeline>
-<codeline lineno="104"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a560644a5c1e6016c509a379ca6e03f05" kindref="member">executionPlans_t</ref><sp/>plans;</highlight></codeline>
-<codeline lineno="105"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">for</highlight><highlight class="normal"><sp/>(</highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>&amp;engine_config<sp/>:<sp/>generate_engine_config(opGraph))<sp/>{</highlight></codeline>
-<codeline lineno="106"><highlight class="normal"></highlight><highlight class="preprocessor">#ifndef<sp/>NV_CUDNN_DISABLE_EXCEPTION</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="107"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">try</highlight><highlight class="normal"><sp/>{</highlight></codeline>
-<codeline lineno="108"><highlight class="normal"></highlight><highlight class="preprocessor">#endif</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="109"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>plans.push_back(</highlight></codeline>
-<codeline lineno="110"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d1/d74/classcudnn__frontend_1_1ExecutionPlanBuilder__v8" kindref="compound">cudnn_frontend::ExecutionPlanBuilder</ref>().setHandle(handle).setEngineConfig(engine_config,<sp/>opGraph.getTag()).build());</highlight></codeline>
-<codeline lineno="111"><highlight class="normal"></highlight><highlight class="preprocessor">#ifndef<sp/>NV_CUDNN_DISABLE_EXCEPTION</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="112"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}<sp/></highlight><highlight class="keywordflow">catch</highlight><highlight class="normal"><sp/>(<ref refid="d9/dca/classcudnn__frontend_1_1cudnnException" kindref="compound">cudnnException</ref><sp/>&amp;e)<sp/>{</highlight></codeline>
-<codeline lineno="113"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">continue</highlight><highlight class="normal">;</highlight></codeline>
-<codeline lineno="114"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="115"><highlight class="normal"></highlight><highlight class="preprocessor">#endif</highlight><highlight class="normal"></highlight></codeline>
-<codeline lineno="116"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
-<codeline lineno="117"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>time_sorted_plan&lt;samplingTechnique&gt;(handle,<sp/><ref refid="df/de1/namespacecudnn__frontend_1a0f52559baeb4e9ee8835d95ea50a875e" kindref="member">filter</ref>(pred,<sp/>plans),<sp/>variantPack);</highlight></codeline>
-<codeline lineno="118"><highlight class="normal">}</highlight></codeline>
-<codeline lineno="119"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="97"><highlight class="normal"><sp/><sp/><sp/><sp/>cudaEventDestroy(start);</highlight></codeline>
+<codeline lineno="98"><highlight class="normal"><sp/><sp/><sp/><sp/>cudaEventDestroy(stop);</highlight></codeline>
+<codeline lineno="99"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight></codeline>
+<codeline lineno="100"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" kindref="member">getLogger</ref>()<sp/>&lt;&lt;<sp/></highlight><highlight class="stringliteral">&quot;[cudnn_frontend]<sp/>Auto-tuning<sp/>returns<sp/>&quot;</highlight><highlight class="normal"><sp/>&lt;&lt;<sp/>time_sorted_plans.size()<sp/>&lt;&lt;<sp/></highlight><highlight class="stringliteral">&quot;<sp/>plans.&quot;</highlight><highlight class="normal"><sp/>&lt;&lt;<sp/>std::endl;</highlight></codeline>
+<codeline lineno="101"><highlight class="normal"></highlight></codeline>
+<codeline lineno="102"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>time_sorted_plans;</highlight></codeline>
+<codeline lineno="103"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="104"><highlight class="normal"></highlight></codeline>
+<codeline lineno="105"><highlight class="normal"></highlight><highlight class="keyword">template</highlight><highlight class="normal"><sp/>&lt;CudnnFindSamplingTechnique<sp/>samplingTechnique&gt;</highlight></codeline>
+<codeline lineno="106"><highlight class="normal"></highlight><highlight class="keyword">auto</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="107" refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a380e8426e6855e8e86405719aefeb905" refkind="member"><highlight class="normal"><ref refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a3b291ce5e552bf0c736be227065cd8ad" kindref="member">EngineConfigGenerator::cudnnFindPlan</ref>(cudnnHandle_t<sp/>handle,</highlight></codeline>
+<codeline lineno="108"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">cudnn_frontend::OperationGraph</ref><sp/>&amp;opGraph,</highlight></codeline>
+<codeline lineno="109"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">cudnn_frontend::VariantPack</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;variantPack)<sp/>-&gt;<sp/><ref refid="df/de1/namespacecudnn__frontend_1a560644a5c1e6016c509a379ca6e03f05" kindref="member">executionPlans_t</ref><sp/>{</highlight></codeline>
+<codeline lineno="111"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a560644a5c1e6016c509a379ca6e03f05" kindref="member">executionPlans_t</ref><sp/>plans<sp/>=<sp/>cudnnGetPlan(handle,<sp/>opGraph);</highlight></codeline>
+<codeline lineno="112"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>time_sorted_plan&lt;samplingTechnique&gt;(handle,<sp/>std::move(plans),<sp/>variantPack);</highlight></codeline>
+<codeline lineno="113"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="114"><highlight class="normal"></highlight></codeline>
+<codeline lineno="115"><highlight class="normal"></highlight><highlight class="keyword">template</highlight><highlight class="normal"><sp/>&lt;CudnnFindSamplingTechnique<sp/>samplingTechnique&gt;</highlight></codeline>
+<codeline lineno="116"><highlight class="normal"></highlight><highlight class="keyword">auto</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="117" refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a3b291ce5e552bf0c736be227065cd8ad" refkind="member"><highlight class="normal"><ref refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a3b291ce5e552bf0c736be227065cd8ad" kindref="member">EngineConfigGenerator::cudnnFindPlan</ref>(cudnnHandle_t<sp/>handle,</highlight></codeline>
+<codeline lineno="118"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">cudnn_frontend::OperationGraph</ref><sp/>&amp;opGraph,</highlight></codeline>
+<codeline lineno="119"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">cudnn_frontend::VariantPack</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;variantPack,</highlight></codeline>
+<codeline lineno="120"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ad31f040777311d1d1a7a2490f23e026e" kindref="member">Predicate</ref><sp/>pred)<sp/>-&gt;<sp/><ref refid="df/de1/namespacecudnn__frontend_1a560644a5c1e6016c509a379ca6e03f05" kindref="member">executionPlans_t</ref><sp/>{</highlight></codeline>
+<codeline lineno="122"><highlight class="normal"><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1a560644a5c1e6016c509a379ca6e03f05" kindref="member">executionPlans_t</ref><sp/>plans<sp/>=<sp/>cudnnGetPlan(handle,<sp/>opGraph,<sp/>pred);</highlight></codeline>
+<codeline lineno="123"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>time_sorted_plan&lt;samplingTechnique&gt;(handle,<sp/>std::move(plans),<sp/>variantPack);</highlight></codeline>
+<codeline lineno="124"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="125"><highlight class="normal"></highlight></codeline>
+<codeline lineno="126"><highlight class="normal"></highlight><highlight class="keyword">template</highlight><highlight class="normal"><sp/>&lt;CudnnFindSamplingTechnique<sp/>samplingTechnique&gt;</highlight></codeline>
+<codeline lineno="127"><highlight class="normal"></highlight><highlight class="keyword">auto</highlight><highlight class="normal"></highlight></codeline>
+<codeline lineno="128" refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a4c600ea0cacb969cb0d7168debc5ebc6" refkind="member"><highlight class="normal"><ref refid="dc/da3/classcudnn__frontend_1_1EngineConfigGenerator_1a4c600ea0cacb969cb0d7168debc5ebc6" kindref="member">EngineConfigGenerator::cudnnFindPlanAndCache</ref>(cudnnHandle_t<sp/>handle,</highlight></codeline>
+<codeline lineno="129"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="de/dd9/classcudnn__frontend_1_1OperationGraph__v8" kindref="compound">cudnn_frontend::OperationGraph</ref><sp/>&amp;opGraph,</highlight></codeline>
+<codeline lineno="130"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8" kindref="compound">cudnn_frontend::VariantPack</ref><sp/></highlight><highlight class="keyword">const</highlight><highlight class="normal"><sp/>&amp;variantPack,</highlight></codeline>
+<codeline lineno="131"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="da/df5/classcudnn__frontend_1_1ExecutionPlanCache__v2" kindref="compound">cudnn_frontend::ExecutionPlanCache</ref><sp/>&amp;cache,</highlight></codeline>
+<codeline lineno="132"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/><ref refid="df/de1/namespacecudnn__frontend_1ad31f040777311d1d1a7a2490f23e026e" kindref="member">Predicate</ref><sp/>pred)<sp/>-&gt;<sp/><ref refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" kindref="compound">cudnn_frontend::ExecutionPlan</ref><sp/>{</highlight></codeline>
+<codeline lineno="134"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keyword">auto</highlight><highlight class="normal"><sp/>sorted_plans<sp/>=<sp/>cudnnFindPlan&lt;samplingTechnique&gt;(handle,<sp/>opGraph,<sp/>variantPack,<sp/>pred);</highlight></codeline>
+<codeline lineno="136"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">if</highlight><highlight class="normal"><sp/>(cache.is_fastest_plan_stable(opGraph,<sp/>sorted_plans.front().getTag()))<sp/>{</highlight></codeline>
+<codeline lineno="137"><highlight class="normal"><sp/><sp/><sp/><sp/><sp/><sp/><sp/><sp/>cache.add_plan_to_cache(opGraph,<sp/>sorted_plans.front());</highlight></codeline>
+<codeline lineno="138"><highlight class="normal"><sp/><sp/><sp/><sp/>}</highlight></codeline>
+<codeline lineno="139"><highlight class="normal"><sp/><sp/><sp/><sp/></highlight><highlight class="keywordflow">return</highlight><highlight class="normal"><sp/>sorted_plans.front();</highlight></codeline>
+<codeline lineno="140"><highlight class="normal">}</highlight></codeline>
+<codeline lineno="141"><highlight class="normal"></highlight></codeline>
+<codeline lineno="142"><highlight class="normal">}</highlight></codeline>
     </programlisting>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_find_plan.h"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_find_plan.h"/>
   </compounddef>
 </doxygen>

@@ -8,6 +8,7 @@ var searchData=
   ['wide_5fstring_5finput_5fhelper_3c_20baseinputadapter_2c_202_20_3e',['wide_string_input_helper&lt; BaseInputAdapter, 2 &gt;',['../df/d83/structnlohmann_1_1detail_1_1wide__string__input__helper_3_01BaseInputAdapter_00_012_01_4.html',1,'nlohmann::detail']]],
   ['wide_5fstring_5finput_5fhelper_3c_20baseinputadapter_2c_204_20_3e',['wide_string_input_helper&lt; BaseInputAdapter, 4 &gt;',['../d5/d14/structnlohmann_1_1detail_1_1wide__string__input__helper_3_01BaseInputAdapter_00_014_01_4.html',1,'nlohmann::detail']]],
   ['workspace',['workspace',['../d0/d20/classcudnn__frontend_1_1VariantPack__v8.html#a0f8d91939842bb9003fe71280f0b230c',1,'cudnn_frontend::VariantPack_v8']]],
+  ['workspacesize',['workSpaceSize',['../d7/d0d/group__ExecutionPlanQuery.html#ga9a2005cc54fdc473faad5a1ae2f47661',1,'cudnn_frontend::ExecutionPlan_v8']]],
   ['write_5fbson',['write_bson',['../df/d1a/classnlohmann_1_1detail_1_1binary__writer.html#a9ffc566db5219b473762462234b47db9',1,'nlohmann::detail::binary_writer']]],
   ['write_5fbson_5farray',['write_bson_array',['../df/d1a/classnlohmann_1_1detail_1_1binary__writer.html#a025212bd170253638b9f05b3b6aa5bf9',1,'nlohmann::detail::binary_writer']]],
   ['write_5fbson_5fbinary',['write_bson_binary',['../df/d1a/classnlohmann_1_1detail_1_1binary__writer.html#a97d34d9a70ddc06ae782c55454df42bc',1,'nlohmann::detail::binary_writer']]],
@@ -28,5 +29,8 @@ var searchData=
   ['write_5fmsgpack',['write_msgpack',['../df/d1a/classnlohmann_1_1detail_1_1binary__writer.html#ae4e0852b64102ce4b07d99f08f828b7c',1,'nlohmann::detail::binary_writer']]],
   ['write_5fnumber',['write_number',['../df/d1a/classnlohmann_1_1detail_1_1binary__writer.html#a6e11b7227fcecc25a548ed45507b7d1c',1,'nlohmann::detail::binary_writer']]],
   ['write_5fnumber_5fwith_5fubjson_5fprefix',['write_number_with_ubjson_prefix',['../df/d1a/classnlohmann_1_1detail_1_1binary__writer.html#a0ea6745f944c0c61672146886b4ee90f',1,'nlohmann::detail::binary_writer::write_number_with_ubjson_prefix(const NumberType n, const bool add_prefix)'],['../df/d1a/classnlohmann_1_1detail_1_1binary__writer.html#a0ea6745f944c0c61672146886b4ee90f',1,'nlohmann::detail::binary_writer::write_number_with_ubjson_prefix(const NumberType n, const bool add_prefix)'],['../df/d1a/classnlohmann_1_1detail_1_1binary__writer.html#a0ea6745f944c0c61672146886b4ee90f',1,'nlohmann::detail::binary_writer::write_number_with_ubjson_prefix(const NumberType n, const bool add_prefix)']]],
-  ['write_5fubjson',['write_ubjson',['../df/d1a/classnlohmann_1_1detail_1_1binary__writer.html#a0f6c65053d859269f88eb4ebb0cd7060',1,'nlohmann::detail::binary_writer']]]
+  ['write_5fubjson',['write_ubjson',['../df/d1a/classnlohmann_1_1detail_1_1binary__writer.html#a0f6c65053d859269f88eb4ebb0cd7060',1,'nlohmann::detail::binary_writer']]],
+  ['wtensor_5fdima',['wTensor_dimA',['../d1/d29/classcudnn__frontend_1_1OperationBuilder__v8.html#a209123790e6990a409e89943f37f1c4a',1,'cudnn_frontend::OperationBuilder_v8']]],
+  ['wtensor_5fstra',['wTensor_strA',['../d1/d29/classcudnn__frontend_1_1OperationBuilder__v8.html#afec2ea4ff3ae76400274bfd45ecde43d',1,'cudnn_frontend::OperationBuilder_v8']]],
+  ['wtype',['wType',['../d1/d29/classcudnn__frontend_1_1OperationBuilder__v8.html#a631fc45099d24910d42e830b524df770',1,'cudnn_frontend::OperationBuilder_v8']]]
 ];

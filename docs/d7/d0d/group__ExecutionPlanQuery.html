@@ -29,7 +29,7 @@
  <tr style="height: 56px;">
   <td id="projectalign" style="padding-left: 0.5em;">
    <div id="projectname">CUDNN Frontend API
-   &#160;<span id="projectnumber">8.2.0</span>
+   &#160;<span id="projectnumber">8.3.0</span>
    </div>
   </td>
  </tr>
@@ -113,14 +113,24 @@ Functions</h2></td></tr>
 <tr class="separator:gad80aa2980d915449d05db4c71041e2e0"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:ga2ff1340409f8834fe9ae68ff4c00281a"><td class="memItemLeft" align="right" valign="top">std::string const  &amp;&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga2ff1340409f8834fe9ae68ff4c00281a">cudnn_frontend::ExecutionPlan_v8::getTag</a> () const</td></tr>
 <tr class="separator:ga2ff1340409f8834fe9ae68ff4c00281a"><td class="memSeparator" colspan="2">&#160;</td></tr>
-<tr class="memitem:ga8a6517102f5c12e63e4417324a03180b"><td class="memItemLeft" align="right" valign="top">void&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga8a6517102f5c12e63e4417324a03180b">cudnn_frontend::ExecutionPlan_v8::computeTag</a> ()</td></tr>
-<tr class="separator:ga8a6517102f5c12e63e4417324a03180b"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ga5dba05b9e657dde5c551e24f752c2955"><td class="memItemLeft" align="right" valign="top">void&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga5dba05b9e657dde5c551e24f752c2955">cudnn_frontend::ExecutionPlan_v8::setExecutionTime</a> (float time_)</td></tr>
+<tr class="separator:ga5dba05b9e657dde5c551e24f752c2955"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ga74f24a0cc255a72af695056c2f559af7"><td class="memItemLeft" align="right" valign="top">float&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga74f24a0cc255a72af695056c2f559af7">cudnn_frontend::ExecutionPlan_v8::getExecutionTime</a> () const</td></tr>
+<tr class="separator:ga74f24a0cc255a72af695056c2f559af7"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:gaa30b7ca096b12ebaf84178f88b00366b"><td class="memItemLeft" align="right" valign="top">std::array&lt; cudnnBackendNumericalNote_t, CUDNN_NUMERICAL_NOTE_TYPE_COUNT &gt; const  &amp;&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#gaa30b7ca096b12ebaf84178f88b00366b">cudnn_frontend::ExecutionPlan_v8::getNumericNotes</a> () const</td></tr>
+<tr class="separator:gaa30b7ca096b12ebaf84178f88b00366b"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ga20a9ecf9902ac8bc280c713a9735322d"><td class="memItemLeft" align="right" valign="top">&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga20a9ecf9902ac8bc280c713a9735322d">cudnn_frontend::ExecutionPlan_v8::ExecutionPlan_v8</a> (<a class="el" href="../../d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html">ExecutionPlan_v8</a> const &amp;)=default</td></tr>
+<tr class="separator:ga20a9ecf9902ac8bc280c713a9735322d"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ga3698990163856e1ab9d1f6f23a13cc0e"><td class="memItemLeft" align="right" valign="top"><a class="el" href="../../d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html">ExecutionPlan_v8</a> &amp;&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga3698990163856e1ab9d1f6f23a13cc0e">cudnn_frontend::ExecutionPlan_v8::operator=</a> (<a class="el" href="../../d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html">ExecutionPlan_v8</a> const &amp;)=default</td></tr>
+<tr class="separator:ga3698990163856e1ab9d1f6f23a13cc0e"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ga7305ab3de5d0790c77492e47cbdbb593"><td class="memItemLeft" align="right" valign="top">void&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga7305ab3de5d0790c77492e47cbdbb593">cudnn_frontend::ExecutionPlan_v8::fetchNotes</a> (<a class="el" href="../../df/de1/namespacecudnn__frontend.html#ac94d582cdfa2adf3d68a4e675e5d69aa">ManagedOpaqueDescriptor</a> &amp;extractedEngine)</td></tr>
+<tr class="separator:ga7305ab3de5d0790c77492e47cbdbb593"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ga093a562caa7f8a906a362d9f70496020"><td class="memItemLeft" align="right" valign="top">void&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga093a562caa7f8a906a362d9f70496020">cudnn_frontend::ExecutionPlan_v8::buildTag</a> (<a class="el" href="../../df/de1/namespacecudnn__frontend.html#ac94d582cdfa2adf3d68a4e675e5d69aa">ManagedOpaqueDescriptor</a> &amp;extractedEngine)</td></tr>
+<tr class="separator:ga093a562caa7f8a906a362d9f70496020"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:gafec2d06137cf97fef71d5ae17f178ce3"><td class="memItemLeft" align="right" valign="top">void&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#gafec2d06137cf97fef71d5ae17f178ce3">cudnn_frontend::ExecutionPlan_v8::computeWorkSpaceSize</a> ()</td></tr>
+<tr class="separator:gafec2d06137cf97fef71d5ae17f178ce3"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:ga2c011aa14563ef96417ce599f0c83d89"><td class="memItemLeft" align="right" valign="top">&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga2c011aa14563ef96417ce599f0c83d89">cudnn_frontend::ExecutionPlan_v8::ExecutionPlan_v8</a> ()=default</td></tr>
 <tr class="separator:ga2c011aa14563ef96417ce599f0c83d89"><td class="memSeparator" colspan="2">&#160;</td></tr>
-<tr class="memitem:ga51c4b75729ab066f0686729896741c5d"><td class="memItemLeft" align="right" valign="top">&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga51c4b75729ab066f0686729896741c5d">cudnn_frontend::ExecutionPlan_v8::ExecutionPlan_v8</a> (<a class="el" href="../../d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html">ExecutionPlan_v8</a> const &amp;)=delete</td></tr>
-<tr class="separator:ga51c4b75729ab066f0686729896741c5d"><td class="memSeparator" colspan="2">&#160;</td></tr>
-<tr class="memitem:ga0705e60cee62d3d196751517d545a7b0"><td class="memItemLeft" align="right" valign="top"><a class="el" href="../../d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html">ExecutionPlan_v8</a> &amp;&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga0705e60cee62d3d196751517d545a7b0">cudnn_frontend::ExecutionPlan_v8::operator=</a> (<a class="el" href="../../d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html">ExecutionPlan_v8</a> const &amp;)=delete</td></tr>
-<tr class="separator:ga0705e60cee62d3d196751517d545a7b0"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:ga5ff39f2019a5a3fe8062bf887707877c"><td class="memItemLeft" align="right" valign="top"><a class="el" href="../../d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html">ExecutionPlan_v8</a> &amp;&amp;&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga5ff39f2019a5a3fe8062bf887707877c">cudnn_frontend::ExecutionPlanBuilder_v8::build</a> ()</td></tr>
 <tr class="separator:ga5ff39f2019a5a3fe8062bf887707877c"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:ga8e48fb375271599c83f57922d9f8c89e"><td class="memItemLeft" align="right" valign="top">&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga8e48fb375271599c83f57922d9f8c89e">cudnn_frontend::ExecutionPlanBuilder_v8::ExecutionPlanBuilder_v8</a> ()=default</td></tr>
@@ -142,6 +152,12 @@ Variables</h2></td></tr>
 <tr class="separator:ga4c36108c6511420d81fcda5292761726"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:gaf732b37c9c05a2a8bd1a76289c740c4a"><td class="memItemLeft" align="right" valign="top">std::string&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#gaf732b37c9c05a2a8bd1a76289c740c4a">cudnn_frontend::ExecutionPlan_v8::planTag</a></td></tr>
 <tr class="separator:gaf732b37c9c05a2a8bd1a76289c740c4a"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ga9a2005cc54fdc473faad5a1ae2f47661"><td class="memItemLeft" align="right" valign="top">std::int64_t&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga9a2005cc54fdc473faad5a1ae2f47661">cudnn_frontend::ExecutionPlan_v8::workSpaceSize</a> = 0</td></tr>
+<tr class="separator:ga9a2005cc54fdc473faad5a1ae2f47661"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ga09c8d1d462a0f779ec10f10b285e5114"><td class="memItemLeft" align="right" valign="top">std::array&lt; cudnnBackendNumericalNote_t, CUDNN_NUMERICAL_NOTE_TYPE_COUNT &gt;&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga09c8d1d462a0f779ec10f10b285e5114">cudnn_frontend::ExecutionPlan_v8::numeric_notes</a></td></tr>
+<tr class="separator:ga09c8d1d462a0f779ec10f10b285e5114"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ga4cc1f2284941f48a122a54afff98caff"><td class="memItemLeft" align="right" valign="top">float&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga4cc1f2284941f48a122a54afff98caff">cudnn_frontend::ExecutionPlan_v8::execution_time_ms</a> = 0.0f</td></tr>
+<tr class="separator:ga4cc1f2284941f48a122a54afff98caff"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:gae1a2e3dd89dbe455e7067531ec5b5562"><td class="memItemLeft" align="right" valign="top"><a class="el" href="../../d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html">ExecutionPlan_v8</a>&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#gae1a2e3dd89dbe455e7067531ec5b5562">cudnn_frontend::ExecutionPlanBuilder_v8::m_execution_plan</a></td></tr>
 <tr class="separator:gae1a2e3dd89dbe455e7067531ec5b5562"><td class="memSeparator" colspan="2">&#160;</td></tr>
 </table>
@@ -172,14 +188,14 @@ Variables</h2></td></tr>
 </div><div class="memdoc">
 <p>constructs the Engine Config by calling the cudnn API Throws the appropriate error message </p>
 
-<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00243">243</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00298">298</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00053">cudnn_frontend::ExecutionPlan_v8::ExecutionPlanBuilder_v8</a>, <a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga0705e60cee62d3d196751517d545a7b0">cudnn_frontend::ExecutionPlan_v8::operator=()</a>, <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00060">cudnn_frontend::set_error_and_throw_exception()</a>, and <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00158">cudnn_frontend::BackendDescriptor::status</a>.</p>
+<p class="reference">References <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00053">cudnn_frontend::ExecutionPlan_v8::ExecutionPlanBuilder_v8</a>, <a class="el" href="../../d8/dc4/cudnn__frontend__Logging_8h_source.html#l00072">cudnn_frontend::getLogger()</a>, <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00088">cudnn_frontend::make_shared_backend_pointer()</a>, <a class="el" href="../../d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html#a48865439534090da7c9b261bd77313c7">cudnn_frontend::ExecutionPlan_v8::operator=()</a>, <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00138">cudnn_frontend::set_error_and_throw_exception()</a>, and <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00160">cudnn_frontend::BackendDescriptor::status</a>.</p>
 
 </div>
 </div>
-<a id="ga8a6517102f5c12e63e4417324a03180b"></a>
-<h2 class="memtitle"><span class="permalink"><a href="#ga8a6517102f5c12e63e4417324a03180b">&#9670;&nbsp;</a></span>computeTag()</h2>
+<a id="ga093a562caa7f8a906a362d9f70496020"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#ga093a562caa7f8a906a362d9f70496020">&#9670;&nbsp;</a></span>buildTag()</h2>
 
 <div class="memitem">
 <div class="memproto">
@@ -188,7 +204,37 @@ Variables</h2></td></tr>
   <td class="mlabels-left">
       <table class="memname">
         <tr>
-          <td class="memname">void cudnn_frontend::ExecutionPlan_v8::computeTag </td>
+          <td class="memname">void cudnn_frontend::ExecutionPlan_v8::buildTag </td>
+          <td>(</td>
+          <td class="paramtype"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#ac94d582cdfa2adf3d68a4e675e5d69aa">ManagedOpaqueDescriptor</a> &amp;&#160;</td>
+          <td class="paramname"><em>extractedEngine</em></td><td>)</td>
+          <td></td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">inline</span><span class="mlabel">private</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00152">152</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+
+<p class="reference">References <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00249">cudnn_frontend::ExecutionPlan_v8::engine_config</a>, <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00088">cudnn_frontend::make_shared_backend_pointer()</a>, <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00251">cudnn_frontend::ExecutionPlan_v8::planTag</a>, <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00138">cudnn_frontend::set_error_and_throw_exception()</a>, and <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00160">cudnn_frontend::BackendDescriptor::status</a>.</p>
+
+</div>
+</div>
+<a id="gafec2d06137cf97fef71d5ae17f178ce3"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#gafec2d06137cf97fef71d5ae17f178ce3">&#9670;&nbsp;</a></span>computeWorkSpaceSize()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">void cudnn_frontend::ExecutionPlan_v8::computeWorkSpaceSize </td>
           <td>(</td>
           <td class="paramname"></td><td>)</td>
           <td></td>
@@ -201,9 +247,9 @@ Variables</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00104">104</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00229">229</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00203">cudnn_frontend::ExecutionPlan_v8::engine_config</a>, <a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga2c011aa14563ef96417ce599f0c83d89">cudnn_frontend::ExecutionPlan_v8::ExecutionPlan_v8()</a>, <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00086">cudnn_frontend::make_shared_backend_pointer()</a>, <a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga0705e60cee62d3d196751517d545a7b0">cudnn_frontend::ExecutionPlan_v8::operator=()</a>, <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00205">cudnn_frontend::ExecutionPlan_v8::planTag</a>, <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00060">cudnn_frontend::set_error_and_throw_exception()</a>, and <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00158">cudnn_frontend::BackendDescriptor::status</a>.</p>
+<p class="reference">References <a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga2c011aa14563ef96417ce599f0c83d89">cudnn_frontend::ExecutionPlan_v8::ExecutionPlan_v8()</a>, <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00158">cudnn_frontend::BackendDescriptor::pointer</a>, <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00138">cudnn_frontend::set_error_and_throw_exception()</a>, <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00160">cudnn_frontend::BackendDescriptor::status</a>, and <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00253">cudnn_frontend::ExecutionPlan_v8::workSpaceSize</a>.</p>
 
 </div>
 </div>
@@ -234,12 +280,40 @@ Variables</h2></td></tr>
 
 <p>Implements <a class="el" href="../../d6/d88/classcudnn__frontend_1_1BackendDescriptor.html#ab652fb3e9a58092fbb137b0e959a9478">cudnn_frontend::BackendDescriptor</a>.</p>
 
-<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00091">91</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00071">71</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+
+<p class="reference">References <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00088">cudnn_frontend::ExecutionPlan_v8::getTag()</a>, <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00254">cudnn_frontend::ExecutionPlan_v8::numeric_notes</a>, and <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00253">cudnn_frontend::ExecutionPlan_v8::workSpaceSize</a>.</p>
+
+</div>
+</div>
+<a id="ga20a9ecf9902ac8bc280c713a9735322d"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#ga20a9ecf9902ac8bc280c713a9735322d">&#9670;&nbsp;</a></span>ExecutionPlan_v8() <span class="overload">[1/2]</span></h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">cudnn_frontend::ExecutionPlan_v8::ExecutionPlan_v8 </td>
+          <td>(</td>
+          <td class="paramtype"><a class="el" href="../../d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html">ExecutionPlan_v8</a> const &amp;&#160;</td>
+          <td class="paramname"></td><td>)</td>
+          <td></td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">default</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
 
 </div>
 </div>
 <a id="ga2c011aa14563ef96417ce599f0c83d89"></a>
-<h2 class="memtitle"><span class="permalink"><a href="#ga2c011aa14563ef96417ce599f0c83d89">&#9670;&nbsp;</a></span>ExecutionPlan_v8() <span class="overload">[1/2]</span></h2>
+<h2 class="memtitle"><span class="permalink"><a href="#ga2c011aa14563ef96417ce599f0c83d89">&#9670;&nbsp;</a></span>ExecutionPlan_v8() <span class="overload">[2/2]</span></h2>
 
 <div class="memitem">
 <div class="memproto">
@@ -261,33 +335,7 @@ Variables</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="reference">Referenced by <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00104">cudnn_frontend::ExecutionPlan_v8::computeTag()</a>.</p>
-
-</div>
-</div>
-<a id="ga51c4b75729ab066f0686729896741c5d"></a>
-<h2 class="memtitle"><span class="permalink"><a href="#ga51c4b75729ab066f0686729896741c5d">&#9670;&nbsp;</a></span>ExecutionPlan_v8() <span class="overload">[2/2]</span></h2>
-
-<div class="memitem">
-<div class="memproto">
-<table class="mlabels">
-  <tr>
-  <td class="mlabels-left">
-      <table class="memname">
-        <tr>
-          <td class="memname">cudnn_frontend::ExecutionPlan_v8::ExecutionPlan_v8 </td>
-          <td>(</td>
-          <td class="paramtype"><a class="el" href="../../d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html">ExecutionPlan_v8</a> const &amp;&#160;</td>
-          <td class="paramname"></td><td>)</td>
-          <td></td>
-        </tr>
-      </table>
-  </td>
-  <td class="mlabels-right">
-<span class="mlabels"><span class="mlabel">private</span><span class="mlabel">delete</span></span>  </td>
-  </tr>
-</table>
-</div><div class="memdoc">
+<p class="reference">Referenced by <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00229">cudnn_frontend::ExecutionPlan_v8::computeWorkSpaceSize()</a>, and <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00103">cudnn_frontend::ExecutionPlan_v8::getNumericNotes()</a>.</p>
 
 </div>
 </div>
@@ -368,6 +416,96 @@ Variables</h2></td></tr>
 
 </div>
 </div>
+<a id="ga7305ab3de5d0790c77492e47cbdbb593"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#ga7305ab3de5d0790c77492e47cbdbb593">&#9670;&nbsp;</a></span>fetchNotes()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">void cudnn_frontend::ExecutionPlan_v8::fetchNotes </td>
+          <td>(</td>
+          <td class="paramtype"><a class="el" href="../../df/de1/namespacecudnn__frontend.html#ac94d582cdfa2adf3d68a4e675e5d69aa">ManagedOpaqueDescriptor</a> &amp;&#160;</td>
+          <td class="paramname"><em>extractedEngine</em></td><td>)</td>
+          <td></td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">inline</span><span class="mlabel">private</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00119">119</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+
+<p class="reference">References <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00254">cudnn_frontend::ExecutionPlan_v8::numeric_notes</a>, <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00138">cudnn_frontend::set_error_and_throw_exception()</a>, and <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00160">cudnn_frontend::BackendDescriptor::status</a>.</p>
+
+</div>
+</div>
+<a id="ga74f24a0cc255a72af695056c2f559af7"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#ga74f24a0cc255a72af695056c2f559af7">&#9670;&nbsp;</a></span>getExecutionTime()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">float cudnn_frontend::ExecutionPlan_v8::getExecutionTime </td>
+          <td>(</td>
+          <td class="paramname"></td><td>)</td>
+          <td> const</td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">inline</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00098">98</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+
+<p class="reference">References <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00259">cudnn_frontend::ExecutionPlan_v8::execution_time_ms</a>.</p>
+
+<p class="reference">Referenced by <a class="el" href="../../d3/d6b/cudnn__frontend__find__plan_8h_source.html#l00038">cudnn_frontend::time_sorted_plan()</a>.</p>
+
+</div>
+</div>
+<a id="gaa30b7ca096b12ebaf84178f88b00366b"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#gaa30b7ca096b12ebaf84178f88b00366b">&#9670;&nbsp;</a></span>getNumericNotes()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">std::array&lt;cudnnBackendNumericalNote_t,CUDNN_NUMERICAL_NOTE_TYPE_COUNT&gt; const&amp; cudnn_frontend::ExecutionPlan_v8::getNumericNotes </td>
+          <td>(</td>
+          <td class="paramname"></td><td>)</td>
+          <td> const</td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">inline</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00103">103</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+
+<p class="reference">References <a class="el" href="../../d7/d0d/group__ExecutionPlanQuery.html#ga2c011aa14563ef96417ce599f0c83d89">cudnn_frontend::ExecutionPlan_v8::ExecutionPlan_v8()</a>, <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00254">cudnn_frontend::ExecutionPlan_v8::numeric_notes</a>, and <a class="el" href="../../d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8.html#a48865439534090da7c9b261bd77313c7">cudnn_frontend::ExecutionPlan_v8::operator=()</a>.</p>
+
+</div>
+</div>
 <a id="ga2ff1340409f8834fe9ae68ff4c00281a"></a>
 <h2 class="memtitle"><span class="permalink"><a href="#ga2ff1340409f8834fe9ae68ff4c00281a">&#9670;&nbsp;</a></span>getTag()</h2>
 
@@ -391,9 +529,11 @@ Variables</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00098">98</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00088">88</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00205">cudnn_frontend::ExecutionPlan_v8::planTag</a>.</p>
+<p class="reference">References <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00251">cudnn_frontend::ExecutionPlan_v8::planTag</a>.</p>
+
+<p class="reference">Referenced by <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00071">cudnn_frontend::ExecutionPlan_v8::describe()</a>.</p>
 
 </div>
 </div>
@@ -423,14 +563,14 @@ Variables</h2></td></tr>
 
 <p>Query the workspace requirement for the given plan. </p>
 
-<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00067">67</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00066">66</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00156">cudnn_frontend::BackendDescriptor::pointer</a>, <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00060">cudnn_frontend::set_error_and_throw_exception()</a>, and <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00158">cudnn_frontend::BackendDescriptor::status</a>.</p>
+<p class="reference">References <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00253">cudnn_frontend::ExecutionPlan_v8::workSpaceSize</a>.</p>
 
 </div>
 </div>
-<a id="ga0705e60cee62d3d196751517d545a7b0"></a>
-<h2 class="memtitle"><span class="permalink"><a href="#ga0705e60cee62d3d196751517d545a7b0">&#9670;&nbsp;</a></span>operator=() <span class="overload">[1/2]</span></h2>
+<a id="ga3698990163856e1ab9d1f6f23a13cc0e"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#ga3698990163856e1ab9d1f6f23a13cc0e">&#9670;&nbsp;</a></span>operator=() <span class="overload">[1/2]</span></h2>
 
 <div class="memitem">
 <div class="memproto">
@@ -448,12 +588,10 @@ Variables</h2></td></tr>
       </table>
   </td>
   <td class="mlabels-right">
-<span class="mlabels"><span class="mlabel">private</span><span class="mlabel">delete</span></span>  </td>
+<span class="mlabels"><span class="mlabel">default</span></span>  </td>
   </tr>
 </table>
 </div><div class="memdoc">
-
-<p class="reference">Referenced by <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00243">cudnn_frontend::ExecutionPlanBuilder_v8::build()</a>, and <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00104">cudnn_frontend::ExecutionPlan_v8::computeTag()</a>.</p>
 
 </div>
 </div>
@@ -480,6 +618,36 @@ Variables</h2></td></tr>
   </tr>
 </table>
 </div><div class="memdoc">
+
+</div>
+</div>
+<a id="ga5dba05b9e657dde5c551e24f752c2955"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#ga5dba05b9e657dde5c551e24f752c2955">&#9670;&nbsp;</a></span>setExecutionTime()</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">void cudnn_frontend::ExecutionPlan_v8::setExecutionTime </td>
+          <td>(</td>
+          <td class="paramtype">float&#160;</td>
+          <td class="paramname"><em>time_</em></td><td>)</td>
+          <td></td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">inline</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00093">93</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+
+<p class="reference">References <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00259">cudnn_frontend::ExecutionPlan_v8::execution_time_ms</a>.</p>
 
 </div>
 </div>
@@ -529,9 +697,35 @@ Variables</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00203">203</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00249">249</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00104">cudnn_frontend::ExecutionPlan_v8::computeTag()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00152">cudnn_frontend::ExecutionPlan_v8::buildTag()</a>.</p>
+
+</div>
+</div>
+<a id="ga4cc1f2284941f48a122a54afff98caff"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#ga4cc1f2284941f48a122a54afff98caff">&#9670;&nbsp;</a></span>execution_time_ms</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">float cudnn_frontend::ExecutionPlan_v8::execution_time_ms = 0.0f</td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">private</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00259">259</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+
+<p class="reference">Referenced by <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00098">cudnn_frontend::ExecutionPlan_v8::getExecutionTime()</a>, and <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00093">cudnn_frontend::ExecutionPlan_v8::setExecutionTime()</a>.</p>
 
 </div>
 </div>
@@ -555,7 +749,7 @@ Variables</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00204">204</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00250">250</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
 
 </div>
 </div>
@@ -579,7 +773,33 @@ Variables</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00312">312</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00393">393</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+
+</div>
+</div>
+<a id="ga09c8d1d462a0f779ec10f10b285e5114"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#ga09c8d1d462a0f779ec10f10b285e5114">&#9670;&nbsp;</a></span>numeric_notes</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">std::array&lt;cudnnBackendNumericalNote_t,CUDNN_NUMERICAL_NOTE_TYPE_COUNT&gt; cudnn_frontend::ExecutionPlan_v8::numeric_notes</td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">private</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00254">254</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+
+<p class="reference">Referenced by <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00071">cudnn_frontend::ExecutionPlan_v8::describe()</a>, <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00119">cudnn_frontend::ExecutionPlan_v8::fetchNotes()</a>, and <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00103">cudnn_frontend::ExecutionPlan_v8::getNumericNotes()</a>.</p>
 
 </div>
 </div>
@@ -603,9 +823,35 @@ Variables</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00205">205</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00251">251</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
 
-<p class="reference">Referenced by <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00104">cudnn_frontend::ExecutionPlan_v8::computeTag()</a>, and <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00098">cudnn_frontend::ExecutionPlan_v8::getTag()</a>.</p>
+<p class="reference">Referenced by <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00152">cudnn_frontend::ExecutionPlan_v8::buildTag()</a>, and <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00088">cudnn_frontend::ExecutionPlan_v8::getTag()</a>.</p>
+
+</div>
+</div>
+<a id="ga9a2005cc54fdc473faad5a1ae2f47661"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#ga9a2005cc54fdc473faad5a1ae2f47661">&#9670;&nbsp;</a></span>workSpaceSize</h2>
+
+<div class="memitem">
+<div class="memproto">
+<table class="mlabels">
+  <tr>
+  <td class="mlabels-left">
+      <table class="memname">
+        <tr>
+          <td class="memname">std::int64_t cudnn_frontend::ExecutionPlan_v8::workSpaceSize = 0</td>
+        </tr>
+      </table>
+  </td>
+  <td class="mlabels-right">
+<span class="mlabels"><span class="mlabel">private</span></span>  </td>
+  </tr>
+</table>
+</div><div class="memdoc">
+
+<p class="definition">Definition at line <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00253">253</a> of file <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html">cudnn_frontend_ExecutionPlan.h</a>.</p>
+
+<p class="reference">Referenced by <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00229">cudnn_frontend::ExecutionPlan_v8::computeWorkSpaceSize()</a>, <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00071">cudnn_frontend::ExecutionPlan_v8::describe()</a>, and <a class="el" href="../../d6/d51/cudnn__frontend__ExecutionPlan_8h_source.html#l00066">cudnn_frontend::ExecutionPlan_v8::getWorkspaceSize()</a>.</p>
 
 </div>
 </div>

@@ -23,7 +23,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="94" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="94" bodyend="98"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="92" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" bodystart="92" bodyend="96"/>
       </memberdef>
       <memberdef kind="function" id="d5/def/group__VariantPackBuilder__v8_1gad6dc5c5087c2724ca88cc2668d7f829d" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -44,8 +44,8 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="101" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="101" bodyend="104"/>
-        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a5c3371913fd88b20557bcc4d8ef93219" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="79">cudnn_frontend::VariantPack_v8::uid</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="99" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" bodystart="99" bodyend="102"/>
+        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a5c3371913fd88b20557bcc4d8ef93219" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="77">cudnn_frontend::VariantPack_v8::uid</references>
       </memberdef>
       <memberdef kind="function" id="d5/def/group__VariantPackBuilder__v8_1ga14d3ac479fd01c48a97583adfb567090" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -62,8 +62,8 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="107" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="107" bodyend="116"/>
-        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a3a03ddd893f41a9ce6ca674bbfae7434" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="78">cudnn_frontend::VariantPack_v8::data_pointers</references>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="105" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" bodystart="105" bodyend="114"/>
+        <references refid="d0/d20/classcudnn__frontend_1_1VariantPack__v8_1a3a03ddd893f41a9ce6ca674bbfae7434" compoundref="df/dc0/cudnn__frontend__VariantPack_8h" startline="76">cudnn_frontend::VariantPack_v8::data_pointers</references>
       </memberdef>
       <memberdef kind="function" id="d5/def/group__VariantPackBuilder__v8_1ga3a7b9ac8c714db202a8f89a6110675b6" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -80,7 +80,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" line="119" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_VariantPack.h" bodystart="119" bodyend="122"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" line="117" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_VariantPack.h" bodystart="117" bodyend="120"/>
       </memberdef>
       </sectiondef>
     <briefdescription>

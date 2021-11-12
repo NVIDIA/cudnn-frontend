@@ -29,7 +29,7 @@
  <tr style="height: 56px;">
   <td id="projectalign" style="padding-left: 0.5em;">
    <div id="projectname">CUDNN Frontend API
-   &#160;<span id="projectnumber">8.2.0</span>
+   &#160;<span id="projectnumber">8.3.0</span>
    </div>
   </td>
  </tr>
@@ -95,7 +95,7 @@ Collaboration diagram for cudnn_frontend::ConvDescBuilder_v8:</div>
 <div class="dyncontent">
 <div class="center"><img src="../../dc/d2f/classcudnn__frontend_1_1ConvDescBuilder__v8__coll__graph.png" border="0" usemap="#cudnn__frontend_1_1ConvDescBuilder__v8_coll__map" alt="Collaboration graph"/></div>
 <map name="cudnn__frontend_1_1ConvDescBuilder__v8_coll__map" id="cudnn__frontend_1_1ConvDescBuilder__v8_coll__map">
-<area shape="rect" id="node2" href="../../d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html" title="{cudnn_frontend::ConvDesc_v8\n||+ describe()\l+ ConvDesc_v8()\l+ ~ConvDesc_v8()\l&#45; ConvDesc_v8()\l&#45; ConvDesc_v8()\l&#45; operator=()\l}" alt="" coords="367,647,570,797"/>
+<area shape="rect" id="node2" href="../../d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html" title="{cudnn_frontend::ConvDesc_v8\n||+ describe()\l+ ConvDesc_v8()\l+ operator=()\l+ ~ConvDesc_v8()\l+ getComputePrecision()\l+ getDimensionCount()\l+ getPadding()\l+ getStride()\l+ getDilation()\l+ getMathMode()\l&#45; ConvDesc_v8()\l&#45; ConvDesc_v8()\l&#45; operator=()\l}" alt="" coords="367,647,570,900"/>
 <area shape="rect" id="node3" href="../../d6/d88/classcudnn__frontend_1_1BackendDescriptor.html" title="{cudnn_frontend::BackendDescriptor\n||+ describe()\l+ get_raw_desc()\l+ get_status()\l+ set_status()\l+ set_error()\l+ get_error()\l+ get_desc()\l+ initialize_managed\l_backend_pointer()\l# BackendDescriptor()\l# BackendDescriptor()\l}" alt="" coords="113,301,344,525"/>
 <area shape="rect" id="node4" title="STL class. " alt="" coords="29,154,109,231"/>
 <area shape="rect" id="node5" title="STL class. " alt="" coords="5,5,132,97"/>
@@ -107,6 +107,8 @@ Public Member Functions</h2></td></tr>
 <tr class="memitem:gad8de00b0e7a86bdda61749e7572a35ac"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d3/ddd/group__ConvDescBuilder__v8.html#gad8de00b0e7a86bdda61749e7572a35ac">setDataType</a> (cudnnDataType_t data_type_) -&gt; <a class="el" href="../../db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html">ConvDescBuilder_v8</a> &amp;</td></tr>
 <tr class="memdesc:gad8de00b0e7a86bdda61749e7572a35ac"><td class="mdescLeft">&#160;</td><td class="mdescRight">Set Datatype for the Convolution Operation.  <a href="../../d3/ddd/group__ConvDescBuilder__v8.html#gad8de00b0e7a86bdda61749e7572a35ac">More...</a><br /></td></tr>
 <tr class="separator:gad8de00b0e7a86bdda61749e7572a35ac"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:ga8f4b0d58c7213ce6be6e341afa56c654"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d3/ddd/group__ConvDescBuilder__v8.html#ga8f4b0d58c7213ce6be6e341afa56c654">setComputePrecision</a> (cudnnDataType_t data_type_) -&gt; <a class="el" href="../../db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html">ConvDescBuilder_v8</a> &amp;</td></tr>
+<tr class="separator:ga8f4b0d58c7213ce6be6e341afa56c654"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:gab07bf6292e69d19e6324d3073a86d58c"><td class="memItemLeft" align="right" valign="top">auto&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="../../d3/ddd/group__ConvDescBuilder__v8.html#gab07bf6292e69d19e6324d3073a86d58c">setPrePadding</a> (int64_t ndims, int64_t const *padding) -&gt; <a class="el" href="../../db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html">ConvDescBuilder_v8</a> &amp;</td></tr>
 <tr class="memdesc:gab07bf6292e69d19e6324d3073a86d58c"><td class="mdescLeft">&#160;</td><td class="mdescRight">Set Padding Lower of the convDesc.  <a href="../../d3/ddd/group__ConvDescBuilder__v8.html#gab07bf6292e69d19e6324d3073a86d58c">More...</a><br /></td></tr>
 <tr class="separator:gab07bf6292e69d19e6324d3073a86d58c"><td class="memSeparator" colspan="2">&#160;</td></tr>
@@ -146,7 +148,7 @@ Private Attributes</h2></td></tr>
 <a name="details" id="details"></a><h2 class="groupheader">Detailed Description</h2>
 <div class="textblock"><p><a class="el" href="../../db/de1/classcudnn__frontend_1_1ConvDescBuilder__v8.html">ConvDescBuilder_v8</a> Class Helper class used to build <a class="el" href="../../d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html">ConvDesc_v8</a> class </p>
 
-<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00119">119</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00141">141</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
 </div><h2 class="groupheader">Constructor &amp; Destructor Documentation</h2>
 <a id="ae7b3fb50c7866c50ac1a170e137f38af"></a>
 <h2 class="memtitle"><span class="permalink"><a href="#ae7b3fb50c7866c50ac1a170e137f38af">&#9670;&nbsp;</a></span>ConvDescBuilder_v8() <span class="overload">[1/3]</span></h2>
@@ -275,9 +277,9 @@ Private Attributes</h2></td></tr>
 </div><div class="memdoc">
 <p>constructs the <a class="el" href="../../d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html">ConvDesc_v8</a> by calling the cudnn API Throws the appropriate error message </p>
 
-<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00172">172</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00198">198</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
 
-<p class="reference">References <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00056">cudnn_frontend::ConvDesc_v8::ConvDescBuilder_v8</a>, <a class="el" href="../../d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html#aa8ea272eaf26ae7f7ad2d625253ea62f">cudnn_frontend::ConvDesc_v8::operator=()</a>, <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00060">cudnn_frontend::set_error_and_throw_exception()</a>, and <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00158">cudnn_frontend::BackendDescriptor::status</a>.</p>
+<p class="reference">References <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00056">cudnn_frontend::ConvDesc_v8::ConvDescBuilder_v8</a>, <a class="el" href="../../d8/dc4/cudnn__frontend__Logging_8h_source.html#l00072">cudnn_frontend::getLogger()</a>, <a class="el" href="../../d6/d73/classcudnn__frontend_1_1ConvDesc__v8.html#a9572980b24824da18aa82da4ad6c3052">cudnn_frontend::ConvDesc_v8::operator=()</a>, <a class="el" href="../../df/d17/cudnn__frontend__utils_8h_source.html#l00138">cudnn_frontend::set_error_and_throw_exception()</a>, and <a class="el" href="../../dc/d11/cudnn__backend__base_8h_source.html#l00160">cudnn_frontend::BackendDescriptor::status</a>.</p>
 
 </div>
 </div>
@@ -328,7 +330,7 @@ Private Attributes</h2></td></tr>
 </table>
 </div><div class="memdoc">
 
-<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00314">314</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
+<p class="definition">Definition at line <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html#l00341">341</a> of file <a class="el" href="../../d1/de7/cudnn__frontend__ConvDesc_8h_source.html">cudnn_frontend_ConvDesc.h</a>.</p>
 
 </div>
 </div>

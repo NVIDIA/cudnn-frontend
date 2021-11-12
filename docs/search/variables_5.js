@@ -13,5 +13,7 @@ var searchData=
   ['err_5fmsg',['err_msg',['../d6/d88/classcudnn__frontend_1_1BackendDescriptor.html#a0d416655dab2b5a675fecb5df9ea8521',1,'cudnn_frontend::BackendDescriptor']]],
   ['error_5fhandler',['error_handler',['../d4/d0a/classnlohmann_1_1detail_1_1serializer.html#a09d5a046fb0f7cb61977d6e5fbe8b3a1',1,'nlohmann::detail::serializer']]],
   ['error_5fmessage',['error_message',['../d8/d22/classnlohmann_1_1detail_1_1lexer.html#a84cbcd8c897c98c2ce04d29a29bf84cc',1,'nlohmann::detail::lexer']]],
-  ['errored',['errored',['../dc/d68/classnlohmann_1_1detail_1_1json__sax__dom__parser.html#a31ccb472ed855e2f2370fd091d91aad7',1,'nlohmann::detail::json_sax_dom_parser::errored()'],['../d6/d69/classnlohmann_1_1detail_1_1json__sax__dom__callback__parser.html#ab06baaa640cfaae5846daa7c3594b116',1,'nlohmann::detail::json_sax_dom_callback_parser::errored()']]]
+  ['error_5fstatus',['error_status',['../d9/dca/classcudnn__frontend_1_1cudnnException.html#af8ffe8ca23602e33a75020da77ee9754',1,'cudnn_frontend::cudnnException']]],
+  ['errored',['errored',['../dc/d68/classnlohmann_1_1detail_1_1json__sax__dom__parser.html#a31ccb472ed855e2f2370fd091d91aad7',1,'nlohmann::detail::json_sax_dom_parser::errored()'],['../d6/d69/classnlohmann_1_1detail_1_1json__sax__dom__callback__parser.html#ab06baaa640cfaae5846daa7c3594b116',1,'nlohmann::detail::json_sax_dom_callback_parser::errored()']]],
+  ['execution_5ftime_5fms',['execution_time_ms',['../d7/d0d/group__ExecutionPlanQuery.html#ga4cc1f2284941f48a122a54afff98caff',1,'cudnn_frontend::ExecutionPlan_v8']]]
 ];

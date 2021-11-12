@@ -15,7 +15,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" line="231" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" bodystart="231" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfig.h" line="237" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfig.h" bodystart="237" bodyend="-1"/>
       </memberdef>
       </sectiondef>
       <sectiondef kind="public-func">
@@ -34,10 +34,10 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" line="111" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" bodystart="111" bodyend="153"/>
-        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
-        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="158">cudnn_frontend::BackendDescriptor::status</references>
-        <referencedby refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1aae1a36ace3278dbedcf0d743a7744d98" compoundref="df/d3e/cudnn__frontend__EngineFallbackList_8h" startline="144" endline="170">cudnn_frontend::EngineFallbackListBuilder_v8::build</referencedby>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfig.h" line="112" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfig.h" bodystart="112" bodyend="158"/>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="138" endline="147">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="160">cudnn_frontend::BackendDescriptor::status</references>
+        <referencedby refid="d9/df1/classcudnn__frontend_1_1EngineFallbackListBuilder__v8_1aae1a36ace3278dbedcf0d743a7744d98" compoundref="df/d3e/cudnn__frontend__EngineFallbackList_8h" startline="144" endline="171">cudnn_frontend::EngineFallbackListBuilder_v8::build</referencedby>
       </memberdef>
       <memberdef kind="function" id="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a639e1514ea8f283720e49fc18d7ad673" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type><ref refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8" kindref="compound">EngineConfig_v8</ref> &amp;&amp;</type>
@@ -50,11 +50,12 @@
 <para>constructs the <ref refid="dc/d3c/classcudnn__frontend_1_1Engine__v8" kindref="compound">Engine_v8</ref> Config by calling the cudnn API Throws the appropriate error message </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" line="159" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" bodystart="159" bodyend="221"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfig.h" line="164" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfig.h" bodystart="164" bodyend="227"/>
         <references refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1a9b1cd07d3023dc3130d5eae560558cdb" compoundref="d6/d67/cudnn__frontend__EngineConfig_8h" startline="53">cudnn_frontend::EngineConfig_v8::EngineConfigBuilder_v8</references>
-        <references refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1ad79aab6d69a2b4400259abd72af73c84">cudnn_frontend::EngineConfig_v8::operator=</references>
-        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
-        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="158">cudnn_frontend::BackendDescriptor::status</references>
+        <references refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" compoundref="d8/dc4/cudnn__frontend__Logging_8h" startline="72" endline="75">cudnn_frontend::getLogger</references>
+        <references refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8_1a27ff94800e205f184e65265086caed2c">cudnn_frontend::EngineConfig_v8::operator=</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="138" endline="147">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="160">cudnn_frontend::BackendDescriptor::status</references>
       </memberdef>
       <memberdef kind="function" id="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a49a8a25759e78e7a2c77c55f0b54696b" prot="public" static="no" const="no" explicit="yes" inline="no" virt="non-virtual">
         <type></type>
@@ -67,7 +68,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" line="223" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfig.h" line="229" column="1"/>
       </memberdef>
       <memberdef kind="function" id="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a49eedc731d95df1f21e353a9a9511cfd" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -80,7 +81,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" line="224" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfig.h" line="230" column="1"/>
       </memberdef>
       <memberdef kind="function" id="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a3deb5e1f20c028b8bb39406cca743e43" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -96,7 +97,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" line="225" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfig.h" line="231" column="1"/>
       </memberdef>
       <memberdef kind="function" id="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a17fca0597527c1f6acffa73ddaeedc03" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -112,7 +113,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" line="226" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfig.h" line="232" column="1"/>
       </memberdef>
       <memberdef kind="function" id="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a8d4cb5ab44b076c71afd5f49e6df94f7" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type><ref refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8" kindref="compound">EngineConfigBuilder_v8</ref> &amp;</type>
@@ -128,7 +129,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" line="228" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfig.h" line="234" column="1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -136,84 +137,90 @@
     <detaileddescription>
 <para><ref refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8" kindref="compound">EngineConfigBuilder_v8</ref> Class Helper class used to build <ref refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8" kindref="compound">EngineConfig_v8</ref> class </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="186">
+      <node id="196">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="191">
+      <node id="201">
         <label>T</label>
       </node>
-      <node id="190">
+      <node id="200">
         <label>std::array&lt; T &gt;</label>
-        <childnode refid="191" relation="usage">
+        <childnode refid="201" relation="usage">
           <edgelabel>+elements</edgelabel>
         </childnode>
       </node>
-      <node id="188">
+      <node id="198">
         <label>std::array&lt; ManagedOpaqueDescriptor, CUDNN_KNOB_TYPE_COUNTS &gt;</label>
-        <childnode refid="189" relation="usage">
+        <childnode refid="199" relation="usage">
           <edgelabel>+elements</edgelabel>
         </childnode>
-        <childnode refid="190" relation="template-instance">
+        <childnode refid="200" relation="template-instance">
           <edgelabel>&lt; ManagedOpaqueDescriptor, CUDNN_KNOB_TYPE_COUNTS &gt;</edgelabel>
         </childnode>
       </node>
-      <node id="182">
+      <node id="192">
         <label>cudnn_frontend::EngineConfig_v8</label>
         <link refid="df/d83/classcudnn__frontend_1_1EngineConfig__v8"/>
-        <childnode refid="183" relation="public-inheritance">
+        <childnode refid="193" relation="public-inheritance">
         </childnode>
-        <childnode refid="188" relation="usage">
+        <childnode refid="198" relation="usage">
           <edgelabel>-bChoices</edgelabel>
         </childnode>
-        <childnode refid="192" relation="usage">
+        <childnode refid="202" relation="usage">
           <edgelabel>-numKnobs</edgelabel>
         </childnode>
-        <childnode refid="184" relation="usage">
+        <childnode refid="203" relation="usage">
+          <edgelabel>-set_knobs_attr</edgelabel>
+        </childnode>
+        <childnode refid="194" relation="usage">
           <edgelabel>-opGraphTag</edgelabel>
         </childnode>
-        <childnode refid="186" relation="usage">
+        <childnode refid="196" relation="usage">
           <edgelabel>-engine</edgelabel>
         </childnode>
       </node>
-      <node id="187">
+      <node id="197">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="185">
+      <node id="195">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="181">
+      <node id="191">
         <label>cudnn_frontend::EngineConfigBuilder_v8</label>
         <link refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8"/>
-        <childnode refid="182" relation="usage">
+        <childnode refid="192" relation="usage">
           <edgelabel>-m_engine_config</edgelabel>
         </childnode>
       </node>
-      <node id="189">
+      <node id="199">
         <label>ManagedOpaqueDescriptor</label>
       </node>
-      <node id="192">
+      <node id="203">
+        <label>bool</label>
+      </node>
+      <node id="202">
         <label>int64_t</label>
       </node>
-      <node id="183">
+      <node id="193">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="184" relation="usage">
+        <childnode refid="194" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="186" relation="usage">
+        <childnode refid="196" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="187" relation="usage">
+        <childnode refid="197" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="184">
+      <node id="194">
         <label>std::string</label>
-        <childnode refid="185" relation="public-inheritance">
+        <childnode refid="195" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" line="103" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_EngineConfig.h" bodystart="103" bodyend="232"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfig.h" line="104" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_EngineConfig.h" bodystart="104" bodyend="238"/>
     <listofallmembers>
       <member refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a639e1514ea8f283720e49fc18d7ad673" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineConfigBuilder_v8</scope><name>build</name></member>
       <member refid="dd/d72/classcudnn__frontend_1_1EngineConfigBuilder__v8_1a49a8a25759e78e7a2c77c55f0b54696b" prot="public" virt="non-virtual"><scope>cudnn_frontend::EngineConfigBuilder_v8</scope><name>EngineConfigBuilder_v8</name></member>

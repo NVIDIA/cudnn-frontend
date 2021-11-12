@@ -15,7 +15,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="312" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="312" bodyend="-1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="393" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" bodystart="393" bodyend="-1"/>
       </memberdef>
       </sectiondef>
       <sectiondef kind="public-func">
@@ -34,7 +34,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="219" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="219" bodyend="222"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="274" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" bodystart="274" bodyend="277"/>
       </memberdef>
       <memberdef kind="function" id="d4/de1/group__ExecutionPlanBuilder__v8_1gac5c23cff8c1424f71ef2cee2dc66cd3c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -51,7 +51,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="225" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="225" bodyend="229"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="280" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" bodystart="280" bodyend="284"/>
       </memberdef>
       <memberdef kind="function" id="d4/de1/group__ExecutionPlanBuilder__v8_1gae0f92d5445da53253ff3460ac6aefffa" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type>auto</type>
@@ -73,7 +73,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="233" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="233" bodyend="237"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="288" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" bodystart="288" bodyend="292"/>
       </memberdef>
       <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
         <type><ref refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" kindref="compound">ExecutionPlan_v8</ref> &amp;&amp;</type>
@@ -86,11 +86,13 @@
 <para>constructs the Engine Config by calling the cudnn API Throws the appropriate error message </para>        </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="243" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="243" bodyend="302"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="298" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" bodystart="298" bodyend="383"/>
         <references refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8_1a00c29ad02430927df9260c7e57ae7c7a" compoundref="d6/d51/cudnn__frontend__ExecutionPlan_8h" startline="53">cudnn_frontend::ExecutionPlan_v8::ExecutionPlanBuilder_v8</references>
-        <references refid="d7/d0d/group__ExecutionPlanQuery_1ga0705e60cee62d3d196751517d545a7b0">cudnn_frontend::ExecutionPlan_v8::operator=</references>
-        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="60" endline="69">cudnn_frontend::set_error_and_throw_exception</references>
-        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="158">cudnn_frontend::BackendDescriptor::status</references>
+        <references refid="df/de1/namespacecudnn__frontend_1ac39691550c5659acffd2386354ed18c6" compoundref="d8/dc4/cudnn__frontend__Logging_8h" startline="72" endline="75">cudnn_frontend::getLogger</references>
+        <references refid="df/de1/namespacecudnn__frontend_1aee9c79eb8972c944de14ccd70bf5db43" compoundref="dc/d11/cudnn__backend__base_8h" startline="88" endline="90">cudnn_frontend::make_shared_backend_pointer</references>
+        <references refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8_1a48865439534090da7c9b261bd77313c7">cudnn_frontend::ExecutionPlan_v8::operator=</references>
+        <references refid="df/de1/namespacecudnn__frontend_1a011f392961f07ab6de46a080e9a652a2" compoundref="df/d17/cudnn__frontend__utils_8h" startline="138" endline="147">cudnn_frontend::set_error_and_throw_exception</references>
+        <references refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor_1a8a5466c444f2de721118334ac876c6ba" compoundref="dc/d11/cudnn__backend__base_8h" startline="160">cudnn_frontend::BackendDescriptor::status</references>
       </memberdef>
       <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga8e48fb375271599c83f57922d9f8c89e" prot="public" static="no" const="no" explicit="yes" inline="no" virt="non-virtual">
         <type></type>
@@ -103,7 +105,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="304" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="385" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1gae3f841de1b6461b31bf7967734a70a8a" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -116,7 +118,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="305" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="386" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga60147aa715352906e32cbb87558cb0ae" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -132,7 +134,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="306" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="387" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga2b84d3619b5bd9ca0faa30c126deb43c" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type></type>
@@ -148,7 +150,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="307" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="388" column="1"/>
       </memberdef>
       <memberdef kind="function" id="d7/d0d/group__ExecutionPlanQuery_1ga5f757c2da8c90645c34637dde4aed8f8" prot="public" static="no" const="no" explicit="no" inline="no" virt="non-virtual">
         <type><ref refid="d1/d74/classcudnn__frontend_1_1ExecutionPlanBuilder__v8" kindref="compound">ExecutionPlanBuilder_v8</ref> &amp;</type>
@@ -164,7 +166,7 @@
         </detaileddescription>
         <inbodydescription>
         </inbodydescription>
-        <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="309" column="1"/>
+        <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="390" column="1"/>
       </memberdef>
       </sectiondef>
     <briefdescription>
@@ -172,60 +174,96 @@
     <detaileddescription>
 <para><ref refid="d1/d74/classcudnn__frontend_1_1ExecutionPlanBuilder__v8" kindref="compound">ExecutionPlanBuilder_v8</ref> Class Helper class used to build <ref refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8" kindref="compound">ExecutionPlan_v8</ref> class </para>    </detaileddescription>
     <collaborationgraph>
-      <node id="289">
+      <node id="296">
         <label>shared_ptr&lt; OpaqueBackendPointer &gt;</label>
       </node>
-      <node id="291">
+      <node id="302">
+        <label>T</label>
+      </node>
+      <node id="303">
         <label>cudnnHandle_t</label>
       </node>
-      <node id="290">
+      <node id="301">
+        <label>std::array&lt; T &gt;</label>
+        <childnode refid="302" relation="usage">
+          <edgelabel>+elements</edgelabel>
+        </childnode>
+      </node>
+      <node id="298">
+        <label>float</label>
+      </node>
+      <node id="300">
+        <label>cudnnBackendNumericalNote_t</label>
+      </node>
+      <node id="297">
         <label>cudnnStatus_t</label>
       </node>
-      <node id="288">
+      <node id="295">
         <label>std::basic_string&lt; char &gt;</label>
       </node>
-      <node id="284">
+      <node id="291">
         <label>cudnn_frontend::ExecutionPlanBuilder_v8</label>
         <link refid="d1/d74/classcudnn__frontend_1_1ExecutionPlanBuilder__v8"/>
-        <childnode refid="285" relation="usage">
+        <childnode refid="292" relation="usage">
           <edgelabel>-m_execution_plan</edgelabel>
         </childnode>
       </node>
-      <node id="285">
-        <label>cudnn_frontend::ExecutionPlan_v8</label>
-        <link refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8"/>
-        <childnode refid="286" relation="public-inheritance">
+      <node id="299">
+        <label>std::array&lt; cudnnBackendNumericalNote_t, CUDNN_NUMERICAL_NOTE_TYPE_COUNT &gt;</label>
+        <childnode refid="300" relation="usage">
+          <edgelabel>+elements</edgelabel>
         </childnode>
-        <childnode refid="287" relation="usage">
-          <edgelabel>-planTag</edgelabel>
-        </childnode>
-        <childnode refid="291" relation="usage">
-          <edgelabel>-handle</edgelabel>
-        </childnode>
-        <childnode refid="289" relation="usage">
-          <edgelabel>-engine_config</edgelabel>
+        <childnode refid="301" relation="template-instance">
+          <edgelabel>&lt; cudnnBackendNumericalNote_t, CUDNN_NUMERICAL_NOTE_TYPE_COUNT &gt;</edgelabel>
         </childnode>
       </node>
-      <node id="286">
+      <node id="292">
+        <label>cudnn_frontend::ExecutionPlan_v8</label>
+        <link refid="d5/d06/classcudnn__frontend_1_1ExecutionPlan__v8"/>
+        <childnode refid="293" relation="public-inheritance">
+        </childnode>
+        <childnode refid="298" relation="usage">
+          <edgelabel>-execution_time_ms</edgelabel>
+        </childnode>
+        <childnode refid="299" relation="usage">
+          <edgelabel>-numeric_notes</edgelabel>
+        </childnode>
+        <childnode refid="294" relation="usage">
+          <edgelabel>-planTag</edgelabel>
+        </childnode>
+        <childnode refid="303" relation="usage">
+          <edgelabel>-handle</edgelabel>
+        </childnode>
+        <childnode refid="296" relation="usage">
+          <edgelabel>-engine_config</edgelabel>
+        </childnode>
+        <childnode refid="304" relation="usage">
+          <edgelabel>-workSpaceSize</edgelabel>
+        </childnode>
+      </node>
+      <node id="304">
+        <label>int64_t</label>
+      </node>
+      <node id="293">
         <label>cudnn_frontend::BackendDescriptor</label>
         <link refid="d6/d88/classcudnn__frontend_1_1BackendDescriptor"/>
-        <childnode refid="287" relation="usage">
+        <childnode refid="294" relation="usage">
           <edgelabel>#err_msg</edgelabel>
         </childnode>
-        <childnode refid="289" relation="usage">
+        <childnode refid="296" relation="usage">
           <edgelabel>#pointer</edgelabel>
         </childnode>
-        <childnode refid="290" relation="usage">
+        <childnode refid="297" relation="usage">
           <edgelabel>#status</edgelabel>
         </childnode>
       </node>
-      <node id="287">
+      <node id="294">
         <label>std::string</label>
-        <childnode refid="288" relation="public-inheritance">
+        <childnode refid="295" relation="public-inheritance">
         </childnode>
       </node>
     </collaborationgraph>
-    <location file="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" line="211" column="1" bodyfile="/home/agopal/trees/cudnn_frontend_git/include/cudnn_frontend_ExecutionPlan.h" bodystart="211" bodyend="313"/>
+    <location file="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" line="266" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/cudnn_frontend_ExecutionPlan.h" bodystart="266" bodyend="394"/>
     <listofallmembers>
       <member refid="d7/d0d/group__ExecutionPlanQuery_1ga5ff39f2019a5a3fe8062bf887707877c" prot="public" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanBuilder_v8</scope><name>build</name></member>
       <member refid="d7/d0d/group__ExecutionPlanQuery_1ga8e48fb375271599c83f57922d9f8c89e" prot="public" virt="non-virtual"><scope>cudnn_frontend::ExecutionPlanBuilder_v8</scope><name>ExecutionPlanBuilder_v8</name></member>

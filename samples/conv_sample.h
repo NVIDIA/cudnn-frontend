@@ -43,7 +43,6 @@
 #include "fp16_emu.h"
 #include "helpers.h"
 
-
 void run_from_global_index(
     int64_t* dimA_padded,
     int64_t* padA,
@@ -69,7 +68,8 @@ void run_from_heuristics(
     float * devPtrI,
     float * devPtrF,
     float * devPtrO,
-    cudnnBackendHeurMode_t heur_mode);
+    cudnnBackendHeurMode_t heur_mode,
+    bool expect_in_cache = false);
 
 void run_with_external_config(
     int64_t* dimA_padded,
