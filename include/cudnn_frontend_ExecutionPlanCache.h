@@ -26,8 +26,8 @@
 #include <memory>
 #include <mutex>
 
-#include <cudnn_frontend_OperationGraph.h>
-#include <cudnn_frontend_ExecutionPlan.h>
+#include "cudnn_frontend_OperationGraph.h"
+#include "cudnn_frontend_ExecutionPlan.h"
 
 /// Execution Plan Caching:
 /// Goal is to auto-tune once and then save the best auto-tuned result for a problem for later use.
