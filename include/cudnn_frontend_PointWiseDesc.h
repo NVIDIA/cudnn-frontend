@@ -117,6 +117,7 @@ class PointWiseDesc_v8 : public BackendDescriptor {
 #endif
                 return 2;
         }
+	return -1;
     }
 
     cudnnPointwiseMode_t

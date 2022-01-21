@@ -93,6 +93,10 @@ to_string(cudnnDataType_t type) {
             return std::string("CUDNN_DATA_INT64");
         case CUDNN_DATA_BFLOAT16:
             return std::string("CUDNN_DATA_BFLOAT16");
+#if (CUDNN_VERSION >= 8300)
+        case CUDNN_DATA_BOOLEAN:
+            return std::string("CUDNN_DATA_BOOLEAN");
+#endif
     }
     return std::string("");
 }
