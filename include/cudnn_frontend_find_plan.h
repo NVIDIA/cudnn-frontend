@@ -52,6 +52,9 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const
     cudaEventCreate(&stop);
     cudaDeviceSynchronize();
 
+    cudaStream_t stream = nullptr;
+    ::cudnnGetStream(handle, &stream);
+
     for (auto &plan : plans) {
         float time_ms       = 0.0f;
         float final_time_ms = 0.0f;
@@ -66,11 +69,11 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const
         cudaDeviceSynchronize();
 
         for (int i = 0; i < maxIterCount; i++) {
-            cudaEventRecord(start);
+            cudaEventRecord(start, stream);
 
             ::cudnnBackendExecute(handle, plan.get_raw_desc(), variantPack.get_raw_desc());
 
-            cudaEventRecord(stop);
+            cudaEventRecord(stop, stream);
             cudaEventSynchronize(stop);
             cudaEventElapsedTime(&time_ms, start, stop);
 
