@@ -74,6 +74,44 @@ run_conv_bias_scale_relu(int64_t* x_dim,
                          void* devPtrS);
 
 void
+run_serialization_conv_bias_scale_relu(int64_t* x_dim,
+                         int64_t* w_dim,
+                         int64_t* y_dim,
+                         int64_t* b_dim,
+                         int64_t* s_dim,
+                         cudnnDataType_t dataType,
+                         int convDim,
+                         int64_t* conv_padA,
+                         int64_t* conv_dilationA,
+                         int64_t* conv_strideA,
+                         void* devPtrX,
+                         void* devPtrW,
+                         void* devPtrY,
+                         void* devPtrB,
+                         void* devPtrS);
+
+void
+run_conv_scale_bias_relu_gen_index_selection(int64_t* x_dim,
+                              int64_t* w_dim,
+                              int64_t* y_dim,
+                              int64_t* s_dim,
+                              int64_t* b_dim,
+                              int64_t* threshold_dim,
+                              cudnnDataType_t dataType,
+                              int convDim,
+                              int64_t* conv_padA,
+                              int64_t* conv_dilationA,
+                              int64_t* conv_strideA,
+                              int axis,
+                              void* devPtrX,
+                              void* devPtrW,
+                              void* devPtrY,
+                              void* devPtrS,
+                              void* devPtrB,
+                              void* devPtrTopThreshold,
+                              void* devPtrBottomThreshold);
+
+void
 run_conv_scale_bias_relu_int8(int64_t* x_dim,
                               int64_t* w_dim,
                               int64_t* y_dim,
@@ -139,3 +177,43 @@ run_conv_reduction(int64_t* x_dim,
                    void* devPtrX,
                    void* devPtrW,
                    void* devPtrR);
+
+void
+run_bn_conv_gen_stat(int64_t* xTensorDim, 
+                    int64_t* wTensorDim, 
+                    int64_t* yTensorDim,  
+                    int64_t* scaleTensorDim,
+                    int convdim, 
+                    int64_t *conv_padA, 
+                    int64_t* conv_dilationA, 
+                    int64_t* conv_strideA, 
+                    void *XdevPtr, 
+                    void *WdevPtr, 
+                    void *YdevPtr,
+                    void *scaledevPtr, 
+                    void *biasdevPtr, 
+                    void *sumdevPtr, 
+                    void *sqSumdevPtr);
+
+void
+run_bn_finalize( 
+    int64_t *perChannelSum, 
+    int64_t *epsilon, 
+
+    void *YSumdevPtr, 
+    void *YSqSumdevPtr, 
+    void *scaledevPtr, 
+    void *biasdevPtr, 
+    void *in_meandevPtr, 
+    void *in_vardevPtr, 
+    void *out_meandevPtr, 
+    void *out_vardevPtr,
+    void *saved_meandevPtr, 
+    void *saved_inv_vardevPtr, 
+    void *eq_scaledevPtr, 
+    void *eq_biasdevPtr,
+
+    double epsilon_val,
+    double exponential_decay_factor,
+    int64_t accumCnt_val
+);

@@ -73,8 +73,8 @@ class VariantPack_v8 : public BackendDescriptor {
     operator=(VariantPack_v8 const &) = delete;
 
     void *workspace         = nullptr;
-    void *data_pointers[10] = {nullptr};
-    int64_t uid[10]         = {-1};
+    std::vector<void *> data_pointers;
+    std::vector<int64_t> uid;
     int64_t num_ptrs        = -1;
 };
 
@@ -90,26 +90,33 @@ class VariantPackBuilder_v8 {
     //! Set dataPointers for the VariantPack_v8
     auto
     setDataPointers(int64_t num_ptr, void **ptrs) -> VariantPackBuilder_v8 & {
-        std::copy(ptrs, ptrs + num_ptr, m_variant_pack.data_pointers);
+        m_variant_pack.data_pointers.reserve(num_ptr);
+        std::copy(ptrs, ptrs + num_ptr, std::back_inserter(m_variant_pack.data_pointers));
         m_variant_pack.num_ptrs = num_ptr;
         return *this;
     }
     //! Set Uids for the VariantPack_v8
     auto
+    setUids(int64_t num_uids, const int64_t *uid) -> VariantPackBuilder_v8 & {
+        return setUids(num_uids, const_cast<int64_t *>(uid));
+    }
+
+    auto
     setUids(int64_t num_uids, int64_t *uid) -> VariantPackBuilder_v8 & {
-        std::copy(uid, uid + num_uids, m_variant_pack.uid);
+        m_variant_pack.uid.reserve(num_uids);
+        std::copy(uid, uid + num_uids, std::back_inserter(m_variant_pack.uid));
         return *this;
     }
     //! Initialize a set of pairs containing uid and data pointer.
     auto
     setDataPointers(std::set<std::pair<uint64_t, void *>> const &data_pointers) -> VariantPackBuilder_v8 & {
-        auto i = 0;
-        for (auto &data_pointer : data_pointers) {
-            m_variant_pack.uid[i]           = data_pointer.first;
-            m_variant_pack.data_pointers[i] = data_pointer.second;
-            i++;
-        }
         m_variant_pack.num_ptrs = data_pointers.size();
+        m_variant_pack.uid.reserve(m_variant_pack.num_ptrs);
+        m_variant_pack.data_pointers.reserve(m_variant_pack.num_ptrs);
+        for (auto &data_pointer : data_pointers) {
+            m_variant_pack.uid.push_back(data_pointer.first);
+            m_variant_pack.data_pointers.push_back(data_pointer.second);
+        }
         return *this;
     }
     //! Set Workspace
@@ -136,7 +143,7 @@ class VariantPackBuilder_v8 {
                                           CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS,
                                           CUDNN_TYPE_VOID_PTR,
                                           m_variant_pack.num_ptrs,
-                                          m_variant_pack.data_pointers);
+                                          m_variant_pack.data_pointers.data());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_variant_pack,
@@ -149,7 +156,7 @@ class VariantPackBuilder_v8 {
                                           CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS,
                                           CUDNN_TYPE_INT64,
                                           m_variant_pack.num_ptrs,
-                                          m_variant_pack.uid);
+                                          m_variant_pack.uid.data());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_variant_pack,

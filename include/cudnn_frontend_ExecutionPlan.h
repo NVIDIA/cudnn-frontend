@@ -111,6 +111,51 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     }
 #endif
 
+
+    std::string
+    getJsonRepresentation() const {
+#if (CUDNN_VERSION >= 8400)
+        auto status = CUDNN_STATUS_SUCCESS;
+        int64_t serializationSize;
+        std::vector<char> serialization_buf;
+        status = cudnnBackendGetAttribute(pointer->get_backend_descriptor(),
+                                          CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
+                                          CUDNN_TYPE_CHAR,
+                                          0,
+                                          &serializationSize,
+                                          nullptr);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
+        }
+        serialization_buf.resize(serializationSize);
+        status = cudnnBackendGetAttribute(pointer->get_backend_descriptor(),
+                                          CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
+                                          CUDNN_TYPE_CHAR,
+                                          serializationSize,
+                                          &serializationSize,
+                                          serialization_buf.data());
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
+        }
+        std::string json_string(serialization_buf.begin(), serialization_buf.end());
+        return json_string;
+#else
+        auto status = CUDNN_STATUS_NOT_SUPPORTED;
+        set_error_and_throw_exception(this,
+                                status,
+                                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
+        std::string json_string{""};
+        return json_string;
+#endif
+    }
+
     ExecutionPlan_v8(ExecutionPlan_v8 const &) = default;
     ExecutionPlan_v8 &
     operator=(ExecutionPlan_v8 const &) = default;
@@ -381,6 +426,133 @@ class ExecutionPlanBuilder_v8 {
         getLogger() << "[cudnn_frontend] " << m_execution_plan << std::endl;
         return std::move(m_execution_plan);
     }
+
+    ExecutionPlan_v8 &&
+    loadFromJson(const std::string &json_plan) {
+#if (CUDNN_VERSION >= 8400)
+        auto status = CUDNN_STATUS_SUCCESS;
+
+        if (m_execution_plan.handle == nullptr) {
+            set_error_and_throw_exception(
+                &m_execution_plan,
+                CUDNN_STATUS_BAD_PARAM,
+                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: Check and Set the CUDNN_ATTR_EXECUTION_PLAN_HANDLE");
+            return std::move(m_execution_plan);
+        };
+
+        // Create a descriptor. Memory allocation happens here.
+        status = m_execution_plan.initialize_managed_backend_pointer(CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                &m_execution_plan, status, "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnCreate Failed");
+            return std::move(m_execution_plan);
+        }
+
+        int64_t serializationSize;
+        std::vector<char> serialization_buf;
+        serialization_buf.assign(json_plan.begin(), json_plan.end());
+        status = cudnnBackendSetAttribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                          CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
+                                          CUDNN_TYPE_CHAR,
+                                          serialization_buf.size(),
+                                          serialization_buf.data());
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                &m_execution_plan,
+                status,
+                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
+            return std::move(m_execution_plan);
+        }
+
+        status = cudnnBackendSetAttribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                          CUDNN_ATTR_EXECUTION_PLAN_HANDLE,
+                                          CUDNN_TYPE_HANDLE,
+                                          1,
+                                          &m_execution_plan.handle);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                &m_execution_plan,
+                status,
+                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute CUDNN_ATTR_EXECUTION_PLAN_HANDLE Failed");
+            return std::move(m_execution_plan);
+        }
+
+        status = cudnnBackendFinalize(m_execution_plan.pointer->get_backend_descriptor());
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                &m_execution_plan, status, "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnFinalize Descriptor Failed");
+            return std::move(m_execution_plan);
+        }
+
+        m_execution_plan.engine_config = make_shared_backend_pointer(CUDNN_BACKEND_ENGINECFG_DESCRIPTOR);
+        status                         = m_execution_plan.engine_config->get_status();
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnCreate of "
+                                          "CUDNN_BACKEND_ENGINECFG_DESCRIPTOR failed when computing tag");
+            return std::move(m_execution_plan);
+        }
+
+        cudnnBackendDescriptor_t engCfgDesc = m_execution_plan.engine_config->get_backend_descriptor();
+        int64_t elemCount                   = 0;
+        status = cudnnBackendGetAttribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                          CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG,
+                                          CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                          1,
+                                          &elemCount,
+                                          &engCfgDesc);
+
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG Failed");
+            return std::move(m_execution_plan);
+        }
+        ManagedOpaqueDescriptor extractedEngine = make_shared_backend_pointer(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
+        status                                  = extractedEngine->get_status();
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnCreate of "
+                                          "CUDNN_BACKEND_ENGINE_DESCRIPTOR failed when computing tag");
+            return std::move(m_execution_plan);
+        }
+
+        cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
+
+        status = cudnnBackendGetAttribute(m_execution_plan.engine_config->get_backend_descriptor(),
+                                          CUDNN_ATTR_ENGINECFG_ENGINE,
+                                          CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                          1,
+                                          &elemCount,
+                                          &extractedEngine_);
+
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINECFG_ENGINE Failed");
+            return std::move(m_execution_plan);
+        }
+
+        m_execution_plan.buildTag(extractedEngine);
+        m_execution_plan.fetchNotes(extractedEngine);
+        m_execution_plan.computeWorkSpaceSize();
+
+        getLogger() << "[cudnn_frontend] " << m_execution_plan << std::endl;
+        return std::move(m_execution_plan);
+#else
+        auto status = CUDNN_STATUS_NOT_SUPPORTED;
+        set_error_and_throw_exception(&m_execution_plan,
+                                status,
+                                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: Build "
+                                "From Json Failed");
+        return std::move(m_execution_plan);
+#endif
+    }
+
 
     explicit ExecutionPlanBuilder_v8()                       = default;
     ~ExecutionPlanBuilder_v8()                               = default;

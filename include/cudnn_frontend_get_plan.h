@@ -39,6 +39,7 @@ EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph & opGra
             getLogger() << "[cudnn_frontend] Added plan " << plans.back().getTag() << " " << to_string(plans.back().get_status()) << std::endl;
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnnException &e) {
+            (void)e;
             continue;
         }
 #endif

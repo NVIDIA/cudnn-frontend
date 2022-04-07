@@ -24,6 +24,7 @@
 
 #include <cudnn.h>
 #include <numeric>
+#include "cudnn_frontend_Heuristics.h"
 
 namespace cudnn_frontend {
 
@@ -149,6 +150,14 @@ class EngineFallbackListBuilder_v8 {
                                           "CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH field for heuristic");
             return std::move(m_fallback_list);
         };
+#if (CUDNN_VERSION >= 8400)
+        auto fallback_heuristics = EngineHeuristicsBuilder_v8()
+                                    .setHeurMode(CUDNN_HEUR_MODE_FALLBACK)
+                                    .setOperationGraph(m_fallback_list.opGraph, m_fallback_list.opGraphTag)
+                                    .build();
+        auto count  = fallback_heuristics.getEngineConfigCount();
+        m_fallback_list.m_engine_configs = fallback_heuristics.getEngineConfig(count);
+#else
         auto fallback_engine_list = get_fallback_engine_list(m_fallback_list.mode, m_fallback_list.opGraphTag);
         for (std::uint32_t i = 0; i < fallback_engine_list.size(); i++) {
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
@@ -162,10 +171,12 @@ class EngineFallbackListBuilder_v8 {
                 m_fallback_list.m_engine_configs.emplace_back(engine_config.get_desc());
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
             } catch (cudnn_frontend::cudnnException &e) {
+                (void)e;
                 continue;
             }
 #endif
         }
+#endif
         getLogger() << "[cudnn_frontend] " << m_fallback_list << std::endl;
         return std::move(m_fallback_list);
     }

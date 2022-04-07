@@ -51,6 +51,7 @@ Sample tests are written using the [Catch2](https://github.com/catchorg/Catch2) 
 
      mkdir build; cd build
      cmake ..
+     make
      ./Samples
     
 ## cudnnFindPlan and cudnnGetPlan:
@@ -94,6 +95,13 @@ cuDNN through heuristics provides a way to query a list of good engine configs. 
 
 PS: ExecutionPlanCaching today supports only single operation operation_graphs.
 
+## Execution Plan Serialization and Deserialization (Experimental)
+cuDNN v8.4 and above provides exeuction plan serialization and deserialization to save the execution plan as a string in JSON format. The execution plan can be then restored from that string at a later point, and this also saves compilation time compared to rebuilding the plan from scratch. Currently, this is an experimental feature that only supports the runtime fusion engine. No forward/backward or cross-device compatibility guarantee is offered at this time.
+
+### API:
+    - std::string cudnn_frontend::ExecutionPlan_v8::getJsonRepresentation() : Serialize the execution plan into a string in JSON format.
+    - cudnn_frontend::ExecutionPlan_v8&& cudnn_frontend::ExecutionPlanBuilder_v8::loadFromJson(const std::string &json_plan) : Deserialize from a string containing the JSON representation of the execution plan.
+
 ## Logging
 cuDNN Frontend API logging records execution flow through cuDNN frontend API. This functionality is disabled by default, and can be enabled through methods described in this section.
 
@@ -107,7 +115,6 @@ cuDNN Frontend API logging records execution flow through cuDNN frontend API. Th
 ### Method 2: Using API calls:
 Calling `cudnn_frontend::isLoggingEnabled() = true|false` has same effect of setting the environment variable.
 Calling `cudnn_frontend::getStream() = stream_name` can be used to assign the output stream directly. 
-
 
 ## Documentation
 Documentation can be found at https://nvidia.github.io/cudnn-frontend/
