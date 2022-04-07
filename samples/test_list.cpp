@@ -640,6 +640,150 @@ TEST_CASE("ConvBiasScaleAct sample", "[frontend][fusion][ConvBiasScaleAct]") {
     std::cout << "\n========================================================================================\n";
 }
 
+TEST_CASE("ConvBiasScaleActSerialization sample", "[frontend][fusion][serialization]") {
+    std::cout << "TEST_CASE Serialization :: Sample serialization for runtime fusion with backend API" << std::endl;
+    INFO("TEST_CASE :: Sample serialization for runtime fusion code with backend API");
+    int64_t xTensorDim[] = {1, 16, 512, 512};
+    int64_t wTensorDim[] = {64, 16, 3, 3};
+    int64_t yTensorDim[] = {1, 64, 512, 512};
+
+    int64_t conv_padA[]      = {1, 1};
+    int64_t conv_dilationA[] = {1, 1};
+    int64_t conv_strideA[]   = {1, 1};
+
+    int64_t bTensorDim[] = {1, 64, 1, 1};  // bias
+    int64_t sTensorDim[] = {1, 64, 1, 1};  // scale
+
+    printf("====DIMENSIONS====\n");
+    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
+           xTensorDim[0],
+           xTensorDim[1],
+           xTensorDim[2],
+           xTensorDim[3]);
+    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
+           wTensorDim[0],
+           wTensorDim[1],
+           wTensorDim[2],
+           wTensorDim[3]);
+    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
+           yTensorDim[0],
+           yTensorDim[1],
+           yTensorDim[2],
+           yTensorDim[3]);
+
+    int Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
+
+    Surface<float> X(xTensorDim[0] * xTensorDim[1] * xTensorDim[2] * xTensorDim[3], false);
+    Surface<float> W(wTensorDim[0] * wTensorDim[1] * wTensorDim[2] * wTensorDim[3], false);
+    Surface<float> Y(Ysize, true);
+
+    Surface<float> B(bTensorDim[0] * bTensorDim[1] * bTensorDim[2] * bTensorDim[3], false);
+    Surface<float> S(sTensorDim[0] * sTensorDim[1] * sTensorDim[2] * sTensorDim[3], false);
+
+    run_serialization_conv_bias_scale_relu(xTensorDim,
+                                           wTensorDim,
+                                           yTensorDim,
+                                           bTensorDim,
+                                           sTensorDim,
+                                           CUDNN_DATA_FLOAT,
+                                           2,
+                                           conv_padA,
+                                           conv_dilationA,
+                                           conv_strideA,
+                                           X.devPtr,
+                                           W.devPtr,
+                                           Y.devPtr,
+                                           B.devPtr,
+                                           S.devPtr);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(Y.hostPtr, Y.devPtr, sizeof(Y.hostPtr[0]) * Ysize, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
+}
+
+TEST_CASE("ConvScaleBiasActGenIndexSelection sample", "[frontend][fusion][ConvScaleBiasActGenIndexSelection]") {
+    std::cout << "TEST_CASE ConvScaleBiasActGenIndexSelection :: Sample runtime fusion code with backend API" << std::endl;
+    INFO("TEST_CASE :: Sample runtime fusion code with backend API");
+    int64_t xTensorDim[] = {1, 64, 168, 200};
+    int64_t wTensorDim[] = {64, 64, 3, 3};
+    int64_t yTensorDim[] = {1, 64, 168, 200};
+
+    int64_t conv_padA[]      = {1, 1};
+    int64_t conv_dilationA[] = {1, 1};
+    int64_t conv_strideA[]   = {1, 1};
+
+    int64_t bTensorDim[] = {1, 64, 1, 1};  // bias
+    int64_t sTensorDim[] = {1, 64, 1, 1};  // scale
+
+    int64_t thresholdTensorDim[] = {1, 1, 1, 1}; // scalar number
+
+    printf("====DIMENSIONS====\n");
+    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
+           xTensorDim[0],
+           xTensorDim[1],
+           xTensorDim[2],
+           xTensorDim[3]);
+    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
+           wTensorDim[0],
+           wTensorDim[1],
+           wTensorDim[2],
+           wTensorDim[3]);
+    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
+           yTensorDim[0],
+           yTensorDim[1],
+           yTensorDim[2],
+           yTensorDim[3]);
+
+    int Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
+
+    Surface<half> X(xTensorDim[0] * xTensorDim[1] * xTensorDim[2] * xTensorDim[3], false);
+    Surface<half> W(wTensorDim[0] * wTensorDim[1] * wTensorDim[2] * wTensorDim[3], false);
+    Surface<half> Y(Ysize, true);
+
+    Surface<half> B(bTensorDim[0] * bTensorDim[1] * bTensorDim[2] * bTensorDim[3], false);
+    Surface<half> S(sTensorDim[0] * sTensorDim[1] * sTensorDim[2] * sTensorDim[3], false);
+
+    Surface<int32_t> thresholdTop(1, false);
+    Surface<int32_t> thresholdBottom(1, false);
+
+    thresholdTop.hostPtr[0] = 1;
+    thresholdBottom.hostPtr[0] = 198;
+
+    checkCudaErr(cudaMemcpy(thresholdTop.devPtr, thresholdTop.hostPtr, sizeof(int32_t), cudaMemcpyHostToDevice));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    checkCudaErr(cudaMemcpy(thresholdBottom.devPtr, thresholdBottom.hostPtr, sizeof(int32_t), cudaMemcpyHostToDevice));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    run_conv_scale_bias_relu_gen_index_selection(xTensorDim,
+                                  wTensorDim,
+                                  yTensorDim,
+                                  bTensorDim,
+                                  sTensorDim,
+                                  thresholdTensorDim,
+                                  CUDNN_DATA_HALF,
+                                  2, // spatial dimensions in conv
+                                  conv_padA,
+                                  conv_dilationA,
+                                  conv_strideA,
+                                  2, // index according to H dim (or P dim in y) 
+                                  X.devPtr,
+                                  W.devPtr,
+                                  Y.devPtr,
+                                  B.devPtr,
+                                  S.devPtr,
+                                  thresholdTop.devPtr,
+                                  thresholdBottom.devPtr);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(Y.hostPtr, Y.devPtr, sizeof(Y.hostPtr[0]) * Ysize, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
+}
+
 TEST_CASE("ConvScaleBiasAct_int8 sample", "[frontend][fusion][ConvScaleBiasAct_int8]") {
     std::cout << "TEST_CASE ConvScaleBiasAct_int8 :: Sample runtime fusion code with backend API" << std::endl;
     INFO("TEST_CASE :: Sample runtime fusion code with backend API");
@@ -1145,13 +1289,13 @@ TEST_CASE("Multihead attention sample", "[frontend][fusion][MultiHeadAttention]"
 
     int numErrors = 0;
 
-#if (CUDNN_VERSION >= 8310)
-    const int64_t inputSize  = 16; // 1024;
-    const int64_t outputSize = 16; // 1024;
+#if (CUDNN_VERSION >= 8301)
+    const int64_t inputSize  = 8; // 1024;
+    const int64_t outputSize = 8; // 1024;
     const int64_t headSize   = 8;  // 64;
-    const int64_t seqLength  = 8;  // 128;
-    const int64_t numHeads   = 2;  // 16;
-    const int64_t batchSize  = 2;  // 32;
+    const int64_t seqLength  = 2;  // 128;
+    const int64_t numHeads   = 1;  // 16;
+    const int64_t batchSize  = 1;  // 32;
 
     const int64_t inputTensorSize     = inputSize * seqLength * batchSize;
     const int64_t outputTensorSize    = outputSize * seqLength * batchSize;
@@ -1173,8 +1317,6 @@ TEST_CASE("Multihead attention sample", "[frontend][fusion][MultiHeadAttention]"
 
     cudaMemset(output.devPtr, 0, sizeof(output.hostPtr[0]) * outputTensorSize);
 
-    checkCudaErr(cudaDeviceSynchronize());
-
     // Call multiHeadAttention sample
     multiHeadAttention(inputSize,
                        headSize,
@@ -1193,6 +1335,107 @@ TEST_CASE("Multihead attention sample", "[frontend][fusion][MultiHeadAttention]"
     checkCudaErr(cudaDeviceSynchronize());
     checkCudaErr(cudaMemcpy(output.hostPtr, output.devPtr, sizeof(output.hostPtr[0]) * outputTensorSize, cudaMemcpyDeviceToHost));
     checkCudaErr(cudaDeviceSynchronize());
+
 #endif
     REQUIRE(numErrors == 0);
+}
+
+TEST_CASE("Scale Bias Conv BNGenstats", "[frontend][fusion][bn_genstas]") {
+    std::cout << "Scale Bias Conv BNGenstats" << std::endl;
+    int64_t perChannelScaleDim[]      = { 1,  32, 1, 1};
+    int64_t perChannelBiasDim[]       = { 1,  32, 1, 1};
+    int64_t xTensorDim[]              = { 32,  32, 7, 7};
+    int64_t wTensorDim[]              = {256,  32, 1, 1};
+    int64_t yTensorDim[]              = { 32, 256, 7, 7}; 
+    int64_t sumTensorDim[]            = { 1,  32, 1, 1};
+    int64_t sqSumTensorDim[]          = { 1,  32, 1, 1};
+
+    int64_t conv_padA[]       = {0, 0};
+    int64_t conv_dilationA[]  = {1, 1};
+    int64_t conv_strideA[]    = {1, 1};
+
+    Surface<half> X(xTensorDim[0] * xTensorDim[1] * xTensorDim[2] * xTensorDim[3], false);
+    Surface<half> W(wTensorDim[0] * wTensorDim[1] * wTensorDim[2] * wTensorDim[3], false);
+    Surface<half> Y(yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3], false);
+
+    Surface<half> scale(perChannelScaleDim[0] * perChannelScaleDim[1] * perChannelScaleDim[2] * perChannelScaleDim[3], false);
+    Surface<half> bias(perChannelBiasDim[0] * perChannelBiasDim[1] * perChannelBiasDim[2] * perChannelBiasDim[3], false);
+
+    Surface<float> sum(sumTensorDim[0] * sumTensorDim[1] * sumTensorDim[2] * sumTensorDim[3], false);
+    Surface<float> sqSum(sqSumTensorDim[0] * sqSumTensorDim[1] * sqSumTensorDim[2] * sqSumTensorDim[3], false);
+
+    run_bn_conv_gen_stat(xTensorDim, wTensorDim, yTensorDim, perChannelScaleDim,  
+                    2, conv_padA, conv_dilationA, conv_strideA, 
+                    X.devPtr, W.devPtr, Y.devPtr,
+                    scale.devPtr, bias.devPtr, sum.devPtr, sqSum.devPtr
+                    );
+
+    std::cout << "\n========================================================================================\n";
+}
+
+TEST_CASE("BN Finalize", "[frontend][fusion][bn_finalize]") {
+    std::cout << "BN Finalize" << std::endl;
+    // This  example shows CUDNN_BN_FINALIZE_STATISTICS_TRAINING
+    // For CUDNN_BN_FINALIZE_STATISTICS_INFERENCE,
+    // Input Statistics like ySum, ySqSum, 
+    // And output statistics like modified mean, Inv variance and AccumulationCount.
+
+    // Here Channel count is output channel.
+
+    int64_t perChannelSum[]            = {1, 32, 1, 1};
+    int64_t perChannelSqSum[]          = {1, 32, 1, 1};
+    int64_t bnScale[]                  = {1, 32, 1, 1}; // BN Scale gamma
+    int64_t bnBias[]                   = {1, 32, 1, 1}; // BN bias beta
+
+
+    int64_t inputRunningMean[]         = {1, 32, 1, 1};
+    int64_t inputRunningVar[]          = {1, 32, 1, 1};
+    int64_t updatedRunningMean[]       = {1, 32, 1, 1};
+    int64_t updatedRunningVar[]        = {1, 32, 1, 1};
+
+
+    int64_t bnSavedMean[]              = {1, 32, 1, 1}; // Required for backward path
+    int64_t bnSavedInvVar[]            = {1, 32, 1, 1}; // Required for backward path
+
+    int64_t eqScaleNext[]              = {1, 32, 1, 1}; // (gamma / ((var + epsilon) ^ 1/2))
+    int64_t eqBiasNext[]               = {1, 32, 1, 1};  // (beta - mu/((var + epsilon) ^ 1/2))
+
+    int64_t accumCnt[]              = {1, 1, 1, 1};     
+    int64_t epsilon[]               = {1, 1, 1, 1};
+    int64_t expAverageFactor[]      = {1, 1, 1, 1};
+
+    auto size_calculator = 
+        [](int64_t *arr) {
+            return std::accumulate(arr, arr + 4, 1, std::multiplies<int>());
+        };
+
+    Surface<float> YSum(size_calculator(perChannelSum), false);
+    Surface<float> YSqSum(size_calculator(perChannelSqSum), false);
+
+    Surface<float> scale(size_calculator(bnScale), false); 
+    Surface<float> bias(size_calculator(bnBias), false); 
+
+    Surface<float> in_mean(size_calculator(inputRunningMean), false); 
+    Surface<float> in_var(size_calculator(inputRunningVar), false); 
+    Surface<float> out_mean(size_calculator(updatedRunningMean), false); 
+    Surface<float> out_var(size_calculator(updatedRunningVar), false); 
+    Surface<float> saved_mean(size_calculator(bnSavedMean), false); 
+    Surface<float> saved_inv_var(size_calculator(bnSavedInvVar), false); 
+
+    Surface<half> eq_scale(size_calculator(eqScaleNext), false);
+    Surface<half> eq_bias(size_calculator(eqBiasNext), false);
+
+    double epsilon_val = 0.05;
+    double expAverageFactorVal = 0.9;
+    int64_t accumCntVal = 0;
+
+    // Just passing perChannelSum as proxy for all the 1,K,1,1 tensors
+    run_bn_finalize(perChannelSum, epsilon,
+                    YSum.devPtr, YSqSum.devPtr, scale.devPtr, bias.devPtr, 
+                    in_mean.devPtr, in_var.devPtr, out_mean.devPtr, out_var.devPtr,
+                    saved_mean.devPtr, saved_inv_var.devPtr, eq_scale.devPtr, eq_bias.devPtr,
+                    epsilon_val, expAverageFactorVal, accumCntVal);
+                    
+    std::cout << "\n========================================================================================\n";
+    
 }

@@ -115,9 +115,16 @@ class PointWiseDesc_v8 : public BackendDescriptor {
             case CUDNN_POINTWISE_RSQRT:
             case CUDNN_POINTWISE_LOGICAL_NOT:
 #endif
+#if (CUDNN_VERSION >= 8400)
+            case CUDNN_POINTWISE_GEN_INDEX:
+#endif
                 return 2;
+#if (CUDNN_VERSION >= 8400)
+            case CUDNN_POINTWISE_BINARY_SELECT:
+                return 4;
+#endif
         }
-	return -1;
+        return -1;
     }
 
     cudnnPointwiseMode_t
@@ -146,6 +153,9 @@ class PointWiseDesc_v8 : public BackendDescriptor {
     double elu_alpha                      = 1.0;
     double softplus_beta                  = 1.0;
     double swish_beta                     = 1.0;
+#if (CUDNN_VERSION >= 8400)
+    int64_t axis                          = -1;
+#endif
 };
 
 ////
@@ -219,6 +229,16 @@ class PointWiseDescBuilder_v8 {
         m_pointWiseDesc.swish_beta = swish_beta_;
         return *this;
     }
+    
+
+    auto
+    setAxis(int64_t axis_) -> PointWiseDescBuilder_v8 & {
+#if (CUDNN_VERSION >= 8400)
+        m_pointWiseDesc.axis = axis_;
+#endif
+        return *this;
+    }
+  
 
     //! constructs the PointWiseDesc_v8 by calling the cudnn API
     //! Throws the appropriate error message
@@ -363,7 +383,23 @@ class PointWiseDescBuilder_v8 {
                     "CUDNN_BACKEND_POINTWISE_DESCRIPTOR: SetAttribute CUDNN_ATTR_POINTWISE_SWISH_BETA, Failed");
                 return std::move(m_pointWiseDesc);
             }
-        }
+        } 
+#if (CUDNN_VERSION >= 8400)
+            else if (m_pointWiseDesc.mode == CUDNN_POINTWISE_GEN_INDEX) {
+                status = cudnnBackendSetAttribute(m_pointWiseDesc.pointer->get_backend_descriptor(),
+                                              CUDNN_ATTR_POINTWISE_AXIS,
+                                              CUDNN_TYPE_INT64,
+                                              1,
+                                              &m_pointWiseDesc.axis);
+                if (status != CUDNN_STATUS_SUCCESS) {
+                    set_error_and_throw_exception(
+                        &m_pointWiseDesc,
+                        status,
+                        "CUDNN_BACKEND_POINTWISE_DESCRIPTOR: SetAttribute CUDNN_ATTR_POINTWISE_AXIS, Failed");
+                    return std::move(m_pointWiseDesc);
+                }
+            }
+#endif
 
         // Finalizing the descriptor
         status = cudnnBackendFinalize(m_pointWiseDesc.pointer->get_backend_descriptor());

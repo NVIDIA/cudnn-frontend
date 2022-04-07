@@ -48,6 +48,7 @@ namespace cudnn_frontend {
 ///    - yDesc
 ///    - wdesc
 ///    - bdesc
+///    - tDesc
 ///    - dydesc
 ///    - dxdesc
 ///    - cdesc
@@ -57,9 +58,15 @@ namespace cudnn_frontend {
 ///    - pwdesc
 ///    - matmuldesc
 ///    - reductiondesc
+///    - flagdesc
+///    - inputDescs
 ///    - alpha
 ///    - beta
 ///    - alpha2
+///    - axis
+///    - inplaceIndex
+///    - mode
+///    - value
 ///
 /// Use OperationBuilder_v8 to build this class.
 /// Describe returns a string describing the convolution operation
@@ -76,6 +83,9 @@ class Operation_v8 : public BackendDescriptor {
         ss << std::hex << " Y " << ydesc;
         ss << std::hex << " W " << wdesc;
         ss << std::hex << " B " << bdesc;
+#if (CUDNN_VERSION >= 8400)
+        ss << std::hex << " T " << tdesc;
+#endif
         ss << std::hex << " DW " << dwdesc;
         ss << std::hex << " DY " << dydesc;
         ss << std::hex << " DX " << dxdesc;
@@ -122,22 +132,44 @@ class Operation_v8 : public BackendDescriptor {
 
     cudnnBackendDescriptorType_t op_mode = CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR;
 
-    ManagedOpaqueDescriptor xdesc         = nullptr;
-    ManagedOpaqueDescriptor ydesc         = nullptr;
-    ManagedOpaqueDescriptor wdesc         = nullptr;
-    ManagedOpaqueDescriptor bdesc         = nullptr;
-    ManagedOpaqueDescriptor dydesc        = nullptr;
-    ManagedOpaqueDescriptor dxdesc        = nullptr;
-    ManagedOpaqueDescriptor dwdesc        = nullptr;
-    ManagedOpaqueDescriptor cdesc         = nullptr;
-    ManagedOpaqueDescriptor amatdesc      = nullptr;
-    ManagedOpaqueDescriptor bmatdesc      = nullptr;
-    ManagedOpaqueDescriptor cmatdesc      = nullptr;
-    ManagedOpaqueDescriptor pwdesc        = nullptr;
-    ManagedOpaqueDescriptor matmuldesc    = nullptr;
-    ManagedOpaqueDescriptor reductiondesc = nullptr;
+    ManagedOpaqueDescriptor xdesc              = nullptr;
+    ManagedOpaqueDescriptor ydesc              = nullptr;
+    ManagedOpaqueDescriptor wdesc              = nullptr;
+    ManagedOpaqueDescriptor bdesc              = nullptr;
+#if (CUDNN_VERSION >= 8400)
+    ManagedOpaqueDescriptor tdesc              = nullptr;
+#endif
+    ManagedOpaqueDescriptor dydesc             = nullptr;
+    ManagedOpaqueDescriptor dxdesc             = nullptr;
+    ManagedOpaqueDescriptor dwdesc             = nullptr;
+    ManagedOpaqueDescriptor cdesc              = nullptr;
+    ManagedOpaqueDescriptor amatdesc           = nullptr;
+    ManagedOpaqueDescriptor bmatdesc           = nullptr;
+    ManagedOpaqueDescriptor cmatdesc           = nullptr;
+    ManagedOpaqueDescriptor pwdesc             = nullptr;
+    ManagedOpaqueDescriptor matmuldesc         = nullptr;
+    ManagedOpaqueDescriptor reductiondesc      = nullptr;
+    ManagedOpaqueDescriptor sumdesc            = nullptr;
+    ManagedOpaqueDescriptor sqsumdesc          = nullptr;
+    ManagedOpaqueDescriptor scaledesc          = nullptr;
+    ManagedOpaqueDescriptor biasdesc           = nullptr;
+    ManagedOpaqueDescriptor eqscaledesc        = nullptr;
+    ManagedOpaqueDescriptor eqbiasdesc         = nullptr;
+    ManagedOpaqueDescriptor prevMeandesc       = nullptr;
+    ManagedOpaqueDescriptor prevVardesc        = nullptr;
+    ManagedOpaqueDescriptor nextMeandesc       = nullptr;
+    ManagedOpaqueDescriptor nextVardesc        = nullptr;
+    ManagedOpaqueDescriptor savedMeandesc      = nullptr;
+    ManagedOpaqueDescriptor savedInVardesc     = nullptr;
+    ManagedOpaqueDescriptor accumCountdesc     = nullptr;
+    ManagedOpaqueDescriptor epsilondesc        = nullptr;
+    ManagedOpaqueDescriptor expDecayFactordesc = nullptr;
 
     cudnnBackendAttributeType_t alphabetaType = CUDNN_TYPE_FLOAT;
+    cudnnDataType_t     math_precision   = CUDNN_DATA_FLOAT;
+    cudnnGenStatsMode_t genstats_mode    = CUDNN_GENSTATS_SUM_SQSUM;
+    cudnnBnFinalizeStatsMode_t bn_stats_mode = CUDNN_BN_FINALIZE_STATISTICS_TRAINING;
+
     float alpha_s = 1.0f, beta_s = .0f, alpha2_s = 1.0f;
     double alpha_d = 1.0, beta_d = 0.0, alpha2_d = 1.0;
     int64_t pointwise_port_count = -1;
@@ -160,6 +192,8 @@ class OperationBuilder_v8 {
     bool is_pointwise_op   = false;
     bool is_matmul_op      = false;
     bool is_reduction_op   = false;
+    bool is_genstats_op    = false;
+    bool is_bn_finalize_op = false;
 
     using Message_t = const char *;
 
@@ -432,6 +466,14 @@ class OperationBuilder_v8 {
             case CUDNN_POINTWISE_SWISH_BWD:
                 m_operation.operationTag = "SwishBwd";
                 break;
+#if (CUDNN_VERSION >= 8400)
+            case CUDNN_POINTWISE_GEN_INDEX:
+                m_operation.operationTag = "GenIndex";
+                break;
+            case CUDNN_POINTWISE_BINARY_SELECT:
+                m_operation.operationTag = "BinarySelect";
+                break;
+#endif
         }
 
         status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
@@ -530,7 +572,7 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        if (m_operation.pointwise_port_count == 3 && !m_operation.is_pointwise_activation_bwd_op) {
+        if (m_operation.pointwise_port_count >= 3 && !m_operation.is_pointwise_activation_bwd_op) {
             status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
                     CUDNN_ATTR_OPERATION_POINTWISE_BDESC,
                     CUDNN_TYPE_BACKEND_DESCRIPTOR,
@@ -544,6 +586,24 @@ class OperationBuilder_v8 {
                 return std::move(m_operation);
             }
         }
+        
+#if (CUDNN_VERSION >= 8400)
+        if (m_operation.pointwise_port_count == 4) {
+            status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+                    CUDNN_ATTR_OPERATION_POINTWISE_TDESC,
+                    CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                    1,
+                    &(m_operation.tdesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                        &m_operation,
+                        status,
+                        "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_POINTWISE_TDESC Failed");
+                return std::move(m_operation);
+            }
+        }
+#endif
+        
         status = cudnnBackendFinalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
@@ -650,6 +710,285 @@ class OperationBuilder_v8 {
         extract_feature_vector(CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR);
         return std::move(m_operation);
     }
+
+    Operation_v8 &&
+    build_bn_finalize_op() {
+        m_operation.operationTag = "BNFinalize";
+        auto status = CUDNN_STATUS_SUCCESS;
+
+        auto set_attribute = [&status] (
+            Operation_v8 &operation,
+            cudnnBackendAttributeName_t attr,
+            const char *fail_msg,
+            void const *ptr,
+            cudnnBackendAttributeType_t type = CUDNN_TYPE_BACKEND_DESCRIPTOR,
+            int64_t cnt = 1
+        ) {
+            status = cudnnBackendSetAttribute(operation.pointer->get_backend_descriptor(),
+                    attr, type, cnt, ptr);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(&operation, status, fail_msg);
+            }
+        };
+
+        set_attribute(m_operation,
+                      CUDNN_ATTR_OPERATION_BN_FINALIZE_STATS_MODE, 
+                      "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_STATS_MODE Failed",
+                      &(m_operation.bn_stats_mode),
+                      CUDNN_TYPE_BN_FINALIZE_STATS_MODE, 
+                      1);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            return std::move(m_operation);
+        }
+
+        set_attribute(m_operation,
+                CUDNN_ATTR_OPERATION_BN_FINALIZE_MATH_PREC, 
+                "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_MATH_PREC Failed",
+                &(m_operation.math_precision),
+                CUDNN_TYPE_DATA_TYPE, 
+                1);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            return std::move(m_operation);
+        }
+
+        if (m_operation.sumdesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_Y_SUM_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_Y_SUM_DESC Failed",
+                    &(m_operation.sumdesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+
+        if (m_operation.sqsumdesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_Y_SQ_SUM_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_Y_SQ_SUM_DESC Failed",
+                    &(m_operation.sqsumdesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+
+        if (m_operation.biasdesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_BIAS_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_BIAS_DESC Failed",
+                    &(m_operation.biasdesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+
+        if (m_operation.scaledesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_SCALE_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_SCALE_DESC Failed",
+                    &(m_operation.scaledesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+
+        if (m_operation.eqscaledesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_EQ_SCALE_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_EQ_SCALE_DESC Failed",
+                    &(m_operation.eqscaledesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+
+        if (m_operation.eqbiasdesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_EQ_BIAS_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_EQ_BIAS_DESC Failed",
+                    &(m_operation.eqbiasdesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+
+        if (m_operation.prevMeandesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_PREV_RUNNING_MEAN_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_PREV_RUNNING_MEAN_DESC Failed",
+                    &(m_operation.prevMeandesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+
+        if (m_operation.prevVardesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_PREV_RUNNING_VAR_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_PREV_RUNNING_VAR_DESC Failed",
+                    &(m_operation.prevVardesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+
+        if (m_operation.nextMeandesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_UPDATED_RUNNING_MEAN_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_UPDATED_RUNNING_MEAN_DESC Failed",
+                    &(m_operation.nextMeandesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+
+        if (m_operation.nextVardesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_UPDATED_RUNNING_VAR_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_UPDATED_RUNNING_VAR_DESC Failed",
+                    &(m_operation.nextVardesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+        
+        if (m_operation.savedMeandesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_SAVED_MEAN_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_SAVED_MEAN_DESC Failed",
+                    &(m_operation.savedMeandesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+
+        if (m_operation.savedInVardesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_SAVED_INV_STD_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_SAVED_INV_STD_DESC Failed",
+                    &(m_operation.savedInVardesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+        
+        if (m_operation.epsilondesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_EPSILON_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_EPSILON_DESC Failed",
+                    &(m_operation.epsilondesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+        
+        if (m_operation.expDecayFactordesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_EXP_AVERATE_FACTOR_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_EXP_AVERATE_FACTOR_DESC Failed",
+                    &(m_operation.expDecayFactordesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+        
+        if (m_operation.accumCountdesc) {
+            set_attribute(m_operation,
+                    CUDNN_ATTR_OPERATION_BN_FINALIZE_ACCUM_COUNT_DESC, 
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_BN_FINALIZE_ACCUM_COUNT_DESC Failed",
+                    &(m_operation.accumCountdesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return std::move(m_operation);
+            }
+        }
+
+        status = cudnnBackendFinalize(m_operation.pointer->get_backend_descriptor());
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
+            return std::move(m_operation);
+        }
+        return std::move(m_operation);
+    }
+
+    Operation_v8 &&
+    build_genstats_op() {
+        m_operation.operationTag = "GenStats";
+        auto status = CUDNN_STATUS_SUCCESS;
+
+        status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+                CUDNN_ATTR_OPERATION_GENSTATS_XDESC,
+                CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                1,
+                &(m_operation.xdesc->get_backend_descriptor()));
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                    &m_operation,
+                    status,
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_GENSTATS_XDESC Failed");
+            return std::move(m_operation);
+        }
+
+        status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+                CUDNN_ATTR_OPERATION_GENSTATS_SUMDESC,
+                CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                1,
+                &(m_operation.sumdesc->get_backend_descriptor()));
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                    &m_operation,
+                    status,
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_GENSTATS_SUMDESC Failed");
+            return std::move(m_operation);
+        }
+
+        status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+                CUDNN_ATTR_OPERATION_GENSTATS_SQSUMDESC,
+                CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                1,
+                &(m_operation.sqsumdesc->get_backend_descriptor()));
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                    &m_operation,
+                    status,
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_GENSTATS_SQSUMDESC Failed");
+            return std::move(m_operation);
+        }
+
+        status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+                CUDNN_ATTR_OPERATION_GENSTATS_MODE,
+                CUDNN_TYPE_GENSTATS_MODE,
+                1,
+                &(m_operation.genstats_mode));
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                    &m_operation,
+                    status,
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_GENSTATS_MODE Failed");
+            return std::move(m_operation);
+        }
+
+        status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+                CUDNN_ATTR_OPERATION_GENSTATS_MATH_PREC,
+                CUDNN_TYPE_DATA_TYPE,
+                1,
+                &(m_operation.math_precision));
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                    &m_operation,
+                    status,
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_GENSTATS_MATH_PREC Failed");
+            return std::move(m_operation);
+        }
+
+        
+        status = cudnnBackendFinalize(m_operation.pointer->get_backend_descriptor());
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
+            return std::move(m_operation);
+        }
+
+        return std::move(m_operation);
+    }
+
 
     Operation_v8 && 
     build_conv_backward_filter() {
@@ -1082,6 +1421,26 @@ class OperationBuilder_v8 {
         m_operation.bdesc = tensor.get_desc();
         return *this;
     }
+
+    auto
+    settDesc(Tensor_v8 const &tensor) -> OperationBuilder_v8 & {
+#if (CUDNN_VERSION >= 8400)
+        if (is_pointwise_op == false) {
+            set_error_and_throw_exception(
+                &m_operation,
+                CUDNN_STATUS_BAD_PARAM,
+                "CUDNN_BACKEND_OPERATION_*_DESCRIPTOR: Non Pointwise operation does not need tTensor");
+        }
+        m_operation.tdesc = tensor.get_desc();
+        return *this;
+#else
+            set_error_and_throw_exception(
+                &m_operation,
+                CUDNN_STATUS_NOT_SUPPORTED,
+                "CUDNN_BACKEND_OPERATION_*_DESCRIPTOR: tTensor Not supported in this version");
+#endif
+    }
+
     auto
     setyDesc(Tensor_v8 const &tensor) -> OperationBuilder_v8 & {
         m_operation.ydesc = tensor.get_desc();
@@ -1155,6 +1514,83 @@ class OperationBuilder_v8 {
         copy_dims_and_strides(conv.getStride(), conv_stride);
         cType = conv.getComputePrecision();
         mode  = conv.getMathMode();
+        return *this;
+    }
+
+    auto
+    setBNFinalizeMode (cudnnBnFinalizeStatsMode_t mode) -> OperationBuilder_v8 & {
+        m_operation.bn_stats_mode = mode;
+        return *this;
+    }
+
+    auto
+    setAccumCountTensor(Tensor_v8 const &tensor) -> OperationBuilder_v8 & {
+        m_operation.accumCountdesc = tensor.get_desc();
+        return *this;
+    }
+    
+    auto
+    setEpsilonTensor(Tensor_v8 const &tensor) -> OperationBuilder_v8 & {
+        m_operation.epsilondesc = tensor.get_desc();
+        return *this;
+    }
+    
+    auto
+    setExpDecayFactorTensor(Tensor_v8 const &tensor) -> OperationBuilder_v8 & {
+        m_operation.expDecayFactordesc  = tensor.get_desc();
+        return *this;
+    }
+
+    auto
+    setPrevRunningMeanAndVar(Tensor_v8 const &mean, Tensor_v8 const &var) -> OperationBuilder_v8 & {
+        m_operation.prevMeandesc = mean.get_desc();
+        m_operation.prevVardesc  = var.get_desc();
+        return *this;
+    }
+    
+    auto
+    setNextRunningMeanAndVar(Tensor_v8 const &mean, Tensor_v8 const &var) -> OperationBuilder_v8 & {
+        m_operation.nextMeandesc = mean.get_desc();
+        m_operation.nextVardesc  = var.get_desc();
+        return *this;
+    }
+    
+    auto
+    setSavedMeanAndInvVar(Tensor_v8 const &mean, Tensor_v8 const &var) -> OperationBuilder_v8 & {
+        m_operation.savedMeandesc  = mean.get_desc();
+        m_operation.savedInVardesc = var.get_desc();
+        return *this;
+    }
+
+    auto
+    setScaleAndBias(Tensor_v8 const &scale_tensor, Tensor_v8 const &bias_tensor) -> OperationBuilder_v8 & {
+        m_operation.scaledesc = scale_tensor.get_desc();
+        m_operation.biasdesc  = bias_tensor.get_desc();
+        return *this;
+    }
+    
+    auto
+    setEqScaleAndBias(Tensor_v8 const &eq_scale_tensor, Tensor_v8 const &eq_bias_tensor) -> OperationBuilder_v8 & {
+        m_operation.eqscaledesc = eq_scale_tensor.get_desc();
+        m_operation.eqbiasdesc   = eq_bias_tensor.get_desc();
+        return *this;
+    }
+
+    auto
+    setSumDesc(Tensor_v8 const &tensor) -> OperationBuilder_v8 & {
+        m_operation.sumdesc = tensor.get_desc();
+        return *this;
+    }
+    
+    auto
+    setSqSumDesc(Tensor_v8 const &tensor) -> OperationBuilder_v8 & {
+        m_operation.sqsumdesc = tensor.get_desc();
+        return *this;
+    }
+
+    auto
+    setaMatDesc(ManagedOpaqueDescriptor const &raw_tensor) -> OperationBuilder_v8 & {
+        m_operation.amatdesc = raw_tensor;
         return *this;
     }
     auto
@@ -1251,6 +1687,10 @@ class OperationBuilder_v8 {
                                             (m_operation.pointwise_mode == CUDNN_POINTWISE_CEIL) ||
                                             (m_operation.pointwise_mode == CUDNN_POINTWISE_FLOOR) ||
 #endif
+#if (CUDNN_VERSION >= 8400)
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_GEN_INDEX) ||
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_BINARY_SELECT) ||
+#endif
                                             (m_operation.pointwise_mode == CUDNN_POINTWISE_MIN) ||
                                             (m_operation.pointwise_mode == CUDNN_POINTWISE_MAX) ||
                                             (m_operation.pointwise_mode == CUDNN_POINTWISE_SQRT));
@@ -1314,15 +1754,29 @@ class OperationBuilder_v8 {
         return *this;
     }
 
+    auto
+    setMathPrecision(cudnnDataType_t dtype) -> OperationBuilder_v8 & {
+        m_operation.math_precision = dtype;
+        return *this;
+    }
+
+    auto
+    setGenStatsMode(cudnnGenStatsMode_t type) -> OperationBuilder_v8 & {
+        m_operation.genstats_mode = type;
+        return *this;
+    }
+
     OperationBuilder_v8(cudnnBackendDescriptorType_t mode) {
         m_operation.op_mode = mode;
         is_convolution_op   = ((m_operation.op_mode == CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR) ||
                              (m_operation.op_mode == CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR) ||
                              (m_operation.op_mode == CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR));
 
-        is_pointwise_op = (m_operation.op_mode == CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR);
-        is_matmul_op    = (m_operation.op_mode == CUDNN_BACKEND_OPERATION_MATMUL_DESCRIPTOR);
-        is_reduction_op = (m_operation.op_mode == CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR);
+        is_pointwise_op   = (m_operation.op_mode == CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR);
+        is_matmul_op      = (m_operation.op_mode == CUDNN_BACKEND_OPERATION_MATMUL_DESCRIPTOR);
+        is_reduction_op   = (m_operation.op_mode == CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR);
+        is_genstats_op    = (m_operation.op_mode == CUDNN_BACKEND_OPERATION_GEN_STATS_DESCRIPTOR);
+        is_bn_finalize_op = (m_operation.op_mode == CUDNN_BACKEND_OPERATION_BN_FINALIZE_STATISTICS_DESCRIPTOR);
     }
     /** @} */
 
@@ -1346,7 +1800,12 @@ class OperationBuilder_v8 {
             status_ = validate_matmul_op(msg);
         } else if (is_reduction_op) {
             status_ = validate_reduction_op(msg);
-        } else {
+        } else if (is_genstats_op) {
+            status_ = CUDNN_STATUS_SUCCESS;
+        } else if (is_bn_finalize_op) {
+            status_ = CUDNN_STATUS_SUCCESS;
+        }
+        else {
             status_ = CUDNN_STATUS_BAD_PARAM;
             msg = "CUDNN_BACKEND_OPERATION_DESCRIPTOR: Unsupported cudnn backend descriptor type. Check and set CUDNN_BACKEND_OPERATION_*_DESCRIPTOR";
         }
@@ -1374,6 +1833,10 @@ class OperationBuilder_v8 {
             return build_matmul_op();
         } else if (m_operation.op_mode == CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR) {
             return build_reduction_op();
+        } else if (m_operation.op_mode == CUDNN_BACKEND_OPERATION_GEN_STATS_DESCRIPTOR) {
+            return build_genstats_op();
+        } else if (m_operation.op_mode == CUDNN_BACKEND_OPERATION_BN_FINALIZE_STATISTICS_DESCRIPTOR) {
+            return build_bn_finalize_op();
         }
         getLogger() << "[cudnn_frontend] " << m_operation << std::endl;
         return std::move(m_operation);

@@ -111,7 +111,9 @@ filter(Predicate pred, executionPlans_t &plans) -> executionPlans_t {
             getLogger() << "and Added ";
             filtered_plans.emplace_back(std::move(plan));
         }
-        getLogger() << filtered_plans.back().getTag() << std::endl;
+        if (filtered_plans.size()) {
+            getLogger() << filtered_plans.back().getTag() << std::endl;
+        }
     }
     getLogger() << "[cudnn_frontend] Filtered plans count " << filtered_plans.size() << std::endl;
     return filtered_plans;

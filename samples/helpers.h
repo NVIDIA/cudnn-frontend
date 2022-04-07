@@ -54,6 +54,9 @@ int dim2lin(const int64_t* ids, const int64_t* strides, int length);
 void initImage(float* image, int64_t imageSize);
 void initImage(half1* image, int64_t imageSize);
 void initImage(int8_t* image, int imageSize);
+void initImage(int32_t* image, int imageSize);
+void initImage(int64_t* image, int imageSize);
+void initImage(bool* image, int imageSize);
 void initImagePadded(int8_t* image, int64_t dimA[], int64_t dimPadded[], int64_t stridePadded[], cudnnDataType_t dataType);
 
 void doEpilog(float* out, int idx, float alphaAcc, float beta);

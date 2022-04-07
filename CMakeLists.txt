@@ -16,6 +16,10 @@ else()
 link_directories(/usr/local/cuda/lib64)
 endif()
 
+if(DEFINED ENV{CUDNN_PATH})
+link_directories($ENV{CUDNN_PATH}/lib64)
+endif()
+
 add_executable(Samples samples/conv_sample.cpp 
                        samples/test_list.cpp 
                        samples/fp16_emu.cpp 
@@ -24,12 +28,18 @@ add_executable(Samples samples/conv_sample.cpp
                        samples/fusion_sample.cpp 
                        samples/mha_sample.cpp)
 
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
+
 if(DEFINED ENV{CUDA_PATH})
     target_include_directories(Samples PUBLIC $ENV{CUDA_PATH}/include/)
     target_include_directories(Samples PUBLIC $ENV{CUDA_PATH}/targets/ppc64le-linux/include)
 else()
     target_include_directories(Samples PUBLIC /usr/local/cuda/include/)
     target_include_directories(Samples PUBLIC /usr/local/cuda/targets/ppc64le-linux/include)
+endif()
+
+if(DEFINED ENV{CUDNN_PATH})
+    target_include_directories(Samples PUBLIC $ENV{CUDNN_PATH}/include/)
 endif()
 
 if(DEFINED ENV{CUDNN_FRONTEND_PATH})

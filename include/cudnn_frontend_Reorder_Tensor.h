@@ -56,8 +56,8 @@ cudnnReorderFilterAndBiasInt8x32(cudnnHandle_t handle,
     cudnn_status = cudnnCreateFilterDescriptor(&filterDesc);
     if (cudnn_status != CUDNN_STATUS_SUCCESS) {return cudnn_status;}
 
-    auto conv_dims       = conv_desc.getDimensionCount();
-    auto tensor_dims     = tensor.getDimensionCount();
+    int conv_dims        = conv_desc.getDimensionCount();
+    int tensor_dims      = tensor.getDimensionCount();
     auto non_shape_dims  = tensor_dims - conv_dims;
     
     if (non_shape_dims != 2 && non_shape_dims != 3) {
