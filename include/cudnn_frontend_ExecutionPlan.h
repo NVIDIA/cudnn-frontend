@@ -429,6 +429,7 @@ class ExecutionPlanBuilder_v8 {
 
     ExecutionPlan_v8 &&
     loadFromJson(const std::string &json_plan) {
+    CUDNN_FRONTEND_UNUSED(json_plan);
 #if (CUDNN_VERSION >= 8400)
         auto status = CUDNN_STATUS_SUCCESS;
 

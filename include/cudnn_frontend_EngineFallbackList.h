@@ -171,7 +171,7 @@ class EngineFallbackListBuilder_v8 {
                 m_fallback_list.m_engine_configs.emplace_back(engine_config.get_desc());
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
             } catch (cudnn_frontend::cudnnException &e) {
-                (void)e;
+                CUDNN_FRONTEND_UNUSED(e);
                 continue;
             }
 #endif

@@ -79,7 +79,7 @@ check_rule(const json &json_handle, const std::string & executionPlanTag,
     blocked = blocked && fn(); 
     return blocked;
 
-    (void) handle;
+    CUDNN_FRONTEND_UNUSED(handle);
 }
 
 // Takes in an initialzed json handle and checks if it satisfies the 

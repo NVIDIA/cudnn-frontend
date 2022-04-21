@@ -253,7 +253,7 @@ EngineConfigList
 get_heuristics_list(std::array<cudnnBackendHeurMode_t, SIZE> modes,
     OperationGraph_v8 &opGraph,
     std::function<bool(cudnnBackendDescriptor_t)> filter_fn) {
-    (void) modes;
+    CUDNN_FRONTEND_UNUSED(modes);
     EngineConfigList filtered_configs;
 
     for (auto mode : modes) {
@@ -403,6 +403,7 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
 #endif
 #else
             cudnnBackendDescriptorType_t op_type = CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR;
+            CUDNN_FRONTEND_UNUSED(op_type);
             std::string tag_ = opGraph.getTag();
             if (tag_.find("ConvFwd") != std::string::npos) {
                 op_type = CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR;
