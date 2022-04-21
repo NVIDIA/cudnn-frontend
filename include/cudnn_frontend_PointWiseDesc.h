@@ -233,6 +233,7 @@ class PointWiseDescBuilder_v8 {
 
     auto
     setAxis(int64_t axis_) -> PointWiseDescBuilder_v8 & {
+        CUDNN_FRONTEND_UNUSED(axis_);
 #if (CUDNN_VERSION >= 8400)
         m_pointWiseDesc.axis = axis_;
 #endif

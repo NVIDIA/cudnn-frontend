@@ -28,6 +28,7 @@
 #include "cudnn_backend_base.h"
 #include "cudnn_frontend_Logging.h"
 
+#define CUDNN_FRONTEND_UNUSED(X) ((void)X)
 namespace cudnn_frontend {
 
 /// Detailed feature_vector. Generally the Tensor and Operation properties

@@ -103,6 +103,8 @@ class ExecutionPlanCache_v1 {
     virtual bool 
     is_fastest_plan_stable(const cudnn_frontend::OperationGraph &op_graph,
                            const std::string & tag) {
+        CUDNN_FRONTEND_UNUSED(op_graph);
+        CUDNN_FRONTEND_UNUSED(tag);
         return true;
     }
 

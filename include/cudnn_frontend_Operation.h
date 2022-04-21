@@ -1432,15 +1432,13 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION_*_DESCRIPTOR: Non Pointwise operation does not need tTensor");
         }
         m_operation.tdesc = tensor.get_desc();
-        return *this;
 #else
-        set_error_and_throw_exception(
-            &m_operation,
-            CUDNN_STATUS_NOT_SUPPORTED,
-            "CUDNN_BACKEND_OPERATION_*_DESCRIPTOR: tTensor Not supported in this version");
-
-        return *this;
+        CUDNN_FRONTEND_UNUSED(tensor);
+        set_error_and_throw_exception(&m_operation,
+                                      CUDNN_STATUS_NOT_SUPPORTED,
+                                      "CUDNN_BACKEND_OPERATION_*_DESCRIPTOR: tTensor Not supported in this version");
 #endif
+        return *this;
     }
 
     auto

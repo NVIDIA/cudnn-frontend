@@ -155,6 +155,8 @@ class BackendDescriptor {
         : pointer(pointer_), status(status_), err_msg(err_msg_) {}
     BackendDescriptor() = default;
 
+    virtual ~BackendDescriptor() {};
+
     ManagedOpaqueDescriptor pointer;  //! Shared pointer of the OpaqueBackendPointer
 
     mutable cudnnStatus_t status = CUDNN_STATUS_SUCCESS;  //!< Error code if any being set

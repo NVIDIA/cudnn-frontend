@@ -9,6 +9,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 set (CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE INTERNAL "")
 
+if (MSVC)
+    # warning level 4 and all warnings as errors
+    add_compile_options(/W4 /WX)
+else()
+    # lots of warnings and all warnings as errors
+    add_compile_options(-Wall -Wextra -Werror -Wno-unused-function -Wno-unused-parameter
+	                -Wno-pessimizing-move -Wno-unused-variable -Wno-sign-compare)
+endif()
+
 
 if(DEFINED ENV{CUDA_PATH})
 link_directories($ENV{CUDA_PATH}/lib64)
