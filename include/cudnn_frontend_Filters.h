@@ -52,6 +52,7 @@ hasNumericalNote(cudnnBackendDescriptor_t engine_config) {
         engine_config, CUDNN_ATTR_ENGINECFG_ENGINE, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &engine_count, &engine_);
     if (status == CUDNN_STATUS_SUCCESS) {
         cudnnBackendNumericalNote_t notes[CUDNN_NUMERICAL_NOTE_TYPE_COUNT];
+        std::fill_n(notes, CUDNN_NUMERICAL_NOTE_TYPE_COUNT, CUDNN_NUMERICAL_NOTE_TYPE_COUNT);
         int64_t elem_count = 0;
         cudnnBackendGetAttribute(engine->get_backend_descriptor(),
                                  CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
@@ -80,6 +81,7 @@ hasBehaviorNote(cudnnBackendDescriptor_t engine_config) {
         engine_config, CUDNN_ATTR_ENGINECFG_ENGINE, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &engine_count, &engine_);
     if (status == CUDNN_STATUS_SUCCESS) {
         cudnnBackendBehaviorNote_t notes[CUDNN_BEHAVIOR_NOTE_TYPE_COUNT];
+        std::fill_n(notes, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT);
         int64_t elem_count = 0;
         cudnnBackendGetAttribute(engine->get_backend_descriptor(),
                                  CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
