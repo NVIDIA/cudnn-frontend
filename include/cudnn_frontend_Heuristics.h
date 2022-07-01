@@ -281,6 +281,7 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
 
     for (auto &mode : modes) {
         if (mode.find("heuristics_instant") != std::string::npos) {
+heuristics_instant:
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
             try {
 #endif
@@ -289,7 +290,6 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
                     .setHeurMode(CUDNN_HEUR_MODE_INSTANT)
                     .build();
                 if (heuristics.get_status() != CUDNN_STATUS_SUCCESS) {
-                    goto heuristics_mode_a;
                     statuses.push_back(heuristics.get_status());
                     if (evaluate_all) 
                         continue;
@@ -317,7 +317,6 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
                 statuses.push_back(heuristics.get_status());
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
             } catch (cudnn_frontend::cudnnException &e) {
-                goto heuristics_mode_a;
                 statuses.push_back(e.getCudnnStatus());
                 if (evaluate_all) 
                     continue;
@@ -444,7 +443,7 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
                     .setHeurMode(CUDNN_HEUR_MODE_B)
                     .build();
                 if (heuristics.get_status() != CUDNN_STATUS_SUCCESS) {
-                    goto heuristics_mode_a;
+                    goto heuristics_instant;
                     statuses.push_back(heuristics.get_status());
                     if (evaluate_all) 
                         continue;
@@ -472,7 +471,7 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
                 statuses.push_back(heuristics.get_status());
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
             } catch (cudnn_frontend::cudnnException &e) {
-                goto heuristics_mode_a;
+                goto heuristics_instant;
                 statuses.push_back(e.getCudnnStatus());
                 if (evaluate_all) 
                     continue;
@@ -482,7 +481,6 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
 #endif
 #if (CUDNN_VERSION >= 8300)
         } else if (mode.find("heuristics_mode_a") != std::string::npos) {
-heuristics_mode_a:
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
             try {
 #endif
