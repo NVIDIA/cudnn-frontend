@@ -289,6 +289,7 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
                     .setHeurMode(CUDNN_HEUR_MODE_INSTANT)
                     .build();
                 if (heuristics.get_status() != CUDNN_STATUS_SUCCESS) {
+                    goto heuristics_mode_a;
                     statuses.push_back(heuristics.get_status());
                     if (evaluate_all) 
                         continue;
@@ -316,6 +317,7 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
                 statuses.push_back(heuristics.get_status());
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
             } catch (cudnn_frontend::cudnnException &e) {
+                goto heuristics_mode_a;
                 statuses.push_back(e.getCudnnStatus());
                 if (evaluate_all) 
                     continue;
@@ -442,7 +444,7 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
                     .setHeurMode(CUDNN_HEUR_MODE_B)
                     .build();
                 if (heuristics.get_status() != CUDNN_STATUS_SUCCESS) {
-		            goto heuristics_mode_a;
+                    goto heuristics_mode_a;
                     statuses.push_back(heuristics.get_status());
                     if (evaluate_all) 
                         continue;
@@ -470,7 +472,7 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
                 statuses.push_back(heuristics.get_status());
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
             } catch (cudnn_frontend::cudnnException &e) {
-		        goto heuristics_mode_a;
+                goto heuristics_mode_a;
                 statuses.push_back(e.getCudnnStatus());
                 if (evaluate_all) 
                     continue;
