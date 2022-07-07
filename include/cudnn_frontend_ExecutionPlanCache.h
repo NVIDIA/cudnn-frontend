@@ -139,6 +139,9 @@ class ExecutionPlanCache_v1 {
         getLogger() << "[cudnn_frontend] Cached Plan Found in " << name << std::endl;
         return true;
     }
+
+    virtual ~ExecutionPlanCache_v1() = default;
+
 };
 
 class ExecutionPlanCache_v2 : public ExecutionPlanCache_v1 {
@@ -175,6 +178,8 @@ class ExecutionPlanCache_v2 : public ExecutionPlanCache_v1 {
 
     ExecutionPlanCache_v2(const char * name_) : ExecutionPlanCache_v1(name_) {
     }
+
+    virtual ~ExecutionPlanCache_v2() = default;
 
 };
 

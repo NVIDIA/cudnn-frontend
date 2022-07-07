@@ -15,7 +15,8 @@ if (MSVC)
 else()
     # lots of warnings and all warnings as errors
     add_compile_options(-Wall -Wextra -Werror -Wno-unused-function -Wno-unused-parameter
-	                -Wno-pessimizing-move -Wno-unused-variable -Wno-sign-compare)
+                        -Wno-pessimizing-move -Wno-unused-variable -Wno-sign-compare
+                        -Wnon-virtual-dtor)
 endif()
 
 
