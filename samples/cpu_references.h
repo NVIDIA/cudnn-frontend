@@ -112,6 +112,97 @@ void weightGrad_cpu_ref(
     }
 }
 
+template <typename inputType, typename scale_bias_type, typename outputType>
+void scale_and_bias_tensor_cpu(
+    const inputType* inputData, 
+    outputType* outputData,
+    const scale_bias_type* scaleData,
+    const scale_bias_type* biasData,
+    const int64_t inputSize,
+    const int64_t* inputDims)
+{
+    // Scale and bias per channel basis. Assumes NHWC format.
+    for (int i = 0; i < inputSize; i++) {
+        int c = i % inputDims[0];
+        outputData[i] = inputData[i] * scaleData[c] + biasData[c];
+    }
+}
+
+template <typename inputType>
+void add_tensors_cpu(
+    const inputType* firstInputData,
+    const inputType* secondInputData,
+    inputType* outputData,
+    const int64_t inputSize)
+{
+    for (int i = 0; i < inputSize; i++) {
+        outputData[i] = firstInputData[i] + secondInputData[i];
+    }
+}
+
+
+template <typename inputType, typename outputType>
+void relu(
+    const inputType* inputData, 
+    outputType* outputData,
+    const int64_t inputSize)
+{
+    for (int i = 0; i < inputSize; i++) {
+        outputData[i] = inputData[i] > (inputType) 0.0 ? inputData[i] : (inputType) 0.0;
+    }
+}
+
+template <typename T_ELEM>
+void gen_stats_cpu(
+    const T_ELEM* inputData, 
+    std::vector<std::pair<float, float>> &outputData,
+    const int64_t inputSize,
+    const int64_t* inputDims)
+{
+    std::vector<int> totals(inputDims[0], 0);
+    for (int i = 0; i < inputSize; i++) {
+        int channel_index = i % inputDims[0];
+
+        // Sum
+        outputData[channel_index].first = outputData[channel_index].first + inputData[i];
+        totals[channel_index] = totals[channel_index] + 1;
+    }
+
+    // Calculate the mean for each channel. Assumes NHWC format.
+    for (int i = 0; i < outputData.size(); i++) {
+        outputData[i].first = outputData[i].first / totals[i];
+    }
+
+    for (int i = 0; i < inputSize; i++) {
+        int channel_index = i % inputDims[0];
+
+        // Sum of squares
+        T_ELEM diff = (inputData[i] - outputData[channel_index].first) * (inputData[i] - outputData[channel_index].first);
+        outputData[channel_index].second = outputData[channel_index].second + diff;
+    }
+
+    // Calculate the variance for the channel. Assumes NHWC format.
+    for (int i = 0; i < outputData.size(); i++) {
+        outputData[i].second = outputData[i].second / totals[i];
+    }
+}
+
+template <typename T_ELEM>
+void batch_normalize(
+    const T_ELEM* inputData,
+    T_ELEM* outputData,
+    const std::vector<std::pair<float, float>> &stats,
+    const int64_t inputSize,
+    const int64_t* inputDims)
+{   
+
+    // Loop through each element in the input and normalize it based on what batch it belongs to
+    for (int i = 0; i < inputSize; i++) {
+        int batch_index = i % inputDims[0];
+        outputData[i] = (inputData[i] - stats[batch_index].first) / (T_ELEM) std::sqrt(stats[batch_index].second);
+    }
+}
+
 
 // T_ELEM is the type the data is stored in, T_MATH is the type the calculations are done in.
 template <typename T_ELEM, typename T_MATH> 

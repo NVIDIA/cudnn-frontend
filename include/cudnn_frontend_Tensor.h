@@ -87,23 +87,57 @@ class Tensor_v8 : public BackendDescriptor {
     };
 
     int64_t
-    getDimensionCount() const {
+    getDimCount() const {
         return nDims;
     }
 
     int64_t const *
-    getDimArray() const {
+    getDim() const {
         return btensor_dimA;
     }
 
     int64_t const *
-    getStrideArray() const {
+    getStride() const {
         return btensor_strA;
+    }
+
+
+    // TODO: Deprecate in v1.0
+    int64_t const *
+    getDimArray() const {
+        return getDim();
+    }
+
+    // TODO: Deprecate in v1.0
+    int64_t const *
+    getStrideArray() const {
+        return getStride();
     }
 
     int64_t
     getDataType() const {
         return static_cast<int64_t>(data_type);
+    }
+
+    int64_t
+    getId() const {
+        return id;
+    }
+
+    int64_t
+    getAlignment() const {
+        return alignment;
+    }
+
+    bool
+    isVirtualTensor() const {
+        return isVirtual;
+    }
+
+    // TODO: Deprecate in v1.0
+    int64_t
+    getDimensionCount() const {
+        return getDimCount();
     }
 
     Tensor_v8(Tensor_v8 &&from) = default;
@@ -158,7 +192,7 @@ class TensorBuilder_v8 {
     }
     //! Set Strides of the tensor
     auto
-    setStrides(int64_t ndim, int64_t const *strides) -> TensorBuilder_v8 & {
+    setStride(int64_t ndim, int64_t const *strides) -> TensorBuilder_v8 & {
         std::copy(strides, strides + ndim, m_tensor.btensor_strA);
         return *this;
     }
@@ -200,6 +234,31 @@ class TensorBuilder_v8 {
     }
 #endif
     /** @} */
+
+    // TODO: Deprecate in v1.0
+    auto
+    setStrides(int64_t ndim, int64_t const *strides) -> TensorBuilder_v8 & {
+        return setStride(ndim, strides);
+    }
+
+    // Clone parameters of another tensor. Make sure to still set the UID since UID of two tensors shouldn't be the same.
+    auto cloneFrom(Tensor_v8 const &from, int64_t newID) -> TensorBuilder_v8 & {
+        m_tensor.data_type = from.data_type;
+        m_tensor.nDims      = from.nDims;
+        m_tensor.id         = newID;
+        std::copy(from.getDimArray(), from.getDimArray() + m_tensor.nDims, m_tensor.btensor_dimA);
+        std::copy(from.getStrideArray(), from.getStrideArray() + m_tensor.nDims, m_tensor.btensor_strA);
+        m_tensor.alignment = from.alignment;
+        m_tensor.isVirtual = from.isVirtual;
+        m_tensor.isByValue = from.isByValue;
+        m_tensor.vectorCount = from.vectorCount;
+        m_tensor.vectorDimension = from.vectorDimension;
+
+#if (CUDNN_VERSION >= 8300)
+        m_tensor.reorder_type = from.reorder_type;
+#endif
+        return *this;
+    }
 
     //! constructs the Tensor_v8 by calling the cudnn API
     //! Throws the appropriate error message

@@ -14,8 +14,7 @@ if (MSVC)
     add_compile_options(/W4 /WX)
 else()
     # lots of warnings and all warnings as errors
-    add_compile_options(-Wall -Wextra -Werror -Wno-unused-function -Wno-unused-parameter
-	                -Wno-pessimizing-move -Wno-unused-variable -Wno-sign-compare)
+    add_compile_options(-Wall -Wextra -Werror -Wno-unused-function -Wno-unused-parameter -Wno-pessimizing-move -Wno-unused-variable -Wno-sign-compare -Werror=strict-aliasing -Wnon-virtual-dtor)
 endif()
 
 
@@ -27,6 +26,7 @@ endif()
 
 if(DEFINED ENV{CUDNN_PATH})
 link_directories($ENV{CUDNN_PATH}/lib64)
+link_directories($ENV{CUDNN_PATH}/lib)
 endif()
 
 add_executable(Samples samples/conv_sample.cpp 
@@ -38,6 +38,11 @@ add_executable(Samples samples/conv_sample.cpp
                        samples/mha_sample.cpp)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
+
+if(DEFINED ENV{NO_DEFAULT_IN_SWITCH})
+    message("Default case in the switch is disabled")
+    add_compile_definitions(NO_DEFAULT_IN_SWITCH)
+endif()
 
 if(DEFINED ENV{CUDA_PATH})
     target_include_directories(Samples PUBLIC $ENV{CUDA_PATH}/include/)

@@ -39,7 +39,7 @@ namespace cudnn_frontend {
 /// MatMulDesc  Descriptor Class
 /// This class tells the properties of the MatMul operation
 /// Properties:
-///    - math_precision
+///    - compute_type
 ///
 /// Use MatMulDesc_v8 to build this class.
 /// Describe returns a string describing the MatMul operation
@@ -51,7 +51,7 @@ class MatMulDesc_v8 : public BackendDescriptor {
     describe() const override {
         std::stringstream ss;
         ss << "CUDNN_BACKEND_MATMUL_DESCRIPTOR :"
-           << " Math precision " << (math_precision);
+           << " Math precision " << (compute_type);
         return ss.str();
     }
 
@@ -67,7 +67,7 @@ class MatMulDesc_v8 : public BackendDescriptor {
     MatMulDesc_v8 &
     operator=(MatMulDesc_v8 const &) = delete;
 
-    cudnnDataType_t math_precision = CUDNN_DATA_FLOAT;
+    cudnnDataType_t compute_type = CUDNN_DATA_FLOAT;
 };
 
 ////
@@ -81,11 +81,17 @@ class MatMulDescBuilder_v8 {
      */
     //! Set Math Precision Data Type for the Matmul Operation
     auto
-    setMathPrecision(cudnnDataType_t data_type_) -> MatMulDescBuilder_v8 & {
-        m_matMulDesc.math_precision = data_type_;
+    setComputeType(cudnnDataType_t data_type_) -> MatMulDescBuilder_v8 & {
+        m_matMulDesc.compute_type = data_type_;
         return *this;
     }
     /** @} */
+
+    // TODO Deprecate in v1.0
+    auto
+    setMathPrecision(cudnnDataType_t data_type_) -> MatMulDescBuilder_v8 & {
+        return setComputeType(data_type_);
+    }
 
     //! constructs the MatMulDesc_v8 by calling the cudnn API
     //! Throws the appropriate error message
@@ -103,7 +109,7 @@ class MatMulDescBuilder_v8 {
                                           CUDNN_ATTR_MATMUL_COMP_TYPE,
                                           CUDNN_TYPE_DATA_TYPE,
                                           1,
-                                          &m_matMulDesc.math_precision);
+                                          &m_matMulDesc.compute_type);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_matMulDesc,

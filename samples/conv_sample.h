@@ -71,7 +71,8 @@ void run_from_heuristics(
     cudnnBackendHeurMode_t heur_mode,
     bool expect_in_cache = false);
 
-void run_with_external_config(
+cudnnStatus_t 
+run_with_external_config(
     int64_t* dimA_padded,
     int64_t* padA,
     int64_t* convstrideA,

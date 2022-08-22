@@ -30,7 +30,8 @@
 
 half1 cpu_float2half_rn(float f)
 {
-    unsigned x = *((int*)(void*)(&f));
+    void* f_ptr = &f;
+    unsigned x = *((int*)f_ptr);
     unsigned u = (x & 0x7fffffff), remainder, shift, lsb, lsb_s1, lsb_m1;
     unsigned sign, exponent, mantissa;
 
@@ -39,7 +40,9 @@ half1 cpu_float2half_rn(float f)
     // Get rid of +NaN/-NaN case first.
     if (u > 0x7f800000) {
         hr.x = 0x7fffU;
-        return reinterpret_cast<half1&>(hr);
+        // Add an indirection to get around type aliasing check
+        void* hr_ptr = &hr;
+        return *reinterpret_cast<half1*>(hr_ptr);
     }
   
     sign = ((x >> 16) & 0x8000);
@@ -47,11 +50,15 @@ half1 cpu_float2half_rn(float f)
     // Get rid of +Inf/-Inf, +0/-0.
     if (u > 0x477fefff) {
         hr.x = sign | 0x7c00U;
-        return reinterpret_cast<half1&>(hr);
+        // Add an indirection to get around type aliasing check
+        void* hr_ptr = &hr;
+        return *reinterpret_cast<half1*>(hr_ptr);
     }
     if (u < 0x33000001) {
         hr.x = sign | 0x0000U;
-        return reinterpret_cast<half1&>(hr);
+        // Add an indirection to get around type aliasing check
+        void* hr_ptr = &hr;
+        return *reinterpret_cast<half1*>(hr_ptr);
     }
 
     exponent = ((u >> 23) & 0xff);
@@ -82,7 +89,9 @@ half1 cpu_float2half_rn(float f)
 
     hr.x = (sign | (exponent << 10) | mantissa);  
 
-    return reinterpret_cast<half1&>(hr);
+    // Add an indirection to get around type aliasing check
+    void* hr_ptr = &hr;
+    return *reinterpret_cast<half1*>(hr_ptr);
 }
 
 
@@ -90,7 +99,9 @@ float cpu_half2float(half1 h)
 {
     STATIC_ASSERT(sizeof(int) == sizeof(float));
 
-    __half_raw hr = reinterpret_cast<__half_raw&>(h);
+    // Add an indirection to get around type aliasing check
+    void* h_ptr = &h;
+    __half_raw hr = *reinterpret_cast<__half_raw*>(h_ptr);
 
     unsigned sign     = ((hr.x >> 15) & 1);
     unsigned exponent = ((hr.x >> 10) & 0x1f);
@@ -116,6 +127,9 @@ float cpu_half2float(half1 h)
 
     int temp = ((sign << 31) | (exponent << 23) | mantissa);
 
-    return reinterpret_cast<float&>(temp);
+    // Add an indirection to get around type aliasing check
+    void* temp_ptr = &temp;
+    float* res_ptr = reinterpret_cast<float*>(temp_ptr); 
+    return *res_ptr;
 }
 
