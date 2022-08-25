@@ -224,7 +224,7 @@ class MHA_intputProjLayer {
 
         auto wMatrixTensor = cudnn_frontend::TensorBuilder()
                                  .setDim(3, wDim)
-                                 .setStrides(3, wStride)
+                                 .setStride(3, wStride)
                                  .setId('W')
                                  .setAlignment(16)
                                  .setDataType(dataType)
@@ -236,7 +236,7 @@ class MHA_intputProjLayer {
 
         auto iMatrixTensor = cudnn_frontend::TensorBuilder()
                                  .setDim(3, iDim)
-                                 .setStrides(3, iStride)
+                                 .setStride(3, iStride)
                                  .setId('i')
                                  .setAlignment(16)
                                  .setDataType(dataType)
@@ -248,7 +248,7 @@ class MHA_intputProjLayer {
 
         auto bTensor = cudnn_frontend::TensorBuilder()
                            .setDim(3, bDim)
-                           .setStrides(3, bStride)
+                           .setStride(3, bStride)
                            .setId('b')
                            .setAlignment(16)
                            .setDataType(dataType)
@@ -260,7 +260,7 @@ class MHA_intputProjLayer {
 
         auto beforeBiasMatrixTensor = cudnn_frontend::TensorBuilder()
                                           .setDim(3, oDim)
-                                          .setStrides(3, oStride)
+                                          .setStride(3, oStride)
                                           .setId('a')
                                           .setAlignment(16)
                                           .setVirtual()
@@ -269,7 +269,7 @@ class MHA_intputProjLayer {
 
         auto oMatrixTensor = cudnn_frontend::TensorBuilder()
                                  .setDim(3, oDim)
-                                 .setStrides(3, oStride)
+                                 .setStride(3, oStride)
                                  .setId('o')
                                  .setAlignment(16)
                                  .setDataType(dataType)
@@ -277,12 +277,12 @@ class MHA_intputProjLayer {
 
         // Define the matmul descriptor for Q, K, V = W * Input
         auto matmulDesc = cudnn_frontend::MatMulDescBuilder()
-                              .setMathPrecision(CUDNN_DATA_FLOAT)
+                              .setComputeType(CUDNN_DATA_FLOAT)
                               .build();
         // Define the Bias descriptor for Q, K, V = W * Input + Bias
         auto biasDesc = cudnn_frontend::PointWiseDescBuilder()
                             .setMode(CUDNN_POINTWISE_ADD)
-                            .setMathPrecision(CUDNN_DATA_FLOAT)
+                            .setComputeType(CUDNN_DATA_FLOAT)
                             .build();
         // Create a matmul Node for Q, K, V = W * Input
         auto matmulOp = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_MATMUL_DESCRIPTOR)
@@ -366,7 +366,7 @@ class MHA_outputProjLayer {
 
         auto wMatrixTensor = cudnn_frontend::TensorBuilder()
                                  .setDim(3, wDim)
-                                 .setStrides(3, wStride)
+                                 .setStride(3, wStride)
                                  .setId('W')
                                  .setAlignment(16)
                                  .setDataType(dataType)
@@ -378,7 +378,7 @@ class MHA_outputProjLayer {
 
         auto iMatrixTensor = cudnn_frontend::TensorBuilder()
                                  .setDim(3, iDim)
-                                 .setStrides(3, iStride)
+                                 .setStride(3, iStride)
                                  .setId('i')
                                  .setAlignment(16)
                                  .setDataType(dataType)
@@ -390,7 +390,7 @@ class MHA_outputProjLayer {
 
         auto bTensor = cudnn_frontend::TensorBuilder()
                            .setDim(3, bDim)
-                           .setStrides(3, bStride)
+                           .setStride(3, bStride)
                            .setId('b')
                            .setAlignment(16)
                            .setDataType(dataType)
@@ -402,7 +402,7 @@ class MHA_outputProjLayer {
 
         auto beforeBiasMatrixTensor = cudnn_frontend::TensorBuilder()
                                           .setDim(3, oDim)
-                                          .setStrides(3, oStride)
+                                          .setStride(3, oStride)
                                           .setId('a')
                                           .setAlignment(16)
                                           .setVirtual()
@@ -410,7 +410,7 @@ class MHA_outputProjLayer {
                                           .build();
         auto oMatrixTensor = cudnn_frontend::TensorBuilder()
                                  .setDim(3, oDim)
-                                 .setStrides(3, oStride)
+                                 .setStride(3, oStride)
                                  .setId('o')
                                  .setAlignment(16)
                                  .setDataType(dataType)
@@ -418,12 +418,12 @@ class MHA_outputProjLayer {
 
         // Define the matmul descriptor
         auto matmulDesc = cudnn_frontend::MatMulDescBuilder()
-                              .setMathPrecision(CUDNN_DATA_FLOAT)
+                              .setComputeType(CUDNN_DATA_FLOAT)
                               .build();
         // Define the Bias descriptor
         auto biasDesc = cudnn_frontend::PointWiseDescBuilder()
                             .setMode(CUDNN_POINTWISE_ADD)
-                            .setMathPrecision(CUDNN_DATA_FLOAT)
+                            .setComputeType(CUDNN_DATA_FLOAT)
                             .build();
         // Create a matmul Node
         auto matmulOp = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_MATMUL_DESCRIPTOR)
@@ -511,7 +511,7 @@ class MHA_attentionLayer {
 
             auto qMatrixTensor = cudnn_frontend::TensorBuilder()
                                      .setDim(3, qDim)
-                                     .setStrides(3, qStride)
+                                     .setStride(3, qStride)
                                      .setId('q')
                                      .setAlignment(16)
                                      .setDataType(dataType)
@@ -522,7 +522,7 @@ class MHA_attentionLayer {
 
             auto kMatrixTensor = cudnn_frontend::TensorBuilder()
                                      .setDim(3, kDim)
-                                     .setStrides(3, kStride)
+                                     .setStride(3, kStride)
                                      .setId('k')
                                      .setAlignment(16)
                                      .setDataType(dataType)
@@ -534,7 +534,7 @@ class MHA_attentionLayer {
 
             auto sMatrixTensor = cudnn_frontend::TensorBuilder()
                                      .setDim(3, sDim)
-                                     .setStrides(3, sStride)
+                                     .setStride(3, sStride)
                                      .setId('s')
                                      .setAlignment(16)
                                      .setVirtual()
@@ -543,7 +543,7 @@ class MHA_attentionLayer {
             // Create tensor descriptor for Z = softmaxScaler * S
             auto zMatrixTensor = cudnn_frontend::TensorBuilder()
                                      .setDim(3, sDim)
-                                     .setStrides(3, sStride)
+                                     .setStride(3, sStride)
                                      .setId('z')
                                      .setAlignment(16)
                                      .setDataType(dataType)
@@ -551,7 +551,7 @@ class MHA_attentionLayer {
             // Create tensor descriptor for E = exp(Z)
             auto eMatrixTensor = cudnn_frontend::TensorBuilder()
                                      .setDim(3, sDim)
-                                     .setStrides(3, sStride)
+                                     .setStride(3, sStride)
                                      .setId('e')
                                      .setAlignment(16)
                                      .setVirtual()
@@ -563,7 +563,7 @@ class MHA_attentionLayer {
 
             auto softmaxScalerTensor = cudnn_frontend::TensorBuilder()
                                            .setDim(3, scalerDim)
-                                           .setStrides(3, scalerStride)
+                                           .setStride(3, scalerStride)
                                            .setId('m')
                                            .setAlignment(16)
                                            .setDataType(CUDNN_DATA_FLOAT)
@@ -574,26 +574,26 @@ class MHA_attentionLayer {
 
             auto cTensor = cudnn_frontend::TensorBuilder()
                                .setDim(3, cDim)
-                               .setStrides(3, cStride)
+                               .setStride(3, cStride)
                                .setId('c')
                                .setAlignment(16)
                                .setDataType(CUDNN_DATA_FLOAT)
                                .build();
             // Define the matmul descriptor for S = (Q^T * K)
-            auto matmulDesc = cudnn_frontend::MatMulDescBuilder().setMathPrecision(CUDNN_DATA_FLOAT).build();
+            auto matmulDesc = cudnn_frontend::MatMulDescBuilder().setComputeType(CUDNN_DATA_FLOAT).build();
             // Define the scale descriptor for S' = softmaxScaler * S
             auto softmaxScalerDesc = cudnn_frontend::PointWiseDescBuilder()
                                          .setMode(CUDNN_POINTWISE_MUL)
-                                         .setMathPrecision(CUDNN_DATA_FLOAT)
+                                         .setComputeType(CUDNN_DATA_FLOAT)
                                          .build();
             // Define the activation descriptor for E = exp(S')
             auto expDesc = cudnn_frontend::PointWiseDescBuilder()
                                .setMode(CUDNN_POINTWISE_EXP)
-                               .setMathPrecision(CUDNN_DATA_FLOAT)
+                               .setComputeType(CUDNN_DATA_FLOAT)
                                .build();
             // Define the reduction descriptor
             auto colRedunctionDesc = cudnn_frontend::ReductionDescBuilder()
-                                         .setMathPrecision(CUDNN_DATA_FLOAT)
+                                         .setComputeType(CUDNN_DATA_FLOAT)
                                          .setReductionOp(CUDNN_REDUCE_TENSOR_ADD)
                                          .build();
             // Create a matmul Node for S = (Q^T * K)
@@ -642,7 +642,7 @@ class MHA_attentionLayer {
 
             auto vMatrixTensor = cudnn_frontend::TensorBuilder()
                                      .setDim(3, vDim)
-                                     .setStrides(3, vStride)
+                                     .setStride(3, vStride)
                                      .setId('v')
                                      .setAlignment(16)
                                      .setDataType(dataType)
@@ -653,7 +653,7 @@ class MHA_attentionLayer {
 
             auto sMatrixTensor = cudnn_frontend::TensorBuilder()
                                      .setDim(3, eDim)
-                                     .setStrides(3, eStride)
+                                     .setStride(3, eStride)
                                      .setId('s')
                                      .setAlignment(16)
                                      .setDataType(dataType)
@@ -661,7 +661,7 @@ class MHA_attentionLayer {
 
             auto eMatrixTensor = cudnn_frontend::TensorBuilder()
                                      .setDim(3, eDim)
-                                     .setStrides(3, eStride)
+                                     .setStride(3, eStride)
                                      .setId('e')
                                      .setAlignment(16)
                                      .setVirtual()
@@ -671,7 +671,7 @@ class MHA_attentionLayer {
             // Create tensor descriptor for P = Y / R
             auto pMatrixTensor = cudnn_frontend::TensorBuilder()
                                      .setDim(3, eDim)
-                                     .setStrides(3, eStride)
+                                     .setStride(3, eStride)
                                      .setId('p')
                                      .setAlignment(16)
                                      .setVirtual()
@@ -684,7 +684,7 @@ class MHA_attentionLayer {
 
             auto yMatrixTensor = cudnn_frontend::TensorBuilder()
                                      .setDim(3, yDim)
-                                     .setStrides(3, yStride)
+                                     .setStride(3, yStride)
                                      .setId('y')
                                      .setAlignment(16)
                                      .setDataType(dataType)
@@ -696,7 +696,7 @@ class MHA_attentionLayer {
 
             auto rTensor = cudnn_frontend::TensorBuilder()
                                .setDim(3, rDim)
-                               .setStrides(3, rStride)
+                               .setStride(3, rStride)
                                .setId('r')
                                .setAlignment(16)
                                .setDataType(CUDNN_DATA_FLOAT)
@@ -704,15 +704,15 @@ class MHA_attentionLayer {
             // Define the activation descriptor
             auto expDesc = cudnn_frontend::PointWiseDescBuilder()
                                .setMode(CUDNN_POINTWISE_EXP)
-                               .setMathPrecision(CUDNN_DATA_FLOAT)
+                               .setComputeType(CUDNN_DATA_FLOAT)
                                .build();
             // Define the row-broadcast descriptor for P = Y / R
             auto rowBroadcastDesc = cudnn_frontend::PointWiseDescBuilder()
                                         .setMode(CUDNN_POINTWISE_DIV)
-                                        .setMathPrecision(CUDNN_DATA_FLOAT)
+                                        .setComputeType(CUDNN_DATA_FLOAT)
                                         .build();
             // Define the matmul descriptor for Y = E * V^T
-            auto matmulDesc = cudnn_frontend::MatMulDescBuilder().setMathPrecision(CUDNN_DATA_FLOAT).build();
+            auto matmulDesc = cudnn_frontend::MatMulDescBuilder().setComputeType(CUDNN_DATA_FLOAT).build();
 
             // Create a EXP Node for E = exp(S')
             auto expOp = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)

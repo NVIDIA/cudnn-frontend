@@ -128,6 +128,30 @@ run_conv_scale_bias_relu_int8(int64_t* x_dim,
                               void* devPtrB);
 
 void
+run_pool_scale_bias_relu_int8(int64_t* x_dim,
+                              int64_t* y_dim,
+                              int64_t* s_dim,
+                              int64_t* b_dim,
+                              void* devPtrX,
+                              void* devPtrY,
+                              void* devPtrS,
+                              void* devPtrB, 
+                              cudnnDataType_t compType,
+#if (CUDNN_VERSION >= 8500) 
+                              cudnnResampleMode_t mode ,
+                              cudnnNanPropagation_t nanOpt, 
+                              cudnnPaddingMode_t paddingMode, 
+#endif
+                              int64_t nbSpatialDims,                         
+                              double alpha,                           
+                              double beta,
+                              int64_t* windowDimA,
+                              int64_t* prePaddingA,
+                              int64_t* postPaddingA,
+                              int64_t* strideA);
+ 
+
+void
 run_matmul_bias_gelu(int64_t* a_dim,
                      int64_t* b_dim,
                      int64_t* c_dim,
@@ -136,7 +160,21 @@ run_matmul_bias_gelu(int64_t* a_dim,
                      void* devPtrA,
                      void* devPtrB,
                      void* devPtrC,
-                     void* devPtrZ);
+                     void* devPtrZ,
+                     void* devPtrAfterZ);
+
+                     
+void
+run_matmul_dgelu_dbias(const int64_t* a_dim,
+                       const int64_t* b_dim,
+                       const int64_t* c_dim,
+                       const int64_t* bias_dim,
+                       cudnnDataType_t dataType,
+                       void* devPtrDy,
+                       void* devPtrW,
+                       void* devPtrX,
+                       void* devPtrDX,
+                       void* devPtrDBias);
 
 void
 run_conv_drelu(int64_t* x,
@@ -178,7 +216,7 @@ run_conv_reduction(int64_t* x_dim,
                    void* devPtrW,
                    void* devPtrR);
 
-void
+cudnnStatus_t
 run_bn_conv_gen_stat(int64_t* xTensorDim, 
                     int64_t* wTensorDim, 
                     int64_t* yTensorDim,  
@@ -217,3 +255,31 @@ run_bn_finalize(
     double exponential_decay_factor,
     int64_t accumCnt_val
 );
+
+cudnnStatus_t run_dsbar(int64_t *Y_dim,
+               int64_t *scaleTensorDim,
+               int64_t *biasTensorDim,
+               void *RP_YdevPtr,
+               void *RP_scaleDevPtr,
+               void *RP_biasDevPtr,
+               void *DP_YdevPtr,
+               void *DP_scaleDevPtr,
+               void *DP_biasDevPtr,
+               void *YdevPtr);
+
+void
+run_conv_two_global_scales(int64_t* xTensorDim,
+                   int64_t* wTensorDim,
+                   int64_t* yTensorDim,
+                   int64_t* scaleTensorDim,
+                   int convDim,
+                   int64_t* conv_padA,
+                   int64_t* conv_dilationA,
+                   int64_t* conv_strideA,
+                   void* devPtrX,
+                   void* devPtrW,
+                   void* devPtrScale1,
+                   void* devPtrScale2,
+                   void* devPtrOutput,
+                   void* afterConv);
+

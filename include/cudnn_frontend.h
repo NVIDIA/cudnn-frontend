@@ -114,6 +114,7 @@
 #include "cudnn_frontend_Logging.h"
 #include "cudnn_frontend_Reorder_Tensor.h"
 #include "cudnn_frontend_ExecutionPlanCache.h"
+#include "cudnn_frontend_Resample.h"
 
 namespace cudnn_frontend {
 using Tensor                    = Tensor_v8;
@@ -138,4 +139,6 @@ using VariantPack               = VariantPack_v8;
 using VariantPackBuilder        = VariantPackBuilder_v8;
 using EngineFallbackList        = EngineFallbackList_v8;
 using EngineFallbackListBuilder = EngineFallbackListBuilder_v8;
+using ResampleDesc              = ResampleDesc_v8;
+using ResampleDescBuilder       = ResampleDescBuilder_v8;
 }

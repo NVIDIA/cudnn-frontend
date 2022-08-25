@@ -236,14 +236,29 @@ struct Surface {
     T_ELEM* hostPtr = NULL;
     T_ELEM* hostRefPtr = NULL;
 
-    explicit Surface(int64_t size, bool hasRef) {
-        checkCudaErr(cudaMalloc((void**)&(devPtr), (size) * sizeof(devPtr[0])));
-        hostPtr = (T_ELEM*) calloc(size, sizeof(hostPtr[0]));
+    explicit Surface(int64_t n_elems, bool hasRef) {
+        checkCudaErr(cudaMalloc((void**)&(devPtr), (n_elems) * sizeof(devPtr[0])));
+        hostPtr = (T_ELEM*) calloc(n_elems, sizeof(hostPtr[0]));
         if(hasRef) {
-            hostRefPtr = (T_ELEM*) calloc(size, sizeof(hostRefPtr[0]));
+            hostRefPtr = (T_ELEM*) calloc(n_elems, sizeof(hostRefPtr[0]));
         }
-        initImage(hostPtr, size);
-        checkCudaErr(cudaMemcpy(devPtr, hostPtr, sizeof(hostPtr[0]) * size, cudaMemcpyHostToDevice));
+        initImage(hostPtr, n_elems);
+        checkCudaErr(cudaMemcpy(devPtr, hostPtr, sizeof(hostPtr[0]) * n_elems, cudaMemcpyHostToDevice));
+        checkCudaErr(cudaDeviceSynchronize());
+    }
+
+    explicit Surface(int64_t n_elems, bool hasRef, bool isInterleaved) {
+        checkCudaErr(cudaMalloc((void**)&(devPtr), (n_elems) * sizeof(devPtr[0])));
+        hostPtr = (T_ELEM*) calloc(n_elems, sizeof(hostPtr[0]));
+        if(hasRef) {
+            hostRefPtr = (T_ELEM*) calloc(n_elems, sizeof(hostRefPtr[0]));
+        }
+        initImage(hostPtr, n_elems);
+	uint32_t *temp = (uint32_t *)hostPtr;
+	for (int i = 0; i < n_elems; i = i+2) {
+	    temp[i + 1] = 1u;
+	}
+        checkCudaErr(cudaMemcpy(devPtr, hostPtr, sizeof(hostPtr[0]) * n_elems, cudaMemcpyHostToDevice));
         checkCudaErr(cudaDeviceSynchronize());
     }
 

@@ -23,6 +23,7 @@
 #pragma once
 
 #include <algorithm>
+#include <iterator>
 #include <array>
 #include <functional>
 #include <memory>
@@ -72,15 +73,17 @@ class ExecutionPlan_v8 : public BackendDescriptor {
         std::stringstream ss;
         ss << "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR : ";
         ss << getTag() << ", ";
-        ss << "numeric_notes:" << " ";
-        for (auto note : numeric_notes) 
-            ss << note << " ";
+        ss << "numeric_notes:" << "[";
+        for (auto note : numeric_notes_vec)  {
+            ss << cudnn_frontend::to_string(note) << ",";
+        }
 #if (CUDNN_VERSION >= 8200)  
-        ss << "behavior_notes:" << " ";
-        for (auto note : behavior_notes) 
-            ss << note << " ";
+        ss << "] behavior_notes:" << "[";
+        for (auto note : behavior_notes_vec) {
+            ss << cudnn_frontend::to_string(note) << ",";
+        }
 #endif
-        ss << "workSpaceSize: " << workSpaceSize;
+        ss << "] workSpaceSize: " << workSpaceSize;
         return ss.str();
     }
 
@@ -99,6 +102,11 @@ class ExecutionPlan_v8 : public BackendDescriptor {
         return execution_time_ms;
     }
 
+    std::vector<cudnnBackendNumericalNote_t> const &
+    getAllNumericNotes() const {
+        return numeric_notes_vec;
+    }
+
     std::array<cudnnBackendNumericalNote_t,CUDNN_NUMERICAL_NOTE_TYPE_COUNT> const &
     getNumericNotes() const {
         return numeric_notes;
@@ -108,6 +116,10 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     std::array<cudnnBackendBehaviorNote_t, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT> const &
     getBehaviorNotes() const {
         return behavior_notes;
+    }
+    std::vector<cudnnBackendBehaviorNote_t> const &
+    getAllBehaviorNotes() const {
+        return behavior_notes_vec;
     }
 #endif
 
@@ -170,7 +182,18 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                  CUDNN_TYPE_NUMERICAL_NOTE,
                                  CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
                                  &elem_count,
-                                 numeric_notes.data());
+                                 NULL);
+        numeric_notes_vec.resize(elem_count);
+        status = cudnnBackendGetAttribute(extractedEngine_,
+                                 CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
+                                 CUDNN_TYPE_NUMERICAL_NOTE,
+                                 CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
+                                 &elem_count,
+                                 numeric_notes_vec.data());
+        auto end = std::min(elem_count, static_cast<int64_t>(CUDNN_NUMERICAL_NOTE_TYPE_COUNT));
+        std::copy(numeric_notes_vec.begin(), numeric_notes_vec.begin() + end, numeric_notes.begin());
+        if (elem_count < numeric_notes.size())
+            std::fill_n(numeric_notes.begin() + elem_count, numeric_notes.size() - elem_count, CUDNN_NUMERICAL_NOTE_TYPE_COUNT);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
                                           status,
@@ -183,7 +206,18 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                  CUDNN_TYPE_BEHAVIOR_NOTE,
                                  CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
                                  &elem_count,
-                                 behavior_notes.data());
+                                 NULL);
+        behavior_notes_vec.resize(elem_count);
+        status = cudnnBackendGetAttribute(extractedEngine_,
+                                 CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
+                                 CUDNN_TYPE_BEHAVIOR_NOTE,
+                                 CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
+                                 &elem_count,
+                                 behavior_notes_vec.data());
+        end = std::min(elem_count, static_cast<int64_t>(CUDNN_BEHAVIOR_NOTE_TYPE_COUNT));
+        std::copy(behavior_notes_vec.begin(), behavior_notes_vec.begin() + end, behavior_notes.begin());
+        if (elem_count < behavior_notes.size())
+            std::fill_n(behavior_notes.begin() + elem_count, behavior_notes.size() - elem_count, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
                                           status,
@@ -297,8 +331,10 @@ class ExecutionPlan_v8 : public BackendDescriptor {
 
     std::int64_t workSpaceSize = 0;
     std::array<cudnnBackendNumericalNote_t,CUDNN_NUMERICAL_NOTE_TYPE_COUNT> numeric_notes;
+    std::vector<cudnnBackendNumericalNote_t> numeric_notes_vec;
 #if (CUDNN_VERSION >= 8200)  
     std::array<cudnnBackendBehaviorNote_t, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT>  behavior_notes;
+    std::vector<cudnnBackendBehaviorNote_t>  behavior_notes_vec;
 #endif
 
     float execution_time_ms    = 0.0f;
@@ -341,7 +377,7 @@ class ExecutionPlanBuilder_v8 {
     //! Throws the appropriate error message
     ExecutionPlan_v8 &&
     build() {
-        if (m_execution_plan.handle == nullptr) {
+        if (m_execution_plan.handle == nullptr || !m_execution_plan.handle) {
             set_error_and_throw_exception(
                 &m_execution_plan,
                 CUDNN_STATUS_BAD_PARAM,
@@ -449,7 +485,6 @@ class ExecutionPlanBuilder_v8 {
             return std::move(m_execution_plan);
         }
 
-        int64_t serializationSize;
         std::vector<char> serialization_buf;
         serialization_buf.assign(json_plan.begin(), json_plan.end());
         status = cudnnBackendSetAttribute(m_execution_plan.pointer->get_backend_descriptor(),

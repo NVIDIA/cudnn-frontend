@@ -40,7 +40,7 @@ namespace cudnn_frontend {
 /// PointWiseDesc  Descriptor Class
 /// This class tells the properties of the PointWise operation
 /// Properties:
-///    - math_precision
+///    - compute_type
 ///    - mode
 ///    - nan_propagation
 ///    - upper_clip
@@ -60,7 +60,7 @@ class PointWiseDesc_v8 : public BackendDescriptor {
     describe() const override {
         std::stringstream ss;
         ss << "CUDNN_BACKEND_POINTWISE_DESCRIPTOR :"
-           << " Mode: " << (mode) << " Math precision " << (math_precision);
+           << " Mode: " << to_string(mode) << " Math precision " << to_string(compute_type);
         return ss.str();
     }
 
@@ -91,6 +91,9 @@ class PointWiseDesc_v8 : public BackendDescriptor {
             case CUDNN_POINTWISE_GELU_BWD:
             case CUDNN_POINTWISE_SOFTPLUS_BWD:
             case CUDNN_POINTWISE_SWISH_BWD:
+#if (CUDNN_VERSION >= 8500)
+            case CUDNN_POINTWISE_GELU_APPROX_TANH_BWD:
+#endif
                 return 3;
             case CUDNN_POINTWISE_SQRT:
             case CUDNN_POINTWISE_RELU_FWD:
@@ -118,6 +121,11 @@ class PointWiseDesc_v8 : public BackendDescriptor {
 #if (CUDNN_VERSION >= 8400)
             case CUDNN_POINTWISE_GEN_INDEX:
 #endif
+#if (CUDNN_VERSION >= 8500)
+            case CUDNN_POINTWISE_ERF:
+            case CUDNN_POINTWISE_GELU_APPROX_TANH_FWD:
+            case CUDNN_POINTWISE_IDENTITY:
+#endif
                 return 2;
 #if (CUDNN_VERSION >= 8400)
             case CUDNN_POINTWISE_BINARY_SELECT:
@@ -144,7 +152,7 @@ class PointWiseDesc_v8 : public BackendDescriptor {
     PointWiseDesc_v8 &
     operator=(PointWiseDesc_v8 const &) = delete;
 
-    cudnnDataType_t math_precision        = CUDNN_DATA_FLOAT;
+    cudnnDataType_t compute_type        = CUDNN_DATA_FLOAT;
     cudnnPointwiseMode_t mode             = CUDNN_POINTWISE_ADD;
     cudnnNanPropagation_t nan_propagation = CUDNN_NOT_PROPAGATE_NAN;
     double upper_clip                     = std::numeric_limits<double>::max();
@@ -169,8 +177,8 @@ class PointWiseDescBuilder_v8 {
      */
     //! Set Math Precision Data Type for the Convolution Operation
     auto
-    setMathPrecision(cudnnDataType_t data_type_) -> PointWiseDescBuilder_v8 & {
-        m_pointWiseDesc.math_precision = data_type_;
+    setComputeType(cudnnDataType_t data_type_) -> PointWiseDescBuilder_v8 & {
+        m_pointWiseDesc.compute_type = data_type_;
         return *this;
     }
     //! Set upper and lower limits for the RELU activation
@@ -193,6 +201,12 @@ class PointWiseDescBuilder_v8 {
         return *this;
     }
     /** @} */
+    
+    // TODO Deprecate in v1.0
+    auto
+    setMathPrecision(cudnnDataType_t data_type_) -> PointWiseDescBuilder_v8 & {
+        return setComputeType(data_type_);
+    }
 
     auto
     setReluLowerClip(double lower_clip_) -> PointWiseDescBuilder_v8 & {
@@ -271,7 +285,7 @@ class PointWiseDescBuilder_v8 {
                                           CUDNN_ATTR_POINTWISE_MATH_PREC,
                                           CUDNN_TYPE_DATA_TYPE,
                                           1,
-                                          &m_pointWiseDesc.math_precision);
+                                          &m_pointWiseDesc.compute_type);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_pointWiseDesc,
@@ -307,7 +321,7 @@ class PointWiseDescBuilder_v8 {
                 return std::move(m_pointWiseDesc);
             }
 
-            if (m_pointWiseDesc.math_precision == CUDNN_DATA_FLOAT) {
+            if (m_pointWiseDesc.compute_type == CUDNN_DATA_FLOAT) {
                 double clamped_upper_clip =
                     std::min<double>(m_pointWiseDesc.upper_clip, std::numeric_limits<float>::max());
                 status = cudnnBackendSetAttribute(m_pointWiseDesc.pointer->get_backend_descriptor(),
