@@ -40,7 +40,6 @@
 #include "cudnn_frontend_Resample.h"
 #include "cudnn_frontend_Tensor.h"
 #include "cudnn_frontend_utils.h"
-#include "cudnn_ops_infer.h"
 
 namespace cudnn_frontend {
 ///
