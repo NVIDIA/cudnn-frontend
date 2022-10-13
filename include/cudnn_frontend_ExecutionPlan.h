@@ -142,7 +142,7 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                           "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
                                           "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
         }
-        serialization_buf.resize(serializationSize);
+        serialization_buf.resize(static_cast<size_t>(serializationSize));
         status = cudnnBackendGetAttribute(pointer->get_backend_descriptor(),
                                           CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
                                           CUDNN_TYPE_CHAR,
@@ -182,18 +182,18 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                  CUDNN_TYPE_NUMERICAL_NOTE,
                                  CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
                                  &elem_count,
-                                 NULL);
-        numeric_notes_vec.resize(elem_count);
+                                 nullptr);
+        numeric_notes_vec.resize(static_cast<size_t>(elem_count));
         status = cudnnBackendGetAttribute(extractedEngine_,
                                  CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
                                  CUDNN_TYPE_NUMERICAL_NOTE,
                                  CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
                                  &elem_count,
                                  numeric_notes_vec.data());
-        auto end = std::min(elem_count, static_cast<int64_t>(CUDNN_NUMERICAL_NOTE_TYPE_COUNT));
+        ptrdiff_t end = static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_NUMERICAL_NOTE_TYPE_COUNT)));
         std::copy(numeric_notes_vec.begin(), numeric_notes_vec.begin() + end, numeric_notes.begin());
-        if (elem_count < numeric_notes.size())
-            std::fill_n(numeric_notes.begin() + elem_count, numeric_notes.size() - elem_count, CUDNN_NUMERICAL_NOTE_TYPE_COUNT);
+        if (static_cast<size_t>(elem_count) < numeric_notes.size())
+            std::fill_n(numeric_notes.begin() + static_cast<size_t>(elem_count), numeric_notes.size() - static_cast<size_t>(elem_count), CUDNN_NUMERICAL_NOTE_TYPE_COUNT);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
                                           status,
@@ -206,18 +206,18 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                  CUDNN_TYPE_BEHAVIOR_NOTE,
                                  CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
                                  &elem_count,
-                                 NULL);
-        behavior_notes_vec.resize(elem_count);
+                                 nullptr);
+        behavior_notes_vec.resize(static_cast<size_t>(elem_count));
         status = cudnnBackendGetAttribute(extractedEngine_,
                                  CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
                                  CUDNN_TYPE_BEHAVIOR_NOTE,
                                  CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
                                  &elem_count,
                                  behavior_notes_vec.data());
-        end = std::min(elem_count, static_cast<int64_t>(CUDNN_BEHAVIOR_NOTE_TYPE_COUNT));
+        end = static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_BEHAVIOR_NOTE_TYPE_COUNT)));
         std::copy(behavior_notes_vec.begin(), behavior_notes_vec.begin() + end, behavior_notes.begin());
-        if (elem_count < behavior_notes.size())
-            std::fill_n(behavior_notes.begin() + elem_count, behavior_notes.size() - elem_count, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT);
+        if (static_cast<size_t>(elem_count) < behavior_notes.size())
+            std::fill_n(behavior_notes.begin() + static_cast<size_t>(elem_count), behavior_notes.size() - static_cast<size_t>(elem_count), CUDNN_BEHAVIOR_NOTE_TYPE_COUNT);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
                                           status,
@@ -278,7 +278,7 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                           "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
                                           "numKnobs exceed the CUDNN_KNOB_TYPE_COUNTS");
         }
-        for (int64_t idx = 0; idx < numKnobs; ++idx) {
+        for (size_t idx = 0; idx < static_cast<size_t>(numKnobs); ++idx) {
             const cudnnBackendDescriptor_t &knob = extractedKnobs_[idx];
             cudnnBackendKnobType_t type          = CUDNN_KNOB_TYPE_COUNTS;
             int64_t choice                       = -2;
@@ -310,7 +310,7 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                 CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
                 CUDNN_TYPE_INT64,
                 1,
-                NULL,
+                nullptr,
                 &workSpaceSize);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
