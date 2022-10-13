@@ -49,13 +49,13 @@ half1 cpu_float2half_rn(float f)
   
     // Get rid of +Inf/-Inf, +0/-0.
     if (u > 0x477fefff) {
-        hr.x = sign | 0x7c00U;
+        hr.x = static_cast<unsigned short> (sign | 0x7c00U);
         // Add an indirection to get around type aliasing check
         void* hr_ptr = &hr;
         return *reinterpret_cast<half1*>(hr_ptr);
     }
     if (u < 0x33000001) {
-        hr.x = sign | 0x0000U;
+        hr.x = static_cast<unsigned short> (sign | 0x0000U);
         // Add an indirection to get around type aliasing check
         void* hr_ptr = &hr;
         return *reinterpret_cast<half1*>(hr_ptr);
@@ -87,7 +87,7 @@ half1 cpu_float2half_rn(float f)
         }
     }  
 
-    hr.x = (sign | (exponent << 10) | mantissa);  
+    hr.x = static_cast<unsigned short>((sign | (exponent << 10) | mantissa));
 
     // Add an indirection to get around type aliasing check
     void* hr_ptr = &hr;

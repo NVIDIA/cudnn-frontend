@@ -28,20 +28,30 @@
 
 #include "cudnn_backend_base.h"
 namespace  cudnn_frontend {
+
+static const char *
+get_environment(const char *name) {
+#ifdef WIN32
+#pragma warning(disable:4996)
+#define  _CRT_SECURE_NO_WARNINGS
+#endif
+
+    return std::getenv(name);
+}
+
 inline bool &
 isLoggingEnabled() {
-    static bool log_enabled = std::getenv("CUDNN_FRONTEND_LOG_INFO") && std::strncmp(std::getenv("CUDNN_FRONTEND_LOG_INFO"), "0",1);
+    static bool log_enabled = get_environment("CUDNN_FRONTEND_LOG_INFO") && std::strncmp(get_environment("CUDNN_FRONTEND_LOG_INFO"), "0",1);
     return log_enabled;
 }
- 
  
 inline std::ostream &
 getStream() {                                                                                                                                                                                                                      
     static std::ofstream outFile;
-    static std::ostream & stream  = std::getenv("CUDNN_FRONTEND_LOG_FILE")
-         ?  (std::strncmp(std::getenv("CUDNN_FRONTEND_LOG_FILE"), "stdout", 6) == 0 
-             ? std::cout : (std::strncmp(std::getenv("CUDNN_FRONTEND_LOG_FILE"), "stderr", 6) == 0 
-                 ? std::cerr : (outFile.open(std::getenv("CUDNN_FRONTEND_LOG_FILE"), std::ios::out), outFile)))
+    static std::ostream & stream  = get_environment("CUDNN_FRONTEND_LOG_FILE")
+         ?  (std::strncmp(get_environment("CUDNN_FRONTEND_LOG_FILE"), "stdout", 6) == 0 
+             ? std::cout : (std::strncmp(get_environment("CUDNN_FRONTEND_LOG_FILE"), "stderr", 6) == 0 
+                 ? std::cerr : (outFile.open(get_environment("CUDNN_FRONTEND_LOG_FILE"), std::ios::out), outFile)))
          : (isLoggingEnabled() = false, std::cout);
     return stream;
 }

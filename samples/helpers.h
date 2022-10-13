@@ -29,39 +29,45 @@
 #include <cuda_runtime.h>
 #include <assert.h>
 
-#include "catch.hpp"
+#include <catch2/catch_test_macros.hpp>
 
 #include <cudnn.h>
 
 #include "fp16_dev.h"
 #include "fp16_emu.h"
 
+#include "error_util.h"
+
 #define THRESHOLD 2.0e-2
 
-int getFwdConvDilatedFilterDim(int filterDim, int dilation);
-int getFwdConvPaddedImageDim(int tensorDim, int pad);
-int getFwdConvOutputDim( int tensorDim, int pad, int filterDim, int stride, int dilation);
 
-void generateStrides(const int64_t* dimA, int64_t* strideA, int nbDims, cudnnTensorFormat_t filterFormat);
+bool check_device_arch_newer_than(std::string const arch);
 
-int checkCudaError(cudaError_t code, const char* expr, const char* file, int line);
-int checkCudnnError(cudnnStatus_t code, const char* expr, const char* file, int line);
+int64_t getFwdConvDilatedFilterDim(int64_t filterDim, int64_t dilation);
+int64_t getFwdConvPaddedImageDim(int64_t tensorDim, int64_t pad);
+int64_t getFwdConvOutputDim( int64_t tensorDim, int64_t pad, int64_t filterDim, int64_t stride, int64_t dilation);
 
-void lin2dim(int id, int64_t* ids, const int64_t* dims, int length);
-int dim2lin(const int64_t* ids, const int64_t* strides, int length);
+void generateStrides(const int64_t* dimA, int64_t* strideA, int64_t nbDims, cudnnTensorFormat_t filterFormat);
+void generate4dTransposeStrides(const int64_t* dimA, int64_t* strideA, int64_t nbDims, cudnnTensorFormat_t filterFormat);
+
+int64_t checkCudaError(cudaError_t code, const char* expr, const char* file, int line);
+int64_t checkCudnnError(cudnnStatus_t code, const char* expr, const char* file, int line);
+
+void lin2dim(int64_t id, int64_t* ids, const int64_t* dims, int64_t length);
+int64_t dim2lin(const int64_t* ids, const int64_t* strides, int64_t length);
 
 
 void initImage(float* image, int64_t imageSize);
 void initImage(half1* image, int64_t imageSize);
-void initImage(int8_t* image, int imageSize);
-void initImage(int32_t* image, int imageSize);
-void initImage(int64_t* image, int imageSize);
-void initImage(bool* image, int imageSize);
+void initImage(int8_t* image, int64_t imageSize);
+void initImage(int32_t* image, int64_t imageSize);
+void initImage(int64_t* image, int64_t imageSize);
+void initImage(bool* image, int64_t imageSize);
 void initImagePadded(int8_t* image, int64_t dimA[], int64_t dimPadded[], int64_t stridePadded[], cudnnDataType_t dataType);
 
-void doEpilog(float* out, int idx, float alphaAcc, float beta);
-void doEpilog(half1* out, int idx, float alphaAcc, float beta);
-void doEpilog(int8_t* out, int idx, int32_t alphaAcc, float beta);
+void doEpilog(float* out, int64_t idx, float alphaAcc, float beta);
+void doEpilog(half1* out, int64_t idx, float alphaAcc, float beta);
+void doEpilog(int8_t* out, int64_t idx, int32_t alphaAcc, float beta);
 
 
 float getError(float dev, float ref);
@@ -106,13 +112,13 @@ static float doFma(int8_t fval, int8_t ival, float tmp) {
 
 #define checkCudaErr(...)                                                        \
     do {                                                                         \
-        int err = checkCudaError(__VA_ARGS__, #__VA_ARGS__, __FILE__, __LINE__); \
+        int64_t err = checkCudaError(__VA_ARGS__, #__VA_ARGS__, __FILE__, __LINE__); \
         REQUIRE(err == 0);                                                       \
     } while (0)
 
 #define checkCudnnErr(...)                                                        \
     do {                                                                          \
-        int err = checkCudnnError(__VA_ARGS__, #__VA_ARGS__, __FILE__, __LINE__); \
+        int64_t err = checkCudnnError(__VA_ARGS__, #__VA_ARGS__, __FILE__, __LINE__); \
         REQUIRE(err == 0);                                                        \
     } while (0)
 
@@ -142,47 +148,47 @@ public:
     T_ELEM* host_ref = NULL;
 
 
-explicit SurfaceManager(int64_t Xsize, int64_t Wsize, int64_t Ysize, int ref_size) {
-    checkCudaErr(cudaMalloc((void**)&(devPtrX), (Xsize) * sizeof(devPtrX[0])));
-    checkCudaErr(cudaMalloc((void**)&(devPtrW), (Wsize) * sizeof(devPtrW[0])));
-    checkCudaErr(cudaMalloc((void**)&(devPtrY), (Ysize) * sizeof(devPtrY[0])));
+explicit SurfaceManager(int64_t Xsize, int64_t Wsize, int64_t Ysize, int64_t ref_size) {
+    checkCudaErr(cudaMalloc((void**)&(devPtrX), size_t((Xsize) * sizeof(devPtrX[0]))));
+    checkCudaErr(cudaMalloc((void**)&(devPtrW), size_t((Wsize) * sizeof(devPtrW[0]))));
+    checkCudaErr(cudaMalloc((void**)&(devPtrY), size_t((Ysize) * sizeof(devPtrY[0]))));
 
-    hostX     = (T_ELEM*) calloc(Xsize, sizeof(hostX[0]));
-    hostW     = (T_ELEM*) calloc(Wsize, sizeof(hostW[0]));
-    hostY     = (T_ELEM*) calloc(Ysize, sizeof(hostY[0]));
-    host_ref  = (T_ELEM*) calloc(ref_size, sizeof(host_ref[0]));
+    hostX     = (T_ELEM*) calloc(size_t(Xsize), sizeof(hostX[0]));
+    hostW     = (T_ELEM*) calloc(size_t(Wsize), sizeof(hostW[0]));
+    hostY     = (T_ELEM*) calloc(size_t(Ysize), sizeof(hostY[0]));
+    host_ref  = (T_ELEM*) calloc(size_t(ref_size), sizeof(host_ref[0]));
 
     initImage(hostX, Xsize);
     initImage(hostW, Wsize);
     initImage(hostY, Ysize);
 
-    checkCudaErr(cudaMemcpy(devPtrX, hostX, sizeof(hostX[0]) * Xsize, cudaMemcpyHostToDevice));
-    checkCudaErr(cudaMemcpy(devPtrW, hostW, sizeof(hostW[0]) * Wsize, cudaMemcpyHostToDevice));
-    checkCudaErr(cudaMemcpy(devPtrY, hostY, sizeof(hostY[0]) * Ysize, cudaMemcpyHostToDevice));
+    checkCudaErr(cudaMemcpy(devPtrX, hostX, size_t(sizeof(hostX[0]) * Xsize), cudaMemcpyHostToDevice));
+    checkCudaErr(cudaMemcpy(devPtrW, hostW, size_t(sizeof(hostW[0]) * Wsize), cudaMemcpyHostToDevice));
+    checkCudaErr(cudaMemcpy(devPtrY, hostY, size_t(sizeof(hostY[0]) * Ysize), cudaMemcpyHostToDevice));
     checkCudaErr(cudaDeviceSynchronize());
 }
 
 explicit SurfaceManager(int64_t Xsize, int64_t Wsize, int64_t Ysize, int64_t Bsize, bool isConvBiasAdd) {
     (void)isConvBiasAdd;
 
-    checkCudaErr(cudaMalloc((void**)&(devPtrX), (Xsize) * sizeof(devPtrX[0])));
-    checkCudaErr(cudaMalloc((void**)&(devPtrW), (Wsize) * sizeof(devPtrW[0])));
-    checkCudaErr(cudaMalloc((void**)&(devPtrY), (Ysize) * sizeof(devPtrY[0])));
-    checkCudaErr(cudaMalloc((void**)&(devPtrZ), (Ysize) * sizeof(devPtrZ[0])));
-    checkCudaErr(cudaMalloc((void**)&(devPtrB), (Bsize) * sizeof(devPtrB[0])));
-    checkCudaErr(cudaMalloc((void**)&(devPtrAfterConv), (Ysize) * sizeof(devPtrAfterConv[0])));
-    checkCudaErr(cudaMalloc((void**)&(devPtrAfterAdd), (Ysize) * sizeof(devPtrAfterAdd[0])));
-    checkCudaErr(cudaMalloc((void**)&(devPtrAfterBias), (Ysize) * sizeof(devPtrAfterBias[0])));
+    checkCudaErr(cudaMalloc((void**)&(devPtrX), size_t((Xsize) * sizeof(devPtrX[0]))));
+    checkCudaErr(cudaMalloc((void**)&(devPtrW), size_t((Wsize) * sizeof(devPtrW[0]))));
+    checkCudaErr(cudaMalloc((void**)&(devPtrY), size_t((Ysize) * sizeof(devPtrY[0]))));
+    checkCudaErr(cudaMalloc((void**)&(devPtrZ), size_t((Ysize) * sizeof(devPtrZ[0]))));
+    checkCudaErr(cudaMalloc((void**)&(devPtrB), size_t((Bsize) * sizeof(devPtrB[0]))));
+    checkCudaErr(cudaMalloc((void**)&(devPtrAfterConv), size_t((Ysize) * sizeof(devPtrAfterConv[0]))));
+    checkCudaErr(cudaMalloc((void**)&(devPtrAfterAdd),  size_t((Ysize) * sizeof(devPtrAfterAdd[0] ))));
+    checkCudaErr(cudaMalloc((void**)&(devPtrAfterBias), size_t((Ysize) * sizeof(devPtrAfterBias[0]))));
 
-    hostX     = (T_ELEM*) calloc(Xsize, sizeof(hostX[0]));
-    hostW     = (T_ELEM*) calloc(Wsize, sizeof(hostW[0]));
-    hostY     = (T_ELEM*) calloc(Ysize, sizeof(hostY[0]));
-    hostZ     = (T_ELEM*) calloc(Ysize, sizeof(hostZ[0]));
-    hostB     = (T_ELEM*) calloc(Bsize, sizeof(hostB[0]));
-    hostAfterConv = (T_ELEM*) calloc(Ysize, sizeof(hostAfterConv[0]));
-    hostAfterAdd  = (T_ELEM*) calloc(Ysize, sizeof(hostAfterAdd[0]));
-    hostAfterBias = (T_ELEM*) calloc(Ysize, sizeof(hostAfterBias[0]));
-    host_ref  = (T_ELEM*) calloc(Ysize, sizeof(host_ref[0]));
+    hostX     = (T_ELEM*) calloc(size_t(Xsize), sizeof(hostX[0]));
+    hostW     = (T_ELEM*) calloc(size_t(Wsize), sizeof(hostW[0]));
+    hostY     = (T_ELEM*) calloc(size_t(Ysize), sizeof(hostY[0]));
+    hostZ     = (T_ELEM*) calloc(size_t(Ysize), sizeof(hostZ[0]));
+    hostB     = (T_ELEM*) calloc(size_t(Bsize), sizeof(hostB[0]));
+    hostAfterConv = (T_ELEM*) calloc(size_t(Ysize), sizeof(hostAfterConv[0]));
+    hostAfterAdd  = (T_ELEM*) calloc(size_t(Ysize), sizeof(hostAfterAdd[0]));
+    hostAfterBias = (T_ELEM*) calloc(size_t(Ysize), sizeof(hostAfterBias[0]));
+    host_ref      = (T_ELEM*) calloc(size_t(Ysize), sizeof(host_ref[0]));
 
     initImage(hostX, Xsize);
     initImage(hostW, Wsize);
@@ -193,14 +199,14 @@ explicit SurfaceManager(int64_t Xsize, int64_t Wsize, int64_t Ysize, int64_t Bsi
     initImage(hostAfterBias, Ysize);
     initImage(hostAfterConv, Ysize);
     
-    checkCudaErr(cudaMemcpy(devPtrX, hostX, sizeof(hostX[0]) * Xsize, cudaMemcpyHostToDevice));
-    checkCudaErr(cudaMemcpy(devPtrW, hostW, sizeof(hostW[0]) * Wsize, cudaMemcpyHostToDevice));
-    checkCudaErr(cudaMemcpy(devPtrY, hostY, sizeof(hostY[0]) * Ysize, cudaMemcpyHostToDevice));
-    checkCudaErr(cudaMemcpy(devPtrZ, hostZ, sizeof(hostZ[0]) * Ysize, cudaMemcpyHostToDevice));
-    checkCudaErr(cudaMemcpy(devPtrB, hostB, sizeof(hostB[0]) * Bsize, cudaMemcpyHostToDevice));
-    checkCudaErr(cudaMemcpy(devPtrAfterAdd, hostAfterAdd, sizeof(hostAfterAdd[0]) * Ysize, cudaMemcpyHostToDevice));
-    checkCudaErr(cudaMemcpy(devPtrAfterBias, hostAfterBias, sizeof(hostAfterBias[0]) * Ysize, cudaMemcpyHostToDevice));
-    checkCudaErr(cudaMemcpy(devPtrAfterConv, hostAfterConv, sizeof(hostAfterConv[0]) * Ysize, cudaMemcpyHostToDevice));
+    checkCudaErr(cudaMemcpy(devPtrX, hostX, (size_t)(sizeof(hostX[0]) * Xsize), cudaMemcpyHostToDevice));
+    checkCudaErr(cudaMemcpy(devPtrW, hostW, (size_t)(sizeof(hostW[0]) * Wsize), cudaMemcpyHostToDevice));
+    checkCudaErr(cudaMemcpy(devPtrY, hostY, (size_t)(sizeof(hostY[0]) * Ysize), cudaMemcpyHostToDevice));
+    checkCudaErr(cudaMemcpy(devPtrZ, hostZ, (size_t)(sizeof(hostZ[0]) * Ysize), cudaMemcpyHostToDevice));
+    checkCudaErr(cudaMemcpy(devPtrB, hostB, (size_t)(sizeof(hostB[0]) * Bsize), cudaMemcpyHostToDevice));
+    checkCudaErr(cudaMemcpy(devPtrAfterAdd,  hostAfterAdd,  (size_t)(sizeof(hostAfterAdd[0]) * Ysize), cudaMemcpyHostToDevice));
+    checkCudaErr(cudaMemcpy(devPtrAfterBias, hostAfterBias, (size_t)(sizeof(hostAfterBias[0]) * Ysize), cudaMemcpyHostToDevice));
+    checkCudaErr(cudaMemcpy(devPtrAfterConv, hostAfterConv, (size_t)(sizeof(hostAfterConv[0]) * Ysize), cudaMemcpyHostToDevice));
 
     checkCudaErr(cudaDeviceSynchronize());
 }
@@ -237,30 +243,31 @@ struct Surface {
     T_ELEM* hostRefPtr = NULL;
 
     explicit Surface(int64_t n_elems, bool hasRef) {
-        checkCudaErr(cudaMalloc((void**)&(devPtr), (n_elems) * sizeof(devPtr[0])));
-        hostPtr = (T_ELEM*) calloc(n_elems, sizeof(hostPtr[0]));
+        checkCudaErr(cudaMalloc((void**)&(devPtr), (size_t)((n_elems) * sizeof(devPtr[0]))));
+        hostPtr = (T_ELEM*) calloc((size_t)n_elems, sizeof(hostPtr[0]));
         if(hasRef) {
-            hostRefPtr = (T_ELEM*) calloc(n_elems, sizeof(hostRefPtr[0]));
+            hostRefPtr = (T_ELEM*) calloc((size_t)n_elems, sizeof(hostRefPtr[0]));
         }
         initImage(hostPtr, n_elems);
-        checkCudaErr(cudaMemcpy(devPtr, hostPtr, sizeof(hostPtr[0]) * n_elems, cudaMemcpyHostToDevice));
+        checkCudaErr(cudaMemcpy(devPtr, hostPtr, size_t(sizeof(hostPtr[0]) * n_elems), cudaMemcpyHostToDevice));
         checkCudaErr(cudaDeviceSynchronize());
     }
 
     explicit Surface(int64_t n_elems, bool hasRef, bool isInterleaved) {
+        (void)isInterleaved;
         checkCudaErr(cudaMalloc((void**)&(devPtr), (n_elems) * sizeof(devPtr[0])));
         hostPtr = (T_ELEM*) calloc(n_elems, sizeof(hostPtr[0]));
         if(hasRef) {
             hostRefPtr = (T_ELEM*) calloc(n_elems, sizeof(hostRefPtr[0]));
         }
         initImage(hostPtr, n_elems);
-	uint32_t *temp = (uint32_t *)hostPtr;
-	for (int i = 0; i < n_elems; i = i+2) {
-	    temp[i + 1] = 1u;
-	}
-        checkCudaErr(cudaMemcpy(devPtr, hostPtr, sizeof(hostPtr[0]) * n_elems, cudaMemcpyHostToDevice));
-        checkCudaErr(cudaDeviceSynchronize());
-    }
+        uint32_t *temp = (uint32_t *)hostPtr;
+        for (size_t i = 0; i < n_elems; i = i+2) {
+            temp[i + 1] = 1u;
+        }
+            checkCudaErr(cudaMemcpy(devPtr, hostPtr, size_t(sizeof(hostPtr[0]) * n_elems), cudaMemcpyHostToDevice));
+            checkCudaErr(cudaDeviceSynchronize());
+        }
 
     ~Surface() {
         if (devPtr) cudaFree(devPtr);

@@ -54,7 +54,7 @@ get_plan_from_heuristics(OperationGraph_v8 &opGraph, cudnnHandle_t handle) {
                    .build();
     };
 
-    return std::move(plan_builder());
+    return plan_builder();
 }
 
 class MHAParams {
@@ -217,7 +217,6 @@ class MHA_intputProjLayer {
         const int64_t batchSize  = mhaParams.batchSize;
 
         const cudnnDataType_t dataType = mhaParams.dataType;
-        const cudnnDataType_t mathPrec = mhaParams.mathPrec;
 
         const int64_t wDim[3]    = {3, inputSize, headSize * numHeads};
         const int64_t wStride[3] = {headSize * numHeads * inputSize, headSize * numHeads, 1};
@@ -306,7 +305,7 @@ class MHA_intputProjLayer {
                            .setOperationGraph(ops.size(), ops.data())
                            .build();
 
-        auto plan = std::move(get_plan_from_heuristics(opGraph, handle));
+        auto plan = get_plan_from_heuristics(opGraph, handle);
         inputProjLayerPlan = std::make_shared<cudnn_frontend::ExecutionPlan>(std::move(plan));
 
         std::cout << "[INFO] Execution Plan tag for input projection layer: " << inputProjLayerPlan->getTag() << std::endl;
@@ -350,7 +349,6 @@ class MHA_outputProjLayer {
     ~MHA_outputProjLayer() = default;
 
     MHA_outputProjLayer(cudnnHandle_t handle, MHAParams &mhaParams) {
-        const int64_t inputSize  = mhaParams.inputSize;
         const int64_t outputSize = mhaParams.outputSize;
         const int64_t headSize   = mhaParams.headSize;
         const int64_t numHeads   = mhaParams.numHeads;
@@ -358,7 +356,6 @@ class MHA_outputProjLayer {
         const int64_t batchSize  = mhaParams.batchSize;
 
         const cudnnDataType_t dataType = mhaParams.dataType;
-        const cudnnDataType_t mathPrec = mhaParams.mathPrec;
 
         // Create tensor descriptor for OWeight Matrix
         const int64_t wDim[3]    = {1, headSize * numHeads, outputSize};
@@ -447,7 +444,7 @@ class MHA_outputProjLayer {
                            .setOperationGraph(ops.size(), ops.data())
                            .build();
 
-        auto plan = std::move(get_plan_from_heuristics(opGraph, handle));
+        auto plan = get_plan_from_heuristics(opGraph, handle);
         outputProjLayerPlan = std::make_shared<cudnn_frontend::ExecutionPlan>(std::move(plan));
 
         std::cout << "[INFO] Execution Plan tag for output projection layer: " << outputProjLayerPlan->getTag() << std::endl;
@@ -491,19 +488,16 @@ class MHA_attentionLayer {
     ~MHA_attentionLayer() = default;
 
     MHA_attentionLayer(cudnnHandle_t handle, MHAParams &mhaParams) {
-        const int64_t inputSize  = mhaParams.inputSize;
-        const int64_t outputSize = mhaParams.inputSize;
+        (void)handle;
+        (void)mhaParams;
+#if (CUDNN_VERSION >= 8303)
         const int64_t headSize   = mhaParams.headSize;
         const int64_t numHeads   = mhaParams.numHeads;
         const int64_t seqLength  = mhaParams.seqLength;
         const int64_t batchSize  = mhaParams.batchSize;
 
         const cudnnDataType_t dataType = mhaParams.dataType;
-        const cudnnDataType_t mathPrec = mhaParams.mathPrec;
-#if (CUDNN_VERSION >= 8303)
         {
-            // Softmax scaler
-            const float softmaxScaler = static_cast<float>(1.0 / sqrt(static_cast<double>(headSize)));
 
             // Create tensor descriptor for embedding Q
             const int64_t qDim[3]    = {batchSize * numHeads, headSize, seqLength};
@@ -631,7 +625,7 @@ class MHA_attentionLayer {
                                .setOperationGraph(ops.size(), ops.data())
                                .build();
 
-            auto plan = std::move(get_plan_from_heuristics(opGraph, handle));
+            auto plan = get_plan_from_heuristics(opGraph, handle);
             attentionLayerPlan0 = std::make_shared<cudnn_frontend::ExecutionPlan>(std::move(plan));
         }
 
@@ -743,7 +737,7 @@ class MHA_attentionLayer {
                                .setOperationGraph(ops.size(), ops.data())
                                .build();
 
-            auto plan = std::move(get_plan_from_heuristics(opGraph, handle));
+            auto plan = get_plan_from_heuristics(opGraph, handle);
             attentionLayerPlan1 = std::make_shared<cudnn_frontend::ExecutionPlan>(std::move(plan));
         }
 
@@ -814,6 +808,19 @@ multiHeadAttention(const int64_t inputSize,
                    void const *devPtrQKVBias,
                    void const *devPtrOBias,
                    void *devPtrOut) {
+    (void)inputSize;
+    (void)headSize;
+    (void)seqLength;
+    (void)numHeads;
+    (void)batchSize;
+    (void)outputSize;
+    (void)dataType;
+    (void)devPtrIn;
+    (void)devPtrQKVWeight;
+    (void)devPtrOWeight;
+    (void)devPtrQKVBias;
+    (void)devPtrOBias;
+    (void)devPtrOut;
 #if (CUDNN_VERSION >= 8301)
     cudnnHandle_t handle_;
 
@@ -842,9 +849,17 @@ multiHeadAttention(const int64_t inputSize,
 
         cudnnStatus_t status = CUDNN_STATUS_SUCCESS;
 
+        if (check_device_arch_newer_than("ampere") == false) {
+            set_error_and_throw_exception(
+                    nullptr,
+                    CUDNN_STATUS_ARCH_MISMATCH,
+                    "MHA: Sample requires Ampere or above GPU");
+        }
+
         // Softmax scaler
         const float softmaxScaler   = static_cast<float>(1.0 / sqrt(static_cast<double>(headSize)));
         const int64_t embeddingSize = batchSize * numHeads * headSize * seqLength;
+        (void)softmaxScaler;
 
         void *devPtrQKV    = nullptr;
         void *devPtrE      = nullptr;
@@ -853,13 +868,13 @@ multiHeadAttention(const int64_t inputSize,
         void *devPtrScaler = nullptr;
 
         // Device Memory to store embeddings Q, K, V
-        checkCudaErr(cudaMalloc(&devPtrQKV, embeddingSize * sizeof(half) * 3));
+        checkCudaErr(cudaMalloc(&devPtrQKV, (size_t)(embeddingSize * sizeof(half) * 3)));
         // Device Memory to store internal data E = exp(softmaxScaler * (Q * K^T))
-        checkCudaErr(cudaMalloc(&devPtrE, batchSize * numHeads * seqLength * seqLength * sizeof(half)));
+        checkCudaErr(cudaMalloc(&devPtrE, (size_t)(batchSize * numHeads * seqLength * seqLength * sizeof(half))));
         // Device Memory to store internal data R = row-reduction of E
-        checkCudaErr(cudaMalloc(&devPtrR, batchSize * numHeads * seqLength * sizeof(float)));
+        checkCudaErr(cudaMalloc(&devPtrR, (size_t)(batchSize * numHeads * seqLength * sizeof(float))));
         // Device Memory to store the output from attention layer
-        checkCudaErr(cudaMalloc(&devPtrX, batchSize * numHeads * seqLength * headSize * sizeof(half)));
+        checkCudaErr(cudaMalloc(&devPtrX, (size_t)(batchSize * numHeads * seqLength * headSize * sizeof(half))));
         // Device memory for softmax scaler parameter
         checkCudaErr(cudaMalloc(&devPtrScaler, sizeof(float)));
 
@@ -918,7 +933,9 @@ multiHeadAttention(const int64_t inputSize,
             std::cout << "Example is only supported for Ampere GPUs" << std::endl; 
         }  else {
             std::cout << "[ERROR] Exception " << e.what() << std::endl;
+#if (CUDNN_VERSION >= 8400)
             CHECK(false);
+#endif
         }
     }
 #endif
