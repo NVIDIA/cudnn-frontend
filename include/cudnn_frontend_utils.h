@@ -28,6 +28,12 @@
 #include "cudnn_backend_base.h"
 #include "cudnn_frontend_Logging.h"
 
+#ifndef NV_CUDNN_DISABLE_EXCEPTION
+#ifdef _MSC_VER
+#pragma warning(disable:4702) // if exceptions are enabled there are unreachable return statements
+#endif
+#endif
+
 #define CUDNN_FRONTEND_UNUSED(X) ((void)X)
 namespace cudnn_frontend {
 
@@ -97,6 +103,12 @@ to_string(cudnnDataType_t type) {
 #if (CUDNN_VERSION >= 8300)
         case CUDNN_DATA_BOOLEAN:
             return std::string("CUDNN_DATA_BOOLEAN");
+#endif
+#if (CUDNN_VERSION >= 8600)
+        case CUDNN_DATA_FP8_E5M2:
+            return std::string("CUDNN_DATA_FP8_E5M2");
+        case CUDNN_DATA_FP8_E4M3:
+            return std::string("CUDNN_DATA_FP8_E4M3");
 #endif
 #ifndef NO_DEFAULT_IN_SWITCH
         default:

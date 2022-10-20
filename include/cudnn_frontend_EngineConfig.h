@@ -75,7 +75,7 @@ class EngineConfig_v8 : public BackendDescriptor {
    private:
     EngineConfig_v8() : BackendDescriptor() {
         cudnnStatus_t status;
-        for (uint64_t i = 0; i < bChoices.size(); i++) {
+        for (size_t i = 0; i < bChoices.size(); i++) {
             bChoices[i] = make_shared_backend_pointer(CUDNN_BACKEND_KNOB_CHOICE_DESCRIPTOR);
             if (bChoices[i]->is_good() == false) {
                 status = bChoices[i]->get_status();

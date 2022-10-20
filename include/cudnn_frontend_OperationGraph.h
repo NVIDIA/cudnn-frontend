@@ -78,7 +78,7 @@ class OperationGraph_v8 : public BackendDescriptor {
                                                CUDNN_ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT,
                                                CUDNN_TYPE_INT64,
                                                1,
-                                               NULL,
+                                               nullptr,
                                                &global_count);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
@@ -142,7 +142,7 @@ class OperationGraphBuilder_v8 {
     auto
     setOperationGraph(int64_t numOps_, Operation_v8 const **ops_) -> OperationGraphBuilder_v8 & {
         m_operationGraph.numOps = numOps_;
-        m_operationGraph.feature_vectors.resize(numOps_);
+        m_operationGraph.feature_vectors.resize(static_cast<size_t>(numOps_));
         for (auto i = 0u; i < numOps_; i++) {
             m_operationGraph.ops[i] = ops_[i]->get_desc();
             m_operationGraph.opGraphTag += ops_[i]->getTag() + '_';

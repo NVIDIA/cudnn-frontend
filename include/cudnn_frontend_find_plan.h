@@ -76,8 +76,14 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const
             cudaEventRecord(stop, stream);
             cudaEventSynchronize(stop);
             cudaEventElapsedTime(&time_ms, start, stop);
-
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable:4127) // this could be ommited with c++17 and contexpr
+#endif
             if (samplingTechnique == CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_TILL_STABLE) {
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
                 final_time_ms = std::min(min_time_ms, time_ms);
                 if (time_ms / min_time_ms < threshhold) {
                     min_time_ms = final_time_ms;

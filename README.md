@@ -44,18 +44,15 @@ Samples of runtime fusion are added in `samples/test_list.cpp` and `samples/fusi
 Sample tests are written using the [Catch2](https://github.com/catchorg/Catch2) C++ test framework.
 
 ### How to build samples:
-     - CUDA_PATH has the cuda installation. 
-        - Include files are in CUDA_PATH/include
-        - Link files are in CUDA_PATH/lib64
-     - CUDNN_FRONTEND_PATH has the cudnn frontend header files.
+     - Provide CUDA according to: https://cmake.org/cmake/help/latest/module/FindCUDAToolkit.html
      - CUDNN_PATH has the cudnn installation.
-        - Include files are in CUDNN_PATH/include
-        - Link files are in CUDNN_PATH/lib or CUDNN_PATH/lib64
+        - Headers are in CUDNN_PATH/include
+        - Libraries are in CUDNN_PATH/lib or CUDNN_PATH/lib64 or CUDNN_PATH/lib/x64
 
      mkdir build; cd build
-     cmake ..
-     make
-     ./Samples
+     cmake -DCUDNN_PATH=/path/to/cudnn -DCUDAToolkit_ROOT=/path/to/cuda  ../
+     cmake --build . -j16
+     bin/samples
     
 ## cudnnFindPlan and cudnnGetPlan:
 Prior to cuDNN V8, cuDNN provided `cudnnFindConvolution*` and `cudnnGetConvolution*` functions, which provided a way to sample all the algorithms for a given problem and study the run times. This can be further used to cache the best algorithms for a given problem.  In cuDNN V8, this has been replaced with `cudnnFindPlan` and `cudnnGetPlan`.

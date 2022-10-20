@@ -298,7 +298,7 @@ class EngineBuilder_v8 {
         }
 
 
-        for (uint64_t i = 0; i < m_engine.bKnobs.size(); i++) {
+        for (size_t i = 0; i < m_engine.bKnobs.size(); i++) {
             m_engine.bKnobs[i] = make_shared_backend_pointer(CUDNN_BACKEND_KNOB_INFO_DESCRIPTOR);
             if (m_engine.bKnobs[i]->is_good() == false) {
                 status = m_engine.bKnobs[i]->get_status();

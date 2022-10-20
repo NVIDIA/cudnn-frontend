@@ -81,12 +81,7 @@ class ExecutionPlanCache_v1 {
    protected:
     struct compare {
         bool operator ()(const feature_vector_t & fv1, const feature_vector_t &fv2) const {
-            for (uint32_t i = 0u; i < fv1.size(); i++) {
-                if (fv1[i] < fv2[i]) {
-                    return true;
-                }
-            }
-            return false;
+            return fv1 < fv2;
         }
     };
 

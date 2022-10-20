@@ -38,7 +38,7 @@ namespace cudnn_frontend {
 // is not set the value set in the API is considered.
 static bool
 load_from_config(json &json_handle, const std::string & errata_json) {
-    const char * err_json = std::getenv("CUDNN_ERRATA_JSON_FILE");
+    const char * err_json = get_environment("CUDNN_ERRATA_JSON_FILE");
     if (err_json == NULL && errata_json == "") {return false;}
     if (err_json == NULL) { err_json = errata_json.c_str();}
     std::ifstream ifs(err_json, std::ifstream::in);
@@ -54,7 +54,7 @@ check_rule(const json &json_handle, const std::string & executionPlanTag,
     std::string operation = json_handle["operation"];
     int64_t engine        =  json_handle["engine"];
     uint64_t cudnn_start     =  0;
-    uint64_t cudnn_end       =  -1;
+    uint64_t cudnn_end       =  std::numeric_limits<uint64_t>::max();
     if (json_handle.contains("cudnn_version_start")) {
         cudnn_start   =  json_handle["cudnn_version_start"];
     }
