@@ -116,6 +116,11 @@
 #include "cudnn_frontend_ExecutionPlanCache.h"
 #include "cudnn_frontend_Resample.h"
 
+#define CUDNN_FRONTEND_MAJOR_VERSION 0
+#define CUDNN_FRONTEND_MINOR_VERSION 7
+#define CUDNN_FRONTEND_PATCH_VERSION 3
+#define CUDNN_FRONTEND_VERSION ((CUDNN_FRONTEND_MAJOR_VERSION * 10000) + (CUDNN_FRONTEND_MINOR_VERSION * 100) + CUDNN_FRONTEND_PATCH_VERSION)
+
 namespace cudnn_frontend {
 using Tensor                    = Tensor_v8;
 using TensorBuilder             = TensorBuilder_v8;
