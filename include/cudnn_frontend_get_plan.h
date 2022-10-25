@@ -26,7 +26,7 @@
 
 namespace cudnn_frontend {
 
-auto
+auto inline
 EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph & opGraph)
     -> executionPlans_t {
     // Creating a set of execution plans that are supported.
@@ -47,7 +47,7 @@ EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph & opGra
     return plans;
 }
 
-auto
+auto inline
 EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph & opGraph, Predicate pred)
     -> executionPlans_t {
     // Creating a set of execution plans that are supported.
