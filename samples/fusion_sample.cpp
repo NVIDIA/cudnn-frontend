@@ -856,7 +856,7 @@ run_conv_scale_bias_relu_gen_index_selection(
 #if (CUDNN_VERSION >= 8400)
         // Create cudnn handle
         checkCudnnErr(cudnnCreate(&handle_));
-        if (check_device_arch_newer_than("turing") == false) {
+        if (check_device_arch_newer_than("ampere") == false) {
             cudnn_frontend::set_error_and_throw_exception(
                     nullptr,
                     CUDNN_STATUS_ARCH_MISMATCH,
