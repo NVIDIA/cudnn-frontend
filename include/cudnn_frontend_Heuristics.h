@@ -341,7 +341,7 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
         if (mode.find("heuristics_instant") != std::string::npos ||
             mode.find("heuristics_mode_a")  != std::string::npos) {
             auto heur_mode =
-#if (CUDNN >= 8300)
+#if (CUDNN_VERSION >= 8300)
                         CUDNN_HEUR_MODE_A;
 #else
                         CUDNN_HEUR_MODE_INSTANT;
@@ -352,35 +352,6 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
             NV_CUDNN_FE_CATCH(NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(e.getCudnnStatus(), true));
 
         } else if (mode.find("heuristics_fallback") != std::string::npos) {
-            // MODE_FALLBACK is only available for the graph with a single op since cuDNN 8.3
-            // and the graph with multiple ops since cuDNN 8.4. For other versions, we need to
-            // either check some hard-coded engines or use legacy op-based query to determine
-            // which ones can be used.
-            if (CUDNN_VERSION < 8400 && opGraph.getOpCount() > 1) {
-                std::vector<ManagedOpaqueDescriptor> engine_configs;
-                std::array<int32_t, 2> fallback_engine_list = {0, 1};
-                for (std::uint32_t i = 0; i < fallback_engine_list.size(); i++) {
-                    NV_CUDNN_FE_TRY();
-                    auto engine = cudnn_frontend::EngineBuilder_v8()
-                                        .setGlobalEngineIdx(fallback_engine_list[i])
-                                        .setOperationGraph(opGraph)
-                                        .build();
-                    if (engine.get_status() != CUDNN_STATUS_SUCCESS) {
-                        continue;
-                    }
-                    auto engine_config = cudnn_frontend::EngineConfigBuilder_v8().setEngine(engine).build();
-                    if (engine_config.get_status() != CUDNN_STATUS_SUCCESS) {
-                        continue;
-                    }
-                    engine_configs.emplace_back(engine_config.get_desc());
-                    NV_CUDNN_FE_CATCH(continue);
-                }
-                cudnn_frontend::filter(engine_configs, filtered_configs, filter_fn);
-                cudnnStatus_t status_ = filtered_configs.size() > 0 ? CUDNN_STATUS_SUCCESS 
-                                                                    : CUDNN_STATUS_NOT_SUPPORTED;
-                NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status_, true);
-            }
-
             NV_CUDNN_FE_TRY();
 #if (CUDNN_VERSION >= 8300)
             auto status_l = get_heuristics_list_impl(CUDNN_HEUR_MODE_FALLBACK, opGraph, filter_fn, filtered_configs);
@@ -407,7 +378,7 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
             NV_CUDNN_FE_CATCH(NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(e.getCudnnStatus(), true));
         } else if (mode.find("heuristics_mode_b") != std::string::npos) {
             auto heur_mode =
-#if (CUDNN >= 8300)
+#if (CUDNN_VERSION >= 8300)
                         CUDNN_HEUR_MODE_B;
 #else
                         CUDNN_HEUR_MODE_INSTANT;
@@ -418,13 +389,13 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
             // Between cudnn version 8.3 and 8.6, when heur_mode_b heuristics did not succeed,
             // there was no fallback to the instant mode. We are here manually adding instant mode 
             // to the heur_mode_b to alleviate this issue.
-#if (CUDNN >= 8300) && (CUDNN < 8600)
+#if (CUDNN_VERSION >= 8300) && (CUDNN_VERSION < 8600)
             if (status_l != CUDNN_STATUS_SUCCESS) {
                 status_l = get_heuristics_list_impl(CUDNN_HEUR_MODE_INSTANT, opGraph, filter_fn, filtered_configs);
             }
 #endif
             NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status_l, true);
-#if (CUDNN >= 8300) && (CUDNN < 8600)
+#if (CUDNN_VERSION >= 8300) && (CUDNN_VERSION < 8600)
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
             } catch (cudnn_frontend::cudnnException &) {
                 NV_CUDNN_FE_TRY();
