@@ -114,11 +114,13 @@
 #include "cudnn_frontend_Logging.h"
 #include "cudnn_frontend_Reorder_Tensor.h"
 #include "cudnn_frontend_ExecutionPlanCache.h"
+#include "cudnn_frontend_utils.h"
+
 #include "cudnn_frontend_Resample.h"
 
 #define CUDNN_FRONTEND_MAJOR_VERSION 0
-#define CUDNN_FRONTEND_MINOR_VERSION 7
-#define CUDNN_FRONTEND_PATCH_VERSION 3
+#define CUDNN_FRONTEND_MINOR_VERSION 8
+#define CUDNN_FRONTEND_PATCH_VERSION 0
 #define CUDNN_FRONTEND_VERSION ((CUDNN_FRONTEND_MAJOR_VERSION * 10000) + (CUDNN_FRONTEND_MINOR_VERSION * 100) + CUDNN_FRONTEND_PATCH_VERSION)
 
 namespace cudnn_frontend {
@@ -126,14 +128,8 @@ using Tensor                    = Tensor_v8;
 using TensorBuilder             = TensorBuilder_v8;
 using ConvDesc                  = ConvDesc_v8;
 using ConvDescBuilder           = ConvDescBuilder_v8;
-using PointWiseDescBuilder      = PointWiseDescBuilder_v8;
-using PointWiseDesc             = PointWiseDesc_v8;
-using MatMulDesc                = MatMulDesc_v8;
-using MatMulDescBuilder         = MatMulDescBuilder_v8;
 using ReductionDesc             = ReductionDesc_v8;
 using ReductionDescBuilder      = ReductionDescBuilder_v8;
-using Operation                 = Operation_v8;
-using OperationBuilder          = OperationBuilder_v8;
 using EngineHeuristicsBuilder   = EngineHeuristicsBuilder_v8;
 using EngineHeuristics          = EngineHeuristics_v8;
 using EngineBuilder             = EngineBuilder_v8;
@@ -146,4 +142,8 @@ using EngineFallbackList        = EngineFallbackList_v8;
 using EngineFallbackListBuilder = EngineFallbackListBuilder_v8;
 using ResampleDesc              = ResampleDesc_v8;
 using ResampleDescBuilder       = ResampleDescBuilder_v8;
+using RngDesc                   = RngDesc_v8;
+using RngDescBuilder            = RngDescBuilder_v8;
 }
+
+

@@ -1258,9 +1258,7 @@ run_imma(
                                        .setId('w')
                                        .setAlignment(16)
                                        .setDataType(CUDNN_DATA_INT8)
-#if (CUDNN_VERSION >= 8300)
-                                       .setReorderType(CUDNN_TENSOR_REORDERING_INT8x32)
-#endif
+                                       .setReorderType(cudnn_frontend::cudnnBackendTensorReordering_t::CUDNN_TENSOR_REORDERING_INT8x32)
                                        .setVectorCountAndDimension(vectorCount, vectorDimension)
                                        .build();
         auto conv_desc = cudnn_frontend::ConvDescBuilder()
@@ -1373,4 +1371,3 @@ run_imma(
     } 
     if (handle_) cudnnDestroy(handle_);
 }
-

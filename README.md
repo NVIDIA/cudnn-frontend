@@ -1,7 +1,14 @@
 # cuDNN Frontend API
 
 ## Introduction
-The cuDNN Frontend API is a C++ header-only library that demonstrates how to use the cuDNN C backend API. The cuDNN C backend API is documented in the [cuDNN developer guide](https://docs.nvidia.com/deeplearning/cudnn/developer-guide/index.html). 
+The cuDNN frontend API is a C++ header-only library that wraps the [cuDNN C backend API](https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnn-backend-api). Both the frontend and backend APIs are entry points to the same set of functionality that we commonly refer to as the "[graph API](https://docs.nvidia.com/deeplearning/cudnn/developer-guide/index.html#op-fusion)".
+
+While there are two entry points to the graph API (i.e. backend and frontend), we expect that most users will use the frontend entry point because:
+
+- It is less verbose without loss of control. All functionality accessible through the backend API is also accessible through the frontend API.
+- It adds functionality on top of the backend API, like errata filters and autotuning.
+
+Also, for those who want to use the backend API, the frontend source can serve as a reference implementation.
 
 ## Usage
 In order to include the entire library, include the cudnn_frontend header file `cudnn_frontend.h` into your compilation unit.

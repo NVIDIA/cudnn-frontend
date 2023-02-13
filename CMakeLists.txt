@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.17)
 
-project(cudnn_frontend VERSION 0.7)
+project(cudnn_frontend VERSION 0.8)
 
 add_library(cudnn_frontend INTERFACE)
 

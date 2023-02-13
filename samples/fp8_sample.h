@@ -82,3 +82,22 @@ run_tranpose_scale_convert_fp16_fp8_amax(int64_t* x_dim,
                    void* devPtrR,
                    void* devPtrOutput,
                    void* devPtrScale);
+
+void
+run_fp8_dgrad_descale_descale_amax_scale(int64_t* dx_dim,
+                   int64_t* w_dim,
+                   int64_t* dy_dim,
+                   int64_t* r_dim,
+                   int64_t* scale_dim,
+                   cudnnDataType_t dataType,
+                   int convDim,
+                   int64_t* conv_padA,
+                   int64_t* conv_dilationA,
+                   int64_t* conv_strideA,
+                   void* devPtrdX,
+                   void* devPtrW,
+                   void* devPtrR,
+                   void* devPtrdY,
+                   void* devPtrDescale1,
+                   void* devPtrDescale2,
+                   void* devPtrScale);
