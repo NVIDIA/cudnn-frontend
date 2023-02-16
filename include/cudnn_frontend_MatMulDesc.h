@@ -139,4 +139,6 @@ class MatMulDescBuilder_v8 {
    private:
     MatMulDesc_v8 m_matMulDesc;
 };
+using MatMulDesc                = MatMulDesc_v8;
+using MatMulDescBuilder         = MatMulDescBuilder_v8;
 }

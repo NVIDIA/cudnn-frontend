@@ -54,10 +54,10 @@ class ResampleDesc_v8 : public BackendDescriptor {
         char sep = ',';
         ss << "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: "
            << "Compute Type: " << to_string(computeType)
-           << ", Mode: " << to_string(mode)
+           << ", Resample Mode: " << resample_mode
            << ", Spatial Dimensions: " << spatialDim 
            << ", Nan Propagation: " << std::to_string(nanOpt)
-           << ", Padding Mode: " << to_string(paddingMode);
+           << ", Padding Mode: " << padding_mode;
         ss << ", WindowDim: [";
         for (auto i = 0; i < spatialDim; i++) {
             ss << '(' << windowDim[i].numerator << sep << windowDim[i].denominator << ')' << sep;
@@ -103,22 +103,22 @@ class ResampleDesc_v8 : public BackendDescriptor {
         return spatialDim;
     }
 
-#if (CUDNN_VERSION >= 8500)
-
-    cudnnResampleMode_t
-    getMode() const {
-        return mode;
-    }
-
     cudnnNanPropagation_t
     getNanOpt() const {
         return nanOpt;
     }
 
+    cudnnResampleMode_t
+    getMode() const {
+        return resample_mode;
+    }
+
     cudnnPaddingMode_t
     getPaddingMode() const {
-        return paddingMode;
+        return padding_mode;
     }
+
+#if (CUDNN_VERSION >= 8500)
 
     cudnnFraction_t const *
     getSpatialStride() const {
@@ -152,12 +152,12 @@ class ResampleDesc_v8 : public BackendDescriptor {
     // default values for attributes 
     cudnnDataType_t computeType = CUDNN_DATA_FLOAT;   
     cudnnNanPropagation_t nanOpt = CUDNN_NOT_PROPAGATE_NAN;
+    cudnnResampleMode_t resample_mode = cudnnResampleMode_t::NOT_SET;
+    cudnnPaddingMode_t padding_mode = cudnnPaddingMode_t::NOT_SET;
     
     int64_t spatialDim = 0;
 
 #if (CUDNN_VERSION >= 8500)
-    cudnnResampleMode_t mode = CUDNN_RESAMPLE_AVGPOOL;
-    cudnnPaddingMode_t paddingMode = CUDNN_ZERO_PAD;
     // Shape attributes
     cudnnFraction_t windowDim[CUDNN_DIM_MAX] = {{0,1},{0,1}};
     cudnnFraction_t prePadding[CUDNN_DIM_MAX] = {{0,1},{0,1}};
@@ -182,23 +182,19 @@ class ResampleDescBuilder_v8 {
         return *this;
     }
 
-#if (CUDNN_VERSION >= 8500)
+    //! Set nan propagation mode for the Resample Operation
+    auto
+    setNanPropagation(cudnnNanPropagation_t nanOpt_) -> ResampleDescBuilder_v8 & {
+        m_resampleDesc.nanOpt = nanOpt_;
+        return *this;
+    }
+
+#if CUDNN_VERSION >= 8500
     //! (Overloaded) Set post padding for the Resample Operation with cudnnFraction_t
     auto
     setPostPadding(int64_t count, cudnnFraction_t const * arr) -> ResampleDescBuilder_v8 & {
         // TODO: check the provided array count against the stored spatial dimension count.
         std::copy(arr, arr + count, m_resampleDesc.postPadding);
-        return *this;
-    }
- 
-    //! (Overloaded) Set post padding for the Resample Operation with int64_t
-    auto
-    setPostPadding(int64_t count, int64_t const * arr) -> ResampleDescBuilder_v8 & {
-        // TODO: check the provided array count against the stored spatial dimension count.
-        for (int i = 0; i < count; i++) {
-            m_resampleDesc.postPadding[i].numerator = arr[i];
-            m_resampleDesc.postPadding[i].denominator = 1;
-        }
         return *this;
     }
 
@@ -207,17 +203,6 @@ class ResampleDescBuilder_v8 {
     setPrePadding(int64_t count, cudnnFraction_t const * arr) -> ResampleDescBuilder_v8 & {
         // TODO: check the provided array count against the stored spatial dimension count.
         std::copy(arr, arr + count, m_resampleDesc.prePadding);
-        return *this;
-    }
-    
-    //! (Overloaded) Set pre padding for the Resample Operation with int64_t
-    auto
-    setPrePadding(int64_t count, int64_t const * arr) -> ResampleDescBuilder_v8 & {
-        // TODO: check the provided array count against the stored spatial dimension count.
-        for (int i = 0; i < count; i++) {
-            m_resampleDesc.prePadding[i].numerator = arr[i];
-            m_resampleDesc.prePadding[i].denominator = 1;
-        }
         return *this;
     }
 
@@ -229,17 +214,14 @@ class ResampleDescBuilder_v8 {
         return *this;
     }
     
-    //! (Overloaded) Set stride for the Resample Operation with int64_t
+    //! Set resample mode for the Resample Operation
+    // To be deprecated. Please use setResampleMode(cudnn_frontend::cudnnResampleMode_t).
     auto
-    setSpatialStride(int64_t count, int64_t const * arr) -> ResampleDescBuilder_v8 & {
-        // TODO: check the provided array count against the stored spatial dimension count.
-        for (int i = 0; i < count; i++) {
-            m_resampleDesc.stride[i].numerator = arr[i];
-            m_resampleDesc.stride[i].denominator = 1;
-        }
+    setResampleMode(::cudnnResampleMode_t const mode_) -> ResampleDescBuilder_v8 & {
+        detail::convert_from_cudnn_type(mode_, m_resampleDesc.resample_mode);
         return *this;
     }
-
+    
     //! (Overloaded) Set window dim for the Resample Operation with cudnnFraction_t
     auto
     setSpatialDim(int64_t count, cudnnFraction_t const * arr) -> ResampleDescBuilder_v8 & {
@@ -247,39 +229,96 @@ class ResampleDescBuilder_v8 {
         std::copy(arr, arr + count, m_resampleDesc.windowDim);
         return *this;
     }
+    
+    //! Set padding mode for the Resample Operation
+    // To be deprecated. Please use setPaddingMode(cudnn_frontend::cudnnPaddingMode_t).
+    auto
+    setPaddingMode(::cudnnPaddingMode_t const padding_mode) -> ResampleDescBuilder_v8 & {
+        detail::convert_from_cudnn_type(padding_mode, m_resampleDesc.padding_mode);
+        return *this;
+    }
+#endif
+
+    //! Set padding mode for the Resample Operation
+    auto
+    setPaddingMode(cudnnPaddingMode_t const padding_mode) -> ResampleDescBuilder_v8 & {
+        m_resampleDesc.padding_mode = padding_mode;
+        return *this;
+    }
+
+    //! Set resample mode for the Resample Operation
+    auto
+    setResampleMode(cudnnResampleMode_t const mode) -> ResampleDescBuilder_v8 & {
+        m_resampleDesc.resample_mode = mode;
+        return *this;
+    }
+ 
+    //! (Overloaded) Set post padding for the Resample Operation with int64_t
+    auto
+    setPostPadding(int64_t count, int64_t const * arr) -> ResampleDescBuilder_v8 & {
+#if CUDNN_VERSION < 8500
+        CUDNN_FRONTEND_UNUSED(count);
+        CUDNN_FRONTEND_UNUSED(arr);
+        set_error_and_throw_exception(&m_resampleDesc, CUDNN_STATUS_NOT_SUPPORTED, "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR setPostPadding failed");
+#else
+        // TODO: check the provided array count against the stored spatial dimension count.
+        for (int i = 0; i < count; i++) {
+            m_resampleDesc.postPadding[i].numerator = arr[i];
+            m_resampleDesc.postPadding[i].denominator = 1;
+        }
+#endif
+        return *this;
+    }
+    
+    //! (Overloaded) Set pre padding for the Resample Operation with int64_t
+    auto
+    setPrePadding(int64_t count, int64_t const * arr) -> ResampleDescBuilder_v8 & {
+#if CUDNN_VERSION < 8500
+        CUDNN_FRONTEND_UNUSED(count);
+        CUDNN_FRONTEND_UNUSED(arr);
+        set_error_and_throw_exception(&m_resampleDesc, CUDNN_STATUS_NOT_SUPPORTED, "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR setPrePadding failed");
+#else
+        // TODO: check the provided array count against the stored spatial dimension count.
+        for (int i = 0; i < count; i++) {
+            m_resampleDesc.prePadding[i].numerator = arr[i];
+            m_resampleDesc.prePadding[i].denominator = 1;
+        }
+#endif
+        return *this;
+    }
+    
+    //! (Overloaded) Set stride for the Resample Operation with int64_t
+    auto
+    setSpatialStride(int64_t count, int64_t const * arr) -> ResampleDescBuilder_v8 & {
+#if CUDNN_VERSION < 8500
+        CUDNN_FRONTEND_UNUSED(count);
+        CUDNN_FRONTEND_UNUSED(arr);
+        set_error_and_throw_exception(&m_resampleDesc, CUDNN_STATUS_NOT_SUPPORTED, "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR setSpatialStride failed");
+#else
+        // TODO: check the provided array count against the stored spatial dimension count.
+        for (int i = 0; i < count; i++) {
+            m_resampleDesc.stride[i].numerator = arr[i];
+            m_resampleDesc.stride[i].denominator = 1;
+        }
+#endif
+        return *this;
+    }
 
     //! (Overloaded) Set window dim for the Resample Operation with int64_t
     auto
     setSpatialDim(int64_t count, int64_t const * arr) -> ResampleDescBuilder_v8 & {
+#if CUDNN_VERSION < 8500
+        CUDNN_FRONTEND_UNUSED(count);
+        CUDNN_FRONTEND_UNUSED(arr);
+        set_error_and_throw_exception(&m_resampleDesc, CUDNN_STATUS_NOT_SUPPORTED, "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR setSpatialDim failed");
+#else
         // TODO: check the provided array count against the stored spatial dimension count.
         m_resampleDesc.spatialDim = count;
         for (int i = 0; i < count; i++) {
             m_resampleDesc.windowDim[i].numerator = arr[i];
             m_resampleDesc.windowDim[i].denominator = 1;
         }
-        return *this;
-    }
-    
-     //! Set padding mode for the Resample Operation
-    auto
-    setPaddingMode(cudnnPaddingMode_t paddingMode_) -> ResampleDescBuilder_v8 & {
-        m_resampleDesc.paddingMode = paddingMode_;
-        return *this;
-    }
-
-    //! Set resample mode for the Resample Operation
-    auto
-    setResampleMode(cudnnResampleMode_t mode_) -> ResampleDescBuilder_v8 & {
-        m_resampleDesc.mode = mode_;
-        return *this;
-    }
-
 #endif
-    
-    //! Set nan propagation mode for the Resample Operation
-    auto
-    setNanPropagation(cudnnNanPropagation_t nanOpt_) -> ResampleDescBuilder_v8 & {
-        m_resampleDesc.nanOpt = nanOpt_;
         return *this;
     }
 
@@ -309,11 +348,20 @@ class ResampleDescBuilder_v8 {
         }
 
         // Once Created lets set the descriptor parameters.
+        ::cudnnResampleMode_t cudnn_resample_mode;
+        status = detail::convert_to_cudnn_type(m_resampleDesc.resample_mode, cudnn_resample_mode);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                &m_resampleDesc,
+                status,
+                "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: SetAttribute CUDNN_ATTR_RESAMPLE_MODE Failed");
+            return std::move(m_resampleDesc);
+        }
         status = cudnnBackendSetAttribute(m_resampleDesc.pointer->get_backend_descriptor(), 
                                           CUDNN_ATTR_RESAMPLE_MODE, 
                                           CUDNN_TYPE_RESAMPLE_MODE, 
                                           1,
-                                          &(m_resampleDesc.mode));
+                                          &cudnn_resample_mode);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -348,11 +396,20 @@ class ResampleDescBuilder_v8 {
             return std::move(m_resampleDesc);
         }
 
+        ::cudnnPaddingMode_t cudnn_padding_mode;
+        status = detail::convert_to_cudnn_type(m_resampleDesc.padding_mode, cudnn_padding_mode);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                &m_resampleDesc,
+                status,
+                "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: SetAttribute CUDNN_ATTR_RESAMPLE_PADDING_MODE Failed");
+            return std::move(m_resampleDesc);
+        }
         status = cudnnBackendSetAttribute(m_resampleDesc.pointer->get_backend_descriptor(),
                                            CUDNN_ATTR_RESAMPLE_PADDING_MODE, 
                                            CUDNN_TYPE_PADDING_MODE, 
                                            1, 
-                                           &(m_resampleDesc.paddingMode));
+                                           &cudnn_padding_mode);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,

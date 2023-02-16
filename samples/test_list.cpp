@@ -29,6 +29,7 @@
 #include "fusion_sample.h"
 #include "fp8_sample.h"
 #include "mha_sample.h"
+#include "fused_mha_sample.h"
 
 TEST_CASE("Tensor creation comparison", "[frontend][comparison][backend]") {
     // Consider creation of a 2d Tensor
@@ -492,7 +493,6 @@ TEST_CASE("Use cudnnGetPlan for execution", "[frontend][cudnnGetPlan][conv]" ) {
     std::cout << "\n========================================================================================\n";
 }
 
-
 TEST_CASE("ConvScaleBiasAddAct sample", "[frontend][fusion][ConvScaleBiasAddAct]") {
     std::cout << "TEST_CASE :: ConvScaleBiasAddAct sample" << std::endl;
     INFO("TEST_CASE :: ConvScaleBiasAddAct sample");
@@ -848,22 +848,20 @@ TEST_CASE("ConvScaleBiasAct_int8 sample", "[frontend][fusion][ConvScaleBiasAct_i
     std::cout << "\n========================================================================================\n";
 }
 
-
-TEST_CASE("PoolScaleBiasAct_int8 sample", "[frontend][fusion][PoolScaleBiasAct_int8]") {
+TEST_CASE("PoolScaleBiasAct_int8 sample", "[pooling][forward][avgerage_pooling]") {
     std::cout << "TEST_CASE PoolScaleBiasAct_int8 :: Sample PoolScaleBiasAct_int8 fusion code with backend API" << std::endl;
-    INFO("TEST_CASE :: PoolScaleBiasAct_int8 sample");    
+    INFO("TEST_CASE :: PoolScaleBiasAct_int8 sample");
 
     int64_t xTensorDim[] = {16, 16, 32, 32};
     int64_t yTensorDim[] = {16, 16, 16, 16};
     int64_t bTensorDim[] = {1, 16, 1, 1};  // bias
     int64_t sTensorDim[] = {1, 16, 1, 1};  // scale
 
-    cudnnDataType_t compType = CUDNN_DATA_FLOAT;  
-#if (CUDNN_VERSION >= 8500)
-    cudnnResampleMode_t mode = CUDNN_RESAMPLE_AVGPOOL;
-    cudnnNanPropagation_t nanOpt = CUDNN_NOT_PROPAGATE_NAN;
-    cudnnPaddingMode_t paddingMode = CUDNN_ZERO_PAD;
-#endif
+    cudnnDataType_t compType = CUDNN_DATA_FLOAT;
+    auto const nanOpt = CUDNN_NOT_PROPAGATE_NAN;
+    cudnn_frontend::cudnnResampleMode_t const mode = cudnn_frontend::cudnnResampleMode_t::CUDNN_RESAMPLE_AVGPOOL_INCLUDE_PADDING;
+    cudnn_frontend::cudnnPaddingMode_t const padding_mode = cudnn_frontend::cudnnPaddingMode_t::CUDNN_ZERO_PAD;
+
     int64_t nbSpatialDims = 2;
     double alpha = 1.0;
     double beta = 0.0;
@@ -915,12 +913,9 @@ TEST_CASE("PoolScaleBiasAct_int8 sample", "[frontend][fusion][PoolScaleBiasAct_i
                                   B.devPtr,
                                   S.devPtr, 
                                   compType,
-#if (CUDNN_VERSION >= 8500)
-                                  mode ,
                                   nanOpt, 
-                                  paddingMode, 
-#endif                        
-
+                                  mode,
+                                  padding_mode,
                                   nbSpatialDims, 
                                   alpha,                           
                                   beta, 
@@ -934,7 +929,6 @@ TEST_CASE("PoolScaleBiasAct_int8 sample", "[frontend][fusion][PoolScaleBiasAct_i
     checkCudaErr(cudaDeviceSynchronize());
     std::cout << "\n========================================================================================\n";
 }
-
 
 TEST_CASE("MatmulBiasAct sample", "[frontend][fusion][MatmulBiasAct]") {
     std::cout << "TEST_CASE :: Sample matmul bias runtime fusion code with backend API" << std::endl;
@@ -1362,7 +1356,7 @@ TEST_CASE("Use Plan cache for rerunning the same convolution", "[frontend][dnn_h
     int64_t filterdimA[]  = {32, 32, 1, 1};
     int64_t outdimA[]     = {0, 0, 0, 0}; // Computed Below
     int64_t padA[]        = {0, 0};
-    int64_t dilationA[] = {1, 1};
+    int64_t dilationA[]   = {1, 1};
     int64_t convstrideA[] = {1, 1};
 
     int numErrors = 0;
@@ -1501,7 +1495,6 @@ TEST_CASE("Scale Bias Conv BNGenstats", "[frontend][fusion][bn_genstas]") {
     std::cout << "\n========================================================================================\n";
 }
 
-
 TEST_CASE("Dual Scale Bias Act Relu", "[frontend][fusion][DSBAR]") {
     std::cout << "Dual Scale Bias Act Relu" << std::endl;
     int64_t perChannelScaleDim[]      = { 1,  32, 1, 1};
@@ -1525,7 +1518,7 @@ TEST_CASE("Dual Scale Bias Act Relu", "[frontend][fusion][DSBAR]") {
 
 TEST_CASE("Dual Scale Bias Act Relu on CPU", "[frontend][fusion][DSBAR][CPU]") {
     std::cout << "\n========================================================================================\n";
-    std::cout << "Dual Scale Bias Act Relu wiht CPU" << std::endl;
+    std::cout << "Dual Scale Bias Act Relu on CPU" << std::endl;
     int64_t perChannelScaleDim[]      = { 1,  32, 1, 1};
     int64_t yTensorDim[]              = { 32, 32, 7, 7}; 
 
@@ -1582,7 +1575,6 @@ TEST_CASE("Dual Scale Bias Act Relu on CPU", "[frontend][fusion][DSBAR][CPU]") {
 #endif
     REQUIRE(numErrors == 0);
 }
-    
 
 TEST_CASE("Scale Bias Conv BNGenstats with CPU", "[frontend][fusion][bn_genstats][cpu]") {
     std::cout << "\n========================================================================================\n";
@@ -1635,7 +1627,7 @@ TEST_CASE("Scale Bias Conv BNGenstats with CPU", "[frontend][fusion][bn_genstats
     checkCudaErr(cudaMemcpy(Y.hostPtr, Y.devPtr, (size_t)(sizeof(Y.devPtr[0]) * Ysize), cudaMemcpyDeviceToHost));
     checkCudaErr(cudaDeviceSynchronize());
 
-    Surface<float> afterScaleBiasTensor(Xsize, true);
+    Surface<float> afterScaleBiasTensor(Ysize, true);
     Surface<half> afterConvTensor(Ysize, true);
     Surface<half> afterReluTensor(Ysize, true);
     Surface<half> afterBNTensor(Ysize, true);
@@ -1880,9 +1872,8 @@ TEST_CASE("Tensor cloning", "[frontend][comparison][clone]") {
     }
 }
 
-
 #if (CUDNN_VERSION >= 8600)
-TEST_CASE("Max pooling idx tensor dump", "[frontend][max pooling]") {
+TEST_CASE("Max pooling idx tensor dump", "[pooling][forward][max_pooling]") {
     std::cout << "TEST_CASE Max pooling :: Sample max pooling with idx tensor" << std::endl;
     INFO("TEST_CASE :: Sample max pooling with idx tensor");    
 
@@ -1930,9 +1921,9 @@ TEST_CASE("Max pooling idx tensor dump", "[frontend][max pooling]") {
     Surface<int8_t> idx(Ysize, false);
 
     // Sampling params
-    cudnnResampleMode_t mode = CUDNN_RESAMPLE_MAXPOOL;
-    cudnnNanPropagation_t nanOpt = CUDNN_NOT_PROPAGATE_NAN;
-    cudnnPaddingMode_t paddingMode = CUDNN_NEG_INF_PAD;
+    auto const nanOpt = CUDNN_NOT_PROPAGATE_NAN;
+    cudnn_frontend::cudnnResampleMode_t const mode = cudnn_frontend::cudnnResampleMode_t::CUDNN_RESAMPLE_MAXPOOL;
+    cudnn_frontend::cudnnPaddingMode_t const padding_mode = cudnn_frontend::cudnnPaddingMode_t::CUDNN_NEG_INF_PAD;
     
     run_maxpool_with_idx(xTensorDim,
                     yTensorDim,
@@ -1941,9 +1932,9 @@ TEST_CASE("Max pooling idx tensor dump", "[frontend][max pooling]") {
                     Y.devPtr,
                     idx.devPtr,
                     tensorType,
-                    mode,
                     nanOpt, 
-                    paddingMode, 
+                    mode,
+                    padding_mode, 
                     nbSpatialDims, 
                     windowDimA,
                     prePaddingA,
@@ -1967,7 +1958,7 @@ TEST_CASE("Max pooling idx tensor dump", "[frontend][max pooling]") {
 #endif
 
 #if (CUDNN_VERSION >= 8600)
-TEST_CASE("Backward pooling", "[frontend][backward pooling]") {
+TEST_CASE("Backward pooling", "[pooling][backward][max_pooling]") {
     std::cout << "TEST_CASE Backward pooling :: Sample Backward max and average pooling" << std::endl;
     INFO("TEST_CASE :: Sample Backward max and average pooling");    
 
@@ -2017,19 +2008,19 @@ TEST_CASE("Backward pooling", "[frontend][backward pooling]") {
         std::cout << "BACKWARD AVERAGE POOLING" << std::endl;
 
         // Sampling params
-        cudnnResampleMode_t mode = CUDNN_RESAMPLE_AVGPOOL;
-        cudnnNanPropagation_t nanOpt = CUDNN_NOT_PROPAGATE_NAN;
-        cudnnPaddingMode_t paddingMode = CUDNN_ZERO_PAD;
+        auto const nanOpt = CUDNN_NOT_PROPAGATE_NAN;
+        cudnn_frontend::cudnnResampleMode_t const mode = cudnn_frontend::cudnnResampleMode_t::CUDNN_RESAMPLE_AVGPOOL_INCLUDE_PADDING;
+        cudnn_frontend::cudnnPaddingMode_t const padding_mode = cudnn_frontend::cudnnPaddingMode_t::CUDNN_ZERO_PAD;
         
         run_backward_avgpool(dxTensorDim,
                         dyTensorDim,
                         dX.devPtr,
                         dY.devPtr,
                         tensorType,
-                        mode,
                         nanOpt, 
-                        paddingMode, 
-                        nbSpatialDims, 
+                        mode,
+                        padding_mode, 
+                        nbSpatialDims,
                         windowDimA,
                         prePaddingA,
                         postPaddingA,
@@ -2057,9 +2048,9 @@ TEST_CASE("Backward pooling", "[frontend][backward pooling]") {
         checkCudaErr(cudaDeviceSynchronize());
 
         // Sampling params
-        cudnnResampleMode_t mode = CUDNN_RESAMPLE_MAXPOOL;
-        cudnnNanPropagation_t nanOpt = CUDNN_NOT_PROPAGATE_NAN;
-        cudnnPaddingMode_t paddingMode = CUDNN_NEG_INF_PAD;
+        auto const nanOpt = CUDNN_NOT_PROPAGATE_NAN;
+        cudnn_frontend::cudnnResampleMode_t const mode = cudnn_frontend::cudnnResampleMode_t::CUDNN_RESAMPLE_MAXPOOL;
+        cudnn_frontend::cudnnPaddingMode_t const padding_mode = cudnn_frontend::cudnnPaddingMode_t::CUDNN_NEG_INF_PAD;
         
         run_backward_maxpool(dxTensorDim,
                         dyTensorDim,
@@ -2068,9 +2059,9 @@ TEST_CASE("Backward pooling", "[frontend][backward pooling]") {
                         dY.devPtr,
                         idx.devPtr,
                         tensorType,
-                        mode,
                         nanOpt, 
-                        paddingMode, 
+                        mode,
+                        padding_mode, 
                         nbSpatialDims, 
                         windowDimA,
                         prePaddingA,
@@ -2142,7 +2133,6 @@ TEST_CASE("Conv two global scales", "[frontend][fusion][conv global scale]") {
     std::cout << "\n========================================================================================\n";
 }
 #endif
-
 
 #if (CUDNN_VERSION >= 8600)
 TEST_CASE("Conv Scale", "[frontend][fusion][ConvScaleReduction]") {
@@ -2257,7 +2247,9 @@ TEST_CASE("Conv Descale Descale Amax Scale sample", "[frontend][fusion][ConvScal
 
     std::cout << "\n========================================================================================\n";
 }
+#endif
 
+#if (CUDNN_VERSION >= 8600)
 TEST_CASE("Scale transpose convert amax sample", "[frontend][fusion][Transpose]") {
     std::cout << "TEST_CASE :: Sample scale transpose convert amax code with backend API" << std::endl;
     INFO("TEST_CASE :: Sample scale transpose convert amax code with backend API");
@@ -2300,6 +2292,431 @@ TEST_CASE("Scale transpose convert amax sample", "[frontend][fusion][Transpose]"
 
     std::cout << "\n========================================================================================\n";
 }
-
 #endif
 
+#if (CUDNN_VERSION >= 8700)
+TEST_CASE("Dgrad Descale Descale Amax Scale sample", "[frontend][fusion][ConvScaleReduction]") {
+    std::cout << "TEST_CASE :: Sample Dgrad scale global reduction code with backend API" << std::endl;
+    INFO("TEST_CASE :: Sample Dgrad scale global reduction code with backend API");
+    int64_t dxTensorDim[]      = {64, 256, 14, 14};
+    int64_t wTensorDim[]      = {256, 256, 3, 3};
+    int64_t dyTensorDim[]      = {0, 0, 0, 0}; // Computed below
+
+    int64_t conv_padA[]       = {1, 1};
+    int64_t conv_dilationA[]  = {1, 1};
+    int64_t conv_strideA[]    = {1, 1};
+
+    dyTensorDim[0] = dxTensorDim[0];
+    dyTensorDim[1] = wTensorDim[0];
+    for (int dim = 0; dim < 2; dim++) {
+        dyTensorDim[dim + 2] =
+            getFwdConvOutputDim(dxTensorDim[dim + 2], conv_padA[dim], wTensorDim[dim + 2], conv_strideA[dim], conv_dilationA[dim]);
+    }
+
+    int64_t scaleDim[]        = {1, 1, 1, 1}; // Scalar scale 
+    int64_t amaxTensorDim[] = {1, 1, 1, 1}; // Output is AMAX of conv + scale
+
+    printf("====DIMENSIONS====\n");
+    printf("dx dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dxTensorDim[0], dxTensorDim[1], dxTensorDim[2], dxTensorDim[3]);
+    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", wTensorDim[0], wTensorDim[1], wTensorDim[2], wTensorDim[3]);
+    printf("dy dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dyTensorDim[0], dyTensorDim[1], dyTensorDim[2], dyTensorDim[3]);
+
+    int64_t dxSize = dxTensorDim[0] * dxTensorDim[1] * dxTensorDim[2] * dxTensorDim[3];
+    int64_t filterSize = wTensorDim[0] * wTensorDim[1] * wTensorDim[2] * wTensorDim[3];
+    int64_t dySize = dyTensorDim[0] * dyTensorDim[1] * dyTensorDim[2] * dyTensorDim[3];
+    int64_t amaxSize = amaxTensorDim[0] * amaxTensorDim[1] * amaxTensorDim[2] * amaxTensorDim[3];
+
+    Surface<int8_t> dX(dxSize, false);
+    Surface<int8_t> W(filterSize, false);
+    Surface<int8_t> dY(dySize, false);
+
+    Surface<float> descale1(scaleDim[0] * scaleDim[1] * scaleDim[2] * scaleDim[3], false);
+    Surface<float> descale2(scaleDim[0] * scaleDim[1] * scaleDim[2] * scaleDim[3], false);
+    Surface<float> scale(scaleDim[0] * scaleDim[1] * scaleDim[2] * scaleDim[3], false);
+    Surface<float> Reduced(amaxSize, false);
+
+    run_fp8_dgrad_descale_descale_amax_scale(dxTensorDim, 
+                wTensorDim, 
+                dyTensorDim,
+                amaxTensorDim,
+                scaleDim, 
+                CUDNN_DATA_FP8_E4M3, 
+                2, 
+                conv_padA, 
+                conv_dilationA, 
+                conv_strideA, 
+                dX.devPtr, 
+                W.devPtr, 
+                Reduced.devPtr,
+                dY.devPtr,
+                descale1.devPtr,
+                descale2.devPtr,
+                scale.devPtr);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(dX.hostPtr, dX.devPtr, (size_t)(sizeof(dX.hostPtr[0]) * dxSize), cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaMemcpy(Reduced.hostPtr, Reduced.devPtr, (size_t)1, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+    std::cout << "\n========================================================================================\n";
+}
+#endif
+
+#if (CUDNN_VERSION >= 8400)
+TEST_CASE("BN BWD Weights sample", "[frontend][fusion][BnBwdWeight]") {
+    std::cout << "TEST_CASE :: BN BWD Weights sample" << std::endl;
+    INFO("TEST_CASE :: Sample BN BWD Weights sample");
+    
+    constexpr int64_t C = 8;
+    constexpr int64_t N = 2;
+    constexpr int64_t H = 56;
+    constexpr int64_t W = 56;
+    constexpr int64_t K = 16;
+    constexpr int64_t R = 3;
+    constexpr int64_t S = 3;
+
+    int64_t scaleDim[]        = {1, C, 1, 1};
+
+    int64_t xDim[]      = {N, C, H, W};
+    int64_t wDim[]      = {K, C, R, S};
+    int64_t dyDim[]     = {N, K, 1, 1}; // Computed below
+
+    int64_t conv_padA[]       = {1, 1};
+    int64_t conv_dilationA[]  = {1, 1};
+    int64_t conv_strideA[]    = {1, 1};
+
+    dyDim[0] = dyDim[0];
+    dyDim[1] =  wDim[0];
+    for (int dim = 0; dim < 2; dim++) {
+        dyDim[dim + 2] =
+            getFwdConvOutputDim(xDim[dim + 2], conv_padA[dim], wDim[dim + 2], conv_strideA[dim], conv_dilationA[dim]);
+    }
+
+    int64_t xSize        = xDim[0] * xDim[1] * xDim[2] * xDim[3];
+    int64_t wSize        = wDim[0] * wDim[1] * wDim[2] * wDim[3];
+    int64_t ySize        = dyDim[0] * dyDim[1] * dyDim[2] * dyDim[3];
+    int64_t perScaleSize = C;
+
+    Surface<half> x_bn_forward(xSize, false);
+    Surface<half> dy_bn(xSize, false);
+    Surface<half> w_forward(wSize, false);
+    Surface<half> dy(ySize, false);
+
+    Surface<float> scale(perScaleSize, false);
+    Surface<float> bias(perScaleSize, false);
+    Surface<float> mean(perScaleSize, false);
+    Surface<float> inv_var(perScaleSize, false);
+
+    Surface<float> d_scale(perScaleSize, false);
+    Surface<float> d_bias(perScaleSize, false);
+
+    Surface<float> eqscale_dy(perScaleSize, false);
+    Surface<float> eqscale_x(perScaleSize, false);
+    Surface<float> eqbias(perScaleSize, false);
+
+    run_bn_bwd_weight(xDim, dyDim, wDim, scaleDim, x_bn_forward.devPtr, w_forward.devPtr, dy.devPtr, dy_bn.devPtr, mean.devPtr, inv_var.devPtr, 
+                      scale.devPtr, bias.devPtr, d_scale.devPtr, d_bias.devPtr, eqscale_dy.devPtr, eqscale_x.devPtr, eqbias.devPtr);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    std::cout << "\n========================================================================================\n";
+}
+#endif
+
+#if (CUDNN_VERSION >= 8700)
+TEST_CASE("Back2Back Batch GEMM sample", "[frontend][fusion][back2backBatchGemm]") {
+    std::cout << "TEST_CASE :: Sample back2back batch gemm code with backend API" << std::endl;
+    INFO("TEST_CASE :: Sample back2back batch gemm code with backend API");
+
+    int64_t qTensorDim[] = {32, 16, 512, 64};
+    int64_t kTensorDim[] = {32, 16, 64, 512};
+    int64_t sTensorDim[] = {32, 16, 512, 512};
+    int64_t vTensorDim[] = {32, 16, 512, 64};
+    int64_t oTensorDim[] = {32, 16, 512, 64};
+
+    int64_t qTensorStride[] = {524288, 64, 1024, 1};
+    int64_t kTensorStride[] = {524288, 64, 1, 1024};
+    int64_t sTensorStride[] = {4194304, 262144, 512, 1};
+    int64_t vTensorStride[] = {524288, 64, 1024, 1};
+    int64_t oTensorStride[] = {524288, 64, 1024, 1};
+
+    printf("====DIMENSIONS====\n");
+    printf("q dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", qTensorDim[0], qTensorDim[1], qTensorDim[2], qTensorDim[3]);
+    printf("k dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", kTensorDim[0], kTensorDim[1], kTensorDim[2], kTensorDim[3]);
+    printf("s dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", sTensorDim[0], sTensorDim[1], sTensorDim[2], sTensorDim[3]);
+    printf("v dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", vTensorDim[0], vTensorDim[1], vTensorDim[2], vTensorDim[3]);
+    printf("o dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", oTensorDim[0], oTensorDim[1], oTensorDim[2], oTensorDim[3]);
+
+    int64_t qSize = qTensorDim[0] * qTensorDim[1] * qTensorDim[2] * qTensorDim[3];
+    int64_t kSize = kTensorDim[0] * kTensorDim[1] * kTensorDim[2] * kTensorDim[3];
+    int64_t vSize = vTensorDim[0] * vTensorDim[1] * vTensorDim[2] * vTensorDim[3];
+    int64_t oSize = oTensorDim[0] * oTensorDim[1] * oTensorDim[2] * oTensorDim[3];
+
+    // passing half just to make sure that we have a data type of same size as bf16
+    Surface<half> qTensor(qSize, false);
+    Surface<half> kTensor(kSize, false);
+    Surface<half> vTensor(vSize, false);
+    Surface<half> oTensor(oSize, false);
+
+    run_b2b_batch_gemm(qTensorDim,
+                kTensorDim,
+                sTensorDim,
+                vTensorDim,
+                oTensorDim,
+                qTensor.devPtr,
+                kTensor.devPtr,
+                vTensor.devPtr,
+                oTensor.devPtr,
+                CUDNN_DATA_HALF,
+                4,
+                qTensorStride,
+                kTensorStride,
+                sTensorStride,
+                vTensorStride,
+                oTensorStride);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(oTensor.hostPtr, oTensor.devPtr, sizeof(oTensor.hostPtr[0]) * oSize, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    std::cout << "\n========================================================================================\n";
+}
+
+TEST_CASE("MHA Fprop sample", "[frontend][fusion][mhaFprop]") {
+    std::cout << "TEST_CASE :: MHA Fprop with backend API" << std::endl;
+    INFO("TEST_CASE ::  MHA Fprop with backend API");
+
+    int64_t b = 32;  // batch size
+    int64_t h = 16;  // head dim
+    int64_t s_q = 512; // q tensor is padded to this seq length
+    int64_t s_kv = 512; // k and v tensor is padded to this seq length
+    int64_t d = 64;  // hidden dim
+
+    int64_t seed = 123456; // seed for generating the dropout mask
+
+    MHA_Layout layout = MHA_Layout::QKV_INTERLEAVED; // layout of the tensors Q,K and V
+
+    // this scaling factor needs to be bfloat16 for data type bfloat16
+    half1 scaling_factor = cpu_float2half_rn(0.8f); // scale value before softmax
+
+    double dropout_probability = 0.2f; // probability of dropout
+
+    MHA_Bias_Type bias_type = MHA_Bias_Type::NO_BIAS; // set which bias is required
+
+    bool is_causal_masking = false; // specify if we need causal masking
+
+    printf("====PARAMETERS====\n");
+    printf("batch is %" PRId64 ", head dim is %" PRId64 ", q sequence length is %" PRId64 ", kv sequence length is %" PRId64 ", hidden dim is %" PRId64 "\n", b, h, s_q, s_kv, d);
+
+    void* devPtrQ = nullptr; // queries
+    void* devPtrK = nullptr; // keys
+    void* devPtrV = nullptr; // values
+    void* devPtrS = nullptr; // after softmax output
+    void* devPtrO = nullptr; // final output
+    void* devPtrBias = nullptr; // bias tensor
+
+    int* devActualSeqlenQ = nullptr; // actual seqlen Q
+    int* devActualSeqlenK = nullptr; // actual seqlen K
+
+    int* hostActualSeqlenQ = nullptr;
+    int* hostActualSeqlenK = nullptr;
+
+    // the setup is for the qkv interleaved layout (qkv interleaved assumes s_q = s_kv)
+    int64_t qkvTensorDim[] = {b, s_q, 3, h, d};
+    CUDNN_FRONTEND_UNUSED(qkvTensorDim);
+
+    int64_t qkvSize = b * s_q * 3 * h * d;
+    Surface<half> qkvTensor(qkvSize, false);
+    devPtrQ = (void *)qkvTensor.devPtr; // q points to the top of qkv
+    devPtrK = (void *)(qkvTensor.devPtr + h * d); // k is at an offset of h * d
+    devPtrV = (void *)(qkvTensor.devPtr + 2 * h * d); // v is at an offset of 2 * h * d
+
+    // optionally setup S and bias
+    Surface<half> sTensor(b * h * s_q * s_kv, false);
+    devPtrS = (void *)sTensor.devPtr;
+
+    // setup of actual seqlen Q and seqlen K
+    checkCudaErr(cudaMalloc((void**)&(devActualSeqlenQ), (b) * sizeof(devActualSeqlenQ[0])));
+    hostActualSeqlenQ = (int*) calloc(b, sizeof(hostActualSeqlenQ[0]));
+
+    for (int i = 0; i < b; i++) {
+        hostActualSeqlenQ[i] = 128;
+    }
+
+    checkCudaErr(cudaMemcpy(devActualSeqlenQ, hostActualSeqlenQ, sizeof(hostActualSeqlenQ[0]) * b, cudaMemcpyHostToDevice));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    checkCudaErr(cudaMalloc((void**)&(devActualSeqlenK), (b) * sizeof(devActualSeqlenK[0])));
+    hostActualSeqlenK = (int*) calloc(b, sizeof(hostActualSeqlenK[0]));
+
+    for (int i = 0; i < b; i++) {
+        hostActualSeqlenK[i] = 128;
+    }
+
+    checkCudaErr(cudaMemcpy(devActualSeqlenK, hostActualSeqlenK, sizeof(hostActualSeqlenK[0]) * b, cudaMemcpyHostToDevice));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    int64_t oSize   = b * s_q * h * d;
+    Surface<half> oTensor(oSize, false);
+    devPtrO = (void *)oTensor.devPtr;
+
+    run_mha_fprop(b,
+                h,
+                s_q,
+                s_kv,
+                d,
+                seed,
+                layout,
+                scaling_factor,
+                dropout_probability,
+                bias_type,
+                is_causal_masking,
+                devPtrQ,
+                devPtrK,
+                devPtrV,
+                devPtrS,
+                devPtrO,
+                devPtrBias,
+                devActualSeqlenQ,
+                devActualSeqlenK,
+                CUDNN_DATA_HALF);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(oTensor.hostPtr, oTensor.devPtr, sizeof(oTensor.hostPtr[0]) * oSize, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    if (devActualSeqlenQ) cudaFree(devActualSeqlenQ);
+    if (hostActualSeqlenQ) free(hostActualSeqlenQ);
+
+    if (devActualSeqlenK) cudaFree(devActualSeqlenK);
+    if (hostActualSeqlenK) free(hostActualSeqlenK);
+
+    std::cout << "\n========================================================================================\n";
+}
+#endif
+
+#if (CUDNN_VERSION >= 8800)
+TEST_CASE("MHA Bprop sample", "[frontend][fusion][mhaBprop]") {
+    std::cout << "TEST_CASE :: MHA Bprop with backend API" << std::endl;
+    INFO("TEST_CASE ::  MHA Bprop with backend API");
+
+    int64_t b = 32;  // batch size
+    int64_t h = 16;  // head dim
+    int64_t s_q = 512; // q tensor is padded to this seq length
+    int64_t s_kv = 512; // k and v tensor is padded to this seq length
+    int64_t d = 64;  // hidden dim
+
+    MHA_Layout layout = MHA_Layout::QKV_INTERLEAVED; // layout of the tensors Q,K and V
+
+    float scaling_factor = 0.8f; // scale value before softmax
+    float dropout_probability = 0.2f; // probability of dropout
+
+    bool is_causal_masking = false; // specify if we need causal masking
+
+    printf("====PARAMETERS====\n");
+    printf("batch is %" PRId64 ", head dim is %" PRId64 ", q sequence length is %" PRId64 ", kv sequence length is %" PRId64 ", hidden dim is %" PRId64 "\n", b, h, s_q, s_kv, d);
+
+    void* devPtrQ = nullptr; // queries
+    void* devPtrK = nullptr; // keys
+    void* devPtrV = nullptr; // values
+
+    void* devPtrdQ = nullptr; // derivative of queries
+    void* devPtrdK = nullptr; // derivative of keys
+    void* devPtrdV = nullptr; // derivative of values
+
+    void* devPtrS = nullptr; // after softmax output from fprop kernel
+    void* devPtrdS = nullptr; // bprop kernel emits this tensor
+    void* devPtrdO = nullptr; // input to the bprop, derivative of output
+
+    int* devActualSeqlenQ = nullptr; // actual seqlen Q
+    int* devActualSeqlenK = nullptr; // actual seqlen K
+
+    int* hostActualSeqlenQ = nullptr;
+    int* hostActualSeqlenK = nullptr;
+
+    // the setup is for the qkv interleaved layout (qkv interleaved assumes s_q = s_kv)
+    int64_t qkvTensorDim[] = {b, s_q, 3, h, d};
+    CUDNN_FRONTEND_UNUSED(qkvTensorDim);
+
+    int64_t qkvSize = b * s_q * 3 * h * d;
+    Surface<half> qkvTensor(qkvSize, false);
+    devPtrQ = (void *)qkvTensor.devPtr; // q points to the top of qkv
+    devPtrK = (void *)(qkvTensor.devPtr + h * d); // k is at an offset of h * d
+    devPtrV = (void *)(qkvTensor.devPtr + 2 * h * d); // v is at an offset of 2 * h * d
+
+    int64_t dqkvSize = b * s_q * 3 * h * d;
+    Surface<half> dqkvTensor(dqkvSize, false);
+    devPtrdQ = (void *)dqkvTensor.devPtr; // dq points to the top of dqkv
+    devPtrdK = (void *)(dqkvTensor.devPtr + h * d); // dk is at an offset of h * d
+    devPtrdV = (void *)(dqkvTensor.devPtr + 2 * h * d); // dv is at an offset of 2 * h * d
+
+    // setup S (should be taken from fprop kernel)
+    Surface<half> sTensor(b * h * s_q * s_kv, false);
+    devPtrS = (void *)sTensor.devPtr;
+
+    // setup dS (output from bprop kernel)
+    Surface<half> dsTensor(b * h * s_q * s_kv, false);
+    devPtrdS = (void *)dsTensor.devPtr;
+
+    // setup of actual seqlen Q and seqlen K
+    checkCudaErr(cudaMalloc((void**)&(devActualSeqlenQ), (b) * sizeof(devActualSeqlenQ[0])));
+    hostActualSeqlenQ = (int*) calloc(b, sizeof(hostActualSeqlenQ[0]));
+
+    for (int i = 0; i < b; i++) {
+        hostActualSeqlenQ[i] = 128;
+    }
+
+    checkCudaErr(cudaMemcpy(devActualSeqlenQ, hostActualSeqlenQ, sizeof(hostActualSeqlenQ[0]) * b, cudaMemcpyHostToDevice));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    checkCudaErr(cudaMalloc((void**)&(devActualSeqlenK), (b) * sizeof(devActualSeqlenK[0])));
+    hostActualSeqlenK = (int*) calloc(b, sizeof(hostActualSeqlenK[0]));
+
+    for (int i = 0; i < b; i++) {
+        hostActualSeqlenK[i] = 128;
+    }
+
+    checkCudaErr(cudaMemcpy(devActualSeqlenK, hostActualSeqlenK, sizeof(hostActualSeqlenK[0]) * b, cudaMemcpyHostToDevice));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    int64_t doSize   = b * s_q * h * d;
+    Surface<half> doTensor(doSize, false);
+    devPtrdO = (void *)doTensor.devPtr;
+
+    run_mha_bprop(b,
+                h,
+                s_q,
+                s_kv,
+                d,
+                layout,
+                scaling_factor,
+                dropout_probability,
+                is_causal_masking,
+                devPtrQ,
+                devPtrK,
+                devPtrV,
+                devPtrS,
+                devPtrdQ,
+                devPtrdK,
+                devPtrdV,
+                devPtrdO,
+                devPtrdS,
+                devActualSeqlenQ,
+                devActualSeqlenK,
+                CUDNN_DATA_HALF);
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(dqkvTensor.hostPtr, dqkvTensor.devPtr, sizeof(dqkvTensor.hostPtr[0]) * dqkvSize, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    checkCudaErr(cudaDeviceSynchronize());
+    checkCudaErr(cudaMemcpy(dsTensor.hostPtr, dsTensor.devPtr, sizeof(dsTensor.hostPtr[0]) * b * h * s_q * s_kv, cudaMemcpyDeviceToHost));
+    checkCudaErr(cudaDeviceSynchronize());
+
+    if (devActualSeqlenQ) cudaFree(devActualSeqlenQ);
+    if (hostActualSeqlenQ) free(hostActualSeqlenQ);
+
+    if (devActualSeqlenK) cudaFree(devActualSeqlenK);
+    if (hostActualSeqlenK) free(hostActualSeqlenK);
+
+    std::cout << "\n========================================================================================\n";
+}
+#endif

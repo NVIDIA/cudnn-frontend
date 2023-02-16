@@ -417,6 +417,8 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
 #undef NV_CUDNN_RETURN_IF_ERROR
 #undef NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE
 
+using EngineHeuristicsBuilde    = EngineHeuristicsBuilder_v8;
+using EngineHeuristics          = EngineHeuristics_v8;
 }
 
 #if defined( _MSC_VER )
