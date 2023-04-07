@@ -131,6 +131,10 @@ class PointWiseDesc_v8 : public BackendDescriptor {
             case CUDNN_POINTWISE_BINARY_SELECT:
                 return 4;
 #endif
+#ifndef NO_DEFAULT_IN_SWITCH
+	    default:
+                return -1;
+#endif
         }
         return -1;
     }
