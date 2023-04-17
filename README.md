@@ -84,6 +84,9 @@ Errata filter gives the cuDNN team an opportunity to block certain faulty kernel
     operation           : ""   - Mandatory. Stringified version of the operation graph.
     engine              : ""   - Mandatory. Stringified version of the engine ID.
     knob                : ""   - Optional.  Stringified version of the knob. If specified only the engineConfig for the engine matching the knobs will be blocked. Else, all possible combination of knobs for the engine will be blocked.
+    input_shape         : []   - Optional. Array of input shape for kernel (ex. [64, 32, 128, 128]) to be filtered out. Use -1 if you don't want to filter that dimension. (ex. [-1, -1, 128, 128] to only filter HxW for NCHW format)
+    filter_shape        : []   - Optional. Array of kernel/filter shape for kernel (ex. [32, 32, 5, 5]) to be filtered out. Use -1 if you don't want to filter that dimension. (ex. [-1, -1, 5, 5] to only filter 5x5 filter sizes)
+    shape_format        : ""   - Mandatory if input_shape and/or kernel_shape is present. Optional otherwise. Shape format of tensors as a string. (Ex. "NCHW", "NHWC").
     cudnn_version_start : 0    - Optional. Denotes the cudnn version after which the engine started having issues.
     cudnn_version_end   : -1   - Optional. Denotes the cudnn_version when the issue was fixed. "-1" denotes its an ongoing issue.
     arch                : ""   - Optional. Architectures where this kernel might be faulty.

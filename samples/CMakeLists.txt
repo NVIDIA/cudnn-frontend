@@ -28,6 +28,8 @@ add_executable(
     fp8_sample.cpp 
     mha_sample.cpp
     fused_mha_sample.cpp
+    f16_flash_mha_sample.cpp
+    fp8_flash_mha_sample.cpp
 )
 
 if(DEFINED ENV{NO_DEFAULT_IN_SWITCH})

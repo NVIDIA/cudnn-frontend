@@ -408,6 +408,10 @@ static inline std::ostream& operator<<(std::ostream& os, const cudnnBackendTenso
         case cudnnBackendTensorReordering_t::CUDNN_TENSOR_REORDERING_NONE:
             os << "CUDNN_TENSOR_REORDERING_NONE";
             break;
+#ifndef NO_DEFAULT_IN_SWITCH
+        default:
+            os << "CUDNN_TENSOR_REORDERING_MODE_UNKNOWN";
+#endif
     }
     return os;
 } 
@@ -433,6 +437,10 @@ static inline std::ostream& operator<<(std::ostream& os, const cudnnResampleMode
         case cudnnResampleMode_t::NOT_SET:
             os << "NOT_SET";
             break;
+#ifndef NO_DEFAULT_IN_SWITCH
+        default:
+            os << "CUDNN_TENSOR_RESAMPLE_MODE_UNKNOWN";
+#endif
     }
     return os;
 } 
@@ -452,6 +460,10 @@ static inline std::ostream& operator<<(std::ostream& os, const cudnnPaddingMode_
         case cudnnPaddingMode_t::NOT_SET:
             os << "NOT_SET";
             break;
+#ifndef NO_DEFAULT_IN_SWITCH
+        default:
+            os << "CUDNN_TENSOR_PADDING_MODE_UNKNOWN";
+#endif
     }
     return os;
 } 
@@ -619,4 +631,3 @@ static inline cudnnStatus_t convert_to_cudnn_type(cudnn_frontend::cudnnBackendTe
 } // namespace detail
 
 }
-

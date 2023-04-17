@@ -44,15 +44,18 @@
 enum class MHA_Layout {
     NOT_INTERLEAVED = 0,
     QKV_INTERLEAVED = 1,
-    KV_INTERLEAVED = 2
+    KV_INTERLEAVED = 2,
+    SBH_INTERLEAVED = 3
 };
 
 enum class MHA_Matrix {
-    Q_Matrix = 0, // queries
-    K_Matrix = 1, // keys
-    V_Matrix = 2, // values
-    S_Matrix = 3, // output of GEMM1
-    O_Matrix = 4, // final output
+    Q_Matrix           = 0, // queries
+    K_Matrix           = 1, // keys
+    K_Matrix_Transpose = 2, // keys tranposed
+    V_Matrix           = 3, // values
+    V_Matrix_Transpose = 4, // values transposed
+    S_Matrix           = 5, // output of GEMM1
+    O_Matrix           = 6, // final output
 };
 
 enum class MHA_Bias_Type {
@@ -82,6 +85,7 @@ void initImage(float* image, int64_t imageSize);
 void initImage(half1* image, int64_t imageSize);
 void testinitImage(half1* image, int64_t imageSize, int test);
 void initImage(int8_t* image, int64_t imageSize);
+void initImage(uint8_t* image, int64_t imageSize);
 void initImage(int32_t* image, int64_t imageSize);
 void initImage(int64_t* image, int64_t imageSize);
 void initImage(bool* image, int64_t imageSize);

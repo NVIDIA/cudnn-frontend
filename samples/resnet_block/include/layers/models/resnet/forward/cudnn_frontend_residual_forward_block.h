@@ -101,7 +101,7 @@ class ResidualForwardBlock : public IBlock {
                     
                     void *zptr = params_.skip_residual_convolution(ResidualBlockParams::ForwardLocation::RESIDUAL) ?
                                     devPtrStore->XDevPtrs[ResidualBlockParams::ForwardLocation::ZERO] : 
-                                    intermediate_tensor_workspace_pointer;
+                                    devPtrStore->BNYDevPtrs[ResidualBlockParams::ForwardLocation::RESIDUAL];
 
                     void* bn_data_ptrs[] = {
                         devPtrStore->YDevPtrs[i],
@@ -156,7 +156,7 @@ class ResidualForwardBlock : public IBlock {
                     void* bn_data_ptrs[] = {
                         devPtrStore->YDevPtrs[i],
                         devPtrStore->BNXDescaleDevPtrs[i],
-                        intermediate_tensor_workspace_pointer,
+                        devPtrStore->BNYDevPtrs[i],
                         devPtrStore->BNYScaleDevPtrs[i],
                         devPtrStore->BNYAMaxDevPtrs[i],
                         devPtrStore->scaleDevPtrs[i],

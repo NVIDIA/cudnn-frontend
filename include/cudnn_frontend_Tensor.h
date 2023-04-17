@@ -169,6 +169,7 @@ class Tensor_v8 : public BackendDescriptor {
     bool isVirtual          = false;  //! Whether it is an intermediate tensor of an op graph
     bool isByValue          = false;  //! Whether the tensor is in host memory that needs to be passed to the kernel by value
     cudnn_frontend::cudnnBackendTensorReordering_t reorder_type = cudnn_frontend::cudnnBackendTensorReordering_t::CUDNN_TENSOR_REORDERING_NONE; //! Type of reordering in the tensor
+    std::shared_ptr<Tensor_v8> raggedOffset; //! Ragged offsets for ragged tensors
 };
 
 ///
@@ -251,6 +252,12 @@ class TensorBuilder_v8 {
     auto
     setStrides(int64_t ndim, int64_t const *strides) -> TensorBuilder_v8 & {
         return setStride(ndim, strides);
+    }
+
+    auto
+    setRaggedOffset(std::shared_ptr<Tensor_v8> &raggedOffset) -> TensorBuilder_v8 & {
+        m_tensor.raggedOffset = raggedOffset;
+        return *this;
     }
 
     // Clone parameters of another tensor. Make sure to still set the UID since UID of two tensors shouldn't be the same.
@@ -425,6 +432,26 @@ class TensorBuilder_v8 {
                 return std::move(m_tensor);
             }
         }
+
+        // Set ragged offset descriptor
+#if (CUDNN_VERSION >= 8900)
+        if (m_tensor.raggedOffset != nullptr) {
+            std::vector<cudnnBackendDescriptor_t> backendRaggedOffset;
+            backendRaggedOffset.push_back(m_tensor.raggedOffset.get()->pointer->get_backend_descriptor());
+            status = cudnnBackendSetAttribute(m_tensor.pointer->get_backend_descriptor(),
+                                              CUDNN_ATTR_TENSOR_RAGGED_OFFSET_DESC,
+                                              CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                              static_cast<int64_t>(backendRaggedOffset.size()),
+                                              backendRaggedOffset.data());
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_tensor,
+                    status,
+                    "CUDNN_BACKEND_TENSOR_DESCRIPTOR: SetAttribute CUDNN_ATTR_TENSOR_RAGGED_OFFSET_DESC Failed");
+                return std::move(m_tensor);
+            }
+        }
+#endif
 
         // Set the reorder_type
 #if (CUDNN_VERSION >= 8300)

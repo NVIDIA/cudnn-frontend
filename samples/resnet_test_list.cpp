@@ -291,7 +291,7 @@ TEST_CASE("Residual block with residual conv", "[Resnet][Residual]") {
     Surface<fp8_e4m3> BNY0(N * K[0] * H * W, false);
     Surface<fp8_e4m3> BNY1(N * K[1] * H * W, false);
     Surface<fp8_e4m3> BNY2(N * K[2] * H * W, false);
-    // BNY3 has been moved to workspace
+    Surface<fp8_e4m3> BNY3(N * K[3] * H * W, false);
 
     Surface<float> BNYAmax0(1, false);
     Surface<float> BNYAmax1(1, false);
@@ -374,6 +374,7 @@ TEST_CASE("Residual block with residual conv", "[Resnet][Residual]") {
                                 {cudnn_frontend::ResidualBlockParams::ForwardLocation::ZERO, BNY0.devPtr}
                                 , {cudnn_frontend::ResidualBlockParams::ForwardLocation::ONE, BNY1.devPtr}
                                 , {cudnn_frontend::ResidualBlockParams::ForwardLocation::TWO, BNY2.devPtr}
+                                , {cudnn_frontend::ResidualBlockParams::ForwardLocation::RESIDUAL, BNY3.devPtr}
                             })
                 .setBNYScaleDevPtrs({
                                 {cudnn_frontend::ResidualBlockParams::ForwardLocation::ZERO, BNYScale0.devPtr}

@@ -68,6 +68,8 @@ class MatMulDesc_v8 : public BackendDescriptor {
     operator=(MatMulDesc_v8 const &) = delete;
 
     cudnnDataType_t compute_type = CUDNN_DATA_FLOAT;
+    bool isPadded = false;
+    double paddingValue = 0.0;
 };
 
 ////
@@ -91,6 +93,14 @@ class MatMulDescBuilder_v8 {
     auto
     setMathPrecision(cudnnDataType_t data_type_) -> MatMulDescBuilder_v8 & {
         return setComputeType(data_type_);
+    }
+
+    //! Set padding value for matmul descriptor
+    auto
+    setPaddingValue(double paddingValue) -> MatMulDescBuilder_v8 & {
+        m_matMulDesc.isPadded = true;
+        m_matMulDesc.paddingValue = paddingValue;
+        return *this;
     }
 
     //! constructs the MatMulDesc_v8 by calling the cudnn API
@@ -118,6 +128,24 @@ class MatMulDescBuilder_v8 {
             return std::move(m_matMulDesc);
         }
 
+        #if (CUDNN_VERSION >= 8900)
+        // Setting padding value if matmul desc is padded
+        if (m_matMulDesc.isPadded) {
+            status = cudnnBackendSetAttribute(m_matMulDesc.pointer->get_backend_descriptor(),
+                                          CUDNN_ATTR_MATMUL_PADDING_VALUE,
+                                          CUDNN_TYPE_DOUBLE,
+                                          1,
+                                          &m_matMulDesc.paddingValue);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_matMulDesc,
+                    status,
+                    "CUDNN_BACKEND_MATMUL_DESCRIPTOR: SetAttribute CUDNN_ATTR_MATMUL_PADDING_VALUE Failed");
+                return std::move(m_matMulDesc);
+            }
+        }
+        #endif
+        
         // Finalizing the descriptor
         status = cudnnBackendFinalize(m_matMulDesc.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
