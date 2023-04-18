@@ -49,13 +49,13 @@ allowAllConfig(cudnnBackendDescriptor_t engine_config) {
     return false;
 }
 
-static cudnn_frontend::Tensor tensor_create(cudnnDataType_t type, int64_t id, int64_t const * dim, 
+static cudnn_frontend::Tensor tensor_create(cudnnDataType_t type, int64_t id, int64_t const * dim,
                                 int64_t const * stride, bool is_virtual, bool is_value) {
     int nbDims = 4;
     auto tensor_created = cudnn_frontend::TensorBuilder()
             .setDim(nbDims, dim)
             .setStride(nbDims, stride)
-            .setId(id) 
+            .setId(id)
             .setAlignment(16) // 16B alignment is needed to run a tensor core engine
             .setDataType(type)
             .setVirtual(is_virtual)
@@ -70,12 +70,12 @@ static cudnn_frontend::PointWiseDesc pw_desc_create(cudnnDataType_t type, cudnnP
             .setMode(mode)
             .setComputeType(type)
             .build();
-    
+
     std::cout << pw_desc_created.describe() << std::endl;
     return pw_desc_created;
-} 
+}
 
-static cudnn_frontend::Operation unary_pw_op_create(cudnn_frontend::Tensor const &xDesc, cudnn_frontend::Tensor const &yDesc, 
+static cudnn_frontend::Operation unary_pw_op_create(cudnn_frontend::Tensor const &xDesc, cudnn_frontend::Tensor const &yDesc,
                                                     cudnn_frontend::PointWiseDesc const &pwDesc) {
     auto pw_op_created = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)
                         .setxDesc(xDesc)
@@ -86,7 +86,7 @@ static cudnn_frontend::Operation unary_pw_op_create(cudnn_frontend::Tensor const
     return pw_op_created;
 }
 
-static cudnn_frontend::Operation binary_pw_op_create(cudnn_frontend::Tensor const &xDesc, cudnn_frontend::Tensor const &bDesc, 
+static cudnn_frontend::Operation binary_pw_op_create(cudnn_frontend::Tensor const &xDesc, cudnn_frontend::Tensor const &bDesc,
                                                     cudnn_frontend::Tensor const &yDesc, cudnn_frontend::PointWiseDesc const &pwDesc) {
     auto pw_op_created = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)
                         .setxDesc(xDesc)
@@ -98,7 +98,7 @@ static cudnn_frontend::Operation binary_pw_op_create(cudnn_frontend::Tensor cons
     return pw_op_created;
 }
 
-static cudnn_frontend::Operation ternary_pw_op_create(cudnn_frontend::Tensor const &xDesc, cudnn_frontend::Tensor const &bDesc, cudnn_frontend::Tensor const &tDesc, 
+static cudnn_frontend::Operation ternary_pw_op_create(cudnn_frontend::Tensor const &xDesc, cudnn_frontend::Tensor const &bDesc, cudnn_frontend::Tensor const &tDesc,
                                             cudnn_frontend::Tensor const &yDesc, cudnn_frontend::PointWiseDesc const &pwDesc) {
     auto pw_op_created = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)
                         .setxDesc(xDesc)
@@ -123,7 +123,7 @@ run_b2b_batch_gemm(int64_t* q_dim,
                     void* devPtrV,
                     void* devPtrO,
                     cudnnDataType_t tensorType,
-                    int32_t nbDims,                         
+                    int32_t nbDims,
                     int64_t* q_stride,
                     int64_t* k_stride,
                     int64_t* s_stride,
@@ -144,7 +144,7 @@ run_b2b_batch_gemm(int64_t* q_dim,
         auto vTensor = tensor_create(tensorType, 'v', v_dim, v_stride, false, false);
 
         // second GEMM output
-        auto oTensor = tensor_create(tensorType, 'o', o_dim, o_stride, false, false);  
+        auto oTensor = tensor_create(tensorType, 'o', o_dim, o_stride, false, false);
 
         // Define the matmul 1 desc
         auto matmul_1_Desc = cudnn_frontend::MatMulDescBuilder().setComputeType(CUDNN_DATA_FLOAT).build();
@@ -187,7 +187,7 @@ run_b2b_batch_gemm(int64_t* q_dim,
                     nullptr,
                     CUDNN_STATUS_NOT_SUPPORTED,
                     "run_b2b_batch_gemm: No config returned by the heuristics");
-        }   
+        }
 
         auto plan = cudnn_frontend::ExecutionPlanBuilder().setHandle(handle_).setEngineConfig(filtered_configs[0], opGraph.getTag()).build();
 
@@ -220,10 +220,10 @@ run_b2b_batch_gemm(int64_t* q_dim,
     } catch (cudnn_frontend::cudnnException& e) {
         struct cudaDeviceProp prop;
         checkCudaErrors(cudaGetDeviceProperties( &prop, 0 ));
-        
+
         // this example is only for GA100 cards and GH100 cards
         if (!((prop.major == 8 && prop.minor == 0) || (prop.major == 9 && prop.minor == 0 && CUDNN_VERSION >= 8800)) && (e.getCudnnStatus() == CUDNN_STATUS_ARCH_MISMATCH || e.getCudnnStatus() == CUDNN_STATUS_NOT_SUPPORTED)) {
-            std::cout << "Example is only supported for GA100 (cuDNN >= 8700) and GH100 (cuDNN >= 8800) GPUs" << std::endl; 
+            std::cout << "Example is only supported for GA100 (cuDNN >= 8700) and GH100 (cuDNN >= 8800) GPUs" << std::endl;
         }  else {
             std::cout << "[ERROR] Exception " << e.what() << std::endl;
             CHECK(false);
@@ -231,13 +231,13 @@ run_b2b_batch_gemm(int64_t* q_dim,
     }
 }
 
-static void 
-createScale(int64_t b, 
-            int64_t h, 
+static void
+createScale(int64_t b,
+            int64_t h,
             int64_t s_q,
             int64_t s_kv,
             int64_t d,
-            MHA_Layout layout, 
+            MHA_Layout layout,
             cudnnDataType_t tensorType,
             std::vector<cudnn_frontend::Operation>& ops) {
 
@@ -247,7 +247,7 @@ createScale(int64_t b,
 
     int64_t k_dim [4] =  {b, h, d, s_kv};
     int64_t k_stride [4];
-    generateMHAStrides(b, h, s_q, s_kv, d, k_stride, layout, MHA_Matrix::K_Matrix);
+    generateMHAStrides(b, h, s_q, s_kv, d, k_stride, layout, MHA_Matrix::K_Matrix_Transpose);
 
     auto scaleTensor = tensor_create(tensorType, S_CONST_ID, scale_dim, scale_stride, false, true); // is by value
     auto kTensor = tensor_create(tensorType, K_ID, k_dim, k_stride, false, false);
@@ -263,8 +263,8 @@ createScale(int64_t b,
 }
 
 static cudnn_frontend::Tensor
-createBMM1(int64_t b, 
-           int64_t h, 
+createBMM1(int64_t b,
+           int64_t h,
            int64_t s_q,
            int64_t s_kv,
            int64_t d,
@@ -278,7 +278,7 @@ createBMM1(int64_t b,
 
     int64_t k_dim [4] =  {b, h, d, s_kv};
     int64_t k_stride [4];
-    generateMHAStrides(b, h, s_q, s_kv, d, k_stride, layout, MHA_Matrix::K_Matrix);
+    generateMHAStrides(b, h, s_q, s_kv, d, k_stride, layout, MHA_Matrix::K_Matrix_Transpose);
 
     int64_t p_dim [4] = {b, h, s_q, s_kv};
     int64_t p_stride [4];
@@ -291,7 +291,7 @@ createBMM1(int64_t b,
     auto afterScaleKTensor = tensor_create(tensorType, VIRTUAL_ID, k_dim, k_stride, true, false); // is virtual
     // first GEMM output
     auto pTensor = tensor_create(CUDNN_DATA_FLOAT, VIRTUAL_ID + 1, p_dim, p_stride, true, false); // is virtual
-    
+
     auto seqlenQTensor = tensor_create(CUDNN_DATA_INT32, Q_SEQLEN_ID, seqlen_dim, seqlen_stride, false, false);
     auto seqlenKTensor = tensor_create(CUDNN_DATA_INT32, K_SEQLEN_ID, seqlen_dim, seqlen_stride, false, false);
 
@@ -317,8 +317,8 @@ createBMM1(int64_t b,
 }
 
 static cudnn_frontend::Tensor
-createBias(int64_t b, 
-           int64_t h, 
+createBias(int64_t b,
+           int64_t h,
            int64_t s_q,
            int64_t s_kv,
            int64_t d,
@@ -353,8 +353,8 @@ createBias(int64_t b,
 }
 
 static cudnn_frontend::Tensor
-createMask(int64_t b, 
-           int64_t h, 
+createMask(int64_t b,
+           int64_t h,
            int64_t s_q,
            int64_t s_kv,
            int64_t d,
@@ -381,7 +381,7 @@ createMask(int64_t b,
 
     int64_t maskVal_dim [4] =  {1, 1, 1, 1};
     int64_t maskVal_stride [4] = {1, 1, 1, 1};
-    
+
     // mask value to put in the masked pixels
     auto maskValTensor = tensor_create(CUDNN_DATA_FLOAT, MASK_VAL_ID, maskVal_dim, maskVal_stride, false, true); // is by value
 
@@ -401,7 +401,7 @@ createMask(int64_t b,
     auto rowGreaterColTensor = tensor_create(CUDNN_DATA_BOOLEAN, VIRTUAL_ID + 105, afterBMM1_dim, afterBMM1_stride, true, false); // is virtual
     // create causal mask (padding && row >= col)
     auto causalMaskTensor = tensor_create(CUDNN_DATA_BOOLEAN, VIRTUAL_ID + 106, afterBMM1_dim, afterBMM1_stride, true, false); // is virtual
-    
+
     // output after masking
     int64_t maskOutputTensor_id = VIRTUAL_ID + 107;
     int64_t maskOutputTensor_virtual = true;
@@ -422,7 +422,7 @@ createMask(int64_t b,
             .setByValue(false)
             .setDataType(maskOutputTensor_dataType)
             .setVirtual(maskOutputTensor_virtual)
-            .setId(maskOutputTensor_id) 
+            .setId(maskOutputTensor_id)
             .setReorderType(maskOutputTensor_reorderType)
             .build();
 
@@ -502,8 +502,8 @@ createMask(int64_t b,
 }
 
 static cudnn_frontend::Tensor
-createSoftmaxForward(int64_t b, 
-                     int64_t h, 
+createSoftmaxForward(int64_t b,
+                     int64_t h,
                      int64_t s_q,
                      int64_t s_kv,
                      int64_t d,
@@ -538,7 +538,7 @@ createSoftmaxForward(int64_t b,
     auto afterDivisionTensor = cudnn_frontend::TensorBuilder()
             .setDim(4, afterBMM1_dim)
             .setStride(4, afterBMM1_stride)
-            .setId(softmaxOutputName) 
+            .setId(softmaxOutputName)
             .setAlignment(16) // 16B alignment is needed to run a tensor core engine
             .setDataType(softmaxOutputType)
             .setVirtual(softmax_output_virtual)
@@ -605,8 +605,8 @@ createSoftmaxForward(int64_t b,
 }
 
 static cudnn_frontend::Tensor
-createDropout(int64_t b, 
-              int64_t h, 
+createDropout(int64_t b,
+              int64_t h,
               int64_t s_q,
               int64_t s_kv,
               int64_t d,
@@ -615,9 +615,9 @@ createDropout(int64_t b,
               cudnnDataType_t tensorType,
               std::vector<cudnn_frontend::Operation>& ops,
               cudnn_frontend::Tensor& prevBlockOutputTensor) {
-    
+
     CUDNN_FRONTEND_UNUSED(d);
-    
+
     cudnn_frontend::throw_if(ops.size() == 0, "Dropout DAG constructed incorrectly as the first one", CUDNN_STATUS_BAD_PARAM);
 
     int64_t afterBMM1_dim [4] = {b, h, s_q, s_kv};
@@ -632,7 +632,7 @@ createDropout(int64_t b,
     auto afterDropoutTensor = cudnn_frontend::TensorBuilder()
             .setDim(4, afterBMM1_dim)
             .setStride(4, afterBMM1_stride)
-            .setId(S_ID) 
+            .setId(S_ID)
             .setAlignment(16) // 16B alignment is needed to run a tensor core engine
             .setDataType(tensorType)
             .setVirtual(false)
@@ -681,8 +681,8 @@ createDropout(int64_t b,
 }
 
 static void
-createBMM2(int64_t b, 
-           int64_t h, 
+createBMM2(int64_t b,
+           int64_t h,
            int64_t s_q,
            int64_t s_kv,
            int64_t d,
@@ -703,7 +703,7 @@ createBMM2(int64_t b,
     int64_t o_dim [4] =  {b, h, s_q, d};
     int64_t o_stride [4];
     generateMHAStrides(b, h, s_q, s_kv, d, o_stride, layout, MHA_Matrix::O_Matrix);
-    
+
     auto seqlenQTensor = tensor_create(CUDNN_DATA_INT32, Q_SEQLEN_ID, seqlen_dim, seqlen_stride, false, false);
     auto seqlenKTensor = tensor_create(CUDNN_DATA_INT32, K_SEQLEN_ID, seqlen_dim, seqlen_stride, false, false);
     auto vTensor = tensor_create(tensorType, V_ID, v_dim, v_stride, false, false);
@@ -730,8 +730,8 @@ createBMM2(int64_t b,
 }
 
 static cudnn_frontend::Tensor
-createSoftmaxBackward(int64_t b, 
-                     int64_t h, 
+createSoftmaxBackward(int64_t b,
+                     int64_t h,
                      int64_t s_q,
                      int64_t s_kv,
                      int64_t d,
@@ -809,9 +809,66 @@ createSoftmaxBackward(int64_t b,
     return dxTensor;
 }
 
-void 
-run_mha_fprop(int64_t b, 
-              int64_t h, 
+
+
+cudnnStatus_t
+execute_cached_plan(cudnnHandle_t handle,
+                    cudnn_frontend::ExecutionPlanCache &plan_cache,
+                    cudnn_frontend::OperationGraph &opGraph,
+                    std::set<std::pair<uint64_t, void*>> &data_ptrs) {
+
+    cudnnBackendDescriptor_t raw_plan;
+    int64_t workspace_size = 0;
+
+    cudnn_frontend::ExecutionPlan const *cached_plan;
+    if (plan_cache.get_plan_from_cache(opGraph, cached_plan)) {
+        std::cout << "Cached execution plan found." << cached_plan->getTag() << std::endl;
+        workspace_size = cached_plan->getWorkspaceSize();
+        raw_plan = cached_plan->get_raw_desc();
+    } else {
+        cudnn_frontend::EngineConfigList filtered_configs;
+        auto statuses = cudnn_frontend::get_heuristics_list<1>({"heuristics_instant"}, opGraph, ::allowAllConfig, filtered_configs, true);
+
+        if (filtered_configs.size() == 0) {
+            cudnn_frontend::set_error_and_throw_exception(
+                    nullptr,
+                    CUDNN_STATUS_NOT_SUPPORTED,
+                    "run_mha_fprop: No config returned by the heuristics");
+        }
+
+        auto plan_ = cudnn_frontend::ExecutionPlanBuilder().setHandle(handle).setEngineConfig(filtered_configs[0], opGraph.getTag()).build();
+        plan_cache.add_plan_to_cache(opGraph, plan_);
+        workspace_size = plan_.getWorkspaceSize();
+        raw_plan = plan_.get_raw_desc();
+    }
+
+    void* workspace_ptr = nullptr;
+    if (workspace_size > 0) {
+        checkCudaErr(cudaMalloc(&workspace_ptr, workspace_size));
+    }
+
+    auto variantPack  = cudnn_frontend::VariantPackBuilder()
+                            .setWorkspacePointer(workspace_ptr)
+                            .setDataPointers(data_ptrs)
+                            .build();
+
+    std::cout << "variantPack " << variantPack.describe() << std::endl;
+
+    cudnnStatus_t status = cudnnBackendExecute(handle, raw_plan, variantPack.get_raw_desc());    
+
+    if (workspace_size > 0) {
+        checkCudaErr(cudaFree(workspace_ptr));
+    }
+
+
+    cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
+
+    return status;
+}
+
+void
+run_mha_fprop(int64_t b,
+              int64_t h,
               int64_t s_q,
               int64_t s_kv,
               int64_t d,
@@ -821,16 +878,16 @@ run_mha_fprop(int64_t b,
               double dropout_probability,
               MHA_Bias_Type bias_type,
               bool is_causal_masking,
-              void* devPtrQ, 
-              void* devPtrK,   
-              void* devPtrV,   
+              void* devPtrQ,
+              void* devPtrK,
+              void* devPtrV,
               void* devPtrS,
               void* devPtrO,
               void* devPtrBias,
               void* devActualSeqlenQ,
               void* devActualSeqlenK,
               cudnnDataType_t tensorType) {
-                
+
     cudnnHandle_t handle_;
     try {
         // Create cudnn handle
@@ -879,28 +936,9 @@ run_mha_fprop(int64_t b,
                            .setOperationGraph(all_ops.size(), all_ops.data())
                            .build();
 
-
-        cudnn_frontend::EngineConfigList filtered_configs;
-        auto statuses = cudnn_frontend::get_heuristics_list<1>({"heuristics_instant"}, opGraph, ::allowAllConfig, filtered_configs, true);
-
-        if (filtered_configs.size() == 0) {
-            cudnn_frontend::set_error_and_throw_exception(
-                    nullptr,
-                    CUDNN_STATUS_NOT_SUPPORTED,
-                    "run_mha_fprop: No config returned by the heuristics");
-        }   
-
-        auto plan = cudnn_frontend::ExecutionPlanBuilder().setHandle(handle_).setEngineConfig(filtered_configs[0], opGraph.getTag()).build();
-
-        std::cout << "Plan tag: " << plan.getTag() << std::endl;
-
-        auto workspace_size = plan.getWorkspaceSize();
-        std::cout << plan.describe() << " requires workspace " << workspace_size << std::endl;
-
-        void* workspace_ptr = nullptr;
-        if (workspace_size > 0) {
-            checkCudaErr(cudaMalloc(&workspace_ptr, workspace_size));
-        }
+        // {b, h, s_q, s_kv, d, seed, layout(enum class, should be int), bias_type(enum class, should be int), is_causal_masking(bool), tensorType(cudnnDataType_t)}
+        opGraph.setFeatureVector({b, h, s_q, s_kv, d, seed, static_cast<int64_t>(layout),
+                                 static_cast<int64_t>(bias_type), static_cast<int64_t>(is_causal_masking), static_cast<int64_t>(tensorType)});
 
         // add all the data pointers to be used in the variant pack
         data_ptrs.insert(std::pair<uint64_t, void*>(Q_ID, devPtrQ));
@@ -924,27 +962,21 @@ run_mha_fprop(int64_t b,
             data_ptrs.insert(std::pair<uint64_t, void*>(D_CONST_ID, &scale_dropout));
         }
 
-        auto variantPack  = cudnn_frontend::VariantPackBuilder()
-                               .setWorkspacePointer(workspace_ptr)
-                               .setDataPointers(data_ptrs)
-                               .build();
-        std::cout << "variantPack " << variantPack.describe() << std::endl;
-        cudnnStatus_t status = cudnnBackendExecute(handle_, plan.get_raw_desc(), variantPack.get_raw_desc());
-        if (workspace_size > 0) {
-            checkCudaErr(cudaFree(workspace_ptr));
-        }
+        cudnn_frontend::ExecutionPlanCache plan_cache("mha_fprop_cache");
+
+        execute_cached_plan(handle_, plan_cache, opGraph, data_ptrs);
+        
+        execute_cached_plan(handle_, plan_cache, opGraph, data_ptrs);
 
         checkCudnnErr(cudnnDestroy(handle_));
-
-        cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnn_frontend::cudnnException& e) {
         struct cudaDeviceProp prop;
         checkCudaErrors(cudaGetDeviceProperties( &prop, 0 ));
-        
+
         // this example is only for GA100 cards (cudnn Version >= 8700) and GH100 cards (cudnn Version >= 8800)
         if (!((prop.major == 8 && prop.minor == 0) || (prop.major == 9 && prop.minor == 0 && CUDNN_VERSION >= 8800)) && (e.getCudnnStatus() == CUDNN_STATUS_ARCH_MISMATCH || e.getCudnnStatus() == CUDNN_STATUS_NOT_SUPPORTED)) {
-            std::cout << "Example is only supported for GA100 (cuDNN >= 8700) and GH100 (cuDNN >= 8800) GPUs" << std::endl; 
+            std::cout << "Example is only supported for GA100 (cuDNN >= 8700) and GH100 (cuDNN >= 8800) GPUs" << std::endl;
         }  else {
             std::cout << "[ERROR] Exception " << e.what() << std::endl;
             CHECK(false);
@@ -952,9 +984,9 @@ run_mha_fprop(int64_t b,
     }
 }
 
-void 
-run_mha_bprop(int64_t b, 
-              int64_t h, 
+void
+run_mha_bprop(int64_t b,
+              int64_t h,
               int64_t s_q,
               int64_t s_kv,
               int64_t d,
@@ -962,19 +994,19 @@ run_mha_bprop(int64_t b,
               float scaling_factor,
               float dropout_probability,
               bool is_causal_masking,
-              void* devPtrQ, 
-              void* devPtrK,   
-              void* devPtrV,   
+              void* devPtrQ,
+              void* devPtrK,
+              void* devPtrV,
               void* devPtrS,
-              void* devPtrdQ, 
-              void* devPtrdK,   
-              void* devPtrdV,   
+              void* devPtrdQ,
+              void* devPtrdK,
+              void* devPtrdV,
               void* devPtrdO,
               void* devPtrdS,
               void* devActualSeqlenQ,
               void* devActualSeqlenK,
               cudnnDataType_t tensorType) {
-                
+
     cudnnHandle_t handle_;
     try {
         // Create cudnn handle
@@ -991,11 +1023,11 @@ run_mha_bprop(int64_t b,
 
         int64_t k_dim [4] =  {b, h, s_kv, d};
         int64_t k_stride [4];
-        generateMHAStrides(b, h, s_q, s_kv, d, k_stride, layout, MHA_Matrix::V_Matrix); // type is correct as K is not transposed
+        generateMHAStrides(b, h, s_q, s_kv, d, k_stride, layout, MHA_Matrix::K_Matrix); // type is correct as K is not transposed
 
         int64_t v_dim [4] =  {b, h, d, s_kv};
         int64_t v_stride [4];
-        generateMHAStrides(b, h, s_q, s_kv, d, v_stride, layout, MHA_Matrix::K_Matrix); // type is correct as V is transposed
+        generateMHAStrides(b, h, s_q, s_kv, d, v_stride, layout, MHA_Matrix::V_Matrix_Transpose); // type is correct as V is transposed
 
         int64_t p_dim [4] = {b, h, s_q, s_kv};
         int64_t p_stride [4];
@@ -1027,12 +1059,12 @@ run_mha_bprop(int64_t b,
 
         // gradient of the output
         auto doTensor = tensor_create(tensorType, dO_ID, o_dim, o_stride, false, false);
-         
+
         // activation from fprop
         auto pTensor = cudnn_frontend::TensorBuilder()
             .setDim(4, p_dim)
             .setStride(4, p_stride)
-            .setId(S_ID) 
+            .setId(S_ID)
             .setAlignment(16) // 16B alignment is needed to run a tensor core engine
             .setDataType(tensorType)
             .setVirtual(false)
@@ -1056,7 +1088,7 @@ run_mha_bprop(int64_t b,
                                 .build();
 
         std::cout << reshape_op.describe() << std::endl;
-        ops.push_back(std::move(reshape_op));  
+        ops.push_back(std::move(reshape_op));
 
         // scale dropout
         auto dropoutScaleTensor = tensor_create(CUDNN_DATA_FLOAT, D_CONST_ID, scale_dim, scale_stride, false, true); // is by value
@@ -1091,7 +1123,7 @@ run_mha_bprop(int64_t b,
         ops.push_back(std::move(matmul_op0));
 
         // matmul to calculate dpTensor
-        auto dpTensor = tensor_create(CUDNN_DATA_FLOAT, VIRTUAL_ID + 303, p_dim, p_stride, true, false); 
+        auto dpTensor = tensor_create(CUDNN_DATA_FLOAT, VIRTUAL_ID + 303, p_dim, p_stride, true, false);
 
         auto matmul_1_Desc = cudnn_frontend::MatMulDescBuilder().setComputeType(CUDNN_DATA_FLOAT).build();
         std::cout << matmul_1_Desc.describe() << std::endl;
@@ -1138,7 +1170,7 @@ run_mha_bprop(int64_t b,
         auto selection_0_op = ternary_pw_op_create(dpAfterScaleTensor, zeroTensor, dropoutMaskTensor, dpAfterDropoutTensor, selection_0_desc);
         ops.push_back(std::move(selection_0_op));
 
-        // softmax backward 
+        // softmax backward
         auto dsTensor = createSoftmaxBackward(b, h, s_q, s_kv, d, layout, tensorType, ops, pAbsTensor, dpAfterDropoutTensor);
 
         // mask
@@ -1159,7 +1191,7 @@ run_mha_bprop(int64_t b,
 
         std::cout << matmul_op2.describe() << std::endl;
 
-        ops.push_back(std::move(matmul_op2)); 
+        ops.push_back(std::move(matmul_op2));
 
         // reshape for transpose of ds
         auto dsAfterMaskReshapeTensor = tensor_create(tensorType, VIRTUAL_ID + 308, p_transpose_dim, p_transpose_stride, true, false);
@@ -1170,7 +1202,7 @@ run_mha_bprop(int64_t b,
                                 .build();
 
         std::cout << reshape_2_op.describe() << std::endl;
-        ops.push_back(std::move(reshape_2_op));  
+        ops.push_back(std::move(reshape_2_op));
 
         // matmul to calculate dkTensor
         auto matmul_3_Desc = cudnn_frontend::MatMulDescBuilder().setComputeType(CUDNN_DATA_FLOAT).build();
@@ -1187,7 +1219,7 @@ run_mha_bprop(int64_t b,
 
         std::cout << matmul_op3.describe() << std::endl;
 
-        ops.push_back(std::move(matmul_op3));  
+        ops.push_back(std::move(matmul_op3));
 
         /////////////////////////////////////////////////////////////////
 
@@ -1203,28 +1235,9 @@ run_mha_bprop(int64_t b,
                            .setOperationGraph(all_ops.size(), all_ops.data())
                            .build();
 
-
-        cudnn_frontend::EngineConfigList filtered_configs;
-        auto statuses = cudnn_frontend::get_heuristics_list<1>({"heuristics_instant"}, opGraph, ::allowAllConfig, filtered_configs, true);
-
-        if (filtered_configs.size() == 0) {
-            cudnn_frontend::set_error_and_throw_exception(
-                    nullptr,
-                    CUDNN_STATUS_NOT_SUPPORTED,
-                    "run_mha_bprop: No config returned by the heuristics");
-        }   
-
-        auto plan = cudnn_frontend::ExecutionPlanBuilder().setHandle(handle_).setEngineConfig(filtered_configs[0], opGraph.getTag()).build();
-
-        std::cout << "Plan tag: " << plan.getTag() << std::endl;
-
-        auto workspace_size = plan.getWorkspaceSize();
-        std::cout << plan.describe() << " requires workspace " << workspace_size << std::endl;
-
-        void* workspace_ptr = nullptr;
-        if (workspace_size > 0) {
-            checkCudaErr(cudaMalloc(&workspace_ptr, workspace_size));
-        }
+        // {b, h, s_q, s_kv, d, seed, layout(enum class, should be int), bias_type(enum class, should be int), is_causal_masking(bool), tensorType(cudnnDataType_t)}
+        opGraph.setFeatureVector({b, h, s_q, s_kv, d, static_cast<int64_t>(0), static_cast<int64_t>(layout),
+                                 static_cast<int64_t>(0), static_cast<int64_t>(is_causal_masking), static_cast<int64_t>(tensorType)});
 
         // add all the data pointers to be used in the variant pack
         data_ptrs.insert(std::pair<uint64_t, void*>(dqTensor.getId(), devPtrdQ));
@@ -1247,27 +1260,21 @@ run_mha_bprop(int64_t b,
         data_ptrs.insert(std::pair<uint64_t, void*>(S_CONST_ID, &scaling_factor));
         data_ptrs.insert(std::pair<uint64_t, void*>(zeroTensor.getId(), &zeroVal));
 
-        auto variantPack  = cudnn_frontend::VariantPackBuilder()
-                               .setWorkspacePointer(workspace_ptr)
-                               .setDataPointers(data_ptrs)
-                               .build();
-        std::cout << "variantPack " << variantPack.describe() << std::endl;
-        cudnnStatus_t status = cudnnBackendExecute(handle_, plan.get_raw_desc(), variantPack.get_raw_desc());
-        if (workspace_size > 0) {
-            checkCudaErr(cudaFree(workspace_ptr));
-        }
+        cudnn_frontend::ExecutionPlanCache plan_cache("mha_bprop_cache");
+
+        execute_cached_plan(handle_, plan_cache, opGraph, data_ptrs);
+        
+        execute_cached_plan(handle_, plan_cache, opGraph, data_ptrs);
 
         checkCudnnErr(cudnnDestroy(handle_));
-
-        cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnn_frontend::cudnnException& e) {
         struct cudaDeviceProp prop;
         checkCudaErrors(cudaGetDeviceProperties( &prop, 0 ));
-        
+
         // this example is only for GA100 cards and GH100 cards
         if (!((prop.major == 8 && prop.minor == 0) || (prop.major == 9 && prop.minor == 0 && CUDNN_VERSION >= 8800)) && (e.getCudnnStatus() == CUDNN_STATUS_ARCH_MISMATCH || e.getCudnnStatus() == CUDNN_STATUS_NOT_SUPPORTED)) {
-            std::cout << "Example is only supported for GA100 (cuDNN >= 8700) and GH100 (cuDNN >= 8800) GPUs" << std::endl; 
+            std::cout << "Example is only supported for GA100 (cuDNN >= 8700) and GH100 (cuDNN >= 8800) GPUs" << std::endl;
         }  else {
             std::cout << "[ERROR] Exception " << e.what() << std::endl;
             CHECK(false);

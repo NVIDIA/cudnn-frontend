@@ -1231,6 +1231,13 @@ run_conv_scale_bias_relu_int8(int64_t* x_dim,
         // Create cudnn handle
         checkCudnnErr(cudnnCreate(&handle_));
 
+        if (check_device_arch_newer_than("turing") == false) {
+            cudnn_frontend::set_error_and_throw_exception(
+                    nullptr,
+                    CUDNN_STATUS_ARCH_MISMATCH,
+                    "run_conv_scale_bias_relu_int8: Sample requires Turing or above GPU");
+        }
+
         // Creates the necessary tensor descriptors
         int64_t stride[4];
         generateStrides(x_dim, stride, 4, CUDNN_TENSOR_NHWC);
@@ -1423,9 +1430,9 @@ run_conv_scale_bias_relu_int8(int64_t* x_dim,
     } catch (cudnn_frontend::cudnnException& e) {
         struct cudaDeviceProp prop;
         checkCudaErrors(cudaGetDeviceProperties( &prop, 0 ));
-        // this example is only for Ampere cards
+        // this example is only for Turing and later cards
         if (prop.major < 8 && (e.getCudnnStatus() == CUDNN_STATUS_ARCH_MISMATCH || e.getCudnnStatus() == CUDNN_STATUS_NOT_SUPPORTED)) {
-            std::cout << "Example is only supported for Ampere GPUs" << std::endl; 
+            std::cout << "Example is only supported for Turing GPUs" << std::endl; 
         }  else {
 #if (CUDNN_VERSION == 8600)
             if (prop.major == 9) {
@@ -1695,7 +1702,7 @@ run_matmul_bias_gelu(int64_t* a_dim,
     try {
         // Create cudnn handle
         checkCudnnErr(cudnnCreate(&handle_));
-        if (check_device_arch_newer_than("ampere") == false) {
+        if (check_device_arch_newer_than("ampere") == false && dataType == CUDNN_DATA_FLOAT) {
             cudnn_frontend::set_error_and_throw_exception(
                     nullptr,
                     CUDNN_STATUS_ARCH_MISMATCH,

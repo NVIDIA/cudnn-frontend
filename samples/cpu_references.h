@@ -160,9 +160,10 @@ void gen_stats_cpu(
     const int64_t inputSize,
     const int64_t* inputDims)
 {
-    std::vector<int64_t> totals((size_t)inputDims[0], 0);
+    int64_t channel_dim = inputDims[1];
+    std::vector<int64_t> totals((size_t)channel_dim, 0);
     for (int i = 0; i < inputSize; i++) {
-        int channel_index = i % inputDims[0];
+        int channel_index = i % channel_dim;
 
         // Sum
         outputData[channel_index].first = outputData[channel_index].first + inputData[i];
@@ -175,7 +176,7 @@ void gen_stats_cpu(
     }
 
     for (int i = 0; i < inputSize; i++) {
-        int channel_index = i % inputDims[0];
+        int channel_index = i % channel_dim;
 
         // Sum of squares
         T_ELEM diff = (inputData[i] - outputData[channel_index].first) * (inputData[i] - outputData[channel_index].first);
@@ -196,10 +197,10 @@ void batch_normalize(
     const int64_t inputSize,
     const int64_t* inputDims)
 {   
-
+    int64_t channel_dim = inputDims[1];
     // Loop through each element in the input and normalize it based on what batch it belongs to
     for (int i = 0; i < inputSize; i++) {
-        int batch_index = i % inputDims[0];
+        int batch_index = i % channel_dim;
         outputData[i] = (inputData[i] - stats[batch_index].first) / (T_ELEM) std::sqrt(stats[batch_index].second);
     }
 }

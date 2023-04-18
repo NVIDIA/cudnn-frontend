@@ -35,7 +35,7 @@ namespace cudnn_frontend {
 /// time further.
 template <CudnnFindSamplingTechnique samplingTechnique>
 auto
-time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const &variantPack) -> executionPlans_t {
+time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const &variantPack, uint64_t max_plans_to_evaluate = 1000) -> executionPlans_t {
     executionPlans_t time_sorted_plans;
 
     auto plan_cmp = [](const ExecutionPlan& a, const ExecutionPlan& b) {return a.getExecutionTime() < b.getExecutionTime();};
@@ -46,14 +46,14 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const
             ? 1
             : (samplingTechnique == CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_MEDIAN_OF_THREE) ? 3 : 100;
     const float threshhold = 0.95f;
-
+    uint64_t successful_plan_count = 0;
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaDeviceSynchronize();
 
     cudaStream_t stream = nullptr;
-    ::cudnnGetStream(handle, &stream);
+    cudnnGetStream(handle, &stream);
 
     for (auto &plan : plans) {
         float time_ms       = 0.0f;
@@ -61,17 +61,18 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const
         float min_time_ms   = std::numeric_limits<float>::max();
 
         // Warm-up run
-        auto warmup_status = ::cudnnBackendExecute(handle, plan.get_raw_desc(), variantPack.get_raw_desc());
+        auto warmup_status = cudnnBackendExecute(handle, plan.get_raw_desc(), variantPack.get_raw_desc());
         if (warmup_status != CUDNN_STATUS_SUCCESS) {
             getLogger() << "[cudnn_frontend] Plan " << plan.getTag() << " failed with " << to_string(warmup_status) << std::endl;
             continue;
         }
+        successful_plan_count++;
         cudaDeviceSynchronize();
 
         for (int i = 0; i < maxIterCount; i++) {
             cudaEventRecord(start, stream);
 
-            ::cudnnBackendExecute(handle, plan.get_raw_desc(), variantPack.get_raw_desc());
+            cudnnBackendExecute(handle, plan.get_raw_desc(), variantPack.get_raw_desc());
 
             cudaEventRecord(stop, stream);
             cudaEventSynchronize(stop);
@@ -97,6 +98,10 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const
         getLogger() << "[cudnn_frontend] Plan " << plan.getTag() << " took " << std::setw(10) << final_time_ms << std::endl;
         plan.setExecutionTime(final_time_ms);
         timed_execution_plans.insert(plan);
+        if (successful_plan_count >= max_plans_to_evaluate) {
+            getLogger() << "[cudnn_frontend] Successfully profiled " << max_plans_to_evaluate << "plans." << std::endl; 
+            break;
+        }
     }
 
     for (ExecutionPlan &plan : timed_execution_plans) {

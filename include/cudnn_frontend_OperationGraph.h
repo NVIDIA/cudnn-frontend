@@ -36,6 +36,9 @@
 #include "cudnn_frontend_Operation.h"
 #include "cudnn_frontend_utils.h"
 
+// Compile time constant for max ops in a op graph
+constexpr int64_t MAX_OPGRAPH_OPS = 50;
+
 namespace cudnn_frontend {
 
 ///
@@ -100,14 +103,24 @@ class OperationGraph_v8 : public BackendDescriptor {
         return opGraphTag;
     }
 
+    bool
+    setFeatureVector(feature_vector_t fv) {
+        feature_vectors.push_back(fv);
+        return true;
+    }
+
     feature_vector_t
     getFeatureVector() const {
-        if (numOps != 1) {
-            return {}; /// We do not support multiop opGraph at this point of time.
-        } else {
+        if(feature_vectors.size() != 0) {
             return feature_vectors[0];
+        } else {
+            return {};
         }
+    }
 
+    const std::array<ManagedOpaqueDescriptor, MAX_OPGRAPH_OPS> &
+    getOps() const {
+        return ops;
     }
 
    private:
@@ -117,7 +130,7 @@ class OperationGraph_v8 : public BackendDescriptor {
     operator=(OperationGraph_v8 const &) = delete;
 
     cudnnHandle_t handle = nullptr;
-    std::array<ManagedOpaqueDescriptor, 50> ops{};
+    std::array<ManagedOpaqueDescriptor, MAX_OPGRAPH_OPS> ops{};
     int64_t numOps         = -1;
     std::string opGraphTag = "";
     std::vector<feature_vector_t> feature_vectors;

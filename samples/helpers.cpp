@@ -82,6 +82,16 @@ void initImage(int8_t* image, int64_t imageSize) {
     }
 }
 
+// Currently set to generate random integers [0, 50] to avoid uint8 overflow
+void initImage(uint8_t* image, int64_t imageSize) {
+    static unsigned seed = 123456789;
+    for (int64_t index = 0; index < imageSize; index++) {
+        seed = (1103515245 * seed + 12345) & 0xffffffff;
+        // Takes floats from [0, 1), scales and casts to ints from [0, 50]
+        image[index] = (uint8_t)(50 * float(seed) * 2.3283064e-10f);  // 2^-32
+    }
+}
+
 // Currently set to generate uniform integers [0,1]
 void initImage(int32_t* image, int64_t imageSize) {
     static unsigned seed = 123456789;
@@ -187,18 +197,47 @@ void generateMHAStrides(int64_t b, int64_t h, int64_t s_q, int64_t s_kv, int64_t
     {
         case MHA_Matrix::Q_Matrix:
             if (layout == MHA_Layout::QKV_INTERLEAVED) {
-                strideA[hidden_dim_idx] = 1;
                 strideA[seqlen_dim_idx] = 3 * h * d;
+                strideA[hidden_dim_idx] = 1;
                 strideA[head_dim_idx] = d;
                 strideA[batch_dim_idx] = s_q * 3 * h * d;
-            } else {
+
+            } else if (layout == MHA_Layout::SBH_INTERLEAVED) {
+                strideA[seqlen_dim_idx] = 3 * h * d * b;
                 strideA[hidden_dim_idx] = 1;
+                strideA[head_dim_idx] = 3 * d;
+                strideA[batch_dim_idx] = 3 * h * d;
+            } else {
                 strideA[seqlen_dim_idx] = h * d;
+                strideA[hidden_dim_idx] = 1;
                 strideA[head_dim_idx] = d;
                 strideA[batch_dim_idx] = s_q * h * d;
             }
             break;
         case MHA_Matrix::K_Matrix:
+            if (layout == MHA_Layout::QKV_INTERLEAVED) {
+                strideA[seqlen_dim_idx] = 3 * h * d;
+                strideA[hidden_dim_idx] = 1;
+                strideA[head_dim_idx] = d;
+                strideA[batch_dim_idx] = s_kv * 3 * h * d;
+            } else if (layout == MHA_Layout::KV_INTERLEAVED) {
+                strideA[seqlen_dim_idx] = 2 * h * d;
+                strideA[hidden_dim_idx] = 1;
+                strideA[head_dim_idx] = d;
+                strideA[batch_dim_idx] = s_kv * 2 * h * d;
+            } else if (layout == MHA_Layout::SBH_INTERLEAVED) {
+                strideA[seqlen_dim_idx] = 3 * h * d * b;
+                strideA[hidden_dim_idx] = 1;
+                strideA[head_dim_idx] = 3 * d;
+                strideA[batch_dim_idx] = 3 * h * d;
+            } else {
+                strideA[seqlen_dim_idx] = h * d;
+                strideA[hidden_dim_idx] = 1;
+                strideA[head_dim_idx] = d;
+                strideA[batch_dim_idx] = s_kv * h * d;
+            }
+            break;
+        case MHA_Matrix::K_Matrix_Transpose:
             if (layout == MHA_Layout::QKV_INTERLEAVED) {
                 strideA[seqlen_transpose_dim_idx] = 3 * h * d;
                 strideA[hidden_transpose_dim_idx] = 1;
@@ -209,6 +248,11 @@ void generateMHAStrides(int64_t b, int64_t h, int64_t s_q, int64_t s_kv, int64_t
                 strideA[hidden_transpose_dim_idx] = 1;
                 strideA[head_dim_idx] = d;
                 strideA[batch_dim_idx] = s_kv * 2 * h * d;
+            } else if (layout == MHA_Layout::SBH_INTERLEAVED) {
+                strideA[seqlen_transpose_dim_idx] = 3 * h * d * b;
+                strideA[hidden_transpose_dim_idx] = 1;
+                strideA[head_dim_idx] = 3 * d;
+                strideA[batch_dim_idx] = 3 * h * d;
             } else {
                 strideA[seqlen_transpose_dim_idx] = h * d;
                 strideA[hidden_transpose_dim_idx] = 1;
@@ -218,18 +262,46 @@ void generateMHAStrides(int64_t b, int64_t h, int64_t s_q, int64_t s_kv, int64_t
             break;
         case MHA_Matrix::V_Matrix:
             if (layout == MHA_Layout::QKV_INTERLEAVED) {
-                strideA[hidden_dim_idx] = 1;
                 strideA[seqlen_dim_idx] = 3 * h * d;
+                strideA[hidden_dim_idx] = 1;
                 strideA[head_dim_idx] = d;
                 strideA[batch_dim_idx] = s_kv * 3 * h * d;
             } else if (layout == MHA_Layout::KV_INTERLEAVED) {
-                strideA[hidden_dim_idx] = 1;
                 strideA[seqlen_dim_idx] = 2* h * d;
+                strideA[hidden_dim_idx] = 1;
                 strideA[head_dim_idx] = d;
                 strideA[batch_dim_idx] = s_kv * 2 * h * d;
-            } else {
+            } else if (layout == MHA_Layout::SBH_INTERLEAVED) {
+                strideA[seqlen_dim_idx] = 3 * h * d * b;
                 strideA[hidden_dim_idx] = 1;
+                strideA[head_dim_idx] = 3 * d;
+                strideA[batch_dim_idx] = 3 * h * d;
+            } else {
                 strideA[seqlen_dim_idx] = h * d;
+                strideA[hidden_dim_idx] = 1;
+                strideA[head_dim_idx] = d;
+                strideA[batch_dim_idx] = s_kv * h * d;
+            }
+            break;
+        case MHA_Matrix::V_Matrix_Transpose:
+            if (layout == MHA_Layout::QKV_INTERLEAVED) {
+                strideA[seqlen_transpose_dim_idx] = 3 * h * d;
+                strideA[hidden_transpose_dim_idx] = 1;
+                strideA[head_dim_idx] = d;
+                strideA[batch_dim_idx] = s_kv * 3 * h * d;
+            } else if (layout == MHA_Layout::KV_INTERLEAVED) {
+                strideA[seqlen_transpose_dim_idx] = 2* h * d;
+                strideA[hidden_transpose_dim_idx] = 1;
+                strideA[head_dim_idx] = d;
+                strideA[batch_dim_idx] = s_kv * 2 * h * d;
+            } else if (layout == MHA_Layout::SBH_INTERLEAVED) {
+                strideA[seqlen_transpose_dim_idx] = 3 * h * d * b;
+                strideA[hidden_transpose_dim_idx] = 1;
+                strideA[head_dim_idx] = 3 * d;
+                strideA[batch_dim_idx] = 3 * h * d;
+            } else {
+                strideA[seqlen_transpose_dim_idx] = h * d;
+                strideA[hidden_transpose_dim_idx] = 1;
                 strideA[head_dim_idx] = d;
                 strideA[batch_dim_idx] = s_kv * h * d;
             }

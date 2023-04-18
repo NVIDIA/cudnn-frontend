@@ -564,12 +564,18 @@ class OperationBuilder_v8 {
                 m_operation.operationTag = "Identity";
                 break;
 #endif
+#if (CUDNN_VERSION >= 8900)
+            case CUDNN_POINTWISE_RECIPROCAL:
+                m_operation.operationTag = "Reciprocal";
+                break;
+#endif
 #ifndef NO_DEFAULT_IN_SWITCH
-	    default:
+            default:
                 m_operation.operationTag = "UNKNOWN_POINTWISE_OPERATION";
                 break;
 #endif
         }
+        
 
         status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
                 CUDNN_ATTR_OPERATION_POINTWISE_PW_DESCRIPTOR,
@@ -2018,8 +2024,11 @@ class OperationBuilder_v8 {
             m_operation.feature_vector.push_back(yTensor_strA[i]); // n, c, (g), d, h , w 
         }
 
-        int64_t alpha_as_int = *reinterpret_cast<int64_t *>(&m_operation.alpha_d);
-        int64_t  beta_as_int = *reinterpret_cast<int64_t *>(&m_operation.beta_d);
+        int64_t alpha_as_int;
+        int64_t  beta_as_int;
+        std::memcpy((void *)&alpha_as_int, (void *)(&m_operation.alpha_s), sizeof(int64_t));
+        std::memcpy((void *)&beta_as_int, (void *)(&m_operation.beta_s), sizeof(int64_t));
+
 
         m_operation.feature_vector.push_back(alpha_as_int);
         m_operation.feature_vector.push_back(beta_as_int);
@@ -2730,6 +2739,9 @@ class OperationBuilder_v8 {
 #if (CUDNN_VERSION >= 8500)
                                             (m_operation.pointwise_mode == CUDNN_POINTWISE_ERF) ||
 #endif
+#if (CUDNN_VERSION >= 8900)
+                                            (m_operation.pointwise_mode == CUDNN_POINTWISE_RECIPROCAL) ||
+#endif
                                             (m_operation.pointwise_mode == CUDNN_POINTWISE_MIN) ||
                                             (m_operation.pointwise_mode == CUDNN_POINTWISE_MAX) ||
                                             (m_operation.pointwise_mode == CUDNN_POINTWISE_SQRT));
@@ -2758,7 +2770,7 @@ class OperationBuilder_v8 {
                                                       (m_operation.pointwise_mode == CUDNN_POINTWISE_GELU_BWD) ||
 #if (CUDNN_VERSION >= 8500)
                                                       (m_operation.pointwise_mode == CUDNN_POINTWISE_GELU_APPROX_TANH_BWD) ||
-#endif
+#endif 
                                                       (m_operation.pointwise_mode == CUDNN_POINTWISE_SOFTPLUS_BWD) ||
                                                       (m_operation.pointwise_mode == CUDNN_POINTWISE_SWISH_BWD));
 

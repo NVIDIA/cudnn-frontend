@@ -742,7 +742,10 @@ run_from_cudnn_find(int64_t* x_dim,
         std::cout << "variantPack " << variantPack.describe() << std::endl;
 
         auto sample_predicate_function = [](cudnn_frontend::ExecutionPlan const& plan) -> bool {
-            return plan.getWorkspaceSize() != 0;
+            const int32_t max_plan_count = 5;
+            static int32_t plan_count = 0;
+            plan_count++;
+            return plan.getWorkspaceSize() != 0 || plan_count > max_plan_count;
         };
 
         std::array<cudnn_frontend::GeneratorSource const, 2> sources = {heurgen_method, fallback_method};
@@ -1074,7 +1077,7 @@ block_using_errata(int64_t* x_dim,
                     }, 
                     { "rule_id"             : "ConvBwdFilter_eng20",
                       "operation"           : "ConvBwdFilter",
-                      "engine"              : 20, 
+                      "engine"              : 20,
                       "cudnn_version_start" : 8000, 
                       "cudnn_version_end"   : -1 
                     } 
@@ -1083,6 +1086,60 @@ block_using_errata(int64_t* x_dim,
 
         auto fn = std::bind(::allowErrata, padA);
         bool is_plan_blocked = cudnn_frontend::check_errata<decltype(fn)>(json_handle, plan.getTag(), handle_, fn);
+        CHECK(is_plan_blocked);
+
+        // Filter kernels with specific shape
+        auto json_handle_with_shape = json::parse(R"(
+            { "version" : 1, 
+              "rules"   : 
+                [ 
+                    { "rule_id"             : "ConvBwdData_eng1_k2=2_k3=0", 
+                      "operation"           : "ConvBwdData",
+                      "engine"              : 1, 
+                      "knob"                : ["k2=4", "k3=0"],
+                      "cudnn_version_start" : 8000, 
+                      "cudnn_version_end"   : -1 
+                    }, 
+                    { "rule_id"             : "ConvBwdFilter_eng20",
+                      "operation"           : "ConvBwdFilter",
+                      "engine"              : 20,
+                      "shape_format"        : "NCHW",
+                      "input_shape"         : [1, 32, 128, 128],
+                      "filter_shape"        : [32, 32, 3, 3],
+                      "cudnn_version_start" : 8000, 
+                      "cudnn_version_end"   : -1 
+                    } 
+                ] 
+            })");
+
+        is_plan_blocked = cudnn_frontend::check_errata<decltype(fn)>(json_handle_with_shape, plan.getTag(), handle_, opGraph, fn);
+        CHECK(is_plan_blocked);
+
+        // Filter kernels only on spatial dims (wildcard usage)
+        auto json_handle_with_shape_wildcards = json::parse(R"(
+            { "version" : 1, 
+              "rules"   : 
+                [ 
+                    { "rule_id"             : "ConvBwdData_eng1_k2=2_k3=0", 
+                      "operation"           : "ConvBwdData",
+                      "engine"              : 1, 
+                      "knob"                : ["k2=4", "k3=0"],
+                      "cudnn_version_start" : 8000, 
+                      "cudnn_version_end"   : -1 
+                    }, 
+                    { "rule_id"             : "ConvBwdFilter_eng20",
+                      "operation"           : "ConvBwdFilter",
+                      "engine"              : 20,
+                      "shape_format"        : "NCHW",
+                      "input_shape"         : [-1, -1, 128, 128],
+                      "filter_shape"        : [-1, -1, 3, 3],
+                      "cudnn_version_start" : 8000, 
+                      "cudnn_version_end"   : -1 
+                    } 
+                ] 
+            })");
+
+        is_plan_blocked = cudnn_frontend::check_errata<decltype(fn)>(json_handle_with_shape_wildcards, plan.getTag(), handle_, opGraph, fn);
         CHECK(is_plan_blocked);
 
     } catch (cudnn_frontend::cudnnException &e) {
