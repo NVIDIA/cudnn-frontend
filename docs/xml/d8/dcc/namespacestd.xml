@@ -1,6 +1,6 @@
 <?xml version='1.0' encoding='UTF-8' standalone='no'?>
 <doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.8.13">
-  <compounddef id="d8/dcc/namespacestd" kind="namespace" language="C++">
+  <compounddef id="d8/dcc/namespacestd" kind="namespace" language="Unknown">
     <compoundname>std</compoundname>
     <innerclass refid="d7/d75/classstd_1_1allocator" prot="public">std::allocator</innerclass>
     <innerclass refid="d4/d04/classstd_1_1array" prot="public">std::array</innerclass>
@@ -30,7 +30,6 @@
     <innerclass refid="d7/dc6/classstd_1_1exception" prot="public">std::exception</innerclass>
     <innerclass refid="dc/d78/classstd_1_1forward__list" prot="public">std::forward_list</innerclass>
     <innerclass refid="d1/d7a/classstd_1_1fstream" prot="public">std::fstream</innerclass>
-    <innerclass refid="dd/d6b/structstd_1_1hash_3_01nlohmann_1_1json_01_4" prot="public">std::hash&lt; nlohmann::json &gt;</innerclass>
     <innerclass refid="d6/de4/classstd_1_1ifstream" prot="public">std::ifstream</innerclass>
     <innerclass refid="d1/d11/classstd_1_1invalid__argument" prot="public">std::invalid_argument</innerclass>
     <innerclass refid="d2/d53/classstd_1_1ios" prot="public">std::ios</innerclass>
@@ -38,7 +37,6 @@
     <innerclass refid="d8/d05/classstd_1_1istream" prot="public">std::istream</innerclass>
     <innerclass refid="db/d29/classstd_1_1istringstream" prot="public">std::istringstream</innerclass>
     <innerclass refid="d6/de6/classstd_1_1length__error" prot="public">std::length_error</innerclass>
-    <innerclass refid="df/d4e/structstd_1_1less_3_1_1nlohmann_1_1detail_1_1value__t_01_4" prot="public">std::less&lt;::nlohmann::detail::value_t &gt;</innerclass>
     <innerclass refid="d4/dff/classstd_1_1list" prot="public">std::list</innerclass>
     <innerclass refid="d6/d2f/classstd_1_1logic__error" prot="public">std::logic_error</innerclass>
     <innerclass refid="d4/de8/classstd_1_1map" prot="public">std::map</innerclass>
@@ -60,8 +58,6 @@
     <innerclass refid="d0/d53/classstd_1_1stringstream" prot="public">std::stringstream</innerclass>
     <innerclass refid="d3/dc3/classstd_1_1system__error" prot="public">std::system_error</innerclass>
     <innerclass refid="d6/d35/classstd_1_1thread" prot="public">std::thread</innerclass>
-    <innerclass refid="dc/dac/classstd_1_1tuple__element_3_01N_00_01_1_1nlohmann_1_1detail_1_1iteration__proxy__value_3_01IteratorType_01_4_01_4" prot="public">std::tuple_element&lt; N, ::nlohmann::detail::iteration_proxy_value&lt; IteratorType &gt; &gt;</innerclass>
-    <innerclass refid="da/d86/classstd_1_1tuple__size_3_1_1nlohmann_1_1detail_1_1iteration__proxy__value_3_01IteratorType_01_4_01_4" prot="public">std::tuple_size&lt;::nlohmann::detail::iteration_proxy_value&lt; IteratorType &gt; &gt;</innerclass>
     <innerclass refid="d3/db3/classstd_1_1underflow__error" prot="public">std::underflow_error</innerclass>
     <innerclass refid="dd/def/classstd_1_1unique__ptr" prot="public">std::unique_ptr</innerclass>
     <innerclass refid="d4/d3a/classstd_1_1unordered__map" prot="public">std::unordered_map</innerclass>
@@ -81,33 +77,6 @@
     <innerclass refid="d0/d0f/classstd_1_1wostringstream" prot="public">std::wostringstream</innerclass>
     <innerclass refid="d3/d05/classstd_1_1wstring" prot="public">std::wstring</innerclass>
     <innerclass refid="d0/d29/classstd_1_1wstringstream" prot="public">std::wstringstream</innerclass>
-      <sectiondef kind="func">
-      <memberdef kind="function" id="d5/db8/json_8hpp_1af3f2c23f946bf81b153b863b4acf6bb3" prot="public" static="no" const="no" explicit="no" inline="yes" virt="non-virtual">
-        <templateparamlist>
-        </templateparamlist>
-        <type>void</type>
-        <definition>void std::swap&lt; nlohmann::json &gt;</definition>
-        <argsstring>(nlohmann::json &amp;j1, nlohmann::json &amp;j2) noexcept(//NOLINT(readability-inconsistent-declaration-parameter-name) is_nothrow_move_constructible&lt; nlohmann::json &gt;::value &amp;&amp;//NOLINT(misc-redundant-expression) is_nothrow_move_assignable&lt; nlohmann::json &gt;::value)</argsstring>
-        <name>swap&lt; nlohmann::json &gt;</name>
-        <param>
-          <type><ref refid="d3/d9b/namespacenlohmann_1a2bfd99e845a2e5cd90aeaf1b1431f474" kindref="member">nlohmann::json</ref> &amp;</type>
-          <declname>j1</declname>
-        </param>
-        <param>
-          <type><ref refid="d3/d9b/namespacenlohmann_1a2bfd99e845a2e5cd90aeaf1b1431f474" kindref="member">nlohmann::json</ref> &amp;</type>
-          <declname>j2</declname>
-        </param>
-        <briefdescription>
-<para>exchanges the values of two JSON objects </para>        </briefdescription>
-        <detaileddescription>
-<para><simplesect kind="since"><para>version 1.0.0 </para></simplesect>
-</para>        </detaileddescription>
-        <inbodydescription>
-        </inbodydescription>
-        <location file="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" line="25910" column="1" bodyfile="/home/agopal/trees/cudnn-frontend/include/contrib/nlohmann/json/json.hpp" bodystart="25910" bodyend="25916"/>
-        <references refid="d5/db8/json_8hpp_1a5338981b5ad9027c9e54b1c5597f4344" compoundref="d5/db8/json_8hpp" startline="1456">JSON_HEDLEY_NON_NULL</references>
-      </memberdef>
-      </sectiondef>
     <briefdescription>
 <para>STL namespace. </para>    </briefdescription>
     <detaileddescription>

@@ -56,10 +56,14 @@ Sample tests are written using the [Catch2](https://github.com/catchorg/Catch2) 
         - Headers are in CUDNN_PATH/include
         - Libraries are in CUDNN_PATH/lib or CUDNN_PATH/lib64 or CUDNN_PATH/lib/x64
 
+     From Project Root,
+
      mkdir build; cd build
      cmake -DCUDNN_PATH=/path/to/cudnn -DCUDAToolkit_ROOT=/path/to/cuda  ../
      cmake --build . -j16
      bin/samples
+
+     - You can skip building samples by providing CUDNN_FRONTEND_BUILD_SAMPLES=0 to the cmake.
     
 ## cudnnFindPlan and cudnnGetPlan:
 Prior to cuDNN V8, cuDNN provided `cudnnFindConvolution*` and `cudnnGetConvolution*` functions, which provided a way to sample all the algorithms for a given problem and study the run times. This can be further used to cache the best algorithms for a given problem.  In cuDNN V8, this has been replaced with `cudnnFindPlan` and `cudnnGetPlan`.
@@ -128,6 +132,9 @@ Calling `cudnn_frontend::getStream() = stream_name` can be used to assign the ou
 
 ## Documentation
 Documentation can be found at https://nvidia.github.io/cudnn-frontend/
+
+## Contributing:
+At this point we are not accepting any external PRs. Please create an issue in github and we will get to it.
 
 ## Feedback
 Support, resources, and information about cuDNN can be found online at https://developer.nvidia.com/cudnn. 

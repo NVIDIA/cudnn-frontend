@@ -288,7 +288,7 @@ struct Surface {
         }
         initImage(hostPtr, n_elems);
         uint32_t *temp = (uint32_t *)hostPtr;
-        for (size_t i = 0; i < n_elems; i = i+2) {
+        for (auto i = 0; i < n_elems; i = i+2) {
             temp[i + 1] = 1u;
         }
 

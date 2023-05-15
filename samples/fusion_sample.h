@@ -264,7 +264,8 @@ cudnnStatus_t run_dsbar(int64_t *Y_dim,
                void *DP_YdevPtr,
                void *DP_scaleDevPtr,
                void *DP_biasDevPtr,
-               void *YdevPtr);
+               void *YdevPtr,
+               cudnnDataType_t op_data_type);
 
 #if (CUDNN_VERSION >= 8600)
 void

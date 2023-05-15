@@ -14,7 +14,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Catch2)
 
 # Find cudnn
-include(${CMAKE_SOURCE_DIR}/cmake/cuDNN.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/cuDNN.cmake)
 
 add_executable(
     samples
@@ -27,6 +27,7 @@ add_executable(
     fusion_sample.cpp 
     fp8_sample.cpp 
     mha_sample.cpp
+    norm_samples.cpp
     fused_mha_sample.cpp
     f16_flash_mha_sample.cpp
     fp8_flash_mha_sample.cpp

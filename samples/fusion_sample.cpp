@@ -1457,7 +1457,7 @@ run_pool_scale_bias_relu_int8(int64_t* x_dim,
                               void* devPtrY,
                               void* devPtrS,
                               void* devPtrB, 
-                              cudnnDataType_t tensorType,
+                              cudnnDataType_t compType,
                               cudnnNanPropagation_t const nanOpt, 
                               cudnn_frontend::cudnnResampleMode_t const mode,
                               cudnn_frontend::cudnnPaddingMode_t const padding_mode,
@@ -1488,7 +1488,7 @@ run_pool_scale_bias_relu_int8(int64_t* x_dim,
                            .setStride(4, strideTensor)
                            .setId('x')
                            .setAlignment(16)  // 16B alignment is needed to run a tensor core engine
-                           .setDataType(tensorType)
+                           .setDataType(CUDNN_DATA_INT8)
                            .build();
         generateStrides(s_dim, strideTensor, 4, CUDNN_TENSOR_NHWC);
         auto sTensor = cudnn_frontend::TensorBuilder()
@@ -1505,7 +1505,7 @@ run_pool_scale_bias_relu_int8(int64_t* x_dim,
                            .setStride(4, strideTensor)
                            .setId('b')
                            .setAlignment(16)
-                           .setDataType(tensorType)
+                           .setDataType(CUDNN_DATA_FLOAT)
                            .build();
 
         generateStrides(y_dim, strideTensor, 4, CUDNN_TENSOR_NHWC);
@@ -1515,7 +1515,7 @@ run_pool_scale_bias_relu_int8(int64_t* x_dim,
                                    .setId('A')  // after conv
                                    .setAlignment(16)
                                    .setVirtual()
-                                   .setDataType(tensorType)
+                                   .setDataType(compType)
                                    .build();
         auto afterScaleTensor = cudnn_frontend::TensorBuilder()
                                     .setDim(4, y_dim)
@@ -1523,7 +1523,7 @@ run_pool_scale_bias_relu_int8(int64_t* x_dim,
                                     .setId('B')  // after scale
                                     .setAlignment(16)
                                     .setVirtual()
-                                    .setDataType(CUDNN_DATA_FLOAT)
+                                    .setDataType(compType)
                                     .build();
         auto afterBiasTensor = cudnn_frontend::TensorBuilder()
                                    .setDim(4, y_dim)
@@ -1531,7 +1531,7 @@ run_pool_scale_bias_relu_int8(int64_t* x_dim,
                                    .setId('C')  // after bias
                                    .setAlignment(16)
                                    .setVirtual()
-                                   .setDataType(CUDNN_DATA_FLOAT)
+                                   .setDataType(compType)
                                    .build();
         auto yTensor = cudnn_frontend::TensorBuilder()
                            .setDim(4, y_dim)
@@ -1566,7 +1566,7 @@ run_pool_scale_bias_relu_int8(int64_t* x_dim,
         // Define the scale descriptor
         auto scaleDesc = cudnn_frontend::PointWiseDescBuilder()
                              .setMode(CUDNN_POINTWISE_MUL)
-                             .setComputeType(CUDNN_DATA_FLOAT)
+                             .setComputeType(compType)
                              .build();
         std::cout << "Initialized Scale Desc"<< std::endl;
         std::cout << scaleDesc.describe() << std::endl;
@@ -1574,7 +1574,7 @@ run_pool_scale_bias_relu_int8(int64_t* x_dim,
         // Define the bias descriptor
         auto biasDesc = cudnn_frontend::PointWiseDescBuilder()
                             .setMode(CUDNN_POINTWISE_ADD)
-                            .setComputeType(CUDNN_DATA_FLOAT)
+                            .setComputeType(compType)
                             .build();
         std::cout << "Initialized Bias Desc"<< std::endl;
         std::cout << biasDesc.describe() << std::endl;
@@ -1582,7 +1582,7 @@ run_pool_scale_bias_relu_int8(int64_t* x_dim,
         // Define the activation descriptor
         auto actDesc = cudnn_frontend::PointWiseDescBuilder()
                            .setMode(CUDNN_POINTWISE_RELU_FWD)
-                           .setComputeType(CUDNN_DATA_FLOAT)
+                           .setComputeType(compType)
                            .build();
         std::cout << "Initialized Activation Desc"<< std::endl;
         std::cout << actDesc.describe() << std::endl;
@@ -1929,7 +1929,7 @@ run_conv_drelu(int64_t* x_dim,
                                      .setId(after_conv_id)
                                      .setAlignment(4)
                                      .setVirtual()
-                                     .setDataType(dataType)
+                                     .setDataType(CUDNN_DATA_FLOAT)
                                      .build();
 
         auto bwd_act_x_tensor = cudnn_frontend::TensorBuilder()
@@ -2996,7 +2996,8 @@ cudnnStatus_t run_dsbar(int64_t *Y_dim,
                void *DP_YdevPtr,
                void *DP_scaleDevPtr,
                void *DP_biasDevPtr,
-               void *YdevPtr)
+               void *YdevPtr,
+               cudnnDataType_t op_data_type)
 {
     cudnnHandle_t handle_;
 
@@ -3130,7 +3131,7 @@ cudnnStatus_t run_dsbar(int64_t *Y_dim,
                             .setStride(4, stride)
                             .setId('f')
                             .setAlignment(16) //16 byte alignment
-                            .setDataType(CUDNN_DATA_FLOAT)
+                            .setDataType(op_data_type)
                             .build();
 
         std::cout << RP_yTensor.describe() << std::endl;
