@@ -866,6 +866,10 @@ run_f16_flash_attention_bprop(int64_t b,
         int64_t o_stride [4];
         generateMHAStrides(b, h, s_q, s_kv, d, o_stride, layout, MHA_Matrix::O_Matrix);
 
+        int64_t dqAccum_dim [4] =  {b, h, s_q, d};
+        int64_t dqAccum_stride [4];
+        generateMHAStrides(b, h, s_q, s_kv, d, dqAccum_stride, layout, MHA_Matrix::O_Matrix);
+
         int64_t scale_dim [4] = {1, 1, 1, 1};
         int64_t scale_stride [4] = {1, 1, 1, 1};
 
@@ -891,20 +895,20 @@ run_f16_flash_attention_bprop(int64_t b,
         int64_t reduction_stride [4] = {h * s_q, s_q, 1, 1};
         // reduction(dO * O)
         auto afterReductionTensor = tensor_create(CUDNN_DATA_FLOAT, VIRTUAL_ID + 1, reduction_dim, reduction_stride, true, false); // is virtual
-        auto reductionMaxDesc = cudnn_frontend::ReductionDescBuilder()
+        auto reductionAddDesc = cudnn_frontend::ReductionDescBuilder()
                                 .setComputeType(CUDNN_DATA_FLOAT)
-                                .setReductionOp(CUDNN_REDUCE_TENSOR_MAX)
+                                .setReductionOp(CUDNN_REDUCE_TENSOR_ADD)
                                 .build();
-        std::cout << reductionMaxDesc.describe() << std::endl;
+        std::cout << reductionAddDesc.describe() << std::endl;
 
-        // Create a reduction max Node.
-        auto reductionMax_op = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR)
+        // Create a reduction add Node.
+        auto reductionAdd_op = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR)
                                     .setxDesc(dotProductTensor)
                                     .setyDesc(afterReductionTensor)
-                                    .setreductionDesc(reductionMaxDesc)
+                                    .setreductionDesc(reductionAddDesc)
                                     .build();
-        std::cout << reductionMax_op.describe() << std::endl;
-        ops.push_back(std::move(reductionMax_op));
+        std::cout << reductionAdd_op.describe() << std::endl;
+        ops.push_back(std::move(reductionAdd_op));
 
 
         /*******************************************************************************
@@ -987,13 +991,21 @@ run_f16_flash_attention_bprop(int64_t b,
         ops.push_back(std::move(reshape_op));
 
         // Outputs of bprop
-        int64_t dqkv_dim[4] = {b, h, s_kv, d};
-        int64_t dqkv_stride[4];
-        generateMHAStrides(b, h, s_q, s_kv, d, dqkv_stride, layout, MHA_Matrix::Q_Matrix);
+        int64_t dq_dim[4] = {b, h, s_q, d};
+        int64_t dq_stride[4];
+        generateMHAStrides(b, h, s_q, s_kv, d, dq_stride, layout, MHA_Matrix::Q_Matrix);
+
+        int64_t dk_dim[4] = {b, h, s_kv, d};
+        int64_t dk_stride[4];
+        generateMHAStrides(b, h, s_q, s_kv, d, dk_stride, layout, MHA_Matrix::K_Matrix);
+
+        int64_t dv_dim[4] = {b, h, s_kv, d};
+        int64_t dv_stride[4];
+        generateMHAStrides(b, h, s_q, s_kv, d, dv_stride, layout, MHA_Matrix::V_Matrix);
         // Outputs of backprop
-        auto dQTensor = tensor_create(tensorType, dQ_ID, dqkv_dim, dqkv_stride, false, false);
-        auto dKTensor = tensor_create(tensorType, dK_ID, dqkv_dim, dqkv_stride, false, false);
-        auto dVTensor = tensor_create(tensorType, dV_ID, dqkv_dim, dqkv_stride, false, false); // not virtual
+        auto dQTensor = tensor_create(tensorType, dQ_ID, dq_dim, dq_stride, false, false);
+        auto dKTensor = tensor_create(tensorType, dK_ID, dk_dim, dk_stride, false, false);
+        auto dVTensor = tensor_create(tensorType, dV_ID, dv_dim, dv_stride, false, false); // not virtual
 
         /*******************************************************************************
          *                          sTransposeTensor @ dO -> dV
@@ -1055,8 +1067,9 @@ run_f16_flash_attention_bprop(int64_t b,
          *                          dP * scaleDropout -> dPAfterDropoutScale
         *///////////////////////////////////////////////////////////////////////////////
         auto dPAfterDropoutScaleTensor = tensor_create(CUDNN_DATA_FLOAT, VIRTUAL_ID + 11, p_dim, p_stride, true, false); // is virtual
+        // needs to be bf16 (Please change)
         half1 scale_dropout = cpu_float2half_rn(static_cast<float>(1/(1 - dropout_probability)));
-        auto scaleDropoutTensor = tensor_create(CUDNN_DATA_FLOAT, D_CONST_ID, scale_dim, scale_stride, false, true); // is by value
+        auto scaleDropoutTensor = tensor_create(tensorType, D_CONST_ID, scale_dim, scale_stride, false, true); // is by value
         auto multiply_op3 = binary_pw_op_create(dPTensor, scaleDropoutTensor, dPAfterDropoutScaleTensor, multiplyDesc);
         ops.push_back(std::move(multiply_op3));
 
@@ -1085,8 +1098,8 @@ run_f16_flash_attention_bprop(int64_t b,
          *                          dP @ K -> dqAccumTensor
         *///////////////////////////////////////////////////////////////////////////////
         auto dqAccumTensor = cudnn_frontend::TensorBuilder()
-            .setDim(4, dqkv_dim)
-            .setStride(4, dqkv_stride)
+            .setDim(4, dqAccum_dim)
+            .setStride(4, dqAccum_stride)
             .setId(dQ_ACCUM_ID) 
             .setAlignment(16) // 16B alignment is needed to run a tensor core engine
             .setDataType(CUDNN_DATA_FLOAT)
@@ -1097,7 +1110,7 @@ run_f16_flash_attention_bprop(int64_t b,
         
         auto matmul_3_Desc = cudnn_frontend::MatMulDescBuilder().setComputeType(CUDNN_DATA_FLOAT).build();
         auto matmul_op3 = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_MATMUL_DESCRIPTOR)
-                                .setaMatDesc(dPTensor)
+                                .setaMatDesc(dPScaledTensor)
                                 .setbMatDesc(kTensor)
                                 .setcMatDesc(dqAccumTensor)
                                 .setmatmulDesc(matmul_3_Desc)
@@ -1112,7 +1125,7 @@ run_f16_flash_attention_bprop(int64_t b,
 
         auto dPTransposeTensor = tensor_create(CUDNN_DATA_FLOAT, VIRTUAL_ID + 14, p_transpose_dim, p_transpose_stride, true, false); // is virtual
         auto reshape_op3 = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_RESHAPE_DESCRIPTOR)
-                                .setxDesc(dPTensor)
+                                .setxDesc(dPScaledTensor)
                                 .setyDesc(dPTransposeTensor)
                                 .build();
         std::cout << reshape_op3.describe() << std::endl;

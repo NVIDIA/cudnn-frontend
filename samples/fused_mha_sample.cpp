@@ -899,14 +899,19 @@ run_mha_fprop(int64_t b,
 
         createScale(b, h, s_q, s_kv, d, layout, tensorType, ops);
 
+        std::shared_ptr<cudnn_frontend::Tensor> maskInput;
+
         auto bmm1_output = createBMM1(b, h, s_q, s_kv, d, layout, tensorType, ops);
 
         if (bias_type != MHA_Bias_Type::NO_BIAS) {
-            createBias(b, h, s_q, s_kv, d, layout, tensorType, ops, bmm1_output);
+            auto bias_output = createBias(b, h, s_q, s_kv, d, layout, tensorType, ops, bmm1_output);
+            maskInput = std::make_shared<cudnn_frontend::Tensor>(std::move(bias_output));
+        } else {
+            maskInput = std::make_shared<cudnn_frontend::Tensor>(std::move(bmm1_output));
         }
 
         float negInfinity = -1.0E+20f; // change this if you have access to float_min
-        auto mask_output = createMask(b, h, s_q, s_kv, d, layout, is_causal_masking, tensorType, ops, bmm1_output, false);
+        auto mask_output = createMask(b, h, s_q, s_kv, d, layout, is_causal_masking, tensorType, ops, *maskInput.get(), false);
 
         bool enable_dropout = (dropout_probability != 0.0f);
         cudnn_frontend::throw_if(dropout_probability == 1.0f, "Dropout probability cannot be 1.0", CUDNN_STATUS_BAD_PARAM);

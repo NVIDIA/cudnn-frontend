@@ -125,7 +125,7 @@ void scale_and_bias_tensor_cpu(
     // Scale and bias per channel basis. Assumes NHWC format.
     for (int i = 0; i < inputSize; i++) {
         int c = i % inputDims[0];
-        outputData[i] = inputData[i] * scaleData[c] + biasData[c];
+        outputData[i] = (scale_bias_type)inputData[i] * scaleData[c] + biasData[c];
     }
 }
 
@@ -166,7 +166,7 @@ void gen_stats_cpu(
         int channel_index = i % channel_dim;
 
         // Sum
-        outputData[channel_index].first = outputData[channel_index].first + inputData[i];
+        outputData[channel_index].first = outputData[channel_index].first + (float)inputData[i];
         totals[channel_index] = totals[channel_index] + 1;
     }
 
@@ -179,8 +179,8 @@ void gen_stats_cpu(
         int channel_index = i % channel_dim;
 
         // Sum of squares
-        T_ELEM diff = (inputData[i] - outputData[channel_index].first) * (inputData[i] - outputData[channel_index].first);
-        outputData[channel_index].second = outputData[channel_index].second + diff;
+        T_ELEM diff = ((float)inputData[i] - outputData[channel_index].first) * ((float)inputData[i] - outputData[channel_index].first);
+        outputData[channel_index].second = (T_ELEM)outputData[channel_index].second + diff;
     }
 
     // Calculate the variance for the channel. Assumes NHWC format.
@@ -201,7 +201,7 @@ void batch_normalize(
     // Loop through each element in the input and normalize it based on what batch it belongs to
     for (int i = 0; i < inputSize; i++) {
         int batch_index = i % channel_dim;
-        outputData[i] = (inputData[i] - stats[batch_index].first) / (T_ELEM) std::sqrt(stats[batch_index].second);
+        outputData[i] = ((float)inputData[i] - stats[batch_index].first) / (float) std::sqrt(stats[batch_index].second);
     }
 }
 
