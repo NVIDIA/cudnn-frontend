@@ -2125,7 +2125,7 @@ TEST_CASE("Conv two global scales", "[frontend][fusion][conv global scale]") {
     for (size_t i = 0; i < (size_t)YSize; i++) {
         half afterConvOutput = afterConv.hostPtr[i];
         half finalOutput = Y.hostPtr[i];
-        half globalScaleOutput = afterConvOutput * scale1.hostPtr[0] * scale2.hostPtr[0];
+        half globalScaleOutput = (float)afterConvOutput * scale1.hostPtr[0] * scale2.hostPtr[0];
         float diff         = getError(finalOutput, globalScaleOutput);
         if (diff < 0) diff = -diff;
         if (diff > THRESHOLD) { numErrors++;}
@@ -3356,7 +3356,7 @@ TEST_CASE("Batch normalization", "[frontend][fusion][bn]") {
 
     auto size_calculator = 
         [](int64_t *arr) {
-            return std::accumulate(arr, arr + 4, 1, std::multiplies<int>());
+            return std::accumulate(arr, arr + 4, 1LL, std::multiplies<int64_t>());
         };
 
     Surface<half> input(size_calculator(tensorDims), false);
