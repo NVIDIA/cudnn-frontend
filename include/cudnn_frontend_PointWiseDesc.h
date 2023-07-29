@@ -72,6 +72,7 @@ class PointWiseDesc_v8 : public BackendDescriptor {
 #if (CUDNN_VERSION >= 8300)
             case CUDNN_POINTWISE_DIV:
             case CUDNN_POINTWISE_ADD_SQUARE:
+            case CUDNN_POINTWISE_POW:
             case CUDNN_POINTWISE_SUB:
             case CUDNN_POINTWISE_CMP_EQ:
             case CUDNN_POINTWISE_CMP_NEQ:
@@ -108,7 +109,6 @@ class PointWiseDesc_v8 : public BackendDescriptor {
             case CUDNN_POINTWISE_LOG:
             case CUDNN_POINTWISE_NEG:
             case CUDNN_POINTWISE_MOD:
-            case CUDNN_POINTWISE_POW:
             case CUDNN_POINTWISE_ABS:
             case CUDNN_POINTWISE_CEIL:
             case CUDNN_POINTWISE_FLOOR:
