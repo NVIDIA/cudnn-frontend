@@ -72,10 +72,10 @@ class VariantPack_v8 : public BackendDescriptor {
     VariantPack_v8 &
     operator=(VariantPack_v8 const &) = delete;
 
-    void *workspace         = nullptr;
+    void *workspace = nullptr;
     std::vector<void *> data_pointers;
     std::vector<int64_t> uid;
-    int64_t num_ptrs        = -1;
+    int64_t num_ptrs = -1;
 };
 
 ///
@@ -185,7 +185,7 @@ class VariantPackBuilder_v8 {
                 &m_variant_pack, status, "CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR: cudnnFinalize Failed");
             return std::move(m_variant_pack);
         }
-        getLogger() << "[cudnn_frontend] "<< m_variant_pack << std::endl;
+        getLogger() << "[cudnn_frontend] " << m_variant_pack << std::endl;
         return std::move(m_variant_pack);
     }
 
@@ -199,4 +199,8 @@ class VariantPackBuilder_v8 {
    private:
     VariantPack_v8 m_variant_pack;
 };
-}
+
+using VariantPack        = VariantPack_v8;
+using VariantPackBuilder = VariantPackBuilder_v8;
+
+}  // namespace cudnn_frontend

@@ -18,17 +18,16 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
- */ 
-
+ */
 
 #include "error_util.h"
 #include "fp16_dev.h"
 
 #define BLOCK_SIZE 128
 template <class value_type>
-__global__ void float2half_rn_kernel(int size, const value_type *buffIn, half1 *buffOut)
-{
-    const int idx = BLOCK_SIZE*blockIdx.x+threadIdx.x;
+__global__ void
+float2half_rn_kernel(int size, const value_type *buffIn, half1 *buffOut) {
+    const int idx = BLOCK_SIZE * blockIdx.x + threadIdx.x;
     if (idx >= size) {
         return;
     }
@@ -42,13 +41,14 @@ __global__ void float2half_rn_kernel(int size, const value_type *buffIn, half1 *
 }
 
 template <class value_type>
-void gpu_float2half_rn(int size, const value_type *buffIn, half1 *buffOut)
-{
+void
+gpu_float2half_rn(int size, const value_type *buffIn, half1 *buffOut) {
     int grid_size = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    float2half_rn_kernel<value_type><<<grid_size, BLOCK_SIZE>>> (size, buffIn, buffOut);
+    float2half_rn_kernel<value_type><<<grid_size, BLOCK_SIZE>>>(size, buffIn, buffOut);
     checkCudaErrors(cudaDeviceSynchronize());
 }
 
-template void gpu_float2half_rn<float> (int, const float*, half1*);
-template void gpu_float2half_rn<double> (int, const double*, half1*);
-
+template void
+gpu_float2half_rn<float>(int, const float *, half1 *);
+template void
+gpu_float2half_rn<double>(int, const double *, half1 *);

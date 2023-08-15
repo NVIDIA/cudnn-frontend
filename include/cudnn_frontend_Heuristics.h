@@ -36,9 +36,9 @@
 #include "cudnn_frontend_utils.h"
 #include "cudnn_frontend_Filters.h"
 
-#if defined( _MSC_VER )
-#pragma warning( push )
-#pragma warning( disable : 4127 )
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4127)
 #endif
 namespace cudnn_frontend {
 ///
@@ -64,7 +64,7 @@ class EngineHeuristics_v8 : public BackendDescriptor {
 
     EngineHeuristics_v8(EngineHeuristics_v8 &&from) = default;
     EngineHeuristics_v8 &
-    operator= (EngineHeuristics_v8 &&from) = default;
+    operator=(EngineHeuristics_v8 &&from) = default;
 
     ~EngineHeuristics_v8() = default;
 
@@ -138,7 +138,8 @@ class EngineHeuristics_v8 : public BackendDescriptor {
     std::vector<ManagedOpaqueDescriptor> m_heuristic_results;  //! storage of heuristic results
     std::string opGraphTag;
 
-    static std::mutex & get_heur_b_mutex() {
+    static std::mutex &
+    get_heur_b_mutex() {
         static std::mutex heur_b_mutex;
         return heur_b_mutex;
     }
@@ -252,38 +253,38 @@ class EngineHeuristicsBuilder_v8 {
     EngineHeuristics_v8 m_heuristics;
 };
 
-template<std::size_t SIZE>
+template <std::size_t SIZE>
 EngineConfigList
 get_heuristics_list(std::array<cudnnBackendHeurMode_t, SIZE> modes,
-    OperationGraph_v8 &opGraph,
-    std::function<bool(cudnnBackendDescriptor_t)> filter_fn) {
+                    OperationGraph_v8 &opGraph,
+                    std::function<bool(cudnnBackendDescriptor_t)> filter_fn) {
     CUDNN_FRONTEND_UNUSED(modes);
     EngineConfigList filtered_configs;
 
     for (auto mode : modes) {
-        if (mode == CUDNN_HEUR_MODES_COUNT) {continue;}
-        auto heuristics = EngineHeuristicsBuilder_v8()
-            .setOperationGraph(opGraph)
-            .setHeurMode(mode)
-            .build();
-        getLogger() << "Heuristic Mode " << mode << " has " << heuristics.getEngineConfigCount() << " configurations " << std::endl;
-        auto& engine_config = heuristics.getEngineConfig(heuristics.getEngineConfigCount());
+        if (mode == CUDNN_HEUR_MODES_COUNT) {
+            continue;
+        }
+        auto heuristics = EngineHeuristicsBuilder_v8().setOperationGraph(opGraph).setHeurMode(mode).build();
+        getLogger() << "Heuristic Mode " << mode << " has " << heuristics.getEngineConfigCount() << " configurations "
+                    << std::endl;
+        auto &engine_config = heuristics.getEngineConfig(heuristics.getEngineConfigCount());
         cudnn_frontend::filter(engine_config, filtered_configs, filter_fn);
     }
     return filtered_configs;
 }
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
-#define NV_CUDNN_FE_TRY() \
-    try {
+#define NV_CUDNN_FE_TRY() try {
 #else
 #define NV_CUDNN_FE_TRY()
 #endif
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
-#define NV_CUDNN_FE_CATCH(...)                            \
-    } catch (cudnn_frontend::cudnnException &e) { \
-        __VA_ARGS__;                              \
+#define NV_CUDNN_FE_CATCH(...)                   \
+    }                                            \
+    catch (cudnn_frontend::cudnnException & e) { \
+        __VA_ARGS__;                             \
     }
 #else
 #define NV_CUDNN_FE_CATCH(...)
@@ -296,55 +297,50 @@ get_heuristics_list(std::array<cudnnBackendHeurMode_t, SIZE> modes,
         }                                                      \
     } while (0);
 
-#define NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status, is_last_status)   \
-    if (is_last_status || status != CUDNN_STATUS_SUCCESS) {             \
-        statuses.push_back(status);                                     \
-        if (status == CUDNN_STATUS_SUCCESS || evaluate_all) {continue;} \
-        break;                                                          \
+#define NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status, is_last_status) \
+    if (is_last_status || status != CUDNN_STATUS_SUCCESS) {           \
+        statuses.push_back(status);                                   \
+        if (status == CUDNN_STATUS_SUCCESS || evaluate_all) {         \
+            continue;                                                 \
+        }                                                             \
+        break;                                                        \
     }
 
-static inline
-cudnnStatus_t
-get_heuristics_list_impl(
-    cudnnBackendHeurMode_t heur_mode,
-    OperationGraph_v8 &opGraph,
-    std::function<bool(cudnnBackendDescriptor_t)> filter_fn,
-    EngineConfigList &filtered_configs) {
-
-        auto heuristics = EngineHeuristicsBuilder_v8()
-            .setOperationGraph(opGraph)
-            .setHeurMode(heur_mode)
-            .build();
-        NV_CUDNN_RETURN_IF_ERROR(heuristics);
-        auto num_config = heuristics.getEngineConfigCount();
-        NV_CUDNN_RETURN_IF_ERROR(heuristics);
-        getLogger() << "Heuristic Mode " << heur_mode << " has " << num_config << " configurations " << std::endl;
-        auto& engine_config = heuristics.getEngineConfig(num_config);
-        NV_CUDNN_RETURN_IF_ERROR(heuristics);
-        cudnn_frontend::filter(engine_config, filtered_configs, filter_fn);
-        return CUDNN_STATUS_SUCCESS;
+static inline cudnnStatus_t
+get_heuristics_list_impl(cudnnBackendHeurMode_t heur_mode,
+                         OperationGraph_v8 &opGraph,
+                         std::function<bool(cudnnBackendDescriptor_t)> filter_fn,
+                         EngineConfigList &filtered_configs) {
+    auto heuristics = EngineHeuristicsBuilder_v8().setOperationGraph(opGraph).setHeurMode(heur_mode).build();
+    NV_CUDNN_RETURN_IF_ERROR(heuristics);
+    auto num_config = heuristics.getEngineConfigCount();
+    NV_CUDNN_RETURN_IF_ERROR(heuristics);
+    getLogger() << "Heuristic Mode " << heur_mode << " has " << num_config << " configurations " << std::endl;
+    auto &engine_config = heuristics.getEngineConfig(num_config);
+    NV_CUDNN_RETURN_IF_ERROR(heuristics);
+    cudnn_frontend::filter(engine_config, filtered_configs, filter_fn);
+    return CUDNN_STATUS_SUCCESS;
 }
 
-template<std::size_t SIZE>
+template <std::size_t SIZE>
 std::vector<cudnnStatus_t>
 get_heuristics_list(std::array<std::string, SIZE> modes,
-    OperationGraph_v8 &opGraph,
-    std::function<bool(cudnnBackendDescriptor_t)> filter_fn,
-    EngineConfigList &filtered_configs,
-    bool evaluate_all = false) {
-    
+                    OperationGraph_v8 &opGraph,
+                    std::function<bool(cudnnBackendDescriptor_t)> filter_fn,
+                    EngineConfigList &filtered_configs,
+                    bool evaluate_all = false) {
     std::vector<cudnnStatus_t> statuses;
 
-    // Try building the heuristics for each mode 
+    // Try building the heuristics for each mode
     // if fails push the status in the list of statuses
     for (auto &mode : modes) {
         if (mode.find("heuristics_instant") != std::string::npos ||
-            mode.find("heuristics_mode_a")  != std::string::npos) {
+            mode.find("heuristics_mode_a") != std::string::npos) {
             auto heur_mode =
 #if (CUDNN_VERSION >= 8300)
-                        CUDNN_HEUR_MODE_A;
+                CUDNN_HEUR_MODE_A;
 #else
-                        CUDNN_HEUR_MODE_INSTANT;
+                CUDNN_HEUR_MODE_INSTANT;
 #endif
             NV_CUDNN_FE_TRY();
             auto status_l = get_heuristics_list_impl(heur_mode, opGraph, filter_fn, filtered_configs);
@@ -357,19 +353,17 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
             auto status_l = get_heuristics_list_impl(CUDNN_HEUR_MODE_FALLBACK, opGraph, filter_fn, filtered_configs);
             NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status_l, true);
 #else
-            cudnnBackendDescriptorType_t op_type = CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR;
-            std::string tag_ = opGraph.getTag();
+            DescriptorType_t op_type = DescriptorType_t::OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR;
+            std::string tag_         = opGraph.getTag();
             if (tag_.find("ConvFwd") != std::string::npos) {
-                op_type = CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR;
+                op_type = DescriptorType_t::OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR;
             } else if (tag_.find("ConvBwdFilter") != std::string::npos) {
-                op_type = CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR;
+                op_type = DescriptorType_t::OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR;
             }
-            auto heuristics = cudnn_frontend::EngineFallbackListBuilder_v8()
-                                .setOperationGraph(opGraph)
-                                .setOperation(op_type)
-                                .build();
+            auto heuristics =
+                cudnn_frontend::EngineFallbackListBuilder_v8().setOperationGraph(opGraph).setOperation(op_type).build();
             NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(heuristics.get_status(), false);
-            auto& fallback_list = heuristics.getFallbackList();
+            auto &fallback_list = heuristics.getFallbackList();
             NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(heuristics.get_status(), false);
             getLogger() << "Fallback List has " << fallback_list.size() << " configurations " << std::endl;
             cudnn_frontend::filter(fallback_list, filtered_configs, filter_fn);
@@ -379,15 +373,15 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
         } else if (mode.find("heuristics_mode_b") != std::string::npos) {
             auto heur_mode =
 #if (CUDNN_VERSION >= 8300)
-                        CUDNN_HEUR_MODE_B;
+                CUDNN_HEUR_MODE_B;
 #else
-                        CUDNN_HEUR_MODE_INSTANT;
+                CUDNN_HEUR_MODE_INSTANT;
 #endif
             NV_CUDNN_FE_TRY();
             auto status_l = get_heuristics_list_impl(heur_mode, opGraph, filter_fn, filtered_configs);
 
             // Between cudnn version 8.3 and 8.6, when heur_mode_b heuristics did not succeed,
-            // there was no fallback to the instant mode. We are here manually adding instant mode 
+            // there was no fallback to the instant mode. We are here manually adding instant mode
             // to the heur_mode_b to alleviate this issue.
 #if (CUDNN_VERSION >= 8300) && (CUDNN_VERSION < 8600)
             if (status_l != CUDNN_STATUS_SUCCESS) {
@@ -397,19 +391,20 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
             NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status_l, true);
 #if (CUDNN_VERSION >= 8300) && (CUDNN_VERSION < 8600)
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
-            } catch (cudnn_frontend::cudnnException &) {
-                NV_CUDNN_FE_TRY();
-                auto status_ = get_heuristics_list_impl(heur_mode, opGraph, filter_fn, filtered_configs);
-                statuses.push_back(status_);
-                NV_CUDNN_FE_CATCH(NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(e.getCudnnStatus(), true));
-            }
+        }
+        catch (cudnn_frontend::cudnnException &) {
+            NV_CUDNN_FE_TRY();
+            auto status_ = get_heuristics_list_impl(heur_mode, opGraph, filter_fn, filtered_configs);
+            statuses.push_back(status_);
+            NV_CUDNN_FE_CATCH(NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(e.getCudnnStatus(), true));
+        }
 #endif
 #else
             NV_CUDNN_FE_CATCH(NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(e.getCudnnStatus(), true));
 #endif
-        }
     }
-    return statuses;
+}
+return statuses;
 }
 
 #undef NV_CUDNN_FE_TRY
@@ -417,10 +412,10 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
 #undef NV_CUDNN_RETURN_IF_ERROR
 #undef NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE
 
-using EngineHeuristicsBuilde    = EngineHeuristicsBuilder_v8;
-using EngineHeuristics          = EngineHeuristics_v8;
-}
+using EngineHeuristicsBuilde = EngineHeuristicsBuilder_v8;
+using EngineHeuristics       = EngineHeuristics_v8;
+}  // namespace cudnn_frontend
 
-#if defined( _MSC_VER )
-#pragma warning( pop )
+#if defined(_MSC_VER)
+#pragma warning(pop)
 #endif

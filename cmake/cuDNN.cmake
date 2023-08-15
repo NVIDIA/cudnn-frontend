@@ -7,22 +7,20 @@ find_path(
 )
 
 function(find_cudnn_library NAME)
-    string(TOUPPER ${NAME} UPPERCASE_NAME)
-
     find_library(
-        ${UPPERCASE_NAME}_LIBRARY ${NAME}
+        ${NAME}_LIBRARY ${NAME}
         HINTS $ENV{CUDNN_PATH} ${CUDNN_PATH} ${CUDAToolkit_LIBRARY_DIR}
         PATH_SUFFIXES lib64 lib/x64 lib
     )
     
-    if(${UPPERCASE_NAME}_LIBRARY)
+    if(${NAME}_LIBRARY)
         add_library(CUDNN::${NAME} UNKNOWN IMPORTED)
         set_target_properties(
             CUDNN::${NAME} PROPERTIES
             INTERFACE_INCLUDE_DIRECTORIES ${CUDNN_INCLUDE_DIR}
-            IMPORTED_LOCATION ${${UPPERCASE_NAME}_LIBRARY}
+            IMPORTED_LOCATION ${${NAME}_LIBRARY}
         )
-        message(STATUS "${NAME} found at ${${UPPERCASE_NAME}_LIBRARY}.")
+        message(STATUS "${NAME} found at ${${NAME}_LIBRARY}.")
     else()
         message(STATUS "${NAME} not found.")
     endif()
@@ -41,12 +39,12 @@ find_cudnn_library(cudnn_ops_train)
 include (FindPackageHandleStandardArgs)
 find_package_handle_standard_args(
     LIBRARY REQUIRED_VARS
-    CUDNN_INCLUDE_DIR CUDNN_LIBRARY
+    CUDNN_INCLUDE_DIR cudnn_LIBRARY
 )
 
-if(CUDNN_INCLUDE_DIR AND CUDNN_LIBRARY)
+if(CUDNN_INCLUDE_DIR AND cudnn_LIBRARY)
 
-    message(STATUS "cuDNN: ${CUDNN_LIBRARY}")
+    message(STATUS "cuDNN: ${cudnn_LIBRARY}")
     message(STATUS "cuDNN: ${CUDNN_INCLUDE_DIR}")
     
     set(CUDNN_FOUND ON CACHE INTERNAL "cuDNN Library Found")

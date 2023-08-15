@@ -94,7 +94,7 @@ class EngineConfig_v8 : public BackendDescriptor {
     ManagedOpaqueDescriptor engine = nullptr;
     int64_t numKnobs               = 0;
     std::string opGraphTag;
-    bool set_knobs_attr = false;
+    bool set_knobs_attr                                                  = false;
     std::array<ManagedOpaqueDescriptor, CUDNN_KNOB_TYPE_COUNTS> bChoices = {};  //!< Opaque pointer to the backend knobs
 };
 
@@ -246,4 +246,4 @@ class EngineConfigBuilder_v8 {
 /// from various source and apply a filter.
 
 using EngineConfigList = std::vector<ManagedOpaqueDescriptor>;
-}
+}  // namespace cudnn_frontend

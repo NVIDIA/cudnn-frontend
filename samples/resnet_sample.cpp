@@ -18,7 +18,7 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
- */ 
+ */
 
 #include "cudnn_frontend.h"
 
@@ -26,7 +26,10 @@
 
 #include "resnet_sample.h"
 
-void RunResidualBlock(cudnn_frontend::ResidualBlockParams const & params, cudnn_frontend::ResidualBlockDevPtrStore* devPtrStore, const std::string &type) {
+void
+RunResidualBlock(cudnn_frontend::ResidualBlockParams const &params,
+                 cudnn_frontend::ResidualBlockDevPtrStore *devPtrStore,
+                 const std::string &type) {
     if (check_device_arch_newer_than("hopper") == false) {
         return;
     }
@@ -52,13 +55,13 @@ void RunResidualBlock(cudnn_frontend::ResidualBlockParams const & params, cudnn_
     std::cout << "Residual block " << type << " requires workspace " << workspace_size << " bytes." << std::endl;
 
     void *workspace_ptr = NULL;
-    checkCudaErr(cudaMalloc((void**)&(workspace_ptr), workspace_size));
+    checkCudaErr(cudaMalloc((void **)&(workspace_ptr), workspace_size));
 
     status = cudnn_frontend::setWorkspace(devPtrStore, type, workspace_ptr);
     if (status != CUDNN_STATUS_SUCCESS) {
         CHECK(false);
     }
-    
+
     // Creates variant packs based on devPtrStore and executes
     status = cudnn_frontend::runBlock(handle, residualBlock, devPtrStore);
 
@@ -66,6 +69,7 @@ void RunResidualBlock(cudnn_frontend::ResidualBlockParams const & params, cudnn_
         std::cout << residualBlock->getErrorMessage() << std::endl;
         CHECK(false);
     }
+    cudaDeviceSynchronize();
     checkCudnnErr(cudnnDestroy(handle));
 }
 

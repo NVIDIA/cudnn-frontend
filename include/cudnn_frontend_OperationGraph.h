@@ -65,7 +65,7 @@ class OperationGraph_v8 : public BackendDescriptor {
 
     OperationGraph_v8(OperationGraph_v8 &&from) = default;
     OperationGraph_v8 &
-    operator= (OperationGraph_v8 &&from) = default;
+    operator=(OperationGraph_v8 &&from) = default;
 
     ~OperationGraph_v8() = default;
 
@@ -111,7 +111,7 @@ class OperationGraph_v8 : public BackendDescriptor {
 
     feature_vector_t
     getFeatureVector() const {
-        if(feature_vectors.size() != 0) {
+        if (feature_vectors.size() != 0) {
             return feature_vectors[0];
         } else {
             return {};
@@ -166,7 +166,7 @@ class OperationGraphBuilder_v8 {
 
     //! Set numoperations and the operations
     auto
-    setOperationGraph(std::vector<Operation> const & ops_) -> OperationGraphBuilder_v8 & {
+    setOperationGraph(std::vector<Operation> const &ops_) -> OperationGraphBuilder_v8 & {
         m_operationGraph.numOps = ops_.size();
         m_operationGraph.feature_vectors.resize(ops_.size());
         for (auto i = 0u; i < ops_.size(); i++) {
@@ -265,6 +265,7 @@ class OperationGraphBuilder_v8 {
     OperationGraph_v8 m_operationGraph;
 };
 
-using OperationGraph            = OperationGraph_v8;
-using OperationGraphBuilder     = OperationGraphBuilder_v8;
-}
+using OperationGraph        = OperationGraph_v8;
+using OperationGraphBuilder = OperationGraphBuilder_v8;
+
+}  // namespace cudnn_frontend

@@ -97,4 +97,4 @@ hasBehaviorNote(cudnnBackendDescriptor_t engine_config) {
     return hasBehavior;
 }
 #endif
-}
+}  // namespace cudnn_frontend
