@@ -27,9 +27,9 @@
 namespace cudnn_frontend {
 
 /// Variety of renames.
-using executionPlans_t   = std::vector<cudnn_frontend::ExecutionPlan>;
-using Predicate          = std::function<bool(cudnn_frontend::ExecutionPlan const &plan)>;
-using GeneratorSource    = std::function<cudnn_frontend::EngineConfigList(cudnn_frontend::OperationGraph &)>;
+using executionPlans_t = std::vector<cudnn_frontend::ExecutionPlan>;
+using Predicate        = std::function<bool(cudnn_frontend::ExecutionPlan const &plan)>;
+using GeneratorSource  = std::function<cudnn_frontend::EngineConfigList(cudnn_frontend::OperationGraph &)>;
 
 enum class CudnnFindSamplingTechnique {
     CUDNN_FIND_SAMPLE_ONCE,             //!< Sample once quick but may have unstable values
@@ -60,8 +60,8 @@ class EngineConfigGenerator {
         cudnn_frontend::EngineConfigList engine_configs;
         for (auto fn : engine_config_generators) {
             cudnn_frontend::EngineConfigList new_engine_config = fn(opGraph);
-            getLogger() << "[cudnn_frontend] Called engine config generator and produced " 
-                << new_engine_config.size() << " configs." << std::endl; 
+            getLogger() << "[cudnn_frontend] Called engine config generator and produced " << new_engine_config.size()
+                        << " configs." << std::endl;
             std::copy(new_engine_config.begin(), new_engine_config.end(), std::back_inserter(engine_configs));
             new_engine_config.clear();
         }
@@ -73,7 +73,6 @@ class EngineConfigGenerator {
     cudnnGetPlan(cudnnHandle_t handle, cudnn_frontend::OperationGraph &opGraph, Predicate pred) -> executionPlans_t;
     auto
     cudnnGetPlan(cudnnHandle_t handle, cudnn_frontend::OperationGraph &opGraph) -> executionPlans_t;
-
 
     /// Reruns the concatenated plans and measures the execution time following which
     /// a sorted order of executionPlans are return to the user.
@@ -89,14 +88,15 @@ class EngineConfigGenerator {
     cudnnFindPlan(cudnnHandle_t handle,
                   cudnn_frontend::OperationGraph &opGraph,
                   cudnn_frontend::VariantPack const &variantPack) -> executionPlans_t;
-    
+
     template <CudnnFindSamplingTechnique samplingTechnique>
     auto
-    cudnnFindPlanAndCache(cudnnHandle_t handle,
-                          cudnn_frontend::OperationGraph &opGraph,
-                          cudnn_frontend::VariantPack const &variantPack,
-                          cudnn_frontend::ExecutionPlanCache &cache,
-                          Predicate pred = [](const cudnn_frontend::ExecutionPlan &) {return false;}) -> cudnn_frontend::ExecutionPlan;
+    cudnnFindPlanAndCache(
+        cudnnHandle_t handle,
+        cudnn_frontend::OperationGraph &opGraph,
+        cudnn_frontend::VariantPack const &variantPack,
+        cudnn_frontend::ExecutionPlanCache &cache,
+        Predicate pred = [](const cudnn_frontend::ExecutionPlan &) { return false; }) -> cudnn_frontend::ExecutionPlan;
 };
 
 /// Filter out the execution plan based on the prerequisite conditions.
@@ -106,7 +106,8 @@ static auto
 filter(Predicate pred, executionPlans_t &plans) -> executionPlans_t {
     executionPlans_t filtered_plans;
     for (auto &plan : plans) {
-        getLogger() << "[cudnn_frontend] "<< "Filtered ";
+        getLogger() << "[cudnn_frontend] "
+                    << "Filtered ";
         if (!pred(plan)) {
             getLogger() << "and Added ";
             filtered_plans.emplace_back(std::move(plan));
@@ -118,4 +119,4 @@ filter(Predicate pred, executionPlans_t &plans) -> executionPlans_t {
     getLogger() << "[cudnn_frontend] Filtered plans count " << filtered_plans.size() << std::endl;
     return filtered_plans;
 }
-}
+}  // namespace cudnn_frontend

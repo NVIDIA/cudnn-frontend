@@ -18,7 +18,7 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
- */ 
+ */
 
 #pragma once
 
@@ -26,21 +26,20 @@
 #include <cmath>
 
 template <typename T_ELEM>
-void weightGrad_cpu_ref(
-    const T_ELEM* image,
-    const T_ELEM* diffData,
-    T_ELEM* output,
-    cudnnTensorFormat_t filterFormat,
-    const int64_t* inDims,
-    const int64_t* filDims,
-    const int64_t* diffDims,
-    const int64_t* stride,
-    const int64_t* pad,
-    const int64_t* dilation,
-    int nbDims) 
-{
-    float alpha     = 1.0f;
-    float beta      = 0.0;
+void
+weightGrad_cpu_ref(const T_ELEM* image,
+                   const T_ELEM* diffData,
+                   T_ELEM* output,
+                   cudnnTensorFormat_t filterFormat,
+                   const int64_t* inDims,
+                   const int64_t* filDims,
+                   const int64_t* diffDims,
+                   const int64_t* stride,
+                   const int64_t* pad,
+                   const int64_t* dilation,
+                   int nbDims) {
+    float alpha = 1.0f;
+    float beta  = 0.0;
     // Some sanity checks
     // image   is n x c x h x w
     // diff    is n x k x p x q
@@ -65,7 +64,8 @@ void weightGrad_cpu_ref(
         for (size_t ri = 0; ri < (size_t)filDims[2]; ri++) {          //        ^
             for (size_t si = 0; si < (size_t)filDims[3]; si++) {      //    ^
                 for (size_t ki = 0; ki < (size_t)filDims[0]; ki++) {  // ^
-                    int64_t filIdx = ki * filterStride[0] + ci * filterStride[1] + ri * filterStride[2] + si * filterStride[3];
+                    int64_t filIdx =
+                        ki * filterStride[0] + ci * filterStride[1] + ri * filterStride[2] + si * filterStride[3];
                     float val = 0.f;
                     // For every image (n)
                     for (int ni = 0; ni < inDims[0]; ni++) {  // Sum over the batch
@@ -78,7 +78,7 @@ void weightGrad_cpu_ref(
                                 int64_t y = pi * stride[0] - pad[0];
                                 int64_t x = qi * stride[1] - pad[1];
                                 // Convolution = Correlation with a flipped filter
-                                // So basically, for the convolution, we replace r by dim-1-r 
+                                // So basically, for the convolution, we replace r by dim-1-r
                                 // and s by dim-1-s to "flip" the filter.
                                 // We can then just reason in term of correlation
                                 if (isConv) {
@@ -97,7 +97,8 @@ void weightGrad_cpu_ref(
                                 if (inBounds) {
                                     int imIdx = static_cast<int>(offset_image + y * inStride[2] + x * inStride[3]);
                                     // Diff value
-                                    int diffIdx = static_cast<int>(offset_diff + pi * diffStride[2] + qi * diffStride[3]);
+                                    int diffIdx =
+                                        static_cast<int>(offset_diff + pi * diffStride[2] + qi * diffStride[3]);
                                     // Prod and accumulate
                                     T_ELEM imTmp   = image[imIdx];
                                     T_ELEM diffTmp = diffData[diffIdx];
@@ -114,52 +115,45 @@ void weightGrad_cpu_ref(
 }
 
 template <typename inputType, typename scale_bias_type, typename outputType>
-void scale_and_bias_tensor_cpu(
-    const inputType* inputData, 
-    outputType* outputData,
-    const scale_bias_type* scaleData,
-    const scale_bias_type* biasData,
-    const int64_t inputSize,
-    const int64_t* inputDims)
-{
+void
+scale_and_bias_tensor_cpu(const inputType* inputData,
+                          outputType* outputData,
+                          const scale_bias_type* scaleData,
+                          const scale_bias_type* biasData,
+                          const int64_t inputSize,
+                          const int64_t* inputDims) {
     // Scale and bias per channel basis. Assumes NHWC format.
     for (int i = 0; i < inputSize; i++) {
-        int c = i % inputDims[0];
+        int c         = i % inputDims[0];
         outputData[i] = (scale_bias_type)inputData[i] * scaleData[c] + biasData[c];
     }
 }
 
 template <typename inputType>
-void add_tensors_cpu(
-    const inputType* firstInputData,
-    const inputType* secondInputData,
-    inputType* outputData,
-    const int64_t inputSize)
-{
+void
+add_tensors_cpu(const inputType* firstInputData,
+                const inputType* secondInputData,
+                inputType* outputData,
+                const int64_t inputSize) {
     for (int i = 0; i < inputSize; i++) {
         outputData[i] = firstInputData[i] + secondInputData[i];
     }
 }
 
-
 template <typename inputType, typename outputType>
-void relu(
-    const inputType* inputData, 
-    outputType* outputData,
-    const int64_t inputSize)
-{
+void
+relu(const inputType* inputData, outputType* outputData, const int64_t inputSize) {
     for (int i = 0; i < inputSize; i++) {
-        outputData[i] = inputData[i] > (inputType) 0.0 ? inputData[i] : (inputType) 0.0;
+        outputData[i] = inputData[i] > (inputType)0.0 ? inputData[i] : (inputType)0.0;
     }
 }
 
 template <typename T_ELEM>
-void gen_stats_cpu(
-    const T_ELEM* inputData, 
-    std::vector<std::pair<float, float>> &outputData,
-    const int64_t inputSize,
-    const int64_t* inputDims)
-{
+void
+gen_stats_cpu(const T_ELEM* inputData,
+              std::vector<std::pair<float, float>>& outputData,
+              const int64_t inputSize,
+              const int64_t* inputDims) {
     int64_t channel_dim = inputDims[1];
     std::vector<int64_t> totals((size_t)channel_dim, 0);
     for (int i = 0; i < inputSize; i++) {
@@ -167,7 +161,7 @@ void gen_stats_cpu(
 
         // Sum
         outputData[channel_index].first = outputData[channel_index].first + (float)inputData[i];
-        totals[channel_index] = totals[channel_index] + 1;
+        totals[channel_index]           = totals[channel_index] + 1;
     }
 
     // Calculate the mean for each channel. Assumes NHWC format.
@@ -179,7 +173,8 @@ void gen_stats_cpu(
         int channel_index = i % channel_dim;
 
         // Sum of squares
-        T_ELEM diff = ((float)inputData[i] - outputData[channel_index].first) * ((float)inputData[i] - outputData[channel_index].first);
+        T_ELEM diff = ((float)inputData[i] - outputData[channel_index].first) *
+                      ((float)inputData[i] - outputData[channel_index].first);
         outputData[channel_index].second = (T_ELEM)outputData[channel_index].second + diff;
     }
 
@@ -190,41 +185,38 @@ void gen_stats_cpu(
 }
 
 template <typename T_ELEM>
-void batch_normalize(
-    const T_ELEM* inputData,
-    T_ELEM* outputData,
-    const std::vector<std::pair<float, float>> &stats,
-    const int64_t inputSize,
-    const int64_t* inputDims)
-{   
+void
+batch_normalize(const T_ELEM* inputData,
+                T_ELEM* outputData,
+                const std::vector<std::pair<float, float>>& stats,
+                const int64_t inputSize,
+                const int64_t* inputDims) {
     int64_t channel_dim = inputDims[1];
     // Loop through each element in the input and normalize it based on what batch it belongs to
     for (int i = 0; i < inputSize; i++) {
         int batch_index = i % channel_dim;
-        outputData[i] = ((float)inputData[i] - stats[batch_index].first) / (float) std::sqrt(stats[batch_index].second);
+        outputData[i] = ((float)inputData[i] - stats[batch_index].first) / (float)std::sqrt(stats[batch_index].second);
     }
 }
 
-
 // T_ELEM is the type the data is stored in, T_MATH is the type the calculations are done in.
-template <typename T_ELEM, typename T_MATH> 
-void conv_cpu_ref(
-    const T_ELEM* inputData,
-    const T_ELEM* filterData,
-    T_ELEM* outputData,
-    int resizeFactor,
-    cudnnTensorFormat_t filterFormat,
-    const int64_t* inDims,
-    const int64_t* filDims,
-    const int64_t* diffDims,
-    const int64_t* stride,
-    const int64_t* pad,
-    const int64_t* dilation,
-    int64_t nbDims) 
-{
+template <typename T_ELEM, typename T_MATH>
+void
+conv_cpu_ref(const T_ELEM* inputData,
+             const T_ELEM* filterData,
+             T_ELEM* outputData,
+             int resizeFactor,
+             cudnnTensorFormat_t filterFormat,
+             const int64_t* inDims,
+             const int64_t* filDims,
+             const int64_t* diffDims,
+             const int64_t* stride,
+             const int64_t* pad,
+             const int64_t* dilation,
+             int64_t nbDims) {
     int64_t imDims = nbDims - 2;
-    float alpha     = 1.0f;
-    float beta      = 0.0;
+    float alpha    = 1.0f;
+    float beta     = 0.0;
     // Some sanity checks
     // image   is n x c x h x w
     // diff    is n x k x p x q
@@ -274,7 +266,7 @@ void conv_cpu_ref(
             for (int outId = 0; outId < nPixelsOut; outId++) {
                 // Get output pixel ids
                 lin2dim(outId, outIds, diffDims + 2, imDims);  // Skip n and k dimensions
-                // Now we get the coordinates in input space of the "top left" corner 
+                // Now we get the coordinates in input space of the "top left" corner
                 // of the filter: multiply by stride and remove pad
                 for (int d = 0; d < imDims; d++) {
                     inIds[d] = outIds[d] * stride[d] - pad[d];
@@ -286,7 +278,8 @@ void conv_cpu_ref(
                     // For each outer feature layer of the input image and filter
                     for (int ci = 0; ci < inDims[1] / resizeFactor; ci++) {
                         int64_t inputOffset = ni * inStride[0] / resizeFactor + ci * inStride[1];
-                        int64_t filterOffset = (ki_outer * resizeFactor + ki_inner) * filStride[0] / resizeFactor + ci * filStride[1];
+                        int64_t filterOffset =
+                            (ki_outer * resizeFactor + ki_inner) * filStride[0] / resizeFactor + ci * filStride[1];
                         // Now for every pixel in the filter
                         for (int filId = 0; filId < nPixelsFil; filId++) {
                             // Get the position of the pixel
@@ -329,21 +322,20 @@ void conv_cpu_ref(
     }
 }
 
-template <typename T_ELEM> 
-void dataGrad_cpu_ref(
-    const T_ELEM* weight,
-    const T_ELEM* top_diff,
-    T_ELEM* output,
-    cudnnTensorFormat_t filterFormat,
-    const int64_t* inDims,
-    const int64_t* filDims,
-    const int64_t* outDims,
-    const int64_t* stride,
-    const int64_t* pad,
-    const int64_t* dilation,
-    int nbDims,
-    cudnnConvolutionMode_t mode) 
-{
+template <typename T_ELEM>
+void
+dataGrad_cpu_ref(const T_ELEM* weight,
+                 const T_ELEM* top_diff,
+                 T_ELEM* output,
+                 cudnnTensorFormat_t filterFormat,
+                 const int64_t* inDims,
+                 const int64_t* filDims,
+                 const int64_t* outDims,
+                 const int64_t* stride,
+                 const int64_t* pad,
+                 const int64_t* dilation,
+                 int nbDims,
+                 cudnnConvolutionMode_t mode) {
     // Sanity checks
     // output is n x c x h x w
     // diff   is n x k x p x q
@@ -355,8 +347,8 @@ void dataGrad_cpu_ref(
     int64_t inStride[8];
     int64_t outStride[8];
 
-    float alpha     = 1.0f;
-    float beta      = 0.0;
+    float alpha = 1.0f;
+    float beta  = 0.0;
 
     generateStrides(inDims, inStride, nbDims, filterFormat);
     generateStrides(outDims, outStride, nbDims, filterFormat);
@@ -373,7 +365,7 @@ void dataGrad_cpu_ref(
             for (int hi = 0; hi < outDims[2]; hi++) {
                 for (int wi = 0; wi < outDims[3]; wi++) {
                     int64_t outIdx = ni * outStride[0] + ci * outStride[1] + hi * outStride[2] + wi * outStride[3];
-                    float val  = 0.0;
+                    float val      = 0.0;
 
                     // For every diff channel (k)
                     for (int ki = 0; ki < inDims[1]; ki++) {  // Sum over k channels
@@ -399,7 +391,7 @@ void dataGrad_cpu_ref(
                                 int64_t q = wi + pad[1];
 
                                 // Fetch the value in filter and diff, product and accumulate
-                                // So basically, for the convolution, we replace r by dim-1-r 
+                                // So basically, for the convolution, we replace r by dim-1-r
                                 // and s by dim-1-s to "flip" the filter
                                 // We can then just reason in term of correlation
                                 if (isConv) {
@@ -419,9 +411,9 @@ void dataGrad_cpu_ref(
                                 if (inBounds) {
                                     int64_t filterIdx = offset_filter + ri * filStride[2] + si * filStride[3];
                                     int64_t diffIdx   = offset_diff + p * inStride[2] + q * inStride[3];
-                                    T_ELEM imTmp  = top_diff[(size_t)diffIdx];
-                                    T_ELEM filTmp = weight[(size_t)filterIdx];
-                                    val           = doFma(filTmp, imTmp, val);
+                                    T_ELEM imTmp      = top_diff[(size_t)diffIdx];
+                                    T_ELEM filTmp     = weight[(size_t)filterIdx];
+                                    val               = doFma(filTmp, imTmp, val);
                                 }
                             }
                         }

@@ -28,43 +28,43 @@
 
 namespace cudnn_frontend {
 
-auto static get_fallback_engine_list(cudnnBackendDescriptorType_t mode, const std::string  &opGraphTag) -> std::vector<int> {
+[[maybe_unused]] auto static get_fallback_engine_list(DescriptorType_t mode, const std::string &opGraphTag) -> std::vector<int> {
     auto major_version = cudnnGetVersion() / 1000;
-    
+
     auto minor_version = (cudnnGetVersion() / 100) % 10;
     if (major_version >= 8) {
         if (minor_version <= 2) {
             /// Here we are using the term "bias" in the operationGraph as a proxy for
-            /// the conv*bias* operation graph. We are not strictly checking the order of 
+            /// the conv*bias* operation graph. We are not strictly checking the order of
             /// the operations in the graph. We propose this as a temporary workaround until
             /// the backend API supports querying the fallback list directly from cudnn
-            if (mode == CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR) {
+            if (mode == DescriptorType_t::OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR) {
                 if (opGraphTag.find("bias") == std::string::npos) {
                     std::vector<int> engine_list(50);
                     std::iota(engine_list.begin(), engine_list.end(), 0);
                     return engine_list;
                 } else {
-                    return {11,0};
+                    return {11, 0};
                 }
-            } else if (mode == CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR) {
+            } else if (mode == DescriptorType_t::OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR) {
                 std::vector<int> engine_list(61);
                 std::iota(engine_list.begin(), engine_list.end(), 0);
                 return engine_list;
-            } else if (mode == CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR) {
+            } else if (mode == DescriptorType_t::OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR) {
                 return {0, 1, 20};
             } else {
                 return {};
             }
         } else {
-            if (mode == CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR) {
+            if (mode == DescriptorType_t::OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR) {
                 if (opGraphTag.find("bias") == std::string::npos) {
                     return {0, 1, 28};
                 } else {
                     return {};
                 }
-            } else if (mode == CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR) {
+            } else if (mode == DescriptorType_t::OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR) {
                 return {0, 1, 25};
-            } else if (mode == CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR) {
+            } else if (mode == DescriptorType_t::OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR) {
                 return {0, 1, 20};
             } else {
                 return {};
@@ -109,7 +109,7 @@ class EngineFallbackList_v8 : public BackendDescriptor {
     operator=(EngineFallbackList_v8 const &) = delete;
 
     ManagedOpaqueDescriptor opGraph = nullptr;
-    cudnnBackendDescriptorType_t mode;
+    DescriptorType_t mode;
     uint64_t num_ops;
     std::vector<ManagedOpaqueDescriptor> m_engine_configs;
     std::string opGraphTag;
@@ -132,9 +132,16 @@ class EngineFallbackListBuilder_v8 {
         m_fallback_list.num_ops    = opGraph_.getOpCount();
         return *this;
     }
+
+    auto
+    setOperation(DescriptorType_t mode) -> EngineFallbackListBuilder_v8 & {
+        m_fallback_list.mode = mode;
+        return *this;
+    }
+
     auto
     setOperation(cudnnBackendDescriptorType_t mode) -> EngineFallbackListBuilder_v8 & {
-        m_fallback_list.mode = mode;
+        m_fallback_list.mode = detail::convert_from_cudnn_type(mode);
         return *this;
     }
     /** @} */
@@ -152,10 +159,10 @@ class EngineFallbackListBuilder_v8 {
         };
 #if (CUDNN_VERSION >= 8400)
         auto fallback_heuristics = EngineHeuristicsBuilder_v8()
-                                    .setHeurMode(CUDNN_HEUR_MODE_FALLBACK)
-                                    .setOperationGraph(m_fallback_list.opGraph, m_fallback_list.opGraphTag)
-                                    .build();
-        auto count  = fallback_heuristics.getEngineConfigCount();
+                                       .setHeurMode(CUDNN_HEUR_MODE_FALLBACK)
+                                       .setOperationGraph(m_fallback_list.opGraph, m_fallback_list.opGraphTag)
+                                       .build();
+        auto count                       = fallback_heuristics.getEngineConfigCount();
         m_fallback_list.m_engine_configs = fallback_heuristics.getEngineConfig(count);
 #else
         auto fallback_engine_list = get_fallback_engine_list(m_fallback_list.mode, m_fallback_list.opGraphTag);
@@ -191,4 +198,4 @@ class EngineFallbackListBuilder_v8 {
    private:
     EngineFallbackList_v8 m_fallback_list;
 };
-}
+}  // namespace cudnn_frontend

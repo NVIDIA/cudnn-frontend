@@ -9,7 +9,7 @@ find_package(CUDAToolkit)
 FetchContent_Declare(
   Catch2
   GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-  GIT_TAG        v3.0.1
+  GIT_TAG        v3.3.2
 )
 FetchContent_MakeAvailable(Catch2)
 
@@ -18,7 +18,16 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/cuDNN.cmake)
 
 add_executable(
     samples
-    conv_sample.cpp
+    
+    cpp/mha.cpp
+    cpp/convolutions.cpp
+    cpp/dgrads.cpp
+    cpp/matmuls.cpp
+    cpp/batchnorm.cpp
+    cpp/layernorm.cpp
+    cpp/wgrads.cpp
+
+    conv_sample.cpp 
     resnet_test_list.cpp
     resnet_sample.cpp
     test_list.cpp 
@@ -26,7 +35,6 @@ add_executable(
     helpers.cpp 
     fusion_sample.cpp 
     fp8_sample.cpp 
-    mha_sample.cpp
     norm_samples.cpp
     fused_mha_sample.cpp
     f16_flash_mha_sample.cpp
@@ -56,7 +64,6 @@ else()
         -Wno-unused-function
     )
 endif()
-target_include_directories(samples PRIVATE "resnet_block/include")
 
 target_link_libraries(
     samples
@@ -77,4 +84,10 @@ set_target_properties(
     PROPERTIES
     LINK_WHAT_YOU_USE TRUE
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+set_source_files_properties(
+    resnet_test_list.cpp resnet_sample.cpp
+    PROPERTIES 
+    INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/samples/resnet_block/include"
 )

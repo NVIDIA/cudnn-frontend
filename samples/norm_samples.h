@@ -39,22 +39,22 @@
 /**
  * @brief Run a Group BN forward sample with 2 peer stat tensors.
  *
- * @param tensorDims an array with shape (N, C, H, W) for input tensor dims. Stride in NHWC or NCHW will take care of memory format
+ * @param tensorDims an array with shape (N, C, H, W) for input tensor dims. Stride in NHWC or NCHW will take care of
+ memory format
  * @param perChannelSum an array with shape (1, C, 1, 1) to denote the sum values for each channel in the input tensor
  * @param epsilon a scalar array with shape (1, 1, 1, 1) to represent the epsilon value for the BN
- * @param peerDims an array with shape (num GPUs, 2 * C, 1, 1) to denote the tensor dimensions for peer stat tensor in GBN
+ * @param peerDims an array with shape (num GPUs, 2 * C, 1, 1) to denote the tensor dimensions for peer stat tensor in
+ GBN
 
  *
  */
 cudnn_frontend::ExecutionPlan
-run_batch_norm_forward(
-    cudnnHandle_t &handle_,
-    int64_t *tensorDims,
-    int64_t *perChannelSum,
-    int64_t *epsilon,
-    int64_t *peerDims,
-    cudnnDataType_t in_out_data_type
-);
+run_batch_norm_forward(cudnnHandle_t &handle_,
+                       int64_t *tensorDims,
+                       int64_t *perChannelSum,
+                       int64_t *epsilon,
+                       int64_t *peerDims,
+                       cudnnDataType_t in_out_data_type);
 /**
  * @param xDevPtr input tensor device pointer
  * @param yDevPtr output tensor device pointer
@@ -71,34 +71,35 @@ run_batch_norm_forward(
  * @param epsilon_val episilon value as a double
  * @param exponential_decay_factor exponential_decay_factor as a value
  *
-**/
+ **/
 void
-execute_batch_norm_forward(
-    cudnnHandle_t &handle_,
-    cudnn_frontend::ExecutionPlan plan,
-    void *xDevPtr,
-    void *yDevPtr,
-    void *scaledevPtr,
-    void *biasdevPtr,
-    void *in_meandevPtr,
-    void *in_vardevPtr,
-    void *out_meandevPtr,
-    void *out_vardevPtr,
-    void *saved_meandevPtr,
-    void *saved_inv_vardevPtr,
-    void *peer_devPtr1,
-    void *peer_devPtr2,
+execute_batch_norm_forward(cudnnHandle_t &handle_,
+                           cudnn_frontend::ExecutionPlan plan,
+                           void *xDevPtr,
+                           void *yDevPtr,
+                           void *scaledevPtr,
+                           void *biasdevPtr,
+                           void *in_meandevPtr,
+                           void *in_vardevPtr,
+                           void *out_meandevPtr,
+                           void *out_vardevPtr,
+                           void *saved_meandevPtr,
+                           void *saved_inv_vardevPtr,
+                           void *peer_devPtr1,
+                           void *peer_devPtr2,
 
-    double epsilon_val,
-    double exponential_decay_factor);
+                           double epsilon_val,
+                           double exponential_decay_factor);
 
 /**
  * @brief Run a Group BN backward sample with 2 peer stat tensors.
  *
- * @param tensorDims an array with shape (N, C, H, W) for input tensor dims. Stride in NHWC or NCHW will take care of memory format
+ * @param tensorDims an array with shape (N, C, H, W) for input tensor dims. Stride in NHWC or NCHW will take care of
+ * memory format
  * @param perChannelSum an array with shape (1, C, 1, 1) to denote the sum values for each channel in the input tensor
  * @param epsilon a scalar array with shape (1, 1, 1, 1) to represent the epsilon value for the BN
- * @param peerDims an array with shape (num GPUs, 2 * C, 1, 1) to denote the tensor dimensions for peer stat tensor in GBN
+ * @param peerDims an array with shape (num GPUs, 2 * C, 1, 1) to denote the tensor dimensions for peer stat tensor in
+ * GBN
  * @param xDevPtr input tensor device pointer
  * @param yDevPtr output tensor device pointer
  * @param scaledevPtr input scale device pointer for BN scaling
@@ -116,23 +117,21 @@ execute_batch_norm_forward(
  *
  */
 void
-run_batch_norm_backward(
-    int64_t *tensorDims,
-    int64_t *perChannelSum,
-    int64_t *epsilon,
-    int64_t *peerDims,
+run_batch_norm_backward(int64_t *tensorDims,
+                        int64_t *perChannelSum,
+                        int64_t *epsilon,
+                        int64_t *peerDims,
 
-    void *xDevPtr,
-    void *dyDevPtr,
-    void *scaledevPtr,
-    void *saved_meandevPtr,
-    void *saved_inv_vardevPtr,
-    void *peer_devPtr1,
-    void *peer_devPtr2,
-    void *dscaledevPtr,
-    void *dbiasdevPtr,
-    void *dxDevPtr,
+                        void *xDevPtr,
+                        void *dyDevPtr,
+                        void *scaledevPtr,
+                        void *saved_meandevPtr,
+                        void *saved_inv_vardevPtr,
+                        void *peer_devPtr1,
+                        void *peer_devPtr2,
+                        void *dscaledevPtr,
+                        void *dbiasdevPtr,
+                        void *dxDevPtr,
 
-    double epsilon_val,
-    cudnnDataType_t in_out_data_type
-);
+                        double epsilon_val,
+                        cudnnDataType_t in_out_data_type);

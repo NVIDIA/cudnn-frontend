@@ -27,13 +27,13 @@
 #include <cstring>
 
 #include "cudnn_backend_base.h"
-namespace  cudnn_frontend {
+namespace cudnn_frontend {
 
 static const char *
 get_environment(const char *name) {
 #ifdef WIN32
-#pragma warning(disable:4996)
-#define  _CRT_SECURE_NO_WARNINGS
+#pragma warning(disable : 4996)
+#define _CRT_SECURE_NO_WARNINGS
 #endif
 
     return std::getenv(name);
@@ -41,53 +41,62 @@ get_environment(const char *name) {
 
 inline bool &
 isLoggingEnabled() {
-    static bool log_enabled = get_environment("CUDNN_FRONTEND_LOG_INFO") && std::strncmp(get_environment("CUDNN_FRONTEND_LOG_INFO"), "0",1);
+    static bool log_enabled =
+        get_environment("CUDNN_FRONTEND_LOG_INFO") && std::strncmp(get_environment("CUDNN_FRONTEND_LOG_INFO"), "0", 1);
     return log_enabled;
 }
- 
+
 inline std::ostream &
-getStream() {                                                                                                                                                                                                                      
+getStream() {
     static std::ofstream outFile;
-    static std::ostream & stream  = get_environment("CUDNN_FRONTEND_LOG_FILE")
-         ?  (std::strncmp(get_environment("CUDNN_FRONTEND_LOG_FILE"), "stdout", 6) == 0 
-             ? std::cout : (std::strncmp(get_environment("CUDNN_FRONTEND_LOG_FILE"), "stderr", 6) == 0 
-                 ? std::cerr : (outFile.open(get_environment("CUDNN_FRONTEND_LOG_FILE"), std::ios::out), outFile)))
-         : (isLoggingEnabled() = false, std::cout);
+    static std::ostream &stream =
+        get_environment("CUDNN_FRONTEND_LOG_FILE")
+            ? (std::strncmp(get_environment("CUDNN_FRONTEND_LOG_FILE"), "stdout", 6) == 0
+                   ? std::cout
+                   : (std::strncmp(get_environment("CUDNN_FRONTEND_LOG_FILE"), "stderr", 6) == 0
+                          ? std::cerr
+                          : (outFile.open(get_environment("CUDNN_FRONTEND_LOG_FILE"), std::ios::out), outFile)))
+            : (isLoggingEnabled() = false, std::cout);
     return stream;
 }
 
-
 class ConditionalStreamer {
-  private:
+   private:
     std::ostream &stream;
-  public:
-    ConditionalStreamer(std::ostream &stream_) : stream(stream_){}
-  
+
+   public:
+    ConditionalStreamer(std::ostream &stream_) : stream(stream_) {}
+
     template <typename T>
     const ConditionalStreamer &
-    operator<< (const T &t) const {
-        if (isLoggingEnabled()) {stream << t;}  
+    operator<<(const T &t) const {
+        if (isLoggingEnabled()) {
+            stream << t;
+        }
         return *this;
     }
-  
+
     const ConditionalStreamer &
-    operator<< (std::ostream &(*spl)(std::ostream &)) const {
-        if (isLoggingEnabled()) {stream << spl;}
+    operator<<(std::ostream &(*spl)(std::ostream &)) const {
+        if (isLoggingEnabled()) {
+            stream << spl;
+        }
         return *this;
     }
 };
 
-
 inline ConditionalStreamer &
-getLogger() {                                         
+getLogger() {
     static ConditionalStreamer opt(getStream());
     return opt;
-}                    
+}
 
-static
-std::ostream &
-operator << (std::ostream &os, const BackendDescriptor & desc) {
-    if (isLoggingEnabled()) {os << desc.describe();}
+static std::ostream &
+operator<<(std::ostream &os, const BackendDescriptor &desc) {
+    if (isLoggingEnabled()) {
+        os << desc.describe();
+    }
     return os;
 }
-}
+
+}  // namespace cudnn_frontend

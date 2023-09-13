@@ -107,7 +107,7 @@ class Engine_v8 : public BackendDescriptor {
        private:
         cudnnBackendKnobType_t knobType = CUDNN_KNOB_TYPE_COUNTS;
         int64_t maxValue = 0, minValue = 0, stride = 0;  //!< min, max and stride of the knob value
-        int64_t choice = -1;                              //!< Choice set by the user
+        int64_t choice = -1;                             //!< Choice set by the user
     };
 
     ManagedOpaqueDescriptor opGraph = nullptr;
@@ -175,7 +175,7 @@ class Engine_v8 : public BackendDescriptor {
 
     Engine_v8 &
     operator=(Engine_v8 &&) = default;
-    ~Engine_v8() = default;
+    ~Engine_v8()            = default;
 
     std::string const &
     getTag() const {
@@ -194,10 +194,11 @@ class Engine_v8 : public BackendDescriptor {
         return knobs;
     }
 
-    bool knobs_set() const {
+    bool
+    knobs_set() const {
         bool is_knob_set = false;
         for (auto i = 0; i < numKnobs; i++) {
-            if(knobs[i].getChoice() != -1) {
+            if (knobs[i].getChoice() != -1) {
                 is_knob_set = true;
                 break;
             }
@@ -297,7 +298,6 @@ class EngineBuilder_v8 {
             return std::move(m_engine);
         }
 
-
         for (size_t i = 0; i < m_engine.bKnobs.size(); i++) {
             m_engine.bKnobs[i] = make_shared_backend_pointer(CUDNN_BACKEND_KNOB_INFO_DESCRIPTOR);
             if (m_engine.bKnobs[i]->is_good() == false) {
@@ -322,7 +322,9 @@ class EngineBuilder_v8 {
                                           bKnobs_.data());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
-                &m_engine, status, "CUDNN_BACKEND_ENGINE_DESCRIPTOR: GetAttribute CUDNN_ATTR_ENGINE_KNOB_INFO Query Failed");
+                &m_engine,
+                status,
+                "CUDNN_BACKEND_ENGINE_DESCRIPTOR: GetAttribute CUDNN_ATTR_ENGINE_KNOB_INFO Query Failed");
         }
         m_engine.buildKnobs();
         getLogger() << "[cudnn_frontend] " << m_engine << std::endl;
@@ -339,4 +341,4 @@ class EngineBuilder_v8 {
    private:
     Engine_v8 m_engine;
 };
-}
+}  // namespace cudnn_frontend

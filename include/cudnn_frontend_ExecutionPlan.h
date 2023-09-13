@@ -33,6 +33,7 @@
 #include <cudnn.h>
 #include <cudnn_backend.h>
 
+#include "cudnn_frontend_EngineConfig.h"
 #include "cudnn_frontend_Engine.h"
 #include "cudnn_frontend_utils.h"
 
@@ -73,12 +74,14 @@ class ExecutionPlan_v8 : public BackendDescriptor {
         std::stringstream ss;
         ss << "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR : ";
         ss << getTag() << ", ";
-        ss << "numeric_notes:" << "[";
-        for (auto note : numeric_notes_vec)  {
+        ss << "numeric_notes:"
+           << "[";
+        for (auto note : numeric_notes_vec) {
             ss << cudnn_frontend::to_string(note) << ",";
         }
-#if (CUDNN_VERSION >= 8200)  
-        ss << "] behavior_notes:" << "[";
+#if (CUDNN_VERSION >= 8200)
+        ss << "] behavior_notes:"
+           << "[";
         for (auto note : behavior_notes_vec) {
             ss << cudnn_frontend::to_string(note) << ",";
         }
@@ -107,12 +110,12 @@ class ExecutionPlan_v8 : public BackendDescriptor {
         return numeric_notes_vec;
     }
 
-    std::array<cudnnBackendNumericalNote_t,CUDNN_NUMERICAL_NOTE_TYPE_COUNT> const &
+    std::array<cudnnBackendNumericalNote_t, CUDNN_NUMERICAL_NOTE_TYPE_COUNT> const &
     getNumericNotes() const {
         return numeric_notes;
     }
 
-#if (CUDNN_VERSION >= 8200)  
+#if (CUDNN_VERSION >= 8200)
     std::array<cudnnBackendBehaviorNote_t, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT> const &
     getBehaviorNotes() const {
         return behavior_notes;
@@ -122,7 +125,6 @@ class ExecutionPlan_v8 : public BackendDescriptor {
         return behavior_notes_vec;
     }
 #endif
-
 
     std::string
     getJsonRepresentation() const {
@@ -160,9 +162,9 @@ class ExecutionPlan_v8 : public BackendDescriptor {
 #else
         auto status = CUDNN_STATUS_NOT_SUPPORTED;
         set_error_and_throw_exception(this,
-                                status,
-                                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
-                                "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
+                                      status,
+                                      "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                      "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
         std::string json_string{""};
         return json_string;
 #endif
@@ -171,53 +173,59 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     ExecutionPlan_v8(ExecutionPlan_v8 const &) = default;
     ExecutionPlan_v8 &
     operator=(ExecutionPlan_v8 const &) = default;
+
    private:
     void
     fetchNotes(ManagedOpaqueDescriptor &extractedEngine) {
-        auto status = CUDNN_STATUS_SUCCESS;
-        int64_t elem_count = 0;
+        auto status                               = CUDNN_STATUS_SUCCESS;
+        int64_t elem_count                        = 0;
         cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
-        status = cudnnBackendGetAttribute(extractedEngine_,
-                                 CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
-                                 CUDNN_TYPE_NUMERICAL_NOTE,
-                                 CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
-                                 &elem_count,
-                                 nullptr);
+        status                                    = cudnnBackendGetAttribute(extractedEngine_,
+                                          CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
+                                          CUDNN_TYPE_NUMERICAL_NOTE,
+                                          CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
+                                          &elem_count,
+                                          nullptr);
         numeric_notes_vec.resize(static_cast<size_t>(elem_count));
         status = cudnnBackendGetAttribute(extractedEngine_,
-                                 CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
-                                 CUDNN_TYPE_NUMERICAL_NOTE,
-                                 CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
-                                 &elem_count,
-                                 numeric_notes_vec.data());
-        ptrdiff_t end = static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_NUMERICAL_NOTE_TYPE_COUNT)));
+                                          CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
+                                          CUDNN_TYPE_NUMERICAL_NOTE,
+                                          CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
+                                          &elem_count,
+                                          numeric_notes_vec.data());
+        ptrdiff_t end =
+            static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_NUMERICAL_NOTE_TYPE_COUNT)));
         std::copy(numeric_notes_vec.begin(), numeric_notes_vec.begin() + end, numeric_notes.begin());
         if (static_cast<size_t>(elem_count) < numeric_notes.size())
-            std::fill_n(numeric_notes.begin() + static_cast<size_t>(elem_count), numeric_notes.size() - static_cast<size_t>(elem_count), CUDNN_NUMERICAL_NOTE_TYPE_COUNT);
+            std::fill_n(numeric_notes.begin() + static_cast<size_t>(elem_count),
+                        numeric_notes.size() - static_cast<size_t>(elem_count),
+                        CUDNN_NUMERICAL_NOTE_TYPE_COUNT);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
                                           status,
                                           "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
                                           "CUDNN_ATTR_ENGINE_NUMERICAL_NOTE Failed");
         }
-#if (CUDNN_VERSION >= 8200)  
+#if (CUDNN_VERSION >= 8200)
         status = cudnnBackendGetAttribute(extractedEngine_,
-                                 CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
-                                 CUDNN_TYPE_BEHAVIOR_NOTE,
-                                 CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
-                                 &elem_count,
-                                 nullptr);
+                                          CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
+                                          CUDNN_TYPE_BEHAVIOR_NOTE,
+                                          CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
+                                          &elem_count,
+                                          nullptr);
         behavior_notes_vec.resize(static_cast<size_t>(elem_count));
         status = cudnnBackendGetAttribute(extractedEngine_,
-                                 CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
-                                 CUDNN_TYPE_BEHAVIOR_NOTE,
-                                 CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
-                                 &elem_count,
-                                 behavior_notes_vec.data());
-        end = static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_BEHAVIOR_NOTE_TYPE_COUNT)));
+                                          CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
+                                          CUDNN_TYPE_BEHAVIOR_NOTE,
+                                          CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
+                                          &elem_count,
+                                          behavior_notes_vec.data());
+        end    = static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_BEHAVIOR_NOTE_TYPE_COUNT)));
         std::copy(behavior_notes_vec.begin(), behavior_notes_vec.begin() + end, behavior_notes.begin());
         if (static_cast<size_t>(elem_count) < behavior_notes.size())
-            std::fill_n(behavior_notes.begin() + static_cast<size_t>(elem_count), behavior_notes.size() - static_cast<size_t>(elem_count), CUDNN_BEHAVIOR_NOTE_TYPE_COUNT);
+            std::fill_n(behavior_notes.begin() + static_cast<size_t>(elem_count),
+                        behavior_notes.size() - static_cast<size_t>(elem_count),
+                        CUDNN_BEHAVIOR_NOTE_TYPE_COUNT);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
                                           status,
@@ -301,26 +309,25 @@ class ExecutionPlan_v8 : public BackendDescriptor {
             tag << "_k" << type << "=" << choice;
         }
         planTag += tag.str();
-
     }
 
     void
     computeWorkSpaceSize() {
-        auto status            = cudnnBackendGetAttribute(pointer->get_backend_descriptor(),
-                CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
-                CUDNN_TYPE_INT64,
-                1,
-                nullptr,
-                &workSpaceSize);
+        auto status = cudnnBackendGetAttribute(pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
+                                               CUDNN_TYPE_INT64,
+                                               1,
+                                               nullptr,
+                                               &workSpaceSize);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
-                    status,
-                    "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
-                    "CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE Failed");
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE Failed");
         }
         if (workSpaceSize < 0) {
             set_error_and_throw_exception(
-                    this, status, "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute Workspace Size Invalid");
+                this, status, "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute Workspace Size Invalid");
         }
     }
 
@@ -330,15 +337,14 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     std::string planTag;
 
     std::int64_t workSpaceSize = 0;
-    std::array<cudnnBackendNumericalNote_t,CUDNN_NUMERICAL_NOTE_TYPE_COUNT> numeric_notes;
+    std::array<cudnnBackendNumericalNote_t, CUDNN_NUMERICAL_NOTE_TYPE_COUNT> numeric_notes;
     std::vector<cudnnBackendNumericalNote_t> numeric_notes_vec;
-#if (CUDNN_VERSION >= 8200)  
-    std::array<cudnnBackendBehaviorNote_t, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT>  behavior_notes;
-    std::vector<cudnnBackendBehaviorNote_t>  behavior_notes_vec;
+#if (CUDNN_VERSION >= 8200)
+    std::array<cudnnBackendBehaviorNote_t, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT> behavior_notes;
+    std::vector<cudnnBackendBehaviorNote_t> behavior_notes_vec;
 #endif
 
-    float execution_time_ms    = 0.0f;
-
+    float execution_time_ms = 0.0f;
 };
 
 ///
@@ -435,12 +441,14 @@ class ExecutionPlanBuilder_v8 {
         ManagedOpaqueDescriptor extractedEngine = make_shared_backend_pointer(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
         status                                  = extractedEngine->get_status();
         if (status != CUDNN_STATUS_SUCCESS) {
-            set_error_and_throw_exception(
-                &m_execution_plan, status, "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnCreate of CUDNN_BACKEND_ENGINE_DESCRIPTOR failed when compute tag");
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnCreate of "
+                                          "CUDNN_BACKEND_ENGINE_DESCRIPTOR failed when compute tag");
             return std::move(m_execution_plan);
         }
         cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
-        int64_t elemCount = 0;
+        int64_t elemCount                         = 0;
         status = cudnnBackendGetAttribute(m_execution_plan.engine_config->get_backend_descriptor(),
                                           CUDNN_ATTR_ENGINECFG_ENGINE,
                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
@@ -465,7 +473,7 @@ class ExecutionPlanBuilder_v8 {
 
     ExecutionPlan_v8 &&
     loadFromJson(const std::string &json_plan) {
-    CUDNN_FRONTEND_UNUSED(json_plan);
+        CUDNN_FRONTEND_UNUSED(json_plan);
 #if (CUDNN_VERSION >= 8400)
         auto status = CUDNN_STATUS_SUCCESS;
 
@@ -493,10 +501,10 @@ class ExecutionPlanBuilder_v8 {
                                           serialization_buf.size(),
                                           serialization_buf.data());
         if (status != CUDNN_STATUS_SUCCESS) {
-            set_error_and_throw_exception(
-                &m_execution_plan,
-                status,
-                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
             return std::move(m_execution_plan);
         }
 
@@ -582,13 +590,12 @@ class ExecutionPlanBuilder_v8 {
 #else
         auto status = CUDNN_STATUS_NOT_SUPPORTED;
         set_error_and_throw_exception(&m_execution_plan,
-                                status,
-                                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: Build "
-                                "From Json Failed");
+                                      status,
+                                      "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: Build "
+                                      "From Json Failed");
         return std::move(m_execution_plan);
 #endif
     }
-
 
     explicit ExecutionPlanBuilder_v8()                       = default;
     ~ExecutionPlanBuilder_v8()                               = default;
@@ -601,6 +608,7 @@ class ExecutionPlanBuilder_v8 {
     ExecutionPlan_v8 m_execution_plan;
 };
 
-using ExecutionPlan             = ExecutionPlan_v8;
-using ExecutionPlanBuilder      = ExecutionPlanBuilder_v8;
-}
+using ExecutionPlan        = ExecutionPlan_v8;
+using ExecutionPlanBuilder = ExecutionPlanBuilder_v8;
+
+}  // namespace cudnn_frontend

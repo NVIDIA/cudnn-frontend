@@ -43,33 +43,33 @@
  *    | Feature_vector_type0_val0   |  Plan A0   |
  *    | Feature_vector_type0_val1   |  Plan B0   |
  *    ===============================================================================
- * 
- *    device_id_0 Operation_Graph1 (dgrad)  
+ *
+ *    device_id_0 Operation_Graph1 (dgrad)
  *    -------------------------------------------------------------------------------
  *    | Feature_vector_type1_val0   |  Plan A1   |
  *    | Feature_vector_type1_val1   |  Plan B1   |
  *    ===============================================================================
- *    
- *    device_id_0 Operation_Graph2 (wgrad)  
+ *
+ *    device_id_0 Operation_Graph2 (wgrad)
  *    -------------------------------------------------------------------------------
- *    | Feature_vector_type2_val0   |  Plan B2   |  
+ *    | Feature_vector_type2_val0   |  Plan B2   |
  *    ===============================================================================
- * 
+ *
  *    device_id_1 Operation_Graph0 (conv_fprop)
  *    -------------------------------------------------------------------------------
  *    | Feature_vector_type0_val0   |  Plan A0   |
  *    | Feature_vector_type0_val1   |  Plan B0   |
  *    ===============================================================================
- * 
- *    device_id_1 Operation_Graph1 (dgrad)  
+ *
+ *    device_id_1 Operation_Graph1 (dgrad)
  *    -------------------------------------------------------------------------------
  *    | Feature_vector_type1_val0   |  Plan A1   |
  *    | Feature_vector_type1_val1   |  Plan B1   |
  *    ===============================================================================
- *     
- *    device_id_1 Operation_Graph2 (wgrad)  
+ *
+ *    device_id_1 Operation_Graph2 (wgrad)
  *    -------------------------------------------------------------------------------
- *    | Feature_vector_type2_val0   |  Plan B2   |  
+ *    | Feature_vector_type2_val0   |  Plan B2   |
  *    ===============================================================================
  */
 
@@ -77,10 +77,10 @@ namespace cudnn_frontend {
 
 /// Plan Cache structure for the above table
 class ExecutionPlanCache_v1 {
-
    protected:
     struct compare {
-        bool operator ()(const feature_vector_t & fv1, const feature_vector_t &fv2) const {
+        bool
+        operator()(const feature_vector_t &fv1, const feature_vector_t &fv2) const {
             return fv1 < fv2;
         }
     };
@@ -88,39 +88,40 @@ class ExecutionPlanCache_v1 {
     std::string name = "plan_cache_[unnamed]";
 
     /// String to map of feature_vector to execution plan
-    /// For a given FeatureVector of type T according to the Operation Graph, we get the plan. 
-    using FeatureVectorToPlanMap = std::map<cudnn_frontend::feature_vector_t, cudnn_frontend::ExecutionPlan, cudnn_frontend::ExecutionPlanCache_v1::compare>;
-    FeatureVectorToPlanMap  cache;
+    /// For a given FeatureVector of type T according to the Operation Graph, we get the plan.
+    using FeatureVectorToPlanMap = std::map<cudnn_frontend::feature_vector_t,
+                                            cudnn_frontend::ExecutionPlan,
+                                            cudnn_frontend::ExecutionPlanCache_v1::compare>;
+    FeatureVectorToPlanMap cache;
 
     mutable std::mutex cache_mutex;
 
- public:
-    virtual bool 
-    is_fastest_plan_stable(const cudnn_frontend::OperationGraph &op_graph,
-                           const std::string & tag) {
+   public:
+    virtual bool
+    is_fastest_plan_stable(const cudnn_frontend::OperationGraph &op_graph, const std::string &tag) {
         CUDNN_FRONTEND_UNUSED(op_graph);
         CUDNN_FRONTEND_UNUSED(tag);
         return true;
     }
 
-    void add_plan_to_cache(const cudnn_frontend::OperationGraph &op_graph,
-                           const cudnn_frontend::ExecutionPlan &plan) {
+    void
+    add_plan_to_cache(const cudnn_frontend::OperationGraph &op_graph, const cudnn_frontend::ExecutionPlan &plan) {
         std::lock_guard<std::mutex> guard(cache_mutex);
-        cache.insert(std::make_pair(op_graph.getFeatureVector(),plan));
+        cache.insert(std::make_pair(op_graph.getFeatureVector(), plan));
         getLogger() << "[cudnn_frontend] Added to " << name << " " << op_graph.getTag() << std::endl;
     }
 
-    ExecutionPlanCache_v1(const char * name_) {
-        name = name_;
-    }
+    ExecutionPlanCache_v1(const char *name_) { name = name_; }
 
-    const std::string & get_name() const {
+    const std::string &
+    get_name() const {
         return name;
     }
 
     // Plan is the output here.
-    bool get_plan_from_cache(const cudnn_frontend::OperationGraph &op_graph, 
-                             const cudnn_frontend::ExecutionPlan *&plan) const {
+    bool
+    get_plan_from_cache(const cudnn_frontend::OperationGraph &op_graph,
+                        const cudnn_frontend::ExecutionPlan *&plan) const {
         {
             std::lock_guard<std::mutex> guard(cache_mutex);
             auto it = cache.find(op_graph.getFeatureVector());
@@ -136,48 +137,48 @@ class ExecutionPlanCache_v1 {
     }
 
     virtual ~ExecutionPlanCache_v1() = default;
-
 };
 
 class ExecutionPlanCache_v2 : public ExecutionPlanCache_v1 {
-
     using SaturationTracker = std::map<std::pair<cudnn_frontend::feature_vector_t, std::string>, int32_t>;
     SaturationTracker tracker;
-    
+
     int32_t saturationCount = 1;
 
- public:
-    virtual bool 
-    is_fastest_plan_stable(const cudnn_frontend::OperationGraph &op_graph,
-                           const std::string & tag) {
-        if (saturationCount == 1) {return true;} // Special case. Always add to the cache.
+   public:
+    virtual bool
+    is_fastest_plan_stable(const cudnn_frontend::OperationGraph &op_graph, const std::string &tag) {
+        if (saturationCount == 1) {
+            return true;
+        }  // Special case. Always add to the cache.
 
         // If plan cache is already created for the op_graph no need to update.
         // Ideally, one will auto-tune only if the plan cache has no plan for the op_graph.
         cudnn_frontend::ExecutionPlan const *plan = nullptr;
         if (get_plan_from_cache(op_graph, plan)) {
-            getLogger() << "[cudnn_frontend] SaturationTracker " << name << " " << op_graph.getTag() << " " << tag << " plan already in cache." << std::endl;
+            getLogger() << "[cudnn_frontend] SaturationTracker " << name << " " << op_graph.getTag() << " " << tag
+                        << " plan already in cache." << std::endl;
             return false;
         }
 
         // Lock the cache and increase the count till we saturate
         std::lock_guard<std::mutex> guard(cache_mutex);
-        auto cnt = tracker[std::make_pair(op_graph.getFeatureVector(),tag)] += 1;
-        getLogger() << "[cudnn_frontend] SaturationTracker " << name << " " << op_graph.getTag() << " " << tag << " " << cnt << std::endl;
+        auto cnt = tracker[std::make_pair(op_graph.getFeatureVector(), tag)] += 1;
+        getLogger() << "[cudnn_frontend] SaturationTracker " << name << " " << op_graph.getTag() << " " << tag << " "
+                    << cnt << std::endl;
         return cnt >= saturationCount;
     }
 
-    void set_saturation_count(int32_t count) {
+    void
+    set_saturation_count(int32_t count) {
         saturationCount = count;
     }
 
-    ExecutionPlanCache_v2(const char * name_) : ExecutionPlanCache_v1(name_) {
-    }
+    ExecutionPlanCache_v2(const char *name_) : ExecutionPlanCache_v1(name_) {}
 
     virtual ~ExecutionPlanCache_v2() = default;
-    
 };
 
 using ExecutionPlanCache = ExecutionPlanCache_v2;
 
-}
+}  // namespace cudnn_frontend

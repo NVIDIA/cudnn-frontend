@@ -1,8 +1,17 @@
 cmake_minimum_required(VERSION 3.17)
 
-project(cudnn_frontend VERSION 0.9)
+project(cudnn_frontend VERSION 1.0.0)
 
 option(CUDNN_FRONTEND_BUILD_SAMPLES "Defines if samples are built or not." ON)
+option(CUDNN_FRONTEND_BUILD_UNIT_TESTS "Defines if unittests are built or not." OFF)
+
+if(MSVC OR MSYS OR MINGW)
+    option(CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS "Defines if python bindings are built or not." OFF)
+    add_compile_options(/W4 /WX)
+else()
+    option(CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS "Defines if python bindings are built or not." ON)
+    add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wno-error=attributes -Wno-attributes -Wno-error=unused-function -Wno-unused-function)
+endif()
 
 add_library(cudnn_frontend INTERFACE)
 
@@ -12,8 +21,16 @@ target_include_directories(
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-target_compile_features(cudnn_frontend INTERFACE cxx_std_11)
+target_compile_features(cudnn_frontend INTERFACE cxx_std_17)
 
-if (${CUDNN_FRONTEND_BUILD_SAMPLES})
-add_subdirectory(samples)
+if (CUDNN_FRONTEND_BUILD_SAMPLES)
+    add_subdirectory(samples)
+endif()
+
+if (CUDNN_FRONTEND_BUILD_UNIT_TESTS)
+    add_subdirectory(test)
+endif()
+
+if (CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS)
+    add_subdirectory(python_bindings)
 endif()

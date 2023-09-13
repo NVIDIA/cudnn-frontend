@@ -22,9 +22,9 @@
 
 #pragma once
 
-#include <cudnn_frontend_EngineConfigGenerator.h>
 #include <iomanip>
 #include <set>
+#include "cudnn_frontend_EngineConfigGenerator.h"
 
 namespace cudnn_frontend {
 
@@ -35,17 +35,22 @@ namespace cudnn_frontend {
 /// time further.
 template <CudnnFindSamplingTechnique samplingTechnique>
 auto
-time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const &variantPack, uint64_t max_plans_to_evaluate = 1000) -> executionPlans_t {
+time_sorted_plan(cudnnHandle_t handle,
+                 executionPlans_t plans,
+                 VariantPack const &variantPack,
+                 uint64_t max_plans_to_evaluate = 1000) -> executionPlans_t {
     executionPlans_t time_sorted_plans;
 
-    auto plan_cmp = [](const ExecutionPlan& a, const ExecutionPlan& b) {return a.getExecutionTime() < b.getExecutionTime();};
+    auto plan_cmp = [](const ExecutionPlan &a, const ExecutionPlan &b) {
+        return a.getExecutionTime() < b.getExecutionTime();
+    };
     std::set<std::reference_wrapper<ExecutionPlan>, decltype(plan_cmp)> timed_execution_plans(plan_cmp);
 
-    const int maxIterCount =
-        (samplingTechnique == CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_ONCE)
-            ? 1
-            : (samplingTechnique == CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_MEDIAN_OF_THREE) ? 3 : 100;
-    const float threshhold = 0.95f;
+    const int maxIterCount         = (samplingTechnique == CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_ONCE) ? 1
+                                     : (samplingTechnique == CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_MEDIAN_OF_THREE)
+                                         ? 3
+                                         : 100;
+    const float threshhold         = 0.95f;
     uint64_t successful_plan_count = 0;
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -63,12 +68,14 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const
         // Warm-up run
         auto warmup_status = cudnnBackendExecute(handle, plan.get_raw_desc(), variantPack.get_raw_desc());
         if (warmup_status != CUDNN_STATUS_SUCCESS) {
-            getLogger() << "[cudnn_frontend] Plan " << plan.getTag() << " failed with " << to_string(warmup_status) << std::endl;
+            getLogger() << "[cudnn_frontend] Plan " << plan.getTag() << " failed with " << to_string(warmup_status)
+                        << std::endl;
             continue;
         }
         successful_plan_count++;
         cudaDeviceSynchronize();
 
+        float time_run_ms[3] = {0.0f, 0.0f, 0.0f};
         for (int i = 0; i < maxIterCount; i++) {
             cudaEventRecord(start, stream);
 
@@ -77,29 +84,32 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const
             cudaEventRecord(stop, stream);
             cudaEventSynchronize(stop);
             cudaEventElapsedTime(&time_ms, start, stop);
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable:4127) // this could be ommited with c++17 and contexpr
-#endif
-            if (samplingTechnique == CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_TILL_STABLE) {
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
+
+            if constexpr (samplingTechnique == CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_TILL_STABLE) {
+
                 final_time_ms = std::min(min_time_ms, time_ms);
                 if (time_ms / min_time_ms < threshhold) {
                     min_time_ms = final_time_ms;
                 } else {
                     break;
                 }
+            } else if constexpr (samplingTechnique == CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_MEDIAN_OF_THREE) {
+                time_run_ms[i] = time_ms;
+                if (i == maxIterCount - 1) {
+                    auto min_of_first_two = std::min(time_run_ms[0], time_run_ms[1]);
+                    auto max_of_first_two = std::max(time_run_ms[0], time_run_ms[1]);
+                    final_time_ms         = std::max(min_of_first_two, std::min(max_of_first_two, time_run_ms[2]));
+                }
             } else {
-                final_time_ms = i == (maxIterCount / 2) ? time_ms : final_time_ms;
+                final_time_ms = time_ms;
             }
         }
-        getLogger() << "[cudnn_frontend] Plan " << plan.getTag() << " took " << std::setw(10) << final_time_ms << std::endl;
+        getLogger() << "[cudnn_frontend] Plan " << plan.getTag() << " took " << std::setw(10) << final_time_ms
+                    << std::endl;
         plan.setExecutionTime(final_time_ms);
         timed_execution_plans.insert(plan);
         if (successful_plan_count >= max_plans_to_evaluate) {
-            getLogger() << "[cudnn_frontend] Successfully profiled " << max_plans_to_evaluate << "plans." << std::endl; 
+            getLogger() << "[cudnn_frontend] Successfully profiled " << max_plans_to_evaluate << "plans." << std::endl;
             break;
         }
     }
@@ -110,7 +120,7 @@ time_sorted_plan(cudnnHandle_t handle, executionPlans_t plans, VariantPack const
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    
+
     getLogger() << "[cudnn_frontend] Auto-tuning returns " << time_sorted_plans.size() << " plans." << std::endl;
 
     return time_sorted_plans;
@@ -140,10 +150,10 @@ EngineConfigGenerator::cudnnFindPlan(cudnnHandle_t handle,
 template <CudnnFindSamplingTechnique samplingTechnique>
 auto
 EngineConfigGenerator::cudnnFindPlanAndCache(cudnnHandle_t handle,
-                                     cudnn_frontend::OperationGraph &opGraph,
-                                     cudnn_frontend::VariantPack const &variantPack,
-                                     cudnn_frontend::ExecutionPlanCache &cache,
-                                     Predicate pred) -> cudnn_frontend::ExecutionPlan {
+                                             cudnn_frontend::OperationGraph &opGraph,
+                                             cudnn_frontend::VariantPack const &variantPack,
+                                             cudnn_frontend::ExecutionPlanCache &cache,
+                                             Predicate pred) -> cudnn_frontend::ExecutionPlan {
     /// Creating a set of execution plans that are supported.
     auto sorted_plans = cudnnFindPlan<samplingTechnique>(handle, opGraph, variantPack, pred);
     /// Check if the fastest plan is stable enough to be added to the plan cache
@@ -153,4 +163,4 @@ EngineConfigGenerator::cudnnFindPlanAndCache(cudnnHandle_t handle,
     return sorted_plans.front();
 }
 
-}
+}  // namespace cudnn_frontend

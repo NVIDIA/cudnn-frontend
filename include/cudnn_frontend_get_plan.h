@@ -22,23 +22,23 @@
 
 #pragma once
 
-#include <cudnn_frontend_EngineConfigGenerator.h>
+#include "cudnn_frontend_EngineConfigGenerator.h"
 
 namespace cudnn_frontend {
 
-auto inline
-EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph & opGraph)
-    -> executionPlans_t {
+auto inline EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph& opGraph) -> executionPlans_t {
     // Creating a set of execution plans that are supported.
     executionPlans_t plans;
     for (auto& engine_config : generate_engine_config(opGraph)) {
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         try {
 #endif
-            plans.push_back(ExecutionPlanBuilder().setHandle(handle).setEngineConfig(engine_config, opGraph.getTag()).build());
-            getLogger() << "[cudnn_frontend] Added plan " << plans.back().getTag() << " " << to_string(plans.back().get_status()) << std::endl;
+            plans.push_back(
+                ExecutionPlanBuilder().setHandle(handle).setEngineConfig(engine_config, opGraph.getTag()).build());
+            getLogger() << "[cudnn_frontend] Added plan " << plans.back().getTag() << " "
+                        << to_string(plans.back().get_status()) << std::endl;
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
-        } catch (cudnnException &e) {
+        } catch (cudnnException& e) {
             CUDNN_FRONTEND_UNUSED(e);
             continue;
         }
@@ -47,11 +47,10 @@ EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph & opGra
     return plans;
 }
 
-auto inline
-EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph & opGraph, Predicate pred)
+auto inline EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph& opGraph, Predicate pred)
     -> executionPlans_t {
     // Creating a set of execution plans that are supported.
     executionPlans_t plans = cudnnGetPlan(handle, opGraph);
     return filter(pred, plans);
 }
-}
+}  // namespace cudnn_frontend
