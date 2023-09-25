@@ -27,11 +27,10 @@ class DBNNode : public INode {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Validating DBNNode " << options.name << "..." << std::endl;
 
-        if (!(options.inputs.MEAN) && !(options.inputs.INV_VARIANCE) && !(options.inputs.EPSILON)) {
-            auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-            std::string message = "[cudnn_frontend] ERROR: Either saved mean/inv_variance or epsilon required.";
-            return {status, message};
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !(options.inputs.MEAN) && !(options.inputs.INV_VARIANCE) && !(options.inputs.EPSILON),
+            error_code_t::ATTRIBUTE_NOT_SET,
+            "Either saved mean/inv_variance or epsilon required.");
 
         return {error_code_t::OK, ""};
     }
@@ -55,7 +54,10 @@ class DBNNode : public INode {
             DY->set_dim(x_tensor_dim);
         }
         if (DY->get_stride().empty()) {
-            DY->set_stride(detail::generate_stride(DY->get_dim()));
+            auto const& DY_dim = DY->get_dim();
+            // Default to NHWC
+            auto const& stride_order = detail::generate_NHWC_stride_order(DY_dim.size());
+            DY->set_stride(detail::generate_stride(DY_dim, stride_order));
         }
 
         auto DX            = options.outputs.DX;
@@ -66,7 +68,10 @@ class DBNNode : public INode {
             DX->set_dim(x_tensor_dim);
         }
         if (DX->get_stride().empty()) {
-            DX->set_stride(detail::generate_stride(DX->get_dim()));
+            auto const& DX_dim = DX->get_dim();
+            // Default to NHWC
+            auto const& stride_order = detail::generate_NHWC_stride_order(DX_dim.size());
+            DX->set_stride(detail::generate_stride(DX_dim, stride_order));
         }
 
         // Set channel length tensors
@@ -79,7 +84,10 @@ class DBNNode : public INode {
                 T->set_dim(tensor_dim);
             }
             if (T->get_stride().empty()) {
-                T->set_stride(detail::generate_stride(T->get_dim()));
+                auto const& T_dim = T->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(T_dim.size());
+                T->set_stride(detail::generate_stride(T_dim, stride_order));
             }
         };
         infer_per_channel_tensors(options.inputs.MEAN);
@@ -90,7 +98,10 @@ class DBNNode : public INode {
 
         for (auto const& peer_stat : options.inputs.peer_stats) {
             if (peer_stat->get_stride().empty()) {
-                peer_stat->set_stride(detail::generate_stride(peer_stat->get_dim()));
+                auto const& peer_stat_dim = peer_stat->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(peer_stat_dim.size());
+                peer_stat->set_stride(detail::generate_stride(peer_stat_dim, stride_order));
             }
         }
 

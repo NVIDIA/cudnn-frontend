@@ -26,23 +26,11 @@ class MatmulNode : public INode {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Validating matmul node " << options.name << "..." << std::endl;
 
-        if (!(options.inputs.A)) {
-            auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-            std::string message = "[cudnn_frontend] ERROR: matmul A not set.";
-            return {status, message};
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!(options.inputs.A), error_code_t::ATTRIBUTE_NOT_SET, "matmul A not set.");
 
-        if (!(options.inputs.B)) {
-            auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-            std::string message = "[cudnn_frontend] ERROR: matmul B not set.";
-            return {status, message};
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!(options.inputs.B), error_code_t::ATTRIBUTE_NOT_SET, "matmul B not set.");
 
-        if (!(options.outputs.C)) {
-            auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-            std::string message = "[cudnn_frontend] ERROR: matmul C not set.";
-            return {status, message};
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!(options.outputs.C), error_code_t::ATTRIBUTE_NOT_SET, "matmul C not set.");
 
         return {error_code_t::OK, ""};
     }
@@ -72,7 +60,10 @@ class MatmulNode : public INode {
             c_tensor->set_dim(c_tensor_dim);
         }
         if (c_tensor->get_stride().empty()) {
-            c_tensor->set_stride(detail::generate_stride(c_tensor->get_dim()));
+            auto const& c_dim = c_tensor->get_dim();
+            // Default to Col major
+            auto const& stride_order = detail::generate_column_major_stride_order(c_dim.size());
+            c_tensor->set_stride(detail::generate_stride(c_dim, stride_order));
         }
 
         return {error_code_t::OK, ""};

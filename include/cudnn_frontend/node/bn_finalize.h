@@ -41,7 +41,10 @@ class BatchNormFinalizeNode : public INode {
                 T->set_dim(tensor_dim);
             }
             if (T->get_stride().empty()) {
-                T->set_stride(detail::generate_stride(T->get_dim()));
+                auto const& T_dim = T->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(T_dim.size());
+                T->set_stride(detail::generate_stride(T_dim, stride_order));
             }
         };
         infer_per_channel_tensors(options.inputs.SQ_SUM);
@@ -65,7 +68,10 @@ class BatchNormFinalizeNode : public INode {
                 T->set_dim(tensor_dim);
             }
             if (T->get_stride().empty()) {
-                T->set_stride(detail::generate_stride(T->get_dim()));
+                auto const& T_dim = T->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(T_dim.size());
+                T->set_stride(detail::generate_stride(T_dim, stride_order));
             }
         };
         infer_scalars(options.inputs.EPSILON);

@@ -43,6 +43,10 @@ throw_if(bool const cond, cudnn_frontend::error_code_t const error_code, std::st
             throw std::runtime_error(error_msg);
         case cudnn_frontend::error_code_t::HEURISTIC_QUERY_FAILED:
             throw std::runtime_error(error_msg);
+        case cudnn_frontend::error_code_t::CUDNN_BACKEND_API_FAILED:
+            throw std::runtime_error(error_msg);
+        case cudnn_frontend::error_code_t::CUDA_API_FAILED:
+            throw std::runtime_error(error_msg);
         case cudnn_frontend::error_code_t::INVALID_CUDA_DEVICE:
             throw std::runtime_error(error_msg);
         case cudnn_frontend::error_code_t::UNSUPPORTED_GRAPH_FORMAT:
@@ -131,22 +135,21 @@ class PyGraph {
             cudnn_frontend::DataType_t io_data_type,
             cudnn_frontend::DataType_t intermediate_data_type,
             cudnn_frontend::DataType_t compute_data_type,
-            void * handle_ = nullptr)
-        : graph(), handle((cudnnHandle_t)handle_), 
-        is_handle_owner(false), is_built(false) {
+            void* handle_ = nullptr)
+        : graph(), handle((cudnnHandle_t)handle_), is_handle_owner(false), is_built(false) {
         graph.set_compute_data_type(compute_data_type)
             .set_intermediate_data_type(intermediate_data_type)
             .set_io_data_type(io_data_type);
-        
+
         if (handle_ == nullptr) {
             cudnnCreate(&handle);
-            is_handle_owner = true; 
+            is_handle_owner = true;
         }
     }
 
-    ~PyGraph() { 
+    ~PyGraph() {
         if (is_handle_owner) {
-            cudnnDestroy(handle); 
+            cudnnDestroy(handle);
         }
     }
 
@@ -343,7 +346,8 @@ class PyGraph {
            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& B,
            cudnn_frontend::DataType_t const& compute_data_type,
            std::string const& name) {
-        auto attributes = cudnn_frontend::graph::Matmul_attributes().set_compute_data_type(compute_data_type).set_name(name);
+        auto attributes =
+            cudnn_frontend::graph::Matmul_attributes().set_compute_data_type(compute_data_type).set_name(name);
 
         auto C = graph.matmul(A, B, attributes);
         return C;
@@ -507,6 +511,66 @@ class PyGraph {
         return {O, Stats};
     }
 
+    std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 3>
+    scaled_dot_product_flash_attention_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
+                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
+                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
+                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& o,
+                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO,
+                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& stats,
+                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& attn_scale,
+                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
+                                                bool const use_causal_mask,
+                                                py::object const& dropout,
+                                                cudnn_frontend::DataType_t const& compute_data_type,
+                                                std::string const& name) {
+        auto attributes = cudnn_frontend::graph::Scaled_dot_product_flash_attention_backward_attributes()
+                              .set_attn_scale(attn_scale)
+                              .set_bias(bias)
+                              .set_causal_mask(use_causal_mask)
+                              .set_compute_data_type(compute_data_type)
+                              .set_name(name);
+
+        py::object cudnn_tensor_type = py::module_::import("cudnn").attr("tensor");
+
+        if (!dropout.is_none()) {
+            if (!py::isinstance<py::tuple>(dropout)) {
+                throw std::runtime_error(
+                    "dropout must be a tuple of (float probability, a seed tensor"
+                    ", and an offset tensor) or (mask tensor, scale tensor)");
+            }
+            py::tuple dropout_tuple = dropout.cast<py::tuple>();
+            if (dropout_tuple.size() != 3) {
+                throw std::runtime_error(
+                    "dropout must be a tuple of (float probability, a seed tensor"
+                    ", and an offset tensor) or (mask tensor, scale tensor)");
+            }
+
+            if (py::isinstance<py::float_>(dropout_tuple[0]) && py::isinstance(dropout_tuple[1], cudnn_tensor_type) &&
+                py::isinstance(dropout_tuple[2], cudnn_tensor_type)) {
+                auto const probability = dropout_tuple[0].cast<float>();
+                auto const seed   = dropout_tuple[1].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+                auto const offset = dropout_tuple[2].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+                attributes.set_dropout(probability, seed, offset);
+            } else if (py::isinstance(dropout_tuple[0], cudnn_tensor_type) &&
+                       py::isinstance(dropout_tuple[1], cudnn_tensor_type) &&
+                       py::isinstance(dropout_tuple[2], cudnn_tensor_type)) {
+                auto const mask  = dropout_tuple[0].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+                auto const scale = dropout_tuple[1].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+                auto const scale_inv =
+                    dropout_tuple[2].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+                attributes.set_dropout(mask, scale, scale_inv);
+            } else {
+                throw std::runtime_error(
+                    "dropout must be a tuple of (float probability, a seed tensor"
+                    ", and an offset tensor) or (mask tensor, scale tensor)");
+            }
+        }
+
+        auto [dQ, dK, dV] = graph.scaled_dot_product_flash_attention_backward(q, k, v, o, dO, stats, attributes);
+        return {dQ, dK, dV};
+    }
+
     void
     check_support() {
         build();
@@ -576,7 +640,7 @@ init_pygraph_submodule(py::module_& m) {
                       cudnn_frontend::DataType_t,
                       cudnn_frontend::DataType_t,
                       cudnn_frontend::DataType_t,
-                      void *>(),
+                      void*>(),
              py::arg_v("name", "test_graph"),
              py::arg_v("io_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("intermediate_data_type", cudnn_frontend::DataType_t::NOT_SET),
@@ -803,8 +867,44 @@ init_pygraph_submodule(py::module_& m) {
                     name (Optional[str]): The name of the operation.
 
                 Returns:
-                    cudnn_tensor: The result of scaled dot-product flash attention.
-                    Optional[cudnn_tensor]: The softmax statistics in case the operation is in a training step.
+                    o (cudnn_tensor): The result of scaled dot-product flash attention.
+                    stats (Optional[cudnn_tensor]): The softmax statistics in case the operation is in a training step.
+            )pbdoc")
+        .def("scaled_dot_product_flash_attention_backward",
+             &PyGraph::scaled_dot_product_flash_attention_backward,
+             py::arg("q"),
+             py::arg("k"),
+             py::arg("v"),
+             py::arg("o"),
+             py::arg("dO"),
+             py::arg("stats"),
+             py::arg_v("attn_scale", nullptr),
+             py::arg_v("bias", nullptr),
+             py::arg_v("use_causal_mask", false),
+             py::arg_v("dropout", py::none()),
+             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+             py::arg_v("name", ""),
+             R"pbdoc(
+                Compute the key, query, value gradients of scaled dot-product flash attention.
+
+                Args:
+                    q (cudnn_tensor): The query data.
+                    k (cudnn_tensor): The key data.
+                    v (cudnn_tensor): The value data.
+                    o (cudnn_tensor): The output data.
+                    dO (cudnn_tensor): The output loss gradient.
+                    stats (cudnn_tensor): The softmax statistics from the forward pass.
+                    attn_scale (Optional[cudnn_tensor]): The scale factor for attention. Default is None.
+                    bias (Optional[cudnn_tensor]): The bias data for attention. Default is None.
+                    use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
+                    dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
+                    compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
+                    name (Optional[str]): The name of the operation.
+
+                Returns:
+                    dQ (cudnn_tensor): The query gradient tensor of scaled dot-product flash attention.
+                    dK (cudnn_tensor): The key gradient tensor of scaled dot-product flash attention.
+                    dV (cudnn_tensor): The value gradient tensor of scaled dot-product flash attention.
             )pbdoc")
         .def("build", &PyGraph::build)
         .def("check_support", &PyGraph::check_support)
@@ -1765,6 +1865,6 @@ init_pygraph_submodule(py::module_& m) {
         )pbdoc");
 }
 
-}
+}  // namespace python_bindings
 
-}
+}  // namespace cudnn_frontend

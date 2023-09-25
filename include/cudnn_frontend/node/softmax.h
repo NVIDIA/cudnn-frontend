@@ -28,12 +28,8 @@ class SoftmaxNode : public INode {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Validating SoftmaxNode " << options.name << "..." << std::endl;
 
-        if (options.use_stats.has_value() == false) {
-            auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-            std::string message = "[cudnn_frontend] ERROR: use_stats attribute not set.";
-            return {status, message};
-        }
-
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            options.use_stats.has_value() == false, error_code_t::ATTRIBUTE_NOT_SET, "use_stats attribute not set.");
         return {error_code_t::OK, ""};
     }
 

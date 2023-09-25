@@ -56,7 +56,10 @@ class ConvolutionNode : public INode {
             Y->set_dim(y_tensor_dim);
         }
         if (Y->get_stride().empty()) {
-            Y->set_stride(detail::generate_stride(Y->get_dim()));
+            auto const& Y_dim = Y->get_dim();
+            // Default to NHWC
+            auto const& stride_order = detail::generate_NHWC_stride_order(Y_dim.size());
+            Y->set_stride(detail::generate_stride(Y_dim, stride_order));
         }
 
         return {error_code_t::OK, ""};

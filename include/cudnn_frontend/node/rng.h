@@ -24,11 +24,7 @@ class RngNode : public INode {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Validating RngNode " << options.name << "..." << std::endl;
 
-        if (!(options.outputs.Y)) {
-            auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-            std::string message = "[cudnn_frontend] ERROR: rng output not set.";
-            return {status, message};
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!(options.outputs.Y), error_code_t::ATTRIBUTE_NOT_SET, "rng output not set.");
 
         return {error_code_t::OK, ""};
     }
@@ -74,7 +70,10 @@ class RngNode : public INode {
             if (options.get_stride().size()) {
                 y_tensor->set_stride(options.get_stride());
             } else {
-                y_tensor->set_stride(detail::generate_stride(y_tensor->get_dim()));
+                auto const& y_dim = y_tensor->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(y_dim.size());
+                y_tensor->set_stride(detail::generate_stride(y_dim, stride_order));
             }
         }
 

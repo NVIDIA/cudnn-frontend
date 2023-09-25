@@ -165,6 +165,7 @@ class Operation {
         Reshape,
         Scaled_dot_product_attention,
         Scaled_dot_product_flash_attention,
+        Scaled_dot_product_flash_attention_backward,
         Softmax,
     };
     Tag tag;
@@ -187,27 +188,28 @@ class Operation {
     virtual ~Operation() = default;
 };
 
-NLOHMANN_JSON_SERIALIZE_ENUM(Operation::Tag,
-                             {
-                                 {Operation::Tag::BN, "BN"},
-                                 {Operation::Tag::BN_inference, "BN_inference"},
-                                 {Operation::Tag::BN_finalize, "BN_finalize"},
-                                 {Operation::Tag::Conv_fprop, "Conv_fprop"},
-                                 {Operation::Tag::Conv_dgrad, "Conv_dgrad"},
-                                 {Operation::Tag::Conv_wgrad, "Conv_wgrad"},
-                                 {Operation::Tag::DBN, "DBN"},
-                                 {Operation::Tag::DBN_weight, "DBN_weight"},
-                                 {Operation::Tag::Genstats, "Genstats"},
-                                 {Operation::Tag::Matmul, "Matmul"},
-                                 {Operation::Tag::Pointwise, "Pointwise"},
-                                 {Operation::Tag::Reduction, "Reduction"},
-                                 {Operation::Tag::Rng, "Rng"},
-                                 {Operation::Tag::Reshape, "Reshape"},
-                                 {Operation::Tag::Scaled_dot_product_attention, "Scaled_dot_product_attention"},
-                                 {Operation::Tag::Scaled_dot_product_flash_attention,
-                                  "Scaled_dot_product_flash_attention"},
-                                 {Operation::Tag::Softmax, "Softmax"},
-                             })
+NLOHMANN_JSON_SERIALIZE_ENUM(
+    Operation::Tag,
+    {
+        {Operation::Tag::BN, "BN"},
+        {Operation::Tag::BN_inference, "BN_inference"},
+        {Operation::Tag::BN_finalize, "BN_finalize"},
+        {Operation::Tag::Conv_fprop, "Conv_fprop"},
+        {Operation::Tag::Conv_dgrad, "Conv_dgrad"},
+        {Operation::Tag::Conv_wgrad, "Conv_wgrad"},
+        {Operation::Tag::DBN, "DBN"},
+        {Operation::Tag::DBN_weight, "DBN_weight"},
+        {Operation::Tag::Genstats, "Genstats"},
+        {Operation::Tag::Matmul, "Matmul"},
+        {Operation::Tag::Pointwise, "Pointwise"},
+        {Operation::Tag::Reduction, "Reduction"},
+        {Operation::Tag::Rng, "Rng"},
+        {Operation::Tag::Reshape, "Reshape"},
+        {Operation::Tag::Scaled_dot_product_attention, "Scaled_dot_product_attention"},
+        {Operation::Tag::Scaled_dot_product_flash_attention, "Scaled_dot_product_flash_attention"},
+        {Operation::Tag::Scaled_dot_product_flash_attention_backward, "Scaled_dot_product_flash_attention_backward"},
+        {Operation::Tag::Softmax, "Softmax"},
+    })
 
 class BN_finalize_attributes : public Operation {
    public:
@@ -875,9 +877,15 @@ class Layernorm_backward_attributes : public Operation {
         inputs.SCALE->fill_from_context(context);
         inputs.DY->fill_from_context(context);
 
-        if (inputs.MEAN) { inputs.MEAN->fill_from_context(context);}
-        if (inputs.INV_VARIANCE) {inputs.INV_VARIANCE->fill_from_context(context);}
-        if (inputs.EPSILON) {inputs.EPSILON->fill_from_context(context);}
+        if (inputs.MEAN) {
+            inputs.MEAN->fill_from_context(context);
+        }
+        if (inputs.INV_VARIANCE) {
+            inputs.INV_VARIANCE->fill_from_context(context);
+        }
+        if (inputs.EPSILON) {
+            inputs.EPSILON->fill_from_context(context);
+        }
 
         outputs.DX->fill_from_context(context);
         outputs.DSCALE->fill_from_context(context);
@@ -1597,6 +1605,108 @@ class Scaled_dot_product_flash_attention_attributes : public Operation {
         inputs.K->fill_from_context(context);
         inputs.V->fill_from_context(context);
         outputs.O->fill_from_context(context);
+
+        // Fill this node
+        if (get_compute_data_type() == DataType_t::NOT_SET) {
+            set_compute_data_type(context.get_compute_data_type());
+        }
+        return *this;
+    }
+};
+
+class Scaled_dot_product_flash_attention_backward_attributes : public Operation {
+   public:
+    struct Inputs {
+        std::shared_ptr<Tensor_attributes> Q;
+        std::shared_ptr<Tensor_attributes> K;
+        std::shared_ptr<Tensor_attributes> V;
+        std::shared_ptr<Tensor_attributes> O;
+        std::shared_ptr<Tensor_attributes> dO;
+        std::shared_ptr<Tensor_attributes> Stats;
+        std::shared_ptr<Tensor_attributes> Attn_scale;
+        std::shared_ptr<Tensor_attributes> Bias;
+        std::shared_ptr<Tensor_attributes> Seed;
+        std::shared_ptr<Tensor_attributes> Offset;
+        std::shared_ptr<Tensor_attributes> Dropout_mask;
+        std::shared_ptr<Tensor_attributes> Dropout_scale;
+        std::shared_ptr<Tensor_attributes> Dropout_scale_inv;
+    } inputs;
+
+    struct Outputs {
+        std::shared_ptr<Tensor_attributes> dQ;
+        std::shared_ptr<Tensor_attributes> dK;
+        std::shared_ptr<Tensor_attributes> dV;
+    } outputs;
+
+    bool causal_mask = false;
+    std::optional<float> dropout_probability;
+
+   public:
+    Scaled_dot_product_flash_attention_backward_attributes()
+        : Operation(Tag::Scaled_dot_product_flash_attention_backward) {}
+
+    Scaled_dot_product_flash_attention_backward_attributes&
+    set_attn_scale(std::shared_ptr<Tensor_attributes> value) {
+        inputs.Attn_scale = value;
+        return *this;
+    }
+
+    Scaled_dot_product_flash_attention_backward_attributes&
+    set_bias(std::shared_ptr<Tensor_attributes> value) {
+        inputs.Bias = value;
+        return *this;
+    }
+
+    Scaled_dot_product_flash_attention_backward_attributes&
+    set_causal_mask(bool const value) {
+        causal_mask = value;
+        return *this;
+    }
+
+    Scaled_dot_product_flash_attention_backward_attributes&
+    set_dropout(float const probability,
+                std::shared_ptr<Tensor_attributes> seed,
+                std::shared_ptr<Tensor_attributes> offset) {
+        dropout_probability = probability;
+        inputs.Seed         = seed;
+        inputs.Offset       = offset;
+        return *this;
+    }
+
+    Scaled_dot_product_flash_attention_backward_attributes&
+    set_dropout(std::shared_ptr<Tensor_attributes> mask,
+                std::shared_ptr<Tensor_attributes> scale,
+                std::shared_ptr<Tensor_attributes> scale_inv) {
+        inputs.Dropout_mask      = mask;
+        inputs.Dropout_scale     = scale;
+        inputs.Dropout_scale_inv = scale_inv;
+        return *this;
+    }
+
+    Scaled_dot_product_flash_attention_backward_attributes&
+    set_compute_data_type(DataType_t const value) {
+        compute_data_type = value;
+        return *this;
+    }
+
+    Scaled_dot_product_flash_attention_backward_attributes&
+    set_name(std::string const& value) {
+        name = value;
+        return *this;
+    }
+
+    Scaled_dot_product_flash_attention_backward_attributes&
+    fill_from_context(detail::Context const& context) {
+        // Fill node's tensors
+        inputs.Q->fill_from_context(context);
+        inputs.K->fill_from_context(context);
+        inputs.V->fill_from_context(context);
+        inputs.O->fill_from_context(context);
+        inputs.dO->fill_from_context(context);
+        inputs.Stats->fill_from_context(context);
+        outputs.dQ->fill_from_context(context);
+        outputs.dK->fill_from_context(context);
+        outputs.dV->fill_from_context(context);
 
         // Fill this node
         if (get_compute_data_type() == DataType_t::NOT_SET) {

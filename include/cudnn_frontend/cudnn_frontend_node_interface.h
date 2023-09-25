@@ -55,10 +55,7 @@ class INode : public ICudnn {
     assign_uids() {
         CHECK_CUDNN_FRONTEND_ERROR(assign_uids_node());
         for (auto const& sub_node : sub_nodes) {
-            auto status = sub_node->assign_uids();
-            if (status.is_bad()) {
-                return status;
-            }
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->assign_uids());
         }
         return {error_code_t::OK, ""};
     }
@@ -88,24 +85,24 @@ class INode : public ICudnn {
     }
 
     virtual error_t
-    pass_by_value_tensors_(std::unordered_map<std::shared_ptr<Tensor_attributes>, pass_by_values_t>&,
-                           [[maybe_unused]] void* node_workspace) {
+    pass_by_value_tensors_(cudnnHandle_t,
+                           std::unordered_map<std::shared_ptr<Tensor_attributes>, pass_by_values_t>&,
+                           void*) {
         return {error_code_t::OK, ""};
     }
 
     error_t
     gather_pass_by_value_tensors(
+        cudnnHandle_t const& handle,
         std::unordered_map<std::shared_ptr<Tensor_attributes>, pass_by_values_t>& tensor_to_pass_by_value,
         void* fe_workspace) {
         void* node_workspace = fe_workspace;
-        CHECK_CUDNN_FRONTEND_ERROR(pass_by_value_tensors_(tensor_to_pass_by_value, node_workspace));
+        CHECK_CUDNN_FRONTEND_ERROR(pass_by_value_tensors_(handle, tensor_to_pass_by_value, node_workspace));
         node_workspace = static_cast<char*>(node_workspace) + get_fe_workspace_size_node();
         for (auto const& sub_node : sub_nodes) {
-            auto status    = sub_node->gather_pass_by_value_tensors(tensor_to_pass_by_value, node_workspace);
+            CHECK_CUDNN_FRONTEND_ERROR(
+                sub_node->gather_pass_by_value_tensors(handle, tensor_to_pass_by_value, node_workspace));
             node_workspace = static_cast<char*>(node_workspace) + sub_node->get_fe_workspace_size_node();
-            if (status.get_code() != error_code_t::OK) {
-                return status;
-            }
         }
         return {error_code_t::OK, ""};
     }
@@ -140,10 +137,7 @@ class INode : public ICudnn {
     virtual error_t
     createTensors() {
         for (auto const& sub_node : sub_nodes) {
-            auto status = sub_node->createTensors();
-            if (status.get_code() != error_code_t::OK) {
-                return status;
-            }
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->createTensors());
         }
         return {error_code_t::OK, ""};
     }
@@ -156,10 +150,7 @@ class INode : public ICudnn {
     virtual error_t
     createOperations() {
         for (auto const& sub_node : sub_nodes) {
-            auto status = sub_node->createOperations();
-            if (status.is_bad()) {
-                return status;
-            }
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->createOperations());
 
             // Roll up operations to parent node, so that parent can too partition operation graphs.
             for (auto&& operation_with_uids : sub_node->operations) {
@@ -182,26 +173,14 @@ class INode : public ICudnn {
         }
 
         // validate self
-        auto status = validate_node();
-        if (status.is_bad()) {
-            getLogger() << "[cudnn_frontend] ERROR: Validation failed." << std::endl;
-            return status;
-        }
+        CHECK_CUDNN_FRONTEND_ERROR(validate_node());
 
         // infer_properties self
-        status = infer_properties_node();
-        if (status.is_bad()) {
-            getLogger() << "[cudnn_frontend] ERROR: Infer properties failed." << std::endl;
-            return status;
-        }
+        CHECK_CUDNN_FRONTEND_ERROR(infer_properties_node());
 
         // validate sub nodes
         for (auto const& sub_node : sub_nodes) {
-            status = sub_node->validate();
-            if (status.is_bad()) {
-                getLogger() << "[cudnn_frontend] ERROR: Validation failed." << std::endl;
-                return status;
-            }
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->validate());
         }
 
         has_validation_checked = true;
@@ -210,36 +189,11 @@ class INode : public ICudnn {
 
     error_t
     build_operation_graph(cudnnHandle_t handle) {
-        auto status = validate();
-        if (status.is_bad()) {
-            getLogger() << "[cudnn_frontend] ERROR: Failed to build." << std::endl;
-            return status;
-        }
-
-        status = assign_uids();
-        if (status.is_bad()) {
-            getLogger() << "[cudnn_frontend] ERROR: Failed to build." << std::endl;
-            return status;
-        }
-
-        status = createTensors();
-        if (status.is_bad()) {
-            getLogger() << "[cudnn_frontend] ERROR: Failed to build." << std::endl;
-            return status;
-        }
-
-        status = createOperations();
-        if (status.is_bad()) {
-            getLogger() << "[cudnn_frontend] ERROR: Failed to build." << std::endl;
-            return status;
-        }
-
-        status = createOperationGraphs(handle);
-        if (status.is_bad()) {
-            getLogger() << "[cudnn_frontend] ERROR: Failed to build." << std::endl;
-            return status;
-        }
-
+        CHECK_CUDNN_FRONTEND_ERROR(validate());
+        CHECK_CUDNN_FRONTEND_ERROR(assign_uids());
+        CHECK_CUDNN_FRONTEND_ERROR(createTensors());
+        CHECK_CUDNN_FRONTEND_ERROR(createOperations());
+        CHECK_CUDNN_FRONTEND_ERROR(createOperationGraphs(handle));
         return {error_code_t::OK, ""};
     }
 
@@ -264,11 +218,7 @@ class INode : public ICudnn {
         void* fe_workspace    = workspace;
         void* cudnn_workspace = static_cast<char*>(fe_workspace) + get_fe_workspace_size();
 
-        auto status = gather_pass_by_value_tensors(tensor_to_pass_by_value, fe_workspace);
-        if (status.is_bad()) {
-            getLogger() << "[cudnn_frontend] ERROR: Failed to gather_pass_by_value_tensors." << std::endl;
-            return status;
-        }
+        CHECK_CUDNN_FRONTEND_ERROR(gather_pass_by_value_tensors(handle, tensor_to_pass_by_value, fe_workspace));
 
         // Add pass_by_value data pointers to tensor_uid_to_pointer map
         // object lifetime is controlled by tensor_to_pass_by_value which means the pointer should stay valid during
@@ -281,19 +231,14 @@ class INode : public ICudnn {
             } else if (void** void_value_ptr = std::get_if<void*>(&value)) {
                 tensor_uid_to_pointer_map.emplace(tensor->get_uid(), *void_value_ptr);
             } else {
-                status.code    = error_code_t::INVALID_VARIANT_PACK;
-                status.err_msg = "[cudnn_frontend] ERROR: Unexpected type for pass by value tensor.";
-                return status;
+                RETURN_CUDNN_FRONTEND_ERROR_IF(
+                    true, error_code_t::INVALID_VARIANT_PACK, "Unexpected type for pass by value tensor.");
             }
         }
 
-        status = execute_cudnn_plans(handle, tensor_uid_to_pointer_map, cudnn_workspace);
-        if (status.is_bad()) {
-            getLogger() << "[cudnn_frontend] ERROR: Execution failed." << std::endl;
-            return status;
-        }
+        CHECK_CUDNN_FRONTEND_ERROR(execute_cudnn_plans(handle, tensor_uid_to_pointer_map, cudnn_workspace));
 
-        return status;
+        return {error_code_t::OK, ""};
     }
 
     INode(detail::Context const& context) : context(context) {}

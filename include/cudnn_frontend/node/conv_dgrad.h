@@ -26,12 +26,9 @@ class DgradNode : public INode {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Validating DgradNode " << options.name << "..." << std::endl;
 
-        if (options.outputs.DX->get_dim().empty()) {
-            auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-            std::string message = "[cudnn_frontend] ERROR: dgrad requires output tensor to have its dims set.";
-            getLogger() << message << std::endl;
-            return {status, message};
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(options.outputs.DX->get_dim().empty(),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "dgrad requires output tensor to have its dims set.");
 
         return {error_code_t::OK, ""};
     }
@@ -55,7 +52,10 @@ class DgradNode : public INode {
         // No dim inferencing as inverse mapping from DY, W to DX is not unique.
         // Only infer strides if user did not set them
         if (DX->get_stride().empty()) {
-            DX->set_stride(detail::generate_stride(DX->get_dim()));
+            auto const& DX_dim = DX->get_dim();
+            // Default to NHWC
+            auto const& stride_order = detail::generate_NHWC_stride_order(DX_dim.size());
+            DX->set_stride(detail::generate_stride(DX_dim, stride_order));
         }
 
         return {error_code_t::OK, ""};

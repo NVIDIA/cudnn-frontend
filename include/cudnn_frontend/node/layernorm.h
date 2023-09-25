@@ -40,7 +40,10 @@ class LayerNormNode : public INode {
             Y->set_dim(x_tensor_dim);
         }
         if (Y->get_stride().empty()) {
-            Y->set_stride(detail::generate_stride(Y->get_dim()));
+            auto const& Y_dim = Y->get_dim();
+            // Default to NHWC
+            auto const& stride_order = detail::generate_NHWC_stride_order(Y_dim.size());
+            Y->set_stride(detail::generate_stride(Y_dim, stride_order));
         }
 
         // scale_bias   dim is 1,c,h,w
@@ -58,7 +61,10 @@ class LayerNormNode : public INode {
             scale->set_dim(scale_bias_dim);
         }
         if (scale->get_stride().empty()) {
-            scale->set_stride(detail::generate_stride(scale->get_dim()));
+            auto const& scale_dim = scale->get_dim();
+            // Default to NHWC
+            auto const& stride_order = detail::generate_NHWC_stride_order(scale_dim.size());
+            scale->set_stride(detail::generate_stride(scale_dim, stride_order));
         }
 
         auto bias = options.inputs.BIAS;
@@ -66,7 +72,10 @@ class LayerNormNode : public INode {
             bias->set_dim(scale_bias_dim);
         }
         if (bias->get_stride().empty()) {
-            bias->set_stride(detail::generate_stride(bias->get_dim()));
+            auto const& bias_dim = bias->get_dim();
+            // Default to NHWC
+            auto const& stride_order = detail::generate_NHWC_stride_order(bias_dim.size());
+            bias->set_stride(detail::generate_stride(bias_dim, stride_order));
         }
 
         if (options.forward_phase == NormFwdPhase_t::TRAINING) {
@@ -75,7 +84,10 @@ class LayerNormNode : public INode {
                 mean->set_dim(stats_dim);
             }
             if (mean->get_stride().empty()) {
-                mean->set_stride(detail::generate_stride(mean->get_dim()));
+                auto const& mean_dim = mean->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(mean_dim.size());
+                mean->set_stride(detail::generate_stride(mean_dim, stride_order));
             }
 
             auto inv_var = options.outputs.INV_VARIANCE;
@@ -83,7 +95,10 @@ class LayerNormNode : public INode {
                 inv_var->set_dim(stats_dim);
             }
             if (inv_var->get_stride().empty()) {
-                inv_var->set_stride(detail::generate_stride(inv_var->get_dim()));
+                auto const& inv_var_dim = inv_var->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(inv_var_dim.size());
+                inv_var->set_stride(detail::generate_stride(inv_var_dim, stride_order));
             }
         }
 
@@ -96,7 +111,10 @@ class LayerNormNode : public INode {
                 T->set_dim(tensor_dim);
             }
             if (T->get_stride().empty()) {
-                T->set_stride(detail::generate_stride(T->get_dim()));
+                auto const& T_dim = T->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(T_dim.size());
+                T->set_stride(detail::generate_stride(T_dim, stride_order));
             }
         };
         infer_scalar_tensors(options.inputs.EPSILON);
@@ -110,11 +128,9 @@ class LayerNormNode : public INode {
                     << "Validating LayerNormNode " << options.name << "..." << std::endl;
 
         // Norm forward phase should be set
-        if (options.forward_phase == NormFwdPhase_t::NOT_SET) {
-            auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-            std::string message = "[cudnn_frontend] ERROR: Forward phase not set of layernorm node.";
-            return {status, message};
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(options.forward_phase == NormFwdPhase_t::NOT_SET,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Forward phase not set of layernorm node.");
 
         return {error_code_t::OK, ""};
     }

@@ -39,7 +39,10 @@ class BatchnormInferenceNode : public INode {
             Y->set_dim(x_tensor_dim);
         }
         if (Y->get_stride().empty()) {
-            Y->set_stride(detail::generate_stride(Y->get_dim()));
+            auto const& Y_dim = Y->get_dim();
+            // Default to NHWC
+            auto const& stride_order = detail::generate_NHWC_stride_order(Y_dim.size());
+            Y->set_stride(detail::generate_stride(Y_dim, stride_order));
         }
 
         // Set channel length tensors
@@ -52,7 +55,10 @@ class BatchnormInferenceNode : public INode {
                 T->set_dim(tensor_dim);
             }
             if (T->get_stride().empty()) {
-                T->set_stride(detail::generate_stride(T->get_dim()));
+                auto const& T_dim = T->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(T_dim.size());
+                T->set_stride(detail::generate_stride(T_dim, stride_order));
             }
         };
         infer_per_channel_tensors(attributes.inputs.MEAN);

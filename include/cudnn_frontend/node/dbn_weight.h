@@ -41,7 +41,10 @@ class DBNWeightNode : public INode {
             X->set_dim(dy_tensor_dim);
         }
         if (X->get_stride().empty()) {
-            X->set_stride(detail::generate_stride(X->get_dim()));
+            auto const& X_dim = X->get_dim();
+            // Default to NHWC
+            auto const& stride_order = detail::generate_NHWC_stride_order(X_dim.size());
+            X->set_stride(detail::generate_stride(X_dim, stride_order));
         }
 
         // Set channel length tensors
@@ -54,7 +57,10 @@ class DBNWeightNode : public INode {
                 T->set_dim(tensor_dim);
             }
             if (T->get_stride().empty()) {
-                T->set_stride(detail::generate_stride(T->get_dim()));
+                auto const& T_dim = T->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(T_dim.size());
+                T->set_stride(detail::generate_stride(T_dim, stride_order));
             }
         };
         infer_per_channel_tensors(options.inputs.MEAN);

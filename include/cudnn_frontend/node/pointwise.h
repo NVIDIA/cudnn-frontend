@@ -26,45 +26,26 @@ class PointwiseNode : public INode {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Validating pointwise node " << options.name << "..." << std::endl;
 
-        if (options.mode == PointwiseMode_t::NOT_SET) {
-            auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-            std::string message = "[cudnn_frontend] ERROR: pointwise mode not set.";
-            getLogger() << message << std::endl;
-            return {status, message};
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            options.mode == PointwiseMode_t::NOT_SET, error_code_t::ATTRIBUTE_NOT_SET, "pointwise mode not set.");
 
-        if (!(options.inputs.IN_0)) {
-            auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-            std::string message = "[cudnn_frontend] ERROR: pointwise input IN_0 not set.";
-            getLogger() << message << std::endl;
-            return {status, message};
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !(options.inputs.IN_0), error_code_t::ATTRIBUTE_NOT_SET, "pointwise input IN_0 not set.");
 
         auto const port_count = get_pointwise_mode_port_count(options.mode);
         if (port_count >= 3) {
-            if (!(options.inputs.IN_1)) {
-                auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-                std::string message = "[cudnn_frontend] ERROR: pointwise input IN_1 not set.";
-                getLogger() << message << std::endl;
-                return {status, message};
-            }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !(options.inputs.IN_1), error_code_t::ATTRIBUTE_NOT_SET, "pointwise input IN_1 not set.");
         }
 
         if (port_count >= 4) {
-            if (!(options.inputs.IN_2)) {
-                auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-                std::string message = "[cudnn_frontend] ERROR: pointwise input IN_2 not set.";
-                getLogger() << message << std::endl;
-                return {status, message};
-            }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !(options.inputs.IN_2), error_code_t::ATTRIBUTE_NOT_SET, "pointwise input IN_2 not set.");
         }
 
-        if (!(options.outputs.OUT_0)) {
-            auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-            std::string message = "[cudnn_frontend] ERROR: pointwise output OUT_0 not set in " + options.get_name();
-            getLogger() << message << std::endl;
-            return {status, message};
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!(options.outputs.OUT_0),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "pointwise output OUT_0 not set in " + options.get_name());
 
         return {error_code_t::OK, ""};
     }

@@ -47,7 +47,9 @@ class ICudnn {
     error_t
     create_cudnn_tensor(std::shared_ptr<graph::Tensor_attributes> const& props) {
         // Check whether tensor already created
-        if (tensors.find(props->get_uid()) != tensors.end()) {
+        auto const uid = props->get_uid();
+        if (tensors.find(uid) != tensors.end()) {
+            getLogger() << "[cudnn_frontend] INFO: Backend tensor already created for Id: " << uid << ".\n";
             return {error_code_t::OK, ""};
         }
 
@@ -55,14 +57,14 @@ class ICudnn {
         auto tensor = cudnn_frontend::TensorBuilder()
                           .setDim(props->get_dim().size(), props->get_dim().data())
                           .setStrides(props->get_stride().size(), props->get_stride().data())
-                          .setId(props->get_uid())
+                          .setId(uid)
                           .setAlignment(16)
                           .setDataType(props->get_data_type())
                           .setVirtual(props->get_is_virtual())
                           .setByValue(props->get_is_pass_by_value())
                           .setReorderType(props->get_reordering_type())
                           .build();
-        tensors.emplace(props->get_uid(), std::make_shared<Tensor>(std::move(tensor)));
+        tensors.emplace(uid, std::make_shared<Tensor>(std::move(tensor)));
 
         return {error_code_t::OK, ""};
     }

@@ -41,7 +41,10 @@ class GenstatsNode : public INode {
             SUM->set_dim(sum_tensor_dim);
         }
         if (SUM->get_stride().empty()) {
-            SUM->set_stride(detail::generate_stride(SUM->get_dim()));
+            auto const& SUM_dim = SUM->get_dim();
+            // Default to NHWC
+            auto const& stride_order = detail::generate_NHWC_stride_order(SUM_dim.size());
+            SUM->set_stride(detail::generate_stride(SUM_dim, stride_order));
         }
 
         // Only infer dims and strides if user did not set them
@@ -51,7 +54,10 @@ class GenstatsNode : public INode {
             SQ_SUM->set_dim(sq_sum_tensor_dim);
         }
         if (SQ_SUM->get_stride().empty()) {
-            SQ_SUM->set_stride(detail::generate_stride(SQ_SUM->get_dim()));
+            auto const& SQ_SUM_dim = SQ_SUM->get_dim();
+            // Default to NHWC
+            auto const& stride_order = detail::generate_NHWC_stride_order(SQ_SUM_dim.size());
+            SQ_SUM->set_stride(detail::generate_stride(SQ_SUM_dim, stride_order));
         }
 
         return {error_code_t::OK, ""};

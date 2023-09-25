@@ -39,7 +39,10 @@ class BatchNormNode : public INode {
             Y->set_dim(x_tensor_dim);
         }
         if (Y->get_stride().empty()) {
-            Y->set_stride(detail::generate_stride(Y->get_dim()));
+            auto const& Y_dim = Y->get_dim();
+            // Default to NHWC
+            auto const& stride_order = detail::generate_NHWC_stride_order(Y_dim.size());
+            Y->set_stride(detail::generate_stride(Y_dim, stride_order));
         }
 
         // Set channel length tensors
@@ -52,7 +55,10 @@ class BatchNormNode : public INode {
                 T->set_dim(tensor_dim);
             }
             if (T->get_stride().empty()) {
-                T->set_stride(detail::generate_stride(T->get_dim()));
+                auto const& T_dim = T->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(T_dim.size());
+                T->set_stride(detail::generate_stride(T_dim, stride_order));
             }
         };
         infer_per_channel_tensors(options.outputs.MEAN);
@@ -73,7 +79,10 @@ class BatchNormNode : public INode {
                 T->set_dim(tensor_dim);
             }
             if (T->get_stride().empty()) {
-                T->set_stride(detail::generate_stride(T->get_dim()));
+                auto const& T_dim = T->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(T_dim.size());
+                T->set_stride(detail::generate_stride(T_dim, stride_order));
             }
         };
         infer_scalar_tensors(options.inputs.EPSILON);
@@ -81,7 +90,10 @@ class BatchNormNode : public INode {
 
         for (auto const& peer_stat : options.inputs.peer_stats) {
             if (peer_stat->get_stride().empty()) {
-                peer_stat->set_stride(detail::generate_stride(peer_stat->get_dim()));
+                auto const& peer_stat_dim = peer_stat->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(peer_stat_dim.size());
+                peer_stat->set_stride(detail::generate_stride(peer_stat_dim, stride_order));
             }
         }
 
@@ -94,11 +106,9 @@ class BatchNormNode : public INode {
                     << "Validating BatchNormNode " << options.name << "..." << std::endl;
 
         // Norm forward phase should be set
-        if (options.forward_phase == NormFwdPhase_t::NOT_SET) {
-            auto status         = error_code_t::ATTRIBUTE_NOT_SET;
-            std::string message = "[cudnn_frontend] ERROR: Forward phase not set of batchnorm node.";
-            return {status, message};
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(options.forward_phase == NormFwdPhase_t::NOT_SET,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Forward phase not set of batchnorm node.");
 
         return {error_code_t::OK, ""};
     }

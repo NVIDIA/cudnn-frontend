@@ -16,15 +16,15 @@ namespace python_bindings {
 void
 throw_if(bool const cond, cudnn_frontend::error_code_t const error_code, std::string const& error_msg);
 
-void * 
+void*
 create_handle() {
     cudnnHandle_t handle;
     cudnnCreate(&handle);
-    return (void *)handle;
+    return (void*)handle;
 }
 
 void
-destroy_handle(void *handle) {
+destroy_handle(void* handle) {
     auto status = cudnnDestroy((cudnnHandle_t)handle);
     throw_if(status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnHandle Destroy failed");
 }
@@ -61,8 +61,7 @@ init_properties(py::module_& m) {
             out << json{props};
             return out.str();
         });
-
 }
 
-}
-}
+}  // namespace python_bindings
+}  // namespace cudnn_frontend

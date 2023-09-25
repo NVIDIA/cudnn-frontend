@@ -20,6 +20,8 @@ enum class [[nodiscard]] error_code_t{OK,
                                       GRAPH_EXECUTION_FAILED,
                                       HEURISTIC_QUERY_FAILED,
                                       UNSUPPORTED_GRAPH_FORMAT,
+                                      CUDA_API_FAILED,
+                                      CUDNN_BACKEND_API_FAILED,
                                       INVALID_CUDA_DEVICE,
                                       HANDLE_ERROR};
 
@@ -61,69 +63,83 @@ typedef struct error_object {
 
 } error_t;
 
-#define CHECK_CUDNN_FRONTEND_ERROR(x)                                                                                \
-    do {                                                                                                             \
-        if (x.is_bad()) {                                                                                            \
-            getLogger() << "[cudnn_frontend] ERROR: " << #x << " code " << x.get_code() << " at " << __FILE__ << ":" \
-                        << __LINE__ << std::endl;                                                                    \
-            return x;                                                                                                \
-        }                                                                                                            \
-    } while (0)
+#ifdef WIN32
+#define CUDNN_FRONTEND_WHILE_FALSE \
+    __pragma(warning(push)) __pragma(warning(disable : 4127)) while (0) __pragma(warning(pop))
+#else
+#define CUDNN_FRONTEND_WHILE_FALSE while (0)
+#endif
 
-#define RETURN_CUDNN_FRONTEND_ERROR_IF(cond, retval)                                                              \
+#define CHECK_CUDNN_FRONTEND_ERROR(x)                                                                              \
+    do {                                                                                                           \
+        if (auto retval = x; retval.is_bad()) {                                                                    \
+            getLogger() << "[cudnn_frontend] ERROR: " << #x << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
+            return retval;                                                                                         \
+        }                                                                                                          \
+    }                                                                                                              \
+    CUDNN_FRONTEND_WHILE_FALSE
+
+#define RETURN_CUDNN_FRONTEND_ERROR_IF(cond, retval, message)                                                        \
+    do {                                                                                                             \
+        if (cond) {                                                                                                  \
+            if (retval == error_code_t::OK) {                                                                        \
+                getLogger() << "[cudnn_frontend] INFO: ";                                                            \
+            } else {                                                                                                 \
+                getLogger() << "[cudnn_frontend] ERROR: ";                                                           \
+            }                                                                                                        \
+            getLogger() << message << ". " << retval << " because (" << #cond ") at " << __FILE__ << ":" << __LINE__ \
+                        << "\n";                                                                                     \
+            return {retval, message};                                                                                \
+        }                                                                                                            \
+    }                                                                                                                \
+    CUDNN_FRONTEND_WHILE_FALSE
+
+#define CHECK_CUDNN_ERROR(x)                                                                                      \
     do {                                                                                                          \
-        if (cond) {                                                                                               \
-            if (retval.get_code() == error_code_t::OK) {                                                          \
-                getLogger() << "[cudnn_frontend] INFO: " << #cond << " returned " << retval.get_code() << " at "  \
-                            << __FILE__ << ":" << __LINE__ << std::endl;                                          \
-            } else {                                                                                              \
-                getLogger() << "[cudnn_frontend] ERROR: " << #cond << " returned " << retval.get_code() << " at " \
-                            << __FILE__ << ":" << __LINE__ << std::endl;                                          \
-            }                                                                                                     \
-            return {retval};                                                                                      \
+        if (auto cudnn_retval = x; cudnn_retval != CUDNN_STATUS_SUCCESS) {                                        \
+            std::stringstream error_msg;                                                                          \
+            error_msg << #x << " failed with " << cudnnGetErrorString(cudnn_retval);                              \
+            getLogger() << "[cudnn_frontend] ERROR: " << error_msg.str() << " at " << __FILE__ << ":" << __LINE__ \
+                        << std::endl;                                                                             \
+            return {error_code_t::CUDNN_BACKEND_API_FAILED, error_msg.str()};                                     \
         }                                                                                                         \
-    } while (0)
+    }                                                                                                             \
+    CUDNN_FRONTEND_WHILE_FALSE
+
+#define CHECK_CUDA_ERROR(x)                                                                                       \
+    do {                                                                                                          \
+        if (auto cuda_retval = x; cuda_retval != cudaSuccess) {                                                   \
+            std::stringstream error_msg;                                                                          \
+            error_msg << #x << " failed with " << cudaGetErrorString(cuda_retval);                                \
+            getLogger() << "[cudnn_frontend] ERROR: " << error_msg.str() << " at " << __FILE__ << ":" << __LINE__ \
+                        << std::endl;                                                                             \
+            return {error_code_t::CUDA_API_FAILED, error_msg.str()};                                              \
+        }                                                                                                         \
+    }                                                                                                             \
+    CUDNN_FRONTEND_WHILE_FALSE
+
+NLOHMANN_JSON_SERIALIZE_ENUM(error_code_t,
+                             {
+                                 {error_code_t::OK, "OK"},
+                                 {error_code_t::ATTRIBUTE_NOT_SET, "ATTRIBUTE_NOT_SET"},
+                                 {error_code_t::SHAPE_DEDUCTION_FAILED, "SHAPE_DEDUCTION_FAILED"},
+                                 {error_code_t::INVALID_TENSOR_NAME, "INVALID_TENSOR_NAME"},
+                                 {error_code_t::INVALID_VARIANT_PACK, "INVALID_VARIANT_PACK"},
+                                 {error_code_t::GRAPH_NOT_SUPPORTED, "GRAPH_NOT_SUPPORTED"},
+                                 {error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
+                                  "GRAPH_EXECUTION_PLAN_CREATION_FAILED"},
+                                 {error_code_t::GRAPH_EXECUTION_FAILED, "GRAPH_EXECUTION_FAILED"},
+                                 {error_code_t::HEURISTIC_QUERY_FAILED, "HEURISTIC_QUERY_FAILED"},
+                                 {error_code_t::CUDNN_BACKEND_API_FAILED, "CUDNN_BACKEND_API_FAILED"},
+                                 {error_code_t::CUDA_API_FAILED, "CUDA_API_FAILED"},
+                                 {error_code_t::INVALID_CUDA_DEVICE, "INVALID_CUDA_DEVICE"},
+                                 {error_code_t::UNSUPPORTED_GRAPH_FORMAT, "UNSUPPORTED_GRAPH_FORMAT"},
+                                 {error_code_t::HANDLE_ERROR, "HANDLE_ERROR"},
+                             })
 
 static inline std::ostream&
 operator<<(std::ostream& os, const error_code_t& mode) {
-    switch (mode) {
-        case error_code_t::OK:
-            os << "OK";
-            break;
-        case error_code_t::ATTRIBUTE_NOT_SET:
-            os << "ATTRIBUTE_NOT_SET";
-            break;
-        case error_code_t::SHAPE_DEDUCTION_FAILED:
-            os << "SHAPE_DEDUCTION_FAILED";
-            break;
-        case error_code_t::INVALID_TENSOR_NAME:
-            os << "INVALID_TENSOR_NAME";
-            break;
-        case error_code_t::INVALID_VARIANT_PACK:
-            os << "INVALID_VARIANT_PACK";
-            break;
-        case error_code_t::GRAPH_NOT_SUPPORTED:
-            os << "GRAPH_NOT_SUPPORTED";
-            break;
-        case error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED:
-            os << "GRAPH_EXECUTION_PLAN_CREATION_FAILED";
-            break;
-        case error_code_t::GRAPH_EXECUTION_FAILED:
-            os << "GRAPH_EXECUTION_FAILED";
-            break;
-        case error_code_t::HEURISTIC_QUERY_FAILED:
-            os << "HEURISTIC_QUERY_FAILED";
-            break;
-        case error_code_t::INVALID_CUDA_DEVICE:
-            os << "INVALID_CUDA_DEVICE";
-            break;
-        case error_code_t::UNSUPPORTED_GRAPH_FORMAT:
-            os << "UNSUPPORTED_GRAPH_FORMAT";
-            break;
-        case error_code_t::HANDLE_ERROR:
-            os << "HANDLE_ERROR";
-            break;
-    }
+    os << json{mode};
     return os;
 }
 
@@ -195,18 +211,60 @@ class Context {
     }
 };
 
-// Always generates NCHW (4d/5d tensors) or Col major (matrices)
+// Creates dense, non-overlapping strides from given dim and stride_order.
+// For example, if a is a 4D tensor with dimensions labeled NCHW, then strided(a, (3, 0, 2, 1)) produces
+// strides where the C dimension has a corresponding stride of one.
 inline std::vector<int64_t>
-generate_stride(std::vector<int64_t> const& dim) {
-    std::vector<int64_t> stride(dim.size(), 1);
+generate_stride(std::vector<int64_t> const& dim, std::vector<int64_t> const& stride_order) {
+    size_t num_dims = dim.size();
+    std::vector<int64_t> stride(num_dims);
 
-    stride[dim.size() - 1] = stride[1] * dim[1];
-    for (int64_t d = dim.size() - 2; d >= 2; d--) {
-        stride[d] = stride[d + 1] * dim[d + 1];
+    // Sort the dimensions according to strides from least to greatest.
+    // Example, dim = (2, 3, 4, 5) stride_order = (3, 1, 2, 0)
+    // sorted_stride_order = ((0, (3, 5)), (1, (1, 3)), (2, (2, 4)), (3, (0, 2)))
+    std::vector<std::pair<int64_t, std::pair<size_t, size_t>>> sorted_stride_order;
+    for (size_t i = 0; i < num_dims; ++i) {
+        sorted_stride_order.push_back({stride_order[i], {i, dim[i]}});
     }
-    stride[0] = stride[2] * dim[2];
+    std::sort(sorted_stride_order.begin(), sorted_stride_order.end());
+
+    // As dims have now been ordered starting from fastest changing,
+    // just fill in strides by iterating linearly over them.
+    int64_t product = 1;
+    for (size_t i = 0; i < num_dims; ++i) {
+        stride[sorted_stride_order[i].second.first] = product;
+        product *= sorted_stride_order[i].second.second;
+    }
 
     return stride;
+}
+
+// Generate NHWC stride_order
+inline std::vector<int64_t>
+generate_NHWC_stride_order(int64_t const num_dims) {
+    std::vector<int64_t> stride_order(num_dims);
+
+    int64_t order   = 0;
+    stride_order[1] = order++;
+    for (size_t i = num_dims - 1; i > 1; --i) {
+        stride_order[i] = order++;
+    }
+    stride_order[0] = order;
+
+    return stride_order;
+}
+
+// Generate column major stride_order for matrices
+// dim = (*, M, N) where * is batch dimsensions
+// strides should be (..., N, 1)
+inline std::vector<int64_t>
+generate_column_major_stride_order(int64_t const num_dims) {
+    std::vector<int64_t> stride_order(num_dims);
+
+    int64_t order = num_dims - 1;
+    std::generate(stride_order.begin(), stride_order.end(), [&order] { return order--; });
+
+    return stride_order;
 }
 
 }  // namespace detail
