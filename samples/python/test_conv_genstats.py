@@ -56,10 +56,12 @@ def test_conv_genstats():
     SUM, SQ_SUM = graph.genstats(name = "genstats", input = Y)
     SUM.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     SQ_SUM.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-
-    graph.check_support()
     
-    graph.build()
+    graph.validate()
+    graph.build_operation_graph()
+    plans = graph.get_execution_plan_list([cudnn.heur_mode.A])
+    plans.check_support()
+    graph.set_execution_plans(plans)
 
     sum_dev    = torch.zeros_like(sum_expected)
     sq_sum_dev = torch.zeros_like(sq_sum_expected)

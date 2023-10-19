@@ -26,9 +26,14 @@ include(${CMAKE_SOURCE_DIR}/cmake/cuDNN.cmake)
 pybind11_add_module(
     cudnn
     
-    cudnn_frontend_bindings.cpp
-    cudnn_frontend_pygraph.cpp
-    cudnn_frontend_properties.cpp
+    pycudnn.cpp
+    properties.cpp
+    pyplans.cpp
+    
+    pygraph/pygraph.cpp
+    pygraph/norm.cpp
+    pygraph/sdpa.cpp
+    pygraph/pointwise.cpp
 )
 
 target_link_libraries(
@@ -38,7 +43,6 @@ target_link_libraries(
 
     PRIVATE dlpack
     PRIVATE CUDA::cudart
-    PRIVATE CUDA::cublas
     PRIVATE CUDA::nvrtc
     PRIVATE CUDNN::cudnn_all
 )

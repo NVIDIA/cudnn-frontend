@@ -3,8 +3,8 @@
 #include "../../cudnn_frontend_ReductionDesc.h"
 #include "../../cudnn_frontend_Logging.h"
 
-#include "../cudnn_frontend_graph_helpers.h"
-#include "../cudnn_frontend_node_interface.h"
+#include "../graph_helpers.h"
+#include "../node_interface.h"
 
 namespace cudnn_frontend::graph {
 

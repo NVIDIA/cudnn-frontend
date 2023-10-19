@@ -72,7 +72,7 @@ TEST_CASE("Wgrad Graph", "[wgrad][graph][scale-bias-relu-wgrad][ConvBNwgrad]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list(fe::HeurMode_t::HEUR_MODE_A);
+    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::A});
 
     REQUIRE(plans.check_support(handle).is_good());
 

@@ -163,7 +163,7 @@ Python API:
 
 ### Layernorm Backward
 
-DLN operation computes data graident, scale gradient, bias gradient during backpropagation of batchnorm forward operation.
+DLN operation computes data graident, scale gradient, bias gradient during backpropagation of layernorm forward operation.
 
 The API to achieve above is:  
 ```
@@ -181,6 +181,75 @@ Layernorm_attributes&
 set_name(std::string const&)
 
 Layernorm_attributes&
+set_compute_data_type(DataType_t value)
+```
+
+Python API: 
+- layernorm
+    - input
+    - scale
+    - loss
+    - compute_data_type
+    - name
+
+
+### Instancenorm Forward
+
+Instance norm computes
+
+$$ output = scale*{input - mean \over \sqrt{variance + epsilon}} + bias $$
+
+where normalization happens across each sample.
+
+The API to achieve above equations is:  
+```
+std::array<std::shared_ptr<Tensor_attributes>, 3> instancenorm(std::shared_ptr<Tensor_attributes>& input,
+                                                            std::shared_ptr<Tensor_attributes>& scale,
+                                                            std::shared_ptr<Tensor_attributes>& bias,
+                                                            Instancenorm_attributes attribues); 
+```
+where the output array has tensors in order of: `[output, mean, variance]`
+
+Instancenorm_attributes is a lighweight structure with setters for providing optional input tensors and other operation attributes:  
+```
+Instancenorm_attributes&
+set_name(std::string const&)
+
+Instancenorm_attributes&
+set_compute_data_type(DataType_t value)
+```
+
+Python API: 
+- instancenorm
+    - norm_forward_phase
+    - input
+    - scale
+    - bias
+    - epsilon
+    - compute_data_type
+    - name
+
+
+### Instancenorm Backward
+
+DIN operation computes data graident, scale gradient, bias gradient during backpropagation of instancenorm forward operation.
+
+The API to achieve above is:  
+```
+std::array<std::shared_ptr<Tensor_attributes>, 3>
+            instancenorm_backward(std::shared_ptr<Tensor_attributes> dy,
+                          std::shared_ptr<Tensor_attributes> x,
+                          std::shared_ptr<Tensor_attributes> scale,
+                          Instancenorm_backward_attributes options);
+```
+where the output array has tensors in order of: `[input gradient, scale gradient, bias gradient]`.
+
+Instancenorm_attributes is a lighweight structure with setters for providing optoinal input tensors and other operation attributes:  
+```
+Instancenorm_attributes&
+set_name(std::string const&)
+
+Instancenorm_attributes&
 set_compute_data_type(DataType_t value)
 ```
 

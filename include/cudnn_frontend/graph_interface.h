@@ -2,196 +2,31 @@
 
 #include <unordered_map>
 
-#include "cudnn_frontend/node/batchnorm.h"
-#include "cudnn_frontend/node/batchnorm_inference.h"
-#include "cudnn_frontend/node/bn_finalize.h"
-#include "cudnn_frontend/node/conv_fprop.h"
-#include "cudnn_frontend/node/conv_dgrad.h"
-#include "cudnn_frontend/node/conv_wgrad.h"
-#include "cudnn_frontend/node/dbn.h"
-#include "cudnn_frontend/node/dln.h"
-#include "cudnn_frontend/node/dbn_weight.h"
-#include "cudnn_frontend/node/genstats.h"
-#include "cudnn_frontend/node/layernorm.h"
-#include "cudnn_frontend/node/matmul.h"
-#include "cudnn_frontend/node/pointwise.h"
-#include "cudnn_frontend/node/reduction.h"
-#include "cudnn_frontend/node/rng.h"
-#include "cudnn_frontend/node/reshape.h"
-#include "cudnn_frontend/node/scaled_dot_product_attention.h"
-#include "cudnn_frontend/node/scaled_dot_product_flash_attention.h"
+#include "node/batchnorm.h"
+#include "node/batchnorm_inference.h"
+#include "node/bn_finalize.h"
+#include "node/conv_fprop.h"
+#include "node/conv_dgrad.h"
+#include "node/conv_wgrad.h"
+#include "node/dbn.h"
+#include "node/dln.h"
+#include "node/dbn_weight.h"
+#include "node/genstats.h"
+#include "node/layernorm.h"
+#include "node/instancenorm.h"
+#include "node/matmul.h"
+#include "node/pointwise.h"
+#include "node/reduction.h"
+#include "node/reshape.h"
+#include "node/rmsnorm.h"
+#include "node/rng.h"
+#include "node/scaled_dot_product_attention.h"
+#include "node/scaled_dot_product_flash_attention.h"
 
-#include "cudnn_frontend_graph_helpers.h"
+#include "plans.h"
+#include "graph_helpers.h"
 
 namespace cudnn_frontend::graph {
-
-class Plans {
-    friend class Graph;
-    Execution_plan_list list_of_engine_configs;
-
-   public:
-    Execution_plan_list &
-    get_engine_configs() {
-        return list_of_engine_configs;
-    }
-
-    Plans &
-    filter_out_numeric_notes(std::vector<cudnnBackendNumericalNote_t> const &);
-    Plans &
-    filter_out_behavior_notes(std::vector<cudnnBackendBehaviorNote_t> const &);
-    Plans &
-    filter_out_workspace_greater_than(int64_t const workspace) {
-        list_of_engine_configs.set_max_workspace_allowed(workspace);
-        return *this;
-    }
-
-    error_t build_all_plans(cudnnHandle_t);
-
-    inline error_t
-    check_support(cudnnHandle_t h) {
-        CHECK_CUDNN_FRONTEND_ERROR(list_of_engine_configs.check_support(h));
-        return {error_code_t::OK, ""};
-    }
-
-    int64_t
-    get_max_workspace_size();
-
-    static error_t
-    autotune_default_impl(Plans *plans,
-                          cudnnHandle_t handle,
-                          std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> variants,
-                          void *workspace,
-                          void *) {
-        auto &execution_plans = plans->get_engine_configs().get_execution_plans();
-
-        // Create the variant pack for all the plans to use.
-        std::vector<int64_t> uids;
-        std::vector<void *> ptrs;
-        for (auto it : variants) {
-            uids.push_back(it.first->get_uid());
-            ptrs.push_back(it.second);
-        }
-
-        auto variantPack = VariantPackBuilder()
-                               .setDataPointers(ptrs.size(), ptrs.data())
-                               .setUids(uids.size(), uids.data())
-                               .setWorkspacePointer(workspace)
-                               .build();
-
-        std::vector<std::shared_ptr<ExecutionPlan>> time_sorted_plans;
-
-        auto plan_cmp = [](std::shared_ptr<ExecutionPlan> a, std::shared_ptr<ExecutionPlan> b) {
-            return a->getExecutionTime() < b->getExecutionTime();
-        };
-        std::set<std::shared_ptr<ExecutionPlan>, decltype(plan_cmp)> timed_execution_plans(plan_cmp);
-
-        const int maxIterCount         = 100;
-        const float threshhold         = 0.95f;
-        uint64_t successful_plan_count = 0;
-        cudaEvent_t start, stop;
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-        cudaDeviceSynchronize();
-
-        cudaStream_t stream = nullptr;
-        cudnnGetStream(handle, &stream);
-
-        for (auto plan : plans->get_engine_configs().get_execution_plans()) {
-            float time_ms       = 0.0f;
-            float final_time_ms = 0.0f;
-            float min_time_ms   = std::numeric_limits<float>::max();
-
-            // Warm-up run
-            auto warmup_status = cudnnBackendExecute(handle, plan->get_raw_desc(), variantPack.get_raw_desc());
-            if (warmup_status != CUDNN_STATUS_SUCCESS) {
-                getLogger() << "[cudnn_frontend] Plan " << plan->getTag() << " failed with " << to_string(warmup_status)
-                            << std::endl;
-                continue;
-            }
-            successful_plan_count++;
-            cudaDeviceSynchronize();
-
-            for (int i = 0; i < maxIterCount; i++) {
-                cudaEventRecord(start, stream);
-
-                cudnnBackendExecute(handle, plan->get_raw_desc(), variantPack.get_raw_desc());
-
-                cudaEventRecord(stop, stream);
-                cudaEventSynchronize(stop);
-                cudaEventElapsedTime(&time_ms, start, stop);
-
-                final_time_ms = std::min(min_time_ms, time_ms);
-                if (time_ms / min_time_ms < threshhold) {
-                    min_time_ms = final_time_ms;
-                } else {
-                    break;
-                }
-            }
-
-            getLogger() << "[cudnn_frontend] Plan " << plan->getTag() << " took " << std::setw(10) << final_time_ms
-                        << std::endl;
-            plan->setExecutionTime(final_time_ms);
-            timed_execution_plans.insert(plan);
-        }
-
-        execution_plans.clear();
-        for (auto sorted_plan : timed_execution_plans) {
-            execution_plans.push_back(sorted_plan);
-        }
-
-        cudaEventDestroy(start);
-        cudaEventDestroy(stop);
-
-        getLogger() << "Autotuned " << successful_plan_count << " plans." << std::endl;
-        return {error_code_t::OK, ""};
-    }
-
-    std::function<
-        error_t(Plans *, cudnnHandle_t, std::unordered_map<std::shared_ptr<Tensor_attributes>, void *>, void *, void *)>
-        autotune_impl = &Plans::autotune_default_impl;
-
-    error_t
-    autotune(cudnnHandle_t handle,
-             std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> variants,
-             void *workspace,
-             void *user_impl = nullptr) {
-        auto error = autotune_impl(this, handle, variants, workspace, user_impl);
-        return error;
-    }
-};
-
-inline Plans &
-Plans::filter_out_behavior_notes(std::vector<cudnnBackendBehaviorNote_t> const &notes) {
-    // TODO: The error returned is not propagate to user.
-    // Should the return value be changed to error_code_t too?
-    auto status = list_of_engine_configs.filter_out_behavior_notes(notes);
-    if (status.is_bad()) {
-        getLogger() << "[cudnn_frontend] ERROR: Filtering by behavioural notes failed." << std::endl;
-    }
-    return *this;
-}
-
-inline Plans &
-Plans::filter_out_numeric_notes(std::vector<cudnnBackendNumericalNote_t> const &notes) {
-    // TODO: The error returned is not propagate to user.
-    // Should the return value be changed to error_code_t too?
-    auto status = list_of_engine_configs.filter_out_numeric_notes(notes);
-    if (status.is_bad()) {
-        getLogger() << "[cudnn_frontend] ERROR: Filtering by numerical notes failed." << std::endl;
-    }
-    return *this;
-}
-
-inline error_t
-Plans::build_all_plans(cudnnHandle_t h) {
-    CHECK_CUDNN_FRONTEND_ERROR(list_of_engine_configs.build_all_plans(h));
-    return {error_code_t::OK, ""};
-}
-
-inline int64_t
-Plans::get_max_workspace_size() {
-    return list_of_engine_configs.get_max_workspace_size();
-}
 
 class Graph : public INode {
    private:
@@ -234,6 +69,11 @@ class Graph : public INode {
                                                                 std::shared_ptr<Tensor_attributes>,
                                                                 std::shared_ptr<Tensor_attributes>,
                                                                 Layernorm_attributes);
+
+    std::array<std::shared_ptr<Tensor_attributes>, 3> instancenorm(std::shared_ptr<Tensor_attributes>,
+                                                                   std::shared_ptr<Tensor_attributes>,
+                                                                   std::shared_ptr<Tensor_attributes>,
+                                                                   Instancenorm_attributes);
 
     std::array<std::shared_ptr<Tensor_attributes>, 5> batchnorm(std::shared_ptr<Tensor_attributes>,
                                                                 std::shared_ptr<Tensor_attributes>,
@@ -284,6 +124,10 @@ class Graph : public INode {
                                                                          std::shared_ptr<Tensor_attributes>,
                                                                          Layernorm_backward_attributes);
 
+    std::array<std::shared_ptr<Tensor_attributes>, 3> instancenorm_backward(std::shared_ptr<Tensor_attributes>,
+                                                                            std::shared_ptr<Tensor_attributes>,
+                                                                            std::shared_ptr<Tensor_attributes>,
+                                                                            Instancenorm_backward_attributes);
     std::array<std::shared_ptr<Tensor_attributes>, 2> genstats(std::shared_ptr<Tensor_attributes>, Genstats_attributes);
 
     std::shared_ptr<Tensor_attributes> matmul(std::shared_ptr<Tensor_attributes>,
@@ -301,6 +145,16 @@ class Graph : public INode {
 
     std::shared_ptr<Tensor_attributes> reduction(std::shared_ptr<Tensor_attributes>, Reduction_attributes);
 
+    std::array<std::shared_ptr<Tensor_attributes>, 2> rmsnorm(std::shared_ptr<Tensor_attributes>,
+                                                              std::shared_ptr<Tensor_attributes>,
+                                                              Rmsnorm_attributes);
+
+    std::array<std::shared_ptr<Tensor_attributes>, 3> rmsnorm_backward(std::shared_ptr<Tensor_attributes>,
+                                                                       std::shared_ptr<Tensor_attributes>,
+                                                                       std::shared_ptr<Tensor_attributes>,
+                                                                       std::shared_ptr<Tensor_attributes>,
+                                                                       Rmsnorm_backward_attributes);
+
     std::array<std::shared_ptr<Tensor_attributes>, 2> scaled_dot_product_flash_attention(
         std::shared_ptr<Tensor_attributes>,
         std::shared_ptr<Tensor_attributes>,
@@ -316,7 +170,7 @@ class Graph : public INode {
         Scaled_dot_product_flash_attention_backward_attributes);
 
     Plans
-    get_execution_plan_list(HeurMode_t mode);
+    get_execution_plan_list(std::vector<HeurMode_t> const &mode);
 
     error_t
     set_execution_plans(Plans const &plan) {
@@ -330,21 +184,7 @@ class Graph : public INode {
     }
 
     error_t
-    get_engine_configs(Execution_plan_list &plan_list) {
-        getLogger() << "[cudnn_frontend] INFO: Extracting engine configs." << std::endl;
-
-        if (engine_configs.size() == 0) {
-            return {error_code_t::HEURISTIC_QUERY_FAILED, "No valid engine configs for mode_a"};
-        }
-        plan_list.set_tag(engine_configs.begin()->first);
-        plan_list.set_engine_configs(engine_configs.begin()->second);
-
-        getLogger() << "[cudnn_frontend] INFO: Querying engine config properties for cfg_count "
-                    << engine_configs.begin()->second.size() << std::endl;
-        CHECK_CUDNN_FRONTEND_ERROR(plan_list.query_properties());
-
-        return {error_code_t::OK, ""};
-    }
+    build(cudnnHandle_t const &handle, std::vector<HeurMode_t> const &mode);
 
     error_t
     createOperationGraphs(cudnnHandle_t handle) override final {
@@ -357,22 +197,44 @@ class Graph : public INode {
 };
 
 inline Plans
-Graph::get_execution_plan_list(HeurMode_t mode) {
+Graph::get_execution_plan_list(std::vector<HeurMode_t> const &mode) {
     Plans plan_list;
     // TODO: The error returned is not propagate to user.
     // Should the return value be changed to error_code_t too?
 
-    auto status = query_heuristics(mode);
+    std::unordered_map<std::string, EngineConfigList> op_graph_to_configs;
+    auto status = detail::query_heuristics(operation_graphs, op_graph_to_configs, mode);
     if (status.is_bad()) {
         getLogger() << "[cudnn_frontend] ERROR: Failed to build." << std::endl;
         return plan_list;
     }
 
-    status = get_engine_configs(plan_list.list_of_engine_configs);
+    getLogger() << "[cudnn_frontend] INFO: Extracting engine configs." << std::endl;
+    auto &engine_configs = plan_list.list_of_engine_configs;
+    engine_configs.set_tag(op_graph_to_configs.begin()->first);
+    engine_configs.set_engine_configs(op_graph_to_configs.begin()->second);
+
+    getLogger() << "[cudnn_frontend] INFO: Querying engine config properties\n";
+    status = engine_configs.query_properties();
     if (status.is_bad()) {
         getLogger() << "[cudnn_frontend] ERROR: Querying engine configs failed." << std::endl;
     }
     return plan_list;
+}
+
+inline error_t
+Graph::build(cudnnHandle_t const &handle, std::vector<HeurMode_t> const &modes) {
+    CHECK_CUDNN_FRONTEND_ERROR(validate());
+
+    CHECK_CUDNN_FRONTEND_ERROR(build_operation_graph(handle));
+
+    auto plans = get_execution_plan_list(modes);
+
+    CHECK_CUDNN_FRONTEND_ERROR(plans.check_support(handle));
+
+    CHECK_CUDNN_FRONTEND_ERROR(set_execution_plans(plans));
+
+    return {error_code_t::OK, ""};
 }
 
 inline Graph &
@@ -458,6 +320,29 @@ Graph::layernorm(std::shared_ptr<Tensor_attributes> x,
     return {Y, MEAN, INV_VARIANCE};
 }
 
+inline std::array<std::shared_ptr<Tensor_attributes>, 3>
+Graph::instancenorm(std::shared_ptr<Tensor_attributes> x,
+                    std::shared_ptr<Tensor_attributes> scale,
+                    std::shared_ptr<Tensor_attributes> bias,
+                    Instancenorm_attributes options) {
+    // Set outputs
+    auto Y = options.outputs.Y                      = output_tensor(options.get_name() + "::Y");
+    std::shared_ptr<Tensor_attributes> MEAN         = nullptr;
+    std::shared_ptr<Tensor_attributes> INV_VARIANCE = nullptr;
+    if (options.forward_phase == NormFwdPhase_t::TRAINING) {
+        MEAN = options.outputs.MEAN = output_tensor(options.get_name() + "::MEAN");
+        INV_VARIANCE = options.outputs.INV_VARIANCE = output_tensor(options.get_name() + "::INV_VARIANCE");
+    }
+    // Set inputs
+    options.inputs.X     = x;
+    options.inputs.SCALE = scale;
+    options.inputs.BIAS  = bias;
+
+    sub_nodes.emplace_back(std::make_unique<InstanceNormNode>(std::move(options), context));
+
+    return {Y, MEAN, INV_VARIANCE};
+}
+
 inline std::array<std::shared_ptr<Tensor_attributes>, 5>
 Graph::batchnorm(std::shared_ptr<Tensor_attributes> x,
                  std::shared_ptr<Tensor_attributes> scale,
@@ -523,6 +408,25 @@ Graph::batchnorm_backward(std::shared_ptr<Tensor_attributes> dy,
     options.inputs.SCALE = scale;
 
     sub_nodes.emplace_back(std::make_unique<DBNNode>(std::move(options), context));
+
+    return {return_outputs.DX, return_outputs.DSCALE, return_outputs.DBIAS};
+}
+
+inline std::array<std::shared_ptr<Tensor_attributes>, 3>
+Graph::instancenorm_backward(std::shared_ptr<Tensor_attributes> dy,
+                             std::shared_ptr<Tensor_attributes> x,
+                             std::shared_ptr<Tensor_attributes> scale,
+                             Instancenorm_backward_attributes options) {
+    // Set outputs
+    options.make_outputs([this](std::string const &name) { return output_tensor(name); });
+    auto return_outputs = options.outputs;
+
+    // Set inputs
+    options.inputs.DY    = dy;
+    options.inputs.X     = x;
+    options.inputs.SCALE = scale;
+
+    sub_nodes.emplace_back(std::make_unique<DINNode>(std::move(options), context));
 
     return {return_outputs.DX, return_outputs.DSCALE, return_outputs.DBIAS};
 }
@@ -692,6 +596,50 @@ Graph::reduction(std::shared_ptr<Tensor_attributes> input, Reduction_attributes 
     return Y;
 }
 
+inline std::array<std::shared_ptr<Tensor_attributes>, 2>
+Graph::rmsnorm(std::shared_ptr<Tensor_attributes> x,
+               std::shared_ptr<Tensor_attributes> scale,
+               Rmsnorm_attributes options) {
+    // Set outputs
+    auto Y = options.outputs.Y                      = output_tensor(options.get_name() + "::Y");
+    std::shared_ptr<Tensor_attributes> INV_VARIANCE = nullptr;
+    if (options.forward_phase == NormFwdPhase_t::TRAINING) {
+        INV_VARIANCE = options.outputs.INV_VARIANCE = output_tensor(options.get_name() + "::INV_VARIANCE");
+    }
+    // Set inputs
+    options.inputs.X     = x;
+    options.inputs.SCALE = scale;
+
+    sub_nodes.emplace_back(std::make_unique<RMSNormNode>(std::move(options), context));
+
+    return {Y, INV_VARIANCE};
+}
+
+inline std::array<std::shared_ptr<Tensor_attributes>, 3>
+Graph::rmsnorm_backward(std::shared_ptr<Tensor_attributes> dy,
+                        std::shared_ptr<Tensor_attributes> x,
+                        std::shared_ptr<Tensor_attributes> scale,
+                        std::shared_ptr<Tensor_attributes> inv_variance,
+                        Rmsnorm_backward_attributes options) {
+    // Set outputs
+    auto DX = options.outputs.DX = output_tensor(options.get_name() + "::DX");
+    auto DScale = options.outputs.DSCALE     = output_tensor(options.get_name() + "::Dscale");
+    std::shared_ptr<Tensor_attributes> DBias = nullptr;
+    if (options.use_dbias.value_or(true)) {
+        DBias = options.outputs.DBIAS = output_tensor(options.get_name() + "::Dbias");
+    }
+
+    // Set inputs
+    options.inputs.DY           = dy;
+    options.inputs.X            = x;
+    options.inputs.SCALE        = scale;
+    options.inputs.INV_VARIANCE = inv_variance;
+
+    sub_nodes.emplace_back(std::make_unique<DRMSNormNode>(std::move(options), context));
+
+    return {DX, DScale, DBias};
+}
+
 inline std::shared_ptr<Tensor_attributes>
 Graph::matmul(std::shared_ptr<Tensor_attributes> a, std::shared_ptr<Tensor_attributes> b, Matmul_attributes options) {
     auto C = options.outputs.C = output_tensor(options.get_name() + "_output");
@@ -733,7 +681,9 @@ Graph::scaled_dot_product_flash_attention(std::shared_ptr<Tensor_attributes> q,
     auto O = options.outputs.O = output_tensor(options.get_name() + "::O");
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> Stats = nullptr;
-    Stats = options.outputs.Stats = output_tensor(options.get_name() + "::Stats");
+    if (options.is_inference == false) {
+        Stats = options.outputs.Stats = output_tensor(options.get_name() + "::Stats");
+    }
 
     // Set inputs
     options.inputs.Q = q;

@@ -25,6 +25,7 @@ add_executable(
     cpp/matmuls.cpp
     cpp/batchnorm.cpp
     cpp/layernorm.cpp
+    cpp/rmsnorm.cpp
     cpp/wgrads.cpp
 
     conv_sample.cpp 
@@ -71,7 +72,6 @@ target_link_libraries(
     Catch2::Catch2WithMain
 
     CUDA::cudart
-    CUDA::cublas
     CUDA::nvrtc
     
     CUDNN::cudnn_all

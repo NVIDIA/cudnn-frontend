@@ -2501,6 +2501,12 @@ class OperationBuilder_v8 {
     }
 
     auto
+    setSavedInvVar(Tensor_v8 const &var) -> OperationBuilder_v8 & {
+        m_operation.savedInVardesc = var.get_desc();
+        return *this;
+    }
+
+    auto
     setScale(Tensor_v8 const &scale_tensor) -> OperationBuilder_v8 & {
         m_operation.scaledesc = scale_tensor.get_desc();
         return *this;
@@ -2510,6 +2516,12 @@ class OperationBuilder_v8 {
     setScaleAndBias(Tensor_v8 const &scale_tensor, Tensor_v8 const &bias_tensor) -> OperationBuilder_v8 & {
         m_operation.scaledesc = scale_tensor.get_desc();
         m_operation.biasdesc  = bias_tensor.get_desc();
+        return *this;
+    }
+
+    auto
+    setDScale(Tensor_v8 const &scale_tensor) -> OperationBuilder_v8 & {
+        m_operation.dscaledesc = scale_tensor.get_desc();
         return *this;
     }
 

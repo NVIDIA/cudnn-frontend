@@ -345,9 +345,8 @@ get_heuristics_list_impl(cudnnBackendHeurMode_t heur_mode,
     return CUDNN_STATUS_SUCCESS;
 }
 
-template <std::size_t SIZE>
-std::vector<cudnnStatus_t>
-get_heuristics_list(std::array<std::string, SIZE> modes,
+static inline std::vector<cudnnStatus_t>
+get_heuristics_list(std::vector<std::string> const &modes,
                     OperationGraph_v8 &opGraph,
                     std::function<bool(cudnnBackendDescriptor_t)> filter_fn,
                     EngineConfigList &filtered_configs,
@@ -428,6 +427,37 @@ get_heuristics_list(std::array<std::string, SIZE> modes,
     }
 }
 return statuses;
+}
+
+static inline std::vector<cudnnStatus_t>
+get_heuristics_list(std::vector<cudnn_frontend::HeurMode_t> const &modes,
+                    OperationGraph_v8 &opGraph,
+                    std::function<bool(cudnnBackendDescriptor_t)> filter_fn,
+                    EngineConfigList &filtered_configs,
+                    bool evaluate_all = false) {
+    std::unordered_map<HeurMode_t, std::string> mode_to_string = {
+        {HeurMode_t::A, "heuristics_mode_a"},
+        {HeurMode_t::B, "heuristics_mode_b"},
+        {HeurMode_t::FALLBACK, "heuristics_fallback"},
+    };
+
+    std::vector<std::string> string_modes(modes.size());
+    std::transform(modes.begin(), modes.end(), string_modes.begin(), [&mode_to_string](const auto &mode) {
+        return mode_to_string.at(mode);
+    });
+
+    return get_heuristics_list(string_modes, opGraph, filter_fn, filtered_configs, evaluate_all);
+}
+
+template <std::size_t SIZE>
+std::vector<cudnnStatus_t>
+get_heuristics_list(std::array<std::string, SIZE> modes,
+                    OperationGraph_v8 &opGraph,
+                    std::function<bool(cudnnBackendDescriptor_t)> filter_fn,
+                    EngineConfigList &filtered_configs,
+                    bool evaluate_all = false) {
+    std::vector<std::string> modes_vector(modes.begin(), modes.end());
+    return get_heuristics_list(modes_vector, opGraph, filter_fn, filtered_configs, evaluate_all);
 }
 
 #undef NV_CUDNN_FE_TRY

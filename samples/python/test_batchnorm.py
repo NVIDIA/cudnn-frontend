@@ -66,8 +66,12 @@ def test_bn_relu_with_mask():
                         comparison = comparison)
     mask.set_output(True).set_data_type(cudnn.data_type.BOOLEAN)
 
-    graph.check_support()
-    graph.build()
+    
+    graph.validate()
+    graph.build_operation_graph()
+    plans = graph.get_execution_plan_list([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    plans.check_support()
+    graph.set_execution_plans(plans)
 
     saved_mean_actual = torch.zeros_like(scale_gpu)
     saved_inv_var_actual = torch.zeros_like(scale_gpu)
@@ -138,10 +142,12 @@ def test_bn():
     saved_inv_var.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     out_running_mean.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     out_running_var.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-
-    graph.check_support()
-
-    graph.build()
+    
+    graph.validate()
+    graph.build_operation_graph()
+    plans = graph.get_execution_plan_list([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    plans.check_support()
+    graph.set_execution_plans(plans)
 
     saved_mean_actual = torch.zeros_like(scale_gpu)
     saved_inv_var_actual = torch.zeros_like(scale_gpu)
@@ -210,10 +216,12 @@ def test_drelu_dadd_dbn():
     DX.set_output(True)
     DScale.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     DBias.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-
-    graph.check_support()
-
-    graph.build()
+    
+    graph.validate()
+    graph.build_operation_graph()
+    plans = graph.get_execution_plan_list([cudnn.heur_mode.A])
+    plans.check_support()
+    graph.set_execution_plans(plans)
 
     DScale_actual = torch.zeros_like(scale_gpu)
     DBias_actual = torch.zeros_like(scale_gpu)
@@ -277,10 +285,12 @@ def test_bn_infer_drelu_dbn():
     DX.set_output(True)
     DScale.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     DBias.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-
-    graph.check_support()
-
-    graph.build()
+    
+    graph.validate()
+    graph.build_operation_graph()
+    plans = graph.get_execution_plan_list([cudnn.heur_mode.A])
+    plans.check_support()
+    graph.set_execution_plans(plans)
 
     DScale_actual = torch.zeros_like(scale_gpu)
     DBias_actual = torch.zeros_like(scale_gpu)

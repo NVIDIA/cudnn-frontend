@@ -18,7 +18,7 @@ def convert_to_cudnn_type(torch_type):
         raise ValueError("Unsupported tensor data type.")
     
 problem_size_options = [(1, 128, 768)
-                        # , (16, 512, 1600) TODO: BUG https://nvbugswb.nvidia.com/NvBugs5/SWBug.aspx?bugid=4291755&cmtNo=
+                        , (16, 512, 1600)
                         , (1, 128, 1024)]
 input_type_options = [torch.bfloat16, torch.float16]
 
@@ -32,6 +32,13 @@ def test_matmul_bias_relu(param_extract):
     problem_size_options, input_type = param_extract
     b, s, e = problem_size_options
 
+    if b > 1 and cudnn.backend_version() < 8906:
+        pytest.skip("matmul broadcast only supported 8.9.6 onwards.")
+
+    # Regression in cudnn backend where ampere does not support matmul broadcast starting 8.9.6
+    if b > 1 and torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("matmul broadcast on ampere with 8.9.6 is not supported.")
+        
     X_gpu = torch.randn(b,s,e, requires_grad=False, device="cuda", dtype=input_type)
     W_gpu = torch.randn(1,e,e*4, requires_grad=False, device="cuda", dtype=input_type)
     B_gpu = torch.randn(1,1,e*4, requires_grad=False, device="cuda", dtype=input_type)
@@ -46,9 +53,12 @@ def test_matmul_bias_relu(param_extract):
     response = graph.matmul(name = "matmul", A = X, B = W)
     Y = graph.bias(name = "bias", input = response, bias = B)
     Y.set_output(True).set_data_type(convert_to_cudnn_type(input_type))
-
-    graph.check_support()
-    graph.build()
+    
+    graph.validate()
+    graph.build_operation_graph()
+    plans = graph.get_execution_plan_list([cudnn.heur_mode.A])
+    plans.check_support()
+    graph.set_execution_plans(plans)
 
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 

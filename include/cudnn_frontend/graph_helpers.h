@@ -254,15 +254,28 @@ generate_NHWC_stride_order(int64_t const num_dims) {
     return stride_order;
 }
 
-// Generate column major stride_order for matrices
+// Generate row major stride_order for matrices
 // dim = (*, M, N) where * is batch dimsensions
 // strides should be (..., N, 1)
 inline std::vector<int64_t>
-generate_column_major_stride_order(int64_t const num_dims) {
+generate_row_major_stride_order(int64_t const num_dims) {
     std::vector<int64_t> stride_order(num_dims);
 
     int64_t order = num_dims - 1;
     std::generate(stride_order.begin(), stride_order.end(), [&order] { return order--; });
+
+    return stride_order;
+}
+
+// Generate column major stride_order for matrices
+// dim = (M, N)
+// strides should be (1, M)
+inline std::vector<int64_t>
+generate_column_major_stride_order(int64_t const num_dims) {
+    std::vector<int64_t> stride_order(num_dims);
+
+    int64_t order = 1;
+    std::generate(stride_order.begin(), stride_order.end(), [&order] { return order++; });
 
     return stride_order;
 }

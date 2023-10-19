@@ -3,8 +3,8 @@
 #include "../../cudnn_frontend_Heuristics.h"
 #include "../../cudnn_frontend_Logging.h"
 
-#include "../cudnn_frontend_graph_helpers.h"
-#include "../cudnn_frontend_node_interface.h"
+#include "../graph_helpers.h"
+#include "../node_interface.h"
 
 namespace cudnn_frontend {
 
@@ -124,6 +124,23 @@ class DLNNode : public INode {
         infer_scale_bias_tensors(options.outputs.DSCALE);
         infer_scale_bias_tensors(options.outputs.DBIAS);
 
+        // Set scalar tensors
+        auto infer_scalar_tensors = [&x_tensor_dim](std::shared_ptr<Tensor_attributes>& T) {
+            auto tensor_dim = T->get_dim();
+            // Only infer dims and strides if user did not set them
+            if (tensor_dim.empty()) {
+                tensor_dim.resize(x_tensor_dim.size(), 1);
+                T->set_dim(tensor_dim);
+            }
+            if (T->get_stride().empty()) {
+                auto const& T_dim = T->get_dim();
+                // Default to NHWC
+                auto const& stride_order = detail::generate_NHWC_stride_order(T_dim.size());
+                T->set_stride(detail::generate_stride(T_dim, stride_order));
+            }
+        };
+        if (options.inputs.EPSILON) infer_scalar_tensors(options.inputs.EPSILON);
+
         return {error_code_t::OK, ""};
     }
 
@@ -132,9 +149,9 @@ class DLNNode : public INode {
         options.inputs.X->set_uid(ICudnn::create_new_uid());
         options.inputs.DY->set_uid(ICudnn::create_new_uid());
         options.inputs.SCALE->set_uid(ICudnn::create_new_uid());
-        options.inputs.MEAN->set_uid(ICudnn::create_new_uid());
-        options.inputs.INV_VARIANCE->set_uid(ICudnn::create_new_uid());
-        // epsilon->set_uid(ICudnn::create_new_uid());
+        if (options.inputs.MEAN) options.inputs.MEAN->set_uid(ICudnn::create_new_uid());
+        if (options.inputs.INV_VARIANCE) options.inputs.INV_VARIANCE->set_uid(ICudnn::create_new_uid());
+        if (options.inputs.EPSILON) options.inputs.EPSILON->set_uid(ICudnn::create_new_uid());
         options.outputs.DX->set_uid(ICudnn::create_new_uid());
         options.outputs.DSCALE->set_uid(ICudnn::create_new_uid());
         options.outputs.DBIAS->set_uid(ICudnn::create_new_uid());
@@ -149,9 +166,9 @@ class DLNNode : public INode {
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.X));
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.DY));
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.SCALE));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.MEAN));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.INV_VARIANCE));
-        // CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(epsilon));
+        if (options.inputs.MEAN) CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.MEAN));
+        if (options.inputs.INV_VARIANCE) CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.INV_VARIANCE));
+        if (options.inputs.EPSILON) CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.EPSILON));
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.DX));
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.DSCALE));
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.DBIAS));
@@ -178,21 +195,21 @@ class DLNNode : public INode {
                                                             *(tensors.at(options.inputs.INV_VARIANCE->get_uid())))
                                      .setDScaleAndDBias(*(tensors.at(options.outputs.DSCALE->get_uid())),
                                                         *(tensors.at(options.outputs.DBIAS->get_uid())))
-                                     // .setEpsilonTensor(*(tensors.at(epsilon->get_uid())))
+                                     .setEpsilonTensor(*(tensors.at(options.inputs.EPSILON->get_uid())))
                                      .setdxDesc(*(tensors.at(options.outputs.DX->get_uid())))
                                      .build();
 
             // Push all real tensors as required for operation execution.
-            std::vector<std::shared_ptr<Tensor_attributes>> tensors_involved_in_operation = {options.inputs.X,
-                                                                                             options.inputs.DY,
-                                                                                             options.inputs.SCALE,
-                                                                                             options.inputs.MEAN,
-                                                                                             options.inputs.INV_VARIANCE
-                                                                                             // , epsilon
-                                                                                             ,
-                                                                                             options.outputs.DX,
-                                                                                             options.outputs.DSCALE,
-                                                                                             options.outputs.DBIAS};
+            std::vector<std::shared_ptr<Tensor_attributes>> tensors_involved_in_operation = {
+                options.inputs.X,
+                options.inputs.DY,
+                options.inputs.SCALE,
+                options.inputs.MEAN,
+                options.inputs.INV_VARIANCE,
+                options.inputs.EPSILON,
+                options.outputs.DX,
+                options.outputs.DSCALE,
+                options.outputs.DBIAS};
 
             std::vector<uid_t> uids_in_operation;
             for (auto const& tensor : tensors_involved_in_operation) {

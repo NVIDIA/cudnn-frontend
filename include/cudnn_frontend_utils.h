@@ -363,6 +363,7 @@ enum class NormMode_t {
     INSTANCE_NORM,
     BATCH_NORM,
     GROUP_NORM,
+    RMS_NORM,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(NormMode_t,
@@ -372,6 +373,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(NormMode_t,
                                  {NormMode_t::INSTANCE_NORM, "INSTANCE_NORM"},
                                  {NormMode_t::BATCH_NORM, "BATCH_NORM"},
                                  {NormMode_t::GROUP_NORM, "GROUP_NORM"},
+                                 {NormMode_t::RMS_NORM, "RMS_NORM"},
                              })
 
 enum class PointwiseMode_t {
@@ -485,16 +487,16 @@ NLOHMANN_JSON_SERIALIZE_ENUM(PointwiseMode_t,
                              })
 
 enum class HeurMode_t {
-    HEUR_MODE_A,
-    HEUR_MODE_B,
-    HEUR_MODE_FALLBACK,
+    A,
+    B,
+    FALLBACK,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(HeurMode_t,
                              {
-                                 {HeurMode_t::HEUR_MODE_A, "HEUR_MODE_A"},
-                                 {HeurMode_t::HEUR_MODE_B, "HEUR_MODE_B"},
-                                 {HeurMode_t::HEUR_MODE_FALLBACK, "HEUR_MODE_FALLBACK"},
+                                 {HeurMode_t::A, "A"},
+                                 {HeurMode_t::B, "B"},
+                                 {HeurMode_t::FALLBACK, "FALLBACK"},
                              })
 
 enum class DataType_t {
@@ -1429,6 +1431,12 @@ convert_to_cudnn_type(cudnn_frontend::NormMode_t const mode, cudnnBackendNormMod
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
 #endif
 
+#if (CUDNN_VERSION >= 8906)
+        case NormMode_t::RMS_NORM:
+            cudnn_mode = CUDNN_RMS_NORM;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#endif
+
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
@@ -1528,6 +1536,12 @@ convert_from_cudnn_type(cudnnBackendNormMode_t const cudnn_mode, cudnn_frontend:
             break;
         case CUDNN_GROUP_NORM:
             mode = NormMode_t::GROUP_NORM;
+            break;
+#endif
+
+#if (CUDNN_VERSION >= 8906)
+        case CUDNN_RMS_NORM:
+            mode = NormMode_t::RMS_NORM;
             break;
 #endif
 

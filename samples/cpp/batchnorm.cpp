@@ -68,7 +68,7 @@ TEST_CASE("BN Finalize Graph", "[batchnorm][graph]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list(fe::HeurMode_t::HEUR_MODE_FALLBACK);
+    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::FALLBACK});
 
     REQUIRE(plans.check_support(handle).is_good());
 
@@ -177,7 +177,7 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list(fe::HeurMode_t::HEUR_MODE_FALLBACK);
+    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::FALLBACK});
 
     REQUIRE(plans.check_support(handle).is_good());
 
@@ -278,15 +278,7 @@ TEST_CASE("DBN Add Relu Graph", "[BN][graph][backward]") {
     cudnnHandle_t handle;
     checkCudnnErr(cudnnCreate(&handle));
 
-    REQUIRE(graph.validate().is_good());
-
-    REQUIRE(graph.build_operation_graph(handle).is_good());
-
-    auto plans = graph.get_execution_plan_list(fe::HeurMode_t::HEUR_MODE_FALLBACK);
-
-    REQUIRE(plans.check_support(handle).is_good());
-
-    REQUIRE(graph.set_execution_plans(plans).is_good());
+    REQUIRE(graph.build(handle, {fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
 
     Surface<half> X_tensor(4 * 32 * 16 * 16, false);
     Surface<int8_t> Mask_tensor(4 * 32 * 16 * 16 / 8, false);
@@ -374,7 +366,7 @@ TEST_CASE("BN_inference DRelu DBN Graph", "[Batchnorm][graph][backward]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list(fe::HeurMode_t::HEUR_MODE_FALLBACK);
+    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::FALLBACK});
 
     REQUIRE(plans.check_support(handle).is_good());
 

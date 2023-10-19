@@ -41,10 +41,12 @@ def test_conv_bias_relu():
 
     Y = graph.relu(name = "relu", input = bias_output)
     Y.set_output(True)
-    
-    graph.check_support()
-
-    graph.build()
+        
+    graph.validate()
+    graph.build_operation_graph()
+    plans = graph.get_execution_plan_list([cudnn.heur_mode.A])
+    plans.check_support()
+    graph.set_execution_plans(plans)
 
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
@@ -75,10 +77,12 @@ def test_conv_relu():
 
     Y = graph.relu(name = "relu", input = conv_output)
     Y.set_output(True)
-    
-    graph.check_support()
-    
-    graph.build()
+        
+    graph.validate()
+    graph.build_operation_graph()
+    plans = graph.get_execution_plan_list([cudnn.heur_mode.A])
+    plans.check_support()
+    graph.set_execution_plans(plans)
 
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
@@ -116,10 +120,12 @@ def test_conv3d_bias_leaky_relu():
 
     Y = graph.leaky_relu(name = "relu", input = bias_output, negative_slope = negative_slope)
     Y.set_output(True)
-    
-    graph.check_support()
-
-    graph.build()
+        
+    graph.validate()
+    graph.build_operation_graph()
+    plans = graph.get_execution_plan_list([cudnn.heur_mode.A])
+    plans.check_support()
+    graph.set_execution_plans(plans)
 
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
@@ -148,10 +154,12 @@ def test_leaky_relu_backward():
 
     Y = graph.leaky_relu_backward(loss = loss, input = input, negative_slope = negative_slope)
     Y.set_output(True)
-    
-    graph.check_support()
-
-    graph.build()
+        
+    graph.validate()
+    graph.build_operation_graph()
+    plans = graph.get_execution_plan_list([cudnn.heur_mode.A])
+    plans.check_support()
+    graph.set_execution_plans(plans)
 
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 

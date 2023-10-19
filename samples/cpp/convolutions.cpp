@@ -65,7 +65,7 @@ TEST_CASE("CSBR Graph", "[conv][graph]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list(fe::HeurMode_t::HEUR_MODE_A);
+    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::A});
 
     REQUIRE(plans.check_support(handle).is_good());
 
@@ -137,7 +137,7 @@ TEST_CASE("SBRCS", "[conv][genstats][graph]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list(fe::HeurMode_t::HEUR_MODE_A);
+    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::A});
 
     REQUIRE(plans.check_support(handle).is_good());
 
@@ -234,12 +234,12 @@ TEST_CASE("DBARCS", "[conv][genstats][graph]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list(fe::HeurMode_t::HEUR_MODE_A);
+    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::A});
 
     auto status = plans.check_support(handle);
 
     if (status.is_bad()) {
-        auto fallback_plans = graph.get_execution_plan_list(fe::HeurMode_t::HEUR_MODE_FALLBACK);
+        auto fallback_plans = graph.get_execution_plan_list({fe::HeurMode_t::FALLBACK});
         REQUIRE(fallback_plans.check_support(handle).is_good());
     }
 

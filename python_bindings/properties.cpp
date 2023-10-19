@@ -31,6 +31,24 @@ destroy_handle(void* handle) {
 
 void
 init_properties(py::module_& m) {
+    py::enum_<cudnn_frontend::DataType_t>(m, "data_type")
+        .value("FLOAT", cudnn_frontend::DataType_t::FLOAT)
+        .value("DOUBLE", cudnn_frontend::DataType_t::DOUBLE)
+        .value("HALF", cudnn_frontend::DataType_t::HALF)
+        .value("INT8", cudnn_frontend::DataType_t::INT8)
+        .value("INT32", cudnn_frontend::DataType_t::INT32)
+        .value("INT8x4", cudnn_frontend::DataType_t::INT8x4)
+        .value("UINT8", cudnn_frontend::DataType_t::UINT8)
+        .value("UINT8x4", cudnn_frontend::DataType_t::UINT8x4)
+        .value("INT8x32", cudnn_frontend::DataType_t::INT8x32)
+        .value("BFLOAT16", cudnn_frontend::DataType_t::BFLOAT16)
+        .value("INT64", cudnn_frontend::DataType_t::INT64)
+        .value("BOOLEAN", cudnn_frontend::DataType_t::BOOLEAN)
+        .value("FP8_E4M3", cudnn_frontend::DataType_t::FP8_E4M3)
+        .value("FP8_E5M2", cudnn_frontend::DataType_t::FP8_E5M2)
+        .value("FAST_FLOAT_FOR_FP8", cudnn_frontend::DataType_t::FAST_FLOAT_FOR_FP8)
+        .value("NOT_SET", cudnn_frontend::DataType_t::NOT_SET);
+
     py::class_<cudnn_frontend::graph::Tensor_attributes, std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(
         m, "tensor")
         .def(py::init<>())
@@ -61,6 +79,31 @@ init_properties(py::module_& m) {
             out << json{props};
             return out.str();
         });
+
+    m.def("create_handle", &create_handle);
+    m.def("destroy_handle", &destroy_handle);
+
+    py::enum_<cudnn_frontend::NormFwdPhase_t>(m, "norm_forward_phase")
+        .value("INFERENCE", cudnn_frontend::NormFwdPhase_t::INFERENCE)
+        .value("TRAINING", cudnn_frontend::NormFwdPhase_t::TRAINING)
+        .value("NOT_SET", cudnn_frontend::NormFwdPhase_t::NOT_SET);
+
+    py::enum_<cudnn_frontend::HeurMode_t>(m, "heur_mode")
+        .value("A", cudnn_frontend::HeurMode_t::A)
+        .value("B", cudnn_frontend::HeurMode_t::B)
+        .value("FALLBACK", cudnn_frontend::HeurMode_t::FALLBACK);
+
+    py::enum_<cudnn_frontend::ReductionMode_t>(m, "reduction_mode")
+        .value("ADD", cudnn_frontend::ReductionMode_t::ADD)
+        .value("MUL", cudnn_frontend::ReductionMode_t::MUL)
+        .value("MIN", cudnn_frontend::ReductionMode_t::MIN)
+        .value("MAX", cudnn_frontend::ReductionMode_t::MAX)
+        .value("AMAX", cudnn_frontend::ReductionMode_t::AMAX)
+        .value("AVG", cudnn_frontend::ReductionMode_t::AVG)
+        .value("NORM1", cudnn_frontend::ReductionMode_t::NORM1)
+        .value("NORM2", cudnn_frontend::ReductionMode_t::NORM2)
+        .value("MUL_NO_ZEROS", cudnn_frontend::ReductionMode_t::MUL_NO_ZEROS)
+        .value("NOT_SET", cudnn_frontend::ReductionMode_t::NOT_SET);
 }
 
 }  // namespace python_bindings

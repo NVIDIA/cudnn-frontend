@@ -5,9 +5,23 @@
 ### Scaled Dot Product Flash Attention
 Computes the scaled dot product attention for given Query, Key and Value tensors. Optionally, can set dropout probability, causal mask. Can optionally dump stats to be used for the bprop computation.
 
-API:
+The dimensions for
 
-```
+- Query tensor should be $(B, H, S_{q}, D)$
+- Key tensor should be $(B, H, S_{kv}, D)$
+- Value tensor should be $(B, H, S_{kv}, D)$
+- Output tensor should be $(B, H, S_{q}, D)$
+- Stats tensor should be $(B, H, S_{q}, 1)$
+
+Where $B$ is the batch size, $H$ is the number of heads, $S_{q}$ is the sequence length of the query, $S_{kv}$ is the sequence length
+of the key and value, and $D$ is the embedding dimension per head.
+
+Additionally, the stride for the last dimension corresponding to the embedding dim per head for each of these tensors
+must be 1.
+
+**API:**
+
+```cpp
 std::array<std::shared_ptr<Tensor_attributes>, 2> 
 scaled_dot_product_flash_attention
     (std::shared_ptr<Tensor_attributes> q,
@@ -18,18 +32,30 @@ scaled_dot_product_flash_attention
 
 where the output array has tensors in order of: `[output, softmax_stats]` and `Scaled_dot_product_flash_attention_attributes` controls the sub-graph in the operation
 
-```
+```cpp
 Scaled_dot_product_flash_attention_attributes &
 set_is_inference(bool const value);
 
 Scaled_dot_product_flash_attention_attributes &
-set_causal_mask(bool const value);
+set_attn_scale(std::shared_ptr<Tensor_attributes> value);
 
 Scaled_dot_product_flash_attention_attributes &
 set_bias(std::shared_ptr<Tensor_attributes> value);
 
+Scaled_dot_product_flash_attention_attributes&
+set_alibi_mask(bool const value)
+
+Scaled_dot_product_flash_attention_attributes&
+set_padding_mask(bool const value);
+
+Scaled_dot_product_flash_attention_attributes&
+set_seq_len_q(std::shared_ptr<Tensor_attributes> value);
+
+Scaled_dot_product_flash_attention_attributes&
+set_seq_len_kv(std::shared_ptr<Tensor_attributes> value);
+
 Scaled_dot_product_flash_attention_attributes &
-set_attn_scale(std::shared_ptr<Tensor_attributes> value);
+set_causal_mask(bool const value);
 
 Scaled_dot_product_flash_attention_attributes &
 set_dropout(float const probability,
@@ -37,25 +63,26 @@ set_dropout(float const probability,
             std::shared_ptr<Tensor_attributes> offset);
 
 Scaled_dot_product_flash_attention_attributes &
-set_dropout(std::shared_ptr<Tensor_attributes> mask, std::shared_ptr<Tensor_attributes> scale);
+set_dropout(std::shared_ptr<Tensor_attributes> mask,
+            std::shared_ptr<Tensor_attributes> scale);
 
 Scaled_dot_product_flash_attention_attributes &
 set_compute_data_type(DataType_t value)
 ```
 
-Python API: 
+**Python API:**
 
 ```
 Args:
     q (cudnn_tensor): The query data.
     k (cudnn_tensor): The key data.
     v (cudnn_tensor): The value data.
-    seq_len_q (Optional[cudnn_tensor]): The sequence length of the query.
-    seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key.
     is_inference (bool): Whether it is an inference step or training step.
-    attn_scale (Optional[cudnn_tensor]): The scale factor for attention. Default is None.
+    attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
     bias (Optional[cudnn_tensor]): The bias data for attention. Default is None.
     use_padding_mask (Optional[bool]): Whether to use padding mask. Default is False.
+    seq_len_q (Optional[cudnn_tensor]): The sequence length of the query.
+    seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key.
     use_alibi_mask (Optional[bool]): Whether to use alibi mask. Default is False.
     use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
     dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
@@ -70,8 +97,23 @@ Returns:
 ### Scaled Dot Product Flash Attention Backward
 Computes the query, key and value gradient tensors for scaled dot product flash attention. Optionally, can set dropout probability, causal mask.
 
+The dimensions for
+
+- Query tensor should be $(B, H, S_{q}, D)$
+- Key tensor should be $(B, H, S_{kv}, D)$
+- Value tensor should be $(B, H, S_{kv}, D)$
+- Output tensor should be $(B, H, S_{q}, D)$
+- Stats tensor should be $(B, H, S_{q}, 1)$
+- Gradient tensors for query, key, value, and output should follow the same convention
+
+Where $B$ is the batch size, $H$ is the number of heads, $S_{q}$ is the sequence length of the query, $S_{kv}$ is the sequence length
+of the key and value, and $D$ is the embedding size per head.
+
+Additionally, the stride for the last dimension corresponding to the embedding size per head for each of these tensors
+must be 1.
+
 API:
-```
+```cpp
 std::array<std::shared_ptr<Tensor_attributes>, 3>
 scaled_dot_product_flash_attention_backward
     (std::shared_ptr<Tensor_attributes> q,
@@ -87,12 +129,24 @@ where the output array has tensors in order of: `[dQ, dK, dV]`
 where, `Scaled_dot_product_flash_attention_backward_attributes` controls the sub-graph in the operation
 
 
-```
+```cpp
 Scaled_dot_product_flash_attention_backward_attributes&
 set_attn_scale(std::shared_ptr<Tensor_attributes> value)
 
 Scaled_dot_product_flash_attention_backward_attributes&
 set_bias(std::shared_ptr<Tensor_attributes> value)
+
+Scaled_dot_product_flash_attention_backward_attributes&
+set_alibi_mask(bool const value)
+
+Scaled_dot_product_flash_attention_backward_attributes&
+set_padding_mask(bool const value);
+
+Scaled_dot_product_flash_attention_backward_attributes&
+set_seq_len_q(std::shared_ptr<Tensor_attributes> value);
+
+Scaled_dot_product_flash_attention_backward_attributes&
+set_seq_len_kv(std::shared_ptr<Tensor_attributes> value);
 
 Scaled_dot_product_flash_attention_backward_attributes&
 set_causal_mask(bool const value)
@@ -103,7 +157,9 @@ set_dropout(float const probability,
             std::shared_ptr<Tensor_attributes> offset)
 
 Scaled_dot_product_flash_attention_backward_attributes&
-set_dropout(std::shared_ptr<Tensor_attributes> mask, std::shared_ptr<Tensor_attributes> scale, std::shared_ptr<Tensor_attributes> scale_inv)
+set_dropout(std::shared_ptr<Tensor_attributes> mask,
+            std::shared_ptr<Tensor_attributes> scale,
+            std::shared_ptr<Tensor_attributes> scale_inv)
 
 Scaled_dot_product_flash_attention_backward_attributes&
 set_compute_data_type(DataType_t const value)
@@ -119,10 +175,13 @@ Args:
     o (cudnn_tensor): The output data.
     dO (cudnn_tensor): The output loss gradient.
     stats (cudnn_tensor): The softmax statistics from the forward pass.
-    attn_scale (Optional[cudnn_tensor]): The scale factor for attention. Default is None.
+    attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
     bias (Optional[cudnn_tensor]): The bias data for attention. Default is None.
+    use_alibi_mask (Optional[bool]): Whether to use alibi mask. Default is False.
     use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
-    dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
+    dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)],
+                            Tuple[mask: cudnn_tensor, scale: cudnn_tensor, scale_inv: cudnn_tensor]]]):
+        Whether to do dropout. Default is None.
     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
     name (Optional[str]): The name of the operation.
 
@@ -137,3 +196,4 @@ Returns:
 - The cudnn backend enums are changed as follows:
     - `cudnnBackend<enum_name>` -> `cudnn_frontend::<enum_name>`
     - `cudnn<enum_name>` -> `cudnn_frontend::<enum_name>`
+- Scaled Dot Product Flash Attention Backward improves computation speed by employing an optional workspace tensor, which consumes quadratically increasing memory usage relative to sequence length. The default GPU memory limit for the workspace tensor is 256MB, but users with enough available GPU memory budget can increase this limit by configuring the CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT environment variable to the desired new limit in bytes.
