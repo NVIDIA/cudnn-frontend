@@ -19,11 +19,11 @@ The steps involved in building and running a cudnn graph are as follows:
 3. Create and add the operation nodes. The outputs of these operation are of tensor type and can be sequentially used as inputs to the next node.
 4. Validate the operation graph. This step makes sure the graph is well built and does not have hanging tensors or node.
 5. Build the cudnn operation graph. This step lowers the graph into cudnn dialect.
-6. Get the execution plan, based on the heuristics type of your choice.
+6. Create the execution plan, based on the heuristics type of your choice.
 7. [Optional] Check support of the operation graph.
 8. [Optional] Filter out the plans by your custom criteria (Optional).
-9. [Optional] Run autotuning on the filter plan (Optional). 
-10. Set the execution plan of choice back into the graph.
+9. Build (one or all) the execution plans. 
+10. [Optional] Run autotuning on the filter plan (Optional). 
 11. Execute the graph with the relevant data pointers.
     
 ## APIs
@@ -90,27 +90,36 @@ This method creates cudnn backend descriptors for all constituents of the graph.
 cudnn_frontend::error_t cudnn_frontend::graph::Graph::build_operation_graph(cudnnHandle_t handle)
 ```
 
-### Get Execution plans
-This method returns a list of execution plans that can potentially run the FE graph.
+### Create Execution plans
+This method internally queries the heuristics for engine configs for the given heuristics modes.
 
 ```
-cudnn_frontend::graph::Plans cudnn_frontend::graph::Graph::get_execution_plans(heur_mode_t)
-```
-
-### Filter plans
-Users can filter out plans against numerical, behavioral notes, or plans that do not provide desired functional correctness.
-
-```
-cudnn_frontend::graph::Plans& cudnn_frontend::graph::Plans::filter_out_numeric_notes(std::vector<cudnnBackendNumericalNote_t> const&);
-cudnn_frontend::graph::Plans& cudnn_frontend::graph::Plans::filter_out_behavior_notes(std::vector<cudnnBackendBehaviorNote_t> const&);
-cudnn_frontend::graph::Plans& cudnn_frontend::graph::Plans::filter_out_workspace_greater_than(int64_t max_allowed_workspace);
+cudnn_frontend::error_t cudnn_frontend::graph::Graph::get_execution_plans(std::vector<heur_mode_t>)
 ```
 
 ### Check graph support
 This method guarantees that executing the graph using plans queried will succeed.
 
 ```
-cudnn_frontend::error_t Plans::check_support();
+cudnn_frontend::error_t cudnn_frontend::graph::Graph::check_support(cudnnHandle_t h);
+```
+
+### Build plans
+This method builds one or all the engine configs that was queries during the create_execution_plan phase.
+
+```
+cudnn_frontend::error_t cudnn_frontend::graph::Graph::build_plans(cudnnHandle_t const &handle, 
+                                                                cudnn_frontend::BuildPlanPolicy_t const policy, 
+                                                                bool const do_multithreaded_builds);
+```
+
+### Filter plans (optional)
+Users can filter out plans against numerical, behavioral notes, or plans that do not provide desired functional correctness.
+
+```
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_numeric_notes(std::vector<cudnn_frontend::NumericalNote_t> const&);
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_behavior_notes(std::vector<cudnn_frontend::BehaviorNote_t> const&);
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_workspace_greater_than(int64_t const workspace);
 ```
 
 ### Autotune
@@ -120,22 +129,13 @@ This generally helps validate and improve upon the results provided by the heuri
 
 The current API to perform the autotuning on the filtered plans:
 ```
-    error_t
-    autotune(cudnnHandle_t handle,
-             std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> variants,
-             void *workspace,
-             void *user_impl = nullptr);
-
-```
-
-### Set Execution plans
-After checking support, filtering and/or autotuning, execution plans can be set in descending order of preference.
-
-```
 cudnn_frontend::error_t
-cudnn_frontend::graph::Graph::set_execution_plans(cudnn_frontend::::graph::Plans const&)
-```
+cudnn_frontend::graph::Graph::autotune(cudnnHandle_t handle,
+            std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> variants,
+            void *workspace,
+            void *user_impl = nullptr);
 
+```
 ### Execute
 Executing graph requires device pointers to all input output tensors and a user alloaction device workspace pointer.
 
@@ -145,6 +145,17 @@ cudnn_frontend::graph::Graph::execute(cudnnHandle_t handle,
                                         std::unordered_map<std::shared_ptr<Tensor>, void *> var_pack,
                                         void* workspace);
 ```
+
+### Miscellaneous APIs
+
+Get workspace to execute the current selected execution plan.
+
+`int64_t get_workspace_size() const`
+
+Get workspace to run autotune on all plans.
+
+`get_autotune_workspace_size() const`
+
 
 ## Samples
 Samples are meant to illustrate FE v1.0 API usage to users.  

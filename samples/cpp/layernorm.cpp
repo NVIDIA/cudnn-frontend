@@ -21,7 +21,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
-#include "../helpers.h"
+#include "../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
@@ -40,11 +40,22 @@ TEST_CASE("LayerNorm Training", "[layernorm][graph]") {
                               .set_name("X")
                               .set_dim({batch_size * seq_length, hidden_size, 1, 1})
                               .set_stride({hidden_size, 1, hidden_size, hidden_size}));
-    auto scale = graph.tensor(fe::graph::Tensor_attributes().set_name("scale").set_data_type(fe::DataType_t::FLOAT));
-    auto bias  = graph.tensor(fe::graph::Tensor_attributes().set_name("bias").set_data_type(fe::DataType_t::FLOAT));
+    auto scale = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("scale")
+                                  .set_dim({1, hidden_size, 1, 1})
+                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                  .set_data_type(fe::DataType_t::FLOAT));
+    auto bias  = graph.tensor(fe::graph::Tensor_attributes()
+                                 .set_name("bias")
+                                 .set_dim({1, hidden_size, 1, 1})
+                                 .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                 .set_data_type(fe::DataType_t::FLOAT));
 
-    auto epsilon =
-        graph.tensor(fe::graph::Tensor_attributes().set_name("epsilon").set_data_type(fe::DataType_t::FLOAT));
+    auto epsilon = graph.tensor(fe::graph::Tensor_attributes()
+                                    .set_name("epsilon")
+                                    .set_dim({1, 1, 1, 1})
+                                    .set_stride({1, 1, 1, 1})
+                                    .set_data_type(fe::DataType_t::FLOAT));
 
     auto layernorm_options =
         fe::graph::Layernorm_attributes().set_forward_phase(fe::NormFwdPhase_t::TRAINING).set_epsilon(epsilon);
@@ -67,11 +78,11 @@ TEST_CASE("LayerNorm Training", "[layernorm][graph]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::FALLBACK});
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
 
-    REQUIRE(plans.check_support(handle).is_good());
+    REQUIRE(graph.check_support(handle).is_good());
 
-    REQUIRE(graph.set_execution_plans(plans).is_good());
+    REQUIRE(graph.build_plans(handle).is_good());
 
     Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
     Surface<float> Mean_tensor(batch_size * seq_length, false);
@@ -111,11 +122,22 @@ TEST_CASE("LayerNorm Inference", "[layernorm][graph]") {
                               .set_name("X")
                               .set_dim({batch_size * seq_length, hidden_size, 1, 1})
                               .set_stride({hidden_size, 1, hidden_size, hidden_size}));
-    auto scale = graph.tensor(fe::graph::Tensor_attributes().set_name("scale").set_data_type(fe::DataType_t::FLOAT));
-    auto bias  = graph.tensor(fe::graph::Tensor_attributes().set_name("bias").set_data_type(fe::DataType_t::FLOAT));
+    auto scale = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("scale")
+                                  .set_dim({1, hidden_size, 1, 1})
+                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                  .set_data_type(fe::DataType_t::FLOAT));
+    auto bias  = graph.tensor(fe::graph::Tensor_attributes()
+                                 .set_name("bias")
+                                 .set_dim({1, hidden_size, 1, 1})
+                                 .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                 .set_data_type(fe::DataType_t::FLOAT));
 
-    auto epsilon =
-        graph.tensor(fe::graph::Tensor_attributes().set_name("epsilon").set_data_type(fe::DataType_t::FLOAT));
+    auto epsilon = graph.tensor(fe::graph::Tensor_attributes()
+                                    .set_name("epsilon")
+                                    .set_dim({1, 1, 1, 1})
+                                    .set_stride({1, 1, 1, 1})
+                                    .set_data_type(fe::DataType_t::FLOAT));
 
     auto layernorm_options =
         fe::graph::Layernorm_attributes().set_forward_phase(fe::NormFwdPhase_t::INFERENCE).set_epsilon(epsilon);
@@ -138,11 +160,11 @@ TEST_CASE("LayerNorm Inference", "[layernorm][graph]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::FALLBACK});
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
 
-    REQUIRE(plans.check_support(handle).is_good());
+    REQUIRE(graph.check_support(handle).is_good());
 
-    REQUIRE(graph.set_execution_plans(plans).is_good());
+    REQUIRE(graph.build_plans(handle).is_good());
 
     Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
     Surface<float> Scale_tensor(hidden_size, false);
@@ -183,17 +205,23 @@ TEST_CASE("LayerNorm Backward", "[layernorm][graph]") {
                                .set_dim({batch_size * seq_length, hidden_size, 1, 1})
                                .set_stride({hidden_size, 1, hidden_size, hidden_size}));
 
-    auto scale = graph.tensor(fe::graph::Tensor_attributes().set_name("scale").set_data_type(fe::DataType_t::FLOAT));
-    auto mean  = graph.tensor(fe::graph::Tensor_attributes().set_name("mean").set_data_type(fe::DataType_t::FLOAT));
-    auto inv_variance =
-        graph.tensor(fe::graph::Tensor_attributes().set_name("inv_variance").set_data_type(fe::DataType_t::FLOAT));
+    auto scale        = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("scale")
+                                  .set_dim({1, hidden_size, 1, 1})
+                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                  .set_data_type(fe::DataType_t::FLOAT));
+    auto mean         = graph.tensor(fe::graph::Tensor_attributes()
+                                 .set_name("mean")
+                                 .set_dim({batch_size * seq_length, 1, 1, 1})
+                                 .set_stride({1, 1, 1, 1})
+                                 .set_data_type(fe::DataType_t::FLOAT));
+    auto inv_variance = graph.tensor(fe::graph::Tensor_attributes()
+                                         .set_name("inv_variance")
+                                         .set_dim({batch_size * seq_length, 1, 1, 1})
+                                         .set_stride({1, 1, 1, 1})
+                                         .set_data_type(fe::DataType_t::FLOAT));
 
-    auto epsilon =
-        graph.tensor(fe::graph::Tensor_attributes().set_name("epsilon").set_data_type(fe::DataType_t::FLOAT));
-
-    auto DLN_options = fe::graph::Layernorm_backward_attributes()
-                           .set_saved_mean_and_inv_variance(mean, inv_variance)
-                           .set_epsilon(epsilon);
+    auto DLN_options = fe::graph::Layernorm_backward_attributes().set_saved_mean_and_inv_variance(mean, inv_variance);
     auto [DX, dscale, dbias] = graph.layernorm_backward(DY, X, scale, DLN_options);
     DX->set_output(true);
     dscale->set_output(true).set_data_type(fe::DataType_t::FLOAT);
@@ -212,11 +240,11 @@ TEST_CASE("LayerNorm Backward", "[layernorm][graph]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::FALLBACK});
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
 
-    REQUIRE(plans.check_support(handle).is_good());
+    REQUIRE(graph.check_support(handle).is_good());
 
-    REQUIRE(graph.set_execution_plans(plans).is_good());
+    REQUIRE(graph.build_plans(handle).is_good());
 
     Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
     Surface<half> DY_tensor(batch_size * seq_length * hidden_size, false);
@@ -226,7 +254,6 @@ TEST_CASE("LayerNorm Backward", "[layernorm][graph]") {
     Surface<float> Dscale_tensor(hidden_size, false);
     Surface<float> Dbias_tensor(hidden_size, false);
     Surface<half> DX_tensor(batch_size * seq_length * hidden_size, false);
-    float epsilon_value = 1e-5f;
 
     Surface<int8_t> workspace(graph.get_workspace_size(), false);
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
@@ -234,7 +261,6 @@ TEST_CASE("LayerNorm Backward", "[layernorm][graph]") {
         {DY, DY_tensor.devPtr},
         {mean, Mean_tensor.devPtr},
         {inv_variance, Inv_variance_tensor.devPtr},
-        {epsilon, &epsilon_value},
         {scale, Scale_tensor.devPtr},
         {dscale, Dscale_tensor.devPtr},
         {dbias, Dbias_tensor.devPtr},

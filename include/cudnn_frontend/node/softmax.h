@@ -13,10 +13,10 @@ namespace cudnn_frontend::graph {
 
 class SoftmaxNode : public INode {
    public:
-    Softmax_attributes options;
+    Softmax_attributes attributes;
 
-    SoftmaxNode(Softmax_attributes&& options_, detail::Context const& context)
-        : INode(context), options(std::move(options_)) {}
+    SoftmaxNode(Softmax_attributes&& attributes_, detail::Context const& context)
+        : INode(context), attributes(std::move(attributes_)) {}
 
     Type
     getType() override final {
@@ -24,119 +24,101 @@ class SoftmaxNode : public INode {
     }
 
     error_t
-    validate_node() const override final {
+    pre_validate_node() const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating SoftmaxNode " << options.name << "..." << std::endl;
+                    << "Validating SoftmaxNode " << attributes.name << "..." << std::endl;
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
-            options.use_stats.has_value() == false, error_code_t::ATTRIBUTE_NOT_SET, "use_stats attribute not set.");
+            attributes.use_stats.has_value() == false, error_code_t::ATTRIBUTE_NOT_SET, "use_stats attribute not set.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.use_M_Zinv.has_value() == false,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "use_M_Zinv attribute not set.");
+
+        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
+
         return {error_code_t::OK, ""};
     }
 
     error_t
-    infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for Softmax node " << options.name << "."
+    expand_and_infer_properties() override final {
+        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for Softmax node " << attributes.name << "."
                     << std::endl;
 
-        options.fill_from_context(context);
+        attributes.fill_from_context(context);
 
         // Fill properties of virtual tensors
-        auto const& p_dim = options.inputs.P->get_dim();
+        auto const& p_dim = attributes.inputs[Softmax_attributes::input_names::P]->get_dim();
         auto b            = p_dim[0];
         auto h            = p_dim[1];
         auto s_q          = p_dim[2];
 
-        // Lower options to max options
-        auto max_output = std::make_shared<Tensor_attributes>();
-        max_output
-            ->set_is_virtual(true)
-            // Reduction today has no dim inferencing logic today. Hence, hardcoding output dim here.
-            .set_dim({b, h, s_q, 1})
-            .set_stride({h * s_q, s_q, 1, 1});
+        auto max_output = attributes.outputs[Softmax_attributes::output_names::M];
+        if (!attributes.use_M_Zinv.value()) {
+            max_output = std::make_shared<Tensor_attributes>();
+            max_output->set_name("M").set_is_virtual(true);
+        }
+        //////////////// TODO //////////////////////////
+        // Check Stride (Before setting dimension?)
+        max_output->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+        ;
 
-        auto max_options = Reduction_attributes();
-        max_options.set_name("max");
-        max_options.set_mode(ReductionMode_t::MAX);
-        max_options.inputs.X  = options.inputs.P;
-        max_options.outputs.Y = max_output;
-        auto max_node         = std::make_unique<ReductionNode>(std::move(max_options), context);
-        sub_nodes.emplace_back(std::move(max_node));
+        auto max_attributes = Reduction_attributes().set_name("M").set_mode(ReductionMode_t::MAX);
+        // Special non-functional-style call. Needed because output already created and provided to user.
+        reduction(attributes.inputs[Softmax_attributes::input_names::P], max_attributes, max_output);
 
-        // Lower options to sub options
-        auto sub_output = std::make_shared<Tensor_attributes>();
-        sub_output->set_is_virtual(true);
+        auto sub_attributes = Pointwise_attributes().set_name("sub").set_mode(PointwiseMode_t::SUB);
+        auto const& sub_output =
+            pointwise(attributes.inputs[Softmax_attributes::input_names::P], max_output, sub_attributes);
+        sub_output->set_name("sub_M");
 
-        Pointwise_attributes sub_options;
-        sub_options.set_name("sub");
-        sub_options.set_mode(PointwiseMode_t::SUB);
-        sub_options.inputs.IN_0   = options.inputs.P;
-        sub_options.inputs.IN_1   = max_output;
-        sub_options.outputs.OUT_0 = sub_output;
-        auto sub_node             = std::make_unique<PointwiseNode>(std::move(sub_options), context);
-        sub_nodes.emplace_back(std::move(sub_node));
+        auto exp_attributes    = Pointwise_attributes().set_name("exp").set_mode(PointwiseMode_t::EXP);
+        auto const& exp_output = pointwise(sub_output, exp_attributes);
+        exp_output->set_name("exp_sub_M");
 
-        // Lower options to exp options
-        auto exp_output = std::make_shared<Tensor_attributes>();
-        exp_output->set_is_virtual(true);
-
-        Pointwise_attributes exp_options;
-        exp_options.set_name("exp");
-        exp_options.set_mode(PointwiseMode_t::EXP);
-        exp_options.inputs.IN_0   = sub_output;
-        exp_options.outputs.OUT_0 = exp_output;
-        auto exp_node             = std::make_unique<PointwiseNode>(std::move(exp_options), context);
-        sub_nodes.emplace_back(std::move(exp_node));
-
-        // Lower options to reduce sum options
-        auto sum_output = std::make_shared<Tensor_attributes>();
-        sum_output
-            ->set_is_virtual(true)
-            // Reduction today has no dim inferencing logic today. Hence, hardcoding output dim here.
-            .set_dim({b, h, s_q, 1})
-            .set_stride({h * s_q, s_q, 1, 1});
-
-        auto sum_options = Reduction_attributes();
-        sum_options.set_name("sum");
-        sum_options.set_mode(ReductionMode_t::ADD);
-        sum_options.inputs.X  = exp_output;
-        sum_options.outputs.Y = sum_output;
-        auto sum_node         = std::make_unique<ReductionNode>(std::move(sum_options), context);
-        sub_nodes.emplace_back(std::move(sum_node));
+        auto sum_attributes    = Reduction_attributes().set_name("sum").set_mode(ReductionMode_t::ADD);
+        auto const& sum_output = reduction(exp_output, sum_attributes);
+        sum_output->set_name("Z").set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
 
         // Another path to add when in flash attention mode.
-        if (options.use_stats.value()) {
-            // Lower options to log options
-            auto log_output = std::make_shared<Tensor_attributes>();
-            log_output->set_is_virtual(true);
+        if (attributes.use_stats.value()) {
+            auto log_attributes    = Pointwise_attributes().set_name("log").set_mode(PointwiseMode_t::LOG);
+            auto const& log_output = pointwise(sum_output, log_attributes);
 
-            auto log_options = Pointwise_attributes();
-            log_options.set_name("log");
-            log_options.set_mode(PointwiseMode_t::LOG);
-            log_options.inputs.IN_0   = sum_output;
-            log_options.outputs.OUT_0 = log_output;
-            auto log_node             = std::make_unique<PointwiseNode>(std::move(log_options), context);
-            sub_nodes.emplace_back(std::move(log_node));
-
-            // Lower options to add options
-            auto add_options = Pointwise_attributes();
-            add_options.set_name("add");
-            add_options.set_mode(PointwiseMode_t::ADD);
-            add_options.inputs.IN_0   = max_output;
-            add_options.inputs.IN_1   = log_output;
-            add_options.outputs.OUT_0 = options.outputs.Stats;
-            auto add_node             = std::make_unique<PointwiseNode>(std::move(add_options), context);
-            sub_nodes.emplace_back(std::move(add_node));
+            auto add_attributes = Pointwise_attributes().set_name("add").set_mode(PointwiseMode_t::ADD);
+            // Special non-functional-style call. Needed because output already created and provided to user.
+            pointwise(
+                max_output, log_output, add_attributes, attributes.outputs[Softmax_attributes::output_names::Stats]);
         }
 
-        // Lower options to div options
-        auto div_options = Pointwise_attributes();
-        div_options.set_name("div");
-        div_options.set_mode(PointwiseMode_t::DIV);
-        div_options.inputs.IN_0   = exp_output;
-        div_options.inputs.IN_1   = sum_output;
-        div_options.outputs.OUT_0 = options.outputs.S;
-        auto div_node             = std::make_unique<PointwiseNode>(std::move(div_options), context);
-        sub_nodes.emplace_back(std::move(div_node));
+        if (attributes.use_M_Zinv.value()) {
+            auto reciprocal_attributes =
+                Pointwise_attributes().set_name("reciprocal").set_mode(PointwiseMode_t::RECIPROCAL);
+            // Special non-functional-style call. Needed because output already created and provided to user.
+            pointwise(sum_output, reciprocal_attributes, attributes.outputs[Softmax_attributes::output_names::Zinv]);
+        }
+
+        if (!attributes.use_M_Zinv.value()) {
+            auto div_attributes = Pointwise_attributes().set_name("div").set_mode(PointwiseMode_t::DIV);
+            // Special non-functional-style call. Needed because output already created and provided to user.
+            pointwise(exp_output, sum_output, div_attributes, attributes.outputs[Softmax_attributes::output_names::S]);
+        } else {
+            auto mul_attributes = Pointwise_attributes().set_name("mul").set_mode(PointwiseMode_t::MUL);
+            // Special non-functional-style call. Needed because output already created and provided to user.
+            pointwise(exp_output,
+                      attributes.outputs[Softmax_attributes::output_names::Zinv],
+                      mul_attributes,
+                      attributes.outputs[Softmax_attributes::output_names::S]);
+        }
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    post_validate_node() const override final {
+        // Validate outputs
+        // All properties of output tensors should have been set now.
+        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
 
         return {error_code_t::OK, ""};
     }

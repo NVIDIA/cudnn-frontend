@@ -377,6 +377,14 @@ class ExecutionPlanBuilder_v8 {
         m_execution_plan.planTag       = opGraphTag_;
         return *this;
     }
+
+    auto
+    setEngineConfig(ManagedOpaqueDescriptor const &desc, std::string const &opGraphTag_ = "")
+        -> ExecutionPlanBuilder_v8 & {
+        m_execution_plan.engine_config = desc;
+        m_execution_plan.planTag       = opGraphTag_;
+        return *this;
+    }
     /** @} */
 
     //! constructs the Engine Config by calling the cudnn API

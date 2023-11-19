@@ -28,7 +28,8 @@
 
 namespace cudnn_frontend {
 
-[[maybe_unused]] auto static get_fallback_engine_list(DescriptorType_t mode, const std::string &opGraphTag) -> std::vector<int> {
+[[maybe_unused]] auto static get_fallback_engine_list(DescriptorType_t mode, const std::string &opGraphTag)
+    -> std::vector<int> {
     auto major_version = cudnnGetVersion() / 1000;
 
     auto minor_version = (cudnnGetVersion() / 100) % 10;

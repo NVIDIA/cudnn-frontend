@@ -50,10 +50,6 @@ throw_if(bool const cond, cudnn_frontend::error_code_t const error_code, std::st
     }
 }
 
-// pybinds for pyplan class
-void
-init_pyplans_submodule(py::module_ &);
-
 // pybinds for pygraph class
 void
 init_pygraph_submodule(py::module_ &);
@@ -67,7 +63,6 @@ PYBIND11_MODULE(cudnn, m) {
 
     init_properties(m);
     init_pygraph_submodule(m);
-    init_pyplans_submodule(m);
 }
 
 }  // namespace python_bindings

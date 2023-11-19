@@ -2,9 +2,6 @@ cmake_minimum_required(VERSION 3.18)
 
 Include(FetchContent)
 
-# Find the cuda compiler
-find_package(CUDAToolkit)
-
 # Fetch and build catch2
 FetchContent_Declare(
   Catch2
@@ -12,9 +9,6 @@ FetchContent_Declare(
   GIT_TAG        v3.3.2
 )
 FetchContent_MakeAvailable(Catch2)
-
-# Find cudnn
-include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/cuDNN.cmake)
 
 add_executable(
     samples
@@ -28,18 +22,18 @@ add_executable(
     cpp/rmsnorm.cpp
     cpp/wgrads.cpp
 
-    conv_sample.cpp 
-    resnet_test_list.cpp
-    resnet_sample.cpp
-    test_list.cpp 
-    fp16_emu.cpp 
-    helpers.cpp 
-    fusion_sample.cpp 
-    fp8_sample.cpp 
-    norm_samples.cpp
-    fused_mha_sample.cpp
-    f16_flash_mha_sample.cpp
-    fp8_flash_mha_sample.cpp
+    legacy_samples/conv_sample.cpp 
+    legacy_samples/resnet_test_list.cpp
+    legacy_samples/resnet_sample.cpp
+    legacy_samples/test_list.cpp 
+    legacy_samples/fp16_emu.cpp 
+    legacy_samples/helpers.cpp 
+    legacy_samples/fusion_sample.cpp 
+    legacy_samples/fp8_sample.cpp 
+    legacy_samples/norm_samples.cpp
+    legacy_samples/fused_mha_sample.cpp
+    legacy_samples/f16_flash_mha_sample.cpp
+    legacy_samples/fp8_flash_mha_sample.cpp
 )
 
 if(DEFINED ENV{NO_DEFAULT_IN_SWITCH})
@@ -68,13 +62,9 @@ endif()
 
 target_link_libraries(
     samples
+
     cudnn_frontend
     Catch2::Catch2WithMain
-
-    CUDA::cudart
-    CUDA::nvrtc
-    
-    CUDNN::cudnn_all
 )
 
 # cuDNN dlopen's its libraries
@@ -87,7 +77,7 @@ set_target_properties(
 )
 
 set_source_files_properties(
-    resnet_test_list.cpp resnet_sample.cpp
+    legacy_samples/resnet_test_list.cpp legacy_samples/resnet_sample.cpp
     PROPERTIES 
-    INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/samples/resnet_block/include"
+    INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/samples/legacy_samples/resnet_block/include"
 )

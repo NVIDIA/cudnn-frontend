@@ -10,6 +10,15 @@ def convert_to_cudnn_type(torch_type):
     else:
         raise ValueError("Unsupported tensor data type.")
 
+def is_ampere_arch():
+    (major, minor) = torch.cuda.get_device_capability()
+    cc = major*10 + minor
+    return 80 <= cc and cc < 89
+
+def is_hopper_arch():
+    (major, minor) = torch.cuda.get_device_capability()
+    cc = major*10 + minor
+    return 90 <= cc
 
 n = 4
 c = 32
@@ -20,7 +29,9 @@ dilation = [1,1]
 
 @pytest.mark.skipif(cudnn.backend_version() < 8800, reason="requires cudnn 8.8 or higher")
 def test_scale_bias_relu_wgrad():
-    print("Running test_scale_bias_relu_wgrad")
+
+    if not is_ampere_arch() and not is_hopper_arch():
+        pytest.skip("SBR Wgrad is only supported on ampere and hopper.")
 
     # Reference
     X_gpu  = torch.randn(n, c, 32, 32, requires_grad=False, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
@@ -46,9 +57,9 @@ def test_scale_bias_relu_wgrad():
     
     graph.validate()
     graph.build_operation_graph()
-    plans = graph.get_execution_plan_list([cudnn.heur_mode.A])
-    plans.check_support()
-    graph.set_execution_plans(plans)
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    graph.check_support()
+    graph.build_plans()
 
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 

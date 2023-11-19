@@ -254,6 +254,20 @@ to_string(cudnnRngDistribution_t distribution) {
 }
 #endif
 
+enum class BuildPlanPolicy_t {
+    // Builds and stores the "first successful" plan from the list returned by heuristics.
+    // heuristics list is traversed sequentially and in decreasing order of potential performance.
+    HEURISTICS_CHOICE,
+    // Builds and stores all the "successful" plans from the list returned by heuristics.
+    ALL,
+};
+
+NLOHMANN_JSON_SERIALIZE_ENUM(BuildPlanPolicy_t,
+                             {
+                                 {BuildPlanPolicy_t::HEURISTICS_CHOICE, "HEURISTICS_CHOICE"},
+                                 {BuildPlanPolicy_t::ALL, "ALL"},
+                             })
+
 enum class TensorReordering_t {
     NONE,
     INT8x32,
@@ -497,6 +511,44 @@ NLOHMANN_JSON_SERIALIZE_ENUM(HeurMode_t,
                                  {HeurMode_t::A, "A"},
                                  {HeurMode_t::B, "B"},
                                  {HeurMode_t::FALLBACK, "FALLBACK"},
+                             })
+
+enum class BehaviorNote_t {
+    RUNTIME_COMPILATION,
+    REQUIRES_FILTER_INT8x32_REORDER,
+    REQUIRES_BIAS_INT8x32_REORDER,
+};
+
+NLOHMANN_JSON_SERIALIZE_ENUM(BehaviorNote_t,
+                             {
+                                 {BehaviorNote_t::RUNTIME_COMPILATION, "RUNTIME_COMPILATION"},
+                                 {BehaviorNote_t::REQUIRES_FILTER_INT8x32_REORDER, "REQUIRES_FILTER_INT8x32_REORDER"},
+                                 {BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER, "REQUIRES_BIAS_INT8x32_REORDER"},
+                             })
+
+enum class NumericalNote_t {
+    TENSOR_CORE,
+    DOWN_CONVERT_INPUTS,
+    REDUCED_PRECISION_REDUCTION,
+    FFT,
+    NONDETERMINISTIC,
+    WINOGRAD,
+    WINOGRAD_TILE_4x4,
+    WINOGRAD_TILE_6x6,
+    WINOGRAD_TILE_13x13,
+};
+
+NLOHMANN_JSON_SERIALIZE_ENUM(NumericalNote_t,
+                             {
+                                 {NumericalNote_t::TENSOR_CORE, "TENSOR_CORE"},
+                                 {NumericalNote_t::DOWN_CONVERT_INPUTS, "DOWN_CONVERT_INPUTS"},
+                                 {NumericalNote_t::REDUCED_PRECISION_REDUCTION, "REDUCED_PRECISION_REDUCTION"},
+                                 {NumericalNote_t::FFT, "FFT"},
+                                 {NumericalNote_t::NONDETERMINISTIC, "NONDETERMINISTIC"},
+                                 {NumericalNote_t::WINOGRAD, "WINOGRAD"},
+                                 {NumericalNote_t::WINOGRAD_TILE_4x4, "WINOGRAD_TILE_4x4"},
+                                 {NumericalNote_t::WINOGRAD_TILE_6x6, "WINOGRAD_TILE_6x6"},
+                                 {NumericalNote_t::WINOGRAD_TILE_13x13, "WINOGRAD_TILE_13x13"},
                              })
 
 enum class DataType_t {
@@ -1188,6 +1240,56 @@ convert_to_cudnn_type(cudnn_frontend::PointwiseMode_t const mode, cudnnPointwise
         default:
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
+    }
+    return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+}
+
+static inline cudnnStatus_t
+convert_to_cudnn_type(cudnn_frontend::NumericalNote_t const mode, cudnnBackendNumericalNote_t& cudnn_mode) {
+    switch (mode) {
+        case NumericalNote_t::TENSOR_CORE:
+            cudnn_mode = CUDNN_NUMERICAL_NOTE_TENSOR_CORE;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case NumericalNote_t::DOWN_CONVERT_INPUTS:
+            cudnn_mode = CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case NumericalNote_t::REDUCED_PRECISION_REDUCTION:
+            cudnn_mode = CUDNN_NUMERICAL_NOTE_REDUCED_PRECISION_REDUCTION;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case NumericalNote_t::FFT:
+            cudnn_mode = CUDNN_NUMERICAL_NOTE_FFT;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case NumericalNote_t::NONDETERMINISTIC:
+            cudnn_mode = CUDNN_NUMERICAL_NOTE_NONDETERMINISTIC;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case NumericalNote_t::WINOGRAD:
+            cudnn_mode = CUDNN_NUMERICAL_NOTE_WINOGRAD;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case NumericalNote_t::WINOGRAD_TILE_4x4:
+            cudnn_mode = CUDNN_NUMERICAL_NOTE_WINOGRAD_TILE_4x4;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case NumericalNote_t::WINOGRAD_TILE_6x6:
+            cudnn_mode = CUDNN_NUMERICAL_NOTE_WINOGRAD_TILE_6x6;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case NumericalNote_t::WINOGRAD_TILE_13x13:
+            cudnn_mode = CUDNN_NUMERICAL_NOTE_WINOGRAD_TILE_13x13;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+    }
+    return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+}
+
+static inline cudnnStatus_t
+convert_to_cudnn_type(cudnn_frontend::BehaviorNote_t const mode, cudnnBackendBehaviorNote_t& cudnn_mode) {
+    switch (mode) {
+        case BehaviorNote_t::RUNTIME_COMPILATION:
+            cudnn_mode = CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case BehaviorNote_t::REQUIRES_FILTER_INT8x32_REORDER:
+            cudnn_mode = CUDNN_BEHAVIOR_NOTE_REQUIRES_FILTER_INT8x32_REORDER;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER:
+            cudnn_mode = CUDNN_BEHAVIOR_NOTE_REQUIRES_BIAS_INT8x32_REORDER;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
     }
     return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 }

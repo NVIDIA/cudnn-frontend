@@ -11,10 +11,10 @@ namespace cudnn_frontend {
 namespace graph {
 class LayerNormNode : public INode {
    public:
-    Layernorm_attributes options;
+    Layernorm_attributes attributes;
 
-    LayerNormNode(Layernorm_attributes&& options_, detail::Context const& context)
-        : INode(context), options(std::move(options_)) {}
+    LayerNormNode(Layernorm_attributes&& attributes_, detail::Context const& context)
+        : INode(context), attributes(std::move(attributes_)) {}
 
     Type
     getType() override final {
@@ -22,16 +22,16 @@ class LayerNormNode : public INode {
     }
 
     error_t
-    infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferencing properties for layernorm node " << options.name << "..."
+    expand_and_infer_properties() override final {
+        getLogger() << "[cudnn_frontend] INFO: Inferencing properties for layernorm node " << attributes.name << "..."
                     << std::endl;
 
-        options.fill_from_context(context);
+        attributes.fill_from_context(context);
 
-        auto X                  = options.inputs.X;
+        auto X                  = attributes.inputs[Layernorm_attributes::input_names::X];
         auto const x_tensor_dim = X->get_dim();
 
-        auto Y            = options.outputs.Y;
+        auto Y            = attributes.outputs[Layernorm_attributes::output_names::Y];
         auto y_tensor_dim = Y->get_dim();
 
         // Only infer dims and strides if user did not set them
@@ -56,7 +56,7 @@ class LayerNormNode : public INode {
             stats_dim[i] = 1;
         }
 
-        auto scale = options.inputs.SCALE;
+        auto scale = attributes.inputs[Layernorm_attributes::input_names::SCALE];
         if (scale->get_dim().empty()) {
             scale->set_dim(scale_bias_dim);
         }
@@ -67,7 +67,7 @@ class LayerNormNode : public INode {
             scale->set_stride(detail::generate_stride(scale_dim, stride_order));
         }
 
-        auto bias = options.inputs.BIAS;
+        auto bias = attributes.inputs[Layernorm_attributes::input_names::BIAS];
         if (bias->get_dim().empty()) {
             bias->set_dim(scale_bias_dim);
         }
@@ -78,8 +78,8 @@ class LayerNormNode : public INode {
             bias->set_stride(detail::generate_stride(bias_dim, stride_order));
         }
 
-        if (options.forward_phase == NormFwdPhase_t::TRAINING) {
-            auto mean = options.outputs.MEAN;
+        if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
+            auto mean = attributes.outputs[Layernorm_attributes::output_names::MEAN];
             if (mean->get_dim().empty()) {
                 mean->set_dim(stats_dim);
             }
@@ -90,7 +90,7 @@ class LayerNormNode : public INode {
                 mean->set_stride(detail::generate_stride(mean_dim, stride_order));
             }
 
-            auto inv_var = options.outputs.INV_VARIANCE;
+            auto inv_var = attributes.outputs[Layernorm_attributes::output_names::INV_VARIANCE];
             if (inv_var->get_dim().empty()) {
                 inv_var->set_dim(stats_dim);
             }
@@ -117,117 +117,108 @@ class LayerNormNode : public INode {
                 T->set_stride(detail::generate_stride(T_dim, stride_order));
             }
         };
-        infer_scalar_tensors(options.inputs.EPSILON);
+        infer_scalar_tensors(attributes.inputs[Layernorm_attributes::input_names::EPSILON]);
 
         return {error_code_t::OK, ""};
     }
 
     error_t
-    validate_node() const override final {
+    pre_validate_node() const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating LayerNormNode " << options.name << "..." << std::endl;
+                    << "Validating LayerNormNode " << attributes.name << "..." << std::endl;
 
         // Norm forward phase should be set
-        RETURN_CUDNN_FRONTEND_ERROR_IF(options.forward_phase == NormFwdPhase_t::NOT_SET,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.forward_phase == NormFwdPhase_t::NOT_SET,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Forward phase not set of layernorm node.");
 
+        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
+
         return {error_code_t::OK, ""};
     }
 
     error_t
-    assign_uids_node() override final {
-        options.inputs.X->set_uid(ICudnn::create_new_uid());
-        options.inputs.SCALE->set_uid(ICudnn::create_new_uid());
-        options.inputs.BIAS->set_uid(ICudnn::create_new_uid());
-        options.inputs.EPSILON->set_uid(ICudnn::create_new_uid());
-        options.outputs.Y->set_uid(ICudnn::create_new_uid());
-        if (options.forward_phase == NormFwdPhase_t::TRAINING) {
-            options.outputs.MEAN->set_uid(ICudnn::create_new_uid());
-            options.outputs.INV_VARIANCE->set_uid(ICudnn::create_new_uid());
+    post_validate_node() const override final {
+        // Validate outputs
+        // All properties of output tensors should have been set now.
+        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    create_cudnn_tensors(int64_t& uid, std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors)
+        const override final {
+        getLogger() << "[cudnn_frontend] INFO: "
+                    << "Building LayerNormNode tensors " << attributes.name << "..." << std::endl;
+
+        for (auto const& [name, tensor] : attributes.inputs) {
+            (void)name;
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+            }
+        }
+        for (auto const& [name, tensor] : attributes.outputs) {
+            (void)name;
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+            }
         }
         return {error_code_t::OK, ""};
     }
-
     error_t
-    createTensors() override final {
+    create_cudnn_operations(
+        std::unordered_set<uid_t>& uids_involved_in_operations,
+        std::vector<cudnn_frontend::Operation_v8>& operations,
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building LayerNormNode tensors " << options.name << "..." << std::endl;
-
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.X));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.EPSILON));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.SCALE));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.BIAS));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.Y));
-        if (options.forward_phase == NormFwdPhase_t::TRAINING) {
-            CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.MEAN));
-            CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.INV_VARIANCE));
-        }
-        return {error_code_t::OK, ""};
-    }
-    error_t
-    createOperations() override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building LayerNormNode operations " << options.name << "..." << std::endl;
+                    << "Building LayerNormNode operations " << attributes.name << "..." << std::endl;
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         try {
 #endif
-            // Push all real tensors as required for operation execution.
-            std::vector<std::shared_ptr<Tensor_attributes>> tensors_involved_in_operation = {
-                options.inputs.X, options.inputs.EPSILON, options.inputs.SCALE, options.inputs.BIAS, options.outputs.Y};
+            auto&& layernorm_operation_builder =
+                cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_FORWARD_DESCRIPTOR);
+            layernorm_operation_builder.setNormalizationMode(NormMode_t::LAYER_NORM)
+                .setNormFwdPhase(attributes.forward_phase);
 
-            if (options.forward_phase == NormFwdPhase_t::TRAINING) {
-                tensors_involved_in_operation.push_back(options.outputs.MEAN);
-                tensors_involved_in_operation.push_back(options.outputs.INV_VARIANCE);
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Layernorm_attributes::input_names::X);
+            layernorm_operation_builder.setxDesc(*(tensors.at(X->second->get_uid())));
+
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Layernorm_attributes::input_names::SCALE);
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(BIAS, Layernorm_attributes::input_names::BIAS);
+            layernorm_operation_builder.setScaleAndBias(*(tensors.at(SCALE->second->get_uid())),
+                                                        *(tensors.at(BIAS->second->get_uid())));
+
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(EPSILON, Layernorm_attributes::input_names::EPSILON);
+            layernorm_operation_builder.setEpsilonTensor(*(tensors.at(EPSILON->second->get_uid())));
+
+            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Layernorm_attributes::output_names::Y);
+            layernorm_operation_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
+
+            if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
+                CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(MEAN, Layernorm_attributes::output_names::MEAN);
+                CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(INV_VARIANCE,
+                                                           Layernorm_attributes::output_names::INV_VARIANCE);
+                layernorm_operation_builder.setSavedMeanAndInvVar(*(tensors.at(MEAN->second->get_uid())),
+                                                                  *(tensors.at(INV_VARIANCE->second->get_uid())));
             }
 
-            std::vector<uid_t> uids_in_operation;
-            for (auto const& tensor : tensors_involved_in_operation) {
-                if (tensor && tensor->get_is_virtual() == false) {
-                    uids_in_operation.push_back(tensor->get_uid());
-                }
-            }
-
-            if (options.forward_phase == NormFwdPhase_t::TRAINING) {
-                auto layernorm_operation =
-                    cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_FORWARD_DESCRIPTOR)
-                        .setNormalizationMode(NormMode_t::LAYER_NORM)
-                        .setNormFwdPhase(options.forward_phase)
-                        .setxDesc(*(tensors.at(options.inputs.X->get_uid())))
-                        .setSavedMeanAndInvVar(*(tensors.at(options.outputs.MEAN->get_uid())),
-                                               *(tensors.at(options.outputs.INV_VARIANCE->get_uid())))
-                        .setScaleAndBias(*(tensors.at(options.inputs.SCALE->get_uid())),
-                                         *(tensors.at(options.inputs.BIAS->get_uid())))
-                        .setEpsilonTensor(*(tensors.at(options.inputs.EPSILON->get_uid())))
-                        .setyDesc(*(tensors.at(options.outputs.Y->get_uid())))
-                        .build();
-                operations.push_back({std::move(layernorm_operation), std::move(uids_in_operation)});
-            } else {
-                auto layernorm_operation =
-                    cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_FORWARD_DESCRIPTOR)
-                        .setNormalizationMode(NormMode_t::LAYER_NORM)
-                        .setNormFwdPhase(options.forward_phase)
-                        .setxDesc(*(tensors.at(options.inputs.X->get_uid())))
-                        .setScaleAndBias(*(tensors.at(options.inputs.SCALE->get_uid())),
-                                         *(tensors.at(options.inputs.BIAS->get_uid())))
-                        .setEpsilonTensor(*(tensors.at(options.inputs.EPSILON->get_uid())))
-                        .setyDesc(*(tensors.at(options.outputs.Y->get_uid())))
-                        .build();
-                operations.push_back({std::move(layernorm_operation), std::move(uids_in_operation)});
-            }
+            operations.push_back(std::move(layernorm_operation_builder.build()));
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {
             throw cudnnException(e.what(), e.getCudnnStatus());
         }
 #endif
 
+        auto const& non_virtual_uids = attributes.get_non_virtual_uids();
+        uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
         return {error_code_t::OK, ""};
     }
 
     virtual void
     serialize(json& j) const override final {
-        j = options;
+        j = attributes;
     }
 };
 

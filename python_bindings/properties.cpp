@@ -16,18 +16,34 @@ namespace python_bindings {
 void
 throw_if(bool const cond, cudnn_frontend::error_code_t const error_code, std::string const& error_msg);
 
-void*
-create_handle() {
-    cudnnHandle_t handle;
-    cudnnCreate(&handle);
-    return (void*)handle;
-}
+class HandleManagement {
+   public:
+    static void*
+    create_handle() {
+        cudnnHandle_t handle;
+        cudnnCreate(&handle);
+        return (void*)handle;
+    }
 
-void
-destroy_handle(void* handle) {
-    auto status = cudnnDestroy((cudnnHandle_t)handle);
-    throw_if(status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnHandle Destroy failed");
-}
+    static void
+    destroy_handle(void* handle) {
+        auto status = cudnnDestroy((cudnnHandle_t)handle);
+        throw_if(
+            status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnHandle Destroy failed");
+    }
+
+    void
+    set_stream(void* handle, void* streamId) {
+        auto status = cudnnSetStream((cudnnHandle_t)handle, (cudaStream_t)streamId);
+        throw_if(status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnSetStream failed");
+    }
+
+    void
+    get_stream(void* handle, void* streamId) {
+        auto status = cudnnGetStream((cudnnHandle_t)handle, (cudaStream_t*)streamId);
+        throw_if(status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnGetStream failed");
+    }
+};
 
 void
 init_properties(py::module_& m) {
@@ -80,8 +96,10 @@ init_properties(py::module_& m) {
             return out.str();
         });
 
-    m.def("create_handle", &create_handle);
-    m.def("destroy_handle", &destroy_handle);
+    m.def("create_handle", &HandleManagement::create_handle);
+    m.def("destroy_handle", &HandleManagement::destroy_handle);
+    m.def("get_stream", &HandleManagement::get_stream);
+    m.def("set_stream", &HandleManagement::set_stream);
 
     py::enum_<cudnn_frontend::NormFwdPhase_t>(m, "norm_forward_phase")
         .value("INFERENCE", cudnn_frontend::NormFwdPhase_t::INFERENCE)
@@ -104,6 +122,26 @@ init_properties(py::module_& m) {
         .value("NORM2", cudnn_frontend::ReductionMode_t::NORM2)
         .value("MUL_NO_ZEROS", cudnn_frontend::ReductionMode_t::MUL_NO_ZEROS)
         .value("NOT_SET", cudnn_frontend::ReductionMode_t::NOT_SET);
+
+    py::enum_<cudnn_frontend::BuildPlanPolicy_t>(m, "build_plan_policy")
+        .value("HEURISTICS_CHOICE", cudnn_frontend::BuildPlanPolicy_t::HEURISTICS_CHOICE)
+        .value("ALL", cudnn_frontend::BuildPlanPolicy_t::ALL);
+
+    py::enum_<cudnn_frontend::NumericalNote_t>(m, "numerical_note")
+        .value("TENSOR_CORE", cudnn_frontend::NumericalNote_t::TENSOR_CORE)
+        .value("DOWN_CONVERT_INPUTS", cudnn_frontend::NumericalNote_t::DOWN_CONVERT_INPUTS)
+        .value("REDUCED_PRECISION_REDUCTION", cudnn_frontend::NumericalNote_t::REDUCED_PRECISION_REDUCTION)
+        .value("FFT", cudnn_frontend::NumericalNote_t::FFT)
+        .value("NONDETERMINISTIC", cudnn_frontend::NumericalNote_t::NONDETERMINISTIC)
+        .value("WINOGRAD", cudnn_frontend::NumericalNote_t::WINOGRAD)
+        .value("WINOGRAD_TILE_4x4", cudnn_frontend::NumericalNote_t::WINOGRAD_TILE_4x4)
+        .value("WINOGRAD_TILE_6x6", cudnn_frontend::NumericalNote_t::WINOGRAD_TILE_6x6)
+        .value("WINOGRAD_TILE_13x13", cudnn_frontend::NumericalNote_t::WINOGRAD_TILE_13x13);
+
+    py::enum_<cudnn_frontend::BehaviorNote_t>(m, "behavior_note")
+        .value("RUNTIME_COMPILATION", cudnn_frontend::BehaviorNote_t::RUNTIME_COMPILATION)
+        .value("REQUIRES_FILTER_INT8x32_REORDER", cudnn_frontend::BehaviorNote_t::REQUIRES_FILTER_INT8x32_REORDER)
+        .value("REQUIRES_BIAS_INT8x32_REORDER", cudnn_frontend::BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER);
 }
 
 }  // namespace python_bindings

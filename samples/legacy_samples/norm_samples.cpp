@@ -23,8 +23,8 @@
 #include "norm_samples.h"
 #include <cudnn_frontend.h>
 #include "cudnn_backend.h"
-#include "error_util.h"
-#include "helpers.h"
+#include "../utils/error_util.h"
+#include "../utils/helpers.h"
 
 bool
 AllowAll(cudnnBackendDescriptor_t engine_config) {

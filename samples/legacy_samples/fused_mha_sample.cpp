@@ -22,7 +22,7 @@
 
 #include "fused_mha_sample.h"
 #include <cudnn_frontend.h>
-#include "error_util.h"
+#include "../utils/error_util.h"
 
 #define Q_ID 1
 #define K_ID 2

@@ -9,11 +9,11 @@
 namespace cudnn_frontend::graph {
 
 class ReductionNode : public INode {
-    Reduction_attributes options;
+    Reduction_attributes attributes;
 
    public:
-    ReductionNode(Reduction_attributes&& options_, detail::Context const& context)
-        : INode(context), options(std::move(options_)) {}
+    ReductionNode(Reduction_attributes&& attributes_, detail::Context const& context)
+        : INode(context), attributes(std::move(attributes_)) {}
 
     Type
     getType() override final {
@@ -21,28 +21,28 @@ class ReductionNode : public INode {
     }
 
     error_t
-    validate_node() const override final {
+    pre_validate_node() const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating reduction node " << options.name << "..." << std::endl;
+                    << "Validating reduction node " << attributes.name << "..." << std::endl;
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !(options.inputs.X), error_code_t::ATTRIBUTE_NOT_SET, "reduction input not set.");
+        CUDNN_FE_VALIDATE_INPUT_TENSOR(Reduction_attributes::input_names::X);
+        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(Reduction_attributes::output_names::Y);
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!(options.outputs.Y), error_code_t::ATTRIBUTE_NOT_SET, "reduction Y not set.");
+        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
 
         return {error_code_t::OK, ""};
     }
 
     error_t
-    infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for reduction node " << options.name << "..."
+    expand_and_infer_properties() override final {
+        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for reduction node " << attributes.name << "..."
                     << std::endl;
 
-        options.fill_from_context(context);
+        attributes.fill_from_context(context);
 
         // Only inferrencing from IN_0 to OUT_0 works today.
-        auto x_tensor = options.inputs.X;
-        auto y_tensor = options.outputs.Y;
+        auto x_tensor = attributes.inputs[Reduction_attributes::input_names::X];
+        auto y_tensor = attributes.outputs[Reduction_attributes::output_names::Y];
 
         auto const& x_tensor_dim = x_tensor->get_dim();
         auto y_tensor_dim        = y_tensor->get_dim();
@@ -61,54 +61,64 @@ class ReductionNode : public INode {
     }
 
     error_t
-    assign_uids_node() override final {
-        options.inputs.X->set_uid(ICudnn::create_new_uid());
-        options.outputs.Y->set_uid(ICudnn::create_new_uid());
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    createTensors() override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building ReductionNode tensors " << options.name << "..." << std::endl;
-
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.X));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.Y));
+    post_validate_node() const override final {
+        // Validate outputs
+        // All properties of output tensors should have been set now.
+        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
 
         return {error_code_t::OK, ""};
     }
 
     error_t
-    createOperations() override final {
+    create_cudnn_tensors(int64_t& uid, std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors)
+        const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building ReductionNode operations " << options.name << "..." << std::endl;
+                    << "Building ReductionNode tensors " << attributes.name << "..." << std::endl;
+
+        for (auto const& [name, tensor] : attributes.inputs) {
+            (void)name;
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+            }
+        }
+        for (auto const& [name, tensor] : attributes.outputs) {
+            (void)name;
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+            }
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    create_cudnn_operations(
+        std::unordered_set<uid_t>& uids_involved_in_operations,
+        std::vector<cudnn_frontend::Operation_v8>& operations,
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
+        getLogger() << "[cudnn_frontend] INFO: "
+                    << "Building ReductionNode operations " << attributes.name << "..." << std::endl;
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         try {
 #endif
 
             auto reduction_descriptor = cudnn_frontend::ReductionDescBuilder()
-                                            .setComputeType(options.get_compute_data_type())
-                                            .setReductionOp(options.get_mode().value())
+                                            .setComputeType(attributes.compute_data_type)
+                                            .setReductionOp(attributes.get_mode().value())
                                             .build();
 
-            auto reduction_operation = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR)
-                                           .setxDesc(*(tensors.at(options.inputs.X->get_uid())))
-                                           .setyDesc(*(tensors.at(options.outputs.Y->get_uid())))
-                                           .setreductionDesc(reduction_descriptor)
-                                           .build();
+            auto&& reduction_operation_builder =
+                cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR);
 
-            // Push all real tensors as required for operation execution.
-            auto const& tensors_involved_in_operation = {options.inputs.X, options.outputs.Y};
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Reduction_attributes::input_names::X);
+            reduction_operation_builder.setxDesc(*(tensors.at(X->second->get_uid())));
 
-            std::vector<uid_t> uids_in_operation;
-            for (auto const& tensor : tensors_involved_in_operation) {
-                if (tensor && tensor->get_is_virtual() == false) {
-                    uids_in_operation.push_back(tensor->get_uid());
-                }
-            }
+            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Reduction_attributes::output_names::Y);
+            reduction_operation_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
 
-            operations.push_back({std::move(reduction_operation), std::move(uids_in_operation)});
+            reduction_operation_builder.setreductionDesc(reduction_descriptor);
+
+            operations.push_back(std::move(reduction_operation_builder.build()));
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {
@@ -116,12 +126,14 @@ class ReductionNode : public INode {
         }
 #endif
 
+        auto const& non_virtual_uids = attributes.get_non_virtual_uids();
+        uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
         return {error_code_t::OK, ""};
     }
 
     virtual void
     serialize(json& j) const override final {
-        j = options;
+        j = attributes;
     }
 };
 

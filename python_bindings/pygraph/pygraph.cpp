@@ -120,6 +120,11 @@ PyGraph::tensor(std::vector<int64_t> const& dim,
 }
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::tensor_like(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& tensor, std::string const& name) {
+    return graph.tensor_like(tensor, name);
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::tensor_like(py::object const& pyobj) {
     throw_if(!py::hasattr(pyobj, "__dlpack__"),
              cudnn_frontend::error_code_t::INVALID_VARIANT_PACK,
@@ -258,23 +263,27 @@ PyGraph::validate() {
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
+size_t
+PyGraph::key() {
+    return graph.key();
+}
+
 void
 PyGraph::build_operation_graph() {
     auto status = graph.build_operation_graph(handle);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
-PyPlans
-PyGraph::get_execution_plan_list(std::vector<cudnn_frontend::HeurMode_t> const& modes) {
-    PyPlans pyplans;
-    pyplans.plans  = graph.get_execution_plan_list(modes);
-    pyplans.handle = handle;
-    return pyplans;
+void
+PyGraph::create_execution_plans(std::vector<cudnn_frontend::HeurMode_t> const& modes) {
+    auto status = graph.create_execution_plans(modes);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
 void
-PyGraph::set_execution_plans(PyPlans const& pyplans) {
-    auto status = graph.set_execution_plans(pyplans.plans);
+PyGraph::build_plans(BuildPlanPolicy_t const policy) {
+    // TODO: Add multithreaded support in python
+    auto status = graph.build_plans(handle, policy, false);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
@@ -282,9 +291,15 @@ void
 PyGraph::build(std::vector<cudnn_frontend::HeurMode_t> const& modes) {
     validate();
     build_operation_graph();
-    auto pyplans = get_execution_plan_list(modes);
-    pyplans.check_support();
-    set_execution_plans(pyplans);
+    create_execution_plans(modes);
+    check_support();
+    build_plans(cudnn_frontend::BuildPlanPolicy_t::HEURISTICS_CHOICE);
+}
+
+void
+PyGraph::check_support() {
+    auto status = graph.check_support(handle);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
 int64_t
@@ -332,7 +347,12 @@ init_pygraph_submodule(py::module_& m) {
              py::arg_v("intermediate_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("handle", nullptr))
-        .def("tensor_like", &PyGraph::tensor_like)
+        .def("tensor_like",
+             py::overload_cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const&, std::string const&>(
+                 &PyGraph::tensor_like),
+             py::arg("input"),
+             py::arg_v("name", ""))
+        .def("tensor_like", py::overload_cast<py::object const&>(&PyGraph::tensor_like))
         .def("tensor",
              &PyGraph::tensor,
              py::arg{"dim"},
@@ -468,10 +488,17 @@ init_pygraph_submodule(py::module_& m) {
                 Returns:
                     cudnn_tensor: The result of reduction operation.
             )pbdoc")
+        .def("deselect_numeric_notes", &PyGraph::deselect_numeric_notes)
+        .def("deselect_behavior_notes", &PyGraph::deselect_behavior_notes)
+        .def("deselect_workspace_greater_than", &PyGraph::deselect_workspace_greater_than)
         .def("validate", &PyGraph::validate)
+        .def("key", &PyGraph::key)
         .def("build_operation_graph", &PyGraph::build_operation_graph)
-        .def("get_execution_plan_list", &PyGraph::get_execution_plan_list)
-        .def("set_execution_plans", &PyGraph::set_execution_plans)
+        .def("create_execution_plans", &PyGraph::create_execution_plans)
+        .def("check_support", &PyGraph::check_support)
+        .def("build_plans",
+             &PyGraph::build_plans,
+             py::arg("policy") = cudnn_frontend::BuildPlanPolicy_t::HEURISTICS_CHOICE)
         .def("build", &PyGraph::build)
         .def("get_workspace_size", &PyGraph::get_workspace_size)
         .def("execute", &PyGraph::execute)

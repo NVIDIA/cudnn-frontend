@@ -21,10 +21,176 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
-#include "../helpers.h"
+#include "../utils/helpers.h"
 
 #include <cuda_runtime_api.h>
 #include <cudnn_frontend.h>
+
+namespace fe = cudnn_frontend;
+
+using graph_and_tensors = std::tuple<std::shared_ptr<fe::graph::Graph>,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Q,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // K,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // V,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Attn_scale,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Bias,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // SEQ_LEN_Q,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // SEQ_LEN_KV,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Seed,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Offset,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Dropout_mask,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Dropout_scale
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // O
+                                     std::shared_ptr<fe::graph::Tensor_attributes>   // Stats
+                                     >;
+
+using cache_type = std::unordered_map<std::size_t, graph_and_tensors>;
+
+template <typename... Args>
+auto
+lookup_cache_or_build_graph(cudnnHandle_t handle, cache_type& user_maintained_cache, Args... args) {
+    auto [b,
+          h,
+          s_q,
+          s_kv,
+          d,
+          is_inference,
+          is_attn_scale,
+          causal_mask,
+          padding_mask,
+          alibi_mask,
+          has_bias,
+          use_dropout_with_rng,
+          dropout_probability,
+          seq_len_override,
+          use_dropout_mask] = std::make_tuple(args...);
+
+    (void)use_dropout_mask;
+
+    auto graph = std::make_shared<fe::graph::Graph>();
+    graph->set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto Q = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("Q")
+                               .set_dim({b, h, s_q, d})
+                               .set_stride({3 * h * d, 3 * d, 3 * b * h * d, 1}));
+    auto K = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("K")
+                               .set_dim({b, h, s_kv, d})
+                               .set_stride({3 * h * d, 3 * d, 3 * b * h * d, 1}));
+    auto V = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("V")
+                               .set_dim({b, h, s_kv, d})
+                               .set_stride({3 * h * d, 3 * d, 3 * b * h * d, 1}));
+
+    auto attn_scale = is_attn_scale ? graph->tensor(fe::graph::Tensor_attributes()
+                                                        .set_name("attn_scale")
+                                                        .set_dim({1, 1, 1, 1})
+                                                        .set_stride({1, 1, 1, 1})
+                                                        .set_is_pass_by_value(true)
+                                                        .set_data_type(fe::DataType_t::FLOAT))
+                                    : nullptr;
+
+    auto scaled_dot_product_flash_attention_options = fe::graph::Scaled_dot_product_flash_attention_attributes()
+                                                          .set_name("flash_attention")
+                                                          .set_is_inference(is_inference);
+
+    if (is_attn_scale) {
+        scaled_dot_product_flash_attention_options.set_attn_scale(attn_scale);
+    };
+
+    scaled_dot_product_flash_attention_options.set_alibi_mask(alibi_mask);
+    scaled_dot_product_flash_attention_options.set_causal_mask(causal_mask);
+
+    auto seed = use_dropout_with_rng ? graph->tensor(fe::graph::Tensor_attributes()
+                                                         .set_name("Seed")
+                                                         .set_dim({1, 1, 1, 1})
+                                                         .set_stride({1, 1, 1, 1})
+                                                         .set_data_type(fe::DataType_t::INT32))
+                                     : nullptr;
+
+    auto offset = use_dropout_with_rng ? graph->tensor(fe::graph::Tensor_attributes()
+                                                           .set_name("Offset")
+                                                           .set_dim({1, 1, 1, 1})
+                                                           .set_stride({1, 1, 1, 1})
+                                                           .set_data_type(fe::DataType_t::INT32))
+                                       : nullptr;
+
+    if (use_dropout_with_rng) {
+        scaled_dot_product_flash_attention_options.set_dropout(dropout_probability, seed, offset);
+    }
+
+    auto bias = graph->tensor(fe::graph::Tensor_attributes()
+                                  .set_name("bias")
+                                  .set_dim({b, 1, s_q, s_kv})
+                                  .set_stride({s_q * s_kv, s_q * s_kv, s_kv, 1}));
+
+    if (has_bias) {
+        scaled_dot_product_flash_attention_options.set_bias(bias);
+    }
+
+    auto seq_q  = seq_len_override ? graph->tensor(fe::graph::Tensor_attributes()
+                                                      .set_name("seq_q")
+                                                      .set_dim({b, 1, 1, 1})
+                                                      .set_stride({1, 1, 1, 1})
+                                                      .set_data_type(fe::DataType_t::INT32))
+                                   : nullptr;
+    auto seq_kv = seq_len_override ? graph->tensor(fe::graph::Tensor_attributes()
+                                                       .set_name("seq_kv")
+                                                       .set_dim({b, 1, 1, 1})
+                                                       .set_stride({1, 1, 1, 1})
+                                                       .set_data_type(fe::DataType_t::INT32))
+                                   : nullptr;
+
+    if (padding_mask) {
+        scaled_dot_product_flash_attention_options.set_padding_mask(true);
+    }
+    if (seq_len_override) {
+        scaled_dot_product_flash_attention_options.set_seq_len_q(seq_q).set_seq_len_kv(seq_kv);
+    }
+
+    auto [O, stats] = graph->scaled_dot_product_flash_attention(Q, K, V, scaled_dot_product_flash_attention_options);
+
+    O->set_output(true).set_stride({h * d, d, b * h * d, 1});
+
+    // Check that Stats tensor is real, which is only when its training step
+    if (is_inference) {
+        REQUIRE(stats == nullptr);
+    } else {
+        stats->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+    }
+
+    REQUIRE(graph->validate().is_good());
+
+    auto key = graph->key();
+
+    auto it = user_maintained_cache.find(key);
+
+    if (it != user_maintained_cache.end()) {
+        return it->second;
+    }
+
+    REQUIRE(graph->build_operation_graph(handle).is_good());
+
+    auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
+
+    REQUIRE(graph->check_support(handle).is_good());
+
+    REQUIRE(graph->build_plans(handle).is_good());
+
+    std::shared_ptr<fe::graph::Tensor_attributes> dropout_mask  = nullptr;
+    std::shared_ptr<fe::graph::Tensor_attributes> dropout_scale = nullptr;
+
+    user_maintained_cache.insert(
+        {key,
+         std::make_tuple(
+             graph, Q, K, V, attn_scale, bias, seq_q, seq_kv, seed, offset, dropout_mask, dropout_scale, O, stats)});
+
+    return std::make_tuple(
+        graph, Q, K, V, attn_scale, bias, seq_q, seq_kv, seed, offset, dropout_mask, dropout_scale, O, stats);
+}
 
 TEST_CASE("Flash with rng dropout", "[graph][mha][flash][forward]") {
     if (cudnnGetCudartVersion() < 12000) {
@@ -52,98 +218,41 @@ TEST_CASE("Flash with rng dropout", "[graph][mha][flash][forward]") {
 
     namespace fe = cudnn_frontend;
     fe::graph::Graph mha_graph;
-    mha_graph.set_io_data_type(fe::DataType_t::HALF)
-        .set_intermediate_data_type(fe::DataType_t::FLOAT)
-        .set_compute_data_type(fe::DataType_t::FLOAT);
 
-    auto Q = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                  .set_name("Q")
-                                  .set_dim({b, h, s_q, d})
-                                  .set_stride({3 * h * d, 3 * d, 3 * b * h * d, 1}));
-    auto K = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                  .set_name("K")
-                                  .set_dim({b, h, s_kv, d})
-                                  .set_stride({3 * h * d, 3 * d, 3 * b * h * d, 1}));
-    auto V = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                  .set_name("V")
-                                  .set_dim({b, h, s_kv, d})
-                                  .set_stride({3 * h * d, 3 * d, 3 * b * h * d, 1}));
+    bool is_attn_scale        = true;
+    bool causal_mask          = true;
+    bool padding_mask         = (cudnnGetVersion() >= 8903);
+    bool alibi_mask           = (cudnnGetVersion() >= 8904);
+    bool use_dropout_with_rng = true;
+    bool has_bias             = (cudnnGetVersion() >= 8903);
+    bool seq_len_override     = padding_mask;
 
-    auto attn_scale = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                           .set_name("attn_scale")
-                                           .set_dim({1, 1, 1, 1})
-                                           .set_stride({1, 1, 1, 1})
-                                           .set_is_pass_by_value(true)
-                                           .set_data_type(fe::DataType_t::FLOAT));
-
-    auto bias = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                     .set_name("bias")
-                                     .set_dim({b, 1, s_q, s_kv})
-                                     .set_stride({s_q * s_kv, s_q * s_kv, s_kv, 1}));
-
-    auto seed                                       = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                     .set_name("Seed")
-                                     .set_dim({1, 1, 1, 1})
-                                     .set_stride({1, 1, 1, 1})
-                                     .set_data_type(fe::DataType_t::INT32));
-    auto offset                                     = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                       .set_name("Offset")
-                                       .set_dim({1, 1, 1, 1})
-                                       .set_stride({1, 1, 1, 1})
-                                       .set_data_type(fe::DataType_t::INT32));
-    auto scaled_dot_product_flash_attention_options = fe::graph::Scaled_dot_product_flash_attention_attributes()
-                                                          .set_name("flash_attention")
-                                                          .set_is_inference(is_inference)
-                                                          .set_causal_mask(true)
-                                                          .set_attn_scale(attn_scale)
-                                                          .set_dropout(dropout_probability, seed, offset);
-
-    // Optional bias in flash attention is only supported 8.9.3 onwards
-    if (cudnnGetVersion() >= 8904) {
-        scaled_dot_product_flash_attention_options.set_alibi_mask(true);
-    }
-
-    auto seq_q  = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                      .set_name("seq_q")
-                                      .set_dim({b, 1, 1, 1})
-                                      .set_stride({1, 1, 1, 1})
-                                      .set_data_type(fe::DataType_t::INT32));
-    auto seq_kv = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                       .set_name("seq_kv")
-                                       .set_dim({b, 1, 1, 1})
-                                       .set_stride({1, 1, 1, 1})
-                                       .set_data_type(fe::DataType_t::INT32));
-
-    if (cudnnGetVersion() >= 8903) {
-        scaled_dot_product_flash_attention_options.set_bias(bias)
-            .set_padding_mask(true)
-            .set_seq_len_q(seq_q)
-            .set_seq_len_kv(seq_kv);
-    }
-
-    auto [O, Stats] = mha_graph.scaled_dot_product_flash_attention(Q, K, V, scaled_dot_product_flash_attention_options);
-
-    O->set_output(true).set_stride({h * d, d, b * h * d, 1});
-
-    // Check that Stats tensor is real, which is only when its training step
-    if (is_inference) {
-        REQUIRE(Stats == nullptr);
-    } else {
-        Stats->set_output(true).set_data_type(fe::DataType_t::FLOAT);
-    }
-
+    bool use_dropout_mask = false;
     cudnnHandle_t handle;
     checkCudnnErr(cudnnCreate(&handle));
 
-    REQUIRE(mha_graph.validate().is_good());
+    cache_type user_maintained_cache;
+    auto [graph, Q, K, V, attn_scale, bias, seq_q, seq_kv, seed, offset, dropout_mask, dropout_scale, O, stats] =
+        lookup_cache_or_build_graph(handle,
+                                    user_maintained_cache,
+                                    b,
+                                    h,
+                                    s_q,
+                                    s_kv,
+                                    d,
+                                    is_inference,
+                                    is_attn_scale,
+                                    causal_mask,
+                                    padding_mask,
+                                    alibi_mask,
+                                    has_bias,
+                                    use_dropout_with_rng,
+                                    dropout_probability,
+                                    seq_len_override,
+                                    use_dropout_mask);
 
-    REQUIRE(mha_graph.build_operation_graph(handle).is_good());
-
-    auto plans = mha_graph.get_execution_plan_list({fe::HeurMode_t::A});
-
-    REQUIRE(plans.check_support(handle).is_good());
-
-    REQUIRE(mha_graph.set_execution_plans(plans).is_good());
+    (void)dropout_mask;
+    (void)dropout_scale;
 
     //// Build variant pack
     Surface<half> qkvTensor(b * s_q * 3 * h * d, false);
@@ -172,31 +281,33 @@ TEST_CASE("Flash with rng dropout", "[graph][mha][flash][forward]") {
         {offset, dropoutOffset.devPtr},
         {O, devPtrO}};
 
-#if (CUDNN_VERSION >= 8903)
-    Surface<int32_t> devActualSeqlenQ(b, false);
-    Surface<int32_t> devActualSeqlenKV(b, false);
-    std::vector<int32_t> hostActualSeqlenQ(b, 20);
-    std::vector<int32_t> hostActualSeqlenKV(b, 20);
+    if (seq_len_override) {
+        Surface<int32_t> devActualSeqlenQ(b, false);
+        Surface<int32_t> devActualSeqlenKV(b, false);
+        std::vector<int32_t> hostActualSeqlenQ(b, 20);
+        std::vector<int32_t> hostActualSeqlenKV(b, 20);
 
-    checkCudaErr(cudaMemcpy(
-        devActualSeqlenQ.devPtr, hostActualSeqlenQ.data(), sizeof(hostActualSeqlenQ[0]) * b, cudaMemcpyHostToDevice));
-    checkCudaErr(cudaMemcpy(devActualSeqlenKV.devPtr,
-                            hostActualSeqlenKV.data(),
-                            sizeof(hostActualSeqlenKV[0]) * b,
-                            cudaMemcpyHostToDevice));
-    checkCudaErr(cudaDeviceSynchronize());
+        checkCudaErr(cudaMemcpy(devActualSeqlenQ.devPtr,
+                                hostActualSeqlenQ.data(),
+                                sizeof(hostActualSeqlenQ[0]) * b,
+                                cudaMemcpyHostToDevice));
+        checkCudaErr(cudaMemcpy(devActualSeqlenKV.devPtr,
+                                hostActualSeqlenKV.data(),
+                                sizeof(hostActualSeqlenKV[0]) * b,
+                                cudaMemcpyHostToDevice));
+        checkCudaErr(cudaDeviceSynchronize());
 
-    variant_pack[seq_q]  = devActualSeqlenQ.devPtr;
-    variant_pack[seq_kv] = devActualSeqlenKV.devPtr;
-#endif
+        variant_pack[seq_q]  = devActualSeqlenQ.devPtr;
+        variant_pack[seq_kv] = devActualSeqlenKV.devPtr;
+    }
 
     Surface<float> statsTensor(b * h * s_q * 1, false);
     if (is_inference == false) {
-        variant_pack[Stats] = statsTensor.devPtr;
+        variant_pack[stats] = statsTensor.devPtr;
     }
 
-    Surface<int8_t> workspace(mha_graph.get_workspace_size(), false);
-    REQUIRE(mha_graph.execute(handle, variant_pack, workspace.devPtr).is_good());
+    Surface<int8_t> workspace(graph->get_workspace_size(), false);
+    REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 
     checkCudaErr(cudaDeviceSynchronize());
 
@@ -226,69 +337,44 @@ TEST_CASE("Flash with no dropout", "[graph][mha][flash][forward]") {
     int64_t d         = 128;   // hidden dim
     bool is_inference = false;
 
-    namespace fe = cudnn_frontend;
-    fe::graph::Graph mha_graph;
-    mha_graph.set_io_data_type(fe::DataType_t::HALF)
-        .set_intermediate_data_type(fe::DataType_t::FLOAT)
-        .set_compute_data_type(fe::DataType_t::FLOAT);
+    bool is_attn_scale        = true;
+    bool causal_mask          = true;
+    bool padding_mask         = false;
+    bool alibi_mask           = (cudnnGetVersion() >= 8904);
+    bool use_dropout_with_rng = false;
+    bool has_bias             = (cudnnGetVersion() >= 8903);
+    bool seq_len_override     = false;
 
-    auto Q = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                  .set_name("Q")
-                                  .set_dim({b, h, s_q, d})
-                                  .set_stride({3 * h * d, 3 * d, 3 * b * h * d, 1}));
-    auto K = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                  .set_name("K")
-                                  .set_dim({b, h, s_kv, d})
-                                  .set_stride({3 * h * d, 3 * d, 3 * b * h * d, 1}));
-    auto V = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                  .set_name("V")
-                                  .set_dim({b, h, s_kv, d})
-                                  .set_stride({3 * h * d, 3 * d, 3 * b * h * d, 1}));
-
-    auto attn_scale = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                           .set_name("attn_scale")
-                                           .set_dim({1, 1, 1, 1})
-                                           .set_stride({1, 1, 1, 1})
-                                           .set_is_pass_by_value(true)
-                                           .set_data_type(fe::DataType_t::FLOAT));
-
-    auto bias = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                     .set_name("bias")
-                                     .set_dim({b, 1, s_q, s_kv})
-                                     .set_stride({s_q * s_kv, s_q * s_kv, s_kv, 1}));
-
-    auto scaled_dot_product_flash_attention_options = fe::graph::Scaled_dot_product_flash_attention_attributes()
-                                                          .set_name("flash_attention")
-                                                          .set_is_inference(is_inference)
-                                                          .set_causal_mask(true)
-                                                          .set_attn_scale(attn_scale)
-                                                          .set_bias(bias);
-
-    // Alibi mask in flash attention is only supported 8.9.4 onwards
-    if (cudnnGetVersion() >= 8904) {
-        scaled_dot_product_flash_attention_options.set_alibi_mask(true);
-    }
-
-    auto [O, Stats] = mha_graph.scaled_dot_product_flash_attention(Q, K, V, scaled_dot_product_flash_attention_options);
-    O->set_output(true).set_stride({h * d, d, b * h * d, 1});
-
-    // Check that Stats tensor is real, which is only when its training step
-    if (Stats) {
-        Stats->set_output(true).set_data_type(fe::DataType_t::FLOAT);
-    }
-
+    bool use_dropout_mask = false;
     cudnnHandle_t handle;
     checkCudnnErr(cudnnCreate(&handle));
 
-    REQUIRE(mha_graph.validate().is_good());
+    cache_type user_maintained_cache;
+    auto [graph, Q, K, V, attn_scale, bias, seq_q, seq_kv, seed, offset, dropout_mask, dropout_scale, O, stats] =
+        lookup_cache_or_build_graph(handle,
+                                    user_maintained_cache,
+                                    b,
+                                    h,
+                                    s_q,
+                                    s_kv,
+                                    d,
+                                    is_inference,
+                                    is_attn_scale,
+                                    causal_mask,
+                                    padding_mask,
+                                    alibi_mask,
+                                    has_bias,
+                                    use_dropout_with_rng,
+                                    0.0f,
+                                    seq_len_override,
+                                    use_dropout_mask);
 
-    REQUIRE(mha_graph.build_operation_graph(handle).is_good());
-
-    auto plans = mha_graph.get_execution_plan_list({fe::HeurMode_t::A});
-
-    REQUIRE(plans.check_support(handle).is_good());
-
-    REQUIRE(mha_graph.set_execution_plans(plans).is_good());
+    (void)seq_q;
+    (void)seq_kv;
+    (void)seed;
+    (void)offset;
+    (void)dropout_mask;
+    (void)dropout_scale;
 
     //// Build variant pack
     Surface<half> qkvTensor(b * s_q * 3 * h * d, false);
@@ -307,11 +393,11 @@ TEST_CASE("Flash with no dropout", "[graph][mha][flash][forward]") {
 
     Surface<float> statsTensor(b * h * s_q * 1, false);
     if (is_inference == false) {
-        variant_pack[Stats] = statsTensor.devPtr;
+        variant_pack[stats] = statsTensor.devPtr;
     }
 
-    Surface<int8_t> workspace(mha_graph.get_workspace_size(), false);
-    REQUIRE(mha_graph.execute(handle, variant_pack, workspace.devPtr).is_good());
+    Surface<int8_t> workspace(graph->get_workspace_size(), false);
+    REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 
     checkCudaErr(cudaDeviceSynchronize());
 
@@ -427,11 +513,11 @@ TEST_CASE("Flash backward", "[graph][mha][flash][backward]") {
 
     REQUIRE(mha_graph.build_operation_graph(handle).is_good());
 
-    auto plans = mha_graph.get_execution_plan_list({fe::HeurMode_t::A});
+    auto plans = mha_graph.create_execution_plans({fe::HeurMode_t::A});
 
-    REQUIRE(plans.check_support(handle).is_good());
+    REQUIRE(mha_graph.check_support(handle).is_good());
 
-    REQUIRE(mha_graph.set_execution_plans(plans).is_good());
+    REQUIRE(mha_graph.build_plans(handle).is_good());
 
     // build variant pack
     // inputs

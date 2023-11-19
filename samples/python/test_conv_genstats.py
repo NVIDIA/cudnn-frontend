@@ -59,9 +59,9 @@ def test_conv_genstats():
     
     graph.validate()
     graph.build_operation_graph()
-    plans = graph.get_execution_plan_list([cudnn.heur_mode.A])
-    plans.check_support()
-    graph.set_execution_plans(plans)
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    graph.check_support()
+    graph.build_plans()
 
     sum_dev    = torch.zeros_like(sum_expected)
     sq_sum_dev = torch.zeros_like(sq_sum_expected)

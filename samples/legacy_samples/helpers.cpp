@@ -20,12 +20,37 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#include "helpers.h"
+#include "../utils/helpers.h"
+
+size_t
+get_compute_capability() {
+    struct cudaDeviceProp prop;
+    checkCudaErrors(cudaGetDeviceProperties(&prop, 0));
+    return prop.major * 10 + prop.minor;
+}
 
 bool
-check_device_arch_newer_than(std::string const arch) {
-    int arch_major = 6;
-    int arch_minor = 0;
+is_ampere_arch() {
+    auto cc = get_compute_capability();
+    return (80 <= cc) && (cc < 89);
+}
+
+bool
+is_ada_arch() {
+    auto cc = get_compute_capability();
+    return (cc == 89);
+}
+
+bool
+is_hopper_arch() {
+    auto cc = get_compute_capability();
+    return (90 <= cc);
+}
+
+bool
+check_device_arch_newer_than(std::string const& arch) {
+    size_t arch_major = 6;
+    size_t arch_minor = 0;
     if (arch == "hopper") {
         arch_major = 9;
     }
@@ -43,12 +68,8 @@ check_device_arch_newer_than(std::string const arch) {
         arch_major = 6;
     }
 
-    struct cudaDeviceProp prop;
-    checkCudaErrors(cudaGetDeviceProperties(&prop, 0));
-
-    auto device_version  = prop.major * 10 + prop.minor;
     auto queried_version = arch_major * 10 + arch_minor;
-    if (device_version >= queried_version) {
+    if (get_compute_capability() >= queried_version) {
         return true;
     }
     return false;

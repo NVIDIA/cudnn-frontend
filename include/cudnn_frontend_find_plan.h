@@ -86,7 +86,6 @@ time_sorted_plan(cudnnHandle_t handle,
             cudaEventElapsedTime(&time_ms, start, stop);
 
             if constexpr (samplingTechnique == CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_TILL_STABLE) {
-
                 final_time_ms = std::min(min_time_ms, time_ms);
                 if (time_ms / min_time_ms < threshhold) {
                     min_time_ms = final_time_ms;

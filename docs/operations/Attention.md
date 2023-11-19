@@ -3,7 +3,9 @@
 2. [Scaled Dot Product Flash Attention Backward](#scaled-dot-product-flash-attention-backward)
 
 ### Scaled Dot Product Flash Attention
-Computes the scaled dot product attention for given Query, Key and Value tensors. Optionally, can set dropout probability, causal mask. Can optionally dump stats to be used for the bprop computation.
+Computes the scaled dot product attention for given Query, Key and Value tensors. Setting `is_inference` to false configures the operation to output `softmax_stats` to be used for backwards computation.
+
+The user can also optionally configure attention scale, bias mask, alibi mask, padding mask, causal mask, and dropout for this operation.
 
 The dimensions for
 
@@ -16,8 +18,7 @@ The dimensions for
 Where $B$ is the batch size, $H$ is the number of heads, $S_{q}$ is the sequence length of the query, $S_{kv}$ is the sequence length
 of the key and value, and $D$ is the embedding dimension per head.
 
-Additionally, the stride for the last dimension corresponding to the embedding dim per head for each of these tensors
-must be 1.
+Additionally, the stride for the last dimension $D$ corresponding to the embedding dimension per head for each of these tensors must be 1.
 
 **API:**
 
@@ -95,7 +96,9 @@ Returns:
 ```
 
 ### Scaled Dot Product Flash Attention Backward
-Computes the query, key and value gradient tensors for scaled dot product flash attention. Optionally, can set dropout probability, causal mask.
+Computes the query, key and value gradient tensors for scaled dot product flash attention.
+
+The user can also optionally configure attention scale, bias mask, alibi mask, padding mask, causal mask, and dropout for this operation.
 
 The dimensions for
 
@@ -135,6 +138,9 @@ set_attn_scale(std::shared_ptr<Tensor_attributes> value)
 
 Scaled_dot_product_flash_attention_backward_attributes&
 set_bias(std::shared_ptr<Tensor_attributes> value)
+
+Scaled_dot_product_flash_attention_backward_attributes&
+set_dbias(std::shared_ptr<Tensor_attributes> value)
 
 Scaled_dot_product_flash_attention_backward_attributes&
 set_alibi_mask(bool const value)
@@ -177,6 +183,7 @@ Args:
     stats (cudnn_tensor): The softmax statistics from the forward pass.
     attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
     bias (Optional[cudnn_tensor]): The bias data for attention. Default is None.
+    dBias (Optional[cudnn_tensor]): The dBias output for attention. Default is None.
     use_alibi_mask (Optional[bool]): Whether to use alibi mask. Default is False.
     use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
     dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)],
@@ -196,4 +203,12 @@ Returns:
 - The cudnn backend enums are changed as follows:
     - `cudnnBackend<enum_name>` -> `cudnn_frontend::<enum_name>`
     - `cudnn<enum_name>` -> `cudnn_frontend::<enum_name>`
-- Scaled Dot Product Flash Attention Backward improves computation speed by employing an optional workspace tensor, which consumes quadratically increasing memory usage relative to sequence length. The default GPU memory limit for the workspace tensor is 256MB, but users with enough available GPU memory budget can increase this limit by configuring the CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT environment variable to the desired new limit in bytes.
+- Scaled Dot Product Flash Attention Backward improves performance by through the use of an optional dP workspace tensor. This tensor's memory consumption increases quadratically with the sequence length. The following describes the behavior of the `CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT` environment variable, which allows the user to change the GPU memory limit for this workspace tensor:
+  - `CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT = unset`  
+    The optimization will utilize workspace memory until reaching the default limit of 256MB.
+  - `CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT = -1`  
+    Workspace optimization is always enabled, regardless of memory usage.
+  - `CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT = 0`  
+    Workspace optimization is always disabled, avoiding the additional memory usage.
+  - `CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT = n`  
+    Allows workspace optimization up to a user-defined limit of n bytes, accommodating systems with varying GPU memory capacities.

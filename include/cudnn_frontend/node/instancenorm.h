@@ -11,10 +11,10 @@ namespace cudnn_frontend {
 namespace graph {
 class InstanceNormNode : public INode {
    public:
-    Instancenorm_attributes options;
+    Instancenorm_attributes attributes;
 
-    InstanceNormNode(Instancenorm_attributes&& options_, detail::Context const& context)
-        : INode(context), options(std::move(options_)) {}
+    InstanceNormNode(Instancenorm_attributes&& attributes_, detail::Context const& context)
+        : INode(context), attributes(std::move(attributes_)) {}
 
     Type
     getType() override final {
@@ -22,16 +22,16 @@ class InstanceNormNode : public INode {
     }
 
     error_t
-    infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferencing properties for instancenorm node " << options.name << "..."
-                    << std::endl;
+    expand_and_infer_properties() override final {
+        getLogger() << "[cudnn_frontend] INFO: Inferencing properties for instancenorm node " << attributes.name
+                    << "..." << std::endl;
 
-        options.fill_from_context(context);
+        attributes.fill_from_context(context);
 
-        auto X                  = options.inputs.X;
+        auto X                  = attributes.inputs[Instancenorm_attributes::input_names::X];
         auto const x_tensor_dim = X->get_dim();
 
-        auto Y            = options.outputs.Y;
+        auto Y            = attributes.outputs[Instancenorm_attributes::output_names::Y];
         auto y_tensor_dim = Y->get_dim();
 
         // Only infer dims and strides if user did not set them
@@ -46,45 +46,14 @@ class InstanceNormNode : public INode {
             Y->set_stride(detail::generate_stride(Y_dim, stride_order));
         }
 
-        // scale_bias   dim is 1,c,1,1
         // mean inv_var dim is n,c,1,1
-        auto scale_bias_dim = X->get_dim();
-        auto stats_dim      = X->get_dim();
-
-        for (size_t i = 0; i < scale_bias_dim.size(); i++) {
-            if (i != 1) {
-                scale_bias_dim[i] = 1;
-            }
-        }
-
+        auto stats_dim = X->get_dim();
         for (size_t i = 2; i < stats_dim.size(); i++) {
             stats_dim[i] = 1;
         }
 
-        auto scale = options.inputs.SCALE;
-        if (scale->get_dim().empty()) {
-            scale->set_dim(scale_bias_dim);
-        }
-        if (scale->get_stride().empty()) {
-            auto const& scale_dim = scale->get_dim();
-            // Default to NHWC
-            auto const& stride_order = detail::generate_NHWC_stride_order(scale_dim.size());
-            scale->set_stride(detail::generate_stride(scale_dim, stride_order));
-        }
-
-        auto bias = options.inputs.BIAS;
-        if (bias->get_dim().empty()) {
-            bias->set_dim(scale_bias_dim);
-        }
-        if (bias->get_stride().empty()) {
-            auto const& bias_dim = bias->get_dim();
-            // Default to NHWC
-            auto const& stride_order = detail::generate_NHWC_stride_order(bias_dim.size());
-            bias->set_stride(detail::generate_stride(bias_dim, stride_order));
-        }
-
-        if (options.forward_phase == NormFwdPhase_t::TRAINING) {
-            auto mean = options.outputs.MEAN;
+        if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
+            auto mean = attributes.outputs[Instancenorm_attributes::output_names::MEAN];
             if (mean->get_dim().empty()) {
                 mean->set_dim(stats_dim);
             }
@@ -95,7 +64,7 @@ class InstanceNormNode : public INode {
                 mean->set_stride(detail::generate_stride(mean_dim, stride_order));
             }
 
-            auto inv_var = options.outputs.INV_VARIANCE;
+            auto inv_var = attributes.outputs[Instancenorm_attributes::output_names::INV_VARIANCE];
             if (inv_var->get_dim().empty()) {
                 inv_var->set_dim(stats_dim);
             }
@@ -106,132 +75,117 @@ class InstanceNormNode : public INode {
                 inv_var->set_stride(detail::generate_stride(inv_var_dim, stride_order));
             }
         }
-
-        // Set scalar tensors
-        auto infer_scalar_tensors = [&x_tensor_dim](std::shared_ptr<Tensor_attributes>& T) {
-            auto tensor_dim = T->get_dim();
-            // Only infer dims and strides if user did not set them
-            if (tensor_dim.empty()) {
-                tensor_dim.resize(x_tensor_dim.size(), 1);
-                T->set_dim(tensor_dim);
-            }
-            if (T->get_stride().empty()) {
-                auto const& T_dim = T->get_dim();
-                // Default to NHWC
-                auto const& stride_order = detail::generate_NHWC_stride_order(T_dim.size());
-                T->set_stride(detail::generate_stride(T_dim, stride_order));
-            }
-        };
-        infer_scalar_tensors(options.inputs.EPSILON);
-
         return {error_code_t::OK, ""};
     }
 
     error_t
-    validate_node() const override final {
+    pre_validate_node() const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating InstanceNormNode " << options.name << "..." << std::endl;
+                    << "Validating InstanceNormNode " << attributes.name << "..." << std::endl;
 
         // Norm forward phase should be set
-        RETURN_CUDNN_FRONTEND_ERROR_IF(options.forward_phase == NormFwdPhase_t::NOT_SET,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.forward_phase == NormFwdPhase_t::NOT_SET,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Forward phase not set of instancenorm node.");
 
+        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
+
         return {error_code_t::OK, ""};
     }
 
     error_t
-    assign_uids_node() override final {
-        options.inputs.X->set_uid(ICudnn::create_new_uid());
-        options.inputs.SCALE->set_uid(ICudnn::create_new_uid());
-        options.inputs.BIAS->set_uid(ICudnn::create_new_uid());
-        options.inputs.EPSILON->set_uid(ICudnn::create_new_uid());
-        options.outputs.Y->set_uid(ICudnn::create_new_uid());
-        if (options.forward_phase == NormFwdPhase_t::TRAINING) {
-            options.outputs.MEAN->set_uid(ICudnn::create_new_uid());
-            options.outputs.INV_VARIANCE->set_uid(ICudnn::create_new_uid());
+    post_validate_node() const override final {
+        // Validate outputs
+        // All properties of output tensors should have been set now.
+        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    create_cudnn_tensors(int64_t& uid, std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors)
+        const override final {
+        getLogger() << "[cudnn_frontend] INFO: "
+                    << "Building InstanceNormNode tensors " << attributes.name << "..." << std::endl;
+
+        for (auto const& [name, tensor] : attributes.inputs) {
+            (void)name;
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+            }
+        }
+        for (auto const& [name, tensor] : attributes.outputs) {
+            (void)name;
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+            }
         }
         return {error_code_t::OK, ""};
     }
-
     error_t
-    createTensors() override final {
+    create_cudnn_operations(
+        std::unordered_set<uid_t>& uids_involved_in_operations,
+        std::vector<cudnn_frontend::Operation_v8>& operations,
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building InstanceNormNode tensors " << options.name << "..." << std::endl;
-
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.X));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.EPSILON));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.SCALE));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.BIAS));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.Y));
-        if (options.forward_phase == NormFwdPhase_t::TRAINING) {
-            CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.MEAN));
-            CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.INV_VARIANCE));
-        }
-        return {error_code_t::OK, ""};
-    }
-    error_t
-    createOperations() override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building InstanceNormNode operations " << options.name << "..." << std::endl;
+                    << "Building InstanceNormNode operations " << attributes.name << "..." << std::endl;
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         try {
 #endif
-            // Push all real tensors as required for operation execution.
-            std::vector<std::shared_ptr<Tensor_attributes>> tensors_involved_in_operation = {
-                options.inputs.X, options.inputs.EPSILON, options.inputs.SCALE, options.inputs.BIAS, options.outputs.Y};
 
-            if (options.forward_phase == NormFwdPhase_t::TRAINING) {
-                tensors_involved_in_operation.push_back(options.outputs.MEAN);
-                tensors_involved_in_operation.push_back(options.outputs.INV_VARIANCE);
+            auto&& op_builder = cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_FORWARD_DESCRIPTOR);
+
+            op_builder.setNormalizationMode(NormMode_t::INSTANCE_NORM);
+
+            op_builder.setNormFwdPhase(attributes.forward_phase);
+
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Instancenorm_attributes::input_names::X);
+            op_builder.setxDesc(*(tensors.at(X->second->get_uid())));
+
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Instancenorm_attributes::input_names::SCALE);
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(BIAS, Instancenorm_attributes::input_names::BIAS);
+            op_builder.setScaleAndBias(*(tensors.at(SCALE->second->get_uid())), *(tensors.at(BIAS->second->get_uid())));
+
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(EPSILON, Instancenorm_attributes::input_names::EPSILON);
+            op_builder.setEpsilonTensor(*(tensors.at(EPSILON->second->get_uid())));
+
+            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Instancenorm_attributes::output_names::Y);
+            op_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
+
+            if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
+                CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(MEAN, Instancenorm_attributes::output_names::MEAN);
+                CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(INV_VARIANCE,
+                                                           Instancenorm_attributes::output_names::INV_VARIANCE);
+                op_builder.setSavedMeanAndInvVar(*(tensors.at(MEAN->second->get_uid())),
+                                                 *(tensors.at(INV_VARIANCE->second->get_uid())));
             }
 
-            std::vector<uid_t> uids_in_operation;
-            for (auto const& tensor : tensors_involved_in_operation) {
-                if (tensor && tensor->get_is_virtual() == false) {
-                    uids_in_operation.push_back(tensor->get_uid());
-                }
-            }
+            operations.push_back(std::move(op_builder.build()));
 
-            cudnn_frontend::OperationBuilder &op_builder = cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_FORWARD_DESCRIPTOR)
-                                    .setNormalizationMode(NormMode_t::INSTANCE_NORM)
-                                    .setNormFwdPhase(options.forward_phase)
-                                    .setxDesc(*(tensors.at(options.inputs.X->get_uid())))
-                                    .setScaleAndBias(*(tensors.at(options.inputs.SCALE->get_uid())),
-                                                     *(tensors.at(options.inputs.BIAS->get_uid())))
-                                    .setEpsilonTensor(*(tensors.at(options.inputs.EPSILON->get_uid())))
-                                    .setyDesc(*(tensors.at(options.outputs.Y->get_uid())));
-
-            if (options.forward_phase == NormFwdPhase_t::TRAINING) {
-                op_builder.setSavedMeanAndInvVar(*(tensors.at(options.outputs.MEAN->get_uid())),
-                                                 *(tensors.at(options.outputs.INV_VARIANCE->get_uid())));
-            }
-
-            // cudnn_frontend::Operation instancenorm_operation = op_builder.build();
-            operations.push_back({op_builder.build(), std::move(uids_in_operation)});
-            
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {
             throw cudnnException(e.what(), e.getCudnnStatus());
         }
 #endif
 
+        auto const& non_virtual_uids = attributes.get_non_virtual_uids();
+        uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
         return {error_code_t::OK, ""};
     }
 
     virtual void
     serialize(json& j) const override final {
-        j = options;
+        j = attributes;
     }
 };
 
 class DINNode : public INode {
    public:
-    Instancenorm_backward_attributes options;
+    Instancenorm_backward_attributes attributes;
 
-    DINNode(Instancenorm_backward_attributes&& options_, detail::Context const& context)
-        : INode(context), options(std::move(options_)) {}
+    DINNode(Instancenorm_backward_attributes&& attributes_, detail::Context const& context)
+        : INode(context), attributes(std::move(attributes_)) {}
 
     Type
     getType() override final {
@@ -239,30 +193,27 @@ class DINNode : public INode {
     }
 
     error_t
-    validate_node() const override final {
+    pre_validate_node() const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating DINNode " << options.name << "..." << std::endl;
+                    << "Validating DINNode " << attributes.name << "..." << std::endl;
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!(options.inputs.MEAN) && !(options.inputs.INV_VARIANCE) &&
-                                           !(options.inputs.SCALE),
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "Either saved mean/inv_variance/scale or epsilon required.");
+        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
 
         return {error_code_t::OK, ""};
     }
 
     error_t
-    infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferencing properties for DIN node " << options.name << "..."
+    expand_and_infer_properties() override final {
+        getLogger() << "[cudnn_frontend] INFO: Inferencing properties for DIN node " << attributes.name << "..."
                     << std::endl;
 
-        options.fill_from_context(context);
+        attributes.fill_from_context(context);
 
         // TODO: Only inferencing from X works today.
-        auto X                  = options.inputs.X;
+        auto X                  = attributes.inputs[Instancenorm_backward_attributes::input_names::X];
         auto const x_tensor_dim = X->get_dim();
 
-        auto DY            = options.inputs.DY;
+        auto DY            = attributes.inputs[Instancenorm_backward_attributes::input_names::DY];
         auto dy_tensor_dim = DY->get_dim();
 
         // Only infer dims and strides if user did not set them
@@ -277,7 +228,7 @@ class DINNode : public INode {
             DY->set_stride(detail::generate_stride(DY_dim, stride_order));
         }
 
-        auto DX            = options.outputs.DX;
+        auto DX            = attributes.outputs[Instancenorm_backward_attributes::output_names::DX];
         auto dx_tensor_dim = DX->get_dim();
         // Only infer dims and strides if user did not set them
         if (dx_tensor_dim.empty()) {
@@ -294,38 +245,10 @@ class DINNode : public INode {
         // scale_bias   dim is 1,c,1,1
         // mean inv_var dim is n,c,1,1
         auto scale_bias_dim = X->get_dim();
-        auto stats_dim      = X->get_dim();
-
         for (size_t i = 0; i < scale_bias_dim.size(); i++) {
             if (i != 1) {
                 scale_bias_dim[i] = 1;
             }
-        }
-
-        for (size_t i = 2; i < stats_dim.size(); i++) {
-            stats_dim[i] = 1;
-        }
-
-        auto mean = options.inputs.MEAN;
-        if (mean->get_dim().empty()) {
-            mean->set_dim(stats_dim);
-        }
-        if (mean->get_stride().empty()) {
-            auto const& mean_dim = mean->get_dim();
-            // Default to NHWC
-            auto const& stride_order = detail::generate_NHWC_stride_order(mean_dim.size());
-            mean->set_stride(detail::generate_stride(mean_dim, stride_order));
-        }
-
-        auto inv_var = options.inputs.INV_VARIANCE;
-        if (inv_var->get_dim().empty()) {
-            inv_var->set_dim(stats_dim);
-        }
-        if (inv_var->get_stride().empty()) {
-            auto const& inv_var_dim = inv_var->get_dim();
-            // Default to NHWC
-            auto const& stride_order = detail::generate_NHWC_stride_order(inv_var_dim.size());
-            inv_var->set_stride(detail::generate_stride(inv_var_dim, stride_order));
         }
 
         // Set channel length tensors
@@ -343,84 +266,84 @@ class DINNode : public INode {
             }
         };
 
-        infer_scale_bias_tensors(options.inputs.SCALE);
-        infer_scale_bias_tensors(options.outputs.DSCALE);
-        infer_scale_bias_tensors(options.outputs.DBIAS);
+        infer_scale_bias_tensors(attributes.outputs[Instancenorm_backward_attributes::output_names::DSCALE]);
+        infer_scale_bias_tensors(attributes.outputs[Instancenorm_backward_attributes::output_names::DBIAS]);
 
         return {error_code_t::OK, ""};
     }
 
     error_t
-    assign_uids_node() override final {
-        options.inputs.X->set_uid(ICudnn::create_new_uid());
-        options.inputs.DY->set_uid(ICudnn::create_new_uid());
-        options.inputs.SCALE->set_uid(ICudnn::create_new_uid());
-        if (options.inputs.MEAN) {options.inputs.MEAN->set_uid(ICudnn::create_new_uid());}
-        if (options.inputs.INV_VARIANCE) {options.inputs.INV_VARIANCE->set_uid(ICudnn::create_new_uid());}
-        options.outputs.DX->set_uid(ICudnn::create_new_uid());
-        options.outputs.DSCALE->set_uid(ICudnn::create_new_uid());
-        options.outputs.DBIAS->set_uid(ICudnn::create_new_uid());
+    post_validate_node() const override final {
+        // Validate outputs
+        // All properties of output tensors should have been set now.
+        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
+
         return {error_code_t::OK, ""};
     }
 
     error_t
-    createTensors() override final {
+    create_cudnn_tensors(int64_t& uid, std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors)
+        const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building DINode tensors " << options.name << "..." << std::endl;
+                    << "Building DINode tensors " << attributes.name << "..." << std::endl;
 
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.X));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.DY));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.SCALE));
-        if (options.inputs.MEAN) {CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.MEAN));}
-        if (options.inputs.INV_VARIANCE) {CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.INV_VARIANCE));}
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.DX));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.DSCALE));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.DBIAS));
-
+        for (auto const& [name, tensor] : attributes.inputs) {
+            (void)name;
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+            }
+        }
+        for (auto const& [name, tensor] : attributes.outputs) {
+            (void)name;
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+            }
+        }
         return {error_code_t::OK, ""};
     }
 
     error_t
-    createOperations() override final {
+    create_cudnn_operations(
+        std::unordered_set<uid_t>& uids_involved_in_operations,
+        std::vector<cudnn_frontend::Operation_v8>& operations,
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building DINode operations " << options.name << "..." << std::endl;
+                    << "Building DINode operations " << attributes.name << "..." << std::endl;
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         try {
 #endif
 
             // Create the DIN operation.
-            auto DIN_operation = cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_BACKWARD_DESCRIPTOR)
-                                     .setNormalizationMode(NormMode_t::INSTANCE_NORM)
-                                     .setxDesc(*(tensors.at(options.inputs.X->get_uid())))
-                                     .setdyDesc(*(tensors.at(options.inputs.DY->get_uid())))
-                                     .setScale(*(tensors.at(options.inputs.SCALE->get_uid())))
-                                     .setSavedMeanAndInvVar(*(tensors.at(options.inputs.MEAN->get_uid())),
-                                                            *(tensors.at(options.inputs.INV_VARIANCE->get_uid())))
-                                     .setDScaleAndDBias(*(tensors.at(options.outputs.DSCALE->get_uid())),
-                                                        *(tensors.at(options.outputs.DBIAS->get_uid())))
-                                     .setdxDesc(*(tensors.at(options.outputs.DX->get_uid())))
-                                     .build();
+            auto&& DIN_operation_builder =
+                cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_BACKWARD_DESCRIPTOR);
 
-            // Push all real tensors as required for operation execution.
-            std::vector<std::shared_ptr<Tensor_attributes>> tensors_involved_in_operation = {
-                options.inputs.X,
-                options.inputs.DY,
-                options.inputs.SCALE,
-                options.inputs.MEAN,
-                options.inputs.INV_VARIANCE,
-                options.outputs.DX,
-                options.outputs.DSCALE,
-                options.outputs.DBIAS};
+            DIN_operation_builder.setNormalizationMode(NormMode_t::INSTANCE_NORM);
 
-            std::vector<uid_t> uids_in_operation;
-            for (auto const& tensor : tensors_involved_in_operation) {
-                if (tensor && tensor->get_is_virtual() == false) {
-                    uids_in_operation.push_back(tensor->get_uid());
-                }
-            }
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Instancenorm_backward_attributes::input_names::X);
+            DIN_operation_builder.setxDesc(*(tensors.at(X->second->get_uid())));
 
-            operations.push_back({std::move(DIN_operation), std::move(uids_in_operation)});
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(DY, Instancenorm_backward_attributes::input_names::DY);
+            DIN_operation_builder.setdyDesc(*(tensors.at(DY->second->get_uid())));
+
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Instancenorm_backward_attributes::input_names::SCALE);
+            DIN_operation_builder.setScale(*(tensors.at(SCALE->second->get_uid())));
+
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(MEAN, Instancenorm_backward_attributes::input_names::MEAN);
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(INV_VARIANCE,
+                                                      Instancenorm_backward_attributes::input_names::INV_VARIANCE);
+            DIN_operation_builder.setSavedMeanAndInvVar(*(tensors.at(MEAN->second->get_uid())),
+                                                        *(tensors.at(INV_VARIANCE->second->get_uid())));
+
+            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DSCALE, Instancenorm_backward_attributes::output_names::DSCALE);
+            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DBIAS, Instancenorm_backward_attributes::output_names::DBIAS);
+            DIN_operation_builder.setDScaleAndDBias(*(tensors.at(DSCALE->second->get_uid())),
+                                                    *(tensors.at(DBIAS->second->get_uid())));
+
+            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DX, Instancenorm_backward_attributes::output_names::DX);
+            DIN_operation_builder.setdxDesc(*(tensors.at(DX->second->get_uid())));
+
+            operations.push_back(std::move(DIN_operation_builder.build()));
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {
@@ -428,12 +351,14 @@ class DINNode : public INode {
         }
 #endif
 
+        auto const& non_virtual_uids = attributes.get_non_virtual_uids();
+        uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
         return {error_code_t::OK, ""};
     }
 
     virtual void
     serialize(json& j) const override final {
-        j = options;
+        j = attributes;
     }
 };
 

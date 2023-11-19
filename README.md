@@ -22,25 +22,36 @@ In order to include the entire library, include the cudnn_frontend header file `
 ### Dependencies
 With the release of v1.0, we are bumping up the minimum supported cudnn version to 8.5.0
 
+cuda can be downloaded from the [nvidia dev-zone](https://developer.nvidia.com/cuda-downloads)
+
+cudnn can be installed from 
+    - [nvidia dev-zone] (https://developer.nvidia.com/cudnn)
+    - [pypi wheels] (https://pypi.org/project/nvidia-cudnn-cu12/)
+
 Minimum python version needed 3.6
 The python binding compilation requires development package which can be installed by running `apt-get install python-dev`.
 
 To run the python samples, additionally, you will need the following python packages
 - pytest
-- pytorch-cuda=11.8 (or pytorch-cuda=12.1)
+- pytorch-cuda=12.1 (or pytorch-cuda=11.8)
 - torchvision
 - torchaudio
 - pytorch
 
 
 ### C++ API
+
+C++ API is header only library. The following compilation steps are only required for building the samples and python bindings.
+
+The CMakeLists.txt can be used reference to include the cudnn_frontend in your project.
+
 Provide CUDA according to: https://cmake.org/cmake/help/latest/module/FindCUDAToolkit.html  
 
 CUDNN_PATH has the cudnn installation:
 - Headers are in CUDNN_PATH/include.
 - Libraries are in CUDNN_PATH/lib or CUDNN_PATH/lib64 or CUDNN_PATH/lib/x64.
 
-From Project Root,
+From project Root,
 
 ```
 mkdir build; cd build

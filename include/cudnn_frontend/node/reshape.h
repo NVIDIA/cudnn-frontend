@@ -8,11 +8,11 @@
 namespace cudnn_frontend::graph {
 
 class ReshapeNode : public INode {
-    Reshape_attributes options;
+    Reshape_attributes attributes;
 
    public:
-    ReshapeNode(Reshape_attributes&& options_, detail::Context const& context)
-        : INode(context), options(std::move(options_)) {}
+    ReshapeNode(Reshape_attributes&& attributes_, detail::Context const& context)
+        : INode(context), attributes(std::move(attributes_)) {}
 
     Type
     getType() override final {
@@ -20,44 +20,43 @@ class ReshapeNode : public INode {
     }
 
     error_t
-    validate_node() const override final {
+    pre_validate_node() const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating ReshapeNode " << options.name << "..." << std::endl;
+                    << "Validating ReshapeNode " << attributes.name << "..." << std::endl;
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            nullptr == options.inputs.X, error_code_t::ATTRIBUTE_NOT_SET, "reshape input not set.");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            nullptr == options.outputs.Y, error_code_t::ATTRIBUTE_NOT_SET, "reshape output not set.");
+        auto const& x    = attributes.inputs.find(Reshape_attributes::input_names::X);
+        bool const has_x = (x != attributes.inputs.end()) && (x->second != nullptr);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_x, error_code_t::ATTRIBUTE_NOT_SET, "reshape input not set.");
+
+        auto const& y    = attributes.outputs.find(Reshape_attributes::output_names::Y);
+        bool const has_y = (y != attributes.outputs.end()) && (y->second != nullptr);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_y, error_code_t::ATTRIBUTE_NOT_SET, "reshape output not set.");
+
+        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
+
         return {error_code_t::OK, ""};
     }
 
     error_t
-    assign_uids_node() override final {
-        options.inputs.X->set_uid(ICudnn::create_new_uid());
-        options.outputs.Y->set_uid(ICudnn::create_new_uid());
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for reshape node " << options.name << "..."
+    expand_and_infer_properties() override final {
+        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for reshape node " << attributes.name << "..."
                     << std::endl;
 
-        auto y_tensor = options.outputs.Y;
+        auto y_tensor = attributes.outputs[Reshape_attributes::output_names::Y];
 
-        options.fill_from_context(context);
+        attributes.fill_from_context(context);
 
         // If user does not set shape and layout of the output tensor,
         // Get it from node attributes
         // If layout is not set, generate the strides from layout
 
-        if (y_tensor->get_dim().empty() && options.get_dim().size()) {
-            y_tensor->set_dim(options.dim);
+        if (y_tensor->get_dim().empty() && attributes.get_dim().size()) {
+            y_tensor->set_dim(attributes.dim);
         }
 
         if (y_tensor->get_stride().empty()) {
-            if (options.get_stride().size()) {
-                y_tensor->set_stride(options.get_stride());
+            if (attributes.get_stride().size()) {
+                y_tensor->set_stride(attributes.get_stride());
             } else {
                 auto const& y_dim = y_tensor->get_dim();
                 // Default to NHWC
@@ -74,52 +73,70 @@ class ReshapeNode : public INode {
     }
 
     error_t
-    createTensors() override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building Reshape tensors " << options.name << "..." << std::endl;
-
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.inputs.X));
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(options.outputs.Y));
+    post_validate_node() const override final {
+        // Validate outputs
+        // All properties of output tensors should have been set now.
+        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
 
         return {error_code_t::OK, ""};
     }
 
     error_t
-    createOperations() override final {
+    create_cudnn_tensors(int64_t& uid, std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors)
+        const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building ReshapeNode operations " << options.name << "..." << std::endl;
+                    << "Building Reshape tensors " << attributes.name << "..." << std::endl;
+
+        for (auto const& [name, tensor] : attributes.inputs) {
+            (void)name;
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+            }
+        }
+        for (auto const& [name, tensor] : attributes.outputs) {
+            (void)name;
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+            }
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    create_cudnn_operations(
+        std::unordered_set<uid_t>& uids_involved_in_operations,
+        std::vector<cudnn_frontend::Operation_v8>& operations,
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
+        getLogger() << "[cudnn_frontend] INFO: "
+                    << "Building ReshapeNode operations " << attributes.name << "..." << std::endl;
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         try {
 #endif
-            // Push all real tensors as required for operation execution.
-            auto const& tensors_involved_in_operation = {options.inputs.X, options.outputs.Y};
+            auto&& reshape_op_builder =
+                cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_RESHAPE_DESCRIPTOR);
 
-            auto reshape_op = cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_RESHAPE_DESCRIPTOR)
-                                  .setxDesc(*(tensors.at(options.inputs.X->get_uid())))
-                                  .setyDesc(*(tensors.at(options.outputs.Y->get_uid())))
-                                  .build();
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Reshape_attributes::input_names::X);
+            reshape_op_builder.setxDesc(*(tensors.at(X->second->get_uid())));
 
-            std::vector<uid_t> uids_in_operation;
-            for (auto const& tensor : tensors_involved_in_operation) {
-                if (tensor && tensor->get_is_virtual() == false) {
-                    uids_in_operation.push_back(tensor->get_uid());
-                }
-            }
-            operations.push_back({std::move(reshape_op), std::move(uids_in_operation)});
+            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Reshape_attributes::output_names::Y);
+            reshape_op_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
 
+            operations.push_back(std::move(reshape_op_builder.build()));
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {
             throw cudnnException(e.what(), e.getCudnnStatus());
         }
 #endif
 
+        auto const& non_virtual_uids = attributes.get_non_virtual_uids();
+        uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
         return {error_code_t::OK, ""};
     }
 
     virtual void
     serialize(json& j) const override final {
-        j = options;
+        j = attributes;
     }
 };
 

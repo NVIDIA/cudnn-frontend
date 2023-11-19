@@ -25,6 +25,7 @@ PyGraph::scaled_dot_product_flash_attention(std::shared_ptr<cudnn_frontend::grap
                                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
                                             bool const use_causal_mask,
                                             py::object const& dropout,
+                                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
                                             cudnn_frontend::DataType_t const& compute_data_type,
                                             std::string const& name) {
     auto attributes = cudnn_frontend::graph::Scaled_dot_product_flash_attention_attributes()
@@ -71,6 +72,9 @@ PyGraph::scaled_dot_product_flash_attention(std::shared_ptr<cudnn_frontend::grap
             }
 
             attributes.set_dropout(probability, seed, offset);
+            if (rng_dump) {
+                attributes.set_rng_dump(rng_dump);
+            }
         } else {
             auto const mask = dropout_tuple[0].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
             if (!mask) {
@@ -100,16 +104,19 @@ PyGraph::scaled_dot_product_flash_attention_backward(
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& stats,
     py::object const& attn_scale,
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dBias,
     bool const use_alibi_mask,
     bool const use_padding_mask,
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
     bool const use_causal_mask,
     py::object const& dropout,
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
     cudnn_frontend::DataType_t const& compute_data_type,
     std::string const& name) {
     auto attributes = cudnn_frontend::graph::Scaled_dot_product_flash_attention_backward_attributes()
                           .set_bias(bias)
+                          .set_dbias(dBias)
                           .set_alibi_mask(use_alibi_mask)
                           .set_padding_mask(use_padding_mask)
                           .set_seq_len_q(seq_len_q)
@@ -152,6 +159,9 @@ PyGraph::scaled_dot_product_flash_attention_backward(
             auto const seed        = dropout_tuple[1].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
             auto const offset      = dropout_tuple[2].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
             attributes.set_dropout(probability, seed, offset);
+            if (rng_dump) {
+                attributes.set_rng_dump(rng_dump);
+            }
         } else if (py::isinstance(dropout_tuple[0], cudnn_tensor_type) &&
                    py::isinstance(dropout_tuple[1], cudnn_tensor_type) &&
                    py::isinstance(dropout_tuple[2], cudnn_tensor_type)) {
@@ -186,6 +196,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("seq_len_kv", nullptr),
           py::arg_v("use_causal_mask", false),
           py::arg_v("dropout", py::none()),
+          py::arg_v("rng_dump", nullptr),
           py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
           py::arg_v("name", ""),
           R"pbdoc(
@@ -221,12 +232,14 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
              py::arg("stats"),
              py::arg_v("attn_scale", py::none()),
              py::arg_v("bias", nullptr),
+             py::arg_v("dBias", nullptr),
              py::arg_v("use_alibi_mask", false),
              py::arg_v("use_padding_mask", false),
              py::arg_v("seq_len_q", nullptr),
              py::arg_v("seq_len_kv", nullptr),
              py::arg_v("use_causal_mask", false),
              py::arg_v("dropout", py::none()),
+             py::arg_v("rng_dump", nullptr),
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("name", ""),
              R"pbdoc(
@@ -241,6 +254,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     stats (cudnn_tensor): The softmax statistics from the forward pass.
                     attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
                     bias (Optional[cudnn_tensor]): The bias data for attention. Default is None.
+                    dBias (Optional[cudnn_tensor]): The dBias data for attention. Default is None.
                     use_alibi_mask (Optional[bool]): Whether to use alibi mask. Default is False.
                     use_padding_mask (Optional[bool]): Whether to use padding mask. Default is False.
                     seq_len_q (Optional[cudnn_tensor]): The sequence length of the query.

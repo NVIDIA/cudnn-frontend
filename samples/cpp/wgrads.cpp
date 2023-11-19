@@ -21,7 +21,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
-#include "../helpers.h"
+#include "../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
@@ -72,11 +72,11 @@ TEST_CASE("Wgrad Graph", "[wgrad][graph][scale-bias-relu-wgrad][ConvBNwgrad]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::A});
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-    REQUIRE(plans.check_support(handle).is_good());
+    REQUIRE(graph.check_support(handle).is_good());
 
-    REQUIRE(graph.set_execution_plans(plans).is_good());
+    REQUIRE(graph.build_plans(handle).is_good());
 
     Surface<half> x_tensor(4 * 64 * 16 * 16, false);
     Surface<half> s_tensor(64, false);

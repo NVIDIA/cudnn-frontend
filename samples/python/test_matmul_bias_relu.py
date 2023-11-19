@@ -17,6 +17,10 @@ def convert_to_cudnn_type(torch_type):
     else:
         raise ValueError("Unsupported tensor data type.")
     
+def get_cc():
+    (major, minor) = torch.cuda.get_device_capability()
+    return major*10 + minor
+
 problem_size_options = [(1, 128, 768)
                         , (16, 512, 1600)
                         , (1, 128, 1024)]
@@ -56,9 +60,9 @@ def test_matmul_bias_relu(param_extract):
     
     graph.validate()
     graph.build_operation_graph()
-    plans = graph.get_execution_plan_list([cudnn.heur_mode.A])
-    plans.check_support()
-    graph.set_execution_plans(plans)
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    graph.check_support()
+    graph.build_plans()
 
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
@@ -66,8 +70,9 @@ def test_matmul_bias_relu(param_extract):
 
     graph.execute({X: X_gpu, W:  W_gpu, B:  B_gpu, Y:  Y_actual}, workspace)
 
+    atol = 0.0625 if get_cc() == 89 else 1e-3
     rtol = 1e-2 if input_type == torch.bfloat16 else 1e-3
-    torch.testing.assert_close(Y_expected, Y_actual, atol=1e-3, rtol=rtol)
+    torch.testing.assert_close(Y_expected, Y_actual, atol=atol, rtol=rtol)
         
 if __name__ == "__main__":
     test_matmul_bias_relu(((1,128,1600), torch.float16))

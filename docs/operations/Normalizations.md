@@ -43,7 +43,6 @@ set_compute_data_type(DataType_t value)
 
 Python API: 
 - batchnorm
-    - norm_forward_phase
     - input
     - scale
     - bias

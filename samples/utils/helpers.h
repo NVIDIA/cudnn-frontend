@@ -56,7 +56,13 @@ enum class MHA_Matrix {
 enum class MHA_Bias_Type { NO_BIAS = 0, PRE_SCALE_BIAS = 1, POST_SCALE_BIAS = 2 };
 
 bool
-check_device_arch_newer_than(std::string const arch);
+is_ampere_arch();
+bool
+is_ada_arch();
+bool
+is_hopper_arch();
+bool
+check_device_arch_newer_than(std::string const& arch);
 
 int64_t
 getFwdConvDilatedFilterDim(int64_t filterDim, int64_t dilation);

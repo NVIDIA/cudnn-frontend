@@ -22,7 +22,7 @@
 
 #include "fp8_flash_mha_sample.h"
 #include <cudnn_frontend.h>
-#include "error_util.h"
+#include "../utils/error_util.h"
 
 #if (CUDNN_VERSION >= 8900)
 std::unordered_map<std::string, int> tensor_name_to_uid = {{"Q", 1},

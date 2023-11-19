@@ -2,9 +2,6 @@ cmake_minimum_required(VERSION 3.18)
 
 Include(FetchContent)
 
-# Find the cuda compiler
-find_package(CUDAToolkit)
-
 # Fetch and build dlpack
 FetchContent_Declare(
   dlpack
@@ -20,15 +17,11 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(pybind11)
 
-# Find cudnn
-include(${CMAKE_SOURCE_DIR}/cmake/cuDNN.cmake)
-
 pybind11_add_module(
     cudnn
     
     pycudnn.cpp
     properties.cpp
-    pyplans.cpp
     
     pygraph/pygraph.cpp
     pygraph/norm.cpp
@@ -40,11 +33,7 @@ target_link_libraries(
     cudnn
     
     PRIVATE cudnn_frontend
-
     PRIVATE dlpack
-    PRIVATE CUDA::cudart
-    PRIVATE CUDA::nvrtc
-    PRIVATE CUDNN::cudnn_all
 )
 
 set_target_properties(

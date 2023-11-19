@@ -37,9 +37,9 @@
 
 #include <cudnn_frontend.h>
 
-#include "fp16_dev.h"
-#include "fp16_emu.h"
-#include "helpers.h"
+#include "../utils/fp16_dev.h"
+#include "../utils/fp16_emu.h"
+#include "../utils/helpers.h"
 
 void
 run_from_global_index(int64_t* dimA_padded,

@@ -28,7 +28,7 @@ class ScaledDotProductAttentionNode : public INode {
     }
 
     error_t
-    validate_node() const override final {
+    pre_validate_node() const override final {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Validating ScaledDotProductAttentionNode " << options.name << "..." << std::endl;
 
@@ -54,7 +54,7 @@ class ScaledDotProductAttentionNode : public INode {
     }
 
     error_t
-    infer_properties_node() override final {
+    expand_and_infer_properties() override final {
         getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for Scaled_dot_product_attention node "
                     << options.name << "..." << std::endl;
 
@@ -328,8 +328,9 @@ class ScaledDotProductAttentionNode : public INode {
     virtual error_t
     pass_by_value_tensors_(
         cudnnHandle_t,
+        std::unordered_map<std::shared_ptr<Tensor_attributes>, void*> const&,
         std::unordered_map<std::shared_ptr<Tensor_attributes>, pass_by_values_t>& tensor_to_pass_by_value,
-        void*) override {
+        void*) const override final {
         half dropout_scale_value = options.dropout_scale;
         tensor_to_pass_by_value.emplace(options.inputs.Dropout_scale, dropout_scale_value);
 

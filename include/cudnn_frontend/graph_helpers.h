@@ -25,7 +25,7 @@ enum class [[nodiscard]] error_code_t{OK,
                                       INVALID_CUDA_DEVICE,
                                       HANDLE_ERROR};
 
-typedef struct error_object {
+typedef struct [[nodiscard]] error_object {
     error_code_t code;
     std::string err_msg;
     error_object() : code(error_code_t::OK), err_msg(""){};
@@ -157,59 +157,13 @@ allowAllConfig(cudnnBackendDescriptor_t engine_config) {
 
 namespace detail {
 
-class Context {
-    DataType_t compute_data_type      = DataType_t::NOT_SET;
-    DataType_t intermediate_data_type = DataType_t::NOT_SET;
-    DataType_t io_data_type           = DataType_t::NOT_SET;
-
-   public:
-    Context&
-    set_intermediate_data_type(DataType_t const type) {
-        intermediate_data_type = type;
-        return *this;
-    }
-
-    Context&
-    set_io_data_type(DataType_t const type) {
-        io_data_type = type;
-        return *this;
-    }
-
-    Context&
-    set_compute_data_type(DataType_t const type) {
-        compute_data_type = type;
-        return *this;
-    }
-
-    DataType_t
-    get_io_data_type() const {
-        return io_data_type;
-    }
-
-    DataType_t
-    get_intermediate_data_type() const {
-        return intermediate_data_type;
-    }
-
-    DataType_t
-    get_compute_data_type() const {
-        return compute_data_type;
-    }
-
-    Context&
-    fill_missing_properties(Context const& global_context) {
-        if (get_compute_data_type() == DataType_t::NOT_SET) {
-            set_compute_data_type(global_context.get_compute_data_type());
-        }
-        if (get_intermediate_data_type() == DataType_t::NOT_SET) {
-            set_intermediate_data_type(global_context.get_intermediate_data_type());
-        }
-        if (get_io_data_type() == DataType_t::NOT_SET) {
-            set_io_data_type(global_context.get_io_data_type());
-        }
-        return *this;
-    }
-};
+inline bool
+is_activation_backward_mode(PointwiseMode_t const mode) {
+    return ((mode == PointwiseMode_t::RELU_BWD) || (mode == PointwiseMode_t::TANH_BWD) ||
+            (mode == PointwiseMode_t::SIGMOID_BWD) || (mode == PointwiseMode_t::ELU_BWD) ||
+            (mode == PointwiseMode_t::GELU_BWD) || (mode == PointwiseMode_t::GELU_APPROX_TANH_BWD) ||
+            (mode == PointwiseMode_t::SOFTPLUS_BWD) || (mode == PointwiseMode_t::SWISH_BWD));
+}
 
 // Creates dense, non-overlapping strides from given dim and stride_order.
 // For example, if a is a 4D tensor with dimensions labeled NCHW, then strided(a, (3, 0, 2, 1)) produces

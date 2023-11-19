@@ -21,7 +21,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
-#include "../helpers.h"
+#include "../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
@@ -39,10 +39,18 @@ TEST_CASE("RmsNorm Training", "[rmsnorm][graph]") {
                               .set_data_type(fe::DataType_t::FLOAT)
                               .set_dim({batch_size * seq_length, hidden_size, 1, 1})
                               .set_stride({hidden_size, 1, hidden_size, hidden_size}));
-    auto scale = graph.tensor(fe::graph::Tensor_attributes().set_name("scale").set_data_type(fe::DataType_t::FLOAT));
+    auto scale = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("scale")
+                                  .set_dim({1, hidden_size, 1, 1})
+                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                  .set_data_type(fe::DataType_t::FLOAT));
 
-    auto epsilon =
-        graph.tensor(fe::graph::Tensor_attributes().set_name("epsilon").set_data_type(fe::DataType_t::FLOAT));
+    auto epsilon = graph.tensor(fe::graph::Tensor_attributes()
+                                    .set_name("epsilon")
+                                    .set_dim({1, 1, 1, 1})
+                                    .set_stride({1, 1, 1, 1})
+                                    .set_is_pass_by_value(true)
+                                    .set_data_type(fe::DataType_t::FLOAT));
 
     auto rmsnorm_options =
         fe::graph::Rmsnorm_attributes().set_forward_phase(fe::NormFwdPhase_t::TRAINING).set_epsilon(epsilon);
@@ -63,17 +71,17 @@ TEST_CASE("RmsNorm Training", "[rmsnorm][graph]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::FALLBACK});
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
 
-    REQUIRE(plans.check_support(handle).is_good());
+    REQUIRE(graph.check_support(handle).is_good());
 
-    REQUIRE(graph.set_execution_plans(plans).is_good());
+    REQUIRE(graph.build_plans(handle).is_good());
 
-    Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
+    Surface<float> X_tensor(batch_size * seq_length * hidden_size, false);
     Surface<float> Var_tensor(batch_size * seq_length, false);
     Surface<float> Scale_tensor(hidden_size, false);
     float epsilon_cpu = 1e-05f;
-    Surface<half> Y_tensor(batch_size * seq_length * hidden_size, false);
+    Surface<float> Y_tensor(batch_size * seq_length * hidden_size, false);
 
     Surface<int8_t> workspace(graph.get_workspace_size(), false);
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
@@ -102,11 +110,23 @@ TEST_CASE("RmsNorm Inference", "[rmsnorm][graph]") {
                               .set_data_type(fe::DataType_t::FLOAT)
                               .set_dim({batch_size * seq_length, hidden_size, 1, 1})
                               .set_stride({hidden_size, 1, hidden_size, hidden_size}));
-    auto scale = graph.tensor(fe::graph::Tensor_attributes().set_name("scale").set_data_type(fe::DataType_t::FLOAT));
-    auto bias  = graph.tensor(fe::graph::Tensor_attributes().set_name("bias").set_data_type(fe::DataType_t::FLOAT));
+    auto scale = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("scale")
+                                  .set_dim({1, hidden_size, 1, 1})
+                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                  .set_data_type(fe::DataType_t::FLOAT));
+    auto bias  = graph.tensor(fe::graph::Tensor_attributes()
+                                 .set_name("bias")
+                                 .set_dim({1, hidden_size, 1, 1})
+                                 .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                 .set_data_type(fe::DataType_t::FLOAT));
 
-    auto epsilon =
-        graph.tensor(fe::graph::Tensor_attributes().set_name("epsilon").set_data_type(fe::DataType_t::FLOAT));
+    auto epsilon = graph.tensor(fe::graph::Tensor_attributes()
+                                    .set_name("epsilon")
+                                    .set_dim({1, 1, 1, 1})
+                                    .set_stride({1, 1, 1, 1})
+                                    .set_is_pass_by_value(true)
+                                    .set_data_type(fe::DataType_t::FLOAT));
 
     auto rmsnorm_options = fe::graph::Rmsnorm_attributes()
                                .set_forward_phase(fe::NormFwdPhase_t::INFERENCE)
@@ -129,17 +149,17 @@ TEST_CASE("RmsNorm Inference", "[rmsnorm][graph]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::FALLBACK});
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
 
-    REQUIRE(plans.check_support(handle).is_good());
+    REQUIRE(graph.check_support(handle).is_good());
 
-    REQUIRE(graph.set_execution_plans(plans).is_good());
+    REQUIRE(graph.build_plans(handle).is_good());
 
-    Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
+    Surface<float> X_tensor(batch_size * seq_length * hidden_size, false);
     Surface<float> Scale_tensor(hidden_size, false);
     Surface<float> Bias_tensor(hidden_size, false);
     float epsilon_cpu = 1e-05f;
-    Surface<half> Y_tensor(batch_size * seq_length * hidden_size, false);
+    Surface<float> Y_tensor(batch_size * seq_length * hidden_size, false);
 
     Surface<int8_t> workspace(graph.get_workspace_size(), false);
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
@@ -174,9 +194,16 @@ TEST_CASE("RmsNorm Backward", "[rmsnorm][graph]") {
                                .set_dim({batch_size * seq_length, hidden_size, 1, 1})
                                .set_stride({hidden_size, 1, hidden_size, hidden_size}));
 
-    auto scale = graph.tensor(fe::graph::Tensor_attributes().set_name("scale").set_data_type(fe::DataType_t::FLOAT));
-    auto inv_variance =
-        graph.tensor(fe::graph::Tensor_attributes().set_name("inv_variance").set_data_type(fe::DataType_t::FLOAT));
+    auto scale        = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("scale")
+                                  .set_dim({1, hidden_size, 1, 1})
+                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                  .set_data_type(fe::DataType_t::FLOAT));
+    auto inv_variance = graph.tensor(fe::graph::Tensor_attributes()
+                                         .set_name("inv_variance")
+                                         .set_dim({batch_size * seq_length, 1, 1, 1})
+                                         .set_stride({1, 1, 1, 1})
+                                         .set_data_type(fe::DataType_t::FLOAT));
 
     auto DRMS_options        = fe::graph::Rmsnorm_backward_attributes().has_dbias(false);
     auto [DX, dscale, dbias] = graph.rmsnorm_backward(DY, X, scale, inv_variance, DRMS_options);
@@ -197,11 +224,11 @@ TEST_CASE("RmsNorm Backward", "[rmsnorm][graph]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    auto plans = graph.get_execution_plan_list({fe::HeurMode_t::A});
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-    REQUIRE(plans.check_support(handle).is_good());
+    REQUIRE(graph.check_support(handle).is_good());
 
-    REQUIRE(graph.set_execution_plans(plans).is_good());
+    REQUIRE(graph.build_plans(handle).is_good());
 
     Surface<float> X_tensor(batch_size * seq_length * hidden_size, false);
     Surface<float> DY_tensor(batch_size * seq_length * hidden_size, false);

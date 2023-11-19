@@ -33,9 +33,9 @@
 #include <functional>
 
 #include <cudnn.h>
-#include "fp16_dev.h"
-#include "fp16_emu.h"
-#include "helpers.h"
+#include "../utils/fp16_dev.h"
+#include "../utils/fp16_emu.h"
+#include "../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
