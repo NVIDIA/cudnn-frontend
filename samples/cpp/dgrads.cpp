@@ -25,6 +25,50 @@
 
 #include <cudnn_frontend.h>
 
+TEST_CASE("Convolution Dgrad", "[dgrad][graph]") {
+    namespace fe = cudnn_frontend;
+    fe::graph::Graph graph;
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto DY = graph.tensor(fe::graph::Tensor_attributes()
+                               .set_name("grad")
+                               .set_dim({4, 64, 16, 16})
+                               .set_stride({64 * 16 * 16, 1, 64 * 16, 64}));
+    auto W  = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("weight")
+                              .set_dim({64, 32, 3, 3})
+                              .set_stride({32 * 3 * 3, 1, 32 * 3, 32}));
+
+    auto dgrad_options = fe::graph::Conv_dgrad_attributes().set_padding({1, 1}).set_stride({1, 1}).set_dilation({1, 1});
+    auto DX            = graph.conv_dgrad(DY, W, dgrad_options);
+    DX->set_dim({4, 32, 16, 16}).set_output(true);
+
+    cudnnHandle_t handle;
+    checkCudnnErr(cudnnCreate(&handle));
+
+    REQUIRE(graph.validate().is_good());
+
+    REQUIRE(graph.build_operation_graph(handle).is_good());
+
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
+
+    REQUIRE(graph.check_support(handle).is_good());
+
+    REQUIRE(graph.build_plans(handle).is_good());
+
+    Surface<half> dy_tensor(4 * 64 * 16 * 16, false);
+    Surface<half> w_tensor(64 * 32 * 3 * 3, false);
+    Surface<half> dx_tensor(4 * 32 * 16 * 16, false);
+
+    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
+        {DY, dy_tensor.devPtr}, {W, w_tensor.devPtr}, {DX, dx_tensor.devPtr}};
+    REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
+    cudnnDestroy(handle);
+}
+
 TEST_CASE("Dgrad Drelu Graph", "[dgrad][graph]") {
     namespace fe = cudnn_frontend;
     fe::graph::Graph graph;

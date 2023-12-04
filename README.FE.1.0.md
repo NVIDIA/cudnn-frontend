@@ -42,8 +42,8 @@ FE v1.0 API follows a functional style of building a graph. Operations take in i
 | Generate stats of output| genstats <br>Genstats_attributes                          | genstats     |
 | BN Finalize of stats    | bn_finalize <br>BN_finalize_attributes                    | bn_finalize  |
 | Dbn weight              | dbn_weight <br>DBN_weight_attributes                      | dbn_weight   |
-| Scale dot product flash attention | scaled_dot_product_flash_attention<br> Scaled_dot_product_flash_attention_attributes | scaled_dot_product_flash_attention |
-| Scale dot product flash attention_backward | scaled_dot_product_flash_attention_backward<br> Scaled_dot_product_flash_attention_backward_attributes | scaled_dot_product_flash_attention_backward |
+| Scale dot product attention | sdpa<br> SDPA_attributes | sdpa |
+| Scale dot product attention backward | sdpa_backward<br> SDPA_backward_attributes | sdpa_backward |
 
 ### Create Graph
 Instantiate an object of class `cudnn_frontend::graph::Graph` which will house tensors and operations.  

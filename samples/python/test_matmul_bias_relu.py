@@ -14,12 +14,116 @@ def convert_to_cudnn_type(torch_type):
         return cudnn.data_type.BOOLEAN
     elif torch_type == torch.uint8:
         return cudnn.data_type.UINT8
+    elif torch_type == torch.int8:
+        return cudnn.data_type.INT8
     else:
         raise ValueError("Unsupported tensor data type.")
     
 def get_cc():
     (major, minor) = torch.cuda.get_device_capability()
     return major*10 + minor
+
+@pytest.mark.skipif(cudnn.backend_version() < 8906, reason="requires cudnn 8.9.6 or higher")
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch")
+def test_int8_bf16_matmul():
+    # matmul problem size 
+    B, M, N, K = 16, 32, 64, 128
+
+    # Initialize input tensors
+    A_gpu = torch.randint(3, (B, M, K), requires_grad=False, device="cuda", dtype=torch.int8) - 2
+    B_gpu = 3 * torch.randn(B, K, N, requires_grad=False, device="cuda", dtype=torch.bfloat16) - 1.25
+    
+    # Make cudnn graph
+    graph = cudnn.pygraph()
+
+    # Create the two non-virtual input tensors A and B.
+    # There are read from global memory.
+    A = graph.tensor_like(A_gpu)
+    B = graph.tensor_like(B_gpu)
+    
+    # Cast the input tensors to required mma precision
+    A_casted = graph.identity(input = A, compute_data_type=cudnn.data_type.FLOAT)
+    A_casted.set_data_type(cudnn.data_type.BFLOAT16)
+    
+    C = graph.matmul(name = "matmul", A = A_casted, B = B, compute_data_type=cudnn.data_type.FLOAT)
+    C.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    
+    graph.build([cudnn.heur_mode.A])
+
+    # Run pyt reference
+    C_expected = torch.matmul(A_gpu.to(torch.bfloat16), B_gpu.to(torch.bfloat16))
+    
+    # Run cudnn graph
+    C_actual = torch.zeros_like(C_expected)
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    graph.execute({A: A_gpu, B:  B_gpu, C:  C_actual}, workspace)
+
+    # compare'em
+    torch.testing.assert_close(C_expected, C_actual)
+
+A_data_type_options = [torch.int8, torch.bfloat16, torch.float16]
+B_data_type_options = [torch.int8, torch.bfloat16, torch.float16]
+MMA_data_type_options = [torch.bfloat16, torch.float16, torch.float32]
+
+@pytest.mark.skipif(cudnn.backend_version() < 8906, reason="requires cudnn 8.9.6 or higher")
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch")
+@pytest.mark.parametrize("A_data_type", A_data_type_options)
+@pytest.mark.parametrize("B_data_type", B_data_type_options)
+@pytest.mark.parametrize("MMA_data_type", MMA_data_type_options)
+def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
+
+    # matmul problem size 
+    B, M, N, K = 16, 32, 64, 128
+
+    # Initialize input tensors
+    if A_data_type != torch.int8:
+        A_gpu = 2 * torch.randn(B, M, K, requires_grad=False, device="cuda", dtype=A_data_type) - 0.5
+    else:
+        A_gpu = torch.randint(4, (B, M, K), requires_grad=False, device="cuda", dtype=A_data_type) - 1
+
+    if B_data_type != torch.int8:
+        B_gpu = 3 * torch.randn(B, K, N, requires_grad=False, device="cuda", dtype=B_data_type) - 1.25
+    else:
+        B_gpu = torch.randint(3, (B, K, N), requires_grad=False, device="cuda", dtype=B_data_type) - 2
+
+    # Make cudnn graph
+    graph = cudnn.pygraph()
+
+    # Create the two non-virtual input tensors A and B.
+    # There are read from global memory.
+    A = graph.tensor_like(A_gpu)
+    B = graph.tensor_like(B_gpu)
+    
+    # Cast the input tensors to required mma precision
+    A_casted = graph.identity(input = A, compute_data_type=convert_to_cudnn_type(MMA_data_type))
+    A_casted.set_data_type(convert_to_cudnn_type(MMA_data_type))
+    
+    # Casting input tensor B is only supported from cudnn v9
+    if B_data_type != MMA_data_type and cudnn.backend_version() < 90000:
+        pytest.skip("mixed precision on B only supported from cudnn v9.")
+    
+    if cudnn.backend_version() < 90000:
+        # Do not create a cast node
+        B_casted = B
+    else:
+        B_casted = graph.identity(input = B, compute_data_type=convert_to_cudnn_type(MMA_data_type))
+        B_casted.set_data_type(convert_to_cudnn_type(MMA_data_type))
+
+    C = graph.matmul(name = "matmul", A = A_casted, B = B_casted, compute_data_type=cudnn.data_type.FLOAT)
+    C.set_output(True).set_data_type(convert_to_cudnn_type(MMA_data_type))
+    
+    graph.build([cudnn.heur_mode.A])
+
+    # Run pyt reference
+    C_expected = torch.matmul(A_gpu.to(MMA_data_type), B_gpu.to(MMA_data_type))
+    
+    # Run cudnn graph
+    C_actual = torch.zeros_like(C_expected)
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    graph.execute({A: A_gpu, B:  B_gpu, C:  C_actual}, workspace)
+
+    # compare'em
+    torch.testing.assert_close(C_expected, C_actual)
 
 problem_size_options = [(1, 128, 768)
                         , (16, 512, 1600)

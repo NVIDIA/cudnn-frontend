@@ -1456,6 +1456,36 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DXDESC Failed");
             return std::move(m_operation);
         }
+#if (CUDNN_VERSION >= 8700)
+        if (m_operation.xdesc != nullptr) {
+            status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+                                              CUDNN_ATTR_OPERATION_RESAMPLE_BWD_XDESC,
+                                              CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                              1,
+                                              &(m_operation.xdesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_operation,
+                    status,
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESAMPLE_BWD_XDESC Failed");
+                return std::move(m_operation);
+            }
+        }
+        if (m_operation.ydesc != nullptr) {
+            status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
+                                              CUDNN_ATTR_OPERATION_RESAMPLE_BWD_YDESC,
+                                              CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                              1,
+                                              &(m_operation.ydesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_operation,
+                    status,
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DXDESC Failed");
+                return std::move(m_operation);
+            }
+        }
+#endif
         status = cudnnBackendSetAttribute(m_operation.pointer->get_backend_descriptor(),
                                           CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DYDESC,
                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,

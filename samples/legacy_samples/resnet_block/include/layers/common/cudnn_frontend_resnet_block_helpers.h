@@ -391,7 +391,7 @@ struct StatsParams {
 struct PoolingParams {
     cudnn_frontend::ResampleMode_t mode        = cudnn_frontend::ResampleMode_t::AVGPOOL_INCLUDE_PADDING;
     cudnn_frontend::PaddingMode_t padding_mode = cudnn_frontend::PaddingMode_t::ZERO_PAD;
-    cudnnNanPropagation_t nanOpt               = CUDNN_NOT_PROPAGATE_NAN;
+    cudnnNanPropagation_t nanOpt               = CUDNN_PROPAGATE_NAN;
 
     int32_t nbSpatialDims              = 2;
     int64_t windowDim[CUDNN_DIM_MAX]   = {-1};

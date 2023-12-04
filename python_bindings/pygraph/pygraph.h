@@ -159,6 +159,7 @@ class PyGraph {
     matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& A,
            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& B,
            cudnn_frontend::DataType_t const& compute_data_type,
+           double const padding,
            std::string const& name);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
@@ -241,41 +242,41 @@ class PyGraph {
                           std::string const& name);
 
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 2>
-    scaled_dot_product_flash_attention(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
-                                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
-                                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
-                                       bool const is_inference,
-                                       py::object const& attn_scale,
-                                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
-                                       bool const use_alibi_mask,
-                                       bool const use_padding_mask,
-                                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
-                                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
-                                       bool const use_causal_mask,
-                                       py::object const& dropout,
-                                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
-                                       cudnn_frontend::DataType_t const& compute_data_type,
-                                       std::string const& name);
+    sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
+         bool const is_inference,
+         py::object const& attn_scale,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
+         bool const use_alibi_mask,
+         bool const use_padding_mask,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+         bool const use_causal_mask,
+         py::object const& dropout,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
+         cudnn_frontend::DataType_t const& compute_data_type,
+         std::string const& name);
 
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 3>
-    scaled_dot_product_flash_attention_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
-                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
-                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
-                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& o,
-                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO,
-                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& stats,
-                                                py::object const& attn_scale,
-                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
-                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dBias,
-                                                bool const use_alibi_mask,
-                                                bool const use_padding_mask,
-                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
-                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
-                                                bool const use_causal_mask,
-                                                py::object const& dropout,
-                                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
-                                                cudnn_frontend::DataType_t const& compute_data_type,
-                                                std::string const& name);
+    sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& o,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& stats,
+                  py::object const& attn_scale,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dBias,
+                  bool const use_alibi_mask,
+                  bool const use_padding_mask,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                  bool const use_causal_mask,
+                  py::object const& dropout,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
+                  cudnn_frontend::DataType_t const& compute_data_type,
+                  std::string const& name);
 
     void
     validate();

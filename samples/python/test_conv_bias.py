@@ -168,8 +168,53 @@ def test_leaky_relu_backward():
 
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-4, rtol=1e-4)
 
+
+def test_conv_int8():
+    N, C, H, W = 1, 64, 32, 32
+    K, R, S = 4, 3, 3
+    padding  = [1,1]
+    stride   = [1,1]
+    dilation = [1,1]
+    
+    compare_output = True
+    
+    # Reference code
+    X_gpu = torch.randint(-127, 128, (N, C, H, W), device="cuda", dtype=torch.int8).to(memory_format=torch.channels_last)
+    W_gpu = torch.randint(-127, 128, (K, C, R, S), device="cuda", dtype=torch.int8).to(memory_format=torch.channels_last)
+    
+    try:
+        Y_expected = torch.nn.functional.conv2d(X_gpu, W_gpu, padding=padding, stride=stride, dilation=dilation).to("cuda").to(torch.int32)
+    except:
+        print("Torch does not support int8 convolution. Disabling comparison of output tensor")
+        compare_output = False
+        
+    graph = cudnn.pygraph(io_data_type = cudnn.data_type.INT8, intermediate_data_type = cudnn.data_type.INT32, compute_data_type = cudnn.data_type.INT32)
+
+    X = graph.tensor_like(X_gpu)
+    W = graph.tensor_like(W_gpu)
+    
+    conv_output = graph.conv_fprop(image = X, weight = W, padding = padding, stride = stride, dilation = dilation)
+    Y = graph.identity(name = "identity", input = conv_output)
+
+    Y.set_output(True).set_data_type(cudnn.data_type.INT32)
+        
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    graph.check_support()
+    graph.build_plans()
+
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+
+    Y_actual = torch.randint(0, 127, tuple(Y.get_dim()), device="cuda", dtype=torch.int32).to(memory_format=torch.channels_last)
+    graph.execute({X: X_gpu, W: W_gpu, Y: Y_actual}, workspace)
+
+    if (compare_output):
+        torch.testing.assert_close(Y_expected, Y_actual, atol=1e-2, rtol=1e-2)
+    
 if __name__ == "__main__":
-    test_conv_relu()
-    test_conv_bias_relu()
-    test_conv3d_bias_leaky_relu()
-    test_leaky_relu_backward()
+    test_conv_int8()
+    # test_conv_relu()
+    # test_conv_bias_relu()
+    # test_conv3d_bias_leaky_relu()
+    # test_leaky_relu_backward()

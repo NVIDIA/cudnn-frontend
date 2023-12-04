@@ -25,7 +25,7 @@ target_include_directories(
 find_package(CUDAToolkit)
 
 # Find cudnn
-include(${CMAKE_SOURCE_DIR}/cmake/cuDNN.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/cuDNN.cmake)
 
 target_link_libraries(
     cudnn_frontend INTERFACE

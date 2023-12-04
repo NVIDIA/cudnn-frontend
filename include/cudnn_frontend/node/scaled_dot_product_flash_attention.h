@@ -13,9 +13,9 @@
 
 namespace cudnn_frontend::graph {
 
-class ScaledDotProductFlashAttentionNode : public INode {
-    using input_names  = Scaled_dot_product_flash_attention_attributes::input_names;
-    using output_names = Scaled_dot_product_flash_attention_attributes::output_names;
+class SDPANode : public INode {
+    using input_names  = SDPA_attributes::input_names;
+    using output_names = SDPA_attributes::output_names;
 
     std::shared_ptr<Tensor_attributes> rng_output;
     std::shared_ptr<Tensor_attributes> dropout_scale;
@@ -24,10 +24,9 @@ class ScaledDotProductFlashAttentionNode : public INode {
     std::shared_ptr<Tensor_attributes> alibi_slopes;
 
    public:
-    Scaled_dot_product_flash_attention_attributes attributes;
+    SDPA_attributes attributes;
 
-    ScaledDotProductFlashAttentionNode(Scaled_dot_product_flash_attention_attributes&& attributes_,
-                                       detail::Context const& context)
+    SDPANode(SDPA_attributes&& attributes_, detail::Context const& context)
         : INode(context), attributes(std::move(attributes_)) {}
 
     Type
@@ -38,34 +37,90 @@ class ScaledDotProductFlashAttentionNode : public INode {
     error_t
     pre_validate_node() const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating ScaledDotProductFlashAttentionNode " << attributes.name << "..." << std::endl;
+                    << "Validating SDPANode " << attributes.name << "..." << std::endl;
 
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::Q);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::K);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::V);
-
-        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::O);
-
-#define CUDNN_FE_VALIDATE_STRIDE(port, port_map)                                                                \
+        // check that Q, K, V, O tensors has been assigned
+        // check that dim and strides has been assigned and last stride is 1
+#define CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(port, port_map)                                                       \
     {                                                                                                           \
-        auto const& t = port_map.find(port);                                                                    \
+        std::shared_ptr<Tensor_attributes> tensor_ptr = port_map.at(port);                                      \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_dim().size() != 4,                                       \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
+                                       "The dim for " + std::string(#port) + " is invalid");                    \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_stride().size() != 4,                                    \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
+                                       "The stride for " + std::string(#port) + " is invalid");                 \
         RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                         \
-            t->second->get_stride().back() != 1,                                                                \
+            tensor_ptr->get_stride()[3] != 1,                                                                   \
             error_code_t::GRAPH_NOT_SUPPORTED,                                                                  \
             "The stride for the last dimension corresponding to the embedding size per head should be 1 for " + \
                 std::string(#port));                                                                            \
     }
 
-        CUDNN_FE_VALIDATE_STRIDE(input_names::Q, attributes.inputs);
-        CUDNN_FE_VALIDATE_STRIDE(input_names::K, attributes.inputs);
-        CUDNN_FE_VALIDATE_STRIDE(input_names::V, attributes.inputs);
+        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::Q);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Q, attributes.inputs);
+        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::K);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::K, attributes.inputs);
+        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::V);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::V, attributes.inputs);
+        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::O);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::O, attributes.outputs);
 
-#undef CUDNN_FE_VALIDATE_STRIDE
-
+        // validate options for is_inference and stats tensor
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.is_inference.has_value() == false,
                                        error_code_t::ATTRIBUTE_NOT_SET,
-                                       "is_infernece attribute not set");
+                                       "is_inference attribute not set");
 
+        if (attributes.is_inference.value() == false) {
+            CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::Stats);
+        }
+
+#undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
+
+        // validate backend limitations for the operation
+        int64_t h_q  = attributes.inputs.at(input_names::Q)->get_dim()[1];
+        int64_t h_k  = attributes.inputs.at(input_names::K)->get_dim()[1];
+        int64_t h_v  = attributes.inputs.at(input_names::V)->get_dim()[1];
+        int64_t d_qk = attributes.inputs.at(input_names::Q)->get_dim()[3];
+        int64_t d_v  = attributes.inputs.at(input_names::V)->get_dim()[3];
+        RETURN_CUDNN_FRONTEND_ERROR_IF((h_q % h_k != 0) || (h_q % h_v != 0),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For group-query attention, number of heads for key and query must be a factor "
+                                       "of number of heads for query");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Num hidden_dim shoud be less than 128 and hidden_dim should be multiple of 8");
+
+        // validate options for attn_scale
+        auto const& attn_scale    = attributes.inputs.find(input_names::Attn_scale);
+        bool const has_attn_scale = (attn_scale != attributes.inputs.end()) && (attn_scale->second != nullptr);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(has_attn_scale && attributes.attn_scale_value.has_value(),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "attn_scale with tensor and value cannot be set at the same time.");
+
+        // validate options for bias mask
+        auto bias_mask = attributes.inputs.find(input_names::Bias);
+        if (bias_mask != attributes.inputs.end() && bias_mask->second != nullptr) {
+            auto bias_mask_dtype = bias_mask->second->get_data_type();
+            RETURN_CUDNN_FRONTEND_ERROR_IF((bias_mask_dtype == DataType_t::BOOLEAN),
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Bias mask data type cannot be boolean");
+        }
+
+        // validate options for padding mask
+        auto const& seq_len_q     = attributes.inputs.find(input_names::SEQ_LEN_Q);
+        bool const has_seq_len_q  = (seq_len_q != attributes.inputs.end()) && (seq_len_q->second != nullptr);
+        auto const& seq_len_kv    = attributes.inputs.find(input_names::SEQ_LEN_KV);
+        bool const has_seq_len_kv = (seq_len_kv != attributes.inputs.end()) && (seq_len_kv->second != nullptr);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.padding_mask && (!has_seq_len_q || !has_seq_len_kv),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Padding mask requires seq_len_q and seq_len_kv to be set.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF((!attributes.padding_mask) && (has_seq_len_q || has_seq_len_kv),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "seq_len_q and seq_len_kv needs to be set only if padding mask is enabled.");
+
+        // validate options for dropout mask
         auto const& dropout_mask    = attributes.inputs.find(input_names::Dropout_mask);
         bool const has_dropout_mask = (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.dropout_probability.has_value() && has_dropout_mask,
@@ -78,44 +133,10 @@ class ScaledDotProductFlashAttentionNode : public INode {
             error_code_t::ATTRIBUTE_NOT_SET,
             "Dropout probability cannot be 1 as corresponding scale wont be well formed.");
 
+        // validate that datatype is set for the graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_intermediate_data_type() == DataType_t::NOT_SET,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Intermediate tensor data type needs to be set as internal tensors require it.");
-
-        auto const& seq_len_q    = attributes.inputs.find(input_names::SEQ_LEN_Q);
-        bool const has_seq_len_q = (seq_len_q != attributes.inputs.end()) && (seq_len_q->second != nullptr);
-
-        auto const& seq_len_kv    = attributes.inputs.find(input_names::SEQ_LEN_KV);
-        bool const has_seq_len_kv = (seq_len_kv != attributes.inputs.end()) && (seq_len_kv->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.padding_mask && (!has_seq_len_q || !has_seq_len_kv),
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "Padding mask requires seq_len_q and seq_len_kv to be set.");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF((!attributes.padding_mask) && (has_seq_len_q || has_seq_len_kv),
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "seq_len_q and seq_len_kv needs to be set only if padding mask is enabled.");
-
-        auto const& attn_scale    = attributes.inputs.find(input_names::Attn_scale);
-        bool const has_attn_scale = (attn_scale != attributes.inputs.end()) && (attn_scale->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(has_attn_scale && attributes.attn_scale_value.has_value(),
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "attn_scale with tensor and value cannot be set at the same time.");
-
-        auto it         = attributes.inputs.find(input_names::Q);
-        auto q_dim      = it->second->get_dim();
-        auto hidden_dim = q_dim[3];
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF((((hidden_dim <= 128) && (hidden_dim % 8 == 0)) == false),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Num hidden_dim shoud be less than 128 and hidden_dim should be multiple of 8");
-
-        auto attn_mask = attributes.inputs.find(input_names::Bias);
-        if (attn_mask != attributes.inputs.end() && attn_mask->second != nullptr) {
-            auto attn_mask_dtype = attn_mask->second->get_data_type();
-            RETURN_CUDNN_FRONTEND_ERROR_IF((attn_mask_dtype == DataType_t::BOOLEAN),
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Attn mask data type cannot be boolean");
-        }
 
         CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
         return {error_code_t::OK, ""};
@@ -132,24 +153,22 @@ class ScaledDotProductFlashAttentionNode : public INode {
         // - dropout scale in pre 8.9.3
         attributes.fill_from_context(context);
 
-        // Gather dims to fill properties of virtual tensors
+        // Gather dim to fill properties of virtual tensors
         auto const& q_dim = attributes.inputs[input_names::Q]->get_dim();
         auto b            = q_dim[0];
         auto h            = q_dim[1];
         auto s_q          = q_dim[2];
         auto const& k_dim = attributes.inputs[input_names::K]->get_dim();
         auto s_kv         = k_dim[2];
-        auto const& v_dim = attributes.inputs[input_names::V]->get_dim();
-        auto d_v          = v_dim[3];
 
         // cuDNN frontend API attention requires Q, K, V where
-        // Q = {b, h, s_q, d_qk}
-        // K = {b, h, s_kv, d_qk}
-        // V = {b, h, s_kv, d_v}
+        // Q = {b, h_q, s_q, d_qk}
+        // K = {b, h_k, s_kv, d_qk}
+        // V = {b, h_v, s_kv, d_v}
         // but cuDNN backend API attention requires Q, KT, V
-        // Q = {b, h, s_q, d_qk}
-        // KT = {b, h, d_qk, s_kv}
-        // V = {b, h, s_kv, d_v}
+        // Q = {b, h_q, s_q, d_qk}
+        // KT = {b, h_k, d_qk, s_kv}
+        // V = {b, h_v, s_kv, d_v}
         // So the code below maps the K->KT
         std::vector<int64_t> temp_vec;
 
@@ -167,9 +186,14 @@ class ScaledDotProductFlashAttentionNode : public INode {
                                    .set_name("bmm1")
                                    .set_m_override(attributes.inputs[input_names::SEQ_LEN_Q])
                                    .set_n_override(attributes.inputs[input_names::SEQ_LEN_KV]);
+
+        if (attributes.padding_mask) {
+            bmm1_attributes.set_padding(0.0);
+        }
+
         auto const& bmm1_output =
             matmul(attributes.inputs[input_names::Q], attributes.inputs[input_names::K], bmm1_attributes);
-        // Setting dims and strides as pointwise op wont have knowledge of how to do it for mha.
+        // Setting dim and strides as pointwise op wont have knowledge of how to do it for mha.
         bmm1_output->set_dim({b, h, s_q, s_kv}).set_stride({h * s_q * s_kv, s_q * s_kv, s_kv, 1});
         last_output = bmm1_output;
 
@@ -372,7 +396,7 @@ class ScaledDotProductFlashAttentionNode : public INode {
                                      .set_distribution(RngDistribution_t::BERNOULLI)
                                      .set_bernoulli_probability(1.0 - attributes.dropout_probability.value()));
                 rng_output
-                    // Hard coding dims and strides as rng output can no inputs to infer it from.
+                    // Hard coding dim and strides as rng output can no inputs to infer it from.
                     ->set_dim({b, h, s_q, s_kv})
                     .set_stride({h * s_q * s_kv, s_q * s_kv, s_kv, 1});
             }
@@ -411,16 +435,6 @@ class ScaledDotProductFlashAttentionNode : public INode {
         // Special non-functional-style call. Needed because output already created and provided to user.
         matmul(last_output, V, bmm2_attributes, O);
 
-        // Set dims if user did not
-        if (attributes.outputs[output_names::O]->get_dim().empty()) {
-            attributes.outputs[output_names::O]->set_dim({b, h, s_q, d_v});
-        }
-        if (attributes.outputs[output_names::O]->get_stride().empty()) {
-            auto const O_dim = attributes.outputs[output_names::O]->get_dim();
-            attributes.outputs[output_names::O]->set_stride(
-                {O_dim[3] * O_dim[2] * O_dim[1], O_dim[3] * O_dim[2], O_dim[3], 1});
-        }
-
         return {error_code_t::OK, ""};
     }
 
@@ -449,9 +463,10 @@ class ScaledDotProductFlashAttentionNode : public INode {
 
     virtual int64_t
     get_fe_workspace_size_node() const override final {
-        auto const& q   = attributes.inputs.find(input_names::Q);
-        int64_t const h = q->second->get_dim()[1];
-        return h * sizeof(float);
+        auto const& q             = attributes.inputs.find(input_names::Q);
+        int64_t const h           = q->second->get_dim()[1];
+        int64_t alibi_slopes_size = h * sizeof(float);
+        return (alibi_slopes_size + 15) & ~15;
     }
 
     virtual error_t
@@ -483,11 +498,12 @@ class ScaledDotProductFlashAttentionNode : public INode {
             CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(Q, input_names::Q);
             int64_t const h            = Q->second->get_dim()[1];
             auto h_alibi_slopes_vector = detail::get_abili_slope(h);
+            int64_t alibi_slopes_size  = h * sizeof(float);
 
             cudaStream_t stream;
             CHECK_CUDNN_ERROR(cudnnGetStream(handle, &stream));
             CHECK_CUDA_ERROR(cudaMemcpyAsync(
-                node_workspace, h_alibi_slopes_vector.data(), h * sizeof(float), cudaMemcpyHostToDevice, stream));
+                node_workspace, h_alibi_slopes_vector.data(), alibi_slopes_size, cudaMemcpyHostToDevice, stream));
             tensor_to_pass_by_value.emplace(alibi_slopes, node_workspace);
         }
 
@@ -500,7 +516,10 @@ class ScaledDotProductFlashAttentionNode : public INode {
     }
 };
 
-class ScaledDotProductFlashAttentionBackwardNode : public INode {
+class SDPABackwardNode : public INode {
+    using input_names  = SDPA_backward_attributes::input_names;
+    using output_names = SDPA_backward_attributes::output_names;
+
    private:
     // non-virtual node cpu tensors
     std::shared_ptr<Tensor_attributes> one_tensor;
@@ -516,10 +535,9 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
     int64_t alibi_slopes_size = 0;
 
    public:
-    Scaled_dot_product_flash_attention_backward_attributes attributes;
+    SDPA_backward_attributes attributes;
 
-    ScaledDotProductFlashAttentionBackwardNode(Scaled_dot_product_flash_attention_backward_attributes&& attributes_,
-                                               detail::Context const& context)
+    SDPABackwardNode(SDPA_backward_attributes&& attributes_, detail::Context const& context)
         : INode(context), attributes(std::move(attributes_)) {}
 
     Type
@@ -530,105 +548,107 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
     error_t
     pre_validate_node() const override final {
         getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating ScaledDotProductFlashAttentionBackwardNode" << attributes.name << "..." << std::endl;
+                    << "Validating SDPABackwardNode" << attributes.name << "..." << std::endl;
 
-        using input_names  = Scaled_dot_product_flash_attention_backward_attributes::input_names;
-        using output_names = Scaled_dot_product_flash_attention_backward_attributes::output_names;
+        // check that Q, K, V, O, stats, dO, dQ, dK, dV tensors has been assigned
+        // check that dim and strides has been assigned and last stride is 1
+#define CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(port, port_map)                                                       \
+    {                                                                                                           \
+        std::shared_ptr<Tensor_attributes> tensor_ptr = port_map.at(port);                                      \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_dim().size() != 4,                                       \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
+                                       "The dim for " + std::string(#port) + " is invalid");                    \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_stride().size() != 4,                                    \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
+                                       "The stride for " + std::string(#port) + " is invalid");                 \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                         \
+            tensor_ptr->get_stride()[3] != 1,                                                                   \
+            error_code_t::GRAPH_NOT_SUPPORTED,                                                                  \
+            "The stride for the last dimension corresponding to the embedding size per head should be 1 for " + \
+                std::string(#port));                                                                            \
+    }
 
-        auto const& q    = attributes.inputs.find(input_names::Q);
-        bool const has_q = (q != attributes.inputs.end()) && (q->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_q, error_code_t::ATTRIBUTE_NOT_SET, "Tensor input q not set");
-        auto const& k    = attributes.inputs.find(input_names::K);
-        bool const has_k = (k != attributes.inputs.end()) && (k->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_k, error_code_t::ATTRIBUTE_NOT_SET, "Tensor input k not set");
-        auto const& v    = attributes.inputs.find(input_names::V);
-        bool const has_v = (v != attributes.inputs.end()) && (v->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_v, error_code_t::ATTRIBUTE_NOT_SET, "Tensor input v not set");
-        auto const& o    = attributes.inputs.find(input_names::O);
-        bool const has_o = (o != attributes.inputs.end()) && (o->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_o, error_code_t::ATTRIBUTE_NOT_SET, "Tensor input o not set");
-        auto const& dO    = attributes.inputs.find(input_names::dO);
-        bool const has_dO = (dO != attributes.inputs.end()) && (dO->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_dO, error_code_t::ATTRIBUTE_NOT_SET, "Tensor input dO not set");
-        auto const& stats    = attributes.inputs.find(input_names::Stats);
-        bool const has_stats = (stats != attributes.inputs.end()) && (stats->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_stats, error_code_t::ATTRIBUTE_NOT_SET, "Tensor input stats not set");
-        auto const& dQ    = attributes.outputs.find(output_names::dQ);
-        bool const has_dQ = (dQ != attributes.outputs.end()) && (dQ->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_dQ, error_code_t::ATTRIBUTE_NOT_SET, "Tensor output dQ not set");
-        auto const& dK    = attributes.outputs.find(output_names::dK);
-        bool const has_dK = (dK != attributes.outputs.end()) && (dK->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_dK, error_code_t::ATTRIBUTE_NOT_SET, "Tensor output dK not set");
-        auto const& dV    = attributes.outputs.find(output_names::dV);
-        bool const has_dV = (dV != attributes.outputs.end()) && (dV->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_dV, error_code_t::ATTRIBUTE_NOT_SET, "Tensor output dV not set");
+        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::Q);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Q, attributes.inputs);
+        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::K);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::K, attributes.inputs);
+        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::V);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::V, attributes.inputs);
+        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::O);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::O, attributes.inputs);
+        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::Stats);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Stats, attributes.inputs);
+        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::dO);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::dO, attributes.inputs);
+        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::dQ);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dQ, attributes.outputs);
+        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::dK);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dK, attributes.outputs);
+        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::dV);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dV, attributes.outputs);
 
-        bool last_dim_is_one = q->second->get_stride().back() == 1;
-        last_dim_is_one &= k->second->get_stride().back() == 1;
-        last_dim_is_one &= v->second->get_stride().back() == 1;
-        last_dim_is_one &= o->second->get_stride().back() == 1;
-        last_dim_is_one &= *(stats->second->get_stride().end() - 1) == 1;
-        last_dim_is_one &= *(stats->second->get_stride().end() - 2) == 1;
-        last_dim_is_one &= dQ->second->get_stride().back() == 1;
-        last_dim_is_one &= dK->second->get_stride().back() == 1;
-        last_dim_is_one &= dV->second->get_stride().back() == 1;
-        last_dim_is_one &= dO->second->get_stride().back() == 1;
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !last_dim_is_one,
-            error_code_t::GRAPH_NOT_SUPPORTED,
-            "The stride for the last dimension corresponding to the hidden size per head should be 1");
+#undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
 
-        auto const& dropout_mask = attributes.inputs.find(input_names::Dropout_mask);
-        auto const& seq_len_q    = attributes.inputs.find(input_names::SEQ_LEN_Q);
-        auto const& seq_len_kv   = attributes.inputs.find(input_names::SEQ_LEN_KV);
-        auto const& attn_scale   = attributes.inputs.find(input_names::Attn_scale);
+        // validate backend limitations for the operation
+        int64_t h_q  = attributes.inputs.at(input_names::Q)->get_dim()[1];
+        int64_t h_k  = attributes.inputs.at(input_names::K)->get_dim()[1];
+        int64_t h_v  = attributes.inputs.at(input_names::V)->get_dim()[1];
+        int64_t d_qk = attributes.inputs.at(input_names::Q)->get_dim()[3];
+        int64_t d_v  = attributes.inputs.at(input_names::V)->get_dim()[3];
+        RETURN_CUDNN_FRONTEND_ERROR_IF((h_q % h_k != 0) || (h_q % h_v != 0),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For group-query attention, number of heads for key and query must be a factor "
+                                       "of number of heads for query");
 
+        RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Num hidden_dim shoud be less than 128 and hidden_dim should be multiple of 8");
+
+        // validate options for attn_scale
+        auto const& attn_scale    = attributes.inputs.find(input_names::Attn_scale);
+        bool const has_attn_scale = (attn_scale != attributes.inputs.end()) && (attn_scale->second != nullptr);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(has_attn_scale && attributes.attn_scale_value.has_value(),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "attn_scale with tensor and value cannot be set at the same time.");
+
+        // validate options for bias mask
+        auto bias_mask = attributes.inputs.find(input_names::Bias);
+        if (bias_mask != attributes.inputs.end() && bias_mask->second != nullptr) {
+            auto bias_mask_dtype = bias_mask->second->get_data_type();
+            RETURN_CUDNN_FRONTEND_ERROR_IF((bias_mask_dtype == DataType_t::BOOLEAN),
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Bias mask data type cannot be boolean");
+        }
+
+        // validate options for padding mask
+        auto const& seq_len_q     = attributes.inputs.find(input_names::SEQ_LEN_Q);
+        bool const has_seq_len_q  = (seq_len_q != attributes.inputs.end()) && (seq_len_q->second != nullptr);
+        auto const& seq_len_kv    = attributes.inputs.find(input_names::SEQ_LEN_KV);
+        bool const has_seq_len_kv = (seq_len_kv != attributes.inputs.end()) && (seq_len_kv->second != nullptr);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.padding_mask && (!has_seq_len_q || !has_seq_len_kv),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Padding mask requires seq_len_q and seq_len_kv to be set.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF((!attributes.padding_mask) && (has_seq_len_q || has_seq_len_kv),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "seq_len_q and seq_len_kv needs to be set only if padding mask is enabled.");
+
+        // validate options for dropout mask
+        auto const& dropout_mask    = attributes.inputs.find(input_names::Dropout_mask);
         bool const has_dropout_mask = (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            attributes.dropout_probability.has_value() && has_dropout_mask,
-            error_code_t::ATTRIBUTE_NOT_SET,
-            "Using both, custom dropout mask and internal-mask generation using dropout probability, is ill-formed.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.dropout_probability.has_value() && has_dropout_mask,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Using both, custom dropout mask and internal-mask generation using dropout "
+                                       "probability, is ill-formed.");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             attributes.dropout_probability.has_value() && attributes.dropout_probability.value() == 1.0,
             error_code_t::ATTRIBUTE_NOT_SET,
             "Dropout probability cannot be 1 as corresponding scale wont be well formed.");
 
-        bool const has_seq_len_q  = (seq_len_q != attributes.inputs.end()) && (seq_len_q->second != nullptr);
-        bool const has_seq_len_kv = (seq_len_kv != attributes.inputs.end()) && (seq_len_kv->second != nullptr);
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.padding_mask && (!has_seq_len_q || !has_seq_len_kv),
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "Padding mask requires seq_len_q and seq_len_kv to be set.");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF((!attributes.padding_mask) && (has_seq_len_q || has_seq_len_kv),
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "seq_len_q and seq_len_kv needs to be set only if padding mask is enabled.");
-
-        bool const has_attn_scale = (attn_scale != attributes.inputs.end()) && (attn_scale->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(has_attn_scale && attributes.attn_scale_value.has_value(),
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "attn_scale with tensor and value cannot be set at the same time.");
-
+        // validate that datatype is set for the graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_intermediate_data_type() == DataType_t::NOT_SET,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Intermediate tensor data type needs to be set as internal tensors require it.");
-
-        auto it         = attributes.inputs.find(input_names::Q);
-        auto q_dim      = it->second->get_dim();
-        auto hidden_dim = q_dim[3];
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF((((hidden_dim <= 128) && (hidden_dim % 8 == 0)) == false),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Num hidden_dim shoud be less than 128 and hidden_dim should be multiple of 8");
-
-        auto attn_mask = attributes.inputs.find(input_names::Bias);
-        if (attn_mask != attributes.inputs.end() && attn_mask->second != nullptr) {
-            auto attn_mask_dtype = attn_mask->second->get_data_type();
-            RETURN_CUDNN_FRONTEND_ERROR_IF((attn_mask_dtype == DataType_t::BOOLEAN),
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Attn mask data type cannot be boolean");
-        }
 
         CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
         return {error_code_t::OK, ""};
@@ -645,31 +665,32 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
 
     error_t
     expand_and_infer_properties() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for ScaledDotProductFlashAttentionBackwardNode "
-                    << attributes.name << "..." << std::endl;
-
-        using input_names  = Scaled_dot_product_flash_attention_backward_attributes::input_names;
-        using output_names = Scaled_dot_product_flash_attention_backward_attributes::output_names;
+        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for SDPABackwardNode " << attributes.name
+                    << "..." << std::endl;
 
         attributes.fill_from_context(context);
 
-        // Gather dims to fill properties of virtual tensors
+        // Gather dim to fill properties of virtual tensors
         auto const& q_dim = attributes.inputs[input_names::Q]->get_dim();
         auto b            = q_dim[0];
-        auto h            = q_dim[1];
+        auto h_q          = q_dim[1];
         auto s_q          = q_dim[2];
-        auto d            = q_dim[3];
+        auto d_qk         = q_dim[3];
         auto const& k_dim = attributes.inputs[input_names::K]->get_dim();
+        auto h_k          = k_dim[1];
         auto s_kv         = k_dim[2];
+        auto const& v_dim = attributes.inputs[input_names::V]->get_dim();
+        auto h_v          = v_dim[1];
+        auto d_v          = v_dim[3];
 
         // cuDNN frontend API attention requires Q, K, V where
-        // Q = {b, h, s_q, d}
-        // K = {b, h, s_kv, d}
-        // V = {b, h, s_kv, d}
+        // Q = {b, h_q, s_q, d_qk}
+        // K = {b, h_k, s_kv, d_qk}
+        // V = {b, h_v, s_kv, d_v}
         // but cuDNN backend API attention requires Q, KT, VT
-        // Q = {b, h, s_q, d}
-        // KT = {b, h, d, s_kv}
-        // VT = {b, h, d, s_kv}
+        // Q = {b, h_q, s_q, d_qk}
+        // KT = {b, h_k, d_qk, s_kv}
+        // VT = {b, h_v, d_v, s_kv}
         // So the code below maps the K->KT and V->VT
         std::vector<int64_t> temp_vec;
 
@@ -710,9 +731,9 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
         if (attributes.alibi_mask) {
             alibi_slopes = std::make_shared<Tensor_attributes>();
             alibi_slopes->set_is_virtual(false);
-            alibi_slopes->set_dim({1, h, 1, 1}).set_stride({h, h, 1, 1});
+            alibi_slopes->set_dim({1, h_q, 1, 1}).set_stride({h_q, h_q, 1, 1});
             alibi_slopes->set_data_type(DataType_t::FLOAT);
-            alibi_slopes_size = h * sizeof(float);
+            alibi_slopes_size = h_q * sizeof(float);
         }
 
         // negative_inf_padding is passed by the node
@@ -781,7 +802,7 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
 
             int64_t workspace_s_q               = ((s_q + 64 - 1) / 64) * 64;
             int64_t workspace_s_kv              = ((s_kv + 64 - 1) / 64) * 64;
-            int64_t required_dp_workspace_bytes = b * h * workspace_s_q * workspace_s_kv * 2;
+            int64_t required_dp_workspace_bytes = b * h_q * workspace_s_q * workspace_s_kv * 2;
 
             if (max_dp_workspace_bytes == -1) {
                 use_workspace_opt = true;
@@ -792,13 +813,19 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
             }
         }
 
+        // WAR force dP workspace implementation if dBias is enabled
+        // since dBias only works with workspace implementation
+        if (attributes.outputs[output_names::dBias]) {
+            use_workspace_opt = true;
+        }
+
         // non-virtual dQ_accum is how the backend API signals workspace optimization
         if (!use_workspace_opt) {
             dQ_accum = std::make_shared<Tensor_attributes>();
             dQ_accum->set_is_virtual(false);
-            dQ_accum->set_dim({b, h, s_q, d}).set_stride({h * s_q * d, s_q * d, d, 1});
+            dQ_accum->set_dim({b, h_q, s_q, d_qk}).set_stride({h_q * s_q * d_qk, s_q * d_qk, d_qk, 1});
             dQ_accum->set_data_type(DataType_t::FLOAT).set_reordering_type(TensorReordering_t::F16x16);
-            dQ_accum_size = b * h * s_q * d * sizeof(float);
+            dQ_accum_size = b * h_q * s_q * d_qk * sizeof(float);
         }
 
         // --------------RNG node--------------------
@@ -820,7 +847,7 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
                                      .set_name("rng")
                                      .set_distribution(RngDistribution_t::BERNOULLI)
                                      .set_bernoulli_probability(1.0f - attributes.dropout_probability.value()));
-                rng_output->set_dim({b, h, s_q, s_kv}).set_stride({h * s_q * s_kv, s_q * s_kv, s_kv, 1});
+                rng_output->set_dim({b, h_q, s_q, s_kv}).set_stride({h_q * s_q * s_kv, s_q * s_kv, s_kv, 1});
             }
         } else if (is_dropout_mask) {
             rng_output = attributes.inputs[input_names::Dropout_mask];
@@ -832,12 +859,12 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
         last_output = pointwise(attributes.inputs[input_names::dO],
                                 attributes.inputs[input_names::O],
                                 Pointwise_attributes().set_name("mul_dO_O").set_mode(PointwiseMode_t::MUL));
-        last_output->set_dim({b, h, s_q, d}).set_stride({h * s_q * d, s_q * d, h * d, 1});
+        last_output->set_dim({b, h_q, s_q, d_v}).set_stride({h_q * s_q * d_v, s_q * d_v, h_q * d_v, 1});
 
-        // last_output = reduce(last_output, "b h sq d -> b h sq 1")
+        // last_output = reduce(last_output, "b hq sq dv -> b hq sq 1")
         last_output =
             reduction(last_output, Reduction_attributes().set_name("reduce_dO_o").set_mode(ReductionMode_t::ADD));
-        last_output->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+        last_output->set_dim({b, h_q, s_q, 1}).set_stride({h_q * s_q, s_q, 1, 1});
 
         // softmax_sum = last_output * dropout_scale
         last_output = pointwise(last_output,
@@ -850,14 +877,14 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
 
         // --------------"Q @ KT => exp_softmax => dV" chain--------------------
 
-        // s = einsum(q, k, "b h sq d, b h skv d -> b h sq skv")
+        // s = einsum(q, k, "b hq sq dqk, b (hk g) skv dqk -> b hq sq skv", g=hq//hk)
         last_output = matmul(attributes.inputs[input_names::Q],
                              attributes.inputs[input_names::K],
                              Matmul_attributes()
                                  .set_name("matmul_Q_KT")
                                  .set_m_override(attributes.inputs[input_names::SEQ_LEN_Q])
                                  .set_n_override(attributes.inputs[input_names::SEQ_LEN_KV]));
-        last_output->set_dim({b, h, s_q, s_kv}).set_stride({h * s_q * s_kv, s_q * s_kv, s_kv, 1});
+        last_output->set_dim({b, h_q, s_q, s_kv}).set_stride({h_q * s_q * s_kv, s_q * s_kv, s_kv, 1});
 
         // last_output = last_output * attention_scale
         if (attributes.inputs[input_names::Attn_scale]) {
@@ -1016,30 +1043,47 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
                           Pointwise_attributes().set_name("mul_p_dropout_scale").set_mode(PointwiseMode_t::MUL));
         }
 
-        // dV = einsum(p, dO, "b h sq skv", "b h sq d -> b h skv d")
+        // dV = einsum(p, dO, "b hq sq skv", "b hq sq dv -> b hq skv dv")
+        // if GQA, then dV = reduce(dV, "b (hv g) skv dv -> b hv skv dv", g=hq//hv)
         // as reshape + matmul
         last_output = reshape(last_output, Reshape_attributes().set_name("reshape_p"));
-        last_output->set_dim({b, h, s_kv, s_q}).set_stride({h * s_q * s_kv, s_q * s_kv, 1, s_kv});
+        last_output->set_dim({b, h_q, s_kv, s_q}).set_stride({h_q * s_q * s_kv, s_q * s_kv, 1, s_kv});
         last_output->set_data_type(context.get_io_data_type());
 
-        matmul(last_output,
-               attributes.inputs[input_names::dO],
-               Matmul_attributes()
-                   .set_name("matmul_pT_dO")
-                   .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
-                   .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]),
-               attributes.outputs[output_names::dV]);
+        if (h_q == h_v) {
+            // for MHA
+            matmul(last_output,
+                   attributes.inputs[input_names::dO],
+                   Matmul_attributes()
+                       .set_name("matmul_pT_dO")
+                       .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
+                       .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]),
+                   attributes.outputs[output_names::dV]);
+        } else {
+            // for GQA and MQA
+            last_output = matmul(last_output,
+                                 attributes.inputs[input_names::dO],
+                                 Matmul_attributes()
+                                     .set_name("matmul_pT_dO")
+                                     .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
+                                     .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]));
+            last_output->set_dim({b, h_q, s_kv, d_v}).set_stride({h_q * s_kv * d_v, s_kv * d_v, d_v, 1});
+            last_output->set_data_type(context.get_io_data_type());
+            reduction(last_output,
+                      Reduction_attributes().set_name("red_dV_head").set_mode(ReductionMode_t::ADD),
+                      attributes.outputs[output_names::dV]);
+        }
 
         // --------------"dO @ VT => dS_output => dK" chain--------------------
 
-        // dP = einsum(dO, v, "b h sq d, b h skv d -> b h sq skv")
+        // dP = einsum(dO, v, "b hq sq dv, b (hv g) skv dv -> b hq sq skv", g=hq//hv)
         last_output = matmul(attributes.inputs[input_names::dO],
                              attributes.inputs[input_names::V],
                              Matmul_attributes()
                                  .set_name("matmul_dO_VT")
                                  .set_m_override(attributes.inputs[input_names::SEQ_LEN_Q])
                                  .set_k_override(attributes.inputs[input_names::SEQ_LEN_KV]));
-        last_output->set_dim({b, h, s_q, s_kv}).set_stride({h * s_q * s_kv, s_q * s_kv, s_kv, 1});
+        last_output->set_dim({b, h_q, s_q, s_kv}).set_stride({h_q * s_q * s_kv, s_q * s_kv, s_kv, 1});
 
         // last_output = last_output(dP) * mask
         last_output = pointwise(last_output,
@@ -1079,26 +1123,43 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
 
         dS_output = last_output;
 
-        // dK = einsum(dS, Q, "b h sq skv", "b h sq d -> b h skv d")
+        // dK = einsum(dS, Q, "b hq sq skv", "b hq sq dqk -> b hq skv dqk")
+        // if GQA, then dK = reduce(dK, "b (hk g) skv dqk -> b hk skv dqk", hq//hk)
         // as reshape + matmul
         last_output = reshape(last_output, Reshape_attributes().set_name("reshape_dS"));
-        last_output->set_dim({b, h, s_kv, s_q}).set_stride({h * s_q * s_kv, s_q * s_kv, 1, s_kv});
+        last_output->set_dim({b, h_q, s_kv, s_q}).set_stride({h_q * s_q * s_kv, s_q * s_kv, 1, s_kv});
         last_output->set_data_type(context.get_io_data_type());
 
-        matmul(last_output,
-               attributes.inputs[input_names::Q],
-               Matmul_attributes()
-                   .set_name("matmul_dST_Q")
-                   .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
-                   .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]),
-               attributes.outputs[output_names::dK]);
+        if (h_q == h_k) {
+            // for MHA
+            matmul(last_output,
+                   attributes.inputs[input_names::Q],
+                   Matmul_attributes()
+                       .set_name("matmul_dST_Q")
+                       .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
+                       .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]),
+                   attributes.outputs[output_names::dK]);
+        } else {
+            // for GQA and MQA
+            last_output = matmul(last_output,
+                                 attributes.inputs[input_names::Q],
+                                 Matmul_attributes()
+                                     .set_name("matmul_dST_Q")
+                                     .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
+                                     .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]));
+            last_output->set_dim({b, h_q, s_kv, d_qk}).set_stride({h_q * s_kv * d_qk, s_kv * d_qk, d_qk, 1});
+            last_output->set_data_type(context.get_io_data_type());
+            reduction(last_output,
+                      Reduction_attributes().set_name("red_dK_head").set_mode(ReductionMode_t::ADD),
+                      attributes.outputs[output_names::dK]);
+        }
 
         // --------------"dp_scaled @ K => dQ" chain--------------------
 
         auto const& kt_dim    = attributes.inputs[input_names::K]->get_dim();
         auto const& kt_stride = attributes.inputs[input_names::K]->get_stride();
 
-        // dQ = einsum(dS, K, "b h sq skv, b h skv d -> b h sq d")
+        // dQ = einsum(dS, K, "b hq sq skv, b (hk g) skv dqk -> b hq sq dqk", g=hq//hk)
         // as reshape + matmul
         last_output = reshape(attributes.inputs[input_names::K], Reshape_attributes().set_name("reshape_k"));
         last_output->set_dim({kt_dim[0], kt_dim[1], kt_dim[3], kt_dim[2]})
@@ -1124,9 +1185,9 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
         // non-virtual softmax_sum is passed by the node
         if (cudnnGetVersion() < 8905) {
             softmax_sum->set_is_virtual(false);
-            softmax_sum->set_dim({b, h, s_q, 1});
+            softmax_sum->set_dim({b, h_q, s_q, 1});
             softmax_sum->set_data_type(DataType_t::FLOAT);
-            softmax_sum_size = b * h * s_q * sizeof(float);
+            softmax_sum_size = b * h_q * s_q * sizeof(float);
         }
 
         return {error_code_t::OK, ""};
@@ -1135,7 +1196,9 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
     virtual int64_t
     get_fe_workspace_size_node() const override final {
         // set in infer_properties_node()
-        return alibi_slopes_size + dQ_accum_size + softmax_sum_size;
+        // align alibi slopes memory to 16 bytes
+        int64_t alibi_slopes_size_padded = (alibi_slopes_size + 15) & ~15;
+        return alibi_slopes_size_padded + dQ_accum_size + softmax_sum_size;
     }
 
     error_t
@@ -1144,7 +1207,7 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
         std::unordered_map<std::shared_ptr<Tensor_attributes>, void*> const&,
         std::unordered_map<std::shared_ptr<Tensor_attributes>, pass_by_values_t>& tensor_to_pass_by_value,
         void* node_workspace) const override final {
-        using input_names = Scaled_dot_product_flash_attention_backward_attributes::input_names;
+        using input_names = SDPA_backward_attributes::input_names;
 
         if (one_tensor) {
             tensor_to_pass_by_value.emplace(one_tensor, 1.0f);
@@ -1157,15 +1220,16 @@ class ScaledDotProductFlashAttentionBackwardNode : public INode {
 
         if (attributes.alibi_mask) {
             CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(Q, input_names::Q);
-            int64_t const h       = Q->second->get_dim()[1];
-            auto alibi_slopes_vec = detail::get_abili_slope(h);
+            int64_t const h_q                = Q->second->get_dim()[1];
+            auto alibi_slopes_vec            = detail::get_abili_slope(h_q);
+            int64_t alibi_slopes_size_padded = (alibi_slopes_size + 15) & ~15;
 
             cudaStream_t stream;
             CHECK_CUDNN_ERROR(cudnnGetStream(handle, &stream));
             CHECK_CUDA_ERROR(cudaMemcpyAsync(
-                node_workspace, alibi_slopes_vec.data(), h * sizeof(float), cudaMemcpyHostToDevice, stream));
+                node_workspace, alibi_slopes_vec.data(), alibi_slopes_size, cudaMemcpyHostToDevice, stream));
             tensor_to_pass_by_value.emplace(alibi_slopes, node_workspace);
-            node_workspace = static_cast<char*>(node_workspace) + alibi_slopes_size;
+            node_workspace = static_cast<char*>(node_workspace) + alibi_slopes_size_padded;
         }
 
         if (attributes.padding_mask) {

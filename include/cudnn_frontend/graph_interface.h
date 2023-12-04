@@ -154,19 +154,35 @@ class Graph : public INode {
                                                                        std::shared_ptr<Tensor_attributes>,
                                                                        Rmsnorm_backward_attributes);
 
-    std::array<std::shared_ptr<Tensor_attributes>, 2> scaled_dot_product_flash_attention(
-        std::shared_ptr<Tensor_attributes>,
-        std::shared_ptr<Tensor_attributes>,
-        std::shared_ptr<Tensor_attributes>,
-        Scaled_dot_product_flash_attention_attributes);
-    std::array<std::shared_ptr<Tensor_attributes>, 3> scaled_dot_product_flash_attention_backward(
-        std::shared_ptr<Tensor_attributes>,
-        std::shared_ptr<Tensor_attributes>,
-        std::shared_ptr<Tensor_attributes>,
-        std::shared_ptr<Tensor_attributes>,
-        std::shared_ptr<Tensor_attributes>,
-        std::shared_ptr<Tensor_attributes>,
-        Scaled_dot_product_flash_attention_backward_attributes);
+    std::array<std::shared_ptr<Tensor_attributes>, 2> sdpa(std::shared_ptr<Tensor_attributes>,
+                                                           std::shared_ptr<Tensor_attributes>,
+                                                           std::shared_ptr<Tensor_attributes>,
+                                                           SDPA_attributes);
+    std::array<std::shared_ptr<Tensor_attributes>, 3> sdpa_backward(std::shared_ptr<Tensor_attributes>,
+                                                                    std::shared_ptr<Tensor_attributes>,
+                                                                    std::shared_ptr<Tensor_attributes>,
+                                                                    std::shared_ptr<Tensor_attributes>,
+                                                                    std::shared_ptr<Tensor_attributes>,
+                                                                    std::shared_ptr<Tensor_attributes>,
+                                                                    SDPA_backward_attributes);
+
+    [[deprecated]] std::array<std::shared_ptr<Tensor_attributes>, 2>
+    scaled_dot_product_flash_attention(std::shared_ptr<Tensor_attributes> q,
+                                       std::shared_ptr<Tensor_attributes> k,
+                                       std::shared_ptr<Tensor_attributes> v,
+                                       SDPA_attributes attributes) {
+        return sdpa(q, k, v, attributes);
+    }
+    [[deprecated]] std::array<std::shared_ptr<Tensor_attributes>, 3>
+    scaled_dot_product_flash_attention_backward(std::shared_ptr<Tensor_attributes> q,
+                                                std::shared_ptr<Tensor_attributes> k,
+                                                std::shared_ptr<Tensor_attributes> v,
+                                                std::shared_ptr<Tensor_attributes> o,
+                                                std::shared_ptr<Tensor_attributes> dO,
+                                                std::shared_ptr<Tensor_attributes> stats,
+                                                SDPA_backward_attributes attributes) {
+        return sdpa_backward(q, k, v, o, dO, stats, attributes);
+    }
 
     error_t
     create_execution_plans(std::vector<HeurMode_t> const &mode);
@@ -691,56 +707,50 @@ Graph::rmsnorm_backward(std::shared_ptr<Tensor_attributes> dy,
 // }
 
 inline std::array<std::shared_ptr<Tensor_attributes>, 2>
-Graph::scaled_dot_product_flash_attention(std::shared_ptr<Tensor_attributes> q,
-                                          std::shared_ptr<Tensor_attributes> k,
-                                          std::shared_ptr<Tensor_attributes> v,
-                                          Scaled_dot_product_flash_attention_attributes attributes) {
+Graph::sdpa(std::shared_ptr<Tensor_attributes> q,
+            std::shared_ptr<Tensor_attributes> k,
+            std::shared_ptr<Tensor_attributes> v,
+            SDPA_attributes attributes) {
     // Make required output tensors
-    auto O = attributes.outputs[Scaled_dot_product_flash_attention_attributes::output_names::O] =
-        output_tensor(attributes.name + "::O");
+    auto O = attributes.outputs[SDPA_attributes::output_names::O] = output_tensor(attributes.name + "::O");
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> Stats = nullptr;
     if (attributes.is_inference == false) {
-        Stats = attributes.outputs[Scaled_dot_product_flash_attention_attributes::output_names::Stats] =
-            output_tensor(attributes.name + "::Stats");
+        Stats = attributes.outputs[SDPA_attributes::output_names::Stats] = output_tensor(attributes.name + "::Stats");
     }
 
     // Set inputs
-    attributes.inputs[Scaled_dot_product_flash_attention_attributes::input_names::Q] = q;
-    attributes.inputs[Scaled_dot_product_flash_attention_attributes::input_names::K] = k;
-    attributes.inputs[Scaled_dot_product_flash_attention_attributes::input_names::V] = v;
+    attributes.inputs[SDPA_attributes::input_names::Q] = q;
+    attributes.inputs[SDPA_attributes::input_names::K] = k;
+    attributes.inputs[SDPA_attributes::input_names::V] = v;
 
-    sub_nodes.emplace_back(std::make_unique<ScaledDotProductFlashAttentionNode>(std::move(attributes), context));
+    sub_nodes.emplace_back(std::make_unique<SDPANode>(std::move(attributes), context));
 
     return {O, Stats};
 }
 
 inline std::array<std::shared_ptr<Tensor_attributes>, 3>
-Graph::scaled_dot_product_flash_attention_backward(std::shared_ptr<Tensor_attributes> q,
-                                                   std::shared_ptr<Tensor_attributes> k,
-                                                   std::shared_ptr<Tensor_attributes> v,
-                                                   std::shared_ptr<Tensor_attributes> o,
-                                                   std::shared_ptr<Tensor_attributes> dO,
-                                                   std::shared_ptr<Tensor_attributes> Stats,
-                                                   Scaled_dot_product_flash_attention_backward_attributes attributes) {
+Graph::sdpa_backward(std::shared_ptr<Tensor_attributes> q,
+                     std::shared_ptr<Tensor_attributes> k,
+                     std::shared_ptr<Tensor_attributes> v,
+                     std::shared_ptr<Tensor_attributes> o,
+                     std::shared_ptr<Tensor_attributes> dO,
+                     std::shared_ptr<Tensor_attributes> stats,
+                     SDPA_backward_attributes attributes) {
     // Set inputs
-    attributes.inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::Q]     = q;
-    attributes.inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::K]     = k;
-    attributes.inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::V]     = v;
-    attributes.inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::O]     = o;
-    attributes.inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::dO]    = dO;
-    attributes.inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::Stats] = Stats;
+    attributes.inputs[SDPA_backward_attributes::input_names::Q]     = q;
+    attributes.inputs[SDPA_backward_attributes::input_names::K]     = k;
+    attributes.inputs[SDPA_backward_attributes::input_names::V]     = v;
+    attributes.inputs[SDPA_backward_attributes::input_names::O]     = o;
+    attributes.inputs[SDPA_backward_attributes::input_names::dO]    = dO;
+    attributes.inputs[SDPA_backward_attributes::input_names::Stats] = stats;
 
     // Make required output tensors
-    auto dQ = attributes.outputs[Scaled_dot_product_flash_attention_backward_attributes::output_names::dQ] =
-        output_tensor(attributes.name + "::dQ");
-    auto dK = attributes.outputs[Scaled_dot_product_flash_attention_backward_attributes::output_names::dK] =
-        output_tensor(attributes.name + "::dK");
-    auto dV = attributes.outputs[Scaled_dot_product_flash_attention_backward_attributes::output_names::dV] =
-        output_tensor(attributes.name + "::dV");
+    auto dQ = attributes.outputs[SDPA_backward_attributes::output_names::dQ] = output_tensor(attributes.name + "::dQ");
+    auto dK = attributes.outputs[SDPA_backward_attributes::output_names::dK] = output_tensor(attributes.name + "::dK");
+    auto dV = attributes.outputs[SDPA_backward_attributes::output_names::dV] = output_tensor(attributes.name + "::dV");
 
-    sub_nodes.emplace_back(
-        std::make_unique<ScaledDotProductFlashAttentionBackwardNode>(std::move(attributes), context));
+    sub_nodes.emplace_back(std::make_unique<SDPABackwardNode>(std::move(attributes), context));
 
     return {dQ, dK, dV};
 }

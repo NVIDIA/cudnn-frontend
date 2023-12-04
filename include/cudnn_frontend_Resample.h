@@ -148,7 +148,7 @@ class ResampleDesc_v8 : public BackendDescriptor {
 
     // default values for attributes
     DataType_t computeType       = DataType_t::FLOAT;
-    cudnnNanPropagation_t nanOpt = CUDNN_NOT_PROPAGATE_NAN;
+    cudnnNanPropagation_t nanOpt = CUDNN_PROPAGATE_NAN;
     ResampleMode_t resample_mode = ResampleMode_t::NOT_SET;
     PaddingMode_t padding_mode   = PaddingMode_t::NOT_SET;
 

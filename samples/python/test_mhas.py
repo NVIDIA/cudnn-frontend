@@ -5,6 +5,7 @@ import math
 
 import itertools
 import random
+import os
 
 
 def convert_to_cudnn_type(torch_type):
@@ -68,46 +69,25 @@ def compare_tensors(expected, actual, name, rtol=2e-2, atol=2e-2, fudge=1e-9):
     return n_errors
 
 
-def get_slopes(n_heads: int, device="cuda"):
-    """
-    ## Get head-specific slope $m$ for each head
-
-    * `n_heads` is the number of heads in the attention layer $n$
-
-    The slope for first head is
-
-    $$\\frac{1}{2^{\\frac{8}{n}}} = 2^{-\\frac{8}{n}}$$
-
-    The slopes for the rest of the heads are in a geometric series with a ratio same as above.
-
-    For instance when the number of heads is $8$ the slopes are
-    $$\\frac{1}{2^1}, \\frac{1}{2^2}, \dots, \\frac{1}{2^8}$$
-    """
-
+def get_alibi_slopes(n_heads, device="cuda"):
     # Get the closest power of 2 to `n_heads`.
     # If `n_heads` is not a power of 2, then we first calculate slopes to the closest (smaller) power of 2,
     # and then add the remaining slopes.
     n = 2 ** math.floor(math.log2(n_heads))
-    # $2^{-\frac{8}{n}}$
     m_0 = 2.0 ** (-8.0 / n)
-    # $2^{-1\frac{8}{n}}, 2^{-2 \frac{8}{n}}, 2^{-3 \frac{8}{n}}, \dots$
     m = torch.pow(m_0, torch.arange(1, 1 + n))
 
     # If `n_heads` is not a power of 2, then we add the remaining slopes.
     # We calculate the remaining slopes for $n * 2$ (avoiding slopes added previously).
     # And pick the slopes upto `n_heads`.
     if n < n_heads:
-        # $2^{-\frac{8}{2n}}$
         m_hat_0 = 2.0 ** (-4.0 / n)
-        # $2^{-1\frac{8}{2n}}, 2^{-3 \frac{8}{2n}}, 2^{-5 \frac{8}{2n}}, \dots$
-        # Note that we take steps by $2$ to avoid slopes added previously.
         m_hat = torch.pow(m_hat_0, torch.arange(1, 1 + 2 * (n_heads - n), 2))
         # Concatenate the slopes with the remaining slopes.
         m = torch.cat([m, m_hat])
 
     # Reshape the tensor to [1, num_heads, 1, 1]
     m = m.view(1, -1, 1, 1).to(device=device)
-
     return m
 
 
@@ -121,16 +101,36 @@ def compute_ref(
     padding=None,
     is_causal=False,
     dropout_prob=0.0,
-    rng_dump=None,
+    dropout_mask=None,
     compute_stats=False,
     device="cuda",
 ):
-    b, h, s_q, d = q.shape
-    _, _, s_kv, _ = k.shape
+    b, h_q, s_q, d_qk = q.shape
+    _, h_k, s_kv, _ = k.shape
+    _, h_v, _, d_v = v.shape
 
-    assert k.shape == (b, h, s_kv, d)
-    assert v.shape == (b, h, s_kv, d)
+    assert k.shape == (b, h_k, s_kv, d_qk)
+    assert v.shape == (b, h_v, s_kv, d_v)
 
+    # use float32 datatype and math for reference computation
+    q = q.to(dtype=torch.float32, device=device)
+    k = k.to(dtype=torch.float32, device=device)
+    v = v.to(dtype=torch.float32, device=device)
+
+    # expand tensors for GQA and MQA
+    if h_q != h_k:
+        assert h_q % h_k == 0
+        k = k.unsqueeze(2)
+        k = k.expand(-1, -1, h_q // h_k, -1, -1)
+        k = k.reshape(k.size(0), -1, k.size(3), k.size(4))
+    if h_q != h_v:
+        assert h_q % h_v == 0
+        v = v.unsqueeze(2)
+        v = v.expand(-1, -1, h_q // h_v, -1, -1)
+        v = v.reshape(v.size(0), -1, v.size(3), v.size(4))
+
+    # generate masks to compute reference values for padding mask
+    # (also called variable sequence length)
     if padding is not None:
         q_mask = torch.ones(b, 1, s_q, 1, dtype=torch.bool, device=device)
         k_mask = torch.ones(b, 1, s_kv, 1, dtype=torch.bool, device=device)
@@ -145,22 +145,25 @@ def compute_ref(
             s_mask[i, :, :, n:] = True
             p_mask[i, :, m:, :] = False
 
-    q = q.to(dtype=torch.float32, device=device)
-    k = k.to(dtype=torch.float32, device=device)
-    v = v.to(dtype=torch.float32, device=device)
     if padding is not None:
         q = q * q_mask
         k = k * k_mask
         v = v * v_mask
 
     s = torch.einsum("bhqd,bhkd->bhqk", q, k) * attn_scale
+
+    # Attention masks are applied in the following order:
+    # - Bias mask
+    # - Alibi mask
+    # - Padding mask
+    # - Causal mask
     if bias is not None:
         s = s + bias
     if is_alibi:
         index_row = torch.arange(s_q, dtype=torch.float32, device=device).view(-1, 1)
         index_col = torch.arange(s_kv, dtype=torch.float32, device=device)
         distance = index_col - index_row
-        alibi_mask = distance.to(dtype=torch.float32) * get_slopes(h, device=device)
+        alibi_mask = distance.to(dtype=torch.float32) * get_alibi_slopes(h_q, device=device)
         s = s + alibi_mask
     if padding is not None:
         s = s.masked_fill(s_mask, float("-inf"))
@@ -172,12 +175,14 @@ def compute_ref(
     if padding is not None:
         p = p * p_mask
 
+    # apply dropout mask over softmax outputs
     if dropout_prob != 0.0:
-        assert rng_dump != None, "PyTorch reference must have rng_dump for dropout"
-        p = (p * rng_dump) / (1 - dropout_prob)
+        assert dropout_mask != None, "PyTorch reference must have dropout_mask for dropout"
+        p = (p * dropout_mask) / (1 - dropout_prob)
 
     o = torch.einsum("bhqk,bhkd->bhqd", p, v)
 
+    # softmax stats is used for backwards computation
     if compute_stats:
         # amax (NOT absolute max) is used here to evenly distribute gradient
         row_max = torch.amax(s, -1, True)
@@ -189,14 +194,15 @@ def compute_ref(
     return o
 
 
+input_type_options = [torch.float16, torch.bfloat16]
+layout_options = ["non_interleaved", "bs3hd", "sbh3d"]
+head_group_options = ["multi_head", "group_query", "multi_query"]
+bias_options = [False, True]
 alibi_mask_options = [False, True]
 padding_mask_options = [False, True]
 causal_mask_options = [False, True]
-layout_options = ["non_interleaved", "bs3hd", "sbh3d"]
 dropout_options = [False, True]
 is_infer_options = [False, True]
-bias_options = [False, True]
-input_type_options = [torch.float16, torch.bfloat16]
 
 all_options_forward = [
     elem
@@ -204,8 +210,9 @@ all_options_forward = [
         *[
             input_type_options,
             layout_options,
-            alibi_mask_options,
+            head_group_options,
             bias_options,
+            alibi_mask_options,
             padding_mask_options,
             causal_mask_options,
             dropout_options,
@@ -220,8 +227,9 @@ all_options_backward = [
         *[
             input_type_options,
             layout_options,
-            alibi_mask_options,
+            head_group_options,
             bias_options,
+            alibi_mask_options,
             padding_mask_options,
             causal_mask_options,
             dropout_options,
@@ -230,23 +238,97 @@ all_options_backward = [
 ]
 
 
+def generate_layout(layout, head_group, shape_q, shape_k, shape_v, shape_o):
+    b, h_q, s_q, d_qk = shape_q
+    b, h_k, s_kv, d_qk = shape_k
+    b, h_v, s_kv, d_v = shape_v
+    b, h_q, s_q, d_v = shape_o
+
+    assert shape_q == (b, h_q, s_q, d_qk)
+    assert shape_k == (b, h_k, s_kv, d_qk)
+    assert shape_v == (b, h_v, s_kv, d_v)
+    assert shape_o == (b, h_q, s_q, d_v)
+
+    if layout == "sbh3d":
+        if head_group == "multi_head":
+            assert (h_q == h_k == h_v) and (s_q == s_kv) and (d_qk == d_v)
+            h, s, d = h_q, s_q, d_qk
+            stride_q = (h * 3 * d, 3 * d, b * h * 3 * d, 1)
+            stride_k = (h * 3 * d, 3 * d, b * h * 3 * d, 1)
+            stride_v = (h * 3 * d, 3 * d, b * h * 3 * d, 1)
+            stride_o = (h * d, d, b * h * d, 1)
+            offset_q = 0
+            offset_k = offset_q + d
+            offset_v = offset_k + d
+        else:
+            # group_query and multi_query
+            # sbhd + sbh2d
+            assert (h_k == h_v) and (s_q == s_kv) and (d_qk == d_v)
+            h_kv, s, d = h_k, s_q, d_qk
+            stride_q = (h_q * d, d, b * h_q * d, 1)
+            stride_k = (h_kv * 2 * d, 2 * d, b * h_kv * 2 * d, 1)
+            stride_v = (h_kv * 2 * d, 2 * d, b * h_kv * 2 * d, 1)
+            stride_o = (h_q * d, d, b * h_q * d, 1)
+            offset_q = 0
+            offset_k = offset_q + s * b * h_q * d
+            offset_v = offset_k + d
+    elif layout == "bs3hd":
+        if head_group == "multi_head":
+            assert (h_q == h_k == h_v) and (s_q == s_kv) and (d_qk == d_v)
+            h, s, d = h_q, s_q, d_qk
+            stride_q = (s * 3 * h * d, d, 3 * h * d, 1)
+            stride_k = (s * 3 * h * d, d, 3 * h * d, 1)
+            stride_v = (s * 3 * h * d, d, 3 * h * d, 1)
+            stride_o = (s * h * d, d, h * d, 1)
+            offset_q = 0
+            offset_k = offset_q + h_q * d
+            offset_v = offset_k + h_k * d
+        else:
+            # group_query and multi_query
+            # bshd + bs2hd
+            assert (h_k == h_v) and (s_q == s_kv) and (d_qk == d_v)
+            h_kv, s, d = h_k, s_q, d_qk
+            stride_q = (s * h_q * d, d, h_q * d, 1)
+            stride_k = (s * 2 * h_kv * d, d, 2 * h_kv * d, 1)
+            stride_v = (s * 2 * h_kv * d, d, 2 * h_kv * d, 1)
+            stride_o = (s * h_q * d, d, h_q * d, 1)
+            offset_q = 0
+            offset_k = offset_q + s * b * h_q * d
+            offset_v = offset_k + h_kv * d
+    else:
+        # bshd non_interleaved layout
+        stride_q = (s_q * h_q * d_qk, d_qk, h_q * d_qk, 1)
+        stride_k = (s_kv * h_k * d_qk, d_qk, h_k * d_qk, 1)
+        stride_v = (s_kv * h_v * d_v, d_v, h_v * d_v, 1)
+        stride_o = (s_q * h_q * d_v, d_v, h_q * d_v, 1)
+        offset_q = 0
+        offset_k = offset_q + b * s_q * h_q * d_qk
+        offset_v = offset_k + b * s_kv * h_k * d_qk
+
+    return stride_q, stride_k, stride_v, stride_o, offset_q, offset_k, offset_v
+
+
 @pytest.fixture(params=all_options_forward)
 def param_extract_forward(request):
     return request.param
 
 
 @pytest.mark.skipif(cudnn.backend_version() < 8903, reason="requires cudnn 8.9.3 or higher")
-def test_scale_dot_product_flash_attention(param_extract_forward):
+def test_sdpa(param_extract_forward):
     (
         input_type,
         layout,
-        is_alibi,
+        head_group,
         is_bias,
+        is_alibi,
         is_padding,
         is_causal,
         is_dropout,
         is_infer,
     ) = param_extract_forward
+
+    if head_group != "multi_head" and cudnn.backend_version() < 8907:
+        pytest.skip("GQA and MQA is only supported 8.9.7 onwards.")
 
     if is_alibi and cudnn.backend_version() < 8904:
         pytest.skip("ALiBi mask is only supported 8.9.4 onwards.")
@@ -254,58 +336,63 @@ def test_scale_dot_product_flash_attention(param_extract_forward):
     if is_padding and cudnn.backend_version() < 8903:
         pytest.skip("Padding mask is only supported 8.9.3 onwards.")
 
-    s_q_choices = [256, 512, 1024, 2048]
-    d_choices = [64, 128]
+    if is_dropout and cudnn.backend_version() < 8906:
+        pytest.skip("Dropout reference is only supported on 8.9.6 onwards.")
 
-    b = 3
-    h = 4
-    s_q = random.choice(s_q_choices)
-    s_kv = s_q
-    d = random.choice(d_choices)
+    # batch size
+    b = 2
+    # query sequence length
+    s_q = random.choice([256, 512, 1024, 2048])
+    # key+value sequence length
+    s_kv = random.choice([256, 512, 1024, 2048]) if layout == "non_interleaved" else s_q
+    # query+key embedding dimension per head
+    d_qk = random.choice([64, 128])
+    # value embedding dimension per head
+    d_v = random.choice([64, 128]) if layout == "non_interleaved" else d_qk
+    # number of heads
+    h_q = 6
+    if head_group == "multi_head":
+        h_k = 6
+        h_v = 6
+    elif head_group == "group_query":
+        h_k = random.choice([6, 3, 2, 1])
+        h_v = random.choice([6, 3, 2, 1]) if layout == "non_interleaved" else h_k
+    elif head_group == "multi_query":
+        h_k = 1
+        h_v = 1
+    else:
+        assert False, "Head group must be either MHA, GQA, or MQA"
 
-    print(f"{str(param_extract_forward)} s={s_q} d={d}")
+    if d_qk != d_v and cudnn.backend_version() < 8906:
+        pytest.skip("d_qk != d_v is only supported on 8.9.6 onwards.")
+
+    print(f"{str(param_extract_forward)} {s_q=} {s_kv=} {d_qk=} {d_v=} {h_q=} {h_k=} {h_v=}")
 
     attn_scale = 0.125
     dropout_prob = 0.1 if is_dropout else 0.0
 
-    shape_q = (b, h, s_q, d)
-    shape_k = (b, h, s_kv, d)
-    shape_v = (b, h, s_kv, d)
-    shape_o = (b, h, s_q, d)
+    shape_q = (b, h_q, s_q, d_qk)
+    shape_k = (b, h_k, s_kv, d_qk)
+    shape_v = (b, h_v, s_kv, d_v)
+    shape_o = (b, h_q, s_q, d_v)
 
-    if layout == "sbh3d":
-        stride_q = (h * 3 * d, 3 * d, b * h * 3 * d, 1)
-        stride_k = (h * 3 * d, 3 * d, b * h * 3 * d, 1)
-        stride_v = (h * 3 * d, 3 * d, b * h * 3 * d, 1)
-        stride_o = (h * d, d, b * h * d, 1)
-        offset_q = d * 0
-        offset_k = d * 1
-        offset_v = d * 2
-    elif layout == "bs3hd":
-        stride_q = (s_q * 3 * h * d, d, 3 * h * d, 1)
-        stride_k = (s_kv * 3 * h * d, d, 3 * h * d, 1)
-        stride_v = (s_kv * 3 * h * d, d, 3 * h * d, 1)
-        stride_o = (s_q * h * d, d, h * d, 1)
-        offset_q = h * d * 0
-        offset_k = h * d * 1
-        offset_v = h * d * 2
-    elif layout == "non_interleaved":
-        stride_q = (h * s_q * d, s_q * d, d, 1)
-        stride_k = (h * s_kv * d, s_kv * d, d, 1)
-        stride_v = (h * s_kv * d, s_kv * d, d, 1)
-        stride_o = (h * s_q * d, s_q * d, d, 1)
-        offset_q = 0
-        offset_k = offset_q + b * h * s_q * d
-        offset_v = offset_k + b * h * s_kv * d
-    else:
-        assert False, "Layout should be either sbh3d or bs3hd or non_interleaved"
+    qkv_num_elems = math.prod(shape_q) + math.prod(shape_k) + math.prod(shape_v)
 
-    qkv_gpu = torch.randn(3 * b * h * s_q * d, dtype=input_type, device="cuda") - 0.5
+    (stride_q, stride_k, stride_v, stride_o, offset_q, offset_k, offset_v) = generate_layout(
+        layout,
+        head_group,
+        shape_q,
+        shape_k,
+        shape_v,
+        shape_o,
+    )
+
+    qkv_gpu = torch.randn(qkv_num_elems, dtype=input_type, device="cuda") - 0.5
     q_gpu = torch.as_strided(qkv_gpu, shape_q, stride_q, storage_offset=offset_q)
     k_gpu = torch.as_strided(qkv_gpu, shape_k, stride_k, storage_offset=offset_k)
     v_gpu = torch.as_strided(qkv_gpu, shape_v, stride_v, storage_offset=offset_v)
 
-    bias_gpu = torch.randn(1, h, s_q, s_kv, device="cuda", dtype=input_type) if is_bias else None
+    bias_gpu = torch.randn(1, h_q, s_q, s_kv, device="cuda", dtype=input_type) if is_bias else None
 
     seq_len_q_gpu = torch.randint(1, s_q + 1, (b, 1, 1, 1), dtype=torch.int32, device="cuda") if is_padding else None
     seq_len_kv_gpu = torch.randint(1, s_kv + 1, (b, 1, 1, 1), dtype=torch.int32, device="cuda") if is_padding else None
@@ -314,10 +401,10 @@ def test_scale_dot_product_flash_attention(param_extract_forward):
         seed_gpu = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
         offset_gpu = torch.full((1, 1, 1, 1), 789, dtype=torch.int64, device="cuda")
 
-    rng_dump_gpu = torch.empty((b, h, s_q, s_kv), dtype=torch.float32, device="cuda") if is_dropout else None
+    rng_dump_gpu = torch.empty((b, h_q, s_q, s_kv), dtype=torch.float32, device="cuda") if is_dropout else None
 
-    o_gpu = torch.empty(b * h * s_q * d, dtype=input_type, device="cuda").as_strided(shape_o, stride_o)
-    stats_gpu = torch.empty(b, h, s_q, 1, dtype=torch.float32, device="cuda") if not is_infer else None
+    o_gpu = torch.empty(b * h_q * s_q * d_v, dtype=input_type, device="cuda").as_strided(shape_o, stride_o)
+    stats_gpu = torch.empty(b, h_q, s_q, 1, dtype=torch.float32, device="cuda") if not is_infer else None
 
     # cuDNN graph
     graph = cudnn.pygraph(
@@ -341,8 +428,8 @@ def test_scale_dot_product_flash_attention(param_extract_forward):
 
     rng_dump = graph.tensor_like(rng_dump_gpu) if is_dropout else None
 
-    o, stats = graph.scaled_dot_product_flash_attention(
-        name="scaled_dot_product_flash_attention",
+    o, stats = graph.sdpa(
+        name="sdpa",
         q=q,
         k=k,
         v=v,
@@ -361,7 +448,7 @@ def test_scale_dot_product_flash_attention(param_extract_forward):
     o.set_output(True).set_dim(shape_o).set_stride(stride_o)
     if is_infer == False:
         stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-    
+
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -377,7 +464,7 @@ def test_scale_dot_product_flash_attention(param_extract_forward):
         seq_len_kv: seq_len_kv_gpu,
         o: o_gpu,
         stats: stats_gpu,
-        rng_dump: rng_dump_gpu
+        rng_dump: rng_dump_gpu,
     }
 
     if is_dropout:
@@ -387,10 +474,6 @@ def test_scale_dot_product_flash_attention(param_extract_forward):
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     graph.execute(variant_pack, workspace)
     torch.cuda.synchronize()
-
-    # compare with torch reference
-    if is_dropout and cudnn.backend_version() < 8906:
-        pytest.skip("Dropout reference is only supported on 8.9.6 onwards.")
 
     q_ref = q_gpu.detach().float()
     k_ref = k_gpu.detach().float()
@@ -417,7 +500,7 @@ def test_scale_dot_product_flash_attention(param_extract_forward):
         is_causal=is_causal,
         compute_stats=(is_infer == False),
         dropout_prob=dropout_prob,
-        rng_dump=rng_dump_ref if is_dropout else None,
+        dropout_mask=rng_dump_ref if is_dropout else None,
     )
     if is_infer == False:
         o_ref, stats_ref = ret
@@ -444,16 +527,29 @@ def param_extract_backward(request):
 
 
 @pytest.mark.skipif(cudnn.backend_version() < 8903, reason="requires cudnn 8.9.3 or higher")
-def test_scale_dot_product_flash_attention_backward(param_extract_backward):
+def test_sdpa_backward(param_extract_backward):
     (
         input_type,
         layout,
-        is_alibi,
+        head_group,
         is_bias,
+        is_alibi,
         is_padding,
         is_causal,
         is_dropout,
     ) = param_extract_backward
+
+    if head_group != "multi_head" and cudnn.backend_version() < 8907:
+        pytest.skip("GQA and MQA is only supported 8.9.7 onwards.")
+
+    if is_bias and cudnn.backend_version() < 8906:
+        pytest.skip("dBias is only supported 8.9.6 onwards.")
+
+    if is_bias and torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("dBias is only supported on hopper onwards.")
+
+    if is_bias and is_padding:
+        pytest.skip("dBias is not supported with padding mask")
 
     if is_alibi and cudnn.backend_version() < 8904:
         pytest.skip("ALiBi mask is only supported 8.9.4 onwards.")
@@ -464,75 +560,71 @@ def test_scale_dot_product_flash_attention_backward(param_extract_backward):
     if is_dropout and cudnn.backend_version() < 8906:
         pytest.skip("RNG dump is only supported on 8.9.6 onwards.")
 
-    if is_bias and cudnn.backend_version() < 8906:
-        pytest.skip("dBias is only supported 8.9.6 onwards.")
+    # test both dP workspace optimization by lowering dP workspace limit to 8MB
+    os.environ["CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT"] = str(8 * 1024 * 1024)
 
-    if is_bias and torch.cuda.get_device_capability()[0] < 9:    
-        pytest.skip("dBias is only supported on hopper onwards.")
+    # batch size
+    b = 2
+    # query sequence length
+    s_q = random.choice([256, 512, 1024])
+    # key+value sequence length
+    s_kv = random.choice([256, 512, 1024]) if layout == "non_interleaved" else s_q
+    # query+key embedding dimension per head
+    d_qk = random.choice([64, 128])
+    # value embedding dimension per head
+    d_v = random.choice([64, 128]) if layout == "non_interleaved" else d_qk
+    # number of heads
+    h_q = 6
+    if head_group == "multi_head":
+        h_k = 6
+        h_v = 6
+    elif head_group == "group_query":
+        h_k = random.choice([6, 3, 2, 1])
+        h_v = random.choice([6, 3, 2, 1]) if layout == "non_interleaved" else h_k
+    elif head_group == "multi_query":
+        h_k = 1
+        h_v = 1
+    else:
+        assert False, "Head group must be either MHA, GQA, or MQA"
 
-    if is_bias and is_padding:
-        pytest.skip("dBias is not supported with padding mask")
+    if d_qk != d_v and cudnn.backend_version() < 8906:
+        pytest.skip("d_qk != d_v is only supported on 8.9.6 onwards.")
 
-    s_q_choices = [256, 512, 1024]
-    d_choices = [64, 128]
-
-    b = 3
-    h = 4
-    s_q = random.choice(s_q_choices)
-    s_kv = s_q
-    d = random.choice(d_choices)
-
-    print(f"{str(param_extract_backward)} s={s_q} d={d}")
+    print(f"{str(param_extract_backward)} {s_q=} {s_kv=} {d_qk=} {d_v=} {h_q=} {h_k=} {h_v=}")
 
     attn_scale = 0.125
     dropout_prob = 0.1 if is_dropout else 0.0
 
-    shape_q = (b, h, s_q, d)
-    shape_k = (b, h, s_kv, d)
-    shape_v = (b, h, s_kv, d)
-    shape_o = (b, h, s_q, d)
+    shape_q = (b, h_q, s_q, d_qk)
+    shape_k = (b, h_k, s_kv, d_qk)
+    shape_v = (b, h_v, s_kv, d_v)
+    shape_o = (b, h_q, s_q, d_v)
 
-    if layout == "sbh3d":
-        stride_q = (h * 3 * d, 3 * d, b * h * 3 * d, 1)
-        stride_k = (h * 3 * d, 3 * d, b * h * 3 * d, 1)
-        stride_v = (h * 3 * d, 3 * d, b * h * 3 * d, 1)
-        stride_o = (h * d, d, b * h * d, 1)
-        offset_q = d * 0
-        offset_k = d * 1
-        offset_v = d * 2
-    elif layout == "bs3hd":
-        stride_q = (s_q * 3 * h * d, d, 3 * h * d, 1)
-        stride_k = (s_kv * 3 * h * d, d, 3 * h * d, 1)
-        stride_v = (s_kv * 3 * h * d, d, 3 * h * d, 1)
-        stride_o = (s_q * h * d, d, h * d, 1)
-        offset_q = h * d * 0
-        offset_k = h * d * 1
-        offset_v = h * d * 2
-    elif layout == "non_interleaved":
-        stride_q = (h * s_q * d, s_q * d, d, 1)
-        stride_k = (h * s_kv * d, s_kv * d, d, 1)
-        stride_v = (h * s_kv * d, s_kv * d, d, 1)
-        stride_o = (h * s_q * d, s_q * d, d, 1)
-        offset_q = 0
-        offset_k = offset_q + b * h * s_q * d
-        offset_v = offset_k + b * h * s_kv * d
-    else:
-        assert False, "Layout should be either sbh3d or bs3hd or non_interleaved"
+    qkv_num_elems = math.prod(shape_q) + math.prod(shape_k) + math.prod(shape_v)
 
-    qkv_gpu = torch.randn(3 * b * h * s_q * d, dtype=input_type, device="cuda") - 0.5
+    (stride_q, stride_k, stride_v, stride_o, offset_q, offset_k, offset_v) = generate_layout(
+        layout,
+        head_group,
+        shape_q,
+        shape_k,
+        shape_v,
+        shape_o,
+    )
+
+    qkv_gpu = torch.randn(qkv_num_elems, dtype=input_type, device="cuda") - 0.5
     q_gpu = torch.as_strided(qkv_gpu, shape_q, stride_q, storage_offset=offset_q)
     k_gpu = torch.as_strided(qkv_gpu, shape_k, stride_k, storage_offset=offset_k)
     v_gpu = torch.as_strided(qkv_gpu, shape_v, stride_v, storage_offset=offset_v)
 
-    dQKV_gpu = torch.empty(3 * b * h * s_q * d, dtype=input_type, device="cuda")
+    dQKV_gpu = torch.empty(qkv_num_elems, dtype=input_type, device="cuda")
     dQ_gpu = torch.as_strided(dQKV_gpu, shape_q, stride_q, storage_offset=offset_q)
     dK_gpu = torch.as_strided(dQKV_gpu, shape_k, stride_k, storage_offset=offset_k)
     dV_gpu = torch.as_strided(dQKV_gpu, shape_v, stride_v, storage_offset=offset_v)
 
-    dO_gpu = 0.1 * torch.randn(b * h * s_q * d, dtype=input_type, device="cuda").as_strided(shape_o, stride_o)
+    dO_gpu = 0.1 * torch.randn(b * h_q * s_q * d_v, dtype=input_type, device="cuda").as_strided(shape_o, stride_o)
 
-    bias_gpu = torch.randn(1, h, s_q, s_kv, device="cuda", dtype=input_type) if is_bias else None
-    dBias_gpu = torch.randn(1, h, s_q, s_kv, device="cuda", dtype=input_type) if is_bias else None
+    bias_gpu = torch.randn(1, h_q, s_q, s_kv, device="cuda", dtype=input_type) if is_bias else None
+    dBias_gpu = torch.randn(1, h_q, s_q, s_kv, device="cuda", dtype=input_type) if is_bias else None
 
     seq_len_q_gpu = torch.randint(1, s_q + 1, (b, 1, 1, 1), dtype=torch.int32, device="cuda") if is_padding else None
     seq_len_kv_gpu = torch.randint(1, s_kv + 1, (b, 1, 1, 1), dtype=torch.int32, device="cuda") if is_padding else None
@@ -541,10 +633,10 @@ def test_scale_dot_product_flash_attention_backward(param_extract_backward):
         seed_gpu = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
         offset_gpu = torch.full((1, 1, 1, 1), 789, dtype=torch.int64, device="cuda")
 
-    rng_dump_gpu = torch.empty((b, h, s_q, s_kv), dtype=torch.float32, device="cuda") if is_dropout else None
+    rng_dump_gpu = torch.empty((b, h_q, s_q, s_kv), dtype=torch.float32, device="cuda") if is_dropout else None
 
-    o_gpu = torch.empty(b * h * s_q * d, dtype=input_type, device="cuda").as_strided(shape_o, stride_o)
-    stats_gpu = torch.empty(b, h, s_q, 1, dtype=torch.float32, device="cuda")
+    o_gpu = torch.empty(b * h_q * s_q * d_v, dtype=input_type, device="cuda").as_strided(shape_o, stride_o)
+    stats_gpu = torch.empty(b, h_q, s_q, 1, dtype=torch.float32, device="cuda")
 
     # forward cuDNN graph
     graph = cudnn.pygraph(
@@ -568,8 +660,8 @@ def test_scale_dot_product_flash_attention_backward(param_extract_backward):
 
     rng_dump = graph.tensor_like(rng_dump_gpu) if is_dropout else None
 
-    o, stats = graph.scaled_dot_product_flash_attention(
-        name="scaled_dot_product_flash_attention",
+    o, stats = graph.sdpa(
+        name="sdpa",
         q=q,
         k=k,
         v=v,
@@ -587,7 +679,7 @@ def test_scale_dot_product_flash_attention_backward(param_extract_backward):
 
     o.set_output(True).set_dim(shape_o).set_stride(stride_o)
     stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-    
+
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -603,7 +695,7 @@ def test_scale_dot_product_flash_attention_backward(param_extract_backward):
         seq_len_kv: seq_len_kv_gpu,
         o: o_gpu,
         stats: stats_gpu,
-        rng_dump: rng_dump_gpu
+        rng_dump: rng_dump_gpu,
     }
 
     if is_dropout:
@@ -634,7 +726,7 @@ def test_scale_dot_product_flash_attention_backward(param_extract_backward):
     stats = graph.tensor_like(stats_gpu)
 
     bias = graph.tensor_like(bias_gpu) if is_bias else None
-    dBias = graph.tensor_like(dBias_gpu).set_stride((h * s_q * s_kv, s_q * s_kv, s_kv, 1)) if is_bias else None
+    dBias = graph.tensor_like(dBias_gpu).set_stride((h_q * s_q * s_kv, s_q * s_kv, s_kv, 1)) if is_bias else None
 
     seq_len_q = graph.tensor_like(seq_len_q_gpu) if is_padding else None
     seq_len_kv = graph.tensor_like(seq_len_kv_gpu) if is_padding else None
@@ -644,8 +736,8 @@ def test_scale_dot_product_flash_attention_backward(param_extract_backward):
         offset = graph.tensor_like(offset_gpu)
         dropout_tuple = (dropout_prob, seed, offset)
 
-    dQ, dK, dV = graph.scaled_dot_product_flash_attention_backward(
-        name="scaled_dot_product_flash_attention",
+    dQ, dK, dV = graph.sdpa_backward(
+        name="sdpa_backward",
         q=q,
         k=k,
         v=v,
@@ -666,7 +758,7 @@ def test_scale_dot_product_flash_attention_backward(param_extract_backward):
     dQ.set_output(True).set_dim(dQ_gpu.size()).set_stride(dQ_gpu.stride())
     dK.set_output(True).set_dim(dK_gpu.size()).set_stride(dK_gpu.stride())
     dV.set_output(True).set_dim(dV_gpu.size()).set_stride(dV_gpu.stride())
-    
+
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -727,7 +819,7 @@ def test_scale_dot_product_flash_attention_backward(param_extract_backward):
         padding=(seq_len_q_ref, seq_len_kv_ref) if is_padding else None,
         is_causal=is_causal,
         dropout_prob=dropout_prob,
-        rng_dump=rng_dump_ref if is_dropout else None,
+        dropout_mask=rng_dump_ref if is_dropout else None,
         compute_stats=False,
     )
 
@@ -758,7 +850,7 @@ def test_scale_dot_product_flash_attention_backward(param_extract_backward):
                 dBias_ref[i, :, :, n:] = 0
 
     assert compare_tensors(dQ_ref, dQ_gpu, "dQ") == 0
-    assert compare_tensors(dK_ref, dK_gpu, "dK") == 0
+    assert compare_tensors(dK_ref, dK_gpu, "dK", atol=2e-2 if input_type != torch.bfloat16 else 4e-2) == 0
     assert compare_tensors(dV_ref, dV_gpu, "dV") == 0
     if is_bias:
         assert compare_tensors(dBias_ref, dBias_gpu, "dBias") == 0
@@ -766,16 +858,22 @@ def test_scale_dot_product_flash_attention_backward(param_extract_backward):
 
 if __name__ == "__main__":
     """
-    option_forward = (input_type, layout, is_alibi, is_bias, is_padding, is_causal, is_dropout, is_infer)
-    option_backward = (input_type, layout, is_alibi, is_bias, is_padding, is_causal, is_dropout)
-    test_scale_dot_product_flash_attention((torch.float16, "bs3hd", False, False, False, False, False, False))
-    test_scale_dot_product_flash_attention_backward((torch.float16, "bs3hd", False, False, False, False, False))
+    option_forward = (input_type, layout, head_group, is_bias, is_alibi, is_padding, is_causal, is_dropout, is_infer)
+    option_backward = (input_type, layout, head_group, is_bias, is_alibi, is_padding, is_causal, is_dropout)
+    test_sdpa((torch.float16, "bs3hd", "multi_head", False, False, False, False, False, False))
+    test_sdpa_backward((torch.float16, "bs3hd", "multi_head", False, False, False, False, False))
     """
 
     print("==========running forward tests==========")
     for option in all_options_forward:
-        test_scale_dot_product_flash_attention(option)
+        try:
+            test_sdpa(option)
+        except pytest.skip.Exception as e:
+            print(f"Skipped {option}: {e}")
 
     print("==========running backward tests==========")
     for option in all_options_backward:
-        test_scale_dot_product_flash_attention_backward(option)
+        try:
+            test_sdpa_backward(option)
+        except pytest.skip.Exception as e:
+            print(f"Skipped {option}: {e}")

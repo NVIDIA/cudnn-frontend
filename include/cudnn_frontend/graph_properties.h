@@ -527,6 +527,8 @@ class Matmul_attributes : public Attributes<Matmul_attributes> {
     enum class output_names { C };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
 
+    double padding_value = 0.0;
+
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(Matmul_attributes, name, inputs, outputs)
 
@@ -545,6 +547,12 @@ class Matmul_attributes : public Attributes<Matmul_attributes> {
     Matmul_attributes&
     set_k_override(std::shared_ptr<Tensor_attributes> const& value) {
         inputs[input_names::K_override] = value;
+        return *this;
+    }
+
+    Matmul_attributes&
+    set_padding(double const padding_val) {
+        padding_value = padding_val;
         return *this;
     }
 };
@@ -1077,9 +1085,9 @@ class Rmsnorm_backward_attributes : public Attributes<Rmsnorm_backward_attribute
 //     }
 // };
 
-class Scaled_dot_product_flash_attention_attributes : public Attributes<Scaled_dot_product_flash_attention_attributes> {
-    friend class Attributes<Scaled_dot_product_flash_attention_attributes>;
-    friend class ScaledDotProductFlashAttentionNode;
+class SDPA_attributes : public Attributes<SDPA_attributes> {
+    friend class Attributes<SDPA_attributes>;
+    friend class SDPANode;
     friend class Graph;
 
     enum class input_names {
@@ -1108,89 +1116,88 @@ class Scaled_dot_product_flash_attention_attributes : public Attributes<Scaled_d
     std::optional<float> attn_scale_value;
 
    public:
-    Scaled_dot_product_flash_attention_attributes&
+    SDPA_attributes&
     set_is_inference(bool const value) {
         is_inference = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_attributes&
+    SDPA_attributes&
     set_attn_scale(std::shared_ptr<Tensor_attributes> value) {
-        inputs[Scaled_dot_product_flash_attention_attributes::input_names::Attn_scale] = value;
+        inputs[SDPA_attributes::input_names::Attn_scale] = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_attributes&
+    SDPA_attributes&
     set_attn_scale(float const value) {
         attn_scale_value = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_attributes&
+    SDPA_attributes&
     set_bias(std::shared_ptr<Tensor_attributes> value) {
-        inputs[Scaled_dot_product_flash_attention_attributes::input_names::Bias] = value;
+        inputs[SDPA_attributes::input_names::Bias] = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_attributes&
+    SDPA_attributes&
     set_alibi_mask(bool const value) {
         alibi_mask = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_attributes&
+    SDPA_attributes&
     set_padding_mask(bool const value) {
         padding_mask = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_attributes&
+    SDPA_attributes&
     set_seq_len_q(std::shared_ptr<Tensor_attributes> value) {
-        inputs[Scaled_dot_product_flash_attention_attributes::input_names::SEQ_LEN_Q] = value;
+        inputs[SDPA_attributes::input_names::SEQ_LEN_Q] = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_attributes&
+    SDPA_attributes&
     set_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
-        inputs[Scaled_dot_product_flash_attention_attributes::input_names::SEQ_LEN_KV] = value;
+        inputs[SDPA_attributes::input_names::SEQ_LEN_KV] = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_attributes&
+    SDPA_attributes&
     set_causal_mask(bool const value) {
         causal_mask = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_attributes&
+    SDPA_attributes&
     set_dropout(float const probability,
                 std::shared_ptr<Tensor_attributes> seed,
                 std::shared_ptr<Tensor_attributes> offset) {
-        dropout_probability                                                        = probability;
-        inputs[Scaled_dot_product_flash_attention_attributes::input_names::Seed]   = seed;
-        inputs[Scaled_dot_product_flash_attention_attributes::input_names::Offset] = offset;
+        dropout_probability                          = probability;
+        inputs[SDPA_attributes::input_names::Seed]   = seed;
+        inputs[SDPA_attributes::input_names::Offset] = offset;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_attributes&
+    SDPA_attributes&
     set_dropout(std::shared_ptr<Tensor_attributes> mask, std::shared_ptr<Tensor_attributes> scale) {
-        inputs[Scaled_dot_product_flash_attention_attributes::input_names::Dropout_mask]  = mask;
-        inputs[Scaled_dot_product_flash_attention_attributes::input_names::Dropout_scale] = scale;
+        inputs[SDPA_attributes::input_names::Dropout_mask]  = mask;
+        inputs[SDPA_attributes::input_names::Dropout_scale] = scale;
         return *this;
     }
 
     // For debugging purposes only.
-    Scaled_dot_product_flash_attention_attributes&
+    SDPA_attributes&
     set_rng_dump(std::shared_ptr<Tensor_attributes> value) {
-        outputs[Scaled_dot_product_flash_attention_attributes::output_names::RNG_DUMP] = value;
+        outputs[SDPA_attributes::output_names::RNG_DUMP] = value;
         return *this;
     }
 };
 
-class Scaled_dot_product_flash_attention_backward_attributes
-    : public Attributes<Scaled_dot_product_flash_attention_backward_attributes> {
-    friend class Attributes<Scaled_dot_product_flash_attention_backward_attributes>;
-    friend class ScaledDotProductFlashAttentionBackwardNode;
+class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
+    friend class Attributes<SDPA_backward_attributes>;
+    friend class SDPABackwardNode;
     friend class Graph;
 
     enum class input_names {
@@ -1223,87 +1230,90 @@ class Scaled_dot_product_flash_attention_backward_attributes
     std::optional<float> attn_scale_value;
 
    public:
-    Scaled_dot_product_flash_attention_backward_attributes&
+    SDPA_backward_attributes&
     set_attn_scale(std::shared_ptr<Tensor_attributes> value) {
-        inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::Attn_scale] = value;
+        inputs[SDPA_backward_attributes::input_names::Attn_scale] = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_backward_attributes&
+    SDPA_backward_attributes&
     set_attn_scale(float const value) {
         attn_scale_value = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_backward_attributes&
+    SDPA_backward_attributes&
     set_bias(std::shared_ptr<Tensor_attributes> value) {
-        inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::Bias] = value;
+        inputs[SDPA_backward_attributes::input_names::Bias] = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_backward_attributes&
+    SDPA_backward_attributes&
     set_dbias(std::shared_ptr<Tensor_attributes> value) {
-        outputs[Scaled_dot_product_flash_attention_backward_attributes::output_names::dBias] = value;
+        outputs[SDPA_backward_attributes::output_names::dBias] = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_backward_attributes&
+    SDPA_backward_attributes&
     set_alibi_mask(bool const value) {
         alibi_mask = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_backward_attributes&
+    SDPA_backward_attributes&
     set_padding_mask(bool const value) {
         padding_mask = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_backward_attributes&
+    SDPA_backward_attributes&
     set_seq_len_q(std::shared_ptr<Tensor_attributes> value) {
-        inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::SEQ_LEN_Q] = value;
+        inputs[SDPA_backward_attributes::input_names::SEQ_LEN_Q] = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_backward_attributes&
+    SDPA_backward_attributes&
     set_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
-        inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::SEQ_LEN_KV] = value;
+        inputs[SDPA_backward_attributes::input_names::SEQ_LEN_KV] = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_backward_attributes&
+    SDPA_backward_attributes&
     set_causal_mask(bool const value) {
         causal_mask = value;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_backward_attributes&
+    SDPA_backward_attributes&
     set_dropout(float const probability,
                 std::shared_ptr<Tensor_attributes> seed,
                 std::shared_ptr<Tensor_attributes> offset) {
-        dropout_probability                                                                 = probability;
-        inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::Seed]   = seed;
-        inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::Offset] = offset;
+        dropout_probability                                   = probability;
+        inputs[SDPA_backward_attributes::input_names::Seed]   = seed;
+        inputs[SDPA_backward_attributes::input_names::Offset] = offset;
         return *this;
     }
 
-    Scaled_dot_product_flash_attention_backward_attributes&
+    SDPA_backward_attributes&
     set_dropout(std::shared_ptr<Tensor_attributes> mask,
                 std::shared_ptr<Tensor_attributes> scale,
                 std::shared_ptr<Tensor_attributes> scale_inv) {
-        inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::Dropout_mask]      = mask;
-        inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::Dropout_scale]     = scale;
-        inputs[Scaled_dot_product_flash_attention_backward_attributes::input_names::Dropout_scale_inv] = scale_inv;
+        inputs[SDPA_backward_attributes::input_names::Dropout_mask]      = mask;
+        inputs[SDPA_backward_attributes::input_names::Dropout_scale]     = scale;
+        inputs[SDPA_backward_attributes::input_names::Dropout_scale_inv] = scale_inv;
         return *this;
     }
 
     // For debugging purposes only.
-    Scaled_dot_product_flash_attention_backward_attributes&
+    SDPA_backward_attributes&
     set_rng_dump(std::shared_ptr<Tensor_attributes> value) {
-        outputs[Scaled_dot_product_flash_attention_backward_attributes::output_names::RNG_DUMP] = value;
+        outputs[SDPA_backward_attributes::output_names::RNG_DUMP] = value;
         return *this;
     }
 };
+
+using Scaled_dot_product_flash_attention_attributes [[deprecated]]          = SDPA_attributes;
+using Scaled_dot_product_flash_attention_backward_attributes [[deprecated]] = SDPA_backward_attributes;
 
 class Softmax_attributes : public Attributes<Softmax_attributes> {
     friend class Attributes<Softmax_attributes>;

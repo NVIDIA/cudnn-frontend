@@ -91,7 +91,9 @@ elseif(CUDNN_MAJOR_VERSION EQUAL 9)
     find_cudnn_library(cudnn_adv)
     find_cudnn_library(cudnn_graph)
     find_cudnn_library(cudnn_ops)
-
+    find_cudnn_library(cudnn_engines_runtime_compiled)
+    find_cudnn_library(cudnn_engines_precompiled)
+    find_cudnn_library(cudnn_heuristic)
 
     target_link_libraries(
         CUDNN::cudnn_all
@@ -100,5 +102,8 @@ elseif(CUDNN_MAJOR_VERSION EQUAL 9)
         CUDNN::cudnn_ops
         CUDNN::cudnn_cnn
         CUDNN::cudnn_graph
+        CUDNN::cudnn_engines_runtime_compiled
+        CUDNN::cudnn_engines_precompiled
+        CUDNN::cudnn_heuristic
     )
 endif()

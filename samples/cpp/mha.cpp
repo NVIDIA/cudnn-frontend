@@ -93,16 +93,14 @@ lookup_cache_or_build_graph(cudnnHandle_t handle, cache_type& user_maintained_ca
                                                         .set_data_type(fe::DataType_t::FLOAT))
                                     : nullptr;
 
-    auto scaled_dot_product_flash_attention_options = fe::graph::Scaled_dot_product_flash_attention_attributes()
-                                                          .set_name("flash_attention")
-                                                          .set_is_inference(is_inference);
+    auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention").set_is_inference(is_inference);
 
     if (is_attn_scale) {
-        scaled_dot_product_flash_attention_options.set_attn_scale(attn_scale);
+        sdpa_options.set_attn_scale(attn_scale);
     };
 
-    scaled_dot_product_flash_attention_options.set_alibi_mask(alibi_mask);
-    scaled_dot_product_flash_attention_options.set_causal_mask(causal_mask);
+    sdpa_options.set_alibi_mask(alibi_mask);
+    sdpa_options.set_causal_mask(causal_mask);
 
     auto seed = use_dropout_with_rng ? graph->tensor(fe::graph::Tensor_attributes()
                                                          .set_name("Seed")
@@ -119,7 +117,7 @@ lookup_cache_or_build_graph(cudnnHandle_t handle, cache_type& user_maintained_ca
                                        : nullptr;
 
     if (use_dropout_with_rng) {
-        scaled_dot_product_flash_attention_options.set_dropout(dropout_probability, seed, offset);
+        sdpa_options.set_dropout(dropout_probability, seed, offset);
     }
 
     auto bias = graph->tensor(fe::graph::Tensor_attributes()
@@ -128,7 +126,7 @@ lookup_cache_or_build_graph(cudnnHandle_t handle, cache_type& user_maintained_ca
                                   .set_stride({s_q * s_kv, s_q * s_kv, s_kv, 1}));
 
     if (has_bias) {
-        scaled_dot_product_flash_attention_options.set_bias(bias);
+        sdpa_options.set_bias(bias);
     }
 
     auto seq_q  = seq_len_override ? graph->tensor(fe::graph::Tensor_attributes()
@@ -145,15 +143,15 @@ lookup_cache_or_build_graph(cudnnHandle_t handle, cache_type& user_maintained_ca
                                    : nullptr;
 
     if (padding_mask) {
-        scaled_dot_product_flash_attention_options.set_padding_mask(true);
+        sdpa_options.set_padding_mask(true);
     }
     if (seq_len_override) {
-        scaled_dot_product_flash_attention_options.set_seq_len_q(seq_q).set_seq_len_kv(seq_kv);
+        sdpa_options.set_seq_len_q(seq_q).set_seq_len_kv(seq_kv);
     }
 
-    auto [O, stats] = graph->scaled_dot_product_flash_attention(Q, K, V, scaled_dot_product_flash_attention_options);
+    auto [O, stats] = graph->sdpa(Q, K, V, sdpa_options);
 
-    O->set_output(true).set_stride({h * d, d, b * h * d, 1});
+    O->set_output(true).set_dim({b, h, s_q, d}).set_stride({h * d, d, b * h * d, 1});
 
     // Check that Stats tensor is real, which is only when its training step
     if (is_inference) {
@@ -484,23 +482,20 @@ TEST_CASE("Flash backward", "[graph][mha][flash][backward]") {
                                               .set_data_type(fe::DataType_t::INT32));
     }
 
-    auto scaled_dot_product_flash_attention_backward_options =
-        fe::graph::Scaled_dot_product_flash_attention_backward_attributes()
-            .set_name("flash_attention_backward")
-            .set_causal_mask(true)
-            .set_attn_scale(attn_scale);
+    auto sdpa_backward_options = fe::graph::SDPA_backward_attributes()
+                                     .set_name("flash_attention_backward")
+                                     .set_causal_mask(true)
+                                     .set_attn_scale(attn_scale);
 
     if (is_bias) {
-        scaled_dot_product_flash_attention_backward_options.set_bias(bias);
+        sdpa_backward_options.set_bias(bias);
     }
 
     if (dropout_probability != 0.0f) {
-        scaled_dot_product_flash_attention_backward_options.set_dropout(
-            dropout_probability, dropout_seed, dropout_offset);
+        sdpa_backward_options.set_dropout(dropout_probability, dropout_seed, dropout_offset);
     }
 
-    auto [dQ, dK, dV] = mha_graph.scaled_dot_product_flash_attention_backward(
-        q, k, v, o, dO, stats, scaled_dot_product_flash_attention_backward_options);
+    auto [dQ, dK, dV] = mha_graph.sdpa_backward(q, k, v, o, dO, stats, sdpa_backward_options);
 
     dQ->set_output(true).set_dim({b, h, s_q, d}).set_stride({h * s_q * d, s_q * d, d, 1});
     dK->set_output(true).set_dim({b, h, s_kv, d}).set_stride({h * s_kv * d, s_kv * d, d, 1});

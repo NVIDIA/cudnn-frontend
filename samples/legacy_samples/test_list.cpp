@@ -1116,7 +1116,7 @@ TEST_CASE("PoolScaleBiasAct_int8 sample", "[pooling][forward][avgerage_pooling]"
     int64_t sTensorDim[] = {1, 16, 1, 1};  // scale
 
     cudnnDataType_t compType                         = CUDNN_DATA_FLOAT;
-    auto const nanOpt                                = CUDNN_NOT_PROPAGATE_NAN;
+    auto const nanOpt                                = CUDNN_PROPAGATE_NAN;
     cudnn_frontend::ResampleMode_t const mode        = cudnn_frontend::ResampleMode_t::AVGPOOL_INCLUDE_PADDING;
     cudnn_frontend::PaddingMode_t const padding_mode = cudnn_frontend::PaddingMode_t::ZERO_PAD;
 
@@ -2339,7 +2339,7 @@ TEST_CASE("Max pooling idx tensor dump", "[pooling][forward][max_pooling]") {
     Surface<int8_t> idx(Ysize, false);
 
     // Sampling params
-    auto const nanOpt                                = CUDNN_NOT_PROPAGATE_NAN;
+    auto const nanOpt                                = CUDNN_PROPAGATE_NAN;
     cudnn_frontend::ResampleMode_t const mode        = cudnn_frontend::ResampleMode_t::MAXPOOL;
     cudnn_frontend::PaddingMode_t const padding_mode = cudnn_frontend::PaddingMode_t::NEG_INF_PAD;
 
@@ -2426,7 +2426,7 @@ TEST_CASE("Backward pooling", "[pooling][backward][max_pooling]") {
         std::cout << "BACKWARD AVERAGE POOLING" << std::endl;
 
         // Sampling params
-        auto const nanOpt                                = CUDNN_NOT_PROPAGATE_NAN;
+        auto const nanOpt                                = CUDNN_PROPAGATE_NAN;
         cudnn_frontend::ResampleMode_t const mode        = cudnn_frontend::ResampleMode_t::AVGPOOL_INCLUDE_PADDING;
         cudnn_frontend::PaddingMode_t const padding_mode = cudnn_frontend::PaddingMode_t::ZERO_PAD;
 
@@ -2468,7 +2468,7 @@ TEST_CASE("Backward pooling", "[pooling][backward][max_pooling]") {
         checkCudaErr(cudaDeviceSynchronize());
 
         // Sampling params
-        auto const nanOpt                                = CUDNN_NOT_PROPAGATE_NAN;
+        auto const nanOpt                                = CUDNN_PROPAGATE_NAN;
         cudnn_frontend::ResampleMode_t const mode        = cudnn_frontend::ResampleMode_t::MAXPOOL;
         cudnn_frontend::PaddingMode_t const padding_mode = cudnn_frontend::PaddingMode_t::NEG_INF_PAD;
 

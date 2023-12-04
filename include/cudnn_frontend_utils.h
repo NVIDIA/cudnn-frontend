@@ -127,44 +127,8 @@ throw_if(bool expr, const char* message, cudnnStatus_t status) {
 }
 
 static inline std::string
-to_string(cudnnStatus_t status) {
-    switch (status) {
-        case CUDNN_STATUS_SUCCESS:
-            return std::string("CUDNN_STATUS_SUCCESS");
-        case CUDNN_STATUS_NOT_INITIALIZED:
-            return std::string("CUDNN_STATUS_NOT_INITIALIZED");
-        case CUDNN_STATUS_ALLOC_FAILED:
-            return std::string("CUDNN_STATUS_ALLOC_FAILED");
-        case CUDNN_STATUS_BAD_PARAM:
-            return std::string("CUDNN_STATUS_BAD_PARAM");
-        case CUDNN_STATUS_INTERNAL_ERROR:
-            return std::string("CUDNN_STATUS_INTERNAL_ERROR");
-        case CUDNN_STATUS_INVALID_VALUE:
-            return std::string("CUDNN_STATUS_INVALID_VALUE");
-        case CUDNN_STATUS_ARCH_MISMATCH:
-            return std::string("CUDNN_STATUS_ARCH_MISMATCH");
-        case CUDNN_STATUS_MAPPING_ERROR:
-            return std::string("CUDNN_STATUS_MAPPING_ERROR");
-        case CUDNN_STATUS_EXECUTION_FAILED:
-            return std::string("CUDNN_STATUS_EXECUTION_FAILED");
-        case CUDNN_STATUS_NOT_SUPPORTED:
-            return std::string("CUDNN_STATUS_NOT_SUPPORTED");
-        case CUDNN_STATUS_LICENSE_ERROR:
-            return std::string("CUDNN_STATUS_LICENSE_ERROR");
-        case CUDNN_STATUS_RUNTIME_PREREQUISITE_MISSING:
-            return std::string("CUDNN_STATUS_RUNTIME_PREREQUISITE_MISSING");
-        case CUDNN_STATUS_RUNTIME_IN_PROGRESS:
-            return std::string("CUDNN_STATUS_RUNTIME_IN_PROGRESS");
-        case CUDNN_STATUS_RUNTIME_FP_OVERFLOW:
-            return std::string("CUDNN_STATUS_RUNTIME_FP_OVERFLOW");
-        case CUDNN_STATUS_VERSION_MISMATCH:
-            return std::string("CUDNN_STATUS_VERSION_MISMATCH");
-#ifndef NO_DEFAULT_IN_SWITCH
-        default:
-            return std::string("UNKNOWN_CUDNN_STATUS");
-#endif
-    }
-    return std::string("");
+to_string(cudnnStatus_t const status) {
+    return cudnnGetErrorString(status);
 }
 
 static inline void
@@ -664,6 +628,7 @@ get_pointwise_mode_port_count(PointwiseMode_t const& mode) {
         case PointwiseMode_t::SOFTPLUS_BWD:
         case PointwiseMode_t::SWISH_BWD:
         case PointwiseMode_t::GELU_APPROX_TANH_BWD:
+        case PointwiseMode_t::POW:
             return 3;
 
         case PointwiseMode_t::SQRT:
@@ -678,7 +643,6 @@ get_pointwise_mode_port_count(PointwiseMode_t const& mode) {
         case PointwiseMode_t::LOG:
         case PointwiseMode_t::NEG:
         case PointwiseMode_t::MOD:
-        case PointwiseMode_t::POW:
         case PointwiseMode_t::ABS:
         case PointwiseMode_t::CEIL:
         case PointwiseMode_t::FLOOR:

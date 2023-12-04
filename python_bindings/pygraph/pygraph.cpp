@@ -224,9 +224,12 @@ std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& A,
                 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& B,
                 cudnn_frontend::DataType_t const& compute_data_type,
+                double const padding,
                 std::string const& name) {
-    auto attributes =
-        cudnn_frontend::graph::Matmul_attributes().set_compute_data_type(compute_data_type).set_name(name);
+    auto attributes = cudnn_frontend::graph::Matmul_attributes()
+                          .set_compute_data_type(compute_data_type)
+                          .set_name(name)
+                          .set_padding(padding);
 
     auto C = graph.matmul(A, B, attributes);
     return C;
@@ -457,6 +460,7 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("A"),
              py::arg("B"),
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+             py::arg_v("padding", 0.0),
              py::arg_v("name", ""),
              R"pbdoc(
                 Perform matrix multiplication of two tensors A and B.

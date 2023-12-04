@@ -13,22 +13,22 @@ using namespace pybind11::literals;
 namespace cudnn_frontend::python_bindings {
 
 std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 2>
-PyGraph::scaled_dot_product_flash_attention(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
-                                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
-                                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
-                                            bool const is_inference,
-                                            py::object const& attn_scale,
-                                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
-                                            bool const use_alibi_mask,
-                                            bool const use_padding_mask,
-                                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
-                                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
-                                            bool const use_causal_mask,
-                                            py::object const& dropout,
-                                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
-                                            cudnn_frontend::DataType_t const& compute_data_type,
-                                            std::string const& name) {
-    auto attributes = cudnn_frontend::graph::Scaled_dot_product_flash_attention_attributes()
+PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
+              bool const is_inference,
+              py::object const& attn_scale,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
+              bool const use_alibi_mask,
+              bool const use_padding_mask,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+              bool const use_causal_mask,
+              py::object const& dropout,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
+              cudnn_frontend::DataType_t const& compute_data_type,
+              std::string const& name) {
+    auto attributes = cudnn_frontend::graph::SDPA_attributes()
                           .set_is_inference(is_inference)
                           .set_bias(bias)
                           .set_alibi_mask(use_alibi_mask)
@@ -90,31 +90,30 @@ PyGraph::scaled_dot_product_flash_attention(std::shared_ptr<cudnn_frontend::grap
         }
     }
 
-    auto [O, Stats] = graph.scaled_dot_product_flash_attention(q, k, v, attributes);
+    auto [O, Stats] = graph.sdpa(q, k, v, attributes);
     return {O, Stats};
 }
 
 std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 3>
-PyGraph::scaled_dot_product_flash_attention_backward(
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& o,
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO,
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& stats,
-    py::object const& attn_scale,
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dBias,
-    bool const use_alibi_mask,
-    bool const use_padding_mask,
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
-    bool const use_causal_mask,
-    py::object const& dropout,
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
-    cudnn_frontend::DataType_t const& compute_data_type,
-    std::string const& name) {
-    auto attributes = cudnn_frontend::graph::Scaled_dot_product_flash_attention_backward_attributes()
+PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& o,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& stats,
+                       py::object const& attn_scale,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dBias,
+                       bool const use_alibi_mask,
+                       bool const use_padding_mask,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                       bool const use_causal_mask,
+                       py::object const& dropout,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
+                       cudnn_frontend::DataType_t const& compute_data_type,
+                       std::string const& name) {
+    auto attributes = cudnn_frontend::graph::SDPA_backward_attributes()
                           .set_bias(bias)
                           .set_dbias(dBias)
                           .set_alibi_mask(use_alibi_mask)
@@ -176,14 +175,14 @@ PyGraph::scaled_dot_product_flash_attention_backward(
         }
     }
 
-    auto [dQ, dK, dV] = graph.scaled_dot_product_flash_attention_backward(q, k, v, o, dO, stats, attributes);
+    auto [dQ, dK, dV] = graph.sdpa_backward(q, k, v, o, dO, stats, attributes);
     return {dQ, dK, dV};
 }
 
 void
 init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
-    m.def("scaled_dot_product_flash_attention",
-          &PyGraph::scaled_dot_product_flash_attention,
+    m.def("sdpa",
+          &PyGraph::sdpa,
           py::arg("q"),
           py::arg("k"),
           py::arg("v"),
@@ -200,7 +199,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
           py::arg_v("name", ""),
           R"pbdoc(
-                Perform scaled dot-product flash attention.
+                Perform scaled dot product attention.
 
                 Args:
                     q (cudnn_tensor): The query data.
@@ -222,8 +221,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     o (cudnn_tensor): The result of scaled dot-product flash attention.
                     stats (Optional[cudnn_tensor]): The softmax statistics in case the operation is in a training step.
             )pbdoc")
-        .def("scaled_dot_product_flash_attention_backward",
-             &PyGraph::scaled_dot_product_flash_attention_backward,
+        .def("sdpa_backward",
+             &PyGraph::sdpa_backward,
              py::arg("q"),
              py::arg("k"),
              py::arg("v"),
@@ -243,7 +242,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("name", ""),
              R"pbdoc(
-                Compute the key, query, value gradients of scaled dot-product flash attention.
+                Compute the key, query, value gradients of scaled dot product attention.
 
                 Args:
                     q (cudnn_tensor): The query data.
@@ -269,6 +268,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     dK (cudnn_tensor): The key gradient tensor of scaled dot-product flash attention.
                     dV (cudnn_tensor): The value gradient tensor of scaled dot-product flash attention.
             )pbdoc");
+    m.attr("scaled_dot_product_flash_attention")          = m.attr("sdpa");
+    m.attr("scaled_dot_product_flash_attention_backward") = m.attr("sdpa_backward");
 }
 
 }  // namespace cudnn_frontend::python_bindings

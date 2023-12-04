@@ -120,8 +120,10 @@ class MatmulNode : public INode {
 #endif
 
             // matmul descriptor
-            auto matmul_descriptor =
-                cudnn_frontend::MatMulDescBuilder().setComputeType(attributes.compute_data_type).build();
+            auto matmul_descriptor = cudnn_frontend::MatMulDescBuilder()
+                                         .setComputeType(attributes.compute_data_type)
+                                         .setPaddingValue(attributes.padding_value)
+                                         .build();
 
             auto&& matmul_operation_builder =
                 cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_MATMUL_DESCRIPTOR);
