@@ -113,7 +113,7 @@ class ConvolutionNode : public INode {
     error_t
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
-        std::vector<cudnn_frontend::Operation_v8>& operations,
+        std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Building ConvolutionNode operations " << attributes.name << "..." << std::endl;
@@ -148,7 +148,10 @@ class ConvolutionNode : public INode {
             convolution_operation_builder.setyDesc(*(tensors[Y->second->get_uid()]));
 
             convolution_operation_builder.setcDesc(convolution_descriptor).setAlpha(1.f).setBeta(0.f);
-            operations.push_back(std::move(convolution_operation_builder.build()));
+
+            auto operation = convolution_operation_builder.build();
+
+            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {

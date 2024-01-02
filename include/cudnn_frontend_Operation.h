@@ -30,9 +30,6 @@
 #include <sstream>
 #include <utility>
 
-#include <cudnn.h>
-#include <cudnn_backend.h>
-
 #include "cudnn_frontend_ConvDesc.h"
 #include "cudnn_frontend_PointWiseDesc.h"
 #include "cudnn_frontend_MatMulDesc.h"

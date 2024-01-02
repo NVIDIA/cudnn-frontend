@@ -25,9 +25,6 @@
 #include <vector>
 #include <mutex>
 
-#include <cudnn.h>
-#include <cudnn_backend.h>
-
 #include "cudnn_frontend_OperationGraph.h"
 #include "cudnn_frontend_EngineConfig.h"
 #if (CUDNN_VERSION < 8400)

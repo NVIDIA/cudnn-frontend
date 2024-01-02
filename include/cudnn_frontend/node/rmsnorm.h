@@ -110,7 +110,7 @@ class RMSNormNode : public INode {
     error_t
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
-        std::vector<cudnn_frontend::Operation_v8>& operations,
+        std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Building RMSNormNode operations " << attributes.name << "..." << std::endl;
@@ -148,7 +148,10 @@ class RMSNormNode : public INode {
                 rmsnorm_operation_builder.setBias(*(tensors.at(BIAS->second->get_uid())));
             }
 
-            operations.push_back(std::move(rmsnorm_operation_builder.build()));
+            auto operation = rmsnorm_operation_builder.build();
+
+            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
+
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {
             throw cudnnException(e.what(), e.getCudnnStatus());
@@ -292,7 +295,7 @@ class DRMSNormNode : public INode {
     error_t
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
-        std::vector<cudnn_frontend::Operation_v8>& operations,
+        std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Building DRMSNormNode operations " << attributes.name << "..." << std::endl;
@@ -330,7 +333,9 @@ class DRMSNormNode : public INode {
             CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DX, Rmsnorm_backward_attributes::output_names::DX);
             DRMSNorm_operation_builder.setdxDesc(*(tensors.at(DX->second->get_uid())));
 
-            operations.push_back(std::move(DRMSNorm_operation_builder.build()));
+            auto operation = DRMSNorm_operation_builder.build();
+
+            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {

@@ -125,7 +125,7 @@ class InstanceNormNode : public INode {
     error_t
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
-        std::vector<cudnn_frontend::Operation_v8>& operations,
+        std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Building InstanceNormNode operations " << attributes.name << "..." << std::endl;
@@ -161,7 +161,9 @@ class InstanceNormNode : public INode {
                                                  *(tensors.at(INV_VARIANCE->second->get_uid())));
             }
 
-            operations.push_back(std::move(op_builder.build()));
+            auto operation = op_builder.build();
+
+            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {
@@ -305,7 +307,7 @@ class DINNode : public INode {
     error_t
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
-        std::vector<cudnn_frontend::Operation_v8>& operations,
+        std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Building DINode operations " << attributes.name << "..." << std::endl;
@@ -343,7 +345,9 @@ class DINNode : public INode {
             CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DX, Instancenorm_backward_attributes::output_names::DX);
             DIN_operation_builder.setdxDesc(*(tensors.at(DX->second->get_uid())));
 
-            operations.push_back(std::move(DIN_operation_builder.build()));
+            auto operation = DIN_operation_builder.build();
+
+            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {

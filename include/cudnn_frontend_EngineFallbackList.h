@@ -22,7 +22,6 @@
 
 #pragma once
 
-#include <cudnn.h>
 #include <numeric>
 #include "cudnn_frontend_Heuristics.h"
 
