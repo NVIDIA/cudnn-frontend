@@ -32,7 +32,7 @@ class ICudnn {
     // Key cannot be fe::Tensor, or shared_ptr<fe::Tensor>, or underlying object address of fe::Tensor.
     // Hence using uid, as that uniquely identifies both types of tensors.
     std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>> uid_to_tensors;
-    std::vector<cudnn_frontend::Operation> operations;
+    std::vector<std::shared_ptr<cudnn_frontend::Operation>> operations;
 
     std::vector<std::shared_ptr<OperationGraph_v8>> operation_graphs;
     std::vector<std::unordered_set<uid_t>> variant_pack_uids;
@@ -91,8 +91,8 @@ class ICudnn {
     error_t
     create_cudnn_operation_graphs(cudnnHandle_t handle) {
         std::vector<Operation const*> cudnn_operations;
-        for (auto const& operation : operations) {
-            cudnn_operations.push_back(&operation);
+        for (std::shared_ptr<cudnn_frontend::Operation> operation : operations) {
+            cudnn_operations.push_back(operation.get());
         }
         auto cudnn_operation_graph = cudnn_frontend::OperationGraphBuilder()
                                          .setHandle(handle)

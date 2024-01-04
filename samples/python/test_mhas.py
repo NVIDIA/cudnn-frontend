@@ -344,11 +344,11 @@ def test_sdpa(param_extract_forward):
     # query sequence length
     s_q = random.choice([256, 512, 1024, 2048])
     # key+value sequence length
-    s_kv = random.choice([256, 512, 1024, 2048]) if layout == "non_interleaved" else s_q
+    s_kv = random.choice([8, 16, 24, 32, 256, 512, 1024, 2048]) if layout == "non_interleaved" else s_q
     # query+key embedding dimension per head
-    d_qk = random.choice([64, 128])
+    d_qk = random.choice([32, 56, 64, 128])
     # value embedding dimension per head
-    d_v = random.choice([64, 128]) if layout == "non_interleaved" else d_qk
+    d_v = random.choice([64, 96, 128]) if layout == "non_interleaved" else d_qk
     # number of heads
     h_q = 6
     if head_group == "multi_head":
@@ -366,7 +366,13 @@ def test_sdpa(param_extract_forward):
     if d_qk != d_v and cudnn.backend_version() < 8906:
         pytest.skip("d_qk != d_v is only supported on 8.9.6 onwards.")
 
-    print(f"{str(param_extract_forward)} {s_q=} {s_kv=} {d_qk=} {d_v=} {h_q=} {h_k=} {h_v=}")
+    if is_dropout and (s_kv % 64 != 0) and cudnn.backend_version() < 90000:
+        pytest.skip("Dropout mask dump with not-multiple-of-64 seq_kv is not supported.")
+
+    if ((d_qk % 64 != 0) or (s_kv % 64 != 0)) and cudnn.backend_version() < 8906:
+        pytest.skip("d not a multiple of 64, not-multiple-of-64 seq_kv is not supported below 8.9.6")
+        
+    print(f"{s_q=} {s_kv=} {d_qk=} {d_v=} {h_q=} {h_k=} {h_v=}")
 
     attn_scale = 0.125
     dropout_prob = 0.1 if is_dropout else 0.0
@@ -568,11 +574,11 @@ def test_sdpa_backward(param_extract_backward):
     # query sequence length
     s_q = random.choice([256, 512, 1024])
     # key+value sequence length
-    s_kv = random.choice([256, 512, 1024]) if layout == "non_interleaved" else s_q
+    s_kv = random.choice([32, 256, 512, 1024]) if layout == "non_interleaved" else s_q
     # query+key embedding dimension per head
-    d_qk = random.choice([64, 128])
+    d_qk = random.choice([32, 56, 64, 128])
     # value embedding dimension per head
-    d_v = random.choice([64, 128]) if layout == "non_interleaved" else d_qk
+    d_v = random.choice([64, 96, 128]) if layout == "non_interleaved" else d_qk
     # number of heads
     h_q = 6
     if head_group == "multi_head":
@@ -589,6 +595,12 @@ def test_sdpa_backward(param_extract_backward):
 
     if d_qk != d_v and cudnn.backend_version() < 8906:
         pytest.skip("d_qk != d_v is only supported on 8.9.6 onwards.")
+
+    if (s_kv % 64 != 0) and layout == "non_interleaved":
+        pytest.skip("cudnn backend does not support non-interlaved layout with non-64-aligned seq_kv.")
+        
+    if ((d_qk % 64 != 0) or (s_kv % 64 != 0)) and cudnn.backend_version() < 8906:
+        pytest.skip("d not a multiple of 64, not-multiple-of-64 seq_kv is not supported below 8.9.6")
 
     print(f"{str(param_extract_backward)} {s_q=} {s_kv=} {d_qk=} {d_v=} {h_q=} {h_k=} {h_v=}")
 

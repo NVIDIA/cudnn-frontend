@@ -156,6 +156,11 @@ Get workspace to run autotune on all plans.
 
 `get_autotune_workspace_size() const`
 
+### Error handling
+
+C++ API returns a error object which has a error code and error message. 
+
+Python API throws an exception with similar error message to be handled in python API.
 
 ## Samples
 Samples are meant to illustrate FE v1.0 API usage to users.  

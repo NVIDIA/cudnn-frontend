@@ -28,6 +28,8 @@ def test_conv_bias_relu():
     Y_expected = model(X_gpu, W_gpu, b = B_gpu, padding = padding, stride = stride, dilation = dilation)
     
     handle = cudnn.create_handle()
+    stream = torch.cuda.Stream().cuda_stream
+    cudnn.set_stream(handle = handle, stream = stream)
 
     graph = cudnn.pygraph(io_data_type = cudnn.data_type.HALF, intermediate_data_type = cudnn.data_type.FLOAT, compute_data_type = cudnn.data_type.FLOAT, handle = handle)
 
@@ -213,8 +215,8 @@ def test_conv_int8():
         torch.testing.assert_close(Y_expected, Y_actual, atol=1e-2, rtol=1e-2)
     
 if __name__ == "__main__":
-    test_conv_int8()
+    # test_conv_int8()
     # test_conv_relu()
-    # test_conv_bias_relu()
+    test_conv_bias_relu()
     # test_conv3d_bias_leaky_relu()
     # test_leaky_relu_backward()

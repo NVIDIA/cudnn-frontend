@@ -30,9 +30,6 @@
 #include <sstream>
 #include <utility>
 
-#include <cudnn.h>
-#include <cudnn_backend.h>
-
 #include "cudnn_frontend_utils.h"
 
 namespace cudnn_frontend {

@@ -22,8 +22,6 @@
 
 #pragma once
 
-#include <cudnn.h>
-
 namespace cudnn_frontend {
 
 // If filter_fn returns true
