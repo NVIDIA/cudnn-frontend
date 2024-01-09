@@ -32,9 +32,6 @@
 #include <tuple>
 #include <functional>
 
-#include <cudnn.h>
-#include <cudnn_backend.h>
-
 #include <cudnn_frontend.h>
 
 #include "../utils/fp16_dev.h"

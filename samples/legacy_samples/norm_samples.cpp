@@ -22,7 +22,7 @@
 
 #include "norm_samples.h"
 #include <cudnn_frontend.h>
-#include "cudnn_backend.h"
+
 #include "../utils/error_util.h"
 #include "../utils/helpers.h"
 
