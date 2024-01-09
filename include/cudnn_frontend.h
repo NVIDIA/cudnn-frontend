@@ -98,7 +98,6 @@
  */
 
 #include <cudnn.h>
-#include <cudnn_backend.h>
 
 #include "cudnn_frontend_ConvDesc.h"
 #include "cudnn_frontend_Heuristics.h"
@@ -125,7 +124,7 @@
 
 #define CUDNN_FRONTEND_MAJOR_VERSION 1
 #define CUDNN_FRONTEND_MINOR_VERSION 0
-#define CUDNN_FRONTEND_PATCH_VERSION 1
+#define CUDNN_FRONTEND_PATCH_VERSION 2
 #define CUDNN_FRONTEND_VERSION \
     ((CUDNN_FRONTEND_MAJOR_VERSION * 10000) + (CUDNN_FRONTEND_MINOR_VERSION * 100) + CUDNN_FRONTEND_PATCH_VERSION)
 
