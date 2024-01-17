@@ -131,6 +131,9 @@ to_string(cudnnStatus_t const status) {
     return cudnnGetErrorString(status);
 }
 
+#ifndef NV_CUDNN_DISABLE_EXCEPTION
+[[noreturn]]
+#endif
 static inline void
 set_error_and_throw_exception(BackendDescriptor const* desc, cudnnStatus_t status, const char* message) {
     if (desc != nullptr) {
