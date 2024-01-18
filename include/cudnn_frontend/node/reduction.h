@@ -139,4 +139,21 @@ class ReductionNode : public INode {
     }
 };
 
+inline void INode::reduction(std::shared_ptr<Tensor_attributes> a,
+              Reduction_attributes attributes,
+              std::shared_ptr<Tensor_attributes> c) {
+  attributes.inputs[Reduction_attributes::input_names::X]   = a;
+  attributes.outputs[Reduction_attributes::output_names::Y] = c;
+  sub_nodes.emplace_back(std::make_unique<ReductionNode>(std::move(attributes), context));
+}
+
+inline std::shared_ptr<Tensor_attributes>
+INode::reduction(std::shared_ptr<Tensor_attributes> input, Reduction_attributes attributes) {
+    attributes.inputs[Reduction_attributes::input_names::X] = input;
+    auto Y = attributes.outputs[Reduction_attributes::output_names::Y] = output_tensor(attributes.name + "::Y");
+
+    sub_nodes.emplace_back(std::make_unique<ReductionNode>(std::move(attributes), context));
+    return Y;
+}
+
 }  // namespace cudnn_frontend::graph
