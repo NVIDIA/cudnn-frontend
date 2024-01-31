@@ -114,18 +114,22 @@ weightGrad_cpu_ref(const T_ELEM* image,
     }
 }
 
-template <typename inputType, typename scale_bias_type, typename outputType>
+template <typename scale_bias_type = float>
 void
-scale_and_bias_tensor_cpu(const inputType* inputData,
-                          outputType* outputData,
+scale_and_bias_tensor_cpu(const half* inputData,
+                          float* outputData,
                           const scale_bias_type* scaleData,
                           const scale_bias_type* biasData,
                           const int64_t inputSize,
                           const int64_t* inputDims) {
     // Scale and bias per channel basis. Assumes NHWC format.
     for (int i = 0; i < inputSize; i++) {
-        int c         = i % inputDims[0];
-        outputData[i] = (scale_bias_type)inputData[i] * scaleData[c] + biasData[c];
+        int c = i % inputDims[0];
+        if constexpr (std::is_same_v<scale_bias_type, float>) {
+            outputData[i] = (__half2float(inputData[i]) * scaleData[c] + biasData[c]);
+        } else {
+            outputData[i] = (__half2float(inputData[i]) * __half2float(scaleData[c]) + __half2float(biasData[c]));
+        }
     }
 }
 
@@ -140,17 +144,21 @@ add_tensors_cpu(const inputType* firstInputData,
     }
 }
 
-template <typename inputType, typename outputType>
+template <typename outputType>
 void
-relu(const inputType* inputData, outputType* outputData, const int64_t inputSize) {
+relu(const float* inputData, outputType* outputData, const int64_t inputSize) {
     for (int i = 0; i < inputSize; i++) {
-        outputData[i] = inputData[i] > (inputType)0.0 ? inputData[i] : (inputType)0.0;
+        float output = inputData[i] > 0.0f ? inputData[i] : 0.0f;
+        if constexpr (std::is_same_v<outputType, float>) {
+            outputData[i] = output;
+        } else {
+            outputData[i] = __float2half(output);
+        }
     }
 }
 
-template <typename T_ELEM>
 void
-gen_stats_cpu(const T_ELEM* inputData,
+gen_stats_cpu(const half* inputData,
               std::vector<std::pair<float, float>>& outputData,
               const int64_t inputSize,
               const int64_t* inputDims) {
@@ -160,7 +168,7 @@ gen_stats_cpu(const T_ELEM* inputData,
         int channel_index = i % channel_dim;
 
         // Sum
-        outputData[channel_index].first = outputData[channel_index].first + (float)inputData[i];
+        outputData[channel_index].first = outputData[channel_index].first + __half2float(inputData[i]);
         totals[channel_index]           = totals[channel_index] + 1;
     }
 
@@ -173,9 +181,9 @@ gen_stats_cpu(const T_ELEM* inputData,
         int channel_index = i % channel_dim;
 
         // Sum of squares
-        T_ELEM diff = ((float)inputData[i] - outputData[channel_index].first) *
-                      ((float)inputData[i] - outputData[channel_index].first);
-        outputData[channel_index].second = (T_ELEM)outputData[channel_index].second + diff;
+        float diff = (__half2float(inputData[i]) - outputData[channel_index].first) *
+                     (__half2float(inputData[i]) - outputData[channel_index].first);
+        outputData[channel_index].second = outputData[channel_index].second + diff;
     }
 
     // Calculate the variance for the channel. Assumes NHWC format.
@@ -184,10 +192,9 @@ gen_stats_cpu(const T_ELEM* inputData,
     }
 }
 
-template <typename T_ELEM>
 void
-batch_normalize(const T_ELEM* inputData,
-                T_ELEM* outputData,
+batch_normalize(const half* inputData,
+                half* outputData,
                 const std::vector<std::pair<float, float>>& stats,
                 const int64_t inputSize,
                 const int64_t* inputDims) {
@@ -195,7 +202,8 @@ batch_normalize(const T_ELEM* inputData,
     // Loop through each element in the input and normalize it based on what batch it belongs to
     for (int i = 0; i < inputSize; i++) {
         int batch_index = i % channel_dim;
-        outputData[i] = ((float)inputData[i] - stats[batch_index].first) / (float)std::sqrt(stats[batch_index].second);
+        outputData[i]   = __float2half((__half2float(inputData[i]) - stats[batch_index].first) /
+                                     (float)std::sqrt(stats[batch_index].second));
     }
 }
 

@@ -1935,18 +1935,18 @@ TEST_CASE("Dual Scale Bias Act Relu with CPU Reference", "[frontend][fusion][DSB
     Surface<float> finalY_cpu(Ysize, true);
 
     // RP_afterScaleBias = RP_scale * RP_Y + RP_bias
-    scale_and_bias_tensor_cpu<half, float, float>(
+    scale_and_bias_tensor_cpu(
         RP_Y.hostPtr, RP_afterScaleBias.hostPtr, RP_scale.hostPtr, RP_bias.hostPtr, Ysize, yTensorDim);
 
     // DP_afterScaleBias = DP_scale * DP_Y + DP_bias
-    scale_and_bias_tensor_cpu<half, float, float>(
+    scale_and_bias_tensor_cpu(
         DP_Y.hostPtr, DP_afterScaleBias.hostPtr, DP_scale.hostPtr, DP_bias.hostPtr, Ysize, yTensorDim);
 
     // finalY_afterAdd = RP_afterScaleBias + DP_afterScaleBias
     add_tensors_cpu<float>(RP_afterScaleBias.hostPtr, DP_afterScaleBias.hostPtr, finalY_afterAdd.hostPtr, Ysize);
 
     // finalY = relu(finalY_afterAdd)
-    relu<float, float>(finalY_afterAdd.hostPtr, finalY_cpu.hostPtr, Ysize);
+    relu<float>(finalY_afterAdd.hostPtr, finalY_cpu.hostPtr, Ysize);
 
     for (int index = 0; index < Ysize; index++) {  // assuming in data is packed
         float diff = getError(finalY.hostPtr[index], finalY_cpu.hostPtr[index]);
@@ -2031,11 +2031,11 @@ TEST_CASE("Scale Bias Conv BNGenstats with CPU Reference", "[frontend][fusion][b
     std::vector<std::pair<float, float>> stats((size_t)Sumsize);
 
     // Scale -> Bias
-    scale_and_bias_tensor_cpu<half, half, float>(
+    scale_and_bias_tensor_cpu<half>(
         X.hostPtr, afterScaleBiasTensor.hostPtr, scale.hostPtr, bias.hostPtr, Xsize, xTensorDim);
 
     // Activation
-    relu<float, half>(afterScaleBiasTensor.hostPtr, afterReluTensor.hostPtr, Ysize);
+    relu<half>(afterScaleBiasTensor.hostPtr, afterReluTensor.hostPtr, Ysize);
 
     // Conv
     conv_cpu_ref<half, float>(afterReluTensor.hostPtr,
@@ -2052,13 +2052,13 @@ TEST_CASE("Scale Bias Conv BNGenstats with CPU Reference", "[frontend][fusion][b
                               4 /*Dims*/);
 
     // Gen stats
-    gen_stats_cpu<half>(afterConvTensor.hostPtr, stats, Ysize, yTensorDim);
+    gen_stats_cpu(afterConvTensor.hostPtr, stats, Ysize, yTensorDim);
 
-    batch_normalize<half>(afterConvTensor.hostPtr, afterBNTensor.hostPtr, stats, Ysize, yTensorDim);
+    batch_normalize(afterConvTensor.hostPtr, afterBNTensor.hostPtr, stats, Ysize, yTensorDim);
 
     std::vector<std::pair<float, float>> after_normalization((size_t)Sumsize);
 
-    gen_stats_cpu<half>(afterBNTensor.hostPtr, after_normalization, Ysize, yTensorDim);
+    gen_stats_cpu(afterBNTensor.hostPtr, after_normalization, Ysize, yTensorDim);
 
     for (int index = 0; index < Ysize; index++) {  // assuming in data is packed
         float diff = getError(Y.hostPtr[index], afterConvTensor.hostPtr[index]);
@@ -2557,7 +2557,7 @@ TEST_CASE("Conv two global scales", "[frontend][fusion][conv global scale]") {
     for (size_t i = 0; i < (size_t)YSize; i++) {
         half afterConvOutput   = afterConv.hostPtr[i];
         half finalOutput       = Y.hostPtr[i];
-        half globalScaleOutput = (float)afterConvOutput * scale1.hostPtr[0] * scale2.hostPtr[0];
+        half globalScaleOutput = __float2half(__half2float(afterConvOutput) * scale1.hostPtr[0] * scale2.hostPtr[0]);
         float diff             = getError(finalOutput, globalScaleOutput);
         if (diff < 0) diff = -diff;
         if (diff > THRESHOLD) {
