@@ -537,7 +537,7 @@ class SDPANode : public INode {
         void* node_workspace) const override final {
         if (attributes.dropout_probability.has_value() && attributes.dropout_probability.value() != 0.0) {
 #if CUDNN_VERSION < 8903
-            half dropout_scale_value = (1.0f / (1.0f - attributes.dropout_probability.value()));
+            half dropout_scale_value = __float2half(1.0f / (1.0f - attributes.dropout_probability.value()));
 #else
             float dropout_scale_value = (1.0f / (1.0f - attributes.dropout_probability.value()));
 #endif
@@ -1088,6 +1088,55 @@ class SDPABackwardNode : public INode {
         last_output = pointwise(last_output,
                                 attributes.inputs[input_names::Stats],
                                 Pointwise_attributes().set_name("sub_s_m").set_mode(PointwiseMode_t::SUB));
+
+        // WAR: Explicitly putting the padding value again after the stats have been loaded
+        if (attributes.padding_mask && cudnnGetVersion() >= 90000) {
+            auto row_idx_output = pointwise(last_output,
+                                            Pointwise_attributes()
+                                                .set_name("gen_row_idx_2nd_padding")
+                                                .set_mode(PointwiseMode_t::GEN_INDEX)
+                                                .set_axis(2)
+                                                .set_compute_data_type(DataType_t::INT32));
+            row_idx_output->set_data_type(DataType_t::INT32);
+
+            auto col_idx_output = pointwise(last_output,
+                                            Pointwise_attributes()
+                                                .set_name("gen_col_idx_2nd_padding")
+                                                .set_mode(PointwiseMode_t::GEN_INDEX)
+                                                .set_axis(3)
+                                                .set_compute_data_type(DataType_t::INT32));
+            col_idx_output->set_data_type(DataType_t::INT32);
+
+            auto row_mask_output = pointwise(row_idx_output,
+                                             attributes.inputs[input_names::SEQ_LEN_Q],
+                                             Pointwise_attributes()
+                                                 .set_name("lt_row_sq_2nd_padding")
+                                                 .set_mode(PointwiseMode_t::CMP_LT)
+                                                 .set_compute_data_type(DataType_t::BOOLEAN));
+            row_mask_output->set_data_type(DataType_t::BOOLEAN);
+
+            auto col_mask_output = pointwise(col_idx_output,
+                                             attributes.inputs[input_names::SEQ_LEN_KV],
+                                             Pointwise_attributes()
+                                                 .set_name("lt_col_skv_2nd_padding")
+                                                 .set_mode(PointwiseMode_t::CMP_LT)
+                                                 .set_compute_data_type(DataType_t::BOOLEAN));
+            col_mask_output->set_data_type(DataType_t::BOOLEAN);
+
+            auto padding_mask_output = pointwise(row_mask_output,
+                                                 col_mask_output,
+                                                 Pointwise_attributes()
+                                                     .set_name("and_row_col_2nd_padding")
+                                                     .set_mode(PointwiseMode_t::LOGICAL_AND)
+                                                     .set_compute_data_type(DataType_t::BOOLEAN));
+            padding_mask_output->set_data_type(DataType_t::BOOLEAN);
+
+            last_output = pointwise(
+                last_output,
+                negative_inf_padding,
+                padding_mask_output,
+                Pointwise_attributes().set_name("select_2nd_padding").set_mode(PointwiseMode_t::BINARY_SELECT));
+        }
 
         // last_output = exp(last_output)
         last_output  = pointwise(last_output, Pointwise_attributes().set_name("exp_s").set_mode(PointwiseMode_t::EXP));

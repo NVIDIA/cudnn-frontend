@@ -49,7 +49,7 @@ def compare_tensors(expected, actual, name, rtol=2e-2, atol=2e-2, fudge=1e-9):
     n_nans = torch.isnan(actual).sum()
     n_zeros = n_elem - torch.count_nonzero(actual)
 
-    if n_errors != 0:
+    if n_errors + n_nans != 0:
         print(f"========== Comparison for {name} ==========")
         print(f"Absolute Tolerance = {atol}")
         print(f"Relative Tolerance = {rtol}")
@@ -66,7 +66,7 @@ def compare_tensors(expected, actual, name, rtol=2e-2, atol=2e-2, fudge=1e-9):
         print(f"Number of Zeros = {n_zeros} ({n_zeros * 100 / n_elem:.2f}%)")
         print("===================================\n")
 
-    return n_errors
+    return n_errors + n_nans
 
 
 def get_alibi_slopes(n_heads, device="cuda"):
