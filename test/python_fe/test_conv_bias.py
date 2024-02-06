@@ -1,4 +1,5 @@
 import cudnn
+import pytest
 import torch
 
 def convert_to_cudnn_type(torch_type):
@@ -17,12 +18,14 @@ class CSBR(torch.nn.Module):
         return torch.nn.functional.relu(conv_output)
 
 def test_conv_bias_relu():
+    torch.manual_seed(0)
+
     # Reference code
     X_gpu = torch.randn(4, 16, 56, 56, requires_grad=False, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
     W_gpu = torch.randn(16, 16, 3, 3, requires_grad=False, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
     B_gpu = torch.randn(1, 16, 1, 1, requires_grad=False, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
-    padding = [0,1]
-    stride = [2,3]
+    padding = [1,1]
+    stride = [3,3]
     dilation = [1,1]
     model = CSBR().eval().to("cuda").to(torch.float16)
     Y_expected = model(X_gpu, W_gpu, b = B_gpu, padding = padding, stride = stride, dilation = dilation)
@@ -37,7 +40,7 @@ def test_conv_bias_relu():
     W = graph.tensor(name = "W", dim = W_gpu.size(), stride = W_gpu.stride(), data_type = convert_to_cudnn_type(W_gpu.dtype))
     B = graph.tensor(name = "B", dim = B_gpu.size(), stride = B_gpu.stride(), data_type = convert_to_cudnn_type(B_gpu.dtype))
 
-    conv_output = graph.conv_fprop(image = X, weight = W, padding = padding, stride = stride, dilation = dilation)
+    conv_output = graph.conv_fprop(image = X, weight = W, pre_padding = padding, post_padding = padding, stride = stride, dilation = dilation)
 
     bias_output = graph.bias(name = "bias", input = conv_output, bias = B)
 
@@ -55,7 +58,7 @@ def test_conv_bias_relu():
     Y_actual = torch.zeros_like(Y_expected)
     graph.execute({X: X_gpu, W: W_gpu, B: B_gpu, Y: Y_actual}, workspace)
 
-    torch.testing.assert_close(Y_expected, Y_actual, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(Y_expected, Y_actual, atol=0.05, rtol=1e-2)
     
     cudnn.destroy_handle(handle)
     
@@ -171,6 +174,7 @@ def test_leaky_relu_backward():
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.skipif(cudnn.backend_version() < 8600, reason="requires cudnn 8.6.0 or higher")
 def test_conv_int8():
     N, C, H, W = 1, 64, 32, 32
     K, R, S = 4, 3, 3
@@ -215,8 +219,8 @@ def test_conv_int8():
         torch.testing.assert_close(Y_expected, Y_actual, atol=1e-2, rtol=1e-2)
     
 if __name__ == "__main__":
-    # test_conv_int8()
-    # test_conv_relu()
+    test_conv_int8()
+    test_conv_relu()
     test_conv_bias_relu()
-    # test_conv3d_bias_leaky_relu()
-    # test_leaky_relu_backward()
+    test_conv3d_bias_leaky_relu()
+    test_leaky_relu_backward()

@@ -9,8 +9,8 @@
 6. [Miscellaneous](#Miscellaneous)
 
 ## Introduction
-FE v1.0 API is aimed to extend functionality and usage exposed by the [cuDNN C backend API](https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnn-backend-api). Both C++ and python APIs are provided with both having functional parity.  
-For a general introduction to FE, please first refer README.md
+FE v1.0 API is aimed to extend functionality and usage exposed by the [cuDNN C backend API](https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnn-backend-api). Both C++ and python APIs are provided, and both have functional parity.  
+For a general introduction to FE, please start with README.md.
 
 ## Workflow
 The steps involved in building and running a cudnn graph are as follows:
@@ -97,6 +97,14 @@ This method internally queries the heuristics for engine configs for the given h
 cudnn_frontend::error_t cudnn_frontend::graph::Graph::get_execution_plans(std::vector<heur_mode_t>)
 ```
 
+### Get execution plan count
+This method returns the number of execution plans returned by cudnn heuristics. Each plan gets an index from 0 to #plans-1, with 0 having top priority.
+
+```
+cudnn_frontend::int64_t
+cudnn_frontend::Graph::get_execution_plan_count() const;
+```
+
 ### Check graph support
 This method guarantees that executing the graph using plans queried will succeed.
 
@@ -105,13 +113,32 @@ cudnn_frontend::error_t cudnn_frontend::graph::Graph::check_support(cudnnHandle_
 ```
 
 ### Build plans
-This method builds one or all the engine configs that was queries during the create_execution_plan phase.
 
+This function builds execution plans queired with `create_execution_plan(...)`` API.
+
+There are two flavours of this API:
+
+Use this method to build execution plans according to a policy. Suitable when trusting cudnn heuristics to return nest suitable execition plan with top priority.
 ```
-cudnn_frontend::error_t cudnn_frontend::graph::Graph::build_plans(cudnnHandle_t const &handle, 
-                                                                cudnn_frontend::BuildPlanPolicy_t const policy, 
-                                                                bool const do_multithreaded_builds);
+cudnn_frontend::error_t
+cudnn_frontend::graph::Graph::build_plan(
+    cudnnHandle_t const &handle, 
+    cudnn_frontend::BuildPlanPolicy_t const policy, 
+    bool const do_multithreaded_builds
+);
 ```
+
+Use this method to build individual plan indicies. Main usecase is to parallely build execution plans when autotuning.
+Plan index to be used here can be queried with `get_execution_plan_count(...)` API.
+```
+cudnn_frontend::error_t
+cudnn_frontend::Graph::build_plan_at_index(
+    cudnnHandle_t const &handle,
+    int64_t plan_index
+);
+```
+
+
 
 ### Filter plans (optional)
 Users can filter out plans against numerical, behavioral notes, or plans that do not provide desired functional correctness.
@@ -139,18 +166,40 @@ cudnn_frontend::graph::Graph::autotune(cudnnHandle_t handle,
 ### Execute
 Executing graph requires device pointers to all input output tensors and a user alloaction device workspace pointer.
 
+Two flavours of execute exists, corresponding to `build_plans(...)`` API.
+
+This API already has a candidate execution plan set. Candidate execution plan get internally set either:
+- if build_policy_t::HEURISTIC_CHOICE is used, or
+- as the last plan built that got built.
+
 ```
 cudnn_frontend::error_t
-cudnn_frontend::graph::Graph::execute(cudnnHandle_t handle,
-                                        std::unordered_map<std::shared_ptr<Tensor>, void *> var_pack,
-                                        void* workspace);
+cudnn_frontend::graph::Graph::execute(
+    cudnnHandle_t handle,
+    std::unordered_map<std::shared_ptr<Tensor>, void *> var_pack,
+    void* workspace
+);
+```
+
+execute API also takes a plan index to target a specific plan. This may be used when autotuning, in conjuction with `build_plan_at_index(...)` API.
+```
+cudnn_frontend::error_t
+cudnn_frontend::graph::Graph::execute(
+    cudnnHandle_t handle,
+    std::unordered_map<std::shared_ptr<Tensor>, void *> var_pack,
+    void* workspace,
+    int64_t plan_index
+);
 ```
 
 ### Miscellaneous APIs
 
 Get workspace to execute the current selected execution plan.
 
+Can also take in a plan index to query workspace for. This may be used when autotuning, in conjuction with `build_plan_at_index(...)` API.
+
 `int64_t get_workspace_size() const`
+`int64_t get_workspace_size_plan_index(int64_t plan_index) const`
 
 Get workspace to run autotune on all plans.
 
@@ -167,8 +216,7 @@ Samples are meant to illustrate FE v1.0 API usage to users.
 - `samples/cpp` contains samples that use C++ API.
 - `samples/python` contains samples that use python API.
 
-C++ samples are written using [Catch2](https://github.com/catchorg/Catch2) test framework.  
-Python samples are written using [pytest](https://github.com/pytest-dev/pytest) and [pytorch](https://pytorch.org), with both requiring external installation.
+Python samples are jupyter notebooks with step by step guide on using FE v1 API.
 
 ## Operations
 

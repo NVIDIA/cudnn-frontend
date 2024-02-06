@@ -84,7 +84,6 @@ namespace cudnn_frontend {
 /// Detailed feature_vector. Generally the Tensor and Operation properties
 using feature_vector_t = std::vector<int64_t>;
 
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
 class cudnnException : public std::runtime_error {
    public:
     cudnnException(const char* message, cudnnStatus_t status) throw() : std::runtime_error(message) {
@@ -101,7 +100,6 @@ class cudnnException : public std::runtime_error {
 
     cudnnStatus_t error_status;
 };
-#endif
 
 static inline bool
 AllowAll(cudnnBackendDescriptor_t engine_config) {
@@ -109,28 +107,14 @@ AllowAll(cudnnBackendDescriptor_t engine_config) {
     return false;
 }
 
-static inline void
-throw_if(std::function<bool()> expr, const char* message, cudnnStatus_t status) {
-    if (expr()) {
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
-        throw cudnnException(message, status);
-#endif
-    }
-}
-static inline void
-throw_if(bool expr, const char* message, cudnnStatus_t status) {
-    if (expr) {
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
-        throw cudnnException(message, status);
-#endif
-    }
-}
-
 static inline std::string
 to_string(cudnnStatus_t const status) {
     return cudnnGetErrorString(status);
 }
 
+#ifndef NV_CUDNN_DISABLE_EXCEPTION
+[[noreturn]]
+#endif
 static inline void
 set_error_and_throw_exception(BackendDescriptor const* desc, cudnnStatus_t status, const char* message) {
     if (desc != nullptr) {
@@ -620,6 +604,7 @@ get_pointwise_mode_port_count(PointwiseMode_t const& mode) {
         case PointwiseMode_t::LOGICAL_OR:
         case PointwiseMode_t::MIN:
         case PointwiseMode_t::MAX:
+        case PointwiseMode_t::MOD:
         case PointwiseMode_t::RELU_BWD:
         case PointwiseMode_t::TANH_BWD:
         case PointwiseMode_t::SIGMOID_BWD:
@@ -642,7 +627,6 @@ get_pointwise_mode_port_count(PointwiseMode_t const& mode) {
         case PointwiseMode_t::EXP:
         case PointwiseMode_t::LOG:
         case PointwiseMode_t::NEG:
-        case PointwiseMode_t::MOD:
         case PointwiseMode_t::ABS:
         case PointwiseMode_t::CEIL:
         case PointwiseMode_t::FLOOR:
@@ -785,7 +769,7 @@ get_abili_slope(int64_t const n_heads) {
 #pragma warning(push)
 #pragma warning(disable : 4244)  // this could be ommited with c++17 and contexpr
 #endif
-    int n = 1 << static_cast<int>(log2f(n_heads));
+    int n = 1 << static_cast<int>(log2(static_cast<double>(n_heads)));
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
@@ -794,12 +778,12 @@ get_abili_slope(int64_t const n_heads) {
     }
 
     for (int i = 0; i < 2 * (n_heads - n); i += 2) {
-        slope.push_back((float)(i + 1.0f) * 0.5f);
+        slope.push_back(static_cast<float>(i + 1) * 0.5f);
     }
 
     for (float& elem : slope) {
-        elem *= -8.0;
-        elem /= n;
+        elem *= -8.0f;
+        elem /= static_cast<float>(n);
         elem = powf(2.0, elem);
     }
 

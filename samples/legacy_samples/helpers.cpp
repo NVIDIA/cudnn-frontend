@@ -48,6 +48,14 @@ is_hopper_arch() {
 }
 
 bool
+is_arch_supported_by_cudnn() {
+    if (cudnnGetVersion() < 8600 && (is_hopper_arch() || is_ada_arch())) {
+        return false;
+    }
+    return true;
+}
+
+bool
 check_device_arch_newer_than(std::string const& arch) {
     size_t arch_major = 6;
     size_t arch_minor = 0;

@@ -28,7 +28,11 @@
 TEST_CASE("Convolution fprop", "[conv][graph][caching]") {
     namespace fe = cudnn_frontend;
 
-    int64_t n = 16, c = 128, h = 56, w = 56, k = 256, r = 3, s = 3;
+    if (is_arch_supported_by_cudnn() == false) {
+        SKIP("Architecture is not supported by currend cudnn version");
+    }
+
+    int64_t n = 16, c = 128, h = 64, w = 64, k = 256, r = 1, s = 1;
 
     auto build_new_graph = [=](cudnnHandle_t handle) {
         auto graph = std::make_shared<fe::graph::Graph>();
@@ -44,8 +48,10 @@ TEST_CASE("Convolution fprop", "[conv][graph][caching]") {
                                    .set_dim({k, c, r, s})
                                    .set_stride({c * r * s, 1, c * s, c}));
 
-        auto conv_options =
-            fe::graph::Conv_fprop_attributes().set_padding({1, 1}).set_stride({1, 1}).set_dilation({1, 1});
+        auto conv_options = fe::graph::Conv_fprop_attributes()
+                                .set_padding({0, 0})
+                                .set_stride({1, 1})
+                                .set_dilation({1, 1});
         auto Y = graph->conv_fprop(X, W, conv_options);
 
         Y->set_output(true);
@@ -73,10 +79,13 @@ TEST_CASE("Convolution fprop", "[conv][graph][caching]") {
     Surface<half> w_tensor(k * c * r * s, false);
     Surface<half> y_tensor(n * k * h * w, false);  // Should be p, q.
 
-    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
-        {X, x_tensor.devPtr}, {W, w_tensor.devPtr}, {Y, y_tensor.devPtr}};
+    std::unordered_map<int64_t, void*> variant_pack = {
+        {X->get_uid(), x_tensor.devPtr}, {W->get_uid(), w_tensor.devPtr}, {Y->get_uid(), y_tensor.devPtr}};
 
     Surface<int8_t> workspace(graph->get_workspace_size(), false);
+
+    std::cout << *graph << std::endl;
+
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
     cudnnDestroy(handle);
 }

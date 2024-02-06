@@ -22,6 +22,11 @@ class PointwiseNode : public INode {
     }
 
     error_t
+    collect_pre_assigned_uids(std::unordered_set<int64_t>& pre_assigned_uids) const override final {
+        return attributes.get_prefilled_uids(pre_assigned_uids);
+    }
+
+    error_t
     pre_validate_node() const override final {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Validating pointwise node " << attributes.name << "..." << std::endl;
@@ -81,21 +86,22 @@ class PointwiseNode : public INode {
     }
 
     error_t
-    create_cudnn_tensors(int64_t& uid, std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors)
-        const override final {
+    create_cudnn_tensors(int64_t& uid,
+                         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors,
+                         std::unordered_set<int64_t> const& invalid_uids) const override final {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Building PointwiseNode " << attributes.name << " tensors X:" << std::endl;
 
         for (auto const& [name, tensor] : attributes.inputs) {
             (void)name;
             if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors, invalid_uids));
             }
         }
         for (auto const& [name, tensor] : attributes.outputs) {
             (void)name;
             if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors, invalid_uids));
             }
         }
 
@@ -110,57 +116,63 @@ class PointwiseNode : public INode {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Building PointwiseNode operations " << attributes.name << "..." << std::endl;
 
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
-        try {
-#endif
+        auto pointwise_descriptor = cudnn_frontend::PointwiseDescBuilder()
+                                        .setAxis(attributes.get_axis().value_or(-1))
+                                        .setReluLowerClipSlope(attributes.relu_lower_clip_slope.value_or(0.0))
+                                        .setComputeType(attributes.compute_data_type)
+                                        .setMode(attributes.mode)
+                                        .build();
 
-            auto pointwise_descriptor = cudnn_frontend::PointwiseDescBuilder()
-                                            .setAxis(attributes.get_axis().value_or(-1))
-                                            .setReluLowerClipSlope(attributes.relu_lower_clip_slope.value_or(0.0))
-                                            .setComputeType(attributes.compute_data_type)
-                                            .setMode(attributes.mode)
-                                            .build();
+        auto const port_count = get_pointwise_mode_port_count(attributes.mode);
 
-            auto const port_count = get_pointwise_mode_port_count(attributes.mode);
+        auto&& pointwise_operation_builder =
+            cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_POINTWISE_DESCRIPTOR);
+        pointwise_operation_builder.setpwDesc(pointwise_descriptor);
 
-            auto&& pointwise_operation_builder =
-                cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_POINTWISE_DESCRIPTOR);
-            pointwise_operation_builder.setpwDesc(pointwise_descriptor);
+        if (detail::is_activation_backward_mode(attributes.mode)) {
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_0, Pointwise_attributes::input_names::IN_0);
+            pointwise_operation_builder.setdyDesc(*(tensors.at(IN_0->second->get_uid())));
 
-            if (detail::is_activation_backward_mode(attributes.mode)) {
-                CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_0, Pointwise_attributes::input_names::IN_0);
-                pointwise_operation_builder.setdyDesc(*(tensors.at(IN_0->second->get_uid())));
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_1, Pointwise_attributes::input_names::IN_1);
+            pointwise_operation_builder.setxDesc(*(tensors.at(IN_1->second->get_uid())));
 
+            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(OUT_0, Pointwise_attributes::output_names::OUT_0);
+            pointwise_operation_builder.setdxDesc(*(tensors.at(OUT_0->second->get_uid())));
+        } else {
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_0, Pointwise_attributes::input_names::IN_0);
+            pointwise_operation_builder.setxDesc(*(tensors.at(IN_0->second->get_uid())));
+
+            if (port_count >= 3) {
                 CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_1, Pointwise_attributes::input_names::IN_1);
-                pointwise_operation_builder.setxDesc(*(tensors.at(IN_1->second->get_uid())));
-
-                CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(OUT_0, Pointwise_attributes::output_names::OUT_0);
-                pointwise_operation_builder.setdxDesc(*(tensors.at(OUT_0->second->get_uid())));
-            } else {
-                CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_0, Pointwise_attributes::input_names::IN_0);
-                pointwise_operation_builder.setxDesc(*(tensors.at(IN_0->second->get_uid())));
-
-                if (port_count >= 3) {
-                    CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_1, Pointwise_attributes::input_names::IN_1);
-                    pointwise_operation_builder.setbDesc(*(tensors.at(IN_1->second->get_uid())));
-                }
-
-                if (port_count >= 4) {
-                    CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_2, Pointwise_attributes::input_names::IN_2);
-                    pointwise_operation_builder.settDesc(*(tensors.at(IN_2->second->get_uid())));
-                }
-
-                CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(OUT_0, Pointwise_attributes::output_names::OUT_0);
-                pointwise_operation_builder.setyDesc(*(tensors.at(OUT_0->second->get_uid())));
+                pointwise_operation_builder.setbDesc(*(tensors.at(IN_1->second->get_uid())));
             }
 
+            if (port_count >= 4) {
+                CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_2, Pointwise_attributes::input_names::IN_2);
+                pointwise_operation_builder.settDesc(*(tensors.at(IN_2->second->get_uid())));
+            }
+
+            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(OUT_0, Pointwise_attributes::output_names::OUT_0);
+            pointwise_operation_builder.setyDesc(*(tensors.at(OUT_0->second->get_uid())));
+        }
+
+#ifdef NV_CUDNN_DISABLE_EXCEPTION
+        // disable exception macro is defined. Calling build will not throw.
+        // Check status of desc and return error.
+        auto operation = pointwise_operation_builder.build();
+        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       operation.get_error());
+        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
+#else
+        // build() can throw
+        // wrap in try catch
+        try {
             auto operation = pointwise_operation_builder.build();
-
             operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {
-            throw cudnnException(e.what(), e.getCudnnStatus());
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
         }
 #endif
 
@@ -172,6 +184,7 @@ class PointwiseNode : public INode {
     virtual void
     serialize(json& j) const override final {
         j = attributes;
+        j.update(R"({"tag": "POINTWISE"})"_json);
     }
 };
 

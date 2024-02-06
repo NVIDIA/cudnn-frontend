@@ -108,6 +108,11 @@ class DLNNode : public INode {
     }
 
     error_t
+    collect_pre_assigned_uids(std::unordered_set<int64_t>& pre_assigned_uids) const override final {
+        return attributes.get_prefilled_uids(pre_assigned_uids);
+    }
+
+    error_t
     post_validate_node() const override final {
         // Validate outputs
         // All properties of output tensors should have been set now.
@@ -117,26 +122,27 @@ class DLNNode : public INode {
     }
 
     error_t
-    create_cudnn_tensors(int64_t& uid, std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors)
-        const override final {
+    create_cudnn_tensors(int64_t& uid,
+                         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors,
+                         std::unordered_set<int64_t> const& invalid_uids) const override final {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Building DLNNode tensors " << attributes.name << "..." << std::endl;
 
         for (auto const& [name, tensor] : attributes.inputs) {
             (void)name;
             if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors, invalid_uids));
             }
         }
         for (auto const& [name, tensor] : attributes.outputs) {
             (void)name;
             if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors, invalid_uids));
             }
         }
 
         if (epsilon) {
-            CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(epsilon, uid, tensors));
+            CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(epsilon, uid, tensors, invalid_uids));
         }
 
         return {error_code_t::OK, ""};
@@ -150,51 +156,56 @@ class DLNNode : public INode {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Building DLNNode operations " << attributes.name << "..." << std::endl;
 
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
+        // Create the DLN operation.
+        auto&& DLN_op_builder = cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_BACKWARD_DESCRIPTOR);
+
+        DLN_op_builder.setNormalizationMode(NormMode_t::LAYER_NORM);
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Layernorm_backward_attributes::input_names::X);
+        DLN_op_builder.setxDesc(*(tensors.at(X->second->get_uid())));
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(DY, Layernorm_backward_attributes::input_names::DY);
+        DLN_op_builder.setdyDesc(*(tensors.at(DY->second->get_uid())));
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Layernorm_backward_attributes::input_names::SCALE);
+        DLN_op_builder.setScale(*(tensors.at(SCALE->second->get_uid())));
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(MEAN, Layernorm_backward_attributes::input_names::MEAN);
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(INV_VARIANCE,
+                                                  Layernorm_backward_attributes::input_names::INV_VARIANCE);
+        DLN_op_builder.setSavedMeanAndInvVar(*(tensors.at(MEAN->second->get_uid())),
+                                             *(tensors.at(INV_VARIANCE->second->get_uid())));
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DSCALE, Layernorm_backward_attributes::output_names::DSCALE);
+        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DBIAS, Layernorm_backward_attributes::output_names::DBIAS);
+        DLN_op_builder.setDScaleAndDBias(*(tensors.at(DSCALE->second->get_uid())),
+                                         *(tensors.at(DBIAS->second->get_uid())));
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DX, Layernorm_backward_attributes::output_names::DX);
+        DLN_op_builder.setdxDesc(*(tensors.at(DX->second->get_uid())));
+
+        if (epsilon) {
+            DLN_op_builder.setEpsilonTensor(*(tensors.at(epsilon->get_uid())));
+            uids_involved_in_operations.insert(epsilon->get_uid());
+        }
+
+#ifdef NV_CUDNN_DISABLE_EXCEPTION
+        // disable exception macro is defined. Calling build will not throw.
+        // Check status of desc and return error.
+        auto operation = DLN_op_builder.build();
+        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       operation.get_error());
+        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
+#else
+        // build() can throw
+        // wrap in try catch
         try {
-#endif
-
-            // Create the DLN operation.
-            auto&& DLN_op_builder =
-                cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_BACKWARD_DESCRIPTOR);
-
-            DLN_op_builder.setNormalizationMode(NormMode_t::LAYER_NORM);
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Layernorm_backward_attributes::input_names::X);
-            DLN_op_builder.setxDesc(*(tensors.at(X->second->get_uid())));
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(DY, Layernorm_backward_attributes::input_names::DY);
-            DLN_op_builder.setdyDesc(*(tensors.at(DY->second->get_uid())));
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Layernorm_backward_attributes::input_names::SCALE);
-            DLN_op_builder.setScale(*(tensors.at(SCALE->second->get_uid())));
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(MEAN, Layernorm_backward_attributes::input_names::MEAN);
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(INV_VARIANCE,
-                                                      Layernorm_backward_attributes::input_names::INV_VARIANCE);
-            DLN_op_builder.setSavedMeanAndInvVar(*(tensors.at(MEAN->second->get_uid())),
-                                                 *(tensors.at(INV_VARIANCE->second->get_uid())));
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DSCALE, Layernorm_backward_attributes::output_names::DSCALE);
-            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DBIAS, Layernorm_backward_attributes::output_names::DBIAS);
-            DLN_op_builder.setDScaleAndDBias(*(tensors.at(DSCALE->second->get_uid())),
-                                             *(tensors.at(DBIAS->second->get_uid())));
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DX, Layernorm_backward_attributes::output_names::DX);
-            DLN_op_builder.setdxDesc(*(tensors.at(DX->second->get_uid())));
-
-            if (epsilon) {
-                DLN_op_builder.setEpsilonTensor(*(tensors.at(epsilon->get_uid())));
-                uids_involved_in_operations.insert(epsilon->get_uid());
-            }
-
             auto operation = DLN_op_builder.build();
-
             operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {
-            throw cudnnException(e.what(), e.getCudnnStatus());
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
         }
 #endif
 
@@ -206,17 +217,14 @@ class DLNNode : public INode {
     virtual void
     serialize(json& j) const override final {
         j = attributes;
+        j.update(R"( {"tag": "LAYER_NORM_BPROP"})"_json);
     }
 
     error_t
-    pass_by_value_tensors_(
-        cudnnHandle_t,
-        std::unordered_map<std::shared_ptr<Tensor_attributes>, void*> const&,
-        std::unordered_map<std::shared_ptr<Tensor_attributes>, pass_by_values_t>& tensor_to_pass_by_value,
-        void*) const override final {
+    pass_by_value_tensors_(std::unordered_map<uid_t, pass_by_values_t>& tensor_to_pass_by_value) const override final {
         if (epsilon) {
             // can pass in any dummy value
-            tensor_to_pass_by_value.emplace(epsilon, 0.0f);
+            tensor_to_pass_by_value.emplace(epsilon->get_uid(), 0.0f);
         }
         return {error_code_t::OK, ""};
     }
