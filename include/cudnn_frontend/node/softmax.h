@@ -122,5 +122,15 @@ class SoftmaxNode : public INode {
 
         return {error_code_t::OK, ""};
     }
+
+    error_t
+    collect_pre_assigned_uids(std::unordered_set<int64_t>& pre_assigned_uids) const override final {
+        return attributes.get_prefilled_uids(pre_assigned_uids);
+    }
+
+    virtual void
+    serialize(json& j) const override final {
+        j = attributes;
+    }
 };
 }  // namespace cudnn_frontend::graph

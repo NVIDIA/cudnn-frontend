@@ -23,6 +23,11 @@ class DBNNode : public INode {
     }
 
     error_t
+    collect_pre_assigned_uids(std::unordered_set<int64_t>& pre_assigned_uids) const override final {
+        return attributes.get_prefilled_uids(pre_assigned_uids);
+    }
+
+    error_t
     pre_validate_node() const override final {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Validating DBNNode " << attributes.name << "..." << std::endl;
@@ -87,28 +92,29 @@ class DBNNode : public INode {
     }
 
     error_t
-    create_cudnn_tensors(int64_t& uid, std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors)
-        const override final {
+    create_cudnn_tensors(int64_t& uid,
+                         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors,
+                         std::unordered_set<int64_t> const& invalid_uids) const override final {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Building DBNNode tensors " << attributes.name << "..." << std::endl;
 
         for (auto const& [name, tensor] : attributes.inputs) {
             (void)name;
             if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors, invalid_uids));
             }
         }
         for (auto const& [name, tensor] : attributes.outputs) {
             (void)name;
             if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors, invalid_uids));
             }
         }
 
         // Special case in BN where peer stats is also an input but is not present in inputs map
         for (auto const& tensor : attributes.peer_stats) {
             if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors, invalid_uids));
             }
         }
 
@@ -123,53 +129,59 @@ class DBNNode : public INode {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Building DBNNode operations " << attributes.name << "..." << std::endl;
 
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
+        std::vector<cudnn_frontend::Tensor> peer_stats;
+        for (auto const& peer_stat : attributes.peer_stats) {
+            peer_stats.emplace_back(std::move(*(tensors.at(peer_stat->get_uid()))));
+        }
+
+        // Create the DBN operation.
+        auto&& DBN_operation_builder =
+            cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_BACKWARD_DESCRIPTOR);
+
+        DBN_operation_builder.setNormalizationMode(NormMode_t::BATCH_NORM);
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Batchnorm_backward_attributes::input_names::X);
+        DBN_operation_builder.setxDesc(*(tensors.at(X->second->get_uid())));
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(DY, Batchnorm_backward_attributes::input_names::DY);
+        DBN_operation_builder.setdyDesc(*(tensors.at(DY->second->get_uid())));
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Batchnorm_backward_attributes::input_names::SCALE);
+        DBN_operation_builder.setScale(*(tensors.at(SCALE->second->get_uid())));
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(MEAN, Batchnorm_backward_attributes::input_names::MEAN);
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(INV_VARIANCE,
+                                                  Batchnorm_backward_attributes::input_names::INV_VARIANCE);
+        DBN_operation_builder.setSavedMeanAndInvVar(*(tensors.at(MEAN->second->get_uid())),
+                                                    *(tensors.at(INV_VARIANCE->second->get_uid())));
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DSCALE, Batchnorm_backward_attributes::output_names::DSCALE);
+        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DBIAS, Batchnorm_backward_attributes::output_names::DBIAS);
+        DBN_operation_builder.setDScaleAndDBias(*(tensors.at(DSCALE->second->get_uid())),
+                                                *(tensors.at(DBIAS->second->get_uid())));
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DX, Batchnorm_backward_attributes::output_names::DX);
+        DBN_operation_builder.setdxDesc(*(tensors.at(DX->second->get_uid())));
+
+        DBN_operation_builder.setPeerStatTensor(peer_stats);
+
+#ifdef NV_CUDNN_DISABLE_EXCEPTION
+        // disable exception macro is defined. Calling build will not throw.
+        // Check status of desc and return error.
+        auto operation = DBN_operation_builder.build();
+        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       operation.get_error());
+        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
+#else
+        // build() can throw
+        // wrap in try catch
         try {
-#endif
-
-            std::vector<cudnn_frontend::Tensor> peer_stats;
-            for (auto const& peer_stat : attributes.peer_stats) {
-                peer_stats.emplace_back(std::move(*(tensors.at(peer_stat->get_uid()))));
-            }
-
-            // Create the DBN operation.
-            auto&& DBN_operation_builder =
-                cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_BACKWARD_DESCRIPTOR);
-
-            DBN_operation_builder.setNormalizationMode(NormMode_t::BATCH_NORM);
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Batchnorm_backward_attributes::input_names::X);
-            DBN_operation_builder.setxDesc(*(tensors.at(X->second->get_uid())));
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(DY, Batchnorm_backward_attributes::input_names::DY);
-            DBN_operation_builder.setdyDesc(*(tensors.at(DY->second->get_uid())));
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Batchnorm_backward_attributes::input_names::SCALE);
-            DBN_operation_builder.setScale(*(tensors.at(SCALE->second->get_uid())));
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(MEAN, Batchnorm_backward_attributes::input_names::MEAN);
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(INV_VARIANCE,
-                                                      Batchnorm_backward_attributes::input_names::INV_VARIANCE);
-            DBN_operation_builder.setSavedMeanAndInvVar(*(tensors.at(MEAN->second->get_uid())),
-                                                        *(tensors.at(INV_VARIANCE->second->get_uid())));
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DSCALE, Batchnorm_backward_attributes::output_names::DSCALE);
-            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DBIAS, Batchnorm_backward_attributes::output_names::DBIAS);
-            DBN_operation_builder.setDScaleAndDBias(*(tensors.at(DSCALE->second->get_uid())),
-                                                    *(tensors.at(DBIAS->second->get_uid())));
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DX, Batchnorm_backward_attributes::output_names::DX);
-            DBN_operation_builder.setdxDesc(*(tensors.at(DX->second->get_uid())));
-
-            DBN_operation_builder.setPeerStatTensor(peer_stats);
-
             auto operation = DBN_operation_builder.build();
-
             operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {
-            throw cudnnException(e.what(), e.getCudnnStatus());
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
         }
 #endif
 
@@ -181,6 +193,7 @@ class DBNNode : public INode {
     virtual void
     serialize(json& j) const override final {
         j = attributes;
+        j.update(R"( {"tag": "DBN"})"_json);
     }
 };
 

@@ -96,10 +96,11 @@ class EngineHeuristics_v8 : public BackendDescriptor {
                                           count,
                                           &result,
                                           heuristic_results_.data());
-        if (status != CUDNN_STATUS_SUCCESS) {
+        if (status != CUDNN_STATUS_SUCCESS || result < 1) {
             set_error_and_throw_exception(
                 this, status, "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: GetAttribute CUDNN_ATTR_ENGINEHEUR_RESULTS Failed");
         };
+        m_heuristic_results.resize(result);
         return m_heuristic_results;
     }
 

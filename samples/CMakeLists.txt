@@ -21,6 +21,8 @@ add_executable(
     cpp/layernorm.cpp
     cpp/rmsnorm.cpp
     cpp/wgrads.cpp
+    cpp/serialization.cpp
+    cpp/pointwise.cpp
 
     legacy_samples/conv_sample.cpp 
     legacy_samples/resnet_test_list.cpp

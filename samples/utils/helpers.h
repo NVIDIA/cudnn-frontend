@@ -63,6 +63,8 @@ bool
 is_hopper_arch();
 bool
 check_device_arch_newer_than(std::string const& arch);
+bool
+is_arch_supported_by_cudnn();
 
 int64_t
 getFwdConvDilatedFilterDim(int64_t filterDim, int64_t dilation);

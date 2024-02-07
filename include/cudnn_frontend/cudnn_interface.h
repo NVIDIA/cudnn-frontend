@@ -42,48 +42,59 @@ class ICudnn {
     // TODO: Always returns OK. Can the status and error message be accessed from tensor descriptor?
     error_t
     create_cudnn_tensor(std::shared_ptr<graph::Tensor_attributes> const& props,
-                        int64_t& uid,
-                        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const {
+                        uid_t& uid,
+                        std::unordered_map<uid_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors,
+                        std::unordered_set<uid_t> const& invalid_uids) const {
         // Check whether tensor already created
-        // TODO: Do not reply on uid being 0?
-        if (props->get_uid() == 0) {
-            // Make sure no other tensor somehow already has claimed uid.
-            RETURN_CUDNN_FRONTEND_ERROR_IF(tensors.find(uid) != tensors.end(),
-                                           error_code_t::ATTRIBUTE_NOT_SET,
-                                           "Trying to assign same uid to possibily two different tensors.");
+        // Make sure no other tensor somehow already has claimed uid.
+
+        auto tensor_uid = props->has_uid() ? props->get_uid() : uid;
+        if (tensors.find(tensor_uid) != tensors.end()) {
+            getLogger() << "[cudnn_frontend] INFO: Shared Tensor" << uid << " already created." << std::endl;
+            return {error_code_t::OK, ""};
+        }
+
+        if (props->has_uid() == false) {
             props->set_uid(uid);
-            uid++;
+            do {
+                uid++;
+            } while (invalid_uids.find(uid) != invalid_uids.end());
+        }
 
-            auto&& tensor_builder = cudnn_frontend::TensorBuilder();
+        auto&& tensor_builder = cudnn_frontend::TensorBuilder();
 
-            tensor_builder.setDim(props->get_dim().size(), props->get_dim().data())
-                .setStrides(props->get_stride().size(), props->get_stride().data())
-                .setId(props->get_uid())
-                .setAlignment(16)
-                .setDataType(props->get_data_type())
-                .setVirtual(props->get_is_virtual())
-                .setByValue(props->get_is_pass_by_value())
-                .setReorderType(props->get_reordering_type());
+        tensor_builder.setDim(props->get_dim().size(), props->get_dim().data())
+            .setStrides(props->get_stride().size(), props->get_stride().data())
+            .setId(props->get_uid())
+            .setAlignment(16)
+            .setDataType(props->get_data_type())
+            .setVirtual(props->get_is_virtual())
+            .setByValue(props->get_is_pass_by_value())
+            .setReorderType(props->get_reordering_type());
 
-            if (auto ragged_offset_props = props->get_ragged_offset()) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(ragged_offset_props, uid, tensors));
-                tensor_builder.setRaggedOffset(tensors.at(ragged_offset_props->get_uid()));
-            }
+        if (auto ragged_offset_props = props->get_ragged_offset()) {
+            CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(ragged_offset_props, uid, tensors, invalid_uids));
+            tensor_builder.setRaggedOffset(tensors.at(ragged_offset_props->get_uid()));
+        }
 
+#ifdef NV_CUDNN_DISABLE_EXCEPTION
+        // disable exception macro is defined. Calling build will not throw.
+        // Check status of desc and return error.
+        auto tensor = tensor_builder.build();
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            tensor.get_status() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, tensor.get_error());
+        tensors.emplace(props->get_uid(), std::make_shared<Tensor>(std::move(tensor)));
+#else
+        // build() can throw
+        // wrap in try catch
+        try {
             auto tensor = tensor_builder.build();
             tensors.emplace(props->get_uid(), std::make_shared<Tensor>(std::move(tensor)));
-
-        } else {
-            // Make sure tensor's uid is present in backend tensor registry.
+        } catch (cudnn_frontend::cudnnException& e) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(
-                tensors.find(props->get_uid()) == tensors.end(),
-                error_code_t::ATTRIBUTE_NOT_SET,
-                "Backend tensor already not found for non-zero Id: " + std::to_string(props->get_uid()));
-
-            getLogger() << "[cudnn_frontend] INFO: Backend tensor already created for Id: " +
-                               std::to_string(props->get_uid())
-                        << std::endl;
+                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
         }
+#endif
 
         return {error_code_t::OK, ""};
     }
@@ -94,26 +105,50 @@ class ICudnn {
         for (std::shared_ptr<cudnn_frontend::Operation> operation : operations) {
             cudnn_operations.push_back(operation.get());
         }
-        auto cudnn_operation_graph = cudnn_frontend::OperationGraphBuilder()
-                                         .setHandle(handle)
-                                         .setOperationGraph(cudnn_operations.size(), cudnn_operations.data())
-                                         .build();
 
+        auto&& cudnn_operation_graph_builder = cudnn_frontend::OperationGraphBuilder();
+        cudnn_operation_graph_builder.setHandle(handle).setOperationGraph(cudnn_operations.size(),
+                                                                          cudnn_operations.data());
+
+#ifdef NV_CUDNN_DISABLE_EXCEPTION
+        // disable exception macro is defined. Calling build will not throw.
+        // Check status of desc and return error.
+        auto cudnn_operation_graph = cudnn_operation_graph_builder.build();
+        RETURN_CUDNN_FRONTEND_ERROR_IF(cudnn_operation_graph.get_status() != CUDNN_STATUS_SUCCESS,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       cudnn_operation_graph.get_error());
         operation_graphs.push_back(std::make_shared<OperationGraph_v8>(std::move(cudnn_operation_graph)));
-        getLogger() << "[cudnn_frontend] INFO: Successfully built Operation Graphs." << std::endl;
-
-        return {error_code_t::OK, ""};
+#else
+        // build() can throw
+        // wrap in try catch
+        try {
+            auto cudnn_operation_graph = cudnn_operation_graph_builder.build();
+            operation_graphs.push_back(std::make_shared<OperationGraph_v8>(std::move(cudnn_operation_graph)));
+        } catch (cudnn_frontend::cudnnException& e) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
+        }
+#endif
+        return {error_code_t::OK, "Successfully built Operation Graphs."};
     }
 
    public:
-    int64_t
-    get_cudnn_workspace_size_node() const {
-        int64_t current_workspace_size = 0;
+    error_t
+    get_cudnn_workspace_size_node(int64_t const plan_index, int64_t& cudnn_workspace_size) const {
         for (auto const& execution_plan_list : plans) {
-            current_workspace_size =
-                std::max(current_workspace_size, execution_plan_list.get_best_candidate()->getWorkspaceSize());
+            int64_t candidate = plan_index != -1 ? plan_index : execution_plan_list.candidate;
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                (candidate < 0) && (static_cast<int64_t>(execution_plan_list.execution_plans.size()) <= candidate),
+                error_code_t::GRAPH_EXECUTION_FAILED,
+                "Plan index is invalid.");
+
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!(execution_plan_list.execution_plans[candidate]),
+                                           error_code_t::GRAPH_EXECUTION_FAILED,
+                                           "No candidate plan found for graph to query worksapce for.");
+            cudnn_workspace_size =
+                std::max(cudnn_workspace_size, execution_plan_list.execution_plans[candidate]->getWorkspaceSize());
         }
-        return current_workspace_size;
+        return {error_code_t::OK, ""};
     }
 
     int64_t
@@ -126,22 +161,18 @@ class ICudnn {
     }
 
     error_t
-    execute_cudnn_plans(cudnnHandle_t handle,
-                        std::unordered_map<uid_t, void*> const& tensor_uid_to_pointer_map,
-                        void* workspace_ptr) const {
-        getLogger() << "[cudnn_frontend] INFO: Executing " << plans.size() << " Plans." << std::endl;
+    execute_cudnn_plans_with_uid(cudnnHandle_t handle,
+                                 std::unordered_map<int64_t, void*> const& tensor_uid_to_pointer_map,
+                                 void* workspace_ptr,
+                                 int64_t plan_index = -1) const {
+        getLogger() << "[cudnn_frontend] INFO: Executing " << plans.size() << " plans." << std::endl;
 
+        // Go over each plan list
         for (size_t i = 0; i < plans.size(); ++i) {
-            auto const& execution_plan = plans[i].get_best_candidate();
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                execution_plan == nullptr, error_code_t::GRAPH_EXECUTION_FAILED, "No plan found to execute!!");
-            auto const& variant_pack_uid = variant_pack_uids[i];
-
-            getLogger() << "[cudnn_frontend] INFO: Executing " << execution_plan->getTag() << "..." << std::endl;
-
+            // Make sure device pointer is provided for all uids expected for this plan
             std::vector<void*> device_ptrs;
             std::vector<uid_t> uids;
-            for (auto const& uid : variant_pack_uid) {
+            for (auto const& uid : variant_pack_uids[i]) {
                 auto search = tensor_uid_to_pointer_map.find(uid);
                 RETURN_CUDNN_FRONTEND_ERROR_IF(search == tensor_uid_to_pointer_map.end(),
                                                error_code_t::INVALID_VARIANT_PACK,
@@ -149,25 +180,19 @@ class ICudnn {
                 device_ptrs.push_back(tensor_uid_to_pointer_map.at(uid));
                 uids.push_back(uid);
             }
-            auto variant_pack = VariantPackBuilder()
-                                    .setDataPointers(device_ptrs.size(), device_ptrs.data())
-                                    .setUids(uids.size(), uids.data())
-                                    .setWorkspacePointer(workspace_ptr)
-                                    .build();
-            if (variant_pack.get_status() != CUDNN_STATUS_SUCCESS) {
-                std::string message = "[cudnn_frontend] ERROR: Variant pack creation failed with " +
-                                      std::string(variant_pack.get_error());
-                return {error_code_t::INVALID_VARIANT_PACK, message};
-            }
-            getLogger() << "[cudnn_frontend] INFO: Built variant pack for " << execution_plan->getTag() << "..."
-                        << std::endl;
 
-            auto status = cudnnBackendExecute(handle, execution_plan->get_raw_desc(), variant_pack.get_raw_desc());
-            if (status != CUDNN_STATUS_SUCCESS) {
-                std::string message = "[cudnn_frontend] ERROR: Graph execution failed.";
-                return {error_code_t::GRAPH_EXECUTION_FAILED, message};
-            }
-            getLogger() << "[cudnn_frontend] INFO: Executed " << execution_plan->getTag() << "." << std::endl;
+            int64_t candidate = plan_index != -1 ? plan_index : plans[i].candidate;
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                (candidate < 0) && (static_cast<int64_t>(plans[i].execution_plans.size()) <= candidate),
+                error_code_t::GRAPH_EXECUTION_FAILED,
+                "Plan index is invalid.");
+
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!(plans[i].execution_plans[candidate]),
+                                           error_code_t::GRAPH_EXECUTION_FAILED,
+                                           "Plan index does not correspond to a valid plan.");
+
+            CHECK_CUDNN_FRONTEND_ERROR(
+                detail::execute(handle, plans[i].execution_plans[candidate].get(), device_ptrs, uids, workspace_ptr));
         }
 
         return {error_code_t::OK, ""};

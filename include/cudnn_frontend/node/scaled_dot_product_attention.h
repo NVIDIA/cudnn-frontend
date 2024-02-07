@@ -326,16 +326,12 @@ class ScaledDotProductAttentionNode : public INode {
     }
 
     virtual error_t
-    pass_by_value_tensors_(
-        cudnnHandle_t,
-        std::unordered_map<std::shared_ptr<Tensor_attributes>, void*> const&,
-        std::unordered_map<std::shared_ptr<Tensor_attributes>, pass_by_values_t>& tensor_to_pass_by_value,
-        void*) const override final {
+    pass_by_value_tensors_(std::map<uid_t, pass_by_values_t>& tensor_to_pass_by_value) const override final {
         half dropout_scale_value = options.dropout_scale;
-        tensor_to_pass_by_value.emplace(options.inputs.Dropout_scale, dropout_scale_value);
+        tensor_to_pass_by_value.emplace(options.inputs.Dropout_scale->get_uid(), dropout_scale_value);
 
         float negative_inf_value = std::numeric_limits<float>::min();
-        tensor_to_pass_by_value.emplace(negative_inf, negative_inf_value);
+        tensor_to_pass_by_value.emplace(negative_inf->get_uid(), negative_inf_value);
 
         return {error_code_t::OK, ""};
     }

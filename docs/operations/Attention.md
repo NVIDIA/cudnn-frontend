@@ -27,6 +27,7 @@ using the FlashAttention-2 algorithm as described in the paper [FlashAttention-2
   - To use an user-provided dropout mask, users must provide:
     - `dropout mask` that matches the attention weights' dimensions, indicating which weights to drop.
     - `dropout scale` used to adjust the scale of the remaining weights accordingly, such as $1 / (1 - \text{dropout probability})$.
+- Ragged tensor: allows the query, key, value, and output tensor to be [ragged tensors](https://www.tensorflow.org/guide/ragged_tensor), which are tensors with nested variable length lists as inner dimensions. Users must pass another tensor called ragged offset tensor using the `Tensor_attributes.set_ragged_offset()` method as specified in the tensors section below.
 
 When multiple masking options are enabled, they are applied in the listed order above.
 
@@ -43,6 +44,7 @@ The dimensions that are passed as 1 will apply a broadcasted mask over attention
 - (Optional) When philox RNG dropout mask is enabled, the RNG seed and offset tensors should have size $(1, 1, 1, 1)$ with int32 or int64 datatype as either a CPU or GPU tensor.
 - (Optional) When a user provided dropout mask is enabled, a dropout mask tensor should have shape $(1, 1, S_{q}, S_{kv})$, $(1, H_{q}, S_{q}, S_{kv})$, $(B, 1, S_{q}, S_{kv})$, or $(B, H_{q}, S_{q}, S_{kv})$ with input/output datatype.  
 The dimensions that are passed as 1 will apply a broadcasted mask over attention weights.
+- (Optional) When query, key, value, and output tensors are ragged tensors, the ragged offset tensor must be a tensor of size $(B + 1, 1, 1, 1)$ that contains the nested tensor's offset in terms of number of elements (not bytes). The last value of the offset tensor specifies the offset of the past-the-end element of the ragged tensor.
 
 Where,
 
@@ -96,7 +98,7 @@ SDPA_attributes &
 set_bias(std::shared_ptr<Tensor_attributes> value);
 
 SDPA_attributes&
-set_alibi_mask(bool const value)
+set_alibi_mask(bool const value);
 
 SDPA_attributes&
 set_padding_mask(bool const value);
@@ -120,7 +122,7 @@ set_dropout(std::shared_ptr<Tensor_attributes> mask,
             std::shared_ptr<Tensor_attributes> scale);
 
 SDPA_attributes &
-set_compute_data_type(DataType_t value)
+set_compute_data_type(DataType_t value);
 ```
 
 **Python API:**
@@ -153,7 +155,7 @@ This operation computes gradient tensors for scaled dot product attention using 
 
 #### Configurable Options:
 
-All the options mentioned in the forward operation, including GQA and MQA, are applicable in the backward operation as well.
+All the options mentioned in the forward operation, including ragged tensors and GQA/MQA, are applicable in the backward operation as well.
 
 #### Tensors:
 
@@ -181,19 +183,19 @@ The `options` parameter of type `SDPA_backward_attributes` is used to control th
 
 ```cpp
 SDPA_backward_attributes&
-set_attn_scale(std::shared_ptr<Tensor_attributes> value)
+set_attn_scale(std::shared_ptr<Tensor_attributes> value);
 
 SDPA_backward_attributes&
 set_attn_scale(float const value);
 
 SDPA_backward_attributes&
-set_bias(std::shared_ptr<Tensor_attributes> value)
+set_bias(std::shared_ptr<Tensor_attributes> value);
 
 SDPA_backward_attributes&
-set_dbias(std::shared_ptr<Tensor_attributes> value)
+set_dbias(std::shared_ptr<Tensor_attributes> value);
 
 SDPA_backward_attributes&
-set_alibi_mask(bool const value)
+set_alibi_mask(bool const value);
 
 SDPA_backward_attributes&
 set_padding_mask(bool const value);
@@ -205,20 +207,20 @@ SDPA_backward_attributes&
 set_seq_len_kv(std::shared_ptr<Tensor_attributes> value);
 
 SDPA_backward_attributes&
-set_causal_mask(bool const value)
+set_causal_mask(bool const value);
 
 SDPA_backward_attributes&
 set_dropout(float const probability,
             std::shared_ptr<Tensor_attributes> seed,
-            std::shared_ptr<Tensor_attributes> offset)
+            std::shared_ptr<Tensor_attributes> offset);
 
 SDPA_backward_attributes&
 set_dropout(std::shared_ptr<Tensor_attributes> mask,
             std::shared_ptr<Tensor_attributes> scale,
-            std::shared_ptr<Tensor_attributes> scale_inv)
+            std::shared_ptr<Tensor_attributes> scale_inv);
 
 SDPA_backward_attributes&
-set_compute_data_type(DataType_t const value)
+set_compute_data_type(DataType_t const value);
 ```
 
 Python API: 

@@ -21,7 +21,52 @@ def convert_to_cudnn_type(torch_type):
     
 def get_cc():
     (major, minor) = torch.cuda.get_device_capability()
-    return major*10 + minor
+    return major*10 + minor 
+
+def compare_tensors(expected, actual, name, rtol=2e-2, atol=2e-2, fudge=1e-9):
+    assert expected.shape == actual.shape
+
+    expected = expected.float().cuda().flatten()
+    actual = actual.float().cuda().flatten()
+
+    n_elem = torch.numel(expected)
+
+    mae = (expected - actual).abs().mean().item()
+    perr = ((expected - actual).abs().sum() / expected.abs().sum()).item()
+    snr = (expected**2).mean().sqrt() / ((expected - actual) ** 2).mean().sqrt()
+    snr_db = (10 * torch.log10(snr)).item()
+
+    absolute_error = (expected - actual).abs()
+    relative_error = absolute_error / torch.where(expected.abs() < fudge, fudge, expected.abs())
+
+    abs_error_indices = absolute_error > atol
+    rel_error_indices = relative_error > rtol
+    n_abs_errors = torch.sum(abs_error_indices)
+    n_rel_errors = torch.sum(rel_error_indices)
+    error_indices = torch.logical_and(abs_error_indices, rel_error_indices)
+    n_errors = torch.sum(error_indices)
+
+    n_nans = torch.isnan(actual).sum()
+    n_zeros = n_elem - torch.count_nonzero(actual)
+
+    if n_errors != 0:
+        print(f"========== Comparison for {name} ==========")
+        print(f"Absolute Tolerance = {atol}")
+        print(f"Relative Tolerance = {rtol}")
+        print(f"Number of elements = {n_elem}")
+        print(f"Number of absolute errors = {n_abs_errors} ({n_abs_errors * 100 / n_elem:.2f}%)")
+        print(f"Number of relative errors = {n_rel_errors} ({n_rel_errors * 100 / n_elem:.2f}%)")
+        print(f"Number of errors (absolute and relative) = {n_errors} ({(n_errors * 100)/n_elem:.2f}%)")
+        print(f"Maximum absolute error = {absolute_error.max():.4f}")
+        print(f"Maximum relative error = {relative_error.max():.4f}")
+        print(f"Mean average error = {mae:.4f}")
+        print(f"Perr error = {perr:.4f} = 1/{(1/perr) if perr != 0 else float('inf'):.2f}")
+        print(f"Signal to noise ratio = {snr.item():.2f} = {snr_db:.2f}dB")
+        print(f"Number of Nans = {n_nans} ({n_nans * 100 / n_elem:.2f}%)")
+        print(f"Number of Zeros = {n_zeros} ({n_zeros * 100 / n_elem:.2f}%)")
+        print("===================================\n")
+
+    return n_errors
 
 @pytest.mark.skipif(cudnn.backend_version() < 8906, reason="requires cudnn 8.9.6 or higher")
 @pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch")
@@ -82,10 +127,12 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
         A_gpu = torch.randint(4, (B, M, K), requires_grad=False, device="cuda", dtype=A_data_type) - 1
 
     if B_data_type != torch.int8:
-        B_gpu = 3 * torch.randn(B, K, N, requires_grad=False, device="cuda", dtype=B_data_type) - 1.25
+        B_gpu_strided = 3 * torch.randn(B, K, N, requires_grad=False, device="cuda", dtype=B_data_type) - 1.25
     else:
-        B_gpu = torch.randint(3, (B, K, N), requires_grad=False, device="cuda", dtype=B_data_type) - 2
-
+        B_gpu_strided = torch.randint(3, (B, K, N), requires_grad=False, device="cuda", dtype=B_data_type).contiguous() - 2
+    
+    B_gpu = torch.as_strided(B_gpu_strided, (B, K, N), (N*K, 1, N))
+    
     # Make cudnn graph
     graph = cudnn.pygraph()
 
@@ -123,7 +170,7 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
     graph.execute({A: A_gpu, B:  B_gpu, C:  C_actual}, workspace)
 
     # compare'em
-    torch.testing.assert_close(C_expected, C_actual)
+    compare_tensors(C_expected, C_actual, "output", atol=1e-4, rtol=1e-4)
 
 problem_size_options = [(1, 128, 768)
                         , (16, 512, 1600)

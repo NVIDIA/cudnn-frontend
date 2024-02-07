@@ -301,7 +301,7 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
         )pbdoc");
     m.def("tanh",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::TANH_FWD>,
-          py::arg("input0"),
+          py::arg("input"),
           py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
           py::arg_v("name", ""),
           R"pbdoc(

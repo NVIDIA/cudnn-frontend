@@ -71,6 +71,7 @@ class PyGraph {
            cudnn_frontend::DataType_t const& data_type,
            bool const& is_virtual,
            bool const& is_pass_by_value,
+           std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& ragged_offset,
            std::string const& name);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
@@ -131,7 +132,8 @@ class PyGraph {
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     conv_fprop(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& image,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& weight,
-               std::vector<int64_t> const& padding,
+               std::vector<int64_t> const& pre_padding,
+               std::vector<int64_t> const& post_padding,
                std::vector<int64_t> const& stride,
                std::vector<int64_t> const& dilation,
                cudnn_frontend::DataType_t const& compute_data_type,
@@ -140,7 +142,8 @@ class PyGraph {
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     conv_dgrad(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& loss,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& filter,
-               std::vector<int64_t> const& padding,
+               std::vector<int64_t> const& pre_padding,
+               std::vector<int64_t> const& post_padding,
                std::vector<int64_t> const& stride,
                std::vector<int64_t> const& dilation,
                cudnn_frontend::DataType_t const& compute_data_type,
@@ -149,7 +152,8 @@ class PyGraph {
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     conv_wgrad(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& image,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& loss,
-               std::vector<int64_t> const& padding,
+               std::vector<int64_t> const& pre_padding,
+               std::vector<int64_t> const& post_padding,
                std::vector<int64_t> const& stride,
                std::vector<int64_t> const& dilation,
                cudnn_frontend::DataType_t const& compute_data_type,
@@ -305,6 +309,9 @@ class PyGraph {
     void
     execute(std::unordered_map<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, py::object> var_pack,
             py::object workspace);
+
+    void
+    execute(std::unordered_map<int64_t, py::object> var_pack, py::object workspace);
 
     void
     deselect_numeric_notes(std::vector<NumericalNote_t> const& notes) {
