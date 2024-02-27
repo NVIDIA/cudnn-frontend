@@ -88,7 +88,7 @@ class CMakeBuild(build_ext):
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="cudnn",
-    version="1.1.0",
+    version="1.1.1",
     author="",
     author_email="",
     description="cudnn_frontend python package",
