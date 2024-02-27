@@ -96,11 +96,7 @@ class EngineHeuristics_v8 : public BackendDescriptor {
                                           count,
                                           &result,
                                           heuristic_results_.data());
-#if (CUDNN_VERSION >= 8907)
-        if (status != CUDNN_STATUS_SUCCESS || result < 1) {
-#else
         if (status != CUDNN_STATUS_SUCCESS) {
-#endif
             set_error_and_throw_exception(
                 this, status, "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: GetAttribute CUDNN_ATTR_ENGINEHEUR_RESULTS Failed");
         };
