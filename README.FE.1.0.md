@@ -152,17 +152,8 @@ cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_workspace_g
 ### Autotune
 
 Autotuning provides a way to execute different execution plans for a given graph and measure their relative performance under run time conditions.
-This generally helps validate and improve upon the results provided by the heuristics.
+This generally helps validate and improve upon the results provided by the heuristics. Please refer to [samples](samples/cpp/autotuning.cpp)
 
-The current API to perform the autotuning on the filtered plans:
-```
-cudnn_frontend::error_t
-cudnn_frontend::graph::Graph::autotune(cudnnHandle_t handle,
-            std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> variants,
-            void *workspace,
-            void *user_impl = nullptr);
-
-```
 ### Execute
 Executing graph requires device pointers to all input output tensors and a user alloaction device workspace pointer.
 
@@ -220,4 +211,4 @@ Python samples are jupyter notebooks with step by step guide on using FE v1 API.
 
 ## Operations
 
-Please look at docs/operations for APIs of different operation types.
+Please look at [docs/operations](docs/operations/) for APIs of different operation types.

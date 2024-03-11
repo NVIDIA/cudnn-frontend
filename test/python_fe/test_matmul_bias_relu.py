@@ -3,6 +3,8 @@ import itertools
 import pytest
 import torch
 
+from test_utils import torch_fork_set_rng
+
 def convert_to_cudnn_type(torch_type):
     if torch_type == torch.float16:
         return cudnn.data_type.HALF
@@ -23,54 +25,11 @@ def get_cc():
     (major, minor) = torch.cuda.get_device_capability()
     return major*10 + minor 
 
-def compare_tensors(expected, actual, name, rtol=2e-2, atol=2e-2, fudge=1e-9):
-    assert expected.shape == actual.shape
-
-    expected = expected.float().cuda().flatten()
-    actual = actual.float().cuda().flatten()
-
-    n_elem = torch.numel(expected)
-
-    mae = (expected - actual).abs().mean().item()
-    perr = ((expected - actual).abs().sum() / expected.abs().sum()).item()
-    snr = (expected**2).mean().sqrt() / ((expected - actual) ** 2).mean().sqrt()
-    snr_db = (10 * torch.log10(snr)).item()
-
-    absolute_error = (expected - actual).abs()
-    relative_error = absolute_error / torch.where(expected.abs() < fudge, fudge, expected.abs())
-
-    abs_error_indices = absolute_error > atol
-    rel_error_indices = relative_error > rtol
-    n_abs_errors = torch.sum(abs_error_indices)
-    n_rel_errors = torch.sum(rel_error_indices)
-    error_indices = torch.logical_and(abs_error_indices, rel_error_indices)
-    n_errors = torch.sum(error_indices)
-
-    n_nans = torch.isnan(actual).sum()
-    n_zeros = n_elem - torch.count_nonzero(actual)
-
-    if n_errors != 0:
-        print(f"========== Comparison for {name} ==========")
-        print(f"Absolute Tolerance = {atol}")
-        print(f"Relative Tolerance = {rtol}")
-        print(f"Number of elements = {n_elem}")
-        print(f"Number of absolute errors = {n_abs_errors} ({n_abs_errors * 100 / n_elem:.2f}%)")
-        print(f"Number of relative errors = {n_rel_errors} ({n_rel_errors * 100 / n_elem:.2f}%)")
-        print(f"Number of errors (absolute and relative) = {n_errors} ({(n_errors * 100)/n_elem:.2f}%)")
-        print(f"Maximum absolute error = {absolute_error.max():.4f}")
-        print(f"Maximum relative error = {relative_error.max():.4f}")
-        print(f"Mean average error = {mae:.4f}")
-        print(f"Perr error = {perr:.4f} = 1/{(1/perr) if perr != 0 else float('inf'):.2f}")
-        print(f"Signal to noise ratio = {snr.item():.2f} = {snr_db:.2f}dB")
-        print(f"Number of Nans = {n_nans} ({n_nans * 100 / n_elem:.2f}%)")
-        print(f"Number of Zeros = {n_zeros} ({n_zeros * 100 / n_elem:.2f}%)")
-        print("===================================\n")
-
-    return n_errors
-
 @pytest.mark.skipif(cudnn.backend_version() < 8906, reason="requires cudnn 8.9.6 or higher")
 @pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch")
+@torch_fork_set_rng(seed=0)
 def test_int8_bf16_matmul():
+
     # matmul problem size 
     B, M, N, K = 16, 32, 64, 128
 
@@ -115,6 +74,7 @@ MMA_data_type_options = [torch.bfloat16, torch.float16, torch.float32]
 @pytest.mark.parametrize("A_data_type", A_data_type_options)
 @pytest.mark.parametrize("B_data_type", B_data_type_options)
 @pytest.mark.parametrize("MMA_data_type", MMA_data_type_options)
+@torch_fork_set_rng(seed=0)
 def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
 
     # matmul problem size 
@@ -142,7 +102,7 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
     B = graph.tensor_like(B_gpu)
     
     # Cast the input tensors to required mma precision
-    A_casted = graph.identity(input = A, compute_data_type=convert_to_cudnn_type(MMA_data_type))
+    A_casted = graph.identity(input = A, compute_data_type=cudnn.data_type.FLOAT)
     A_casted.set_data_type(convert_to_cudnn_type(MMA_data_type))
     
     # Casting input tensor B is only supported from cudnn v9
@@ -153,9 +113,12 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
         # Do not create a cast node
         B_casted = B
     else:
-        B_casted = graph.identity(input = B, compute_data_type=convert_to_cudnn_type(MMA_data_type))
+        # Cast the input tensors to required mma precision
+        B_casted = graph.identity(input = B, compute_data_type=cudnn.data_type.FLOAT)
         B_casted.set_data_type(convert_to_cudnn_type(MMA_data_type))
 
+    # CAUTION: Hardcodes to fp32 as tests today dont cover inputs that are casted to ints.
+    # In case your usecase does cast inputs to int8, use int32 as compute type here. 
     C = graph.matmul(name = "matmul", A = A_casted, B = B_casted, compute_data_type=cudnn.data_type.FLOAT)
     C.set_output(True).set_data_type(convert_to_cudnn_type(MMA_data_type))
     
@@ -170,7 +133,7 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
     graph.execute({A: A_gpu, B:  B_gpu, C:  C_actual}, workspace)
 
     # compare'em
-    compare_tensors(C_expected, C_actual, "output", atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(C_expected, C_actual, atol=1e-4, rtol=1e-4)
 
 problem_size_options = [(1, 128, 768)
                         , (16, 512, 1600)
@@ -183,7 +146,9 @@ all_options = [elem for elem in itertools.product(*[problem_size_options, input_
 def param_extract(request):
   return request.param
 
+@torch_fork_set_rng(seed=0)
 def test_matmul_bias_relu(param_extract):
+
     problem_size_options, input_type = param_extract
     b, s, e = problem_size_options
 

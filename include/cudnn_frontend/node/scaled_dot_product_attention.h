@@ -13,14 +13,14 @@
 
 namespace cudnn_frontend::graph {
 
-class ScaledDotProductAttentionNode : public INode {
+class ScaledDotProductAttentionNode : public NodeCRTP<ScaledDotProductAttentionNode> {
+   public:
     std::shared_ptr<Tensor_attributes> negative_inf;
 
-   public:
     Scaled_dot_product_attention_attributes options;
 
     ScaledDotProductAttentionNode(Scaled_dot_product_attention_attributes&& options_, detail::Context const& context)
-        : INode(context), options(std::move(options_)) {}
+        : NodeCRTP(context), options(std::move(options_)) {}
 
     Type
     getType() override final {
@@ -54,7 +54,7 @@ class ScaledDotProductAttentionNode : public INode {
     }
 
     error_t
-    expand_and_infer_properties() override final {
+    expand_and_infer_properties_node() override final {
         getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for Scaled_dot_product_attention node "
                     << options.name << "..." << std::endl;
 

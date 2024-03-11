@@ -525,6 +525,15 @@ TEST_CASE("Bias + Matmul", "[matmul][graph]") {
 TEST_CASE("Matmul SBR Graph", "[matmul][graph]") {
     namespace fe = cudnn_frontend;
 
+    if (cudnnGetVersion() < 8600) {
+        SKIP("Test requires cuDNN version 8.6.0 or above");
+        return;
+    }
+
+    if (cudnnGetCudartVersion() < 12000) {
+        SKIP("Test requires cuda toolkit 12.0 or above");
+    }
+
     auto b = 4;
     auto m = 16;
     auto k = 64;

@@ -38,7 +38,9 @@ To run the python samples, additionally, you will need the following python pack
 
 
 ### Python API
-Install FE python API by running:
+
+#### Source installation:
+Install FE python API by running in an virtual env:
 ```
 pip install git+https://github.com/NVIDIA/cudnn-frontend.git
 ```
@@ -48,7 +50,15 @@ Above command picks cuda and cudnn from default system paths.
 To provide a custom CUDA installation path, use environment variable: `CUDAToolkit_ROOT`.  
 To provide a custom CUDNN installation path, use environment variable: `CUDNN_PATH`.
 
+#### pip wheel installation
 
+Download the pip wheel corresponding to your python installation.
+
+```
+pip install nvidia_cudnn_frontend-1.2.0-*.whl
+```
+
+#### Checking the installation
 To test whether installation is successful, run:
 ```
 pytest tests/python_fe
@@ -107,11 +117,11 @@ Calling `cudnn_frontend::getStream() = stream_name` can be used to assign the ou
 For further debugging, please turn on the cudnn backend logs described here https://docs.nvidia.com/deeplearning/cudnn/developer-guide/index.html#api-logging
 
 ## Documentation
-- See README.FE.1.0.md for v1.0 API documentation.
-- See README.FE.0.x.md for v0.x API documentation.
+- See [README.FE.1.0.md](README.FE.1.0.md) for v1.0 API documentation.
+- See [README.FE.0.x.md](README.FE.0.x.md) for v0.x API documentation.
 
 ## Contributing:
-No external contribution to this repository is accepted. Please create an issue in github for bugs or feature requests.
+Please refer to our [contribution guide](CONTRIBUTING.md)
 
 ## Feedback
 Support, resources, and information about cuDNN can be found online at https://developer.nvidia.com/cudnn. 

@@ -58,8 +58,8 @@ init_pygraph_submodule(py::module_ &);
 void
 init_properties(py::module_ &);
 
-PYBIND11_MODULE(cudnn, m) {
-    m.def("backend_version", &cudnnGetVersion);
+PYBIND11_MODULE(_compiled_module, m) {
+    m.def("backend_version", &cudnn_frontend::get_backend_version);
 
     init_properties(m);
     init_pygraph_submodule(m);

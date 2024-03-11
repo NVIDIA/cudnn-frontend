@@ -130,11 +130,11 @@ class ReductionDescBuilder_v8 {
                 "CUDNN_BACKEND_REDUCTION_DESCRIPTOR: SetAttribute CUDNN_ATTR_REDUCTION_COMP_TYPE Failed");
             return std::move(m_reductionDesc);
         }
-        status = cudnnBackendSetAttribute(m_reductionDesc.pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_REDUCTION_COMP_TYPE,
-                                          CUDNN_TYPE_DATA_TYPE,
-                                          1,
-                                          &cudnn_data_type);
+        status = cudnn_frontend::set_attribute(m_reductionDesc.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_REDUCTION_COMP_TYPE,
+                                               CUDNN_TYPE_DATA_TYPE,
+                                               1,
+                                               &cudnn_data_type);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_reductionDesc,
@@ -152,11 +152,11 @@ class ReductionDescBuilder_v8 {
                 "CUDNN_BACKEND_REDUCTION_DESCRIPTOR: SetAttribute CUDNN_ATTR_REDUCTION_OPERATOR Failed");
             return std::move(m_reductionDesc);
         }
-        status = cudnnBackendSetAttribute(m_reductionDesc.pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_REDUCTION_OPERATOR,
-                                          CUDNN_TYPE_REDUCTION_OPERATOR_TYPE,
-                                          1,
-                                          &cudnn_reduction_mode);
+        status = cudnn_frontend::set_attribute(m_reductionDesc.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_REDUCTION_OPERATOR,
+                                               CUDNN_TYPE_REDUCTION_OPERATOR_TYPE,
+                                               1,
+                                               &cudnn_reduction_mode);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_reductionDesc,
@@ -166,7 +166,7 @@ class ReductionDescBuilder_v8 {
         }
 
         // Finalizing the descriptor
-        status = cudnnBackendFinalize(m_reductionDesc.pointer->get_backend_descriptor());
+        status = cudnn_frontend::finalize(m_reductionDesc.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_reductionDesc, status, "CUDNN_BACKEND_REDUCTION_DESCRIPTOR: cudnnFinalize Failed");

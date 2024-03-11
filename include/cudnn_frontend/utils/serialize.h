@@ -325,4 +325,50 @@ NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_backward_attributes::output_names,
                                  {SDPA_backward_attributes::output_names::RNG_DUMP, "RNG_DUMP"},
                              })
 
+inline void
+to_json(nlohmann::json& j, const Tensor_attributes& ta) {
+    j = nlohmann::json{{"name", ta.name},
+                       {"data_type", ta.data_type},
+                       {"dim", ta.dim},
+                       {"stride", ta.stride},
+                       {"is_virtual", ta.is_virtual},
+                       {"pass_by_value", ta.pass_by_value},
+                       {"is_pass_by_value", ta.is_pass_by_value},
+                       {"reordering_type", ta.reordering_type},
+                       {"uid", ta.uid},
+                       {"uid_assigned", ta.uid_assigned}};
+}
+
+inline void
+from_json(const nlohmann::json& j, Tensor_attributes& ta) {
+    ta.name             = j.at("name").get<std::string>();
+    ta.data_type        = j.at("data_type").get<DataType_t>();
+    ta.dim              = j.at("dim").get<std::vector<int64_t>>();
+    ta.stride           = j.at("stride").get<std::vector<int64_t>>();
+    ta.is_virtual       = j.at("is_virtual").get<bool>();
+    ta.is_pass_by_value = j.at("is_pass_by_value").get<bool>();
+    ta.reordering_type  = j.at("reordering_type").get<TensorReordering_t>();
+    ta.uid              = j.at("uid").get<Tensor_attributes::uid_t>();
+    ta.uid_assigned     = j.at("uid_assigned").get<bool>();
+
+    if (ta.is_pass_by_value && !j["pass_by_value"].is_null()) {
+        switch (ta.data_type) {
+            case DataType_t::HALF:
+                ta.pass_by_value = j.at("pass_by_value").get<half>();
+                break;
+            case DataType_t::FLOAT:
+                ta.pass_by_value = j.at("pass_by_value").get<float>();
+                break;
+            case DataType_t::BFLOAT16:
+                ta.pass_by_value = j.at("pass_by_value").get<nv_bfloat16>();
+                break;
+            case DataType_t::INT32:
+                ta.pass_by_value = j.at("pass_by_value").get<int32_t>();
+                break;
+            default:
+                throw std::runtime_error("Unsupported data type for pass_by_value");
+        }
+    }
+}
+
 }  // namespace cudnn_frontend::graph

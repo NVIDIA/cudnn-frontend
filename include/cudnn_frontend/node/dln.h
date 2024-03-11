@@ -10,15 +10,12 @@ namespace cudnn_frontend {
 
 namespace graph {
 
-class DLNNode : public INode {
-    // Keep epsilon for pre-8906
-    std::shared_ptr<Tensor_attributes> epsilon;
-
+class DLNNode : public NodeCRTP<DLNNode> {
    public:
     Layernorm_backward_attributes attributes;
 
     DLNNode(Layernorm_backward_attributes&& attributes_, detail::Context const& context)
-        : INode(context), attributes(std::move(attributes_)) {}
+        : NodeCRTP(context), attributes(std::move(attributes_)) {}
 
     Type
     getType() override final {
@@ -36,9 +33,15 @@ class DLNNode : public INode {
     }
 
     error_t
-    expand_and_infer_properties() override final {
+    expand_and_infer_properties_node() override final {
         getLogger() << "[cudnn_frontend] INFO: Inferencing properties for DLN node " << attributes.name << "..."
                     << std::endl;
+
+        // WAR as epsilon was required in previous versions
+        if (cudnn_frontend::get_backend_version() < 8906) {
+            attributes.inputs[Layernorm_backward_attributes::input_names::EPSILON] =
+                std::make_shared<Tensor_attributes>(0.0f);
+        }
 
         attributes.fill_from_context(context);
 
@@ -96,20 +99,7 @@ class DLNNode : public INode {
         infer_scale_bias_tensors(attributes.outputs[Layernorm_backward_attributes::output_names::DSCALE]);
         infer_scale_bias_tensors(attributes.outputs[Layernorm_backward_attributes::output_names::DBIAS]);
 
-        if (cudnnGetVersion() < 8906) {
-            epsilon = std::make_shared<Tensor_attributes>();
-            epsilon->set_is_pass_by_value(true)
-                .set_dim({1, 1, 1, 1})
-                .set_stride({1, 1, 1, 1})
-                .set_data_type(DataType_t::FLOAT);
-        }
-
         return {error_code_t::OK, ""};
-    }
-
-    error_t
-    collect_pre_assigned_uids(std::unordered_set<int64_t>& pre_assigned_uids) const override final {
-        return attributes.get_prefilled_uids(pre_assigned_uids);
     }
 
     error_t
@@ -117,33 +107,6 @@ class DLNNode : public INode {
         // Validate outputs
         // All properties of output tensors should have been set now.
         CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    create_cudnn_tensors(int64_t& uid,
-                         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors,
-                         std::unordered_set<int64_t> const& invalid_uids) const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building DLNNode tensors " << attributes.name << "..." << std::endl;
-
-        for (auto const& [name, tensor] : attributes.inputs) {
-            (void)name;
-            if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors, invalid_uids));
-            }
-        }
-        for (auto const& [name, tensor] : attributes.outputs) {
-            (void)name;
-            if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors, invalid_uids));
-            }
-        }
-
-        if (epsilon) {
-            CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(epsilon, uid, tensors, invalid_uids));
-        }
 
         return {error_code_t::OK, ""};
     }
@@ -184,9 +147,9 @@ class DLNNode : public INode {
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DX, Layernorm_backward_attributes::output_names::DX);
         DLN_op_builder.setdxDesc(*(tensors.at(DX->second->get_uid())));
 
-        if (epsilon) {
-            DLN_op_builder.setEpsilonTensor(*(tensors.at(epsilon->get_uid())));
-            uids_involved_in_operations.insert(epsilon->get_uid());
+        if (cudnn_frontend::get_backend_version() < 8906) {
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(EPSILON, Layernorm_backward_attributes::input_names::EPSILON);
+            DLN_op_builder.setEpsilonTensor(*(tensors.at(EPSILON->second->get_uid())));
         }
 
 #ifdef NV_CUDNN_DISABLE_EXCEPTION
@@ -218,15 +181,6 @@ class DLNNode : public INode {
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"( {"tag": "LAYER_NORM_BPROP"})"_json);
-    }
-
-    error_t
-    pass_by_value_tensors_(std::unordered_map<uid_t, pass_by_values_t>& tensor_to_pass_by_value) const override final {
-        if (epsilon) {
-            // can pass in any dummy value
-            tensor_to_pass_by_value.emplace(epsilon->get_uid(), 0.0f);
-        }
-        return {error_code_t::OK, ""};
     }
 };
 

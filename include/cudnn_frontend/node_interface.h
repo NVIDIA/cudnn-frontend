@@ -7,6 +7,7 @@
 #include <limits>
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include "../cudnn_frontend_Tensor.h"
 #include "../cudnn_frontend_Operation.h"
@@ -22,6 +23,8 @@ namespace cudnn_frontend {
 
 namespace graph {
 
+class BatchNormNode;
+class DBNNode;
 class MatmulNode;
 class PointwiseNode;
 class ReductionNode;
@@ -33,13 +36,11 @@ class SoftmaxNode;
 class INode : public ICudnn {
    public:
     // A closed set of types that are allowed to be passed by value today
-    using pass_by_values_t = std::variant<int32_t, half, float, void*>;
+    using pass_by_values_t = Tensor_attributes::pass_by_values_t;
 
     detail::Context context;
 
    private:
-    std::unordered_map<uid_t, pass_by_values_t> deserialized_pass_by_value;
-    std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> deserialized_workspace_modifications;
     int64_t fe_workspace_size = 0;
 
     std::shared_ptr<Tensor_attributes>
@@ -53,7 +54,7 @@ class INode : public ICudnn {
     pre_validate_node() const = 0;
 
     virtual error_t
-    expand_and_infer_properties() = 0;
+    expand_and_infer_properties_node() = 0;
 
     virtual error_t
     post_validate_node() const = 0;
@@ -98,12 +99,17 @@ class INode : public ICudnn {
     }
 
     virtual error_t
-    pass_by_value_tensors_(std::unordered_map<uid_t, pass_by_values_t>& pass_by_values) const {
-        for (auto [uid, value] : deserialized_pass_by_value) {
-            pass_by_values.emplace(uid, value);
-        }
-        return {error_code_t::OK, ""};
-    }
+    pass_by_value_tensors_(std::unordered_map<uid_t, pass_by_values_t>& pass_by_values) const = 0;
+
+    virtual error_t
+    collect_pre_assigned_uids_(std::unordered_set<int64_t>& pre_assigned_uids) const = 0;
+
+    virtual error_t
+    set_uids_(int64_t& potential_uid, std::unordered_set<int64_t> const& pre_assigned_uids) const = 0;
+
+    virtual error_t
+    create_cudnn_tensors_(
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& uid_to_backend_tensors) const = 0;
 
     error_t
     run_auxiliary_kernels(
@@ -111,21 +117,21 @@ class INode : public ICudnn {
         void* fe_workspace,
         std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>>& workspace_modifications) const {
         cudaStream_t stream;
-        CHECK_CUDNN_ERROR(cudnnGetStream(handle, &stream));
+        CHECK_CUDNN_ERROR(cudnn_frontend::get_stream(handle, &stream));
         char* workspace = static_cast<char*>(fe_workspace);
 
         for (auto [uid, data] : workspace_modifications) {
             (void)uid;
             if (std::get<0>(data) == 0) {
                 auto& vec_data = std::get<2>(data);
-                CHECK_CUDA_ERROR(cudaMemcpyAsync(workspace + std::get<1>(data),
-                                                 vec_data.data(),
-                                                 vec_data.size() * sizeof(float),
-                                                 cudaMemcpyHostToDevice,
-                                                 stream));
+                CHECK_CUDA_ERROR(cuda_mem_cpy_async(workspace + std::get<1>(data),
+                                                    vec_data.data(),
+                                                    vec_data.size() * sizeof(float),
+                                                    cudaMemcpyHostToDevice,
+                                                    stream));
             } else if (std::get<0>(data) == 1) {
                 int64_t memset_size = (int64_t)std::get<2>(data)[0];
-                CHECK_CUDA_ERROR(cudaMemsetAsync(workspace + std::get<1>(data), 0, memset_size, stream));
+                CHECK_CUDA_ERROR(cuda_mem_set_async(workspace + std::get<1>(data), 0, memset_size, stream));
             }
         }
         return {error_code_t::OK, ""};
@@ -182,12 +188,12 @@ class INode : public ICudnn {
         for (auto& [uid, value] : tensor_to_pass_by_value) {
             if (half* half_value_ptr = std::get_if<half>(&value)) {
                 tensor_to_pointer_map.emplace(uid, half_value_ptr);
+            } else if (nv_bfloat16* nv_bfloat16_value_ptr = std::get_if<nv_bfloat16>(&value)) {
+                tensor_to_pointer_map.emplace(uid, nv_bfloat16_value_ptr);
             } else if (int32_t* int32_t_value_ptr = std::get_if<int32_t>(&value)) {
                 tensor_to_pointer_map.emplace(uid, int32_t_value_ptr);
             } else if (float* float_value_ptr = std::get_if<float>(&value)) {
                 tensor_to_pointer_map.emplace(uid, float_value_ptr);
-            } else if (void** void_value_ptr = std::get_if<void*>(&value)) {
-                tensor_to_pointer_map.emplace(uid, *void_value_ptr);
             } else {
                 RETURN_CUDNN_FRONTEND_ERROR_IF(
                     true, error_code_t::INVALID_VARIANT_PACK, "Unexpected type for pass by value tensor.");
@@ -197,6 +203,9 @@ class INode : public ICudnn {
     }
 
    protected:
+    std::unordered_map<uid_t, pass_by_values_t> deserialized_pass_by_value;
+    std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> deserialized_workspace_modifications;
+
     // Type of each node. Nodes can either be a composite (value COMPOSITE) or
     // one of the other primitive types. Primitives types are nothing but
     // cudnn operations.
@@ -302,13 +311,35 @@ class INode : public ICudnn {
         sub_nodes.emplace_back(std::make_unique<RngNode>(std::move(attributes), context));
     }
 
-    // Creates cudnn tensors for each node (and its sub nodes)
-    virtual error_t
-    create_cudnn_tensors(int64_t& uid,
-                         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& uid_to_backend_tensors,
-                         std::unordered_set<int64_t> const& invalid_uids) const {
+    error_t
+    pre_validate_and_expand_node() {
+        // pre validate to catch errors early
+        // Otherwise code reability decreases in expand_and_infer
+        CHECK_CUDNN_FRONTEND_ERROR(pre_validate_node());
+        CHECK_CUDNN_FRONTEND_ERROR(expand_and_infer_properties_node());
         for (auto const& sub_node : sub_nodes) {
-            CHECK_CUDNN_FRONTEND_ERROR(sub_node->create_cudnn_tensors(uid, uid_to_backend_tensors, invalid_uids));
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->pre_validate_and_expand_node());
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    post_validate() const {
+        // Validate self
+        CHECK_CUDNN_FRONTEND_ERROR(post_validate_node());
+        for (auto const& sub_node : sub_nodes) {
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->post_validate());
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    // Creates cudnn tensors for each node (and its sub nodes)
+    error_t
+    create_cudnn_tensors(
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& uid_to_backend_tensors) const {
+        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensors_(uid_to_backend_tensors));
+        for (auto const& sub_node : sub_nodes) {
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->create_cudnn_tensors(uid_to_backend_tensors));
         }
         return {error_code_t::OK, ""};
     }
@@ -327,10 +358,22 @@ class INode : public ICudnn {
         return {error_code_t::OK, ""};
     }
 
-    virtual error_t
+    error_t
     collect_pre_assigned_uids(std::unordered_set<int64_t>& pre_assigned_uids) const {
+        // Collect uids from current node
+        CHECK_CUDNN_FRONTEND_ERROR(collect_pre_assigned_uids_(pre_assigned_uids));
         for (auto const& sub_node : sub_nodes) {
-            auto x = sub_node->collect_pre_assigned_uids(pre_assigned_uids);
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_pre_assigned_uids(pre_assigned_uids));
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    set_uids(int64_t& potential_uid, std::unordered_set<int64_t> const& pre_assigned_uids) const {
+        // Collect uids from current node
+        CHECK_CUDNN_FRONTEND_ERROR(set_uids_(potential_uid, pre_assigned_uids));
+        for (auto const& sub_node : sub_nodes) {
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->set_uids(potential_uid, pre_assigned_uids));
         }
         return {error_code_t::OK, ""};
     }
@@ -364,38 +407,28 @@ class INode : public ICudnn {
                                            Rng_attributes);
     error_t
     validate() {
-        // validate self
-        CHECK_CUDNN_FRONTEND_ERROR(pre_validate_node());
-
         // infer_properties self
-        CHECK_CUDNN_FRONTEND_ERROR(expand_and_infer_properties());
+        CHECK_CUDNN_FRONTEND_ERROR(pre_validate_and_expand_node());
 
-        // validate sub nodes
-        for (auto const& sub_node : sub_nodes) {
-            CHECK_CUDNN_FRONTEND_ERROR(sub_node->validate());
-        }
+        // assign uids as part of validation
+        // This helps catch whether user has assigned duplicated uids to tensors
+        // Each time a backend tensor is created, uid will be incremented by 1, ensuring uniqueness.
+        std::unordered_set<int64_t> pre_assigned_uids;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_pre_assigned_uids(pre_assigned_uids));
 
-        // validate self
-        CHECK_CUDNN_FRONTEND_ERROR(post_validate_node());
+        Tensor_attributes::uid_t start_uid = 1;
+        CHECK_CUDNN_FRONTEND_ERROR(set_uids(start_uid, pre_assigned_uids));
+
+        // validate the full tree again
+        CHECK_CUDNN_FRONTEND_ERROR(post_validate());
 
         return {error_code_t::OK, ""};
     }
 
     error_t
     build_operation_graph(cudnnHandle_t handle) {
-        // Starting uid for operation graph.
-        // Each time a backend tensor is created, uid will be incremented by 1, ensuring uniqueness.
-        // TODO: Maybe just use uid_to_tensors size as uid each time?
-        int64_t uid = 1;
-
-        std::unordered_set<int64_t> pre_assigned_uids;
-        CHECK_CUDNN_FRONTEND_ERROR(collect_pre_assigned_uids(pre_assigned_uids));
-        while (pre_assigned_uids.find(uid) != pre_assigned_uids.end()) {
-            uid++;
-        }
-
         // Lower each sub node to cudnn backend.
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensors(uid, uid_to_tensors, pre_assigned_uids));
+        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensors(uid_to_tensors));
 
         // INode needs to keep track of all uids that an operation graph uses.
         // This is because cudnn backend will not accept extra tensors in variant pack.
@@ -591,30 +624,7 @@ class INode : public ICudnn {
             index++;
         }
 
-        std::unordered_map<uid_t, int32_t> integer_pass_by_values;
-        std::unordered_map<uid_t, float> half_pass_by_values;
-        std::unordered_map<uid_t, float> float_pass_by_values;
-
-        auto pass_by_value_tensors = j["pass_by_values"];
-        for (auto i = 0u; i < pass_by_value_tensors.size(); i++) {
-            if (i == 0) {
-                integer_pass_by_values = pass_by_value_tensors[i].get<std::unordered_map<uid_t, int32_t>>();
-            } else if (i == 1) {
-                half_pass_by_values = pass_by_value_tensors[i].get<std::unordered_map<uid_t, float>>();
-            } else if (i == 2) {
-                float_pass_by_values = pass_by_value_tensors[i].get<std::unordered_map<uid_t, float>>();
-            }
-        }
-
-        for (auto const& [uid, value] : integer_pass_by_values) {
-            deserialized_pass_by_value.emplace(uid, value);
-        }
-        for (auto const& [uid, value] : half_pass_by_values) {
-            deserialized_pass_by_value.emplace(uid, __float2half(value));
-        }
-        for (auto const& [uid, value] : float_pass_by_values) {
-            deserialized_pass_by_value.emplace(uid, value);
-        }
+        deserialized_pass_by_value = j["pass_by_values"];
 
         deserialized_workspace_modifications = j["workspace_modifications"];
 
@@ -642,30 +652,11 @@ class INode : public ICudnn {
 
         std::unordered_map<uid_t, pass_by_values_t> tensor_to_pass_by_value;
         CHECK_CUDNN_FRONTEND_ERROR(gather_pass_by_value_tensors_(tensor_to_pass_by_value));
-
-        j["pass_by_values"];
-        std::unordered_map<uid_t, int32_t> integer_pass_by_values;
-        std::unordered_map<uid_t, float> half_pass_by_values;
-        std::unordered_map<uid_t, float> float_pass_by_values;
-        // std::unordered_map<uid_t, void *>  void_ptr_pass_by_values;
-        for (auto const& [uid, pass_by_value] : tensor_to_pass_by_value) {
-            if (pass_by_value.index() == 0) {
-                integer_pass_by_values.emplace(uid, std::get<0>(pass_by_value));
-            } else if (pass_by_value.index() == 1) {
-                half_pass_by_values.emplace(uid, __half2float(std::get<1>(pass_by_value)));
-            } else if (pass_by_value.index() == 2) {
-                float_pass_by_values.emplace(uid, std::get<2>(pass_by_value));
-            }
-        }
-        // json j = half_pass_by_values;
-        j["pass_by_values"].push_back(integer_pass_by_values);
-        j["pass_by_values"].push_back(half_pass_by_values);
-        j["pass_by_values"].push_back(float_pass_by_values);
+        j["pass_by_values"] = tensor_to_pass_by_value;
 
         std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> workspace_modifications;
         int64_t workspace_offset = 0;
         CHECK_CUDNN_FRONTEND_ERROR(gather_workspace_modifications(workspace_modifications, workspace_offset));
-
         j["workspace_modifications"] = workspace_modifications;
 
         j["fe_workspace_size"] = get_fe_workspace_size();
@@ -694,6 +685,74 @@ class INode : public ICudnn {
 to_json(json& j, const INode& p) {
     p.serialize(j);
 }
+
+template <typename DerivedT>
+class NodeCRTP : public INode {
+    DerivedT&
+    self() {
+        return *static_cast<DerivedT*>(this);
+    }
+    DerivedT const&
+    self() const {
+        return *static_cast<DerivedT const*>(this);
+    }
+
+    error_t
+    pass_by_value_tensors_(
+        std::unordered_map<Tensor_attributes::uid_t, pass_by_values_t>& tensor_to_pass_by_value) const override final {
+        CHECK_CUDNN_FRONTEND_ERROR(self().attributes.fill_pass_by_value(tensor_to_pass_by_value));
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    collect_pre_assigned_uids_(std::unordered_set<int64_t>& pre_assigned_uids) const override final {
+        CHECK_CUDNN_FRONTEND_ERROR(self().attributes.get_prefilled_uids(pre_assigned_uids));
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    set_uids_(int64_t& potential_uid, std::unordered_set<int64_t> const& pre_assigned_uids) const override final {
+        CHECK_CUDNN_FRONTEND_ERROR(self().attributes.set_uids(potential_uid, pre_assigned_uids));
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    create_cudnn_tensors_(
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
+        getLogger() << "[cudnn_frontend] INFO: Creating cudnn tensors for node named '" << self().attributes.name
+                    << "':" << std::endl;
+        for (auto const& [name, tensor] : self().attributes.inputs) {
+            (void)name;
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, tensors));
+            }
+        }
+        for (auto const& [name, tensor] : self().attributes.outputs) {
+            (void)name;
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, tensors));
+            }
+        }
+
+        // Handle special case of BN where peer_stats is also an input
+        if constexpr (std::is_same_v<DerivedT, DBNNode> || std::is_same_v<DerivedT, BatchNormNode>) {
+            // Special case in BN where peer stats is also an input but is not present in inputs map
+            for (auto const& tensor : self().attributes.peer_stats) {
+                if (tensor) {
+                    CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, tensors));
+                }
+            }
+        }
+
+        return {error_code_t::OK, ""};
+    }
+
+   protected:
+    using INode::INode;
+};
 
 #define CUDNN_FE_VALIDATE_TENSOR_(port, map_)                                                      \
     {                                                                                              \

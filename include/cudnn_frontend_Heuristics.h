@@ -27,9 +27,6 @@
 
 #include "cudnn_frontend_OperationGraph.h"
 #include "cudnn_frontend_EngineConfig.h"
-#if (CUDNN_VERSION < 8400)
-#include "cudnn_frontend_EngineFallbackList.h"
-#endif
 #include "cudnn_frontend_utils.h"
 #include "cudnn_frontend_Filters.h"
 
@@ -90,12 +87,13 @@ class EngineHeuristics_v8 : public BackendDescriptor {
             heuristic_results_.emplace_back(m_heuristic_results[i]->get_backend_descriptor());
         }
         int64_t result = -1;
-        status         = cudnnBackendGetAttribute(pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_ENGINEHEUR_RESULTS,
-                                          CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                          count,
-                                          &result,
-                                          heuristic_results_.data());
+        status         = cudnn_frontend::get_attribute(pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_ENGINEHEUR_RESULTS,
+                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                               count,
+                                               &result,
+                                               heuristic_results_.data());
+
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 this, status, "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: GetAttribute CUDNN_ATTR_ENGINEHEUR_RESULTS Failed");
@@ -109,12 +107,12 @@ class EngineHeuristics_v8 : public BackendDescriptor {
     getEngineConfigCount(void) const -> int64_t {
         cudnnStatus_t status;
         int64_t count = -1;
-        status        = cudnnBackendGetAttribute(pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_ENGINEHEUR_RESULTS,
-                                          CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                          0,
-                                          &count,
-                                          nullptr);
+        status        = cudnn_frontend::get_attribute(pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_ENGINEHEUR_RESULTS,
+                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                               0,
+                                               &count,
+                                               nullptr);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 this,
@@ -200,11 +198,11 @@ class EngineHeuristicsBuilder_v8 {
             return std::move(m_heuristics);
         };
 
-        status = cudnnBackendSetAttribute(m_heuristics.pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH,
-                                          CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                          1,
-                                          &(m_heuristics.opGraph->get_backend_descriptor()));
+        status = cudnn_frontend::set_attribute(m_heuristics.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH,
+                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                               1,
+                                               &(m_heuristics.opGraph->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_heuristics,
@@ -212,11 +210,11 @@ class EngineHeuristicsBuilder_v8 {
                 "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: SetAttribute  CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH Failed");
             return std::move(m_heuristics);
         };
-        status = cudnnBackendSetAttribute(m_heuristics.pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_ENGINEHEUR_MODE,
-                                          CUDNN_TYPE_HEUR_MODE,
-                                          1,
-                                          &m_heuristics.mode);
+        status = cudnn_frontend::set_attribute(m_heuristics.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_ENGINEHEUR_MODE,
+                                               CUDNN_TYPE_HEUR_MODE,
+                                               1,
+                                               &m_heuristics.mode);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_heuristics,
@@ -226,11 +224,16 @@ class EngineHeuristicsBuilder_v8 {
         };
 #if (CUDNN_VERSION >= 8905)
         if (m_heuristics.target_sm_count >= 0) {
-            status = cudnnBackendSetAttribute(m_heuristics.pointer->get_backend_descriptor(),
-                                              CUDNN_ATTR_ENGINE_SM_COUNT_TARGET,
-                                              CUDNN_TYPE_INT32,
-                                              1,
-                                              &m_heuristics.target_sm_count);
+            NV_CUDNN_FE_DYNAMIC_CHECK_BACKEND_DESCRIPTOR(
+                8905,
+                m_heuristics,
+                "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: SetAttribute CUDNN_ATTR_ENGINE_SM_COUNT_TARGET requires cudnn "
+                "version 8.9.5");
+            status = cudnn_frontend::set_attribute(m_heuristics.pointer->get_backend_descriptor(),
+                                                   CUDNN_ATTR_ENGINE_SM_COUNT_TARGET,
+                                                   CUDNN_TYPE_INT32,
+                                                   1,
+                                                   &m_heuristics.target_sm_count);
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_heuristics,
@@ -241,18 +244,17 @@ class EngineHeuristicsBuilder_v8 {
         }
 #endif
 
-#if (CUDNN_VERSION >= 8401)
         if (m_heuristics.mode == CUDNN_HEUR_MODE_B) {
             EngineHeuristics_v8::get_heur_b_mutex().lock();
         }
-#endif
+
         // Finalizing the descriptor
-        status = cudnnBackendFinalize(m_heuristics.pointer->get_backend_descriptor());
-#if (CUDNN_VERSION >= 8401)
+        status = cudnn_frontend::finalize(m_heuristics.pointer->get_backend_descriptor());
+
         if (m_heuristics.mode == CUDNN_HEUR_MODE_B) {
             EngineHeuristics_v8::get_heur_b_mutex().unlock();
         }
-#endif
+
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_heuristics, status, "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: cudnn Finalize failed");
@@ -356,12 +358,7 @@ get_heuristics_list(std::vector<std::string> const &modes,
     for (auto &mode : modes) {
         if (mode.find("heuristics_instant") != std::string::npos ||
             mode.find("heuristics_mode_a") != std::string::npos) {
-            auto heur_mode =
-#if (CUDNN_VERSION >= 8300)
-                CUDNN_HEUR_MODE_A;
-#else
-                CUDNN_HEUR_MODE_INSTANT;
-#endif
+            auto heur_mode = CUDNN_HEUR_MODE_A;
             NV_CUDNN_FE_TRY();
             auto status_l = get_heuristics_list_impl(heur_mode, opGraph, filter_fn, filtered_configs);
             NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status_l, true);
@@ -369,34 +366,11 @@ get_heuristics_list(std::vector<std::string> const &modes,
 
         } else if (mode.find("heuristics_fallback") != std::string::npos) {
             NV_CUDNN_FE_TRY();
-#if (CUDNN_VERSION >= 8300)
             auto status_l = get_heuristics_list_impl(CUDNN_HEUR_MODE_FALLBACK, opGraph, filter_fn, filtered_configs);
             NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status_l, true);
-#else
-            DescriptorType_t op_type = DescriptorType_t::OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR;
-            std::string tag_         = opGraph.getTag();
-            if (tag_.find("ConvFwd") != std::string::npos) {
-                op_type = DescriptorType_t::OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR;
-            } else if (tag_.find("ConvBwdFilter") != std::string::npos) {
-                op_type = DescriptorType_t::OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR;
-            }
-            auto heuristics =
-                cudnn_frontend::EngineFallbackListBuilder_v8().setOperationGraph(opGraph).setOperation(op_type).build();
-            NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(heuristics.get_status(), false);
-            auto &fallback_list = heuristics.getFallbackList();
-            NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(heuristics.get_status(), false);
-            getLogger() << "Fallback List has " << fallback_list.size() << " configurations " << std::endl;
-            cudnn_frontend::filter(fallback_list, filtered_configs, filter_fn);
-            NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(heuristics.get_status(), true);
-#endif
             NV_CUDNN_FE_CATCH(NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(e.getCudnnStatus(), true));
         } else if (mode.find("heuristics_mode_b") != std::string::npos) {
-            auto heur_mode =
-#if (CUDNN_VERSION >= 8300)
-                CUDNN_HEUR_MODE_B;
-#else
-                CUDNN_HEUR_MODE_INSTANT;
-#endif
+            auto heur_mode = CUDNN_HEUR_MODE_B;
             NV_CUDNN_FE_TRY();
             auto status_l = get_heuristics_list_impl(heur_mode, opGraph, filter_fn, filtered_configs);
 

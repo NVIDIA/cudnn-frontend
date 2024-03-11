@@ -10,21 +10,16 @@ namespace cudnn_frontend {
 
 namespace graph {
 
-class BatchNormFinalizeNode : public INode {
+class BatchNormFinalizeNode : public NodeCRTP<BatchNormFinalizeNode> {
+   public:
     BN_finalize_attributes attributes;
 
-   public:
     BatchNormFinalizeNode(BN_finalize_attributes&& attributes_, detail::Context const& context)
-        : INode(context), attributes(std::move(attributes_)) {}
+        : NodeCRTP(context), attributes(std::move(attributes_)) {}
 
     Type
     getType() override final {
         return Type::BN_FINALIZE;
-    }
-
-    error_t
-    collect_pre_assigned_uids(std::unordered_set<int64_t>& pre_assigned_uids) const override final {
-        return attributes.get_prefilled_uids(pre_assigned_uids);
     }
 
     error_t
@@ -35,7 +30,7 @@ class BatchNormFinalizeNode : public INode {
     }
 
     error_t
-    expand_and_infer_properties() override final {
+    expand_and_infer_properties_node() override final {
         getLogger() << "[cudnn_frontend] INFO: Inferencing properties for batchnorm finalize node  " << attributes.name
                     << "..." << std::endl;
 
@@ -74,29 +69,6 @@ class BatchNormFinalizeNode : public INode {
         // Validate outputs
         // All properties of output tensors should have been set now.
         CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    create_cudnn_tensors(int64_t& uid,
-                         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors,
-                         std::unordered_set<int64_t> const& invalid_uids) const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building BatchNormFinalizeNode tensors " << attributes.name << "..." << std::endl;
-
-        for (auto const& [name, tensor] : attributes.inputs) {
-            (void)name;
-            if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors, invalid_uids));
-            }
-        }
-        for (auto const& [name, tensor] : attributes.outputs) {
-            (void)name;
-            if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors, invalid_uids));
-            }
-        }
 
         return {error_code_t::OK, ""};
     }
