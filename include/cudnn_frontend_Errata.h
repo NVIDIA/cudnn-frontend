@@ -71,7 +71,7 @@ check_shape(cudnnBackendDescriptor_t &op,
     cudnnBackendDescriptor_t tensor_ = tensor->get_backend_descriptor();
     int64_t count                    = 0;
     cudnnStatus_t status =
-        cudnnBackendGetAttribute(op, tensor_attr, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &count, &tensor_);
+        cudnn_frontend::get_attribute(op, tensor_attr, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &count, &tensor_);
     if (status != CUDNN_STATUS_SUCCESS) {
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         throw cudnnException(std::string("Error getting attribute. cudnn_status: " + to_string(status)).c_str(),
@@ -81,7 +81,7 @@ check_shape(cudnnBackendDescriptor_t &op,
 
     // Get tensor dims
     std::array<int64_t, 5> tensor_dims;
-    status = cudnnBackendGetAttribute(
+    status = cudnn_frontend::get_attribute(
         tensor_, CUDNN_ATTR_TENSOR_DIMENSIONS, CUDNN_TYPE_INT64, 5, &count, tensor_dims.data());
     if (status != CUDNN_STATUS_SUCCESS) {
 #ifndef NV_CUDNN_DISABLE_EXCEPTION

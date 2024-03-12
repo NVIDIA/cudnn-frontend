@@ -3,20 +3,7 @@ import pytest
 import torch
 import itertools
 
-def convert_to_cudnn_type(torch_type):
-    if torch_type == torch.float16:
-        return cudnn.data_type.HALF
-    elif torch_type == torch.bfloat16:
-        return cudnn.data_type.BFLOAT16
-    elif torch_type == torch.float32:
-        return cudnn.data_type.FLOAT
-    elif torch_type == torch.bool:
-        return cudnn.data_type.BOOLEAN
-    elif torch_type == torch.uint8:
-        return cudnn.data_type.UINT8
-    else:
-        raise ValueError("Unsupported tensor data type.")
-
+from test_utils import torch_fork_set_rng
 
 embedding_dim_options = [768, 1024, 1280, 1600]
 input_type_options = [torch.bfloat16, torch.float16]
@@ -28,8 +15,8 @@ def param_extract(request):
   return request.param
 
 @pytest.mark.skipif(cudnn.backend_version() < 8905, reason="LN not supported below cudnn 8.9.5")
+@torch_fork_set_rng(seed=0)
 def test_layernorm(param_extract):
-    torch.manual_seed(0)
 
     embedding_dim, input_type = param_extract
 
@@ -55,10 +42,10 @@ def test_layernorm(param_extract):
 
     graph = cudnn.pygraph(intermediate_data_type = cudnn.data_type.FLOAT, compute_data_type = cudnn.data_type.FLOAT)
 
-    X = graph.tensor(name = "X", dim = x_gpu.size(), stride = x_gpu.stride(), data_type = convert_to_cudnn_type(x_gpu.dtype))
-    scale = graph.tensor(name = "scale", dim = scale_gpu.size(), stride = scale_gpu.stride(), data_type = convert_to_cudnn_type(scale_gpu.dtype))
-    bias = graph.tensor(name = "bias", dim = bias_gpu.size(), stride = bias_gpu.stride(), data_type = convert_to_cudnn_type(bias_gpu.dtype))
-    epsilon = graph.tensor(name = "epsilon", dim = epsilon_cpu.size(), stride = epsilon_cpu.stride(), is_pass_by_value = True, data_type = convert_to_cudnn_type(epsilon_cpu.dtype))
+    X = graph.tensor(name = "X", dim = x_gpu.size(), stride = x_gpu.stride(), data_type = x_gpu.dtype)
+    scale = graph.tensor(name = "scale", dim = scale_gpu.size(), stride = scale_gpu.stride(), data_type = scale_gpu.dtype)
+    bias = graph.tensor(name = "bias", dim = bias_gpu.size(), stride = bias_gpu.stride(), data_type = bias_gpu.dtype)
+    epsilon = graph.tensor(name = "epsilon", dim = epsilon_cpu.size(), stride = epsilon_cpu.stride(), is_pass_by_value = True, data_type = epsilon_cpu.dtype)
 
     Y, mean, inv_var = graph.layernorm(name = "LN", 
                             norm_forward_phase = cudnn.norm_forward_phase.TRAINING,
@@ -67,9 +54,9 @@ def test_layernorm(param_extract):
                             bias = bias,
                             epsilon = epsilon)
     
-    Y.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
-    mean.set_output(True).set_data_type(convert_to_cudnn_type(mean_expected.dtype))
-    inv_var.set_output(True).set_data_type(convert_to_cudnn_type(inv_var_expected.dtype))
+    Y.set_output(True).set_data_type(x_gpu.dtype)
+    mean.set_output(True).set_data_type(mean_expected.dtype)
+    inv_var.set_output(True).set_data_type(inv_var_expected.dtype)
     
     graph.validate()
     graph.build_operation_graph()
@@ -110,7 +97,7 @@ def test_layernorm(param_extract):
     
     bwd_graph = cudnn.pygraph(intermediate_data_type = cudnn.data_type.FLOAT, compute_data_type = cudnn.data_type.FLOAT)
 
-    DY = bwd_graph.tensor(name = "DY", dim = x_gpu.size(), stride = x_gpu.stride(), data_type = convert_to_cudnn_type(x_gpu.dtype))
+    DY = bwd_graph.tensor(name = "DY", dim = x_gpu.size(), stride = x_gpu.stride(), data_type = x_gpu.dtype)
     X_bwd = bwd_graph.tensor_like(X, name = 'X')
     scale_bwd = bwd_graph.tensor_like(scale, name = 'scale')
     mean_bwd = bwd_graph.tensor_like(mean, name = 'mean')
@@ -123,9 +110,9 @@ def test_layernorm(param_extract):
                             mean = mean_bwd,
                             inv_variance = inv_var_bwd)
     
-    DX.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
-    Dscale.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
-    Dbias.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
+    DX.set_output(True).set_data_type(x_gpu.dtype)
+    Dscale.set_output(True).set_data_type(x_gpu.dtype)
+    Dbias.set_output(True).set_data_type(x_gpu.dtype)
 
     bwd_graph.validate()
     bwd_graph.build_operation_graph()    

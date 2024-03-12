@@ -77,30 +77,6 @@ convert_to_cudnn_data_type(const DLDataType& dtype) {
     return cudnn_frontend::DataType_t::NOT_SET;
 }
 
-char*
-extract_data_pointer(py::object const& obj) {
-    throw_if(!py::hasattr(obj, "__dlpack__"),
-             cudnn_frontend::error_code_t::INVALID_VARIANT_PACK,
-             "Object does not have the __dlpack__() method");
-
-    py::capsule capsule = obj.attr("__dlpack__")();
-    throw_if(capsule.is_none(),
-             cudnn_frontend::error_code_t::INVALID_VARIANT_PACK,
-             "Failed to retrieve the DLPack capsule.");
-
-    DLManagedTensor* managed =
-        static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capsule.ptr(), CUDNN_FRONTEND_DLPACK_CAPSULE_NAME));
-    throw_if(managed == nullptr, cudnn_frontend::error_code_t::INVALID_VARIANT_PACK, "Invalid DLPack capsule.");
-
-    DLDeviceType device_type = managed->dl_tensor.device.device_type;
-    throw_if(
-        device_type != kDLCPU && device_type != kDLCUDAHost && device_type != kDLCUDA && device_type != kDLCUDAManaged,
-        cudnn_frontend::error_code_t::INVALID_VARIANT_PACK,
-        "Invalid device type.");
-
-    return (char*)managed->dl_tensor.data + managed->dl_tensor.byte_offset;
-}
-
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::tensor(std::vector<int64_t> const& dim,
                 std::vector<int64_t> const& stride,
@@ -124,6 +100,32 @@ PyGraph::tensor(std::vector<int64_t> const& dim,
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::tensor_like(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& tensor, std::string const& name) {
     return graph.tensor_like(tensor, name);
+}
+
+static std::intptr_t
+extract_data_pointer(py::object const& obj) {
+    throw_if(!py::hasattr(obj, "__dlpack__"),
+             cudnn_frontend::error_code_t::INVALID_VARIANT_PACK,
+             "Object does not have the __dlpack__() method");
+
+    py::capsule capsule = obj.attr("__dlpack__")();
+    throw_if(capsule.is_none(),
+             cudnn_frontend::error_code_t::INVALID_VARIANT_PACK,
+             "Failed to retrieve the DLPack capsule.");
+
+    DLManagedTensor* managed =
+        static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capsule.ptr(), CUDNN_FRONTEND_DLPACK_CAPSULE_NAME));
+    throw_if(managed == nullptr, cudnn_frontend::error_code_t::INVALID_VARIANT_PACK, "Invalid DLPack capsule.");
+
+    DLDeviceType device_type = managed->dl_tensor.device.device_type;
+    throw_if(
+        device_type != kDLCPU && device_type != kDLCUDAHost && device_type != kDLCUDA && device_type != kDLCUDAManaged,
+        cudnn_frontend::error_code_t::INVALID_VARIANT_PACK,
+        "Invalid device type.");
+
+    void* p     = (char*)managed->dl_tensor.data + managed->dl_tensor.byte_offset;
+    auto result = reinterpret_cast<std::intptr_t>(p);
+    return result;
 }
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
@@ -299,6 +301,12 @@ PyGraph::build_plans(BuildPlanPolicy_t const policy) {
 }
 
 void
+PyGraph::build_plan_at_index(int64_t const index) {
+    auto status = graph.build_plan_at_index(handle, index);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+void
 PyGraph::build(std::vector<cudnn_frontend::HeurMode_t> const& modes) {
     validate();
     build_operation_graph();
@@ -318,38 +326,54 @@ PyGraph::get_workspace_size() {
     return graph.get_workspace_size();
 }
 
+std::vector<uint8_t>
+PyGraph::serialize() const {
+    std::vector<uint8_t> data;
+    auto status = graph.serialize(data);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+    return data;
+}
+
 void
-PyGraph::execute(std::unordered_map<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, py::object> var_pack,
-                 py::object workspace) {
-    std::unordered_map<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, void*> var_pack_;
-    for (auto const& [tensor, pyobject] : var_pack) {
-        // Its alright for the user to pass in None objects as key
-        // FE will just ignore them
-        if (tensor) {
-            var_pack_.emplace(tensor, extract_data_pointer(pyobject));
-        }
+PyGraph::deserialize(std::vector<uint8_t> const& data) {
+    auto status = graph.deserialize(handle, data);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+void
+PyGraph::execute(std::unordered_map<int64_t, std::intptr_t> var_pack,
+                 std::intptr_t workspace,
+                 std::optional<std::intptr_t> exec_handle) {
+    std::unordered_map<int64_t, void*> var_pack_;
+    for (auto const& [uid, device_pointer] : var_pack) {
+        var_pack_.emplace(uid, (void*)device_pointer);
     }
 
-    void* workspace_ptr = extract_data_pointer(workspace);
+    auto workspace_ptr = (void*)workspace;
 
-    // TODO: Probably concatenate in a macro?
-    auto status = graph.execute(handle, var_pack_, workspace_ptr);
+    cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
+
+    auto status = graph.execute(handle_, var_pack_, workspace_ptr);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     return;
 }
 
 void
-PyGraph::execute(std::unordered_map<int64_t, py::object> var_pack, py::object workspace) {
+PyGraph::execute_plan_at_index(std::unordered_map<int64_t, std::intptr_t> var_pack,
+                               std::intptr_t workspace,
+                               int64_t index,
+                               std::optional<std::intptr_t> exec_handle) {
     std::unordered_map<int64_t, void*> var_pack_;
-    for (auto const& [uid, pyobject] : var_pack) {
-        var_pack_.emplace(uid, extract_data_pointer(pyobject));
+    for (auto const& [uid, device_pointer] : var_pack) {
+        var_pack_.emplace(uid, (void*)device_pointer);
     }
 
-    void* workspace_ptr = extract_data_pointer(workspace);
+    auto workspace_ptr = (void*)workspace;
 
-    // TODO: Probably concatenate in a macro?
-    auto status = graph.execute(handle, var_pack_, workspace_ptr);
+    cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
+
+    auto status = graph.execute_plan_at_index(handle_, var_pack_, workspace_ptr, index);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     return;
@@ -368,19 +392,19 @@ init_pygraph_submodule(py::module_& m) {
                       cudnn_frontend::DataType_t,
                       cudnn_frontend::DataType_t,
                       cudnn_frontend::DataType_t,
-                      void*>(),
+                      std::optional<std::intptr_t>>(),
              py::arg_v("name", "test_graph"),
              py::arg_v("io_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("intermediate_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("handle", nullptr))
+             py::arg_v("handle", std::nullopt))
         .def("tensor_like",
              py::overload_cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const&, std::string const&>(
                  &PyGraph::tensor_like),
              py::arg("input"),
              py::arg_v("name", ""))
         .def("tensor_like", py::overload_cast<py::object const&>(&PyGraph::tensor_like))
-        .def("tensor",
+        .def("_make_tensor",
              &PyGraph::tensor,
              py::arg{"dim"},
              py::arg{"stride"},
@@ -388,22 +412,7 @@ init_pygraph_submodule(py::module_& m) {
              py::arg_v{"is_virtual", false},
              py::arg_v{"is_pass_by_value", false},
              py::arg_v{"ragged_offset", nullptr},
-             py::arg_v("name", ""),
-             R"pbdoc(
-                Create a tensor.
-
-                Args:
-                    dim (List[int]): The dimensions of the tensor.
-                    stride (List[int]): The strides of the tensor.
-                    data_type (cudnn.data_type): The data type of the tensor. Default is cudnn.data_type.NOT_SET.
-                    is_virtual (bool): Flag indicating if the tensor is virtual. Default is False.
-                    is_pass_by_value (bool): Flag indicating if the tensor is passed by value. Default is False.
-                    ragged_offset (cudnn_tensor): The ragged offset tensor. Default is nullptr.
-                    name (Optional[str]): The name of the tensor.
-
-                Returns:
-                    cudnn_tensor: The created tensor.
-            )pbdoc")
+             py::arg_v("name", ""))
         .def("genstats",
              &PyGraph::genstats,
              py::arg("input"),
@@ -591,21 +600,42 @@ init_pygraph_submodule(py::module_& m) {
         .def("build_plans",
              &PyGraph::build_plans,
              py::arg("policy") = cudnn_frontend::BuildPlanPolicy_t::HEURISTICS_CHOICE)
+        .def("build_plan_at_index",
+             &PyGraph::build_plan_at_index,
+             py::arg("index"),
+             R"pbdoc(
+                Build a plan at the given index.
+                Args:
+                    index (int): The index of the plan to build.
+            )pbdoc")
         .def("build", &PyGraph::build)
+        .def("get_execution_plan_count",
+             &PyGraph::get_execution_plan_count,
+             R"pbdoc(
+                Get the number of execution plan candidates.
+            )pbdoc")
         .def("get_workspace_size", &PyGraph::get_workspace_size)
-        .def(
-            "execute",
-            static_cast<void (PyGraph::*)(
-                std::unordered_map<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, py::object>, py::object)>(
-                &PyGraph::execute))
-        .def("execute",
-             static_cast<void (PyGraph::*)(std::unordered_map<int64_t, py::object>, py::object)>(&PyGraph::execute))
+        .def("get_workspace_size_plan_at_index",
+             &PyGraph::get_workspace_size_plan_at_index,
+             py::arg("index"),
+             R"pbdoc(
+                Get workspace for a plan at the given index.
+                Args:
+                    index (int): The index of the plan to get workspace from.
+                    If the graph is not built at the index, this will return 0.
+            )pbdoc")
+        .def("_execute", &PyGraph::execute)
+        .def("serialize", &PyGraph::serialize)
+        .def("deserialize", &PyGraph::deserialize)
+        .def("_execute_plan_at_index", &PyGraph::execute_plan_at_index)
         .def("__repr__", [](PyGraph const& pygraph) {
             std::stringstream ss;
             json j = pygraph.graph;
             ss << j.dump(4);
             return ss.str();
         });
+
+    m.def("_get_data_ptr", &extract_data_pointer);
 
     init_pygraph_norm_submodule(pygraph_);
     init_pygraph_sdpa_submodule(pygraph_);

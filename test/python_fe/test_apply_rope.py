@@ -1,13 +1,7 @@
 import cudnn
 import torch
 
-def convert_to_cudnn_type(torch_type):
-    if torch_type == torch.float16:
-        return cudnn.data_type.HALF
-    elif torch_type == torch.float32:
-        return cudnn.data_type.FLOAT
-    else:
-        raise ValueError("Unsupported tensor data type.")
+from test_utils import torch_fork_set_rng
 
 def build_rope_cache(
     seq_len: int,
@@ -48,7 +42,9 @@ def apply_rope_ref(q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tor
     q_roped = fn(q[..., : rope_n_elem], cos, sin)
     return torch.cat((q_roped, q[..., rope_n_elem :]), dim=-1)
 
-def apply_rope():
+@torch_fork_set_rng(seed=0)
+def test_apply_rope():
+
     B, nh, T, hs = 8, 32, 4096, 128
     rope_n_elem = int(0.25 * hs)
 
@@ -90,10 +86,10 @@ def apply_rope():
     x1_sin2 = graph.mul(a = x1, b = sin2)
     
     Y1 = graph.sub(a = x1_cos1, b = x2_sin1)
-    Y1.set_output(True).set_data_type(convert_to_cudnn_type(torch.float16))
+    Y1.set_output(True).set_data_type(torch.float16)
     
     Y2 = graph.add(a = x2_cos2, b = x1_sin2)
-    Y2.set_output(True).set_data_type(convert_to_cudnn_type(torch.float16))
+    Y2.set_output(True).set_data_type(torch.float16)
    
     graph.validate()
     graph.build_operation_graph()

@@ -26,7 +26,6 @@
 #include <fstream>
 #include <cstring>
 
-#include "cudnn_backend_base.h"
 namespace cudnn_frontend {
 
 static const char *

@@ -1,14 +1,18 @@
 cmake_minimum_required(VERSION 3.18)
 
-Include(FetchContent)
+find_package(Catch2 QUIET)
 
-# Fetch and build catch2
-FetchContent_Declare(
-  Catch2
-  GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-  GIT_TAG        v3.3.2
-)
-FetchContent_MakeAvailable(Catch2)
+if(NOT Catch2_FOUND)
+    Include(FetchContent)
+
+    # Fetch and build catch2
+    FetchContent_Declare(
+      Catch2
+      GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+      GIT_TAG        v3.3.2
+    )
+    FetchContent_MakeAvailable(Catch2)
+endif()
 
 add_executable(
     samples
@@ -22,6 +26,7 @@ add_executable(
     cpp/rmsnorm.cpp
     cpp/wgrads.cpp
     cpp/serialization.cpp
+    cpp/autotuning.cpp
     cpp/pointwise.cpp
 
     legacy_samples/conv_sample.cpp 

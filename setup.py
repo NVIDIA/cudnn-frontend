@@ -1,5 +1,4 @@
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -30,11 +29,16 @@ class CMakeBuild(build_ext):
 
         # Set Python_EXECUTABLE instead if you use PYBIND11_FINDPYTHON
         cmake_args = [
-            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}{os.sep}",
-            f"-DPYTHON_EXECUTABLE={sys.executable}",
+            f"-DPython_EXECUTABLE={sys.executable}",
             f"-DCMAKE_BUILD_TYPE={cfg}",  # not used on MSVC, but no harm
+            f"-DCUDNN_FRONTEND_BUILD_PYTHON_BINDINGS=ON",
+            # There's no need to build cpp samples and tests with python
             f"-DCUDNN_FRONTEND_BUILD_SAMPLES=OFF",
             f"-DCUDNN_FRONTEND_BUILD_UNIT_TESTS=OFF",
+            # All these are handled by pip
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}{os.sep}",
+            f"-DCUDNN_FRONTEND_KEEP_PYBINDS_IN_BINARY_DIR=OFF",
+            f"-DCUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE=OFF"
         ]
 
         if "CUDA_PATH" in os.environ:
@@ -84,18 +88,7 @@ class CMakeBuild(build_ext):
         )
 
 
-# The information here can also be placed in setup.cfg - better separation of
-# logic and declaration, and simpler if you include description/version in a file.
 setup(
-    name="cudnn",
-    version="1.1.2",
-    author="",
-    author_email="",
-    description="cudnn_frontend python package",
-    long_description="",
-    ext_modules=[CMakeExtension("cudnn")],
+    ext_modules=[CMakeExtension("cudnn/_compiled_module")],
     cmdclass={"build_ext": CMakeBuild},
-    zip_safe=False,
-    extras_require={"test": ["pytest>=6.0"]},
-    python_requires=">=3.7",
 )

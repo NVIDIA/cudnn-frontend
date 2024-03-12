@@ -29,9 +29,9 @@ namespace cudnn_frontend {
 
 [[maybe_unused]] auto static get_fallback_engine_list(DescriptorType_t mode, const std::string &opGraphTag)
     -> std::vector<int> {
-    auto major_version = cudnnGetVersion() / 1000;
+    auto major_version = cudnn_frontend::get_backend_version() / 1000;
 
-    auto minor_version = (cudnnGetVersion() / 100) % 10;
+    auto minor_version = (cudnn_frontend::get_backend_version() / 100) % 10;
     if (major_version >= 8) {
         if (minor_version <= 2) {
             /// Here we are using the term "bias" in the operationGraph as a proxy for
@@ -157,33 +157,12 @@ class EngineFallbackListBuilder_v8 {
                                           "CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH field for heuristic");
             return std::move(m_fallback_list);
         };
-#if (CUDNN_VERSION >= 8400)
         auto fallback_heuristics = EngineHeuristicsBuilder_v8()
                                        .setHeurMode(CUDNN_HEUR_MODE_FALLBACK)
                                        .setOperationGraph(m_fallback_list.opGraph, m_fallback_list.opGraphTag)
                                        .build();
         auto count                       = fallback_heuristics.getEngineConfigCount();
         m_fallback_list.m_engine_configs = fallback_heuristics.getEngineConfig(count);
-#else
-        auto fallback_engine_list = get_fallback_engine_list(m_fallback_list.mode, m_fallback_list.opGraphTag);
-        for (std::uint32_t i = 0; i < fallback_engine_list.size(); i++) {
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
-            try {
-#endif
-                auto engine = cudnn_frontend::EngineBuilder_v8()
-                                  .setGlobalEngineIdx(fallback_engine_list[i])
-                                  .setOperationGraph(m_fallback_list.opGraph)
-                                  .build();
-                auto engine_config = cudnn_frontend::EngineConfigBuilder_v8().setEngine(engine).build();
-                m_fallback_list.m_engine_configs.emplace_back(engine_config.get_desc());
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
-            } catch (cudnn_frontend::cudnnException &e) {
-                CUDNN_FRONTEND_UNUSED(e);
-                continue;
-            }
-#endif
-        }
-#endif
         getLogger() << "[cudnn_frontend] " << m_fallback_list << std::endl;
         return std::move(m_fallback_list);
     }
