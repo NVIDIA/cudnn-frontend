@@ -10,7 +10,7 @@ While there are two entry points to the graph API (i.e. backend and frontend), i
 
 Also, for those using backend API, FE API source and samples can serve as reference implementation.
 
-FE v1.0 API extends the groundwork of earlier versions and introduces a new set of APIs to further simplify the workflow. In FE v1.0 API, users can describe multiple operations that form subgraph through a persistent cudnn_frontend::graph::Graph object. Unlike the FE v0.x API, users dont need to worry about specifying shapes and sizes of the intermediate virtual tensors. For detailed information of FE v1.0 API, see README.FE.v1.0.md. 
+In FE v1.0 API, users can describe multiple operations that form subgraph through a persistent `cudnn_frontend::graph::Graph` object. Unlike the FE v0.x API, users dont need to worry about specifying shapes and sizes of the intermediate virtual tensors. FE v1.0 API extends the groundwork of earlier versions and introduces a new set of APIs to further simplify the workflow.  For detailed information of FE v1.0 API, see [README.FE.v1.0.md](README.FE.1.0.md). 
 
 Additionally, FE v1.0 API provides python bindings to all API through pybind11. It is recommended that new users of cuDNN start with the frontend v1.0 API. See `samples/cpp` and `samples/python` for more details on its usage.
 
@@ -40,7 +40,7 @@ To run the python samples, additionally, you will need the following python pack
 ### Python API
 
 #### Source installation:
-Install FE python API by running in an virtual env:
+Install FE python API by running:
 ```
 pip install git+https://github.com/NVIDIA/cudnn-frontend.git
 ```

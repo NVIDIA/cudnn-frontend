@@ -17,7 +17,7 @@ from ._compiled_module import (
 
 from .datatypes import (_library_type, _is_torch_tensor)
 
-__version__ = '1.2.0'
+__version__ = '1.2.1'
 
 def _tensor(
     self,
@@ -126,3 +126,34 @@ def _execute_plan_at_index(
 
 pygraph.execute = _execute
 pygraph.execute_plan_at_index = _execute_plan_at_index
+
+def _dlopen_cudnn():
+
+    # The default library name that should be dlopened
+    # In case a FW uses a particular cudnn major version, this variable is overridden later.
+    lib_name = 'libcudnn.so'
+
+    # try to get major version from torch
+    # more FWs can be added as and when needed
+    try:
+        import torch
+        if torch.backends.cudnn.is_available():
+            cudnn_version = torch.backends.cudnn.version()
+            cudnn_major_version = str(cudnn_version)[0]
+            lib_name = 'libcudnn.so.' + cudnn_major_version
+    except ImportError:
+            pass
+    
+    # dlopen the library and set the dlhandle inside compiled module
+    try:
+        import ctypes
+        lib = ctypes.CDLL(lib_name)
+        handle = ctypes.cast(lib._handle, ctypes.c_void_p).value
+    except OSError as e:
+        raise Exception(f"Error loading the shared library: {e}")
+    except Exception as e:
+        raise Exception(f"An unexpected error occurred: {e}")
+    
+    _compiled_module._set_dlhandle_cudnn(handle)
+
+_dlopen_cudnn()

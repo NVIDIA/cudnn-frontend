@@ -32,28 +32,13 @@
 namespace cudnn_frontend {
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+
+// cudnn package initialization set this global handle
+extern void *cudnn_dlhandle;
+
 inline void *
 get_symbol(const char *function_name) {
-    static std::mutex cudnn_fe_lib_mutex;
-    std::lock_guard<std::mutex> lock(cudnn_fe_lib_mutex);
-    char *c                = NULL;
-    c                      = dlerror();
-    static void *dl_handle = dlopen("libcudnn.so", RTLD_NOW);
-    c                      = dlerror();
-    (void)c;
-    if (dl_handle == nullptr) {
-        // Fall back major version name
-        dl_handle = dlopen("libcudnn.so.9", RTLD_NOW);
-        if (dl_handle == nullptr) {
-            dl_handle = dlopen("libcudnn.so.8", RTLD_NOW);
-            if (dl_handle == nullptr) {
-                std::string error_msg = std::string("Unable to dlopen libcudnn.so.[8/9]") + std::string(c);
-                throw std::runtime_error(error_msg.c_str());
-            }
-        }
-    }
-
-    void *ret = dlsym(dl_handle, function_name);
+    void *ret = dlsym(cudnn_dlhandle, function_name);
     return ret;
 }
 

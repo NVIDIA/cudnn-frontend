@@ -12,7 +12,11 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(dlpack)
 
+# Find python
 find_package(Python 3.8 COMPONENTS Interpreter Development.Module REQUIRED)
+
+# Find cudnn
+include(${CMAKE_SOURCE_DIR}/cmake/cuDNN.cmake)
 
 option(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE "Whether cmake build system should fetch pybinds." ON)
 if(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE)
@@ -48,6 +52,7 @@ target_compile_features(_compiled_module PRIVATE cxx_std_17)
 target_include_directories(
     _compiled_module
     PRIVATE $<TARGET_PROPERTY:cudnn_frontend,INTERFACE_INCLUDE_DIRECTORIES>
+    PRIVATE $<TARGET_PROPERTY:CUDNN::cudnn_all,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
 target_compile_definitions(_compiled_module PRIVATE NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)

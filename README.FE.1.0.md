@@ -32,18 +32,18 @@ FE v1.0 API follows a functional style of building a graph. Operations take in i
 | Purpose                 | C++ API                                                   | Python API   |
 | ---                     | ---                                                       | ---          |
 | Create tensor           | tensor                                                    | tensor       |
-| Convolution Fprop       | conv_fprop <br>Conv_fprop_attributes                      | conv_fprop   |
-| Convolution Dgrad       | conv_dgrad <br>Conv_dgrad_attributes                      | conv_dgrad   |
-| Convolution Wgrad       | conv_wgrad <br>Conv_wgrad_attributes                      | conv_wgrad   |
-| Matrix Multiplication   | matmul <br> Matmul_attributes                             | matmul       |
-| Pointwise Operations    | pointwise <br> Pointwise_attributes                       | - add<br>- bias<br>- rqsrt<br>- sub<br>- mul<br>- scale<br>- relu<br>- elu<br>- gelu<br>- cmp_gt       |
-| Batch Normalization     | batchnorm <br>Batchnorm_attributes                        | batchnorm    |
-| Batch Norm bprop        | batchnorm_backward <br>Batchnorm_backward_attributes      | batchnorm_backward    |
+| [Convolution Fprop](docs/operations/Convolutions.md)       | conv_fprop <br>Conv_fprop_attributes                      | conv_fprop   |
+| [Convolution Dgrad](docs/operations/Convolutions.md)       | conv_dgrad <br>Conv_dgrad_attributes                      | conv_dgrad   |
+| [Convolution Wgrad](docs/operations/Convolutions.md)       | conv_wgrad <br>Conv_wgrad_attributes                      | conv_wgrad   |
+| [Matrix Multiplication](docs/operations/Matmul.md)   | matmul <br> Matmul_attributes                             | matmul       |
+| [Pointwise Operations](docs/operations/Pointwise.md)    | pointwise <br> Pointwise_attributes                       | - add<br>- bias<br>- rqsrt<br>- sub<br>- mul<br>- scale<br>- relu<br>- elu<br>- gelu<br>- cmp_gt       |
+| [Batch Normalization](docs/operations/Normalizations.md)     | batchnorm <br>Batchnorm_attributes                        | batchnorm    |
+| [Batch Norm bprop](docs/operations/Normalizations.md)        | batchnorm_backward <br>Batchnorm_backward_attributes      | batchnorm_backward    |
 | Generate stats of output| genstats <br>Genstats_attributes                          | genstats     |
 | BN Finalize of stats    | bn_finalize <br>BN_finalize_attributes                    | bn_finalize  |
 | Dbn weight              | dbn_weight <br>DBN_weight_attributes                      | dbn_weight   |
-| Scale dot product attention | sdpa<br> SDPA_attributes | sdpa |
-| Scale dot product attention backward | sdpa_backward<br> SDPA_backward_attributes | sdpa_backward |
+| [Scale dot product attention](docs/operations/Attention.md) | sdpa<br> SDPA_attributes | sdpa |
+| [Scale dot product attention backward](docs/operations/Attention.md) | sdpa_backward<br> SDPA_backward_attributes | sdpa_backward |
 
 ### Create Graph
 Instantiate an object of class `cudnn_frontend::graph::Graph` which will house tensors and operations.  

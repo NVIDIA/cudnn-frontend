@@ -3,4 +3,3 @@ numpy
 pybind11[global]
 pytest
 pytest-xdist
-torch
