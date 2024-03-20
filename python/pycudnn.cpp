@@ -10,6 +10,9 @@ namespace py = pybind11;
 using namespace pybind11::literals;
 
 namespace cudnn_frontend {
+
+void *cudnn_dlhandle = nullptr;
+
 namespace python_bindings {
 
 // Raise C++ exceptions corresponding to C++ FE error codes.
@@ -58,11 +61,18 @@ init_pygraph_submodule(py::module_ &);
 void
 init_properties(py::module_ &);
 
+void
+set_dlhandle_cudnn(std::intptr_t dlhandle) {
+    cudnn_dlhandle = reinterpret_cast<void *>(dlhandle);
+}
+
 PYBIND11_MODULE(_compiled_module, m) {
     m.def("backend_version", &cudnn_frontend::get_backend_version);
 
     init_properties(m);
     init_pygraph_submodule(m);
+
+    m.def("_set_dlhandle_cudnn", &set_dlhandle_cudnn);
 }
 
 }  // namespace python_bindings
