@@ -159,4 +159,27 @@ class MatmulNode : public NodeCRTP<MatmulNode> {
     }
 };
 
+inline void INode::matmul(std::shared_ptr<Tensor_attributes> a,
+                   std::shared_ptr<Tensor_attributes> b,
+                   Matmul_attributes attributes,
+                   std::shared_ptr<Tensor_attributes> c) {
+  attributes.inputs[Matmul_attributes::input_names::A]   = a;
+  attributes.inputs[Matmul_attributes::input_names::B]   = b;
+  attributes.outputs[Matmul_attributes::output_names::C] = c;
+  sub_nodes.emplace_back(std::make_unique<MatmulNode>(std::move(attributes), context));
+}
+
+
+inline std::shared_ptr<Tensor_attributes>
+INode::matmul(std::shared_ptr<Tensor_attributes> a,
+              std::shared_ptr<Tensor_attributes> b,
+              Matmul_attributes attributes) {
+    attributes.inputs[Matmul_attributes::input_names::A] = a;
+    attributes.inputs[Matmul_attributes::input_names::B] = b;
+    auto C = attributes.outputs[Matmul_attributes::output_names::C] = output_tensor(attributes.name + "::C");
+
+    sub_nodes.emplace_back(std::make_unique<MatmulNode>(std::move(attributes), context));
+    return C;
+}
+
 }  // namespace cudnn_frontend::graph

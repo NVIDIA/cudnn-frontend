@@ -160,4 +160,60 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
     }
 };
 
+inline void INode::pointwise(std::shared_ptr<Tensor_attributes> a,
+              Pointwise_attributes attributes,
+              std::shared_ptr<Tensor_attributes> c) {
+  attributes.inputs[Pointwise_attributes::input_names::IN_0]    = a;
+  attributes.outputs[Pointwise_attributes::output_names::OUT_0] = c;
+  sub_nodes.emplace_back(std::make_unique<PointwiseNode>(std::move(attributes), context));
+}
+
+inline void INode::pointwise(std::shared_ptr<Tensor_attributes> a,
+              std::shared_ptr<Tensor_attributes> b,
+              Pointwise_attributes attributes,
+              std::shared_ptr<Tensor_attributes> c) {
+  attributes.inputs[Pointwise_attributes::input_names::IN_0]    = a;
+  attributes.inputs[Pointwise_attributes::input_names::IN_1]    = b;
+  attributes.outputs[Pointwise_attributes::output_names::OUT_0] = c;
+  sub_nodes.emplace_back(std::make_unique<PointwiseNode>(std::move(attributes), context));
+}
+
+inline std::shared_ptr<Tensor_attributes>
+INode::pointwise(std::shared_ptr<Tensor_attributes> a, Pointwise_attributes attributes) {
+    attributes.inputs[Pointwise_attributes::input_names::IN_0] = a;
+    auto OUT_0 = attributes.outputs[Pointwise_attributes::output_names::OUT_0] =
+        output_tensor(attributes.name + "::OUT_0");
+
+    sub_nodes.emplace_back(std::make_unique<PointwiseNode>(std::move(attributes), context));
+    return OUT_0;
+}
+
+inline std::shared_ptr<Tensor_attributes>
+INode::pointwise(std::shared_ptr<Tensor_attributes> a,
+                 std::shared_ptr<Tensor_attributes> b,
+                 Pointwise_attributes attributes) {
+    attributes.inputs[Pointwise_attributes::input_names::IN_0] = a;
+    attributes.inputs[Pointwise_attributes::input_names::IN_1] = b;
+    auto OUT_0 = attributes.outputs[Pointwise_attributes::output_names::OUT_0] =
+        output_tensor(attributes.name + "::OUT_0");
+
+    sub_nodes.emplace_back(std::make_unique<PointwiseNode>(std::move(attributes), context));
+    return OUT_0;
+}
+
+inline std::shared_ptr<Tensor_attributes>
+INode::pointwise(std::shared_ptr<Tensor_attributes> a,
+                 std::shared_ptr<Tensor_attributes> b,
+                 std::shared_ptr<Tensor_attributes> c,
+                 Pointwise_attributes attributes) {
+    attributes.inputs[Pointwise_attributes::input_names::IN_0] = a;
+    attributes.inputs[Pointwise_attributes::input_names::IN_1] = b;
+    attributes.inputs[Pointwise_attributes::input_names::IN_2] = c;
+    auto OUT_0 = attributes.outputs[Pointwise_attributes::output_names::OUT_0] =
+        output_tensor(attributes.name + "::OUT_0");
+
+    sub_nodes.emplace_back(std::make_unique<PointwiseNode>(std::move(attributes), context));
+    return OUT_0;
+}
+
 }  // namespace cudnn_frontend::graph
