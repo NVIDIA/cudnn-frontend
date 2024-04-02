@@ -33,7 +33,6 @@
 #include <tuple>
 #include <functional>
 
-#include <cudnn.h>
 #include <cudnn_frontend.h>
 
 /**

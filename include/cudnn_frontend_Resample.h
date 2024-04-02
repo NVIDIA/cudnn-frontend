@@ -47,7 +47,6 @@ class ResampleDesc_v8 : public BackendDescriptor {
     std::string
     describe() const override {
         std::stringstream ss;
-#if (CUDNN_VERSION >= 8500)
         char sep = ',';
         ss << "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: "
            << "Compute Type: " << json{computeType} << ", Resample Mode: " << json{resample_mode}
@@ -73,7 +72,6 @@ class ResampleDesc_v8 : public BackendDescriptor {
             ss << '(' << stride[i].numerator << sep << stride[i].denominator << ')' << sep;
         }
         ss << "]";
-#endif
         return ss.str();
     }
 
@@ -113,8 +111,6 @@ class ResampleDesc_v8 : public BackendDescriptor {
         return padding_mode;
     }
 
-#if (CUDNN_VERSION >= 8500)
-
     cudnnFraction_t const *
     getSpatialStride() const {
         return stride;
@@ -134,7 +130,6 @@ class ResampleDesc_v8 : public BackendDescriptor {
     getWindowDim() const {
         return windowDim;
     }
-#endif
     /** @} */
 
    private:
@@ -151,13 +146,11 @@ class ResampleDesc_v8 : public BackendDescriptor {
 
     int64_t spatialDim = 0;
 
-#if (CUDNN_VERSION >= 8500)
     // Shape attributes
-    cudnnFraction_t windowDim[CUDNN_DIM_MAX]   = {{0, 1}, { 0, 1 }};
-    cudnnFraction_t prePadding[CUDNN_DIM_MAX]  = {{0, 1}, { 0, 1 }};
-    cudnnFraction_t postPadding[CUDNN_DIM_MAX] = {{0, 1}, { 0, 1 }};
-    cudnnFraction_t stride[CUDNN_DIM_MAX]      = {{0, 1}, { 0, 1 }};
-#endif
+    cudnnFraction_t windowDim[CUDNN_DIM_MAX]   = {{0, 1}, {0, 1}};
+    cudnnFraction_t prePadding[CUDNN_DIM_MAX]  = {{0, 1}, {0, 1}};
+    cudnnFraction_t postPadding[CUDNN_DIM_MAX] = {{0, 1}, {0, 1}};
+    cudnnFraction_t stride[CUDNN_DIM_MAX]      = {{0, 1}, {0, 1}};
 };
 
 ///
@@ -189,7 +182,6 @@ class ResampleDescBuilder_v8 {
         return *this;
     }
 
-#if CUDNN_VERSION >= 8500
     //! (Overloaded) Set post padding for the Resample Operation with cudnnFraction_t
     auto
     setPostPadding(int64_t count, cudnnFraction_t const *arr) -> ResampleDescBuilder_v8 & {
@@ -237,7 +229,6 @@ class ResampleDescBuilder_v8 {
         detail::convert_from_cudnn_type(padding_mode, m_resampleDesc.padding_mode);
         return *this;
     }
-#endif
 
     //! Set padding mode for the Resample Operation
     auto
@@ -256,73 +247,45 @@ class ResampleDescBuilder_v8 {
     //! (Overloaded) Set post padding for the Resample Operation with int64_t
     auto
     setPostPadding(int64_t count, int64_t const *arr) -> ResampleDescBuilder_v8 & {
-#if CUDNN_VERSION < 8500
-        CUDNN_FRONTEND_UNUSED(count);
-        CUDNN_FRONTEND_UNUSED(arr);
-        set_error_and_throw_exception(
-            &m_resampleDesc, CUDNN_STATUS_NOT_SUPPORTED, "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR setPostPadding failed");
-#else
         // TODO: check the provided array count against the stored spatial dimension count.
         for (int i = 0; i < count; i++) {
             m_resampleDesc.postPadding[i].numerator   = arr[i];
             m_resampleDesc.postPadding[i].denominator = 1;
         }
-#endif
         return *this;
     }
 
     //! (Overloaded) Set pre padding for the Resample Operation with int64_t
     auto
     setPrePadding(int64_t count, int64_t const *arr) -> ResampleDescBuilder_v8 & {
-#if CUDNN_VERSION < 8500
-        CUDNN_FRONTEND_UNUSED(count);
-        CUDNN_FRONTEND_UNUSED(arr);
-        set_error_and_throw_exception(
-            &m_resampleDesc, CUDNN_STATUS_NOT_SUPPORTED, "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR setPrePadding failed");
-#else
         // TODO: check the provided array count against the stored spatial dimension count.
         for (int i = 0; i < count; i++) {
             m_resampleDesc.prePadding[i].numerator   = arr[i];
             m_resampleDesc.prePadding[i].denominator = 1;
         }
-#endif
         return *this;
     }
 
     //! (Overloaded) Set stride for the Resample Operation with int64_t
     auto
     setSpatialStride(int64_t count, int64_t const *arr) -> ResampleDescBuilder_v8 & {
-#if CUDNN_VERSION < 8500
-        CUDNN_FRONTEND_UNUSED(count);
-        CUDNN_FRONTEND_UNUSED(arr);
-        set_error_and_throw_exception(
-            &m_resampleDesc, CUDNN_STATUS_NOT_SUPPORTED, "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR setSpatialStride failed");
-#else
         // TODO: check the provided array count against the stored spatial dimension count.
         for (int i = 0; i < count; i++) {
             m_resampleDesc.stride[i].numerator   = arr[i];
             m_resampleDesc.stride[i].denominator = 1;
         }
-#endif
         return *this;
     }
 
     //! (Overloaded) Set window dim for the Resample Operation with int64_t
     auto
     setSpatialDim(int64_t count, int64_t const *arr) -> ResampleDescBuilder_v8 & {
-#if CUDNN_VERSION < 8500
-        CUDNN_FRONTEND_UNUSED(count);
-        CUDNN_FRONTEND_UNUSED(arr);
-        set_error_and_throw_exception(
-            &m_resampleDesc, CUDNN_STATUS_NOT_SUPPORTED, "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR setSpatialDim failed");
-#else
         // TODO: check the provided array count against the stored spatial dimension count.
         m_resampleDesc.spatialDim = count;
         for (int i = 0; i < count; i++) {
             m_resampleDesc.windowDim[i].numerator   = arr[i];
             m_resampleDesc.windowDim[i].denominator = 1;
         }
-#endif
         return *this;
     }
 
@@ -332,7 +295,6 @@ class ResampleDescBuilder_v8 {
     //! Throws the appropriate error message
     ResampleDesc_v8 &&
     build() {
-#if (CUDNN_VERSION >= 8500)
         // Sanity check if non-default fields have been set correctly.
         if (m_resampleDesc.spatialDim < 0) {
             set_error_and_throw_exception(&m_resampleDesc,
@@ -359,11 +321,11 @@ class ResampleDescBuilder_v8 {
                 "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: SetAttribute CUDNN_ATTR_RESAMPLE_MODE Failed");
             return std::move(m_resampleDesc);
         }
-        status = cudnnBackendSetAttribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_RESAMPLE_MODE,
-                                          CUDNN_TYPE_RESAMPLE_MODE,
-                                          1,
-                                          &cudnn_resample_mode);
+        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_RESAMPLE_MODE,
+                                               CUDNN_TYPE_RESAMPLE_MODE,
+                                               1,
+                                               &cudnn_resample_mode);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -381,11 +343,11 @@ class ResampleDescBuilder_v8 {
                 "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: SetAttribute CUDNN_ATTR_RESAMPLE_COMP_TYPE Failed");
             return std::move(m_resampleDesc);
         }
-        status = cudnnBackendSetAttribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_RESAMPLE_COMP_TYPE,
-                                          CUDNN_TYPE_DATA_TYPE,
-                                          1,
-                                          &cudnn_data_type);
+        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_RESAMPLE_COMP_TYPE,
+                                               CUDNN_TYPE_DATA_TYPE,
+                                               1,
+                                               &cudnn_data_type);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -394,11 +356,11 @@ class ResampleDescBuilder_v8 {
             return std::move(m_resampleDesc);
         }
 
-        status = cudnnBackendSetAttribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_RESAMPLE_NAN_PROPAGATION,
-                                          CUDNN_TYPE_NAN_PROPOGATION,
-                                          1,
-                                          &(m_resampleDesc.nanOpt));
+        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_RESAMPLE_NAN_PROPAGATION,
+                                               CUDNN_TYPE_NAN_PROPOGATION,
+                                               1,
+                                               &(m_resampleDesc.nanOpt));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -416,11 +378,11 @@ class ResampleDescBuilder_v8 {
                 "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: SetAttribute CUDNN_ATTR_RESAMPLE_PADDING_MODE Failed");
             return std::move(m_resampleDesc);
         }
-        status = cudnnBackendSetAttribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_RESAMPLE_PADDING_MODE,
-                                          CUDNN_TYPE_PADDING_MODE,
-                                          1,
-                                          &cudnn_padding_mode);
+        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_RESAMPLE_PADDING_MODE,
+                                               CUDNN_TYPE_PADDING_MODE,
+                                               1,
+                                               &cudnn_padding_mode);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -429,11 +391,11 @@ class ResampleDescBuilder_v8 {
             return std::move(m_resampleDesc);
         }
 
-        status = cudnnBackendSetAttribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS,
-                                          CUDNN_TYPE_INT64,
-                                          1,
-                                          &(m_resampleDesc.spatialDim));
+        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS,
+                                               CUDNN_TYPE_INT64,
+                                               1,
+                                               &(m_resampleDesc.spatialDim));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -442,11 +404,11 @@ class ResampleDescBuilder_v8 {
             return std::move(m_resampleDesc);
         }
 
-        status = cudnnBackendSetAttribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_RESAMPLE_WINDOW_DIMS,
-                                          CUDNN_TYPE_FRACTION,
-                                          m_resampleDesc.spatialDim,
-                                          m_resampleDesc.windowDim);
+        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_RESAMPLE_WINDOW_DIMS,
+                                               CUDNN_TYPE_FRACTION,
+                                               m_resampleDesc.spatialDim,
+                                               m_resampleDesc.windowDim);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -455,11 +417,11 @@ class ResampleDescBuilder_v8 {
             return std::move(m_resampleDesc);
         }
 
-        status = cudnnBackendSetAttribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_RESAMPLE_PRE_PADDINGS,
-                                          CUDNN_TYPE_FRACTION,
-                                          m_resampleDesc.spatialDim,
-                                          m_resampleDesc.prePadding);
+        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_RESAMPLE_PRE_PADDINGS,
+                                               CUDNN_TYPE_FRACTION,
+                                               m_resampleDesc.spatialDim,
+                                               m_resampleDesc.prePadding);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -468,11 +430,11 @@ class ResampleDescBuilder_v8 {
             return std::move(m_resampleDesc);
         }
 
-        status = cudnnBackendSetAttribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_RESAMPLE_POST_PADDINGS,
-                                          CUDNN_TYPE_FRACTION,
-                                          m_resampleDesc.spatialDim,
-                                          m_resampleDesc.postPadding);
+        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_RESAMPLE_POST_PADDINGS,
+                                               CUDNN_TYPE_FRACTION,
+                                               m_resampleDesc.spatialDim,
+                                               m_resampleDesc.postPadding);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -481,11 +443,11 @@ class ResampleDescBuilder_v8 {
             return std::move(m_resampleDesc);
         }
 
-        status = cudnnBackendSetAttribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                          CUDNN_ATTR_RESAMPLE_STRIDES,
-                                          CUDNN_TYPE_FRACTION,
-                                          m_resampleDesc.spatialDim,
-                                          m_resampleDesc.stride);
+        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_RESAMPLE_STRIDES,
+                                               CUDNN_TYPE_FRACTION,
+                                               m_resampleDesc.spatialDim,
+                                               m_resampleDesc.stride);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -495,7 +457,7 @@ class ResampleDescBuilder_v8 {
         }
 
         // Finalizing the descriptor
-        status = cudnnBackendFinalize(m_resampleDesc.pointer->get_backend_descriptor());
+        status = cudnn_frontend::finalize(m_resampleDesc.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc, status, "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: cudnnFinalize Failed");
@@ -503,11 +465,6 @@ class ResampleDescBuilder_v8 {
         }
         getLogger() << "[cudnn_frontend] " << m_resampleDesc << std::endl;
         return std::move(m_resampleDesc);
-#else
-        set_error_and_throw_exception(
-            &m_resampleDesc, CUDNN_STATUS_NOT_SUPPORTED, "CUDNN_RESAMPLE_DESCRIPTOR: Not supported in this version");
-        return std::move(m_resampleDesc);
-#endif
     }
 
     explicit ResampleDescBuilder_v8()                      = default;

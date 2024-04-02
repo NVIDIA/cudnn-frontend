@@ -3,20 +3,7 @@ import pytest
 import torch
 import itertools
 
-def convert_to_cudnn_type(torch_type):
-    if torch_type == torch.float16:
-        return cudnn.data_type.HALF
-    elif torch_type == torch.bfloat16:
-        return cudnn.data_type.BFLOAT16
-    elif torch_type == torch.float32:
-        return cudnn.data_type.FLOAT
-    elif torch_type == torch.bool:
-        return cudnn.data_type.BOOLEAN
-    elif torch_type == torch.uint8:
-        return cudnn.data_type.UINT8
-    else:
-        raise ValueError("Unsupported tensor data type.")
-
+from test_utils import torch_fork_set_rng
 
 input_type_options = [torch.bfloat16, torch.float16]
 
@@ -27,8 +14,8 @@ def param_extract(request):
   return request.param
 
 @pytest.mark.skipif(cudnn.backend_version() < 8905, reason="IN not supported below cudnn 8.9.5")
+@torch_fork_set_rng(seed=0)
 def test_in(param_extract):
-    torch.manual_seed(0)
 
     input_type, = param_extract
     print(input_type)
@@ -68,9 +55,9 @@ def test_in(param_extract):
                             bias = bias,
                             epsilon = epsilon)
     
-    Y.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
-    mean.set_output(True).set_data_type(convert_to_cudnn_type(mean_expected.dtype))
-    inv_var.set_output(True).set_data_type(convert_to_cudnn_type(inv_var_expected.dtype))
+    Y.set_output(True).set_data_type(x_gpu.dtype)
+    mean.set_output(True).set_data_type(mean_expected.dtype)
+    inv_var.set_output(True).set_data_type(inv_var_expected.dtype)
     
     graph.validate()
     graph.build_operation_graph()
@@ -132,9 +119,9 @@ def test_in(param_extract):
                             mean = mean_bwd,
                             inv_variance = inv_var_bwd)
     
-    DX.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
-    Dscale.set_output(True).set_data_type(convert_to_cudnn_type(scale_gpu.dtype))
-    Dbias.set_output(True).set_data_type(convert_to_cudnn_type(bias_gpu.dtype))
+    DX.set_output(True).set_data_type(x_gpu.dtype)
+    Dscale.set_output(True).set_data_type(scale_gpu.dtype)
+    Dbias.set_output(True).set_data_type(bias_gpu.dtype)
 
     bwd_graph.validate()
     bwd_graph.build_operation_graph()

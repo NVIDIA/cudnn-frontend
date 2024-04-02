@@ -77,7 +77,32 @@ convert_to_cudnn_data_type(const DLDataType& dtype) {
     return cudnn_frontend::DataType_t::NOT_SET;
 }
 
-char*
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::tensor(std::vector<int64_t> const& dim,
+                std::vector<int64_t> const& stride,
+                cudnn_frontend::DataType_t const& data_type,
+                bool const& is_virtual,
+                bool const& is_pass_by_value,
+                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& ragged_offset,
+                std::string const& name) {
+    auto props = cudnn_frontend::graph::Tensor_attributes()
+                     .set_data_type(data_type)
+                     .set_is_virtual(is_virtual)
+                     .set_is_pass_by_value(is_pass_by_value)
+                     .set_dim(dim)
+                     .set_stride(stride)
+                     .set_ragged_offset(ragged_offset)
+                     .set_name(name);
+
+    return graph.tensor(props);
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::tensor_like(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& tensor, std::string const& name) {
+    return graph.tensor_like(tensor, name);
+}
+
+static std::intptr_t
 extract_data_pointer(py::object const& obj) {
     throw_if(!py::hasattr(obj, "__dlpack__"),
              cudnn_frontend::error_code_t::INVALID_VARIANT_PACK,
@@ -98,30 +123,9 @@ extract_data_pointer(py::object const& obj) {
         cudnn_frontend::error_code_t::INVALID_VARIANT_PACK,
         "Invalid device type.");
 
-    return (char*)managed->dl_tensor.data + managed->dl_tensor.byte_offset;
-}
-
-std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
-PyGraph::tensor(std::vector<int64_t> const& dim,
-                std::vector<int64_t> const& stride,
-                cudnn_frontend::DataType_t const& data_type,
-                bool const& is_virtual,
-                bool const& is_pass_by_value,
-                std::string const& name) {
-    auto props = cudnn_frontend::graph::Tensor_attributes()
-                     .set_data_type(data_type)
-                     .set_is_virtual(is_virtual)
-                     .set_is_pass_by_value(is_pass_by_value)
-                     .set_dim(dim)
-                     .set_stride(stride)
-                     .set_name(name);
-
-    return graph.tensor(props);
-}
-
-std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
-PyGraph::tensor_like(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& tensor, std::string const& name) {
-    return graph.tensor_like(tensor, name);
+    void* p     = (char*)managed->dl_tensor.data + managed->dl_tensor.byte_offset;
+    auto result = reinterpret_cast<std::intptr_t>(p);
+    return result;
 }
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
@@ -168,13 +172,15 @@ PyGraph::tensor_like(py::object const& pyobj) {
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::conv_fprop(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& image,
                     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& weight,
-                    std::vector<int64_t> const& padding,
+                    std::vector<int64_t> const& pre_padding,
+                    std::vector<int64_t> const& post_padding,
                     std::vector<int64_t> const& stride,
                     std::vector<int64_t> const& dilation,
                     cudnn_frontend::DataType_t const& compute_data_type,
                     std::string const& name) {
     auto attributes = cudnn_frontend::graph::Conv_fprop_attributes()
-                          .set_padding(padding)
+                          .set_pre_padding(pre_padding)
+                          .set_post_padding(post_padding)
                           .set_stride(stride)
                           .set_dilation(dilation)
                           .set_compute_data_type(compute_data_type)
@@ -187,13 +193,15 @@ PyGraph::conv_fprop(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& i
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::conv_dgrad(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& loss,
                     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& filter,
-                    std::vector<int64_t> const& padding,
+                    std::vector<int64_t> const& pre_padding,
+                    std::vector<int64_t> const& post_padding,
                     std::vector<int64_t> const& stride,
                     std::vector<int64_t> const& dilation,
                     cudnn_frontend::DataType_t const& compute_data_type,
                     std::string const& name) {
     auto attributes = cudnn_frontend::graph::Conv_dgrad_attributes()
-                          .set_padding(padding)
+                          .set_pre_padding(pre_padding)
+                          .set_post_padding(post_padding)
                           .set_stride(stride)
                           .set_dilation(dilation)
                           .set_compute_data_type(compute_data_type)
@@ -205,13 +213,15 @@ PyGraph::conv_dgrad(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& l
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::conv_wgrad(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& image,
                     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& loss,
-                    std::vector<int64_t> const& padding,
+                    std::vector<int64_t> const& pre_padding,
+                    std::vector<int64_t> const& post_padding,
                     std::vector<int64_t> const& stride,
                     std::vector<int64_t> const& dilation,
                     cudnn_frontend::DataType_t const& compute_data_type,
                     std::string const& name) {
     auto attributes = cudnn_frontend::graph::Conv_wgrad_attributes()
-                          .set_padding(padding)
+                          .set_pre_padding(pre_padding)
+                          .set_post_padding(post_padding)
                           .set_stride(stride)
                           .set_dilation(dilation)
                           .set_compute_data_type(compute_data_type)
@@ -291,6 +301,12 @@ PyGraph::build_plans(BuildPlanPolicy_t const policy) {
 }
 
 void
+PyGraph::build_plan_at_index(int64_t const index) {
+    auto status = graph.build_plan_at_index(handle, index);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+void
 PyGraph::build(std::vector<cudnn_frontend::HeurMode_t> const& modes) {
     validate();
     build_operation_graph();
@@ -310,22 +326,54 @@ PyGraph::get_workspace_size() {
     return graph.get_workspace_size();
 }
 
+std::vector<uint8_t>
+PyGraph::serialize() const {
+    std::vector<uint8_t> data;
+    auto status = graph.serialize(data);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+    return data;
+}
+
 void
-PyGraph::execute(std::unordered_map<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, py::object> var_pack,
-                 py::object workspace) {
-    std::unordered_map<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, void*> var_pack_;
-    for (auto const& [tensor, pyobject] : var_pack) {
-        // Its alright for the user to pass in None objects as key
-        // FE will just ignore them
-        if (tensor) {
-            var_pack_.emplace(tensor, extract_data_pointer(pyobject));
-        }
+PyGraph::deserialize(std::vector<uint8_t> const& data) {
+    auto status = graph.deserialize(handle, data);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+void
+PyGraph::execute(std::unordered_map<int64_t, std::intptr_t> var_pack,
+                 std::intptr_t workspace,
+                 std::optional<std::intptr_t> exec_handle) {
+    std::unordered_map<int64_t, void*> var_pack_;
+    for (auto const& [uid, device_pointer] : var_pack) {
+        var_pack_.emplace(uid, (void*)device_pointer);
     }
 
-    void* workspace_ptr = extract_data_pointer(workspace);
+    auto workspace_ptr = (void*)workspace;
 
-    // TODO: Probably concatenate in a macro?
-    auto status = graph.execute(handle, var_pack_, workspace_ptr);
+    cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
+
+    auto status = graph.execute(handle_, var_pack_, workspace_ptr);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+
+    return;
+}
+
+void
+PyGraph::execute_plan_at_index(std::unordered_map<int64_t, std::intptr_t> var_pack,
+                               std::intptr_t workspace,
+                               int64_t index,
+                               std::optional<std::intptr_t> exec_handle) {
+    std::unordered_map<int64_t, void*> var_pack_;
+    for (auto const& [uid, device_pointer] : var_pack) {
+        var_pack_.emplace(uid, (void*)device_pointer);
+    }
+
+    auto workspace_ptr = (void*)workspace;
+
+    cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
+
+    auto status = graph.execute_plan_at_index(handle_, var_pack_, workspace_ptr, index);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     return;
@@ -344,50 +392,57 @@ init_pygraph_submodule(py::module_& m) {
                       cudnn_frontend::DataType_t,
                       cudnn_frontend::DataType_t,
                       cudnn_frontend::DataType_t,
-                      void*>(),
+                      std::optional<std::intptr_t>>(),
              py::arg_v("name", "test_graph"),
              py::arg_v("io_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("intermediate_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("handle", nullptr))
+             py::arg_v("handle", std::nullopt))
         .def("tensor_like",
              py::overload_cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const&, std::string const&>(
                  &PyGraph::tensor_like),
              py::arg("input"),
              py::arg_v("name", ""))
         .def("tensor_like", py::overload_cast<py::object const&>(&PyGraph::tensor_like))
-        .def("tensor",
+        .def("_make_tensor",
              &PyGraph::tensor,
              py::arg{"dim"},
              py::arg{"stride"},
              py::arg_v("data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v{"is_virtual", false},
              py::arg_v{"is_pass_by_value", false},
-             py::arg_v("name", ""),
-             R"pbdoc(
-                Create a tensor.
-
-                Args:
-                    dim (List[int]): The dimensions of the tensor.
-                    stride (List[int]): The strides of the tensor.
-                    data_type (cudnn.data_type): The data type of the tensor. Default is cudnn.data_type.NOT_SET.
-                    is_virtual (bool): Flag indicating if the tensor is virtual. Default is False.
-                    is_pass_by_value (bool): Flag indicating if the tensor is passed by value. Default is False.
-                    name (Optional[str]): The name of the tensor.
-
-                Returns:
-                    cudnn_tensor: The created tensor.
-            )pbdoc")
+             py::arg_v{"ragged_offset", nullptr},
+             py::arg_v("name", ""))
         .def("genstats",
              &PyGraph::genstats,
              py::arg("input"),
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("name", ""))
+        .def(
+            "conv_fprop",
+            [](PyGraph& self,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& image,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& weight,
+               std::vector<int64_t> const& padding,
+               std::vector<int64_t> const& stride,
+               std::vector<int64_t> const& dilation,
+               cudnn_frontend::DataType_t const& compute_data_type,
+               std::string const& name) {
+                return self.conv_fprop(image, weight, padding, padding, stride, dilation, compute_data_type, name);
+            },
+            py::arg("image"),
+            py::arg("weight"),
+            py::arg_v{"padding", default_vector()},
+            py::arg_v{"stride", default_vector()},
+            py::arg_v{"dilation", default_vector()},
+            py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+            py::arg_v("name", ""))
         .def("conv_fprop",
              &PyGraph::conv_fprop,
              py::arg("image"),
              py::arg("weight"),
-             py::arg_v{"padding", default_vector()},
+             py::arg_v{"pre_padding", default_vector()},
+             py::arg_v{"post_padding", default_vector()},
              py::arg_v{"stride", default_vector()},
              py::arg_v{"dilation", default_vector()},
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
@@ -398,7 +453,8 @@ init_pygraph_submodule(py::module_& m) {
                 Args:
                     image (cudnn_tensor): The image tensor.
                     weight (cudnn_tensor): The weight tensor.
-                    padding (Optional[List[int]]): The padding values for the operation. Default is an empty list.
+                    pre_padding (Optional[List[int]]): The pre padding values for the operation. Default is an empty list.
+                    post_padding (Optional[List[int]]): The post padding values for the operation. Default is an empty list.
                     stride (Optional[List[int]]): The stride values for the operation. Default is an empty list.
                     dilation (Optional[List[int]]): The dilation values for the operation. Default is an empty list.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
@@ -407,11 +463,31 @@ init_pygraph_submodule(py::module_& m) {
                 Returns:
                     cudnn_tensor: The created tensor.
             )pbdoc")
+        .def(
+            "conv_wgrad",
+            [](PyGraph& self,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& image,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& loss,
+               std::vector<int64_t> const& padding,
+               std::vector<int64_t> const& stride,
+               std::vector<int64_t> const& dilation,
+               cudnn_frontend::DataType_t const& compute_data_type,
+               std::string const& name) {
+                return self.conv_wgrad(image, loss, padding, padding, stride, dilation, compute_data_type, name);
+            },
+            py::arg("image"),
+            py::arg("loss"),
+            py::arg_v{"padding", default_vector()},
+            py::arg_v{"stride", default_vector()},
+            py::arg_v{"dilation", default_vector()},
+            py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+            py::arg_v("name", ""))
         .def("conv_wgrad",
              &PyGraph::conv_wgrad,
              py::arg("image"),
              py::arg("loss"),
-             py::arg_v{"padding", default_vector()},
+             py::arg_v{"pre_padding", default_vector()},
+             py::arg_v{"post_padding", default_vector()},
              py::arg_v{"stride", default_vector()},
              py::arg_v{"dilation", default_vector()},
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
@@ -422,8 +498,8 @@ init_pygraph_submodule(py::module_& m) {
                 Args:
                     image (cudnn_tensor): The image tensor.
                     loss (cudnn_tensor): The loss tensor.
-                    padding (Optional[List[int]]): The padding values for the operation. Default is an empty list.
-                    stride (Optional[List[int]]): The stride values for the operation. Default is an empty list.
+                    pre_padding (Optional[List[int]]): The pre padding values for the operation. Default is an empty list.
+                    post_padding (Optional[List[int]]): The post padding values for the operation. Default is an empty list.                    stride (Optional[List[int]]): The stride values for the operation. Default is an empty list.
                     dilation (Optional[List[int]]): The dilation values for the operation. Default is an empty list.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                     name (Optional[str]): A name for the operation to be performed.
@@ -431,11 +507,31 @@ init_pygraph_submodule(py::module_& m) {
                 Returns:
                     cudnn_tensor: The created tensor.
             )pbdoc")
+        .def(
+            "conv_dgrad",
+            [](PyGraph& self,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& loss,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& filter,
+               std::vector<int64_t> const& padding,
+               std::vector<int64_t> const& stride,
+               std::vector<int64_t> const& dilation,
+               cudnn_frontend::DataType_t const& compute_data_type,
+               std::string const& name) {
+                return self.conv_dgrad(loss, filter, padding, padding, stride, dilation, compute_data_type, name);
+            },
+            py::arg("loss"),
+            py::arg("filter"),
+            py::arg_v{"padding", default_vector()},
+            py::arg_v{"stride", default_vector()},
+            py::arg_v{"dilation", default_vector()},
+            py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+            py::arg_v("name", ""))
         .def("conv_dgrad",
              &PyGraph::conv_dgrad,
              py::arg("loss"),
              py::arg("filter"),
-             py::arg_v{"padding", default_vector()},
+             py::arg_v{"pre_padding", default_vector()},
+             py::arg_v{"post_padding", default_vector()},
              py::arg_v{"stride", default_vector()},
              py::arg_v{"dilation", default_vector()},
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
@@ -446,7 +542,8 @@ init_pygraph_submodule(py::module_& m) {
                 Args:
                     loss (cudnn_tensor): The loss tensor.
                     filter (cudnn_tensor): The filter tensor.
-                    padding (Optional[List[int]]): The padding values for the operation. Default is an empty list.
+                    pre_padding (Optional[List[int]]): The pre padding values for the operation. Default is an empty list.
+                    post_padding (Optional[List[int]]): The post padding values for the operation. Default is an empty list.
                     stride (Optional[List[int]]): The stride values for the operation. Default is an empty list.
                     dilation (Optional[List[int]]): The dilation values for the operation. Default is an empty list.
                     compute_data_type (Optional[pycudnn.data_type]): The data type for computation. Default is NOT_SET.
@@ -503,15 +600,42 @@ init_pygraph_submodule(py::module_& m) {
         .def("build_plans",
              &PyGraph::build_plans,
              py::arg("policy") = cudnn_frontend::BuildPlanPolicy_t::HEURISTICS_CHOICE)
+        .def("build_plan_at_index",
+             &PyGraph::build_plan_at_index,
+             py::arg("index"),
+             R"pbdoc(
+                Build a plan at the given index.
+                Args:
+                    index (int): The index of the plan to build.
+            )pbdoc")
         .def("build", &PyGraph::build)
+        .def("get_execution_plan_count",
+             &PyGraph::get_execution_plan_count,
+             R"pbdoc(
+                Get the number of execution plan candidates.
+            )pbdoc")
         .def("get_workspace_size", &PyGraph::get_workspace_size)
-        .def("execute", &PyGraph::execute)
+        .def("get_workspace_size_plan_at_index",
+             &PyGraph::get_workspace_size_plan_at_index,
+             py::arg("index"),
+             R"pbdoc(
+                Get workspace for a plan at the given index.
+                Args:
+                    index (int): The index of the plan to get workspace from.
+                    If the graph is not built at the index, this will return 0.
+            )pbdoc")
+        .def("_execute", &PyGraph::execute)
+        .def("serialize", &PyGraph::serialize)
+        .def("deserialize", &PyGraph::deserialize)
+        .def("_execute_plan_at_index", &PyGraph::execute_plan_at_index)
         .def("__repr__", [](PyGraph const& pygraph) {
             std::stringstream ss;
             json j = pygraph.graph;
             ss << j.dump(4);
             return ss.str();
         });
+
+    m.def("_get_data_ptr", &extract_data_pointer);
 
     init_pygraph_norm_submodule(pygraph_);
     init_pygraph_sdpa_submodule(pygraph_);

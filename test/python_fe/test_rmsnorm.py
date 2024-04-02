@@ -5,19 +5,7 @@ import itertools
 
 import torch.nn as nn
 
-def convert_to_cudnn_type(torch_type):
-    if torch_type == torch.float16:
-        return cudnn.data_type.HALF
-    elif torch_type == torch.bfloat16:
-        return cudnn.data_type.BFLOAT16
-    elif torch_type == torch.float32:
-        return cudnn.data_type.FLOAT
-    elif torch_type == torch.bool:
-        return cudnn.data_type.BOOLEAN
-    elif torch_type == torch.uint8:
-        return cudnn.data_type.UINT8
-    else:
-        raise ValueError("Unsupported tensor data type.")
+from test_utils import torch_fork_set_rng
 
 class RMSNorm(torch.nn.Module):
     """Root Mean Square Layer Normalization.
@@ -52,10 +40,9 @@ def param_extract(request):
   return request.param
 
 @pytest.mark.skipif(cudnn.backend_version() < 8906, reason="RmsNorm not supported below cudnn 8.9.6")
+@torch_fork_set_rng(seed=0)
 def test_rmsnorm(param_extract):
-    # TODO(@barretw): ensure output is deterministic and reproducible
-    torch.manual_seed(0)
-    
+
     embedding_dim, input_type, has_bias = param_extract
     
     batch_size, seq_size = 16, 128
@@ -89,8 +76,8 @@ def test_rmsnorm(param_extract):
                             bias = bias,
                             epsilon = epsilon)
     
-    Y.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
-    inv_var.set_output(True).set_data_type(convert_to_cudnn_type(inv_var_expected.dtype))
+    Y.set_output(True).set_data_type(x_gpu.dtype)
+    inv_var.set_output(True).set_data_type(inv_var_expected.dtype)
     
     graph.validate()
     graph.build_operation_graph()
@@ -143,10 +130,10 @@ def test_rmsnorm(param_extract):
                             inv_variance = inv_var_bwd,
                             has_dbias = has_bias)
     
-    DX.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
-    Dscale.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
+    DX.set_output(True).set_data_type(x_gpu.dtype)
+    Dscale.set_output(True).set_data_type(x_gpu.dtype)
     if has_bias:
-        Dbias.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
+        Dbias.set_output(True).set_data_type(x_gpu.dtype)
     else:
         assert Dbias is None
 

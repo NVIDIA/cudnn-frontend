@@ -2,16 +2,11 @@ import cudnn
 import pytest
 import torch
 
-def convert_to_cudnn_type(torch_type):
-    if torch_type == torch.float16:
-        return cudnn.data_type.HALF
-    elif torch_type == torch.float32:
-        return cudnn.data_type.FLOAT
-    else:
-        raise ValueError("Unsupported tensor data type.")
+from test_utils import torch_fork_set_rng
 
-
+@torch_fork_set_rng(seed=0)
 def test_reduction():
+
     # Define tensor dimensions
     N, K, C, H, W = 4, 32, 16, 64, 64
     R, S = 3, 3
@@ -27,8 +22,8 @@ def test_reduction():
 
     # Cudnn code
     graph = cudnn.pygraph(io_data_type = cudnn.data_type.HALF, intermediate_data_type = cudnn.data_type.FLOAT, compute_data_type = cudnn.data_type.FLOAT)
-    X = graph.tensor(name = "X", dim = X_gpu.size(), stride = X_gpu.stride(), data_type = convert_to_cudnn_type(X_gpu.dtype))
-    Weight = graph.tensor(name = "W", dim = W_gpu.size(), stride = W_gpu.stride(), data_type = convert_to_cudnn_type(W_gpu.dtype))
+    X = graph.tensor(name = "X", dim = X_gpu.size(), stride = X_gpu.stride(), data_type = X_gpu.dtype)
+    Weight = graph.tensor(name = "W", dim = W_gpu.size(), stride = W_gpu.stride(), data_type = W_gpu.dtype)
 
     Y0 = graph.conv_fprop(image = X, weight = Weight, padding = padding, stride = stride, dilation = dilation)
     

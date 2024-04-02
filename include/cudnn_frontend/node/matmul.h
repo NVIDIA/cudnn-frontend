@@ -9,12 +9,12 @@
 
 namespace cudnn_frontend::graph {
 
-class MatmulNode : public INode {
+class MatmulNode : public NodeCRTP<MatmulNode> {
+   public:
     Matmul_attributes attributes;
 
-   public:
     MatmulNode(Matmul_attributes&& attributes_, detail::Context const& context)
-        : INode(context), attributes(std::move(attributes_)) {}
+        : NodeCRTP(context), attributes(std::move(attributes_)) {}
 
     Type
     getType() override final {
@@ -36,7 +36,7 @@ class MatmulNode : public INode {
     }
 
     error_t
-    expand_and_infer_properties() override final {
+    expand_and_infer_properties_node() override final {
         getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for matmul node " << attributes.name << "..."
                     << std::endl;
 
@@ -86,28 +86,6 @@ class MatmulNode : public INode {
     }
 
     error_t
-    create_cudnn_tensors(int64_t& uid, std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors)
-        const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building MatmulNode tensors " << attributes.name << "..." << std::endl;
-
-        for (auto const& [name, tensor] : attributes.inputs) {
-            (void)name;
-            if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
-            }
-        }
-        for (auto const& [name, tensor] : attributes.outputs) {
-            (void)name;
-            if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(tensor, uid, tensors));
-            }
-        }
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
@@ -115,51 +93,57 @@ class MatmulNode : public INode {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Building MatmulNode operations " << attributes.name << "..." << std::endl;
 
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
+        // matmul descriptor
+        auto matmul_descriptor = cudnn_frontend::MatMulDescBuilder()
+                                     .setComputeType(attributes.compute_data_type)
+                                     .setPaddingValue(attributes.padding_value)
+                                     .build();
+
+        auto&& matmul_operation_builder =
+            cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_MATMUL_DESCRIPTOR);
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(A, Matmul_attributes::input_names::A);
+        matmul_operation_builder.setaMatDesc(*tensors.at(A->second->get_uid()));
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(B, Matmul_attributes::input_names::B);
+        matmul_operation_builder.setbMatDesc(*tensors.at(B->second->get_uid()));
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(C, Matmul_attributes::output_names::C);
+        matmul_operation_builder.setcMatDesc(*tensors.at(C->second->get_uid()));
+        matmul_operation_builder.setmatmulDesc(matmul_descriptor);
+
+        auto M_override = attributes.inputs.find(Matmul_attributes::input_names::M_override);
+        if ((M_override != attributes.inputs.end()) && (M_override->second != nullptr)) {
+            matmul_operation_builder.setmOverrideDesc(*tensors.at(M_override->second->get_uid()));
+        }
+
+        auto N_override = attributes.inputs.find(Matmul_attributes::input_names::N_override);
+        if ((N_override != attributes.inputs.end()) && (N_override->second != nullptr)) {
+            matmul_operation_builder.setnOverrideDesc(*tensors.at(N_override->second->get_uid()));
+        }
+
+        auto K_override = attributes.inputs.find(Matmul_attributes::input_names::K_override);
+        if ((K_override != attributes.inputs.end()) && (K_override->second != nullptr)) {
+            matmul_operation_builder.setkOverrideDesc(*tensors.at(K_override->second->get_uid()));
+        }
+
+#ifdef NV_CUDNN_DISABLE_EXCEPTION
+        // disable exception macro is defined. Calling build will not throw.
+        // Check status of desc and return error.
+        auto operation = matmul_operation_builder.build();
+        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       operation.get_error());
+        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
+#else
+        // build() can throw
+        // wrap in try catch
         try {
-#endif
-
-            // matmul descriptor
-            auto matmul_descriptor = cudnn_frontend::MatMulDescBuilder()
-                                         .setComputeType(attributes.compute_data_type)
-                                         .setPaddingValue(attributes.padding_value)
-                                         .build();
-
-            auto&& matmul_operation_builder =
-                cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_MATMUL_DESCRIPTOR);
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(A, Matmul_attributes::input_names::A);
-            matmul_operation_builder.setaMatDesc(*tensors.at(A->second->get_uid()));
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(B, Matmul_attributes::input_names::B);
-            matmul_operation_builder.setbMatDesc(*tensors.at(B->second->get_uid()));
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(C, Matmul_attributes::output_names::C);
-            matmul_operation_builder.setcMatDesc(*tensors.at(C->second->get_uid()));
-            matmul_operation_builder.setmatmulDesc(matmul_descriptor);
-
-            auto M_override = attributes.inputs.find(Matmul_attributes::input_names::M_override);
-            if ((M_override != attributes.inputs.end()) && (M_override->second != nullptr)) {
-                matmul_operation_builder.setmOverrideDesc(*tensors.at(M_override->second->get_uid()));
-            }
-
-            auto N_override = attributes.inputs.find(Matmul_attributes::input_names::N_override);
-            if ((N_override != attributes.inputs.end()) && (N_override->second != nullptr)) {
-                matmul_operation_builder.setnOverrideDesc(*tensors.at(N_override->second->get_uid()));
-            }
-
-            auto K_override = attributes.inputs.find(Matmul_attributes::input_names::K_override);
-            if ((K_override != attributes.inputs.end()) && (K_override->second != nullptr)) {
-                matmul_operation_builder.setkOverrideDesc(*tensors.at(K_override->second->get_uid()));
-            }
-
             auto operation = matmul_operation_builder.build();
-
             operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnn_frontend::cudnnException& e) {
-            throw cudnnException(e.what(), e.getCudnnStatus());
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
         }
 #endif
 
@@ -171,6 +155,7 @@ class MatmulNode : public INode {
     virtual void
     serialize(json& j) const override final {
         j = attributes;
+        j.update(R"( {"tag": "MATMUL"})"_json);
     }
 };
 

@@ -28,11 +28,16 @@ class Graph : public INode {
    private:
     std::unordered_set<std::shared_ptr<Tensor_attributes>> tensors;
 
+    void
+    add_to_tensor_map(std::shared_ptr<Tensor_attributes> tensor) {
+        tensors.emplace(tensor);
+    }
+
     std::shared_ptr<Tensor_attributes>
     output_tensor(std::string const &name) {
         auto tensor = std::make_shared<Tensor_attributes>();
         tensor->set_name(name).set_is_virtual(true);
-        tensors.emplace(tensor);
+        add_to_tensor_map(tensor);
         return tensor;
     }
 
@@ -49,12 +54,37 @@ class Graph : public INode {
     }
 
     error_t
-    expand_and_infer_properties() override final {
+    expand_and_infer_properties_node() override final {
         return {error_code_t::OK, ""};
     }
 
     error_t
     post_validate_node() const override final {
+        return {error_code_t::OK, ""};
+    }
+
+    virtual error_t
+    pass_by_value_tensors_(std::unordered_map<uid_t, pass_by_values_t> &pass_by_values) const override final {
+        for (auto [uid, value] : deserialized_pass_by_value) {
+            pass_by_values.emplace(uid, value);
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    virtual error_t
+    collect_pre_assigned_uids_([[maybe_unused]] std::unordered_set<int64_t> &pre_assigned_uids) const override final {
+        return {error_code_t::OK, ""};
+    }
+
+    virtual error_t
+    create_cudnn_tensors_([[maybe_unused]] std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>
+                              &tensors) const override final {
+        return {error_code_t::OK, ""};
+    }
+
+    virtual error_t
+    set_uids_([[maybe_unused]] int64_t &potential_uid,
+              [[maybe_unused]] std::unordered_set<int64_t> const &pre_assigned_uids) const override final {
         return {error_code_t::OK, ""};
     }
 
@@ -187,6 +217,9 @@ class Graph : public INode {
     error_t
     create_execution_plans(std::vector<HeurMode_t> const &mode);
 
+    int64_t
+    get_execution_plan_count() const;
+
     error_t
     check_support(cudnnHandle_t h) {
         for (auto &plan_list : plans) {
@@ -200,6 +233,9 @@ class Graph : public INode {
                 BuildPlanPolicy_t const policy     = BuildPlanPolicy_t::HEURISTICS_CHOICE,
                 bool const do_multithreaded_builds = false);
 
+    error_t
+    build_plan_at_index(cudnnHandle_t const &handle, int64_t index);
+
     Graph &
     deselect_workspace_greater_than(int64_t const workspace) {
         for (auto &plan_list : plans) {
@@ -210,16 +246,10 @@ class Graph : public INode {
 
     Graph &
     deselect_behavior_notes(std::vector<BehaviorNote_t> const &notes) {
-        std::vector<cudnnBackendBehaviorNote_t> backend_notes;
-        for (auto &note : notes) {
-            cudnnBackendBehaviorNote_t backend_note;
-            detail::convert_to_cudnn_type(note, backend_note);
-            backend_notes.push_back(backend_note);
-        }
         for (auto &plan_list : plans) {
-            auto status = plan_list.filter_out_behavior_notes(backend_notes);
+            auto status = plan_list.deselect_behavior_notes(notes);
             if (status.is_bad()) {
-                getLogger() << "[cudnn_frontend] ERROR: Filtering by behavioural notes failed." << std::endl;
+                getLogger() << status.get_message() << std::endl;
             }
         }
         return *this;
@@ -227,32 +257,82 @@ class Graph : public INode {
 
     Graph &
     deselect_numeric_notes(std::vector<NumericalNote_t> const &notes) {
-        std::vector<cudnnBackendNumericalNote_t> backend_notes;
-        for (auto &note : notes) {
-            cudnnBackendNumericalNote_t backend_note;
-            detail::convert_to_cudnn_type(note, backend_note);
-            backend_notes.push_back(backend_note);
-        }
         for (auto &plan_list : plans) {
-            auto status = plan_list.filter_out_numeric_notes(backend_notes);
+            auto status = plan_list.deselect_numeric_notes(notes);
             if (status.is_bad()) {
-                getLogger() << "[cudnn_frontend] ERROR: Filtering by numerical notes failed." << std::endl;
+                getLogger() << status.get_message() << std::endl;
             }
         }
         return *this;
     }
 
-    error_t
-    autotune(cudnnHandle_t handle,
-             std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> variants,
-             void *workspace,
-             void *user_impl = nullptr) {
-        for (auto &plan_list : plans) {
-            CHECK_CUDNN_FRONTEND_ERROR(plan_list.autotune(handle, variants, workspace, user_impl));
+    using INode::deserialize;
+    using INode::serialize;
+
+    virtual void
+    serialize(json &j) const override final {
+        // Different from serialization of other INodes.
+        // Go over each subnode and serialize them.
+        j["nodes"];
+        for (auto const &sub_node : sub_nodes) {
+            json j_sub_node;
+            sub_node->serialize(j_sub_node);
+            j["nodes"].push_back(j_sub_node);
         }
+    };
+
+    // TODO: temparorily placed in graphs class. This function needs to be a free standing function.
+    error_t
+    deserialize(const json &j) {
+        if (j.contains("nodes") && j["nodes"].is_array()) {
+            for (const auto &j_sub_node : j["nodes"]) {
+                if (j_sub_node.contains("tag") && j_sub_node["tag"].is_string()) {
+                    auto tag = j_sub_node["tag"].get<std::string>();
+                    if (tag == "CONV_FPROP") {
+                        auto conv_fprop_attributes = j_sub_node.get<Conv_fprop_attributes>();
+                        sub_nodes.emplace_back(
+                            std::make_unique<ConvolutionNode>(std::move(conv_fprop_attributes), detail::Context()));
+                    } else if (tag == "POINTWISE") {
+                        auto pointwise_attributes = j_sub_node.get<Pointwise_attributes>();
+                        sub_nodes.emplace_back(
+                            std::make_unique<PointwiseNode>(std::move(pointwise_attributes), detail::Context()));
+                    } else if (tag == "REDUCTION") {
+                        auto reduction_attributes = j_sub_node.get<Reduction_attributes>();
+                        sub_nodes.emplace_back(
+                            std::make_unique<ReductionNode>(std::move(reduction_attributes), detail::Context()));
+                    } else if (tag == "SDPA_FWD") {
+                        auto sdpa_attributes = j_sub_node.get<SDPA_attributes>();
+                        sub_nodes.emplace_back(
+                            std::make_unique<SDPANode>(std::move(sdpa_attributes), detail::Context()));
+                    } else if (tag == "SDPA_BWD") {
+                        auto sdpa_bwd_attributes = j_sub_node.get<SDPA_backward_attributes>();
+                        sub_nodes.emplace_back(
+                            std::make_unique<SDPABackwardNode>(std::move(sdpa_bwd_attributes), detail::Context()));
+                    }
+                }
+            }
+        }
+
         return {error_code_t::OK, ""};
     }
+
+    std::string
+    print(void) const {
+        std::stringstream ss;
+        json j = *this;
+        ss << j.dump(4);
+        return ss.str();
+    }
 };
+
+inline int64_t
+Graph::get_execution_plan_count() const {
+    int64_t plan_count = 0;
+    for (auto &plan_list : plans) {
+        plan_count += plan_list.execution_plans.size();
+    }
+    return plan_count;
+}
 
 inline error_t
 Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
@@ -273,6 +353,14 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
         plans.emplace_back(std::move(plan_list));
     }
 
+    return {error_code_t::OK, ""};
+}
+
+inline error_t
+Graph::build_plan_at_index(cudnnHandle_t const &handle, int64_t plan_index) {
+    for (auto i = 0u; i < plans.size(); i++) {
+        CHECK_CUDNN_FRONTEND_ERROR(plans[i].build_plan_at_index(handle, plan_index));
+    }
     return {error_code_t::OK, ""};
 }
 
@@ -305,7 +393,7 @@ Graph::set_compute_data_type(DataType_t const type) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(Tensor_attributes const &tensor) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(tensor);
-    tensors.emplace(tensor_ptr);
+    add_to_tensor_map(tensor_ptr);
     return tensor_ptr;
 }
 
@@ -320,12 +408,11 @@ Graph::tensor_like(std::shared_ptr<Tensor_attributes> const &tensor, std::string
     // reset the uid of the cloned tensor
     // uids are not meant to be copied by tensor_like
     // When lowering to cudnn backend, both tensors involved here will get unique uids.
-    tensor_ptr->set_uid(0);
+    tensor_ptr->clear_uid();
 
     // reset the name too. Defaults to empty string.
     tensor_ptr->set_name(name);
 
-    tensors.emplace(tensor_ptr);
     return tensor_ptr;
 }
 
@@ -753,6 +840,12 @@ Graph::sdpa_backward(std::shared_ptr<Tensor_attributes> q,
     sub_nodes.emplace_back(std::make_unique<SDPABackwardNode>(std::move(attributes), context));
 
     return {dQ, dK, dV};
+}
+
+static inline std::ostream &
+operator<<(std::ostream &os, Graph const &graph) {
+    os << graph.print();
+    return os;
 }
 
 }  // namespace cudnn_frontend::graph

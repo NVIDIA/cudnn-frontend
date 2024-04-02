@@ -18,30 +18,33 @@ throw_if(bool const cond, cudnn_frontend::error_code_t const error_code, std::st
 
 class HandleManagement {
    public:
-    static void*
+    static std::intptr_t
     create_handle() {
         cudnnHandle_t handle;
-        cudnnCreate(&handle);
-        return (void*)handle;
+        cudnn_frontend::create_handle(&handle);
+        return reinterpret_cast<std::intptr_t>(handle);
     }
 
     static void
-    destroy_handle(void* handle) {
-        auto status = cudnnDestroy((cudnnHandle_t)handle);
+    destroy_handle(std::intptr_t handle) {
+        auto status = cudnn_frontend::destroy_handle((cudnnHandle_t)handle);
         throw_if(
             status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnHandle Destroy failed");
     }
 
     static void
-    set_stream(void* handle, void* stream) {
-        auto status = cudnnSetStream((cudnnHandle_t)handle, (cudaStream_t)stream);
+    set_stream(std::intptr_t handle, std::intptr_t stream) {
+        auto status = cudnn_frontend::set_stream((cudnnHandle_t)handle, (cudaStream_t)stream);
         throw_if(status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnSetStream failed");
     }
 
-    static void
-    get_stream(void* handle, void* streamId) {
-        auto status = cudnnGetStream((cudnnHandle_t)handle, (cudaStream_t*)streamId);
+    static std::intptr_t
+    get_stream(std::intptr_t handle) {
+        cudaStream_t streamId = nullptr;
+        auto status           = cudnn_frontend::get_stream((cudnnHandle_t)handle, &streamId);
         throw_if(status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnGetStream failed");
+
+        return reinterpret_cast<std::intptr_t>(streamId);
     }
 };
 
@@ -71,7 +74,7 @@ init_properties(py::module_& m) {
         .def("get_name", &cudnn_frontend::graph::Tensor_attributes::get_name)
         .def("set_name", &cudnn_frontend::graph::Tensor_attributes::set_name)
         .def("get_data_type", &cudnn_frontend::graph::Tensor_attributes::get_data_type)
-        .def("set_data_type", &cudnn_frontend::graph::Tensor_attributes::set_data_type)
+        .def("_set_data_type", &cudnn_frontend::graph::Tensor_attributes::set_data_type)
         .def("get_dim", &cudnn_frontend::graph::Tensor_attributes::get_dim)
         .def("set_dim", &cudnn_frontend::graph::Tensor_attributes::set_dim)
         .def("get_stride", &cudnn_frontend::graph::Tensor_attributes::get_stride)
@@ -90,6 +93,7 @@ init_properties(py::module_& m) {
         .def("set_is_pass_by_value", &cudnn_frontend::graph::Tensor_attributes::set_is_pass_by_value)
         .def("get_uid", &cudnn_frontend::graph::Tensor_attributes::get_uid)
         .def("set_uid", &cudnn_frontend::graph::Tensor_attributes::set_uid)
+        .def("set_ragged_offset", &cudnn_frontend::graph::Tensor_attributes::set_ragged_offset)
         .def("__repr__", [](cudnn_frontend::graph::Tensor_attributes const& props) {
             std::ostringstream out;
             out << json{props};
@@ -99,11 +103,7 @@ init_properties(py::module_& m) {
     m.def("create_handle", &HandleManagement::create_handle);
     m.def("destroy_handle", &HandleManagement::destroy_handle);
     m.def("get_stream", &HandleManagement::get_stream);
-    m.def(
-        "set_stream",
-        [](void* handle, int64_t stream) { return HandleManagement::set_stream(handle, (void*)stream); },
-        py::arg("handle"),
-        py::arg("stream"));
+    m.def("set_stream", &HandleManagement::set_stream, py::arg("handle"), py::arg("stream"));
 
     py::enum_<cudnn_frontend::NormFwdPhase_t>(m, "norm_forward_phase")
         .value("INFERENCE", cudnn_frontend::NormFwdPhase_t::INFERENCE)

@@ -1,14 +1,21 @@
 cmake_minimum_required(VERSION 3.18)
 
-Include(FetchContent)
+find_package(Catch2 QUIET)
 
-# Fetch and build catch2
-FetchContent_Declare(
-  Catch2
-  GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-  GIT_TAG        v3.3.2
-)
-FetchContent_MakeAvailable(Catch2)
+if(NOT Catch2_FOUND)
+    Include(FetchContent)
+
+    # Fetch and build catch2
+    FetchContent_Declare(
+      Catch2
+      GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+      GIT_TAG        v3.3.2
+    )
+    FetchContent_MakeAvailable(Catch2)
+endif()
+
+# Find cudnn
+include(${CMAKE_SOURCE_DIR}/cmake/cuDNN.cmake)
 
 add_executable(
     samples
@@ -21,6 +28,9 @@ add_executable(
     cpp/layernorm.cpp
     cpp/rmsnorm.cpp
     cpp/wgrads.cpp
+    cpp/serialization.cpp
+    cpp/autotuning.cpp
+    cpp/pointwise.cpp
 
     legacy_samples/conv_sample.cpp 
     legacy_samples/resnet_test_list.cpp
@@ -65,6 +75,8 @@ target_link_libraries(
 
     cudnn_frontend
     Catch2::Catch2WithMain
+
+    CUDNN::cudnn_all
 )
 
 # cuDNN dlopen's its libraries

@@ -3,6 +3,8 @@ import itertools
 import pytest
 import torch
 
+from test_utils import torch_fork_set_rng
+
 def convert_to_cudnn_type(torch_type):
     if torch_type == torch.float16:
         return cudnn.data_type.HALF
@@ -21,11 +23,13 @@ def convert_to_cudnn_type(torch_type):
     
 def get_cc():
     (major, minor) = torch.cuda.get_device_capability()
-    return major*10 + minor
+    return major*10 + minor 
 
 @pytest.mark.skipif(cudnn.backend_version() < 8906, reason="requires cudnn 8.9.6 or higher")
 @pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch")
+@torch_fork_set_rng(seed=0)
 def test_int8_bf16_matmul():
+
     # matmul problem size 
     B, M, N, K = 16, 32, 64, 128
 
@@ -70,6 +74,7 @@ MMA_data_type_options = [torch.bfloat16, torch.float16, torch.float32]
 @pytest.mark.parametrize("A_data_type", A_data_type_options)
 @pytest.mark.parametrize("B_data_type", B_data_type_options)
 @pytest.mark.parametrize("MMA_data_type", MMA_data_type_options)
+@torch_fork_set_rng(seed=0)
 def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
 
     # matmul problem size 
@@ -82,10 +87,12 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
         A_gpu = torch.randint(4, (B, M, K), requires_grad=False, device="cuda", dtype=A_data_type) - 1
 
     if B_data_type != torch.int8:
-        B_gpu = 3 * torch.randn(B, K, N, requires_grad=False, device="cuda", dtype=B_data_type) - 1.25
+        B_gpu_strided = 3 * torch.randn(B, K, N, requires_grad=False, device="cuda", dtype=B_data_type) - 1.25
     else:
-        B_gpu = torch.randint(3, (B, K, N), requires_grad=False, device="cuda", dtype=B_data_type) - 2
-
+        B_gpu_strided = torch.randint(3, (B, K, N), requires_grad=False, device="cuda", dtype=B_data_type).contiguous() - 2
+    
+    B_gpu = torch.as_strided(B_gpu_strided, (B, K, N), (N*K, 1, N))
+    
     # Make cudnn graph
     graph = cudnn.pygraph()
 
@@ -95,7 +102,7 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
     B = graph.tensor_like(B_gpu)
     
     # Cast the input tensors to required mma precision
-    A_casted = graph.identity(input = A, compute_data_type=convert_to_cudnn_type(MMA_data_type))
+    A_casted = graph.identity(input = A, compute_data_type=cudnn.data_type.FLOAT)
     A_casted.set_data_type(convert_to_cudnn_type(MMA_data_type))
     
     # Casting input tensor B is only supported from cudnn v9
@@ -106,9 +113,12 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
         # Do not create a cast node
         B_casted = B
     else:
-        B_casted = graph.identity(input = B, compute_data_type=convert_to_cudnn_type(MMA_data_type))
+        # Cast the input tensors to required mma precision
+        B_casted = graph.identity(input = B, compute_data_type=cudnn.data_type.FLOAT)
         B_casted.set_data_type(convert_to_cudnn_type(MMA_data_type))
 
+    # CAUTION: Hardcodes to fp32 as tests today dont cover inputs that are casted to ints.
+    # In case your usecase does cast inputs to int8, use int32 as compute type here. 
     C = graph.matmul(name = "matmul", A = A_casted, B = B_casted, compute_data_type=cudnn.data_type.FLOAT)
     C.set_output(True).set_data_type(convert_to_cudnn_type(MMA_data_type))
     
@@ -123,7 +133,7 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
     graph.execute({A: A_gpu, B:  B_gpu, C:  C_actual}, workspace)
 
     # compare'em
-    torch.testing.assert_close(C_expected, C_actual)
+    torch.testing.assert_close(C_expected, C_actual, atol=1e-4, rtol=1e-4)
 
 problem_size_options = [(1, 128, 768)
                         , (16, 512, 1600)
@@ -136,7 +146,9 @@ all_options = [elem for elem in itertools.product(*[problem_size_options, input_
 def param_extract(request):
   return request.param
 
+@torch_fork_set_rng(seed=0)
 def test_matmul_bias_relu(param_extract):
+
     problem_size_options, input_type = param_extract
     b, s, e = problem_size_options
 

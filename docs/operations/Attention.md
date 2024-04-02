@@ -1,7 +1,11 @@
 ## Table of Contents
 1. [Scaled Dot Product Attention](#scaled-dot-product-attention)
 2. [Scaled Dot Product Attention Backward](#scaled-dot-product-attention-backward)
-3. [Miscellaneous](#miscellaneous)
+3. Appendices
+    - [Tensor Layouts](#appendix-a)
+    - [Workspace limits and Performance](#appendix-b)
+    - [RNG dump](#appendix-c)
+4. [Miscellaneous](#miscellaneous)
 
 ### Scaled Dot Product Attention
 
@@ -27,6 +31,7 @@ using the FlashAttention-2 algorithm as described in the paper [FlashAttention-2
   - To use an user-provided dropout mask, users must provide:
     - `dropout mask` that matches the attention weights' dimensions, indicating which weights to drop.
     - `dropout scale` used to adjust the scale of the remaining weights accordingly, such as $1 / (1 - \text{dropout probability})$.
+- Ragged tensor: allows the query, key, value, and output tensor to be [ragged tensors](https://www.tensorflow.org/guide/ragged_tensor), which are tensors with nested variable length lists as inner dimensions. Users must pass another tensor called ragged offset tensor using the `Tensor_attributes.set_ragged_offset()` method as specified in the tensors section below.
 
 When multiple masking options are enabled, they are applied in the listed order above.
 
@@ -43,6 +48,7 @@ The dimensions that are passed as 1 will apply a broadcasted mask over attention
 - (Optional) When philox RNG dropout mask is enabled, the RNG seed and offset tensors should have size $(1, 1, 1, 1)$ with int32 or int64 datatype as either a CPU or GPU tensor.
 - (Optional) When a user provided dropout mask is enabled, a dropout mask tensor should have shape $(1, 1, S_{q}, S_{kv})$, $(1, H_{q}, S_{q}, S_{kv})$, $(B, 1, S_{q}, S_{kv})$, or $(B, H_{q}, S_{q}, S_{kv})$ with input/output datatype.  
 The dimensions that are passed as 1 will apply a broadcasted mask over attention weights.
+- (Optional) When query, key, value, and output tensors are ragged tensors, the ragged offset tensor must be a tensor of size $(B + 1, 1, 1, 1)$ that contains the nested tensor's offset in terms of number of elements (not bytes). The last value of the offset tensor specifies the offset of the past-the-end element of the ragged tensor.
 
 Where,
 
@@ -96,7 +102,7 @@ SDPA_attributes &
 set_bias(std::shared_ptr<Tensor_attributes> value);
 
 SDPA_attributes&
-set_alibi_mask(bool const value)
+set_alibi_mask(bool const value);
 
 SDPA_attributes&
 set_padding_mask(bool const value);
@@ -120,7 +126,7 @@ set_dropout(std::shared_ptr<Tensor_attributes> mask,
             std::shared_ptr<Tensor_attributes> scale);
 
 SDPA_attributes &
-set_compute_data_type(DataType_t value)
+set_compute_data_type(DataType_t value);
 ```
 
 **Python API:**
@@ -153,7 +159,7 @@ This operation computes gradient tensors for scaled dot product attention using 
 
 #### Configurable Options:
 
-All the options mentioned in the forward operation, including GQA and MQA, are applicable in the backward operation as well.
+All the options mentioned in the forward operation, including ragged tensors and GQA/MQA, are applicable in the backward operation as well.
 
 #### Tensors:
 
@@ -181,19 +187,19 @@ The `options` parameter of type `SDPA_backward_attributes` is used to control th
 
 ```cpp
 SDPA_backward_attributes&
-set_attn_scale(std::shared_ptr<Tensor_attributes> value)
+set_attn_scale(std::shared_ptr<Tensor_attributes> value);
 
 SDPA_backward_attributes&
 set_attn_scale(float const value);
 
 SDPA_backward_attributes&
-set_bias(std::shared_ptr<Tensor_attributes> value)
+set_bias(std::shared_ptr<Tensor_attributes> value);
 
 SDPA_backward_attributes&
-set_dbias(std::shared_ptr<Tensor_attributes> value)
+set_dbias(std::shared_ptr<Tensor_attributes> value);
 
 SDPA_backward_attributes&
-set_alibi_mask(bool const value)
+set_alibi_mask(bool const value);
 
 SDPA_backward_attributes&
 set_padding_mask(bool const value);
@@ -205,20 +211,20 @@ SDPA_backward_attributes&
 set_seq_len_kv(std::shared_ptr<Tensor_attributes> value);
 
 SDPA_backward_attributes&
-set_causal_mask(bool const value)
+set_causal_mask(bool const value);
 
 SDPA_backward_attributes&
 set_dropout(float const probability,
             std::shared_ptr<Tensor_attributes> seed,
-            std::shared_ptr<Tensor_attributes> offset)
+            std::shared_ptr<Tensor_attributes> offset);
 
 SDPA_backward_attributes&
 set_dropout(std::shared_ptr<Tensor_attributes> mask,
             std::shared_ptr<Tensor_attributes> scale,
-            std::shared_ptr<Tensor_attributes> scale_inv)
+            std::shared_ptr<Tensor_attributes> scale_inv);
 
 SDPA_backward_attributes&
-set_compute_data_type(DataType_t const value)
+set_compute_data_type(DataType_t const value);
 ```
 
 Python API: 
@@ -248,13 +254,65 @@ Returns:
     dV (cudnn_tensor): The value gradient tensor of scaled dot-product attention.
 ```
 
-### Miscellaneous
-- FE provides shadow enums which help avoid users to workaround having different enums for different cudnn versions.
-- The cudnn backend enums are changed as follows:
-    - `cudnnBackend<enum_name>` -> `cudnn_frontend::<enum_name>`
-    - `cudnn<enum_name>` -> `cudnn_frontend::<enum_name>`
-- To dump the dropout mask generated by the Philox RNG dropout implementation for debugging purposes, users can use the `rng_dump` option. This option requires users to pass a tensor of dimensions $(B, H_{q}, S_{q}, S_{kv})$ 
-- Scaled Dot Product Attention Backward improves performance by using an optional dP workspace tensor. This tensor's memory consumption increases quadratically with the sequence length. The following describes the behavior of the `CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT` environment variable, which allows the user to change the GPU memory limit for this workspace tensor:
+
+#### Appendix A 
+Tensor Layouts:
+Q, K, V, O and corresponding gradients layout support. cuDNN API expresses the layout of tensors based on strides.
+
+For example, let Q have dimensions = [5, 7, 4, 3], and strides = [84, 12, 3, 1]
+An element at index [i, j, k, l] can be accessed at the position of Q_ptr + i * 84 + j * 12 + k * 3 + l * 1
+
+Notice how the strides are multiplied to the indices to get the position of all elements.
+Below we will go through the standard usage of the attention tensors and how they can be expressed in cuDNN.
+
+  1. Q, K, V are different matrices with strided layout
+  This is the basic case where the user can specify dims and strides for each of Q, K and V and it works as the example given above.
+  The only limitation is that stride corresponding to the hidden dimension per head (d, last dim in Q) needs to be 1.
+
+  2. Q, K, V are interleaved 
+  This is a special case of (1) and can be described in a strided layout as well. 
+  For example, Q, K and V can be a single matrix of dims (batch (b), number_of_heads (h), sequence_length (s), 3, hidden_dim_per_head(d))
+  Strides of Q can be defined as [h * s * 3 * d, s * 3 * d, 3 * d, 1]
+  Notice how the 3 is multiplied to the strides corresponding to b, h and s because of the interleaving.
+
+  3. There are some special cases when all tokens are not valid and Q, K, V can be in special layouts
+    Let Q tensor have two sequences (i.e batch = 2, number_of_heads = 1) with max_seq_len = 8 and actual_seq_len = [2, 3]
+    Conider two tokens "aa" & "bbb".
+      - Fully padded layout
+
+        aa000000
+        bbb00000
+        Dims = [b=2, h=1, s=8, d=64]
+        Strides = [512, 512, 64, 1]
+        
+        CUDNN gets indication of the actual sequence lengths using the seq_len_q and the seq_len_kv and cuts the computation at these values. Please enable use_padding_mask also for this case. CUDNN reads the data based on the strides.
+
+      - Fully packed layout
+        aabbb000
+        00000000
+        Dims = [b=2, h=1, s=8, d=64]
+        Strides = [512, 512, 64, 1]
+
+        The strides remain the same but they are incorrect as the second batch begins at 64*2. Therefore, we have an API called "ragged_offset" which is a b+1 size tensor telling where each batch begins. The b+1 element is where the last batch ends.
+        Users can set <tensor>.set_ragged_offset(<ragged_offset_tensor>)
+        For this example ragged_offset = [0, 128, 320]
+        Actual sequence length still have to be provided with padding mask.
+
+      - Valid tokens in a batch are packed together
+        aa00bbb0
+        00000000
+
+        User just needs to update the ragged offset to = [0, 256, 448]
+
+      - Valid tokens are not packed together
+        a0abbb00
+        bb000000
+        
+        Ragged offset is insufficient to represent this. This case is NOT supported.
+
+#### Appendix B
+Workspace limit:
+Scaled Dot Product Attention Backward improves performance by using an optional dP workspace tensor. This tensor's memory consumption increases quadratically with the sequence length. The following describes the behavior of the `CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT` environment variable, which allows the user to change the GPU memory limit for this workspace tensor:
   - `CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT = unset`  
     The optimization will utilize workspace memory until reaching the default limit of 256MB.
   - `CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT = -1`  
@@ -263,3 +321,12 @@ Returns:
     Workspace optimization is always disabled, avoiding the additional memory usage.
   - `CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT = n`  
     Allows workspace optimization up to a user-defined limit of n bytes, accommodating systems with varying GPU memory capacities.
+
+#### Appendix C
+To dump the dropout mask generated by the Philox RNG dropout implementation for debugging purposes, users can use the `rng_dump` option. This option requires users to pass a tensor of dimensions $(B, H_{q}, S_{q}, S_{kv})$ 
+
+### Miscellaneous
+- FE provides shadow enums which help avoid users to workaround having different enums for different cudnn versions.
+- The cudnn backend enums are changed as follows:
+    - `cudnnBackend<enum_name>` -> `cudnn_frontend::<enum_name>`
+    - `cudnn<enum_name>` -> `cudnn_frontend::<enum_name>`

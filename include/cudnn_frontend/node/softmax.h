@@ -11,12 +11,12 @@
 
 namespace cudnn_frontend::graph {
 
-class SoftmaxNode : public INode {
+class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
    public:
     Softmax_attributes attributes;
 
     SoftmaxNode(Softmax_attributes&& attributes_, detail::Context const& context)
-        : INode(context), attributes(std::move(attributes_)) {}
+        : NodeCRTP(context), attributes(std::move(attributes_)) {}
 
     Type
     getType() override final {
@@ -41,7 +41,7 @@ class SoftmaxNode : public INode {
     }
 
     error_t
-    expand_and_infer_properties() override final {
+    expand_and_infer_properties_node() override final {
         getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for Softmax node " << attributes.name << "."
                     << std::endl;
 
@@ -121,6 +121,11 @@ class SoftmaxNode : public INode {
         CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
 
         return {error_code_t::OK, ""};
+    }
+
+    virtual void
+    serialize(json& j) const override final {
+        j = attributes;
     }
 };
 

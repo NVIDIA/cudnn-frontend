@@ -13,24 +13,18 @@
 
 namespace cudnn_frontend::graph {
 
-class SDPANode : public INode {
+class SDPANode : public NodeCRTP<SDPANode> {
     using input_names  = SDPA_attributes::input_names;
     using output_names = SDPA_attributes::output_names;
 
     std::shared_ptr<Tensor_attributes> rng_output;
-    std::shared_ptr<Tensor_attributes> dropout_scale;
-    std::shared_ptr<Tensor_attributes> negative_inf_causal;
-    // scalar seq_kv only needs to be passed in case there in no padding mask and seq_kv is not multiple of 64.
-    // Also future versions of cudnn will not need it, hence tensor is pre-fixed with WAR.
-    std::shared_ptr<Tensor_attributes> WAR_scalar_max_seq_kv;
-    std::shared_ptr<Tensor_attributes> negative_inf_padding;
     std::shared_ptr<Tensor_attributes> alibi_slopes;
 
    public:
     SDPA_attributes attributes;
 
     SDPANode(SDPA_attributes&& attributes_, detail::Context const& context)
-        : INode(context), attributes(std::move(attributes_)) {}
+        : NodeCRTP(context), attributes(std::move(attributes_)) {}
 
     Type
     getType() override final {
@@ -81,6 +75,7 @@ class SDPANode : public INode {
 #undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
 
         // validate backend limitations for the operation
+        int64_t s_q  = attributes.inputs.at(input_names::Q)->get_dim()[2];
         int64_t h_q  = attributes.inputs.at(input_names::Q)->get_dim()[1];
         int64_t h_k  = attributes.inputs.at(input_names::K)->get_dim()[1];
         int64_t h_v  = attributes.inputs.at(input_names::V)->get_dim()[1];
@@ -113,20 +108,21 @@ class SDPANode : public INode {
 
         auto const& v_dim = attributes.inputs.at(input_names::V)->get_dim();
         auto s_kv         = v_dim[2];
-        if ((s_kv % 64 != 0) && (!(attributes.padding_mask)) && (cudnnGetVersion() < 90000)) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF((cudnnGetVersion() <= 8905),
+        if ((s_kv % 64 != 0) && (!(attributes.padding_mask)) && (cudnn_frontend::get_backend_version() < 90000)) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF((cudnn_frontend::get_backend_version() <= 8905),
                                            error_code_t::GRAPH_NOT_SUPPORTED,
                                            "s_kv not a multiple of 64 required cudnn version atleast 8.9.5");
             auto const& dropout_mask = attributes.inputs.find(input_names::Dropout_mask);
             bool const has_dropout_mask =
                 (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
             bool const has_dropout = attributes.dropout_probability.has_value() || has_dropout_mask;
-            RETURN_CUDNN_FRONTEND_ERROR_IF(has_dropout,
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "s_kv not a multiple of 64 is not supported with cudnn version below 9.0.0");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                has_dropout,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "s_kv not a multiple of 64 with dropout enabled is not supported with cudnn version below 9.0.0");
         }
 
-        if (((s_kv % 64 != 0) || (d_qk % 64 != 0)) && (cudnnGetVersion() <= 8905)) {
+        if (((s_kv % 64 != 0) || (d_qk % 64 != 0)) && (cudnn_frontend::get_backend_version() <= 8905)) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 true,
                 error_code_t::GRAPH_NOT_SUPPORTED,
@@ -163,12 +159,20 @@ class SDPANode : public INode {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Intermediate tensor data type needs to be set as internal tensors require it.");
 
+        if (((s_q % 64 != 0) || (s_kv % 64 != 0)) && (attributes.padding_mask || has_dropout_mask) &&
+            (cudnn_frontend::get_backend_version() < 90000)) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(true,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "s_q/s_kv not a multiple of 64 with padding/dropout mask is not supported "
+                                           "with cudnn version below 9.0.0");
+        }
+
         CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
         return {error_code_t::OK, ""};
     }
 
     error_t
-    expand_and_infer_properties() override final {
+    expand_and_infer_properties_node() override final {
         getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for Scaled_dot_product_flash_attention node  "
                     << attributes.name << "..." << std::endl;
 
@@ -224,12 +228,8 @@ class SDPANode : public INode {
 
         // Optional scale
         if (attributes.attn_scale_value.has_value()) {
-            attributes.inputs[input_names::Attn_scale] = std::make_shared<Tensor_attributes>();
-            attributes.inputs[input_names::Attn_scale]
-                ->set_dim({1, 1, 1, 1})
-                .set_stride({1, 1, 1, 1})
-                .set_data_type(DataType_t::FLOAT)
-                .set_is_pass_by_value(true);
+            attributes.inputs[input_names::Attn_scale] =
+                std::make_shared<Tensor_attributes>(attributes.attn_scale_value.value());
         }
         if (attributes.inputs[input_names::Attn_scale]) {
             Pointwise_attributes scale_attributes;
@@ -330,12 +330,7 @@ class SDPANode : public INode {
             logical_and_output->set_data_type(DataType_t::BOOLEAN);
 
             // Lower attributes to binary select attributes
-            negative_inf_padding = std::make_shared<Tensor_attributes>();
-            negative_inf_padding->set_dim({1, 1, 1, 1})
-                .set_stride({1, 1, 1, 1})
-                .set_is_pass_by_value(true)
-                // Hard code data type float as FE itself will place FLOAT_MIN in variant pack later
-                .set_data_type(DataType_t::FLOAT);
+            auto negative_inf_padding = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
 
             auto binary_select_attributes =
                 Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT);
@@ -345,17 +340,13 @@ class SDPANode : public INode {
         }
 
         // 2. (bug in cudnn backend) no padding with max_seq_len%64!=0
-        if ((s_kv % 64 != 0) && (!(attributes.padding_mask)) && (cudnnGetVersion() < 90000)) {
+        if ((s_kv % 64 != 0) && (!(attributes.padding_mask)) && (cudnn_frontend::get_backend_version() < 90000)) {
             auto col_index_attributes =
                 Pointwise_attributes().set_name("gen_col_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(3);
             auto col_index_output = pointwise(last_output, col_index_attributes);
-
-            WAR_scalar_max_seq_kv = std::make_shared<Tensor_attributes>();
-            WAR_scalar_max_seq_kv->set_dim({1, 1, 1, 1})
-                .set_stride({1, 1, 1, 1})
-                .set_is_pass_by_value(true)
-                // Hard code data type int32 as FE itself will place FLOAT_MIN in variant pack later
-                .set_data_type(DataType_t::INT32);
+            // scalar seq_kv only needs to be passed in case there in no padding mask and seq_kv is not multiple of 64.
+            // Also future versions of cudnn will not need it, hence tensor is pre-fixed with WAR.
+            auto WAR_scalar_max_seq_kv = std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv));
 
             auto col_less_seq_kv_attributes =
                 Pointwise_attributes().set_name("col_less_seq_kv").set_mode(PointwiseMode_t::CMP_LT);
@@ -363,13 +354,7 @@ class SDPANode : public INode {
                 pointwise(col_index_output, WAR_scalar_max_seq_kv, col_less_seq_kv_attributes);
 
             // Lower attributes to binary select attributes
-            negative_inf_padding = std::make_shared<Tensor_attributes>();
-            negative_inf_padding->set_dim({1, 1, 1, 1})
-                .set_stride({1, 1, 1, 1})
-                .set_is_pass_by_value(true)
-                // Hard code data type float as FE itself will place FLOAT_MIN in variant pack later
-                .set_data_type(DataType_t::FLOAT);
-
+            auto negative_inf_padding = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
             auto binary_select_attributes =
                 Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT);
             auto padding_mask_output =
@@ -395,12 +380,7 @@ class SDPANode : public INode {
             row_greater_than_col_output->set_data_type(DataType_t::BOOLEAN);
 
             // Lower attributes to binary select attributes
-            negative_inf_causal = std::make_shared<Tensor_attributes>();
-            negative_inf_causal->set_dim({1, 1, 1, 1})
-                .set_stride({1, 1, 1, 1})
-                .set_is_pass_by_value(true)
-                // Hard code data type float as FE itself will place FLOAT_MIN in variant pack later
-                .set_data_type(DataType_t::FLOAT);
+            auto negative_inf_causal = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
 
             auto binary_select_attributes =
                 Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT);
@@ -431,7 +411,7 @@ class SDPANode : public INode {
         if (attributes.dropout_probability.has_value()) {
             dropout_present = true;
             // Special case: Skip dropout when 0.0 probability. Only do for 8.9.3 and up as rng isn't optional earlier.
-            if (cudnnGetVersion() > 8902 && attributes.dropout_probability.value() == 0.0) {
+            if (cudnn_frontend::get_backend_version() > 8902 && attributes.dropout_probability.value() == 0.0) {
                 dropout_present = false;
             }
         } else if (attributes.inputs[input_names::Dropout_mask]) {
@@ -465,16 +445,15 @@ class SDPANode : public INode {
             auto const& dropout_mask_output = pointwise(last_output, rng_output, mask_attributes);
             last_output                     = dropout_mask_output;
 
-            dropout_scale = std::make_shared<Tensor_attributes>();
-            dropout_scale->set_dim({1, 1, 1, 1})
-                .set_stride({1, 1, 1, 1})
-                .set_is_pass_by_value(true)
-// Hard code data type input type as FE itself will place value in variant pack later
-#if CUDNN_VERSION < 8903
-                .set_data_type(attributes.inputs[input_names::Q]->get_data_type());
-#else
-                .set_data_type(DataType_t::FLOAT);
-#endif
+            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dropout_scale = nullptr;
+
+            if (get_backend_version() < 8903) {
+                half dropout_scale_value = __float2half(1.0f / (1.0f - attributes.dropout_probability.value()));
+                dropout_scale            = std::make_shared<Tensor_attributes>(dropout_scale_value);
+            } else {
+                float dropout_scale_value = (1.0f / (1.0f - attributes.dropout_probability.value()));
+                dropout_scale             = std::make_shared<Tensor_attributes>(dropout_scale_value);
+            }
 
             auto dropout_scale_attributes =
                 Pointwise_attributes().set_name("dropout_scale").set_mode(PointwiseMode_t::MUL);
@@ -530,68 +509,30 @@ class SDPANode : public INode {
     }
 
     virtual error_t
-    pass_by_value_tensors_(
-        cudnnHandle_t handle,
-        std::unordered_map<std::shared_ptr<Tensor_attributes>, void*> const&,
-        std::unordered_map<std::shared_ptr<Tensor_attributes>, pass_by_values_t>& tensor_to_pass_by_value,
-        void* node_workspace) const override final {
-        if (attributes.dropout_probability.has_value() && attributes.dropout_probability.value() != 0.0) {
-#if CUDNN_VERSION < 8903
-            half dropout_scale_value = (1.0f / (1.0f - attributes.dropout_probability.value()));
-#else
-            float dropout_scale_value = (1.0f / (1.0f - attributes.dropout_probability.value()));
-#endif
-            tensor_to_pass_by_value.emplace(dropout_scale, dropout_scale_value);
-        }
-
-        if (negative_inf_padding) {
-            float negative_inf_value = std::numeric_limits<float>::lowest();
-            tensor_to_pass_by_value.emplace(negative_inf_padding, negative_inf_value);
-        }
-
-        if (WAR_scalar_max_seq_kv) {
-            auto const& v_dim = attributes.inputs.at(input_names::V)->get_dim();
-            int32_t s_kv      = static_cast<int32_t>(v_dim[2]);
-            tensor_to_pass_by_value.emplace(WAR_scalar_max_seq_kv, s_kv);
-        }
-
-        if (negative_inf_causal) {
-            float negative_inf_value = std::numeric_limits<float>::lowest();
-            tensor_to_pass_by_value.emplace(negative_inf_causal, negative_inf_value);
-        }
-
+    workspace_modifications_tensors_(
+        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>>& workspace_modifications,
+        int64_t& offset) const override final {
         if (attributes.alibi_mask) {
             CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(Q, input_names::Q);
-            int64_t const h            = Q->second->get_dim()[1];
-            auto h_alibi_slopes_vector = detail::get_abili_slope(h);
-            int64_t alibi_slopes_size  = h * sizeof(float);
-
-            cudaStream_t stream;
-            CHECK_CUDNN_ERROR(cudnnGetStream(handle, &stream));
-            CHECK_CUDA_ERROR(cudaMemcpyAsync(
-                node_workspace, h_alibi_slopes_vector.data(), alibi_slopes_size, cudaMemcpyHostToDevice, stream));
-            tensor_to_pass_by_value.emplace(alibi_slopes, node_workspace);
+            int64_t const h_q     = Q->second->get_dim()[1];
+            auto alibi_slopes_vec = detail::get_abili_slope(h_q);
+            workspace_modifications.emplace(alibi_slopes->get_uid(), std::make_tuple(0, offset, alibi_slopes_vec));
         }
-
-        if (attributes.attn_scale_value.has_value()) {
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(Attn_scale, input_names::Attn_scale);
-            tensor_to_pass_by_value.emplace(Attn_scale->second, attributes.attn_scale_value.value());
-        }
-
         return {error_code_t::OK, ""};
+    }
+
+    virtual void
+    serialize(json& j) const override final {
+        j = attributes;
+        j.update(R"({"tag": "SDPA_FWD"})"_json);
     }
 };
 
-class SDPABackwardNode : public INode {
+class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
     using input_names  = SDPA_backward_attributes::input_names;
     using output_names = SDPA_backward_attributes::output_names;
 
    private:
-    // non-virtual node cpu tensors
-    std::shared_ptr<Tensor_attributes> one_tensor;
-    std::shared_ptr<Tensor_attributes> negative_inf_padding;
-    std::shared_ptr<Tensor_attributes> negative_inf_causal;
-
     // non-virtual node gpu tensors
     std::shared_ptr<Tensor_attributes> dQ_accum;
     int64_t dQ_accum_size = 0;
@@ -604,7 +545,7 @@ class SDPABackwardNode : public INode {
     SDPA_backward_attributes attributes;
 
     SDPABackwardNode(SDPA_backward_attributes&& attributes_, detail::Context const& context)
-        : INode(context), attributes(std::move(attributes_)) {}
+        : NodeCRTP(context), attributes(std::move(attributes_)) {}
 
     Type
     getType() override final {
@@ -657,10 +598,18 @@ class SDPABackwardNode : public INode {
 
         // validate backend limitations for the operation
         int64_t h_q  = attributes.inputs.at(input_names::Q)->get_dim()[1];
+        int64_t s_q  = attributes.inputs.at(input_names::Q)->get_dim()[2];
         int64_t h_k  = attributes.inputs.at(input_names::K)->get_dim()[1];
         int64_t h_v  = attributes.inputs.at(input_names::V)->get_dim()[1];
         int64_t d_qk = attributes.inputs.at(input_names::Q)->get_dim()[3];
+        int64_t s_kv = attributes.inputs.at(input_names::V)->get_dim()[2];
         int64_t d_v  = attributes.inputs.at(input_names::V)->get_dim()[3];
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            (s_q < 64) && cudnn_frontend::get_backend_version() < 90000,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "Sequence length must be greater than or equal to 64 for cudnn version prior to v9.0.0");
+
         RETURN_CUDNN_FRONTEND_ERROR_IF((h_q % h_k != 0) || (h_q % h_v != 0),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "For group-query attention, number of heads for key and query must be a factor "
@@ -678,8 +627,9 @@ class SDPABackwardNode : public INode {
                                        "attn_scale with tensor and value cannot be set at the same time.");
 
         // validate options for bias mask
-        auto bias_mask = attributes.inputs.find(input_names::Bias);
-        if (bias_mask != attributes.inputs.end() && bias_mask->second != nullptr) {
+        auto bias_mask      = attributes.inputs.find(input_names::Bias);
+        bool const has_bias = (bias_mask != attributes.inputs.end() && bias_mask->second != nullptr);
+        if (has_bias) {
             auto bias_mask_dtype = bias_mask->second->get_data_type();
             RETURN_CUDNN_FRONTEND_ERROR_IF((bias_mask_dtype == DataType_t::BOOLEAN),
                                            error_code_t::GRAPH_NOT_SUPPORTED,
@@ -716,6 +666,14 @@ class SDPABackwardNode : public INode {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Intermediate tensor data type needs to be set as internal tensors require it.");
 
+        if (((s_q % 64 != 0) || (s_kv % 64 != 0)) && (attributes.padding_mask || has_dropout_mask) &&
+            (cudnn_frontend::get_backend_version() < 90000)) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(true,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "s_q/s_kv not a multiple of 64 with padding/dropout mask is not supported "
+                                           "with cudnn version below 9.0.0");
+        }
+
         CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
         return {error_code_t::OK, ""};
     }
@@ -730,7 +688,7 @@ class SDPABackwardNode : public INode {
     }
 
     error_t
-    expand_and_infer_properties() override final {
+    expand_and_infer_properties_node() override final {
         getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for SDPABackwardNode " << attributes.name
                     << "..." << std::endl;
 
@@ -781,16 +739,11 @@ class SDPABackwardNode : public INode {
         // --------------Initialize and create tensors before creating nodes--------------------
         // one_tensor is needed for non-dropout graphs
         // one_tensor is passed by the node
-        one_tensor = std::make_shared<Tensor_attributes>();
-        one_tensor->set_is_virtual(false).set_is_pass_by_value(true);
-        one_tensor->set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1});
-        one_tensor->set_data_type(DataType_t::FLOAT);
+        auto one_tensor = std::make_shared<Tensor_attributes>(1.0f);
 
         if (attributes.attn_scale_value.has_value()) {
-            attributes.inputs[input_names::Attn_scale] = std::make_shared<Tensor_attributes>();
-            attributes.inputs[input_names::Attn_scale]->set_is_virtual(false).set_is_pass_by_value(true);
-            attributes.inputs[input_names::Attn_scale]->set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1});
-            attributes.inputs[input_names::Attn_scale]->set_data_type(DataType_t::FLOAT);
+            attributes.inputs[input_names::Attn_scale] =
+                std::make_shared<Tensor_attributes>(attributes.attn_scale_value.value());
         }
 
         // alibi_slopes is passed by the node
@@ -802,35 +755,17 @@ class SDPABackwardNode : public INode {
             alibi_slopes_size = h_q * sizeof(float);
         }
 
-        // negative_inf_padding is passed by the node
-        if (attributes.padding_mask) {
-            negative_inf_padding = std::make_shared<Tensor_attributes>();
-            negative_inf_padding->set_is_virtual(false).set_is_pass_by_value(true);
-            negative_inf_padding->set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1});
-            negative_inf_padding->set_data_type(DataType_t::FLOAT);
-        }
-
-        // negative_inf_causal is passed by the node
-        if (attributes.causal_mask) {
-            negative_inf_causal = std::make_shared<Tensor_attributes>();
-            negative_inf_causal->set_is_virtual(false).set_is_pass_by_value(true);
-            negative_inf_causal->set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1});
-            negative_inf_causal->set_data_type(DataType_t::FLOAT);
-        }
-
         // if dropout_prob is used, then the node passes scale and scale inverse
         // if dropout_mask is used, then the user passes scale and scale_inverse
         bool is_dropout_prob = (attributes.dropout_probability.has_value());
         bool is_dropout_mask = (attributes.inputs[input_names::Dropout_mask] != nullptr);
         if (is_dropout_prob) {
-            attributes.inputs[input_names::Dropout_scale] = std::make_shared<Tensor_attributes>();
-            attributes.inputs[input_names::Dropout_scale]->set_is_virtual(false).set_is_pass_by_value(true);
-            attributes.inputs[input_names::Dropout_scale]->set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1});
-            attributes.inputs[input_names::Dropout_scale]->set_data_type(DataType_t::FLOAT);
-            attributes.inputs[input_names::Dropout_scale_inv] = std::make_shared<Tensor_attributes>();
-            attributes.inputs[input_names::Dropout_scale_inv]->set_is_virtual(false).set_is_pass_by_value(true);
-            attributes.inputs[input_names::Dropout_scale_inv]->set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1});
-            attributes.inputs[input_names::Dropout_scale_inv]->set_data_type(DataType_t::FLOAT);
+            float dropout_scale_value     = 1.0f / (1.0f - attributes.dropout_probability.value());
+            float dropout_scale_inv_value = (1.0f - attributes.dropout_probability.value());
+
+            attributes.inputs[input_names::Dropout_scale] = std::make_shared<Tensor_attributes>(dropout_scale_value);
+            attributes.inputs[input_names::Dropout_scale_inv] =
+                std::make_shared<Tensor_attributes>(dropout_scale_inv_value);
         }
 
         // ---------------------input tensor workarounds---------------------------
@@ -847,8 +782,9 @@ class SDPABackwardNode : public INode {
         bool use_workspace_opt = false;
 
         struct cudaDeviceProp prop;
-        CHECK_CUDA_ERROR(cudaGetDeviceProperties(&prop, 0));
-        if (cudnnGetVersion() >= 8905 && prop.major >= 9) {
+        CHECK_CUDA_ERROR(cuda_get_device_properties(&prop, 0));
+        if ((cudnn_frontend::get_backend_version() >= 8905 && prop.major >= 9) ||
+            (cudnn_frontend::get_backend_version() >= 9000)) {
             // default upper limit for workspace 256MB
             int64_t max_dp_workspace_bytes = 256 * 1024 * 1024;
 
@@ -1043,6 +979,7 @@ class SDPABackwardNode : public INode {
                                                      .set_mode(PointwiseMode_t::LOGICAL_AND)
                                                      .set_compute_data_type(DataType_t::BOOLEAN));
             padding_mask_output->set_data_type(DataType_t::BOOLEAN);
+            auto negative_inf_padding = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
 
             last_output =
                 pointwise(last_output,
@@ -1076,6 +1013,7 @@ class SDPABackwardNode : public INode {
                                                     .set_mode(PointwiseMode_t::CMP_GE)
                                                     .set_compute_data_type(DataType_t::BOOLEAN));
             causal_mask_output->set_data_type(DataType_t::BOOLEAN);
+            auto negative_inf_causal = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
 
             last_output =
                 pointwise(last_output,
@@ -1088,6 +1026,56 @@ class SDPABackwardNode : public INode {
         last_output = pointwise(last_output,
                                 attributes.inputs[input_names::Stats],
                                 Pointwise_attributes().set_name("sub_s_m").set_mode(PointwiseMode_t::SUB));
+
+        // WAR for bug 4475073 by explicitly putting the padding value again after the stats have been loaded
+        if (attributes.padding_mask && cudnn_frontend::get_backend_version() >= 90000) {
+            auto row_idx_output = pointwise(last_output,
+                                            Pointwise_attributes()
+                                                .set_name("gen_row_idx_2nd_padding")
+                                                .set_mode(PointwiseMode_t::GEN_INDEX)
+                                                .set_axis(2)
+                                                .set_compute_data_type(DataType_t::INT32));
+            row_idx_output->set_data_type(DataType_t::INT32);
+
+            auto col_idx_output = pointwise(last_output,
+                                            Pointwise_attributes()
+                                                .set_name("gen_col_idx_2nd_padding")
+                                                .set_mode(PointwiseMode_t::GEN_INDEX)
+                                                .set_axis(3)
+                                                .set_compute_data_type(DataType_t::INT32));
+            col_idx_output->set_data_type(DataType_t::INT32);
+
+            auto row_mask_output = pointwise(row_idx_output,
+                                             attributes.inputs[input_names::SEQ_LEN_Q],
+                                             Pointwise_attributes()
+                                                 .set_name("lt_row_sq_2nd_padding")
+                                                 .set_mode(PointwiseMode_t::CMP_LT)
+                                                 .set_compute_data_type(DataType_t::BOOLEAN));
+            row_mask_output->set_data_type(DataType_t::BOOLEAN);
+
+            auto col_mask_output = pointwise(col_idx_output,
+                                             attributes.inputs[input_names::SEQ_LEN_KV],
+                                             Pointwise_attributes()
+                                                 .set_name("lt_col_skv_2nd_padding")
+                                                 .set_mode(PointwiseMode_t::CMP_LT)
+                                                 .set_compute_data_type(DataType_t::BOOLEAN));
+            col_mask_output->set_data_type(DataType_t::BOOLEAN);
+
+            auto padding_mask_output = pointwise(row_mask_output,
+                                                 col_mask_output,
+                                                 Pointwise_attributes()
+                                                     .set_name("and_row_col_2nd_padding")
+                                                     .set_mode(PointwiseMode_t::LOGICAL_AND)
+                                                     .set_compute_data_type(DataType_t::BOOLEAN));
+            padding_mask_output->set_data_type(DataType_t::BOOLEAN);
+            auto negative_inf_padding = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
+
+            last_output = pointwise(
+                last_output,
+                negative_inf_padding,
+                padding_mask_output,
+                Pointwise_attributes().set_name("select_2nd_padding").set_mode(PointwiseMode_t::BINARY_SELECT));
+        }
 
         // last_output = exp(last_output)
         last_output  = pointwise(last_output, Pointwise_attributes().set_name("exp_s").set_mode(PointwiseMode_t::EXP));
@@ -1114,7 +1102,7 @@ class SDPABackwardNode : public INode {
         // as reshape + matmul
         last_output = reshape(last_output, Reshape_attributes().set_name("reshape_p"));
         last_output->set_dim({b, h_q, s_kv, s_q}).set_stride({h_q * s_q * s_kv, s_q * s_kv, 1, s_kv});
-        last_output->set_data_type(context.get_io_data_type());
+        last_output->set_data_type(attributes.inputs[input_names::Q]->get_data_type());
 
         if (h_q == h_v) {
             // for MHA
@@ -1134,7 +1122,7 @@ class SDPABackwardNode : public INode {
                                      .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
                                      .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]));
             last_output->set_dim({b, h_q, s_kv, d_v}).set_stride({h_q * s_kv * d_v, s_kv * d_v, d_v, 1});
-            last_output->set_data_type(context.get_io_data_type());
+            last_output->set_data_type(attributes.inputs[input_names::Q]->get_data_type());
             reduction(last_output,
                       Reduction_attributes().set_name("red_dV_head").set_mode(ReductionMode_t::ADD),
                       attributes.outputs[output_names::dV]);
@@ -1148,7 +1136,7 @@ class SDPABackwardNode : public INode {
                              Matmul_attributes()
                                  .set_name("matmul_dO_VT")
                                  .set_m_override(attributes.inputs[input_names::SEQ_LEN_Q])
-                                 .set_k_override(attributes.inputs[input_names::SEQ_LEN_KV]));
+                                 .set_n_override(attributes.inputs[input_names::SEQ_LEN_KV]));
         last_output->set_dim({b, h_q, s_q, s_kv}).set_stride({h_q * s_q * s_kv, s_q * s_kv, s_kv, 1});
 
         // last_output = last_output(dP) * mask
@@ -1194,7 +1182,7 @@ class SDPABackwardNode : public INode {
         // as reshape + matmul
         last_output = reshape(last_output, Reshape_attributes().set_name("reshape_dS"));
         last_output->set_dim({b, h_q, s_kv, s_q}).set_stride({h_q * s_q * s_kv, s_q * s_kv, 1, s_kv});
-        last_output->set_data_type(context.get_io_data_type());
+        last_output->set_data_type(attributes.inputs[input_names::Q]->get_data_type());
 
         if (h_q == h_k) {
             // for MHA
@@ -1214,7 +1202,7 @@ class SDPABackwardNode : public INode {
                                      .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
                                      .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]));
             last_output->set_dim({b, h_q, s_kv, d_qk}).set_stride({h_q * s_kv * d_qk, s_kv * d_qk, d_qk, 1});
-            last_output->set_data_type(context.get_io_data_type());
+            last_output->set_data_type(attributes.inputs[input_names::Q]->get_data_type());
             reduction(last_output,
                       Reduction_attributes().set_name("red_dK_head").set_mode(ReductionMode_t::ADD),
                       attributes.outputs[output_names::dK]);
@@ -1230,6 +1218,10 @@ class SDPABackwardNode : public INode {
         last_output = reshape(attributes.inputs[input_names::K], Reshape_attributes().set_name("reshape_k"));
         last_output->set_dim({kt_dim[0], kt_dim[1], kt_dim[3], kt_dim[2]})
             .set_stride({kt_stride[0], kt_stride[1], kt_stride[3], kt_stride[2]});
+
+        if (attributes.inputs[input_names::K]->get_ragged_offset() != nullptr) {
+            last_output->set_ragged_offset(attributes.inputs[input_names::K]->get_ragged_offset());
+        }
 
         matmul(dS_output,
                last_output,
@@ -1249,7 +1241,7 @@ class SDPABackwardNode : public INode {
 
         // non-virtual softmax_sum is required for below cuDNN 8.9.5
         // non-virtual softmax_sum is passed by the node
-        if (cudnnGetVersion() < 8905) {
+        if (cudnn_frontend::get_backend_version() < 8905) {
             softmax_sum->set_is_virtual(false);
             softmax_sum->set_dim({b, h_q, s_q, 1});
             softmax_sum->set_data_type(DataType_t::FLOAT);
@@ -1267,72 +1259,38 @@ class SDPABackwardNode : public INode {
         return alibi_slopes_size_padded + dQ_accum_size + softmax_sum_size;
     }
 
-    error_t
-    pass_by_value_tensors_(
-        cudnnHandle_t handle,
-        std::unordered_map<std::shared_ptr<Tensor_attributes>, void*> const&,
-        std::unordered_map<std::shared_ptr<Tensor_attributes>, pass_by_values_t>& tensor_to_pass_by_value,
-        void* node_workspace) const override final {
-        using input_names = SDPA_backward_attributes::input_names;
-
-        if (one_tensor) {
-            tensor_to_pass_by_value.emplace(one_tensor, 1.0f);
-        }
-
-        if (attributes.attn_scale_value.has_value()) {
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(Attn_scale, input_names::Attn_scale);
-            tensor_to_pass_by_value.emplace(Attn_scale->second, attributes.attn_scale_value.value());
-        }
-
+    virtual error_t
+    workspace_modifications_tensors_(
+        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>>& workspace_modifications,
+        int64_t& offset) const override final {
         if (attributes.alibi_mask) {
             CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(Q, input_names::Q);
-            int64_t const h_q                = Q->second->get_dim()[1];
-            auto alibi_slopes_vec            = detail::get_abili_slope(h_q);
+            int64_t const h_q     = Q->second->get_dim()[1];
+            auto alibi_slopes_vec = detail::get_abili_slope(h_q);
+            workspace_modifications.emplace(alibi_slopes->get_uid(), std::make_tuple(0, offset, alibi_slopes_vec));
             int64_t alibi_slopes_size_padded = (alibi_slopes_size + 15) & ~15;
-
-            cudaStream_t stream;
-            CHECK_CUDNN_ERROR(cudnnGetStream(handle, &stream));
-            CHECK_CUDA_ERROR(cudaMemcpyAsync(
-                node_workspace, alibi_slopes_vec.data(), alibi_slopes_size, cudaMemcpyHostToDevice, stream));
-            tensor_to_pass_by_value.emplace(alibi_slopes, node_workspace);
-            node_workspace = static_cast<char*>(node_workspace) + alibi_slopes_size_padded;
-        }
-
-        if (attributes.padding_mask) {
-            float negative_inf_value = std::numeric_limits<float>::lowest();
-            tensor_to_pass_by_value.emplace(negative_inf_padding, negative_inf_value);
-        }
-
-        if (attributes.causal_mask) {
-            float negative_inf_value = std::numeric_limits<float>::lowest();
-            tensor_to_pass_by_value.emplace(negative_inf_causal, negative_inf_value);
-        }
-
-        if (attributes.dropout_probability.has_value()) {
-            float dropout_scale_value     = 1.0f / (1.0f - attributes.dropout_probability.value());
-            float dropout_scale_inv_value = (1.0f - attributes.dropout_probability.value());
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(Dropout_scale, input_names::Dropout_scale);
-            tensor_to_pass_by_value.emplace(Dropout_scale->second, dropout_scale_value);
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(Dropout_scale_inv, input_names::Dropout_scale_inv);
-            tensor_to_pass_by_value.emplace(Dropout_scale_inv->second, dropout_scale_inv_value);
+            offset                           = offset + alibi_slopes_size_padded;
         }
 
         if (dQ_accum && !dQ_accum->get_is_virtual()) {
-            cudaStream_t stream;
-            CHECK_CUDNN_ERROR(cudnnGetStream(handle, &stream));
-            CHECK_CUDA_ERROR(cudaMemsetAsync(node_workspace, 0, dQ_accum_size, stream));
-            tensor_to_pass_by_value.emplace(dQ_accum, node_workspace);
-            node_workspace = static_cast<char*>(node_workspace) + dQ_accum_size;
+            std::vector<float> f_vec = {(float)dQ_accum_size};
+            workspace_modifications.emplace(dQ_accum->get_uid(), std::make_tuple(1, offset, f_vec));
+            offset = offset + dQ_accum_size;
         }
 
         if (softmax_sum && !softmax_sum->get_is_virtual()) {
             // There is no requirement for softmax_sum to be memset to 0
-            tensor_to_pass_by_value.emplace(softmax_sum, node_workspace);
+            std::vector<float> f_vec = {};
+            workspace_modifications.emplace(softmax_sum->get_uid(), std::make_tuple(2, offset, f_vec));
         }
 
         return {error_code_t::OK, ""};
+    }
+
+    virtual void
+    serialize(json& j) const override final {
+        j = attributes;
+        j.update(R"({"tag": "SDPA_BWD"})"_json);
     }
 };
 

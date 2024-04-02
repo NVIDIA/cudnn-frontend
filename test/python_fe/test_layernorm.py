@@ -3,20 +3,7 @@ import pytest
 import torch
 import itertools
 
-def convert_to_cudnn_type(torch_type):
-    if torch_type == torch.float16:
-        return cudnn.data_type.HALF
-    elif torch_type == torch.bfloat16:
-        return cudnn.data_type.BFLOAT16
-    elif torch_type == torch.float32:
-        return cudnn.data_type.FLOAT
-    elif torch_type == torch.bool:
-        return cudnn.data_type.BOOLEAN
-    elif torch_type == torch.uint8:
-        return cudnn.data_type.UINT8
-    else:
-        raise ValueError("Unsupported tensor data type.")
-
+from test_utils import torch_fork_set_rng
 
 embedding_dim_options = [768, 1024, 1280, 1600]
 input_type_options = [torch.bfloat16, torch.float16]
@@ -28,8 +15,8 @@ def param_extract(request):
   return request.param
 
 @pytest.mark.skipif(cudnn.backend_version() < 8905, reason="LN not supported below cudnn 8.9.5")
-def test_in(param_extract):
-    torch.manual_seed(0)
+@torch_fork_set_rng(seed=0)
+def test_layernorm(param_extract):
 
     embedding_dim, input_type = param_extract
 
@@ -48,19 +35,17 @@ def test_in(param_extract):
     bias_gpu = 7*torch.randn(1, C, H, W, requires_grad=True, device="cuda", dtype=input_type).to(memory_format=torch.channels_last) -2
     epsilon_cpu = torch.full((1, 1, 1, 1), epsilon_value, requires_grad=False, device="cpu", dtype=torch.float32)
 
-    print("Running reference")
         
     Y_expected = torch.nn.functional.layer_norm(x_gpu, [C, H, W], weight=scale_gpu.squeeze(0), bias=bias_gpu.squeeze(0), eps=epsilon_value)
     mean_expected = x_gpu.to(torch.float32).mean(dim=(1, 2, 3), keepdim=True)
     inv_var_expected = torch.rsqrt(torch.var(x_gpu.to(torch.float32), dim=(1, 2, 3), keepdim=True) + epsilon_value)
-    print("Building cudnn graph")
 
     graph = cudnn.pygraph(intermediate_data_type = cudnn.data_type.FLOAT, compute_data_type = cudnn.data_type.FLOAT)
 
-    X = graph.tensor(name = "X", dim = x_gpu.size(), stride = x_gpu.stride(), data_type = convert_to_cudnn_type(x_gpu.dtype))
-    scale = graph.tensor(name = "scale", dim = scale_gpu.size(), stride = scale_gpu.stride(), data_type = convert_to_cudnn_type(scale_gpu.dtype))
-    bias = graph.tensor(name = "bias", dim = bias_gpu.size(), stride = bias_gpu.stride(), data_type = convert_to_cudnn_type(bias_gpu.dtype))
-    epsilon = graph.tensor(name = "epsilon", dim = epsilon_cpu.size(), stride = epsilon_cpu.stride(), is_pass_by_value = True, data_type = convert_to_cudnn_type(epsilon_cpu.dtype))
+    X = graph.tensor(name = "X", dim = x_gpu.size(), stride = x_gpu.stride(), data_type = x_gpu.dtype)
+    scale = graph.tensor(name = "scale", dim = scale_gpu.size(), stride = scale_gpu.stride(), data_type = scale_gpu.dtype)
+    bias = graph.tensor(name = "bias", dim = bias_gpu.size(), stride = bias_gpu.stride(), data_type = bias_gpu.dtype)
+    epsilon = graph.tensor(name = "epsilon", dim = epsilon_cpu.size(), stride = epsilon_cpu.stride(), is_pass_by_value = True, data_type = epsilon_cpu.dtype)
 
     Y, mean, inv_var = graph.layernorm(name = "LN", 
                             norm_forward_phase = cudnn.norm_forward_phase.TRAINING,
@@ -69,9 +54,9 @@ def test_in(param_extract):
                             bias = bias,
                             epsilon = epsilon)
     
-    Y.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
-    mean.set_output(True).set_data_type(convert_to_cudnn_type(mean_expected.dtype))
-    inv_var.set_output(True).set_data_type(convert_to_cudnn_type(inv_var_expected.dtype))
+    Y.set_output(True).set_data_type(x_gpu.dtype)
+    mean.set_output(True).set_data_type(mean_expected.dtype)
+    inv_var.set_output(True).set_data_type(inv_var_expected.dtype)
     
     graph.validate()
     graph.build_operation_graph()
@@ -84,7 +69,6 @@ def test_in(param_extract):
     inv_var_actual = torch.empty_like(inv_var_expected)
     
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
-    print("Executing cudnn graph")
     
     graph.execute({
                 X : x_gpu.detach()
@@ -96,11 +80,9 @@ def test_in(param_extract):
                 , inv_var: inv_var_actual
             }, workspace)
     
-    print("Comparing with reference")
     torch.testing.assert_close(Y_expected, Y_actual, atol=atol, rtol=rtol)
     torch.testing.assert_close(mean_expected, mean_actual, atol=atol, rtol=rtol)
     torch.testing.assert_close(inv_var_expected, inv_var_actual, atol=atol, rtol=rtol)
-    print("Success!!")
     
     target = torch.randn_like(Y_expected)
     criterion = torch.nn.MSELoss()
@@ -115,7 +97,7 @@ def test_in(param_extract):
     
     bwd_graph = cudnn.pygraph(intermediate_data_type = cudnn.data_type.FLOAT, compute_data_type = cudnn.data_type.FLOAT)
 
-    DY = bwd_graph.tensor(name = "DY", dim = x_gpu.size(), stride = x_gpu.stride(), data_type = convert_to_cudnn_type(x_gpu.dtype))
+    DY = bwd_graph.tensor(name = "DY", dim = x_gpu.size(), stride = x_gpu.stride(), data_type = x_gpu.dtype)
     X_bwd = bwd_graph.tensor_like(X, name = 'X')
     scale_bwd = bwd_graph.tensor_like(scale, name = 'scale')
     mean_bwd = bwd_graph.tensor_like(mean, name = 'mean')
@@ -128,9 +110,9 @@ def test_in(param_extract):
                             mean = mean_bwd,
                             inv_variance = inv_var_bwd)
     
-    DX.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
-    Dscale.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
-    Dbias.set_output(True).set_data_type(convert_to_cudnn_type(x_gpu.dtype))
+    DX.set_output(True).set_data_type(x_gpu.dtype)
+    Dscale.set_output(True).set_data_type(x_gpu.dtype)
+    Dbias.set_output(True).set_data_type(x_gpu.dtype)
 
     bwd_graph.validate()
     bwd_graph.build_operation_graph()    
@@ -143,7 +125,6 @@ def test_in(param_extract):
     Dbias_actual = torch.empty_like(bias_gpu)
 
     workspace = torch.empty(bwd_graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
-    print("Executing cudnn bwd_graph")
     
     bwd_graph.execute({
                 X_bwd : x_gpu.detach()
@@ -156,11 +137,9 @@ def test_in(param_extract):
                 , Dbias: Dbias_actual
             }, workspace)
 
-    print("Comparing with reference")
     torch.testing.assert_close(x_gpu.grad, DX_actual, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(scale_gpu.grad, DScale_actual, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(bias_gpu.grad, Dbias_actual, atol=2e-4, rtol=2e-4)
-    print("Success!!")
 
 if __name__ == "__main__":
-    test_in((1600, torch.bfloat16))
+    test_layernorm((1600, torch.bfloat16))

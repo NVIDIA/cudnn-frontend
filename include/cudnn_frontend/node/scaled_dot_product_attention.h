@@ -13,14 +13,14 @@
 
 namespace cudnn_frontend::graph {
 
-class ScaledDotProductAttentionNode : public INode {
+class ScaledDotProductAttentionNode : public NodeCRTP<ScaledDotProductAttentionNode> {
+   public:
     std::shared_ptr<Tensor_attributes> negative_inf;
 
-   public:
     Scaled_dot_product_attention_attributes options;
 
     ScaledDotProductAttentionNode(Scaled_dot_product_attention_attributes&& options_, detail::Context const& context)
-        : INode(context), options(std::move(options_)) {}
+        : NodeCRTP(context), options(std::move(options_)) {}
 
     Type
     getType() override final {
@@ -54,7 +54,7 @@ class ScaledDotProductAttentionNode : public INode {
     }
 
     error_t
-    expand_and_infer_properties() override final {
+    expand_and_infer_properties_node() override final {
         getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for Scaled_dot_product_attention node "
                     << options.name << "..." << std::endl;
 
@@ -326,16 +326,12 @@ class ScaledDotProductAttentionNode : public INode {
     }
 
     virtual error_t
-    pass_by_value_tensors_(
-        cudnnHandle_t,
-        std::unordered_map<std::shared_ptr<Tensor_attributes>, void*> const&,
-        std::unordered_map<std::shared_ptr<Tensor_attributes>, pass_by_values_t>& tensor_to_pass_by_value,
-        void*) const override final {
+    pass_by_value_tensors_(std::map<uid_t, pass_by_values_t>& tensor_to_pass_by_value) const override final {
         half dropout_scale_value = options.dropout_scale;
-        tensor_to_pass_by_value.emplace(options.inputs.Dropout_scale, dropout_scale_value);
+        tensor_to_pass_by_value.emplace(options.inputs.Dropout_scale->get_uid(), dropout_scale_value);
 
         float negative_inf_value = std::numeric_limits<float>::min();
-        tensor_to_pass_by_value.emplace(negative_inf, negative_inf_value);
+        tensor_to_pass_by_value.emplace(negative_inf->get_uid(), negative_inf_value);
 
         return {error_code_t::OK, ""};
     }

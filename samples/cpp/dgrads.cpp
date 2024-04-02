@@ -27,6 +27,9 @@
 
 TEST_CASE("Convolution Dgrad", "[dgrad][graph]") {
     namespace fe = cudnn_frontend;
+    if (is_arch_supported_by_cudnn() == false) {
+        SKIP("Architecture is not supported by currend cudnn version");
+    }
     fe::graph::Graph graph;
     graph.set_io_data_type(fe::DataType_t::HALF)
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
