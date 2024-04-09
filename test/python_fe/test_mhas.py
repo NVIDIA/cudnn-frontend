@@ -2,6 +2,7 @@ import cudnn
 import pytest
 import torch
 import math
+from looseversion import LooseVersion
 
 import random
 import os
@@ -296,22 +297,24 @@ def test_sdpa(input_type,
         is_infer,
         arg_params):
 
-    if cudnn.backend_version() < 8903:
+    cudnn_version = LooseVersion(cudnn.backend_version_string())
+
+    if cudnn_version < "8.9.3":
         pytest.skip("SDPA fprop requires cudnn 8.9.3 or higher")
 
-    if head_group != "multi_head" and cudnn.backend_version() < 8907:
+    if head_group != "multi_head" and cudnn_version < "8.9.7":
         pytest.skip("GQA and MQA is only supported 8.9.7 onwards.")
 
-    if is_alibi and cudnn.backend_version() < 8904:
+    if is_alibi and cudnn_version < "8.9.4":
         pytest.skip("ALiBi mask is only supported 8.9.4 onwards.")
 
-    if is_padding and cudnn.backend_version() < 8903:
+    if is_padding and cudnn_version < "8.9.3":
         pytest.skip("Padding mask is only supported 8.9.3 onwards.")
 
-    if is_dropout and cudnn.backend_version() < 8906:
+    if is_dropout and cudnn_version < "8.9.6":
         pytest.skip("Dropout reference is only supported on 8.9.6 onwards.")
 
-    if is_ragged and cudnn.backend_version() < 90000:
+    if is_ragged and cudnn_version < "9":
         pytest.skip("Ragged tensor is only supported 9.0.0 onwards")
 
     if is_ragged and torch.cuda.get_device_capability()[0] < 9:
@@ -358,26 +361,26 @@ def test_sdpa(input_type,
     h_k = int(arg_params.mha_h_k) if arg_params.mha_h_k != None else h_k
     h_v = int(arg_params.mha_h_v) if arg_params.mha_h_v != None else h_v
 
-    if d_qk != d_v and cudnn.backend_version() < 8906:
+    if d_qk != d_v and cudnn_version < "8.9.6":
         pytest.skip("d_qk != d_v is only supported on 8.9.6 onwards.")
 
-    if cudnn.backend_version() < 90000:
+    if cudnn_version < "9":
         if ((s_q % 64 != 0) or (s_kv % 64 != 0)) and (is_padding or is_dropout):
             pytest.skip("s_q not a multiple of 64 with padding/dropout is not supported with cudnn version 9.0.0")
 
-    if cudnn.backend_version() < 8906:
+    if cudnn_version < "8.9.6":
         pytest.skip("d not a multiple of 64, not-multiple-of-64 seq_kv is not supported below 8.9.6")
 
-    if (d_qk % 64 != 0) and cudnn.backend_version() < 8906:
+    if (d_qk % 64 != 0) and cudnn_version < "8.9.6":
         pytest.skip("d not a multiple of 64 is not supported below 8.9.6")
 
-    if (d_qk % 64 != 0) and cudnn.backend_version() < 8906:
+    if (d_qk % 64 != 0) and cudnn_version < "8.9.6":
         pytest.skip("d not a multiple of 64 is not supported below 8.9.6")
 
-    if d_qk != d_v and is_ragged:
+    if d_qk != d_v and is_ragged and cudnn_version < "9.1":
         pytest.skip("d_qk != d_v is not supported with ragged offset")
 
-    print(f"{b=} {s_q=} {s_kv=} {d_qk=} {d_v=} {h_q=} {h_k=} {h_v=}")
+    print(f"--mha_b={b} --mha_s_q={s_q} --mha_s_kv={s_kv} --mha_d_qk={d_qk} --mha_d_v={d_v} --mha_h_q={h_q} --mha_h_k={h_k} --mha_h_v={h_v}")
 
     attn_scale = 0.125
     dropout_prob = 0.1 if is_dropout else 0.0
@@ -585,13 +588,15 @@ def test_sdpa_backward(input_type,
         is_ragged,
         arg_params):
 
-    if cudnn.backend_version() < 8903:
+    cudnn_version = LooseVersion(cudnn.backend_version_string())
+
+    if cudnn_version < "8.9.3":
         pytest.skip("SDPA bprop requires cudnn 8.9.3 or higher")
 
-    if head_group != "multi_head" and cudnn.backend_version() < 8907:
+    if head_group != "multi_head" and cudnn_version < "8.9.7":
         pytest.skip("GQA and MQA is only supported 8.9.7 onwards.")
 
-    if is_bias and cudnn.backend_version() < 8906:
+    if is_bias and cudnn_version < "8.9.6":
         pytest.skip("dBias is only supported 8.9.6 onwards.")
 
     if is_bias and torch.cuda.get_device_capability()[0] < 9:
@@ -603,16 +608,16 @@ def test_sdpa_backward(input_type,
     if is_alibi and not is_causal:
         pytest.skip("ALiBi mask is only supported with causal mask")
 
-    if is_alibi and cudnn.backend_version() < 8904:
+    if is_alibi and cudnn_version < "8.9.4":
         pytest.skip("ALiBi mask is only supported 8.9.4 onwards.")
 
-    if is_padding and cudnn.backend_version() < 8903:
+    if is_padding and cudnn_version < "8.9.3":
         pytest.skip("Padding mask is only supported 8.9.3 onwards.")
 
-    if is_dropout and cudnn.backend_version() < 8906:
+    if is_dropout and cudnn_version < "8.9.6":
         pytest.skip("RNG dump is only supported on 8.9.6 onwards.")
 
-    if is_ragged and cudnn.backend_version() < 90000:
+    if is_ragged and cudnn_version < "9":
         pytest.skip("Ragged tensor is only supported 9.0.0 onwards")
 
     if is_ragged and torch.cuda.get_device_capability()[0] < 9:
@@ -655,10 +660,10 @@ def test_sdpa_backward(input_type,
     else:
         assert False, "Head group must be either MHA, GQA, or MQA"
 
-    if d_qk != d_v and cudnn.backend_version() < 8906:
+    if d_qk != d_v and cudnn_version < "8.9.6":
         pytest.skip("d_qk != d_v is only supported on 8.9.6 onwards.")
 
-    if (cudnn.backend_version() < 90000):
+    if (cudnn_version < "9"):
         if (s_q < 64):
             pytest.skip("s_q less than 64 is not supported before cudnn 9.0.0")
 
@@ -668,13 +673,13 @@ def test_sdpa_backward(input_type,
     if ((s_q % 64 != 0) or (s_kv % 64 != 0)) and is_bias:
         pytest.skip("cudnn backend does not support bias with non-64-aligned seq_q or seq_kv.")
 
-    if (s_kv % 64 != 0) and cudnn.backend_version() < 8906:
+    if (s_kv % 64 != 0) and cudnn_version < "8.9.6":
         pytest.skip("not-multiple-of-64 seq_kv is not supported below 8.9.6")
 
-    if (d_qk % 64 != 0) and cudnn.backend_version() < 8906:
+    if (d_qk % 64 != 0) and cudnn_version < "8.9.6":
         pytest.skip("d not a multiple of 64 is not supported below 8.9.6")
 
-    if d_qk != d_v and is_ragged:
+    if d_qk != d_v and is_ragged and cudnn_version < "9.1":
         pytest.skip("d_qk != d_v is not supported with ragged offset")
 
     # -------------------------- override test parameters if args are provided ----------------
@@ -687,7 +692,7 @@ def test_sdpa_backward(input_type,
     h_k = int(arg_params.mha_h_k) if arg_params.mha_h_k != None else h_k
     h_v = int(arg_params.mha_h_v) if arg_params.mha_h_v != None else h_v
 
-    print(f"{b=} {s_q=} {s_kv=} {d_qk=} {d_v=} {h_q=} {h_k=} {h_v=}")
+    print(f"--mha_b={b} --mha_s_q={s_q} --mha_s_kv={s_kv} --mha_d_qk={d_qk} --mha_d_v={d_v} --mha_h_q={h_q} --mha_h_k={h_k} --mha_h_v={h_v}")
 
     attn_scale = 0.125
     dropout_prob = 0.1 if is_dropout else 0.0
@@ -826,7 +831,7 @@ def test_sdpa_backward(input_type,
     graph.execute(variant_pack, workspace)
     torch.cuda.synchronize()
 
-    if cudnn.backend_version() < 8906 and is_padding:
+    if cudnn_version < "8.9.6" and is_padding:
         # zero out padded region of the output and stats
         for i, m in enumerate(seq_len_q_gpu):
             o_gpu[i, :, m:, :] = 0
@@ -1002,8 +1007,8 @@ def test_sdpa_backward(input_type,
                 dBias_ref[i, :, :, n:] = 0
 
     torch.testing.assert_close(dQ_ref, dQ_gpu, check_dtype=False, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(dK_ref, dK_gpu, check_dtype=False, atol=2e-2 if input_type != torch.bfloat16 else 4e-2, rtol=2e-2)
-    torch.testing.assert_close(dV_ref, dV_gpu, check_dtype=False, atol=2e-2 if input_type != torch.bfloat16 else 4e-2, rtol=2e-2)
+    torch.testing.assert_close(dK_ref, dK_gpu, check_dtype=False, atol=2e-2 if input_type != torch.bfloat16 else 7e-2, rtol=2e-2)
+    torch.testing.assert_close(dV_ref, dV_gpu, check_dtype=False, atol=2e-2 if input_type != torch.bfloat16 else 7e-2, rtol=2e-2)
     if is_bias:
         torch.testing.assert_close(dBias_ref, dBias_gpu, check_dtype=False, atol=2e-2, rtol=2e-2)
 

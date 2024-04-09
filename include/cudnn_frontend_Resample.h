@@ -218,6 +218,7 @@ class ResampleDescBuilder_v8 {
     auto
     setSpatialDim(int64_t count, cudnnFraction_t const *arr) -> ResampleDescBuilder_v8 & {
         // TODO: check the provided array count against the stored spatial dimension count.
+        m_resampleDesc.spatialDim = count;
         std::copy(arr, arr + count, m_resampleDesc.windowDim);
         return *this;
     }

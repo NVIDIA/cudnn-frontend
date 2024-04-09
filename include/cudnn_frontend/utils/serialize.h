@@ -214,6 +214,21 @@ NLOHMANN_JSON_SERIALIZE_ENUM(Matmul_attributes::output_names,
                                  {Matmul_attributes::output_names::C, "C"},
                              })
 
+NLOHMANN_JSON_SERIALIZE_ENUM(Matmul_fp8_attributes::input_names,
+                             {
+                                 {Matmul_fp8_attributes::input_names::A, "A"},
+                                 {Matmul_fp8_attributes::input_names::B, "B"},
+                                 {Matmul_fp8_attributes::input_names::Descale_A, "Descale_A"},
+                                 {Matmul_fp8_attributes::input_names::Descale_B, "Descale_B"},
+                                 {Matmul_fp8_attributes::input_names::Scale_C, "Scale_C"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(Matmul_fp8_attributes::output_names,
+                             {
+                                 {Matmul_fp8_attributes::output_names::C, "C"},
+                                 {Matmul_fp8_attributes::output_names::Amax_C, "Amax_C"},
+                             })
+
 NLOHMANN_JSON_SERIALIZE_ENUM(Pointwise_attributes::input_names,
                              {
                                  {Pointwise_attributes::input_names::IN_0, "IN_0"},
@@ -297,6 +312,28 @@ NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_attributes::output_names,
                               {SDPA_attributes::output_names::Stats, "Stats"},
                               {SDPA_attributes::output_names::RNG_DUMP, "RNG_DUMP"}})
 
+NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_fp8_attributes::input_names,
+                             {
+                                 {SDPA_fp8_attributes::input_names::Q, "Q"},
+                                 {SDPA_fp8_attributes::input_names::K, "K"},
+                                 {SDPA_fp8_attributes::input_names::V, "V"},
+                                 {SDPA_fp8_attributes::input_names::Attn_scale, "Attn_scale"},
+                                 {SDPA_fp8_attributes::input_names::Descale_Q, "Descale_Q"},
+                                 {SDPA_fp8_attributes::input_names::Descale_K, "Descale_K"},
+                                 {SDPA_fp8_attributes::input_names::Descale_V, "Descale_V"},
+                                 {SDPA_fp8_attributes::input_names::Descale_S, "Descale_S"},
+                                 {SDPA_fp8_attributes::input_names::Scale_S, "Scale_S"},
+                                 {SDPA_fp8_attributes::input_names::Scale_O, "Scale_O"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_fp8_attributes::output_names,
+                             {
+                                 {SDPA_fp8_attributes::output_names::O, "O"},
+                                 {SDPA_fp8_attributes::output_names::Stats, "Stats"},
+                                 {SDPA_fp8_attributes::output_names::Amax_O, "Amax_O"},
+                                 {SDPA_fp8_attributes::output_names::Amax_S, "Amax_S"},
+                             })
+
 NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_backward_attributes::input_names,
                              {
                                  {SDPA_backward_attributes::input_names::Q, "Q"},
@@ -352,22 +389,7 @@ from_json(const nlohmann::json& j, Tensor_attributes& ta) {
     ta.uid_assigned     = j.at("uid_assigned").get<bool>();
 
     if (ta.is_pass_by_value && !j["pass_by_value"].is_null()) {
-        switch (ta.data_type) {
-            case DataType_t::HALF:
-                ta.pass_by_value = j.at("pass_by_value").get<half>();
-                break;
-            case DataType_t::FLOAT:
-                ta.pass_by_value = j.at("pass_by_value").get<float>();
-                break;
-            case DataType_t::BFLOAT16:
-                ta.pass_by_value = j.at("pass_by_value").get<nv_bfloat16>();
-                break;
-            case DataType_t::INT32:
-                ta.pass_by_value = j.at("pass_by_value").get<int32_t>();
-                break;
-            default:
-                throw std::runtime_error("Unsupported data type for pass_by_value");
-        }
+        ta.pass_by_value = j.at("pass_by_value");
     }
 }
 

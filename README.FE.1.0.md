@@ -29,21 +29,24 @@ The steps involved in building and running a cudnn graph are as follows:
 ## APIs
 FE v1.0 API follows a functional style of building a graph. Operations take in input tensors and return output tensors. This also allows composition of operations. 
 
-| Purpose                 | C++ API                                                   | Python API   |
-| ---                     | ---                                                       | ---          |
-| Create tensor           | tensor                                                    | tensor       |
-| [Convolution Fprop](docs/operations/Convolutions.md)       | conv_fprop <br>Conv_fprop_attributes                      | conv_fprop   |
-| [Convolution Dgrad](docs/operations/Convolutions.md)       | conv_dgrad <br>Conv_dgrad_attributes                      | conv_dgrad   |
-| [Convolution Wgrad](docs/operations/Convolutions.md)       | conv_wgrad <br>Conv_wgrad_attributes                      | conv_wgrad   |
-| [Matrix Multiplication](docs/operations/Matmul.md)   | matmul <br> Matmul_attributes                             | matmul       |
-| [Pointwise Operations](docs/operations/Pointwise.md)    | pointwise <br> Pointwise_attributes                       | - add<br>- bias<br>- rqsrt<br>- sub<br>- mul<br>- scale<br>- relu<br>- elu<br>- gelu<br>- cmp_gt       |
-| [Batch Normalization](docs/operations/Normalizations.md)     | batchnorm <br>Batchnorm_attributes                        | batchnorm    |
-| [Batch Norm bprop](docs/operations/Normalizations.md)        | batchnorm_backward <br>Batchnorm_backward_attributes      | batchnorm_backward    |
-| Generate stats of output| genstats <br>Genstats_attributes                          | genstats     |
-| BN Finalize of stats    | bn_finalize <br>BN_finalize_attributes                    | bn_finalize  |
-| Dbn weight              | dbn_weight <br>DBN_weight_attributes                      | dbn_weight   |
-| [Scale dot product attention](docs/operations/Attention.md) | sdpa<br> SDPA_attributes | sdpa |
-| [Scale dot product attention backward](docs/operations/Attention.md) | sdpa_backward<br> SDPA_backward_attributes | sdpa_backward |
+| Purpose                                                                  | C++ API                                              | Python API                                                                                       |
+|--------------------------------------------------------------------------|------------------------------------------------------|--------------------------------------------------------------------------------------------------|
+| Create tensor                                                            | tensor                                               | tensor                                                                                           |
+| [Convolution Fprop](docs/operations/Convolutions.md)                     | conv_fprop <br>Conv_fprop_attributes                 | conv_fprop                                                                                       |
+| [Convolution Dgrad](docs/operations/Convolutions.md)                     | conv_dgrad <br>Conv_dgrad_attributes                 | conv_dgrad                                                                                       |
+| [Convolution Wgrad](docs/operations/Convolutions.md)                     | conv_wgrad <br>Conv_wgrad_attributes                 | conv_wgrad                                                                                       |
+| [Matrix Multiplication](docs/operations/Matmul.md)                       | matmul <br> Matmul_attributes                        | matmul                                                                                           |
+| [Pointwise Operations](docs/operations/Pointwise.md)                     | pointwise <br> Pointwise_attributes                  | - add<br>- bias<br>- rqsrt<br>- sub<br>- mul<br>- scale<br>- relu<br>- elu<br>- gelu<br>- cmp_gt |
+| [Batch Normalization](docs/operations/Normalizations.md)                 | batchnorm <br>Batchnorm_attributes                   | batchnorm                                                                                        |
+| [Batch Norm bprop](docs/operations/Normalizations.md)                    | batchnorm_backward <br>Batchnorm_backward_attributes | batchnorm_backward                                                                               |
+| Generate stats of output                                                 | genstats <br>Genstats_attributes                     | genstats                                                                                         |
+| BN Finalize of stats                                                     | bn_finalize <br>BN_finalize_attributes               | bn_finalize                                                                                      |
+| Dbn weight                                                               | dbn_weight <br>DBN_weight_attributes                 | dbn_weight                                                                                       |
+| [Resampling](docs/operations/Resampling.md)                              | resample <br>Resample_attributes                     | resample                                                                                         |
+| [Scale dot product attention](docs/operations/Attention.md)              | sdpa<br> SDPA_attributes                             | sdpa                                                                                             |
+| [Scale dot product attention backward](docs/operations/Attention.md)     | sdpa_backward<br> SDPA_backward_attributes           | sdpa_backward                                                                                    |
+| [Scale dot product attention FP8](docs/operations/Attention.md)          | sdpa_fp8<br> SDPA_fp8_attributes                     | sdpa_fp8                                                                                         |
+| [Scale dot product attention backward FP8](docs/operations/Attention.md) | sdpa_fp8_backward<br> SDPA_fp8_backward_attributes   | sdpa_fp8_backward                                                                                |
 
 ### Create Graph
 Instantiate an object of class `cudnn_frontend::graph::Graph` which will house tensors and operations.  
@@ -141,9 +144,12 @@ cudnn_frontend::Graph::build_plan_at_index(
 
 
 ### Filter plans (optional)
-Users can filter out plans against numerical, behavioral notes, or plans that do not provide desired functional correctness.
+Users can filter plans on numerical, behavioral notes, or plans that do not provide desired functional correctness.
 
 ```
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::select_numeric_notes(std::vector<cudnn_frontend::NumericalNote_t> const&);
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::select_behavior_notes(std::vector<cudnn_frontend::BehaviorNote_t> const&);
+
 cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_numeric_notes(std::vector<cudnn_frontend::NumericalNote_t> const&);
 cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_behavior_notes(std::vector<cudnn_frontend::BehaviorNote_t> const&);
 cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_workspace_greater_than(int64_t const workspace);

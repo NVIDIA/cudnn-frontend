@@ -236,4 +236,14 @@ generate_column_major_stride_order(int64_t const num_dims) {
 
 }  // namespace detail
 
+class cudnnGraphNotSupportedException : public std::runtime_error {
+   public:
+    cudnnGraphNotSupportedException(const char* message) throw() : std::runtime_error(message) {}
+
+    virtual const char*
+    what() const throw() {
+        return std::runtime_error::what();
+    }
+};
+
 }  // namespace cudnn_frontend

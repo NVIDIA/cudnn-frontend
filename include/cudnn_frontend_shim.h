@@ -142,6 +142,11 @@ cuda_get_device_properties(cudaDeviceProp *prop, int device) {
     NV_FE_CALL_TO_CUDA(cuda_get_device_properties, cudaGetDeviceProperties, prop, device);
 }
 
+inline cudaError_t
+cuda_get_device(int *device) {
+    NV_FE_CALL_TO_CUDA(cuda_get_device, cudaGetDevice, device);
+}
+
 inline const char *
 cuda_get_error_string(cudaError_t error) {
     NV_FE_CALL_TO_CUDA(cuda_get_error_string, cudaGetErrorString, error);
@@ -181,6 +186,28 @@ get_backend_version(void) {
 #else
     return cudnnGetVersion();
 #endif
+}
+
+namespace detail {
+
+inline std::string
+convert_version_to_str(size_t const version) {
+    // The multiplier for major version pre-v9 and post-v9 are different.
+    size_t major = version / 10000;
+    size_t minor = (version / 100) % 100;
+    if (major == 0) {
+        major = version / 1000;
+        minor = (version / 100) % 10;
+    }
+    auto patch = version % 100;
+
+    return std::to_string(major) + "." + std::to_string(minor) + "." + std::to_string(patch);
+}
+}  // namespace detail
+
+inline std::string
+get_backend_version_string() {
+    return detail::convert_version_to_str(get_backend_version());
 }
 
 inline cudnnStatus_t

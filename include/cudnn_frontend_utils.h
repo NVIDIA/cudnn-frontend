@@ -92,26 +92,31 @@ struct nlohmann::adl_serializer<nv_bfloat16> {
     }
 };
 
-template <typename T, typename... Args>
-void
-convert_from_json_to_variant(const nlohmann::json& j, std::variant<Args...>& data) {
-    try {
-        data = j.get<T>();
-    } catch (...) {
-        // get will throw an error if incorrect type
-    }
-}
-
-template <typename... Args>
-struct nlohmann::adl_serializer<std::variant<Args...>> {
+template <>
+struct nlohmann::adl_serializer<std::variant<int32_t, half, float, nv_bfloat16>> {
     static void
-    to_json(nlohmann::json& j, const std::variant<Args...>& data) {
-        std::visit([&j](const auto& v) { j = v; }, data);
+    to_json(nlohmann::json& j, const std::variant<int32_t, half, float, nv_bfloat16>& data) {
+        std::visit([&](const auto& v) { j = {{"index", data.index()}, {"value", v}}; }, data);
     }
 
     static void
-    from_json(const nlohmann::json& j, std::variant<Args...>& data) {
-        (convert_from_json_to_variant<Args>(j, data), ...);
+    from_json(const nlohmann::json& j, std::variant<int32_t, half, float, nv_bfloat16>& data) {
+        if (!j.is_object() || !j.contains("index") || !j.contains("value")) {
+            throw std::invalid_argument("Invalid JSON format for std::variant");
+        }
+
+        size_t type_index = j.at("index").get<size_t>();
+        if (type_index == 0) {
+            data = j.at("value").get<int32_t>();
+        } else if (type_index == 1) {
+            data = j.at("value").get<half>();
+        } else if (type_index == 2) {
+            data = j.at("value").get<float>();
+        } else if (type_index == 3) {
+            data = j.at("value").get<nv_bfloat16>();
+        } else {
+            throw std::out_of_range("Variant index out of range");
+        }
     }
 };
 
@@ -152,6 +157,20 @@ struct nlohmann::adl_serializer<std::shared_ptr<T>> {
             ptr = std::make_shared<T>(j.get<T>());
         else
             ptr.reset();
+    }
+};
+
+// Specialization of nlohmann::adl_serializer for cudnnFraction_t
+template <>
+struct nlohmann::adl_serializer<cudnnFraction_t> {
+    static void
+    to_json(json& j, const cudnnFraction_t& fraction) {
+        j = fraction.numerator;
+    }
+
+    static void
+    from_json(const json& j, cudnnFraction_t& fraction) {
+        fraction.numerator = j;
     }
 };
 
@@ -256,6 +275,12 @@ to_string(cudnnBackendNumericalNote_t note) {
             return std::string("CUDNN_NUMERICAL_NOTE_WINOGRAD_TILE_13x13");
         case CUDNN_NUMERICAL_NOTE_TYPE_COUNT:
             return std::string("CUDNN_NUMERICAL_NOTE_TYPE_COUNT");
+
+            // If none of the above cases hit, its definitely strict nan prop and should raise an error.
+#if (CUDNN_VERSION >= 90100)
+        case CUDNN_NUMERICAL_NOTE_STRICT_NAN_PROP:
+            return std::string("CUDNN_NUMERICAL_NOTE_STRICT_NAN_PROP");
+#endif
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
             return std::string("UNKNOWN_NUMERICAL_NOTE");
@@ -565,6 +590,7 @@ enum class NumericalNote_t {
     WINOGRAD_TILE_4x4,
     WINOGRAD_TILE_6x6,
     WINOGRAD_TILE_13x13,
+    STRICT_NAN_PROP,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(NumericalNote_t,
@@ -578,6 +604,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(NumericalNote_t,
                                  {NumericalNote_t::WINOGRAD_TILE_4x4, "WINOGRAD_TILE_4x4"},
                                  {NumericalNote_t::WINOGRAD_TILE_6x6, "WINOGRAD_TILE_6x6"},
                                  {NumericalNote_t::WINOGRAD_TILE_13x13, "WINOGRAD_TILE_13x13"},
+                                 {NumericalNote_t::STRICT_NAN_PROP, "STRICT_NAN_PROP"},
                              })
 
 enum class DataType_t {
@@ -1179,6 +1206,14 @@ convert_to_cudnn_type(cudnn_frontend::NumericalNote_t const mode, cudnnBackendNu
         case NumericalNote_t::WINOGRAD_TILE_13x13:
             cudnn_mode = CUDNN_NUMERICAL_NOTE_WINOGRAD_TILE_13x13;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case NumericalNote_t::STRICT_NAN_PROP:
+#if (CUDNN_VERSION >= 90100)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90100, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_NUMERICAL_NOTE_STRICT_NAN_PROP;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
     }
     return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 }

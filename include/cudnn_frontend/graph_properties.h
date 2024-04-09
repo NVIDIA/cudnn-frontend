@@ -340,7 +340,7 @@ class Attributes {
         }
 
         // Handle shape and stride inferencing for fused scalars.
-        // Pick number of dimensions from anyone of non-fused-scalar input tensors
+        // Pick number of dimensions from anyone of non-fused-scalar input/output tensors
         // In case, all tensors are fused scalars, just keep them 1D.
         int64_t number_of_dims = 1;
         for (auto [name, tensor] : derived->inputs) {
@@ -350,6 +350,18 @@ class Attributes {
                 break;
             }
         }
+
+        // If number of dims is still 1, try to see if user set output dims.
+        if (number_of_dims == 1) {
+            for (auto [name, tensor] : derived->outputs) {
+                (void)name;
+                if (tensor && (tensor->get_pass_by_value().has_value() == false)) {
+                    number_of_dims = tensor->get_dim().size();
+                    break;
+                }
+            }
+        }
+
         for (auto [name, tensor] : derived->inputs) {
             (void)name;
             if (tensor && tensor->get_pass_by_value().has_value()) {
@@ -773,6 +785,27 @@ class Matmul_attributes : public Attributes<Matmul_attributes> {
     }
 };
 
+class Matmul_fp8_attributes : public Attributes<Matmul_fp8_attributes> {
+    friend class Attributes<Matmul_fp8_attributes>;
+    friend class MatmulFP8Node;
+    friend class INode;
+
+    double padding_value = 0.0;
+
+   public:
+    enum class input_names { Descale_A, Descale_B, A, B, Scale_C };
+    std::map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { C, Amax_C };
+    std::map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Matmul_fp8_attributes, name, inputs, outputs)
+
+    Matmul_fp8_attributes&
+    set_padding(double const padding_val) {
+        padding_value = padding_val;
+        return *this;
+    }
+};
+
 class Pointwise_attributes : public Attributes<Pointwise_attributes> {
     friend class Attributes<Pointwise_attributes>;
     friend class PointwiseNode;
@@ -1065,6 +1098,120 @@ class Rng_attributes : public Attributes<Rng_attributes> {
     Rng_attributes&
     set_bernoulli_probability(std::optional<double> value) {
         bernoulli_probability = value;
+        return *this;
+    }
+};
+
+class Resample_attributes : public Attributes<Resample_attributes> {
+    friend class Attributes<Resample_attributes>;
+    friend class ResampleNode;
+    friend class INode;
+
+    std::optional<bool> is_inference;
+    ResampleMode_t resample_mode;
+    PaddingMode_t padding_mode;
+    std::vector<cudnnFraction_t> pre_padding;
+    std::vector<cudnnFraction_t> post_padding;
+    std::vector<cudnnFraction_t> stride;
+    std::vector<cudnnFraction_t> window;
+
+   public:
+    enum class input_names { X };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+
+    enum class output_names { Y, Index };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Resample_attributes,
+                                   name,
+                                   inputs,
+                                   outputs,
+                                   resample_mode,
+                                   padding_mode,
+                                   pre_padding,
+                                   post_padding,
+                                   stride,
+                                   window)
+
+    auto
+    set_resampling_mode(ResampleMode_t const& value) -> Resample_attributes& {
+        resample_mode = value;
+        return *this;
+    }
+
+    auto
+    set_padding_mode(PaddingMode_t const& value) -> Resample_attributes& {
+        padding_mode = value;
+        return *this;
+    }
+
+    auto
+    set_window(std::vector<int64_t> const& value) -> Resample_attributes& {
+        window.resize(value.size());
+        for (auto i = 0u; i < value.size(); i++) {
+            window[i].numerator   = value[i];
+            window[i].denominator = 1;
+        }
+        return *this;
+    }
+
+    auto
+    set_window(std::vector<cudnnFraction_t> const& value) -> Resample_attributes& {
+        window = value;
+        return *this;
+    }
+
+    auto
+    set_stride(std::vector<int64_t> const& value) -> Resample_attributes& {
+        stride.resize(value.size());
+        for (auto i = 0u; i < value.size(); i++) {
+            stride[i].numerator   = value[i];
+            stride[i].denominator = 1;
+        }
+        return *this;
+    }
+
+    auto
+    set_stride(std::vector<cudnnFraction_t> const& value) -> Resample_attributes& {
+        stride = value;
+        return *this;
+    }
+
+    auto
+    set_pre_padding(std::vector<int64_t> const& value) -> Resample_attributes& {
+        pre_padding.resize(value.size());
+        for (auto i = 0u; i < value.size(); i++) {
+            pre_padding[i].numerator   = value[i];
+            pre_padding[i].denominator = 1;
+        }
+        return *this;
+    }
+
+    auto
+    set_pre_padding(std::vector<cudnnFraction_t> const& value) -> Resample_attributes& {
+        pre_padding = value;
+        return *this;
+    }
+
+    auto
+    set_post_padding(std::vector<int64_t> const& value) -> Resample_attributes& {
+        post_padding.resize(value.size());
+        for (auto i = 0u; i < value.size(); i++) {
+            post_padding[i].numerator   = value[i];
+            post_padding[i].denominator = 1;
+        }
+        return *this;
+    }
+
+    auto
+    set_post_padding(std::vector<cudnnFraction_t> const& value) -> Resample_attributes& {
+        post_padding = value;
+        return *this;
+    }
+
+    auto
+    set_is_inference(bool const value) -> Resample_attributes& {
+        is_inference = value;
         return *this;
     }
 };
@@ -1397,6 +1544,66 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     }
 };
 
+class SDPA_fp8_attributes : public Attributes<SDPA_fp8_attributes> {
+    friend class Attributes<SDPA_fp8_attributes>;
+    friend class SDPAFP8Node;
+    friend class Graph;
+
+    std::optional<bool> is_inference;
+    bool causal_mask = false;
+    std::optional<float> attn_scale_value;
+
+   public:
+    enum class input_names {
+        Q,
+        K,
+        V,
+        Attn_scale,
+        Descale_Q,
+        Descale_K,
+        Descale_V,
+        Descale_S,
+        Scale_S,
+        Scale_O,
+    };
+    std::map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+
+    enum class output_names { O, Stats, Amax_S, Amax_O };
+    std::map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(SDPA_fp8_attributes,
+                                   name,
+                                   inputs,
+                                   outputs,
+                                   is_inference,
+                                   causal_mask,
+                                   attn_scale_value)
+
+    SDPA_fp8_attributes&
+    set_is_inference(bool const value) {
+        is_inference = value;
+        return *this;
+    }
+
+    SDPA_fp8_attributes&
+    set_attn_scale(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_fp8_attributes::input_names::Attn_scale] = value;
+        return *this;
+    }
+
+    SDPA_fp8_attributes&
+    set_attn_scale(float const value) {
+        attn_scale_value = value;
+        return *this;
+    }
+
+    SDPA_fp8_attributes&
+    set_causal_mask(bool const value) {
+        causal_mask = value;
+        return *this;
+    }
+};
+
 class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     friend class Attributes<SDPA_backward_attributes>;
     friend class SDPABackwardNode;
@@ -1522,6 +1729,62 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     }
 };
 
+class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attributes> {
+    friend class Attributes<SDPA_fp8_backward_attributes>;
+    friend class SDPAFP8BackwardNode;
+    friend class Graph;
+
+    bool causal_mask = false;
+    std::optional<float> attn_scale_value;
+
+   public:
+    enum class input_names {
+        Q,
+        K,
+        V,
+        O,
+        dO,
+        Stats,
+        Attn_scale,
+        Descale_Q,
+        Descale_K,
+        Descale_V,
+        Descale_O,
+        Descale_dO,
+        Descale_S,
+        Descale_dP,
+        Scale_dQ,
+        Scale_dK,
+        Scale_dV,
+        Scale_S,
+        Scale_dP,
+    };
+    std::map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+
+    enum class output_names { dQ, dK, dV, Amax_dQ, Amax_dK, Amax_dV, Amax_dP };
+    std::map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(SDPA_fp8_backward_attributes, name, inputs, outputs, causal_mask, attn_scale_value)
+
+    SDPA_fp8_backward_attributes&
+    set_attn_scale(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_fp8_backward_attributes::input_names::Attn_scale] = value;
+        return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_attn_scale(float const value) {
+        attn_scale_value = value;
+        return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_causal_mask(bool const value) {
+        causal_mask = value;
+        return *this;
+    }
+};
+
 using Scaled_dot_product_flash_attention_attributes [[deprecated]]          = SDPA_attributes;
 using Scaled_dot_product_flash_attention_backward_attributes [[deprecated]] = SDPA_backward_attributes;
 
@@ -1549,114 +1812,6 @@ class Softmax_attributes : public Attributes<Softmax_attributes> {
     Softmax_attributes&
     has_M_Zinv(bool const value) {
         use_M_Zinv = value;
-        return *this;
-    }
-};
-
-class SDPA_FP8_attributes : public Attributes<SDPA_FP8_attributes> {
-    friend class Attributes<SDPA_FP8_attributes>;
-    friend class SDPA_FP8_Node;
-    friend class Graph;
-
-    enum class input_names {
-        Q,
-        K,
-        V,
-        SEQ_LEN_Q,
-        SEQ_LEN_KV,
-        Attn_scale,
-        Bias,
-        Seed,
-        Offset,
-        Dropout_mask,
-        Dropout_scale,
-        descale_Q,
-        descale_K,
-        descale_V,
-        scale_S,
-        scale_O,
-        ragged_offset_QKV,
-        ragged_offset_O
-    };
-    std::map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
-
-    enum class output_names { O, Stats, M, Zinv, AMax_S, AMax_O };
-    std::map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-
-    std::optional<bool> is_inference;
-    bool padding_mask = false;
-    bool causal_mask  = false;
-    std::optional<float> dropout_probability;
-
-   public:
-    SDPA_FP8_attributes&
-    set_is_inference(bool const value) {
-        is_inference = value;
-        return *this;
-    }
-
-    SDPA_FP8_attributes&
-    set_padding_mask(bool const value) {
-        padding_mask = value;
-        return *this;
-    }
-
-    SDPA_FP8_attributes&
-    set_causal_mask(bool const value) {
-        causal_mask = value;
-        return *this;
-    }
-
-    SDPA_FP8_attributes&
-    set_attn_scale(std::shared_ptr<Tensor_attributes> value) {
-        inputs[SDPA_FP8_attributes::input_names::Attn_scale] = value;
-        return *this;
-    }
-
-    SDPA_FP8_attributes&
-    set_bias(std::shared_ptr<Tensor_attributes> value) {
-        inputs[SDPA_FP8_attributes::input_names::Bias] = value;
-        return *this;
-    }
-
-    SDPA_FP8_attributes&
-    set_seq_len_q(std::shared_ptr<Tensor_attributes> value) {
-        inputs[SDPA_FP8_attributes::input_names::SEQ_LEN_Q] = value;
-        return *this;
-    }
-
-    SDPA_FP8_attributes&
-    set_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
-        inputs[SDPA_FP8_attributes::input_names::SEQ_LEN_KV] = value;
-        return *this;
-    }
-
-    SDPA_FP8_attributes&
-    set_ragged_offset_qkv(std::shared_ptr<Tensor_attributes> value) {
-        inputs[SDPA_FP8_attributes::input_names::ragged_offset_QKV] = value;
-        return *this;
-    }
-
-    SDPA_FP8_attributes&
-    set_ragged_offset_o(std::shared_ptr<Tensor_attributes> value) {
-        inputs[SDPA_FP8_attributes::input_names::ragged_offset_O] = value;
-        return *this;
-    }
-
-    SDPA_FP8_attributes&
-    set_dropout(float const probability,
-                std::shared_ptr<Tensor_attributes> seed,
-                std::shared_ptr<Tensor_attributes> offset) {
-        dropout_probability                              = probability;
-        inputs[SDPA_FP8_attributes::input_names::Seed]   = seed;
-        inputs[SDPA_FP8_attributes::input_names::Offset] = offset;
-        return *this;
-    }
-
-    SDPA_FP8_attributes&
-    set_dropout(std::shared_ptr<Tensor_attributes> mask, std::shared_ptr<Tensor_attributes> scale) {
-        inputs[SDPA_FP8_attributes::input_names::Dropout_mask]  = mask;
-        inputs[SDPA_FP8_attributes::input_names::Dropout_scale] = scale;
         return *this;
     }
 };

@@ -2,6 +2,7 @@ import cudnn
 import pytest
 import torch
 import itertools
+from looseversion import LooseVersion
 
 import torch.nn as nn
 
@@ -39,7 +40,7 @@ all_options = [elem for elem in itertools.product(*[embedding_dim_options, input
 def param_extract(request):
   return request.param
 
-@pytest.mark.skipif(cudnn.backend_version() < 8906, reason="RmsNorm not supported below cudnn 8.9.6")
+@pytest.mark.skipif(LooseVersion(cudnn.backend_version_string()) < "8.9.6", reason="RmsNorm not supported below cudnn 8.9.6")
 @torch_fork_set_rng(seed=0)
 def test_rmsnorm(param_extract):
 

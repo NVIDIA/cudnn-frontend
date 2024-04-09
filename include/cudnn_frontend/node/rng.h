@@ -144,14 +144,15 @@ class RngNode : public NodeCRTP<RngNode> {
     }
 };
 
-inline void INode::rng(std::shared_ptr<Tensor_attributes> seed,
-        std::shared_ptr<Tensor_attributes> offset,
-        Rng_attributes attributes,
-        std::shared_ptr<Tensor_attributes> y) {
-  attributes.inputs[Rng_attributes::input_names::Seed]   = seed;
-  attributes.inputs[Rng_attributes::input_names::Offset] = offset;
-  attributes.outputs[Rng_attributes::output_names::Y]    = y;
-  sub_nodes.emplace_back(std::make_unique<RngNode>(std::move(attributes), context));
+inline void
+INode::rng(std::shared_ptr<Tensor_attributes> seed,
+           std::shared_ptr<Tensor_attributes> offset,
+           Rng_attributes attributes,
+           std::shared_ptr<Tensor_attributes> y) {
+    attributes.inputs[Rng_attributes::input_names::Seed]   = seed;
+    attributes.inputs[Rng_attributes::input_names::Offset] = offset;
+    attributes.outputs[Rng_attributes::output_names::Y]    = y;
+    sub_nodes.emplace_back(std::make_unique<RngNode>(std::move(attributes), context));
 }
 
 inline std::shared_ptr<Tensor_attributes>
@@ -165,5 +166,4 @@ INode::rng(std::shared_ptr<Tensor_attributes> seed,
     sub_nodes.emplace_back(std::make_unique<RngNode>(std::move(attributes), context));
     return Y;
 }
-
 }  // namespace cudnn_frontend::graph

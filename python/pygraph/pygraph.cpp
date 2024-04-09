@@ -591,6 +591,8 @@ init_pygraph_submodule(py::module_& m) {
             )pbdoc")
         .def("deselect_numeric_notes", &PyGraph::deselect_numeric_notes)
         .def("deselect_behavior_notes", &PyGraph::deselect_behavior_notes)
+        .def("select_numeric_notes", &PyGraph::select_numeric_notes)
+        .def("select_behavior_notes", &PyGraph::select_behavior_notes)
         .def("deselect_workspace_greater_than", &PyGraph::deselect_workspace_greater_than)
         .def("validate", &PyGraph::validate)
         .def("key", &PyGraph::key)

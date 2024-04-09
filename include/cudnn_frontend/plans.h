@@ -221,10 +221,11 @@ class Execution_plan_list {
     std::string operation_tag;
     std::vector<std::vector<cudnnBackendNumericalNote_t>> numeric_notes;
     std::vector<std::vector<cudnnBackendNumericalNote_t>> behavior_notes;
-    std::vector<bool> filtered_indices;
+    std::vector<bool> barred_indices;
 
     int64_t max_workspace_allowed = std::numeric_limits<int64_t>::max();
 
+    std::vector<std::string> barred_engine_names = {};
     EngineConfigList engine_configs;
 
    public:
@@ -254,7 +255,7 @@ class Execution_plan_list {
         numeric_notes.reserve(engine_configs.size());
         behavior_notes.reserve(engine_configs.size());
 
-        filtered_indices.resize(engine_configs.size(), 0);
+        barred_indices.resize(engine_configs.size(), 0);
         execution_plans.resize(engine_configs.size());
 
         for (auto& engine_config : engine_configs) {
@@ -321,38 +322,33 @@ class Execution_plan_list {
     }
 
     error_t
-    deselect_numeric_notes(std::vector<NumericalNote_t> const& notes) {
+    filter_numeric_notes(std::vector<NumericalNote_t> const& notes, bool const keep) {
         for (auto& note : notes) {
             cudnnBackendNumericalNote_t backend_note;
 
-            RETURN_CUDNN_FRONTEND_ERROR_IF(detail::convert_to_cudnn_type(note, backend_note) != CUDNN_STATUS_SUCCESS,
-                                           error_code_t::CUDNN_BACKEND_API_FAILED,
-                                           "Unexpected behaviour note provided.");
-
+            auto valid_note = (detail::convert_to_cudnn_type(note, backend_note) == CUDNN_STATUS_SUCCESS);
             for (auto i = 0u; i < engine_configs.size(); i++) {
-                if (std::find(numeric_notes[i].begin(), numeric_notes[i].end(), backend_note) !=
-                    numeric_notes[i].end()) {
-                    filtered_indices[i] = true;
-                }
+                bool has_barred_note =
+                    std::find(numeric_notes[i].begin(), numeric_notes[i].end(), backend_note) != numeric_notes[i].end();
+
+                barred_indices[i] = has_barred_note && valid_note ? !keep : keep;
             }
         }
         return {error_code_t::OK, ""};
     }
 
     error_t
-    deselect_behavior_notes(std::vector<BehaviorNote_t> const& notes) {
+    filter_behavior_notes(std::vector<BehaviorNote_t> const& notes, bool const keep) {
         for (auto& note : notes) {
             cudnnBackendBehaviorNote_t backend_note;
 
-            RETURN_CUDNN_FRONTEND_ERROR_IF(detail::convert_to_cudnn_type(note, backend_note) != CUDNN_STATUS_SUCCESS,
-                                           error_code_t::CUDNN_BACKEND_API_FAILED,
-                                           "Unexpected behaviour note provided.");
+            auto valid_note = (detail::convert_to_cudnn_type(note, backend_note) == CUDNN_STATUS_SUCCESS);
 
             for (auto i = 0u; i < engine_configs.size(); i++) {
-                if (std::find(behavior_notes[i].begin(), behavior_notes[i].end(), backend_note) !=
-                    behavior_notes[i].end()) {
-                    filtered_indices[i] = true;
-                }
+                bool has_barred_note = std::find(behavior_notes[i].begin(), behavior_notes[i].end(), backend_note) !=
+                                       numeric_notes[i].end();
+
+                barred_indices[i] = has_barred_note && valid_note ? !keep : keep;
             }
         }
         return {error_code_t::OK, ""};
@@ -363,25 +359,30 @@ class Execution_plan_list {
         max_workspace_allowed = workspace_allowed;
     }
 
+    void
+    set_barred_names(std::vector<std::string> const& engine_names) {
+        barred_engine_names = engine_names;
+    }
+
     EngineConfigList
-    get_filtered_engine_configs() {
-        EngineConfigList filtered_engine_configs;
+    get_barred_engine_configs() {
+        EngineConfigList barred_engine_configs;
         getLogger() << "[cudnn_frontend] INFO: "
                     << " Filtering engine_configs ..." << engine_configs.size() << std::endl;
         for (auto i = 0u; i < engine_configs.size(); i++) {
-            if (filtered_indices[i] == false) {
-                filtered_engine_configs.push_back(engine_configs[i]);
+            if (barred_indices[i] == false) {
+                barred_engine_configs.push_back(engine_configs[i]);
             }
         }
         getLogger() << "[cudnn_frontend] INFO: "
-                    << " Filtered engine_configs ..." << filtered_engine_configs.size() << std::endl;
-        return filtered_engine_configs;
+                    << " barred engine_configs ..." << barred_engine_configs.size() << std::endl;
+        return barred_engine_configs;
     }
 
     error_t
     check_support(cudnnHandle_t handle) {
         for (auto i = 0u; i < engine_configs.size(); i++) {
-            if (filtered_indices[i]) {
+            if (barred_indices[i]) {
                 getLogger() << "[cudnn_frontend] INFO: Deselecting execution plan at position " << i << std::endl;
                 continue;
             }
@@ -395,14 +396,33 @@ class Execution_plan_list {
             if (fe_status.is_good()) {
                 // Filter out execution plans with workspace greater than whats available from user
                 if (execution_plans[i]->getWorkspaceSize() > max_workspace_allowed) {
-                    filtered_indices[i] = true;
-                    execution_plans[i]  = nullptr;
+                    barred_indices[i]  = true;
+                    execution_plans[i] = nullptr;
                     getLogger() << "[cudnn_frontend] INFO: Deselecting execution plan at position " << i << std::endl;
                     continue;
                 }
 
+                auto is_blocked = [](std::string const& full_name,
+                                     std::vector<std::string> const& blocked_names) -> bool {
+                    for (auto const& blocked_name : blocked_names) {
+                        if (full_name.find(blocked_name) != std::string::npos) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+
+                if (is_blocked(execution_plans[i]->getTag(), barred_engine_names)) {
+                    getLogger() << "[cudnn_frontend] INFO: Deselecting execution plan " << execution_plans[i]->getTag()
+                                << std::endl;
+                    barred_indices[i]  = true;
+                    execution_plans[i] = nullptr;
+                    continue;
+                }
+
                 candidate = static_cast<int64_t>(i);
-                getLogger() << "[cudnn_frontend] INFO: Candidate set as " << i << std::endl;
+                getLogger() << "[cudnn_frontend] INFO: Candidate set as " << i << " " << execution_plans[i]->getTag()
+                            << std::endl;
 
                 return {error_code_t::OK, ""};
             }
@@ -427,7 +447,7 @@ class Execution_plan_list {
 
     error_t
     build_plan_at_index(cudnnHandle_t handle, int64_t index) {
-        RETURN_CUDNN_FRONTEND_ERROR_IF(filtered_indices[index] == true,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(barred_indices[index] == true,
                                        error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
                                        "Chosen plan index has been deselected.");
 
@@ -447,7 +467,7 @@ class Execution_plan_list {
             if (execution_plans[index]->getWorkspaceSize() <= max_workspace_allowed) {
                 candidate = index;
             } else {
-                filtered_indices[index] = true;
+                barred_indices[index] = true;
                 return {error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
                         "[cudnn_frontend] Error: Workspace size is too large."};
             }
@@ -469,7 +489,7 @@ class Execution_plan_list {
         }
 
         for (auto i = 0u; i < engine_configs.size(); i++) {
-            if (filtered_indices[i]) {
+            if (barred_indices[i]) {
                 getLogger() << "[cudnn_frontend] INFO: Skipping deselected engine plan at index " << i << std::endl;
                 continue;
             }
@@ -483,8 +503,26 @@ class Execution_plan_list {
                 if (execution_plans[i]->getWorkspaceSize() > max_workspace_allowed) {
                     getLogger() << "[cudnn_frontend] INFO: skipping plan since workspace violation. Requires "
                                 << execution_plans[i]->getWorkspaceSize() << std::endl;
-                    filtered_indices[i] = true;
-                    execution_plans[i]  = nullptr;
+                    barred_indices[i]  = true;
+                    execution_plans[i] = nullptr;
+                    continue;
+                }
+
+                auto is_blocked = [](std::string const& full_name,
+                                     std::vector<std::string> const& blocked_names) -> bool {
+                    for (auto const& blocked_name : blocked_names) {
+                        if (full_name.find(blocked_name) != std::string::npos) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+
+                if (is_blocked(execution_plans[i]->getTag(), barred_engine_names)) {
+                    getLogger() << "[cudnn_frontend] INFO: Deselecting execution plan " << execution_plans[i]->getTag()
+                                << std::endl;
+                    barred_indices[i]  = true;
+                    execution_plans[i] = nullptr;
                     continue;
                 }
                 // Only set the candidate the first time, as the order of iteration is from highest to lowest priority
@@ -492,6 +530,9 @@ class Execution_plan_list {
                     candidate = static_cast<int64_t>(i);
                     getLogger() << "[cudnn_frontend] INFO: Candidate set as " << i << std::endl;
                 }
+
+                getLogger() << "[cudnn_frontend] INFO: Built plan at " << i << " " << execution_plans[i]->getTag()
+                            << std::endl;
 
                 // Return from this function as first successfully built plan is found.
                 if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE) {

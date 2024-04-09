@@ -1,5 +1,6 @@
 from ._compiled_module import (        
     backend_version
+    , backend_version_string
     , destroy_handle
     , norm_forward_phase
     , reduction_mode
@@ -13,11 +14,12 @@ from ._compiled_module import (
     , heur_mode
     , pygraph
     , tensor
+    , cudnnGraphNotSupportedError
 )
 
 from .datatypes import (_library_type, _is_torch_tensor)
 
-__version__ = '1.2.1'
+__version__ = '1.3.0'
 
 def _tensor(
     self,

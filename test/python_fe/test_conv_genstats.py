@@ -1,6 +1,7 @@
 import cudnn
 import pytest
 import torch
+from looseversion import LooseVersion
 
 from test_utils import torch_fork_set_rng
 
@@ -21,7 +22,7 @@ padding  = [1,1]
 stride   = [1,1]
 dilation = [1,1]
 
-@pytest.mark.skipif(cudnn.backend_version() < 8800, reason="requires cudnn 8.8 or higher")
+@pytest.mark.skipif(LooseVersion(cudnn.backend_version_string()) < "8.8", reason="requires cudnn 8.8 or higher")
 @torch_fork_set_rng(seed=0)
 def test_conv_genstats():
 
