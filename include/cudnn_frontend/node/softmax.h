@@ -129,26 +129,27 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
     }
 };
 
-inline void INode::softmax(std::shared_ptr<Tensor_attributes> p,
-            Softmax_attributes attributes,
-            std::shared_ptr<Tensor_attributes> s,
-            std::shared_ptr<Tensor_attributes> stats) {
-  attributes.inputs[Softmax_attributes::input_names::P]       = p;
-  attributes.outputs[Softmax_attributes::output_names::S]     = s;
-  attributes.outputs[Softmax_attributes::output_names::Stats] = stats;
-  sub_nodes.emplace_back(std::make_unique<SoftmaxNode>(std::move(attributes), context));
+inline void
+INode::softmax(std::shared_ptr<Tensor_attributes> p,
+               Softmax_attributes attributes,
+               std::shared_ptr<Tensor_attributes> s,
+               std::shared_ptr<Tensor_attributes> stats) {
+    attributes.inputs[Softmax_attributes::input_names::P]       = p;
+    attributes.outputs[Softmax_attributes::output_names::S]     = s;
+    attributes.outputs[Softmax_attributes::output_names::Stats] = stats;
+    sub_nodes.emplace_back(std::make_unique<SoftmaxNode>(std::move(attributes), context));
 }
 
-inline void INode::softmax(std::shared_ptr<Tensor_attributes> p,
-            Softmax_attributes attributes,
-            std::shared_ptr<Tensor_attributes> s,
-            std::shared_ptr<Tensor_attributes> m,
-            std::shared_ptr<Tensor_attributes> zinv) {
-  attributes.inputs[Softmax_attributes::input_names::P]      = p;
-  attributes.outputs[Softmax_attributes::output_names::S]    = s;
-  attributes.outputs[Softmax_attributes::output_names::M]    = m;
-  attributes.outputs[Softmax_attributes::output_names::Zinv] = zinv;
-  sub_nodes.emplace_back(std::make_unique<SoftmaxNode>(std::move(attributes), context));
+inline void
+INode::softmax(std::shared_ptr<Tensor_attributes> p,
+               Softmax_attributes attributes,
+               std::shared_ptr<Tensor_attributes> s,
+               std::shared_ptr<Tensor_attributes> m,
+               std::shared_ptr<Tensor_attributes> zinv) {
+    attributes.inputs[Softmax_attributes::input_names::P]      = p;
+    attributes.outputs[Softmax_attributes::output_names::S]    = s;
+    attributes.outputs[Softmax_attributes::output_names::M]    = m;
+    attributes.outputs[Softmax_attributes::output_names::Zinv] = zinv;
+    sub_nodes.emplace_back(std::make_unique<SoftmaxNode>(std::move(attributes), context));
 }
-
 }  // namespace cudnn_frontend::graph

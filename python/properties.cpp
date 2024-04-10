@@ -140,7 +140,8 @@ init_properties(py::module_& m) {
         .value("WINOGRAD", cudnn_frontend::NumericalNote_t::WINOGRAD)
         .value("WINOGRAD_TILE_4x4", cudnn_frontend::NumericalNote_t::WINOGRAD_TILE_4x4)
         .value("WINOGRAD_TILE_6x6", cudnn_frontend::NumericalNote_t::WINOGRAD_TILE_6x6)
-        .value("WINOGRAD_TILE_13x13", cudnn_frontend::NumericalNote_t::WINOGRAD_TILE_13x13);
+        .value("WINOGRAD_TILE_13x13", cudnn_frontend::NumericalNote_t::WINOGRAD_TILE_13x13)
+        .value("STRICT_NAN_PROP", cudnn_frontend::NumericalNote_t::STRICT_NAN_PROP);
 
     py::enum_<cudnn_frontend::BehaviorNote_t>(m, "behavior_note")
         .value("RUNTIME_COMPILATION", cudnn_frontend::BehaviorNote_t::RUNTIME_COMPILATION)

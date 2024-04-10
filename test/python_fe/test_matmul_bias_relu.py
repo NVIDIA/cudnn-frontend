@@ -2,6 +2,7 @@ import cudnn
 import itertools
 import pytest
 import torch
+from looseversion import LooseVersion
 
 from test_utils import torch_fork_set_rng
 
@@ -25,7 +26,7 @@ def get_cc():
     (major, minor) = torch.cuda.get_device_capability()
     return major*10 + minor 
 
-@pytest.mark.skipif(cudnn.backend_version() < 8906, reason="requires cudnn 8.9.6 or higher")
+@pytest.mark.skipif(LooseVersion(cudnn.backend_version_string()) < "8.9.6", reason="requires cudnn 8.9.6 or higher")
 @pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch")
 @torch_fork_set_rng(seed=0)
 def test_int8_bf16_matmul():
@@ -69,7 +70,7 @@ A_data_type_options = [torch.int8, torch.bfloat16, torch.float16]
 B_data_type_options = [torch.int8, torch.bfloat16, torch.float16]
 MMA_data_type_options = [torch.bfloat16, torch.float16, torch.float32]
 
-@pytest.mark.skipif(cudnn.backend_version() < 8906, reason="requires cudnn 8.9.6 or higher")
+@pytest.mark.skipif(LooseVersion(cudnn.backend_version_string()) < "8.9.6", reason="requires cudnn 8.9.6 or higher")
 @pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch")
 @pytest.mark.parametrize("A_data_type", A_data_type_options)
 @pytest.mark.parametrize("B_data_type", B_data_type_options)
@@ -106,10 +107,10 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
     A_casted.set_data_type(convert_to_cudnn_type(MMA_data_type))
     
     # Casting input tensor B is only supported from cudnn v9
-    if B_data_type != MMA_data_type and cudnn.backend_version() < 90000:
+    if B_data_type != MMA_data_type and LooseVersion(cudnn.backend_version_string()) < "9":
         pytest.skip("mixed precision on B only supported from cudnn v9.")
     
-    if cudnn.backend_version() < 90000:
+    if LooseVersion(cudnn.backend_version_string()) < "9":
         # Do not create a cast node
         B_casted = B
     else:
@@ -152,7 +153,7 @@ def test_matmul_bias_relu(param_extract):
     problem_size_options, input_type = param_extract
     b, s, e = problem_size_options
 
-    if b > 1 and cudnn.backend_version() < 8906:
+    if b > 1 and LooseVersion(cudnn.backend_version_string()) < "8.9.6":
         pytest.skip("matmul broadcast only supported 8.9.6 onwards.")
 
     # Regression in cudnn backend where ampere does not support matmul broadcast starting 8.9.6

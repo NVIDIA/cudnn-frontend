@@ -31,6 +31,7 @@ add_executable(
     cpp/serialization.cpp
     cpp/autotuning.cpp
     cpp/pointwise.cpp
+    cpp/resample.cpp
 
     legacy_samples/conv_sample.cpp 
     legacy_samples/resnet_test_list.cpp
@@ -59,6 +60,7 @@ if (MSVC)
         /wd4458 # local hides class member (currently a problem for all inline setters)
         /wd4505 # unreferenced function with internal linkage has been removed
         /wd4101 /wd4189 # unreferenced local
+        /bigobj # increase number of sections in .Obj file
     )
 else()
     target_compile_options(
@@ -74,6 +76,7 @@ target_link_libraries(
     samples
 
     cudnn_frontend
+    _cudnn_frontend_pch
     Catch2::Catch2WithMain
 
     CUDNN::cudnn_all

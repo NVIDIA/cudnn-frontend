@@ -1,6 +1,7 @@
 import cudnn
 import pytest
 import torch
+from looseversion import LooseVersion
 
 from test_utils import torch_fork_set_rng
 
@@ -174,7 +175,7 @@ def test_leaky_relu_backward():
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.skipif(cudnn.backend_version() < 8600, reason="requires cudnn 8.6.0 or higher")
+@pytest.mark.skipif(LooseVersion(cudnn.backend_version_string()) < "8.6", reason="requires cudnn 8.6.0 or higher")
 @torch_fork_set_rng(seed=0)
 def test_conv_int8():
 

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.17)
 
-project(cudnn_frontend VERSION 1.2.1)
+project(cudnn_frontend VERSION 1.3.0)
 
 option(CUDNN_FRONTEND_SKIP_NLOHMANN_JSON "Defines whether FE should not include nlohmann/json.hpp." OFF)
 option(CUDNN_FRONTEND_BUILD_SAMPLES "Defines if samples are built or not." ON)
@@ -38,6 +38,10 @@ target_link_libraries(
 )
 
 target_compile_features(cudnn_frontend INTERFACE cxx_std_17)
+
+# Make PCH for targets to link against
+add_library(_cudnn_frontend_pch INTERFACE)
+target_precompile_headers(_cudnn_frontend_pch INTERFACE ${PROJECT_SOURCE_DIR}/include/cudnn_frontend.h)
 
 if (CUDNN_FRONTEND_BUILD_SAMPLES)
     add_subdirectory(samples)

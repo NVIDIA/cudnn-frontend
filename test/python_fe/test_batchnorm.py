@@ -1,6 +1,7 @@
 import cudnn
 import pytest
 import torch
+from looseversion import LooseVersion
 
 from test_utils import torch_fork_set_rng
 
@@ -8,7 +9,7 @@ class SGBN(torch.nn.Module):
     def forward(self, input, running_mean, running_var, weight, bias, eps, momentum):
         return torch.nn.functional.batch_norm(input, running_mean, running_var, weight=weight, bias=bias, training=True, momentum=momentum, eps=eps)
 
-@pytest.mark.skipif(cudnn.backend_version() < 8800, reason="BN with mask output not supported below cudnn 8.8")
+@pytest.mark.skipif(LooseVersion(cudnn.backend_version_string()) < "8.8", reason="BN with mask output not supported below cudnn 8.8")
 @torch_fork_set_rng(seed=0)
 def test_bn_relu_with_mask():
 
@@ -103,7 +104,7 @@ def test_bn_relu_with_mask():
     torch.testing.assert_close(inv_var_expected, saved_inv_var_actual, atol=1e-3, rtol=1e-3)
     # torch.testing.assert_close(mask_expected, mask_actual)
 
-@pytest.mark.skipif(cudnn.backend_version() < 8900, reason="DBN fusions not supported below cudnn 8.9")
+@pytest.mark.skipif(LooseVersion(cudnn.backend_version_string()) < "8.9", reason="DBN fusions not supported below cudnn 8.9")
 @torch_fork_set_rng(seed=0)
 def test_drelu_dadd_dbn():
 
@@ -176,7 +177,7 @@ def test_drelu_dadd_dbn():
         device_buffers[DX_drelu] = DX_drelu_actual
     graph.execute(device_buffers, workspace)
 
-@pytest.mark.skipif(cudnn.backend_version() < 8904, reason="BN_infer-Drelu-DBN not supported below cudnn 8.9.4")
+@pytest.mark.skipif(LooseVersion(cudnn.backend_version_string()) < "8.9.4", reason="BN_infer-Drelu-DBN not supported below cudnn 8.9.4")
 @torch_fork_set_rng(seed=0)
 def test_bn_infer_drelu_dbn():
 

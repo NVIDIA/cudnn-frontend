@@ -23,12 +23,13 @@ namespace cudnn_frontend {
 
 namespace graph {
 
-
 class BatchNormNode;
 class DBNNode;
 class MatmulNode;
+class MatmulFP8Node;
 class PointwiseNode;
 class ReductionNode;
+class ResampleNode;
 class ReshapeNode;
 class RngNode;
 class SoftmaxNode;
@@ -243,36 +244,46 @@ class INode : public ICudnn {
            Matmul_attributes attributes,
            std::shared_ptr<Tensor_attributes> c);
 
-    inline void
+    void
+    matmul_fp8(std::shared_ptr<Tensor_attributes> a,
+               std::shared_ptr<Tensor_attributes> b,
+               std::shared_ptr<Tensor_attributes> descale_a,
+               std::shared_ptr<Tensor_attributes> descale_b,
+               std::shared_ptr<Tensor_attributes> scale_c,
+               Matmul_fp8_attributes attributes,
+               std::shared_ptr<Tensor_attributes> c,
+               std::shared_ptr<Tensor_attributes> amax_c);
+
+    void
     softmax(std::shared_ptr<Tensor_attributes> p,
             Softmax_attributes attributes,
             std::shared_ptr<Tensor_attributes> s,
             std::shared_ptr<Tensor_attributes> stats);
 
-    inline void
+    void
     softmax(std::shared_ptr<Tensor_attributes> p,
             Softmax_attributes attributes,
             std::shared_ptr<Tensor_attributes> s,
             std::shared_ptr<Tensor_attributes> m,
             std::shared_ptr<Tensor_attributes> zinv);
 
-    inline void
+    void
     pointwise(std::shared_ptr<Tensor_attributes> a,
               Pointwise_attributes attributes,
               std::shared_ptr<Tensor_attributes> c);
 
-    inline void
+    void
     pointwise(std::shared_ptr<Tensor_attributes> a,
               std::shared_ptr<Tensor_attributes> b,
               Pointwise_attributes attributes,
               std::shared_ptr<Tensor_attributes> c);
 
-    inline void
+    void
     reduction(std::shared_ptr<Tensor_attributes> a,
               Reduction_attributes attributes,
               std::shared_ptr<Tensor_attributes> c);
 
-    inline void
+    void
     rng(std::shared_ptr<Tensor_attributes> seed,
         std::shared_ptr<Tensor_attributes> offset,
         Rng_attributes attributes,
@@ -353,25 +364,26 @@ class INode : public ICudnn {
     virtual Type
     getType() = 0;
 
-    inline std::shared_ptr<Tensor_attributes> matmul(std::shared_ptr<Tensor_attributes>,
-                                                     std::shared_ptr<Tensor_attributes>,
-                                                     Matmul_attributes);
+    std::shared_ptr<Tensor_attributes> matmul(std::shared_ptr<Tensor_attributes>,
+                                              std::shared_ptr<Tensor_attributes>,
+                                              Matmul_attributes);
 
-    inline std::shared_ptr<Tensor_attributes> pointwise(std::shared_ptr<Tensor_attributes>, Pointwise_attributes);
-    inline std::shared_ptr<Tensor_attributes> pointwise(std::shared_ptr<Tensor_attributes>,
-                                                        std::shared_ptr<Tensor_attributes>,
-                                                        Pointwise_attributes);
-    inline std::shared_ptr<Tensor_attributes> pointwise(std::shared_ptr<Tensor_attributes>,
-                                                        std::shared_ptr<Tensor_attributes>,
-                                                        std::shared_ptr<Tensor_attributes>,
-                                                        Pointwise_attributes);
+    std::shared_ptr<Tensor_attributes> pointwise(std::shared_ptr<Tensor_attributes>, Pointwise_attributes);
+    std::shared_ptr<Tensor_attributes> pointwise(std::shared_ptr<Tensor_attributes>,
+                                                 std::shared_ptr<Tensor_attributes>,
+                                                 Pointwise_attributes);
+    std::shared_ptr<Tensor_attributes> pointwise(std::shared_ptr<Tensor_attributes>,
+                                                 std::shared_ptr<Tensor_attributes>,
+                                                 std::shared_ptr<Tensor_attributes>,
+                                                 Pointwise_attributes);
 
-    inline std::shared_ptr<Tensor_attributes> reduction(std::shared_ptr<Tensor_attributes>, Reduction_attributes);
-    inline std::shared_ptr<Tensor_attributes> reshape(std::shared_ptr<Tensor_attributes>, Reshape_attributes);
+    std::shared_ptr<Tensor_attributes> reduction(std::shared_ptr<Tensor_attributes>, Reduction_attributes);
+    std::array<std::shared_ptr<Tensor_attributes>, 2> resample(std::shared_ptr<Tensor_attributes>, Resample_attributes);
+    std::shared_ptr<Tensor_attributes> reshape(std::shared_ptr<Tensor_attributes>, Reshape_attributes);
 
-    inline std::shared_ptr<Tensor_attributes> rng(std::shared_ptr<Tensor_attributes>,
-                                                  std::shared_ptr<Tensor_attributes>,
-                                                  Rng_attributes);
+    std::shared_ptr<Tensor_attributes> rng(std::shared_ptr<Tensor_attributes>,
+                                           std::shared_ptr<Tensor_attributes>,
+                                           Rng_attributes);
     error_t
     validate() {
         // infer_properties self

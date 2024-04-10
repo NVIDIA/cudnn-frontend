@@ -19,6 +19,7 @@ class SDPANode : public NodeCRTP<SDPANode> {
 
     std::shared_ptr<Tensor_attributes> rng_output;
     std::shared_ptr<Tensor_attributes> alibi_slopes;
+    int64_t alibi_slopes_size = 0;
 
    public:
     SDPA_attributes attributes;
@@ -276,6 +277,7 @@ class SDPANode : public NodeCRTP<SDPANode> {
                 .set_stride({h, 1, 1, 1})
                 // Hard code data type float as FE itself will compute and place in variant pack later
                 .set_data_type(DataType_t::FLOAT);
+            alibi_slopes_size = h * sizeof(float);
 
             auto mul_attributes    = Pointwise_attributes().set_name("mul").set_mode(PointwiseMode_t::MUL);
             auto const& alibi_mask = pointwise(sub_output, alibi_slopes, mul_attributes);
@@ -502,10 +504,12 @@ class SDPANode : public NodeCRTP<SDPANode> {
 
     virtual int64_t
     get_fe_workspace_size_node() const override final {
-        auto const& q             = attributes.inputs.find(input_names::Q);
-        int64_t const h           = q->second->get_dim()[1];
-        int64_t alibi_slopes_size = h * sizeof(float);
-        return (alibi_slopes_size + 15) & ~15;
+        int64_t size = 0;
+
+        // align alibi slopes memory to 16 bytes
+        size += ((alibi_slopes_size + 15) / 16 * 16);
+
+        return size;
     }
 
     virtual error_t
@@ -517,6 +521,8 @@ class SDPANode : public NodeCRTP<SDPANode> {
             int64_t const h_q     = Q->second->get_dim()[1];
             auto alibi_slopes_vec = detail::get_abili_slope(h_q);
             workspace_modifications.emplace(alibi_slopes->get_uid(), std::make_tuple(0, offset, alibi_slopes_vec));
+            int64_t alibi_slopes_size_padded = ((alibi_slopes_size + 15) / 16 * 16);
+            offset                           = offset + alibi_slopes_size_padded;
         }
         return {error_code_t::OK, ""};
     }
@@ -1253,10 +1259,13 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
 
     virtual int64_t
     get_fe_workspace_size_node() const override final {
-        // set in infer_properties_node()
-        // align alibi slopes memory to 16 bytes
-        int64_t alibi_slopes_size_padded = (alibi_slopes_size + 15) & ~15;
-        return alibi_slopes_size_padded + dQ_accum_size + softmax_sum_size;
+        int64_t size = 0;
+
+        size += ((alibi_slopes_size + 15) / 16 * 16);  // align alibi slopes memory to 16 bytes
+        size += dQ_accum_size;
+        size += softmax_sum_size;
+
+        return size;
     }
 
     virtual error_t
@@ -1268,7 +1277,7 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
             int64_t const h_q     = Q->second->get_dim()[1];
             auto alibi_slopes_vec = detail::get_abili_slope(h_q);
             workspace_modifications.emplace(alibi_slopes->get_uid(), std::make_tuple(0, offset, alibi_slopes_vec));
-            int64_t alibi_slopes_size_padded = (alibi_slopes_size + 15) & ~15;
+            int64_t alibi_slopes_size_padded = ((alibi_slopes_size + 15) / 16 * 16);
             offset                           = offset + alibi_slopes_size_padded;
         }
 

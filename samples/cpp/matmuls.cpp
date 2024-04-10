@@ -75,9 +75,11 @@ TEST_CASE("Matmul", "[matmul][graph]") {
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
 
+    graph.deselect_engines({"eng4_"});
+
     REQUIRE(graph.check_support(handle).is_good());
 
-    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::ALL).is_good());
 
     // Run cudnn graph
     Surface<float> C_gpu(b * m * n, false);

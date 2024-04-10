@@ -2,6 +2,7 @@ import cudnn
 import pytest
 import torch
 import itertools
+from looseversion import LooseVersion
 
 from test_utils import torch_fork_set_rng
 
@@ -13,7 +14,7 @@ all_options = [elem for elem in itertools.product(*[input_type_options,])]
 def param_extract(request):
   return request.param
 
-@pytest.mark.skipif(cudnn.backend_version() < 8905, reason="IN not supported below cudnn 8.9.5")
+@pytest.mark.skipif(LooseVersion(cudnn.backend_version_string()) < "8.9.5", reason="IN not supported below cudnn 8.9.5")
 @torch_fork_set_rng(seed=0)
 def test_in(param_extract):
 
