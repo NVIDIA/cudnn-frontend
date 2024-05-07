@@ -22,8 +22,7 @@ class RngNode : public NodeCRTP<RngNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating RngNode " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating RngNode " << attributes.name << "..." << std::endl;
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             attributes.outputs.find(Rng_attributes::output_names::Y) == attributes.outputs.end(),
@@ -84,8 +83,8 @@ class RngNode : public NodeCRTP<RngNode> {
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building RngNode operations " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Building RngNode operations " << attributes.name << "..."
+                    << std::endl;
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.get_distribution() != RngDistribution_t::BERNOULLI,
                                        error_code_t::ATTRIBUTE_NOT_SET,

@@ -54,7 +54,7 @@ cudnnReorderFilterAndBiasInt8x32(cudnnHandle_t handle,
 
     cudnnFilterDescriptor_t filterDesc = nullptr;
 
-    cudnn_status = create_filter_desc_v7(&filterDesc);
+    cudnn_status = detail::create_filter_desc_v7(&filterDesc);
     if (cudnn_status != CUDNN_STATUS_SUCCESS) {
         return cudnn_status;
     }
@@ -81,8 +81,8 @@ cudnnReorderFilterAndBiasInt8x32(cudnnHandle_t handle,
         filter_dims_[4] = static_cast<int>((non_shape_dims == 2) ? filter_dims[4] : filter_dims[5]);  // w
     }
 
-    cudnn_status =
-        set_ndfilter_desc_v7(filterDesc, CUDNN_DATA_INT8x32, CUDNN_TENSOR_NCHW_VECT_C, conv_dims + 2, filter_dims_);
+    cudnn_status = detail::set_ndfilter_desc_v7(
+        filterDesc, CUDNN_DATA_INT8x32, CUDNN_TENSOR_NCHW_VECT_C, conv_dims + 2, filter_dims_);
 
     if (cudnn_status != CUDNN_STATUS_SUCCESS) {
         return cudnn_status;
@@ -90,16 +90,16 @@ cudnnReorderFilterAndBiasInt8x32(cudnnHandle_t handle,
 
     int reorderBias = (dev_bias_ptr != nullptr);
 
-    cudnn_status = reorder_filter_bias(handle,
-                                       filterDesc,
-                                       CUDNN_DEFAULT_REORDER,
-                                       dev_filter_ptr,
-                                       reordered_filter_ptr,
-                                       reorderBias,
-                                       dev_bias_ptr,
-                                       reordered_bias_ptr);
+    cudnn_status = detail::reorder_filter_bias(handle,
+                                               filterDesc,
+                                               CUDNN_DEFAULT_REORDER,
+                                               dev_filter_ptr,
+                                               reordered_filter_ptr,
+                                               reorderBias,
+                                               dev_bias_ptr,
+                                               reordered_bias_ptr);
 
-    destroy_filter(filterDesc);
+    detail::destroy_filter(filterDesc);
     return cudnn_status;
 }
 }  // namespace cudnn_frontend

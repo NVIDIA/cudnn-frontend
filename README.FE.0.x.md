@@ -56,7 +56,7 @@ The `cudnnFindPlan` in turn
 The most common `engineConfig` generation is the built-in heuristics of cuDNN V8. Generally, this is appended with the fallback list. An example of usage can be seen in `run_from_cudnn_find(...)` function in `conv_sample.cpp`.
 
 ## Errata Filter:
-Errata filter gives the cuDNN team an opportunity to block certain faulty kernels from being executed. cuDNN team can eitherprovide a json file which blocks certain engine configs from being executed. The users can augment to this list if they find certain characteristics to be undesirable (Eg. Bad memory access, Execution plan failure). Users can either declare the json file statically or load from a file during runtime using the environment variable "CUDNN_ERRATA_JSON_FILE".
+Errata filter gives the cuDNN team an opportunity to block certain faulty kernels from being executed. cuDNN team can either provide a json file which blocks certain engine configs from being executed. The users can augment to this list if they find certain characteristics to be undesirable (Eg. Bad memory access, Execution plan failure). Users can either declare the json file statically or load from a file during runtime using the environment variable "CUDNN_ERRATA_JSON_FILE".
 
 #### Json format
     version             : 1    - Mandatory. Tells the format version of the json.
@@ -75,7 +75,7 @@ Errata filter gives the cuDNN team an opportunity to block certain faulty kernel
 PS: The errata filter note is still in beta version. We may add/modify certain features as necessary.
 
 ## Execution Plan Caching
-cuDNN through heuristics provides a way to query a list of good engine configs. Based on this query we build the cudnn_frontend_find_plan function which runs all the engineConfig(s) on the given user system and returns a sorted list of plans. This process of running multiple plans through several iterations is time consuming. The ExecutionPlanCache allows the user to build a cache with operation graph as the key to query an execution plan. It is the responsibilty of the user to maintain different caches for different types of operation_graphs (For eg. different cache for convolutionForward compared to Dgrad or Wgrad). The `is_fastest_plan_stable` builds on top of this by making sure the same plan is chosen by the cudnnFind multiple times.
+cuDNN through heuristics provides a way to query a list of good engine configs. Based on this query we build the cudnn_frontend_find_plan function which runs all the engineConfig(s) on the given user system and returns a sorted list of plans. This process of running multiple plans through several iterations is time consuming. The ExecutionPlanCache allows the user to build a cache with operation graph as the key to query an execution plan. It is the responsibility of the user to maintain different caches for different types of operation_graphs (For eg. different cache for convolutionForward compared to Dgrad or Wgrad). The `is_fastest_plan_stable` builds on top of this by making sure the same plan is chosen by the cudnnFind multiple times.
 
 ### API:
     - void add_plan_to_cache(const cudnn_frontend::OperationGraph &op_graph, const cudnn_frontend::ExecutionPlan &plan) : Creates a mapping between the operation graph and executionPlan
@@ -87,7 +87,7 @@ cuDNN through heuristics provides a way to query a list of good engine configs. 
 PS: ExecutionPlanCaching today supports only single operation operation_graphs.
 
 ## Execution Plan Serialization and Deserialization (Experimental)
-cuDNN v8.4 and above provides exeuction plan serialization and deserialization to save the execution plan as a string in JSON format. The execution plan can be then restored from that string at a later point, and this also saves compilation time compared to rebuilding the plan from scratch. Currently, this is an experimental feature that only supports the runtime fusion engine. No forward/backward or cross-device compatibility guarantee is offered at this time.
+cuDNN v8.4 and above provides execution plan serialization and deserialization to save the execution plan as a string in JSON format. The execution plan can be then restored from that string at a later point, and this also saves compilation time compared to rebuilding the plan from scratch. Currently, this is an experimental feature that only supports the runtime fusion engine. No forward/backward or cross-device compatibility guarantee is offered at this time.
 
 ### API:
     - std::string cudnn_frontend::ExecutionPlan_v8::getJsonRepresentation() : Serialize the execution plan into a string in JSON format.

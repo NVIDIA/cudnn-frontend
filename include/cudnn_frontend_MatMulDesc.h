@@ -47,8 +47,7 @@ class MatMulDesc_v8 : public BackendDescriptor {
     std::string
     describe() const override {
         std::stringstream ss;
-        ss << "CUDNN_BACKEND_MATMUL_DESCRIPTOR :"
-           << " Math precision " << json{compute_type};
+        ss << "CUDNN_BACKEND_MATMUL_DESCRIPTOR :" << " Math precision " << json{compute_type};
         return ss.str();
     }
 
@@ -126,11 +125,11 @@ class MatMulDescBuilder_v8 {
                 "CUDNN_BACKEND_MATMUL_DESCRIPTOR: SetAttribute CUDNN_ATTR_MATMUL_COMP_TYPE Failed");
             return std::move(m_matMulDesc);
         }
-        status = cudnn_frontend::set_attribute(m_matMulDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_MATMUL_COMP_TYPE,
-                                               CUDNN_TYPE_DATA_TYPE,
-                                               1,
-                                               &cudnn_data_type);
+        status = detail::set_attribute(m_matMulDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_MATMUL_COMP_TYPE,
+                                       CUDNN_TYPE_DATA_TYPE,
+                                       1,
+                                       &cudnn_data_type);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_matMulDesc,
@@ -146,11 +145,11 @@ class MatMulDescBuilder_v8 {
             m_matMulDesc,
             "CUDNN_BACKEND_MATMUL_DESCRIPTOR: SetAttribute CUDNN_ATTR_MATMUL_PADDING_VALUE requires cudnn 8.9.0");
         if (m_matMulDesc.isPadded) {
-            status = cudnn_frontend::set_attribute(m_matMulDesc.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_MATMUL_PADDING_VALUE,
-                                                   CUDNN_TYPE_DOUBLE,
-                                                   1,
-                                                   &m_matMulDesc.paddingValue);
+            status = detail::set_attribute(m_matMulDesc.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_MATMUL_PADDING_VALUE,
+                                           CUDNN_TYPE_DOUBLE,
+                                           1,
+                                           &m_matMulDesc.paddingValue);
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_matMulDesc,
@@ -162,7 +161,7 @@ class MatMulDescBuilder_v8 {
 #endif
 
         // Finalizing the descriptor
-        status = cudnn_frontend::finalize(m_matMulDesc.pointer->get_backend_descriptor());
+        status = detail::finalize(m_matMulDesc.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_matMulDesc, status, "CUDNN_BACKEND_MATMUL_DESCRIPTOR: cudnnFinalize Failed");

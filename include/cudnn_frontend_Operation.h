@@ -80,8 +80,7 @@ class Operation_v8 : public BackendDescriptor {
     std::string
     describe() const override {
         std::stringstream ss;
-        ss << "CUDNN_BACKEND_OPERATION :"
-           << " OpMode: " << op_mode;
+        ss << "CUDNN_BACKEND_OPERATION :" << " OpMode: " << op_mode;
         ss << std::hex << " X " << xdesc;
         ss << std::hex << " Y " << ydesc;
         ss << std::hex << " W " << wdesc;
@@ -243,11 +242,11 @@ class OperationBuilder_v8 {
     Operation_v8 &&
     build_reduction_op() {
         m_operation.operationTag = "Reduction";
-        auto status              = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                    CUDNN_ATTR_OPERATION_REDUCTION_DESC,
-                                                    CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                    1,
-                                                    &(m_operation.reductiondesc->get_backend_descriptor()));
+        auto status              = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                            CUDNN_ATTR_OPERATION_REDUCTION_DESC,
+                                            CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                            1,
+                                            &(m_operation.reductiondesc->get_backend_descriptor()));
 
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
@@ -256,11 +255,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_REDUCTION_DESC Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_REDUCTION_XDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.xdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_REDUCTION_XDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.xdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -268,11 +267,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_REDUCTION_XDESC Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_REDUCTION_YDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.ydesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_REDUCTION_YDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.ydesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -280,7 +279,7 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_REDUCTION_YDESC Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
@@ -292,31 +291,31 @@ class OperationBuilder_v8 {
     build_matmul_op() {
         m_operation.operationTag = "Matmul";
         auto status              = CUDNN_STATUS_SUCCESS;
-        status                   = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_MATMUL_ADESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.amatdesc->get_backend_descriptor()));
+        status                   = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_MATMUL_ADESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.amatdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation, status, "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_MATMUL_ADESC Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_MATMUL_BDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.bmatdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_MATMUL_BDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.bmatdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation, status, "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_MATMUL_BDESC Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_MATMUL_CDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.cmatdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_MATMUL_CDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.cmatdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation, status, "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_MATMUL_CDESC Failed");
@@ -326,11 +325,11 @@ class OperationBuilder_v8 {
         NV_CUDNN_FE_DYNAMIC_CHECK_BACKEND_DESCRIPTOR(
             8700, m_operation, "CUDNN_BACKEND_OPERATION: M,N,K override Requires cudnn 8.7.0 and above");
         if (m_operation.moverridedesc != nullptr) {
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_MATMUL_GEMM_M_OVERRIDE_DESC,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.moverridedesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_MATMUL_GEMM_M_OVERRIDE_DESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.moverridedesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation,
@@ -340,11 +339,11 @@ class OperationBuilder_v8 {
             }
         }
         if (m_operation.noverridedesc != nullptr) {
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_MATMUL_GEMM_N_OVERRIDE_DESC,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.noverridedesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_MATMUL_GEMM_N_OVERRIDE_DESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.noverridedesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation,
@@ -354,11 +353,11 @@ class OperationBuilder_v8 {
             }
         }
         if (m_operation.koverridedesc != nullptr) {
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_MATMUL_GEMM_K_OVERRIDE_DESC,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.koverridedesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_MATMUL_GEMM_K_OVERRIDE_DESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.koverridedesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation,
@@ -368,17 +367,17 @@ class OperationBuilder_v8 {
             }
         }
 #endif
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_MATMUL_DESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.matmuldesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_MATMUL_DESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.matmuldesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation, status, "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_MATMUL_DESC Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
@@ -393,11 +392,11 @@ class OperationBuilder_v8 {
         json j                   = m_operation.pointwise_mode;
         m_operation.operationTag = j;
 
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_POINTWISE_PW_DESCRIPTOR,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.pwdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_POINTWISE_PW_DESCRIPTOR,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.pwdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -406,11 +405,11 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_POINTWISE_XDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.xdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_POINTWISE_XDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.xdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -420,11 +419,11 @@ class OperationBuilder_v8 {
         }
 
         if (!m_operation.is_pointwise_activation_bwd_op) {
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_POINTWISE_YDESC,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.ydesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_POINTWISE_YDESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.ydesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation,
@@ -433,11 +432,11 @@ class OperationBuilder_v8 {
                 return std::move(m_operation);
             }
         } else {
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_POINTWISE_DYDESC,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.dydesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_POINTWISE_DYDESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.dydesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation,
@@ -446,11 +445,11 @@ class OperationBuilder_v8 {
                 return std::move(m_operation);
             }
 
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_POINTWISE_DXDESC,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.dxdesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_POINTWISE_DXDESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.dxdesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation,
@@ -464,11 +463,11 @@ class OperationBuilder_v8 {
                                                                       : static_cast<void *>(&m_operation.alpha_d));
         void *alpha2 = (m_operation.alphabetaType == CUDNN_TYPE_FLOAT ? static_cast<void *>(&m_operation.alpha2_s)
                                                                       : static_cast<void *>(&m_operation.alpha2_d));
-        status       = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_POINTWISE_ALPHA1,
-                                               m_operation.alphabetaType,
-                                               1,
-                                               alpha);
+        status       = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_POINTWISE_ALPHA1,
+                                       m_operation.alphabetaType,
+                                       1,
+                                       alpha);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -476,11 +475,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_POINTWISE_ALPHA1 Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_POINTWISE_ALPHA2,
-                                               m_operation.alphabetaType,
-                                               1,
-                                               alpha2);
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_POINTWISE_ALPHA2,
+                                       m_operation.alphabetaType,
+                                       1,
+                                       alpha2);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -490,11 +489,11 @@ class OperationBuilder_v8 {
         }
 
         if (m_operation.pointwise_port_count >= 3 && !m_operation.is_pointwise_activation_bwd_op) {
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_POINTWISE_BDESC,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.bdesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_POINTWISE_BDESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.bdesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation,
@@ -505,11 +504,11 @@ class OperationBuilder_v8 {
         }
 
         if (m_operation.pointwise_port_count == 4) {
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_POINTWISE_TDESC,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.tdesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_POINTWISE_TDESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.tdesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation,
@@ -519,7 +518,7 @@ class OperationBuilder_v8 {
             }
         }
 
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
@@ -534,11 +533,11 @@ class OperationBuilder_v8 {
         auto status = CUDNN_STATUS_SUCCESS;
 
         auto dxdesc_ = m_operation.dxdesc != nullptr ? m_operation.dxdesc : m_operation.xdesc;
-        status       = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(dxdesc_->get_backend_descriptor()));
+        status       = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(dxdesc_->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -547,11 +546,11 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.wdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.wdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -561,11 +560,11 @@ class OperationBuilder_v8 {
         }
 
         auto dydesc_ = m_operation.dydesc != nullptr ? m_operation.dydesc : m_operation.ydesc;
-        status       = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(dydesc_->get_backend_descriptor()));
+        status       = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(dydesc_->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -574,11 +573,11 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.cdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.cdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -591,11 +590,11 @@ class OperationBuilder_v8 {
                                                                      : static_cast<void *>(&m_operation.alpha_d));
         void *beta  = (m_operation.alphabetaType == CUDNN_TYPE_FLOAT ? static_cast<void *>(&m_operation.beta_s)
                                                                      : static_cast<void *>(&m_operation.beta_d));
-        status      = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA,
-                                               m_operation.alphabetaType,
-                                               1,
-                                               alpha);
+        status      = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA,
+                                       m_operation.alphabetaType,
+                                       1,
+                                       alpha);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -603,11 +602,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA,
-                                               m_operation.alphabetaType,
-                                               1,
-                                               beta);
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA,
+                                       m_operation.alphabetaType,
+                                       1,
+                                       beta);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -616,7 +615,7 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
@@ -637,7 +636,7 @@ class OperationBuilder_v8 {
                                        void const *ptr,
                                        cudnnBackendAttributeType_t type = CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                        int64_t cnt                      = 1) {
-            status = cudnn_frontend::set_attribute(operation.pointer->get_backend_descriptor(), attr, type, cnt, ptr);
+            status = detail::set_attribute(operation.pointer->get_backend_descriptor(), attr, type, cnt, ptr);
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(&operation, status, fail_msg);
             }
@@ -821,7 +820,7 @@ class OperationBuilder_v8 {
             }
         }
 
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
@@ -834,11 +833,11 @@ class OperationBuilder_v8 {
         m_operation.operationTag = "GenStats";
         auto status              = CUDNN_STATUS_SUCCESS;
 
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_GENSTATS_XDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.xdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_GENSTATS_XDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.xdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -847,11 +846,11 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_GENSTATS_SUMDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.sumdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_GENSTATS_SUMDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.sumdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -860,11 +859,11 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_GENSTATS_SQSUMDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.sqsumdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_GENSTATS_SQSUMDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.sqsumdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -873,11 +872,11 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_GENSTATS_MODE,
-                                               CUDNN_TYPE_GENSTATS_MODE,
-                                               1,
-                                               &(m_operation.genstats_mode));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_GENSTATS_MODE,
+                                       CUDNN_TYPE_GENSTATS_MODE,
+                                       1,
+                                       &(m_operation.genstats_mode));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -886,11 +885,11 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_GENSTATS_MATH_PREC,
-                                               CUDNN_TYPE_DATA_TYPE,
-                                               1,
-                                               &(m_operation.compute_type));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_GENSTATS_MATH_PREC,
+                                       CUDNN_TYPE_DATA_TYPE,
+                                       1,
+                                       &(m_operation.compute_type));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -899,7 +898,7 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
@@ -914,11 +913,11 @@ class OperationBuilder_v8 {
 
         auto status = CUDNN_STATUS_SUCCESS;
 
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_X,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.xdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_X,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.xdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -928,11 +927,11 @@ class OperationBuilder_v8 {
         }
 
         auto dwdesc_ = m_operation.dwdesc != nullptr ? m_operation.dwdesc : m_operation.wdesc;
-        status       = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DW,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(dwdesc_->get_backend_descriptor()));
+        status       = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DW,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(dwdesc_->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -942,11 +941,11 @@ class OperationBuilder_v8 {
         }
 
         auto dydesc_ = m_operation.dydesc != nullptr ? m_operation.dydesc : m_operation.ydesc;
-        status       = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DY,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(dydesc_->get_backend_descriptor()));
+        status       = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DY,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(dydesc_->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -955,11 +954,11 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_CONV_DESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.cdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_CONV_DESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.cdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation,
                                           status,
@@ -971,11 +970,11 @@ class OperationBuilder_v8 {
                                                                      : static_cast<void *>(&m_operation.alpha_d));
         void *beta  = (m_operation.alphabetaType == CUDNN_TYPE_FLOAT ? static_cast<void *>(&m_operation.beta_s)
                                                                      : static_cast<void *>(&m_operation.beta_d));
-        status      = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_ALPHA,
-                                               m_operation.alphabetaType,
-                                               1,
-                                               alpha);
+        status      = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_ALPHA,
+                                       m_operation.alphabetaType,
+                                       1,
+                                       alpha);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -983,11 +982,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_ALPHA Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_BETA,
-                                               m_operation.alphabetaType,
-                                               1,
-                                               beta);
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_BETA,
+                                       m_operation.alphabetaType,
+                                       1,
+                                       beta);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -996,7 +995,7 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
@@ -1017,7 +1016,7 @@ class OperationBuilder_v8 {
                                        void const *ptr,
                                        cudnnBackendAttributeType_t type = CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                        int64_t cnt                      = 1) {
-            status = cudnn_frontend::set_attribute(operation.pointer->get_backend_descriptor(), attr, type, cnt, ptr);
+            status = detail::set_attribute(operation.pointer->get_backend_descriptor(), attr, type, cnt, ptr);
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(&operation, status, fail_msg);
             }
@@ -1032,11 +1031,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_FWD_MODE Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_NORM_FWD_MODE,
-                                               CUDNN_TYPE_NORM_MODE,
-                                               1,
-                                               &cudnn_norm_mode);
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_NORM_FWD_MODE,
+                                       CUDNN_TYPE_NORM_MODE,
+                                       1,
+                                       &cudnn_norm_mode);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1054,11 +1053,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_NORM_FWD_PHASE Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_NORM_FWD_PHASE,
-                                               CUDNN_TYPE_NORM_FWD_PHASE,
-                                               1,
-                                               &cudnn_norm_fwd_phase);
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_NORM_FWD_PHASE,
+                                       CUDNN_TYPE_NORM_FWD_PHASE,
+                                       1,
+                                       &cudnn_norm_fwd_phase);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1184,7 +1183,7 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
 
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
@@ -1204,7 +1203,7 @@ class OperationBuilder_v8 {
                                        void const *ptr,
                                        cudnnBackendAttributeType_t type = CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                        int64_t cnt                      = 1) {
-            status = cudnn_frontend::set_attribute(operation.pointer->get_backend_descriptor(), attr, type, cnt, ptr);
+            status = detail::set_attribute(operation.pointer->get_backend_descriptor(), attr, type, cnt, ptr);
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(&operation, status, fail_msg);
             }
@@ -1310,7 +1309,7 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
 
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
@@ -1323,11 +1322,11 @@ class OperationBuilder_v8 {
     build_resample_fwd_operation() {
         m_operation.operationTag = "Resample_fwd";
         auto status              = CUDNN_STATUS_SUCCESS;
-        status                   = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RESAMPLE_FWD_XDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.xdesc->get_backend_descriptor()));
+        status                   = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RESAMPLE_FWD_XDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.xdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1335,11 +1334,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESAMPLE_FWD_XDESC Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RESAMPLE_FWD_YDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.ydesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RESAMPLE_FWD_YDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.ydesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1347,11 +1346,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESAMPLE_FWD_YDESC Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RESAMPLE_FWD_ALPHA,
-                                               CUDNN_TYPE_DOUBLE,
-                                               1,
-                                               &(m_operation.alpha_d));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RESAMPLE_FWD_ALPHA,
+                                       CUDNN_TYPE_DOUBLE,
+                                       1,
+                                       &(m_operation.alpha_d));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1359,11 +1358,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESAMPLE_FWD_ALPHA Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RESAMPLE_FWD_BETA,
-                                               CUDNN_TYPE_DOUBLE,
-                                               1,
-                                               &(m_operation.beta_d));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RESAMPLE_FWD_BETA,
+                                       CUDNN_TYPE_DOUBLE,
+                                       1,
+                                       &(m_operation.beta_d));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1371,11 +1370,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESAMPLE_FWD_BETA Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RESAMPLE_FWD_DESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.resampledesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RESAMPLE_FWD_DESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.resampledesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1386,11 +1385,11 @@ class OperationBuilder_v8 {
 
         // Maxpooling forward
         if (m_operation.idxdesc != nullptr) {
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_RESAMPLE_FWD_IDXDESC,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.idxdesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_RESAMPLE_FWD_IDXDESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.idxdesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation,
@@ -1400,7 +1399,7 @@ class OperationBuilder_v8 {
             }
         }
 
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
@@ -1415,11 +1414,11 @@ class OperationBuilder_v8 {
             8600, m_operation, "CUDNN_BACKEND_OPERATION: Resample_bwd requires cudnn 8.6.0");
         m_operation.operationTag = "Resample_bwd";
         auto status              = CUDNN_STATUS_SUCCESS;
-        status                   = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DXDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.dxdesc->get_backend_descriptor()));
+        status                   = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DXDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.dxdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1433,11 +1432,11 @@ class OperationBuilder_v8 {
                 8700,
                 m_operation,
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESAMPLE_BWD_XDESC requires cudnn 8.7.0");
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_RESAMPLE_BWD_XDESC,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.xdesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_RESAMPLE_BWD_XDESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.xdesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation,
@@ -1451,11 +1450,11 @@ class OperationBuilder_v8 {
                 8700,
                 m_operation,
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESAMPLE_BWD_YDESC requires cudnn 8.7.0");
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_RESAMPLE_BWD_YDESC,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.ydesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_RESAMPLE_BWD_YDESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.ydesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation,
@@ -1465,11 +1464,11 @@ class OperationBuilder_v8 {
             }
         }
 #endif
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DYDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.dydesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DYDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.dydesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1477,11 +1476,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DYDESC Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RESAMPLE_BWD_ALPHA,
-                                               CUDNN_TYPE_DOUBLE,
-                                               1,
-                                               &(m_operation.alpha_d));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RESAMPLE_BWD_ALPHA,
+                                       CUDNN_TYPE_DOUBLE,
+                                       1,
+                                       &(m_operation.alpha_d));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1489,11 +1488,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESAMPLE_BWD_ALPHA Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RESAMPLE_BWD_BETA,
-                                               CUDNN_TYPE_DOUBLE,
-                                               1,
-                                               &(m_operation.beta_d));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RESAMPLE_BWD_BETA,
+                                       CUDNN_TYPE_DOUBLE,
+                                       1,
+                                       &(m_operation.beta_d));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1501,11 +1500,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESAMPLE_BWD_BETA Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.resampledesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.resampledesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1516,11 +1515,11 @@ class OperationBuilder_v8 {
 
         // Maxpooling backward
         if (m_operation.idxdesc != nullptr) {
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_RESAMPLE_BWD_IDXDESC,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.idxdesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_RESAMPLE_BWD_IDXDESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.idxdesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation,
@@ -1530,7 +1529,7 @@ class OperationBuilder_v8 {
             }
         }
 
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
@@ -1550,11 +1549,11 @@ class OperationBuilder_v8 {
             8700, m_operation, "CUDNN_BACKEND_OPERATION: build_rng_operation requires cudnn 8.7.0");
         m_operation.operationTag = "Rng";
         auto status              = CUDNN_STATUS_SUCCESS;
-        status                   = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RNG_YDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.ydesc->get_backend_descriptor()));
+        status                   = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RNG_YDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.ydesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation, status, "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RNG_YDESC Failed");
@@ -1569,11 +1568,11 @@ class OperationBuilder_v8 {
                 8800,
                 m_operation,
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RNG_SEED requires cudnn 8.8.0");
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_RNG_SEED,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.seeddesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_RNG_SEED,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.seeddesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation, status, "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RNG_SEED Failed");
@@ -1582,22 +1581,22 @@ class OperationBuilder_v8 {
         } else
 #endif
         {
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_RNG_SEED,
-                                                   CUDNN_TYPE_INT64,
-                                                   1,
-                                                   &(m_operation.seed));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_RNG_SEED,
+                                           CUDNN_TYPE_INT64,
+                                           1,
+                                           &(m_operation.seed));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation, status, "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RNG_SEED Failed");
                 return std::move(m_operation);
             }
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RNG_DESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.rngdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RNG_DESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.rngdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation, status, "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RNG_DESC Failed");
@@ -1610,11 +1609,11 @@ class OperationBuilder_v8 {
                 8800,
                 m_operation,
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RNG_OFFSET_DESC requires cudnn 8.8.0");
-            status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                                   CUDNN_ATTR_OPERATION_RNG_OFFSET_DESC,
-                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                   1,
-                                                   &(m_operation.offsetdesc->get_backend_descriptor()));
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_RNG_OFFSET_DESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.offsetdesc->get_backend_descriptor()));
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(
                     &m_operation,
@@ -1625,7 +1624,7 @@ class OperationBuilder_v8 {
         }
 #endif
 
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
@@ -1645,11 +1644,11 @@ class OperationBuilder_v8 {
             8700, m_operation, "CUDNN_BACKEND_OPERATION: build_reshape_operation requires cudnn 8.7.0");
         m_operation.operationTag = "Reshape";
         auto status              = CUDNN_STATUS_SUCCESS;
-        status                   = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RESHAPE_XDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.xdesc->get_backend_descriptor()));
+        status                   = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RESHAPE_XDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.xdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1657,11 +1656,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESHAPE_XDESC Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_RESHAPE_YDESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.ydesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_RESHAPE_YDESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.ydesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1669,7 +1668,7 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESHAPE_YDESC Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
@@ -1687,11 +1686,11 @@ class OperationBuilder_v8 {
         m_operation.operationTag = "Dgrad_Drelu_BN_Bwd";
         auto status              = CUDNN_STATUS_SUCCESS;
 
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_BN_BWD_WEIGHTS_MATH_PREC,
-                                               CUDNN_TYPE_DATA_TYPE,
-                                               1,
-                                               &(m_operation.compute_type));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_BN_BWD_WEIGHTS_MATH_PREC,
+                                       CUDNN_TYPE_DATA_TYPE,
+                                       1,
+                                       &(m_operation.compute_type));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1706,7 +1705,7 @@ class OperationBuilder_v8 {
                                        void const *ptr,
                                        cudnnBackendAttributeType_t type = CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                        int64_t cnt                      = 1) {
-            status = cudnn_frontend::set_attribute(operation.pointer->get_backend_descriptor(), attr, type, cnt, ptr);
+            status = detail::set_attribute(operation.pointer->get_backend_descriptor(), attr, type, cnt, ptr);
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(&operation, status, fail_msg);
             }
@@ -1807,7 +1806,7 @@ class OperationBuilder_v8 {
         if (status != CUDNN_STATUS_SUCCESS) {
             return std::move(m_operation);
         }
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
@@ -1821,11 +1820,11 @@ class OperationBuilder_v8 {
 
         auto status = CUDNN_STATUS_SUCCESS;
 
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.xdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.xdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1833,11 +1832,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.wdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.wdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1845,11 +1844,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.ydesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.ydesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1857,11 +1856,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_operation.cdesc->get_backend_descriptor()));
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_operation.cdesc->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1873,11 +1872,11 @@ class OperationBuilder_v8 {
                                                                      : static_cast<void *>(&m_operation.alpha_d));
         void *beta  = (m_operation.alphabetaType == CUDNN_TYPE_FLOAT ? static_cast<void *>(&m_operation.beta_s)
                                                                      : static_cast<void *>(&m_operation.beta_d));
-        status      = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA,
-                                               m_operation.alphabetaType,
-                                               1,
-                                               alpha);
+        status      = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA,
+                                       m_operation.alphabetaType,
+                                       1,
+                                       alpha);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1885,11 +1884,11 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::set_attribute(m_operation.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA,
-                                               m_operation.alphabetaType,
-                                               1,
-                                               beta);
+        status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA,
+                                       m_operation.alphabetaType,
+                                       1,
+                                       beta);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_operation,
@@ -1897,7 +1896,7 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA Failed");
             return std::move(m_operation);
         }
-        status = cudnn_frontend::finalize(m_operation.pointer->get_backend_descriptor());
+        status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
@@ -2004,15 +2003,15 @@ class OperationBuilder_v8 {
             return CUDNN_STATUS_BAD_PARAM;
         }
 
-        if (get_backend_version() == 8500) {
+        if (detail::get_backend_version() == 8500) {
             std::array<int64_t, 10> x_dimensions;
             int64_t dim_count;
-            status = cudnn_frontend::get_attribute(m_operation.xdesc->get_backend_descriptor(),
-                                                   CUDNN_ATTR_TENSOR_DIMENSIONS,
-                                                   CUDNN_TYPE_INT64,
-                                                   x_dimensions.size(),
-                                                   &dim_count,
-                                                   x_dimensions.data());
+            status = detail::get_attribute(m_operation.xdesc->get_backend_descriptor(),
+                                           CUDNN_ATTR_TENSOR_DIMENSIONS,
+                                           CUDNN_TYPE_INT64,
+                                           x_dimensions.size(),
+                                           &dim_count,
+                                           x_dimensions.data());
             if (status != CUDNN_STATUS_SUCCESS) {
                 msg = "CUDNN_BACKEND_OPERATION: CUDNN_BACKEND_TENSOR has invalid CUDNN_ATTR_TENSOR_DIMENSIONS";
                 return status;

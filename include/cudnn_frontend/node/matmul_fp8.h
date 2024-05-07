@@ -23,8 +23,8 @@ class MatmulFP8Node : public NodeCRTP<MatmulFP8Node> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating matmul fp8 node " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating matmul fp8 node " << attributes.name << "..."
+                    << std::endl;
 
         CUDNN_FE_VALIDATE_INPUT_TENSOR(Matmul_fp8_attributes::input_names::A);
         CUDNN_FE_VALIDATE_INPUT_TENSOR(Matmul_fp8_attributes::input_names::B);

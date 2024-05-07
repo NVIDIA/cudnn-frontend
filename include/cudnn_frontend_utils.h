@@ -215,7 +215,7 @@ AllowAll(cudnnBackendDescriptor_t engine_config) {
 
 static inline std::string
 to_string(cudnnStatus_t const status) {
-    return cudnn_frontend::get_error_string(status);
+    return detail::get_error_string(status);
 }
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
@@ -1952,6 +1952,76 @@ convert_from_cudnn_type(cudnnRngDistribution_t const cudnn_mode) {
     return RngDistribution_t::NOT_SET;
 }
 #endif
+
+std::string static get_engine_tag(ManagedOpaqueDescriptor const config) {
+    std::stringstream tag{""};
+    ManagedOpaqueDescriptor extractedEngine = make_shared_backend_pointer(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
+    auto status                             = extractedEngine->get_status();
+
+    cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
+    int64_t elemCount                         = 0;
+    status                                    = detail::get_attribute(config->get_backend_descriptor(),
+                                   CUDNN_ATTR_ENGINECFG_ENGINE,
+                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                   1,
+                                   &elemCount,
+                                   &extractedEngine_);
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return "INVALID_ENGINE_NAME_CFG";
+    }
+
+    int64_t engineId = 0, numKnobs = 0;
+
+    std::array<ManagedOpaqueDescriptor, CUDNN_KNOB_TYPE_COUNTS> extractedKnobs{{nullptr}};
+    for (auto& knob : extractedKnobs) {
+        knob   = make_shared_backend_pointer(CUDNN_BACKEND_KNOB_CHOICE_DESCRIPTOR);
+        status = knob->get_status();
+        if (status != CUDNN_STATUS_SUCCESS) {
+            return "INVALID_ENGINE_NAME_KNOB";
+        }
+    }
+
+    std::array<cudnnBackendDescriptor_t, CUDNN_KNOB_TYPE_COUNTS> extractedKnobs_{{nullptr}};
+    for (std::uint32_t i = 0; i < extractedKnobs.size(); i++) {
+        extractedKnobs_[i] = extractedKnobs[i]->get_backend_descriptor();
+    }
+
+    status = detail::get_attribute(
+        extractedEngine_, CUDNN_ATTR_ENGINE_GLOBAL_INDEX, CUDNN_TYPE_INT64, 1, &elemCount, &engineId);
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return "INVALID_ENGINE_NAME_IDX";
+    }
+    tag << "eng" << engineId;
+
+    status = detail::get_attribute(config->get_backend_descriptor(),
+                                   CUDNN_ATTR_ENGINECFG_KNOB_CHOICES,
+                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                   CUDNN_KNOB_TYPE_COUNTS,
+                                   &numKnobs,
+                                   &(extractedKnobs_[0]));
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return "INVALID_ENGINE_NAME_KNOB_QUERY";
+    }
+    if (numKnobs > CUDNN_KNOB_TYPE_COUNTS) {
+        return "INVALID_ENGINE_NAME_KNOB_COUNT";
+    }
+
+    for (size_t idx = 0; idx < static_cast<size_t>(numKnobs); ++idx) {
+        const cudnnBackendDescriptor_t& knob = extractedKnobs_[idx];
+        cudnnBackendKnobType_t type          = CUDNN_KNOB_TYPE_COUNTS;
+        int64_t choice                       = -2;
+        status = detail::get_attribute(knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_TYPE, CUDNN_TYPE_KNOB_TYPE, 1, nullptr, &type);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            return "INVALID_ENGINE_NAME_KNOB_CHOICE_KNOB_TYPE";
+        }
+        status = detail::get_attribute(knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_VALUE, CUDNN_TYPE_INT64, 1, nullptr, &choice);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            return "INVALID_ENGINE_NAME_KNOB_CHOICE_KNOB_VALUE";
+        }
+        tag << "_k" << type << "=" << choice;
+    }
+    return tag.str();
+}
 
 }  // namespace detail
 

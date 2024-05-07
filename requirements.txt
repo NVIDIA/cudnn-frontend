@@ -4,3 +4,5 @@ pybind11[global]
 pytest
 pytest-xdist
 looseversion
+black
+clang-format

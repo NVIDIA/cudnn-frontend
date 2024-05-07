@@ -43,7 +43,7 @@ auto set_is_inference(bool const value) -> Resample_attributes&;
 
 cudnn backend develop guide on resampling forward contains more information on exact support surface across different versions. Please refer to it's [Resampling Forward](https://docs.nvidia.com/deeplearning/cudnn/developer/graph-api.html#resamplefwd) section for more details.
 
-Python API for resampling forward will be supproted soon.
+Python API for resampling forward will be supported soon.
 
 ### Resampling Backward
 To be supported soon.

@@ -23,8 +23,8 @@ class ConvolutionNode : public NodeCRTP<ConvolutionNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating Node Type::CONVOLUTION " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating Node Type::CONVOLUTION " << attributes.name << "..."
+                    << std::endl;
 
         CUDNN_FE_VALIDATE_INPUT_TENSOR(Conv_fprop_attributes::input_names::X);
         CUDNN_FE_VALIDATE_INPUT_TENSOR(Conv_fprop_attributes::input_names::W);
@@ -103,8 +103,8 @@ class ConvolutionNode : public NodeCRTP<ConvolutionNode> {
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building ConvolutionNode operations " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Building ConvolutionNode operations " << attributes.name << "..."
+                    << std::endl;
 
         // convolution descriptor
         int64_t const spatial_dim_count = attributes.get_pre_padding().size();

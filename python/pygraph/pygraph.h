@@ -55,14 +55,14 @@ class PyGraph {
         if (handle_.has_value()) {
             handle = static_cast<cudnnHandle_t>((void*)(handle_.value()));
         } else {
-            cudnn_frontend::create_handle(&handle);
+            detail::create_handle(&handle);
             is_handle_owner = true;
         }
     }
 
     ~PyGraph() {
         if (is_handle_owner) {
-            cudnn_frontend::destroy_handle(handle);
+            detail::destroy_handle(handle);
         }
     }
 

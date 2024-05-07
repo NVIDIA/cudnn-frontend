@@ -45,14 +45,12 @@ class OpaqueBackendPointer {
      * OpaqueBackendPointer constructor.
      * Calls the cudnnBackendCreateDescriptor. Allocates memory according to the type.
      */
-    OpaqueBackendPointer(cudnnBackendDescriptorType_t type) {
-        status = cudnn_frontend::create_descriptor(type, &m_desc);
-    }
+    OpaqueBackendPointer(cudnnBackendDescriptorType_t type) { status = detail::create_descriptor(type, &m_desc); }
     /**
      * OpaqueBackendPointer destructor.
      * Calls the cudnnBackendDestroyDescriptor. Frees memory allocated in the constructor.
      */
-    ~OpaqueBackendPointer() { cudnn_frontend::destroy_descriptor(m_desc); };
+    ~OpaqueBackendPointer() { detail::destroy_descriptor(m_desc); };
     /**
      * Accessor.
      * Returns the const reference to raw underlying descriptor.

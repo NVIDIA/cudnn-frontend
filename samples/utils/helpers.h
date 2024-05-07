@@ -296,29 +296,22 @@ class SurfaceManager {
 
 template <typename T_ELEM>
 struct Surface {
-    T_ELEM* devPtr     = NULL;
-    T_ELEM* hostPtr    = NULL;
-    T_ELEM* hostRefPtr = NULL;
-    int64_t n_elems    = 0;
+    T_ELEM* devPtr  = NULL;
+    T_ELEM* hostPtr = NULL;
+    int64_t n_elems = 0;
 
-    explicit Surface(int64_t n_elems, bool hasRef) : n_elems(n_elems) {
+    explicit Surface(int64_t n_elems, [[maybe_unused]] bool hasRef) : n_elems(n_elems) {
         checkCudaErr(cudaMalloc((void**)&(devPtr), (size_t)((n_elems) * sizeof(devPtr[0]))));
         hostPtr = (T_ELEM*)calloc((size_t)n_elems, sizeof(hostPtr[0]));
-        if (hasRef) {
-            hostRefPtr = (T_ELEM*)calloc((size_t)n_elems, sizeof(hostRefPtr[0]));
-        }
         initImage(hostPtr, n_elems);
         checkCudaErr(cudaMemcpy(devPtr, hostPtr, size_t(sizeof(hostPtr[0]) * n_elems), cudaMemcpyHostToDevice));
         checkCudaErr(cudaDeviceSynchronize());
     }
 
-    explicit Surface(int64_t n_elems, bool hasRef, bool isInterleaved) {
+    explicit Surface(int64_t n_elems, [[maybe_unused]] bool hasRef, bool isInterleaved) {
         (void)isInterleaved;
         checkCudaErr(cudaMalloc((void**)&(devPtr), (n_elems) * sizeof(devPtr[0])));
         hostPtr = (T_ELEM*)calloc(n_elems, sizeof(hostPtr[0]));
-        if (hasRef) {
-            hostRefPtr = (T_ELEM*)calloc(n_elems, sizeof(hostRefPtr[0]));
-        }
         initImage(hostPtr, n_elems);
         uint32_t* temp = (uint32_t*)hostPtr;
         for (auto i = 0; i < n_elems; i = i + 2) {
@@ -329,12 +322,9 @@ struct Surface {
         checkCudaErr(cudaDeviceSynchronize());
     }
 
-    explicit Surface(int64_t size, bool hasRef, T_ELEM fillValue) : n_elems(size) {
+    explicit Surface(int64_t size, [[maybe_unused]] bool hasRef, T_ELEM fillValue) : n_elems(size) {
         checkCudaErr(cudaMalloc((void**)&(devPtr), (size) * sizeof(devPtr[0])));
         hostPtr = (T_ELEM*)calloc(size, sizeof(hostPtr[0]));
-        if (hasRef) {
-            hostRefPtr = (T_ELEM*)calloc(n_elems, sizeof(hostRefPtr[0]));
-        }
         for (int i = 0; i < size; i++) {
             hostPtr[i] = fillValue;
         }
@@ -350,10 +340,6 @@ struct Surface {
         if (hostPtr) {
             free(hostPtr);
             hostPtr = nullptr;
-        }
-        if (hostRefPtr) {
-            free(hostRefPtr);
-            hostRefPtr = nullptr;
         }
     }
 };

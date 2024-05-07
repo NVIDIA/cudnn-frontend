@@ -23,8 +23,8 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating pointwise node " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating pointwise node " << attributes.name << "..."
+                    << std::endl;
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             attributes.mode == PointwiseMode_t::NOT_SET, error_code_t::ATTRIBUTE_NOT_SET, "pointwise mode not set.");
@@ -85,8 +85,8 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building PointwiseNode operations " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Building PointwiseNode operations " << attributes.name << "..."
+                    << std::endl;
 
         auto pointwise_descriptor = cudnn_frontend::PointwiseDescBuilder()
                                         .setAxis(attributes.get_axis().value_or(-1))

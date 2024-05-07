@@ -30,18 +30,17 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating SDPAFP8Node " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating SDPAFP8Node " << attributes.name << "..." << std::endl;
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(cudnn_frontend::get_backend_version() < 90100,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90100,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "sdpa fp8 forward operation is only supported starting cudnn 9.1.0. Please "
                                        "consider upgrading your current version.");
 
         cudaDeviceProp prop;
         int device;
-        CHECK_CUDA_ERROR(cuda_get_device(&device));
-        CHECK_CUDA_ERROR(cuda_get_device_properties(&prop, device));
+        CHECK_CUDA_ERROR(detail::cuda_get_device(&device));
+        CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, device));
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             prop.major < 9,
             error_code_t::GRAPH_NOT_SUPPORTED,
@@ -87,6 +86,21 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
 #undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
 
         CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
+
+        int64_t d_qk = attributes.inputs.at(input_names::Q)->get_dim()[3];
+        int64_t d_v  = attributes.inputs.at(input_names::V)->get_dim()[3];
+
+        if (detail::get_backend_version() >= 90101) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                (d_qk > 256) || (d_qk % 8 != 0) || (d_v > 256) || (d_v % 8 != 0),
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "Num hidden_dim shoud be less than 256 and hidden_dim should be multiple of 8");
+        } else {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                (d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "Num hidden_dim shoud be less than 128 and hidden_dim should be multiple of 8");
+        }
         return {error_code_t::OK, ""};
     }
 

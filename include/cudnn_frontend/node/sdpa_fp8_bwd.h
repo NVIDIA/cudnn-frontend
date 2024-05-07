@@ -30,18 +30,18 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating SDPAFP8BackwardNode " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating SDPAFP8BackwardNode " << attributes.name << "..."
+                    << std::endl;
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(cudnn_frontend::get_backend_version() < 90100,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90100,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "sdpa fp8 backward operation is only supported starting cudnn 9.1.0. Please "
                                        "consider upgrading your current version.");
 
         cudaDeviceProp prop;
         int device;
-        CHECK_CUDA_ERROR(cuda_get_device(&device));
-        CHECK_CUDA_ERROR(cuda_get_device_properties(&prop, device));
+        CHECK_CUDA_ERROR(detail::cuda_get_device(&device));
+        CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, device));
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             prop.major < 9,
             error_code_t::GRAPH_NOT_SUPPORTED,

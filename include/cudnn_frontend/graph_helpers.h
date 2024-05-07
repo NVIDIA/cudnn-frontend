@@ -10,20 +10,22 @@
 
 namespace cudnn_frontend {
 
-enum class [[nodiscard]] error_code_t{OK,
-                                      ATTRIBUTE_NOT_SET,
-                                      SHAPE_DEDUCTION_FAILED,
-                                      INVALID_TENSOR_NAME,
-                                      INVALID_VARIANT_PACK,
-                                      GRAPH_NOT_SUPPORTED,
-                                      GRAPH_EXECUTION_PLAN_CREATION_FAILED,
-                                      GRAPH_EXECUTION_FAILED,
-                                      HEURISTIC_QUERY_FAILED,
-                                      UNSUPPORTED_GRAPH_FORMAT,
-                                      CUDA_API_FAILED,
-                                      CUDNN_BACKEND_API_FAILED,
-                                      INVALID_CUDA_DEVICE,
-                                      HANDLE_ERROR};
+enum class [[nodiscard]] error_code_t {
+    OK,
+    ATTRIBUTE_NOT_SET,
+    SHAPE_DEDUCTION_FAILED,
+    INVALID_TENSOR_NAME,
+    INVALID_VARIANT_PACK,
+    GRAPH_NOT_SUPPORTED,
+    GRAPH_EXECUTION_PLAN_CREATION_FAILED,
+    GRAPH_EXECUTION_FAILED,
+    HEURISTIC_QUERY_FAILED,
+    UNSUPPORTED_GRAPH_FORMAT,
+    CUDA_API_FAILED,
+    CUDNN_BACKEND_API_FAILED,
+    INVALID_CUDA_DEVICE,
+    HANDLE_ERROR
+};
 
 typedef struct [[nodiscard]] error_object {
     error_code_t code;
@@ -98,7 +100,10 @@ typedef struct [[nodiscard]] error_object {
     do {                                                                                                          \
         if (auto cudnn_retval = x; cudnn_retval != CUDNN_STATUS_SUCCESS) {                                        \
             std::stringstream error_msg;                                                                          \
-            error_msg << #x << " failed with " << cudnn_frontend::get_error_string(cudnn_retval);                 \
+            char last_error[1024];                                                                                \
+            detail::get_last_error_string(last_error, sizeof(last_error));                                        \
+            error_msg << #x << " failed with code: " << detail::get_error_string(cudnn_retval)                    \
+                      << ", and message: " << last_error;                                                         \
             getLogger() << "[cudnn_frontend] ERROR: " << error_msg.str() << " at " << __FILE__ << ":" << __LINE__ \
                         << std::endl;                                                                             \
             return {error_code_t::CUDNN_BACKEND_API_FAILED, error_msg.str()};                                     \
@@ -110,7 +115,7 @@ typedef struct [[nodiscard]] error_object {
     do {                                                                                                          \
         if (auto cuda_retval = x; cuda_retval != cudaSuccess) {                                                   \
             std::stringstream error_msg;                                                                          \
-            error_msg << #x << " failed with " << cuda_get_error_string(cuda_retval);                             \
+            error_msg << #x << " failed with " << detail::cuda_get_error_string(cuda_retval);                     \
             getLogger() << "[cudnn_frontend] ERROR: " << error_msg.str() << " at " << __FILE__ << ":" << __LINE__ \
                         << std::endl;                                                                             \
             return {error_code_t::CUDA_API_FAILED, error_msg.str()};                                              \
