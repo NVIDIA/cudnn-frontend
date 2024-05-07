@@ -14,8 +14,6 @@ if(NOT Catch2_FOUND)
     FetchContent_MakeAvailable(Catch2)
 endif()
 
-# Find cudnn
-include(${CMAKE_SOURCE_DIR}/cmake/cuDNN.cmake)
 
 add_executable(
     samples
@@ -78,8 +76,6 @@ target_link_libraries(
     cudnn_frontend
     _cudnn_frontend_pch
     Catch2::Catch2WithMain
-
-    CUDNN::cudnn_all
 )
 
 # cuDNN dlopen's its libraries

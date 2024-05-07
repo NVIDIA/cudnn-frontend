@@ -29,10 +29,12 @@ target_include_directories(
 
 # Find the cuda compiler
 find_package(CUDAToolkit)
+# Find cudnn
+include(${CMAKE_SOURCE_DIR}/cmake/cuDNN.cmake)
 
 target_link_libraries(
     cudnn_frontend INTERFACE
-
+    CUDNN::cudnn_all
     CUDA::cudart
     CUDA::nvrtc
 )
@@ -48,6 +50,7 @@ if (CUDNN_FRONTEND_BUILD_SAMPLES)
 endif()
 
 if (CUDNN_FRONTEND_BUILD_UNIT_TESTS)
+    enable_testing()
     add_subdirectory(test)
 endif()
 
@@ -64,4 +67,39 @@ include(GNUInstallDirs)
 install(
     DIRECTORY ${PROJECT_SOURCE_DIR}/include/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+# Export the target
+install(TARGETS cudnn_frontend EXPORT cudnn_frontendTargets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+# Create the cmake directory
+install(EXPORT cudnn_frontendTargets
+    FILE cudnn_frontendTargets.cmake
+    NAMESPACE cudnn_frontend::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cudnn_frontend
+)
+
+# Create the package configuration file
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/cudnn_frontend/cudnn_frontendConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY AnyNewerVersion
+)
+
+configure_package_config_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Config.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/cudnn_frontend/cudnn_frontendConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cudnn_frontend
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/cudnn_frontend/cudnn_frontendConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/cudnn_frontend/cudnn_frontendConfigVersion.cmake"
+    "${CMAKE_SOURCE_DIR}/cmake/cuDNN.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cudnn_frontend
 )
