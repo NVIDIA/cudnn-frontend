@@ -174,7 +174,7 @@ All the options mentioned in the forward operation, including ragged tensors and
 
 #### Tensors:
 
-All the tensor requirements described in the forward operation are applicable in the backward operation as well. The gradient tensors for query, key, value, output, and bias should have the same properites as their non-gradient counterparts.
+All the tensor requirements described in the forward operation are applicable in the backward operation as well. The gradient tensors for query, key, value, output, and bias should have the same properties as their non-gradient counterparts.
 
 #### Limitations:
 
@@ -568,7 +568,7 @@ Below we will go through the standard usage of the attention tensors and how the
 
   3. There are some special cases when all tokens are not valid and Q, K, V can be in special layouts
     Let Q tensor have two sequences (i.e batch = 2, number_of_heads = 1) with max_seq_len = 8 and actual_seq_len = [2, 3]
-    Conider two tokens "aa" & "bbb".
+    Consider two tokens "aa" & "bbb".
       - Fully padded layout
 
         aa000000

@@ -24,8 +24,7 @@ class DLNNode : public NodeCRTP<DLNNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating DLNNode " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating DLNNode " << attributes.name << "..." << std::endl;
 
         CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
 
@@ -38,7 +37,7 @@ class DLNNode : public NodeCRTP<DLNNode> {
                     << std::endl;
 
         // WAR as epsilon was required in previous versions
-        if (cudnn_frontend::get_backend_version() < 8906) {
+        if (detail::get_backend_version() < 8906) {
             attributes.inputs[Layernorm_backward_attributes::input_names::EPSILON] =
                 std::make_shared<Tensor_attributes>(0.0f);
         }
@@ -116,8 +115,8 @@ class DLNNode : public NodeCRTP<DLNNode> {
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building DLNNode operations " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Building DLNNode operations " << attributes.name << "..."
+                    << std::endl;
 
         // Create the DLN operation.
         auto&& DLN_op_builder = cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_BACKWARD_DESCRIPTOR);
@@ -147,7 +146,7 @@ class DLNNode : public NodeCRTP<DLNNode> {
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DX, Layernorm_backward_attributes::output_names::DX);
         DLN_op_builder.setdxDesc(*(tensors.at(DX->second->get_uid())));
 
-        if (cudnn_frontend::get_backend_version() < 8906) {
+        if (detail::get_backend_version() < 8906) {
             CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(EPSILON, Layernorm_backward_attributes::input_names::EPSILON);
             DLN_op_builder.setEpsilonTensor(*(tensors.at(EPSILON->second->get_uid())));
         }

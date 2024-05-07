@@ -34,10 +34,10 @@ class ICudnn {
     std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>> uid_to_tensors;
     std::vector<std::shared_ptr<cudnn_frontend::Operation>> operations;
 
-    std::vector<std::shared_ptr<OperationGraph_v8>> operation_graphs;
-    std::vector<std::unordered_set<uid_t>> variant_pack_uids;
+    std::shared_ptr<OperationGraph_v8> operation_graph;
+    std::unordered_set<graph::Tensor_attributes::uid_t> variant_pack_uids;
 
-    std::vector<graph::Execution_plan_list> plans;
+    graph::Execution_plan_list plans;
 
     // TODO: Always returns OK. Can the status and error message be accessed from tensor descriptor?
     error_t
@@ -95,7 +95,7 @@ class ICudnn {
     }
 
     error_t
-    create_cudnn_operation_graphs(cudnnHandle_t handle) {
+    create_cudnn_operation_graph(cudnnHandle_t handle) {
         std::vector<Operation const*> cudnn_operations;
         for (std::shared_ptr<cudnn_frontend::Operation> operation : operations) {
             cudnn_operations.push_back(operation.get());
@@ -112,13 +112,13 @@ class ICudnn {
         RETURN_CUDNN_FRONTEND_ERROR_IF(cudnn_operation_graph.get_status() != CUDNN_STATUS_SUCCESS,
                                        error_code_t::CUDNN_BACKEND_API_FAILED,
                                        cudnn_operation_graph.get_error());
-        operation_graphs.push_back(std::make_shared<OperationGraph_v8>(std::move(cudnn_operation_graph)));
+        operation_graph = std::make_shared<OperationGraph_v8>(std::move(cudnn_operation_graph));
 #else
         // build() can throw
         // wrap in try catch
         try {
             auto cudnn_operation_graph = cudnn_operation_graph_builder.build();
-            operation_graphs.push_back(std::make_shared<OperationGraph_v8>(std::move(cudnn_operation_graph)));
+            operation_graph            = std::make_shared<OperationGraph_v8>(std::move(cudnn_operation_graph));
         } catch (cudnn_frontend::cudnnException& e) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
@@ -130,65 +130,57 @@ class ICudnn {
    public:
     error_t
     get_cudnn_workspace_size_node(int64_t const plan_index, int64_t& cudnn_workspace_size) const {
-        for (auto const& execution_plan_list : plans) {
-            int64_t candidate = plan_index != -1 ? plan_index : execution_plan_list.candidate;
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                (candidate < 0) && (static_cast<int64_t>(execution_plan_list.execution_plans.size()) <= candidate),
-                error_code_t::GRAPH_EXECUTION_FAILED,
-                "Plan index is invalid.");
+        int64_t candidate = plan_index != -1 ? plan_index : plans.candidate;
 
-            RETURN_CUDNN_FRONTEND_ERROR_IF(!(execution_plan_list.execution_plans[candidate]),
-                                           error_code_t::GRAPH_EXECUTION_FAILED,
-                                           "No candidate plan found for graph to query worksapce for.");
-            cudnn_workspace_size =
-                std::max(cudnn_workspace_size, execution_plan_list.execution_plans[candidate]->getWorkspaceSize());
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            (candidate < 0) && (static_cast<int64_t>(plans.execution_plans.size()) <= candidate),
+            error_code_t::GRAPH_EXECUTION_FAILED,
+            "Plan index is invalid.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!(plans.execution_plans[candidate]),
+                                       error_code_t::GRAPH_EXECUTION_FAILED,
+                                       "No candidate plan found for graph to query worksapce for.");
+        cudnn_workspace_size = std::max(cudnn_workspace_size, plans.execution_plans[candidate]->getWorkspaceSize());
+
         return {error_code_t::OK, ""};
     }
 
     int64_t
     get_max_cudnn_workspace_size_node() const {
-        int64_t current_workspace_size = 0;
-        for (auto const& execution_plan_list : plans) {
-            current_workspace_size = std::max(current_workspace_size, execution_plan_list.get_autotune_workspace());
-        }
-        return current_workspace_size;
+        return plans.get_autotune_workspace();
     }
 
     error_t
-    execute_cudnn_plans_with_uid(cudnnHandle_t handle,
-                                 std::unordered_map<int64_t, void*> const& tensor_uid_to_pointer_map,
-                                 void* workspace_ptr,
-                                 int64_t plan_index = -1) const {
-        getLogger() << "[cudnn_frontend] INFO: Executing " << plans.size() << " plans." << std::endl;
-
-        // Go over each plan list
-        for (size_t i = 0; i < plans.size(); ++i) {
-            // Make sure device pointer is provided for all uids expected for this plan
-            std::vector<void*> device_ptrs;
-            std::vector<uid_t> uids;
-            for (auto const& uid : variant_pack_uids[i]) {
-                auto search = tensor_uid_to_pointer_map.find(uid);
-                RETURN_CUDNN_FRONTEND_ERROR_IF(search == tensor_uid_to_pointer_map.end(),
-                                               error_code_t::INVALID_VARIANT_PACK,
-                                               "Uid " + std::to_string(uid) + " does not exist in variant pack.");
-                device_ptrs.push_back(tensor_uid_to_pointer_map.at(uid));
-                uids.push_back(uid);
-            }
-
-            int64_t candidate = plan_index != -1 ? plan_index : plans[i].candidate;
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                (candidate < 0) && (static_cast<int64_t>(plans[i].execution_plans.size()) <= candidate),
-                error_code_t::GRAPH_EXECUTION_FAILED,
-                "Plan index is invalid.");
-
-            RETURN_CUDNN_FRONTEND_ERROR_IF(!(plans[i].execution_plans[candidate]),
-                                           error_code_t::GRAPH_EXECUTION_FAILED,
-                                           "Plan index does not correspond to a valid plan.");
-
-            CHECK_CUDNN_FRONTEND_ERROR(
-                detail::execute(handle, plans[i].execution_plans[candidate].get(), device_ptrs, uids, workspace_ptr));
+    execute_cudnn_plan_with_uid(cudnnHandle_t handle,
+                                std::unordered_map<int64_t, void*> const& tensor_uid_to_pointer_map,
+                                void* workspace_ptr,
+                                int64_t plan_index = -1) const {
+        // Make sure device pointer is provided for all uids expected for this plan
+        std::vector<void*> device_ptrs;
+        std::vector<uid_t> uids;
+        for (auto const& uid : variant_pack_uids) {
+            auto search = tensor_uid_to_pointer_map.find(uid);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(search == tensor_uid_to_pointer_map.end(),
+                                           error_code_t::INVALID_VARIANT_PACK,
+                                           "Uid " + std::to_string(uid) + " does not exist in variant pack.");
+            device_ptrs.push_back(tensor_uid_to_pointer_map.at(uid));
+            uids.push_back(uid);
         }
+
+        int64_t candidate = plan_index != -1 ? plan_index : plans.candidate;
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            (candidate < 0) && (static_cast<int64_t>(plans.execution_plans.size()) <= candidate),
+            error_code_t::GRAPH_EXECUTION_FAILED,
+            "Plan index is invalid.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!(plans.execution_plans[candidate]),
+                                       error_code_t::GRAPH_EXECUTION_FAILED,
+                                       "Plan index does not correspond to a valid plan.");
+
+        getLogger() << "[cudnn_frontend] INFO: Executing plan at index " << candidate << "." << std::endl;
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            detail::execute(handle, plans.execution_plans[candidate].get(), device_ptrs, uids, workspace_ptr));
 
         return {error_code_t::OK, ""};
     }

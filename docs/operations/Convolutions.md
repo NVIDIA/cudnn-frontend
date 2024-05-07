@@ -15,7 +15,7 @@ std::shared_ptr<Tensor_attributes> conv_fprop(std::shared_ptr<Tensor_attributes>
                                                   Conv_fprop_attributes);
 ```
 
-Conv_fprop attributes is a lighweight structure with setters:  
+Conv_fprop attributes is a lightweight structure with setters:  
 ```
 Conv_fprop_attributes&
 set_padding(std::vector<int64_t>)
@@ -53,7 +53,7 @@ std::shared_ptr<Tensor_attributes> conv_dgrad(std::shared_ptr<Tensor_attributes>
                                                   Conv_dgrad_attributes);
 ```
 
-Conv_dgrad attributes is a lighweight structure with setters:  
+Conv_dgrad attributes is a lightweight structure with setters:  
 ```
 Conv_dgrad_attributes&
 set_padding(std::vector<int64_t>)
@@ -91,7 +91,7 @@ std::shared_ptr<Tensor_attributes> conv_wgrad(std::shared_ptr<Tensor_attributes>
                                                   Conv_wgrad_attributes);
 ```
 
-Conv_wgrad attributes is a lighweight structure with setters:  
+Conv_wgrad attributes is a lightweight structure with setters:  
 ```
 Conv_wgrad_attributes&
 set_padding(std::vector<int64_t>)

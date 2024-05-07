@@ -31,10 +31,12 @@
 
 namespace cudnn_frontend {
 
-#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
-
 // cudnn package initialization set this global handle
 extern void *cudnn_dlhandle;
+
+namespace detail {
+
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
 
 inline void *
 get_symbol(const char *function_name) {
@@ -63,7 +65,7 @@ get_cuda_symbol(const char *function_name) {
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
 #define NV_CUDNN_FE_DYNAMIC_CHECK_BACKEND_DESCRIPTOR(MINIMUM_VERSION, DESCRIPTOR, MESSAGE) \
-    if (MINIMUM_VERSION > get_backend_version()) {                                         \
+    if (MINIMUM_VERSION > detail::get_backend_version()) {                                 \
         set_error_and_throw_exception(&DESCRIPTOR, CUDNN_STATUS_INVALID_VALUE, MESSAGE);   \
         return std::move(DESCRIPTOR);                                                      \
     }
@@ -73,7 +75,7 @@ get_cuda_symbol(const char *function_name) {
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
 #define NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(MINIMUM_VERSION, STATUS) \
-    if (MINIMUM_VERSION > get_backend_version()) {                               \
+    if (MINIMUM_VERSION > detail::get_backend_version()) {                       \
         return STATUS;                                                           \
     }
 #else
@@ -188,8 +190,6 @@ get_backend_version(void) {
 #endif
 }
 
-namespace detail {
-
 inline std::string
 convert_version_to_str(size_t const version) {
     // The multiplier for major version pre-v9 and post-v9 are different.
@@ -203,11 +203,10 @@ convert_version_to_str(size_t const version) {
 
     return std::to_string(major) + "." + std::to_string(minor) + "." + std::to_string(patch);
 }
-}  // namespace detail
 
 inline std::string
 get_backend_version_string() {
-    return detail::convert_version_to_str(get_backend_version());
+    return convert_version_to_str(get_backend_version());
 }
 
 inline cudnnStatus_t
@@ -267,6 +266,17 @@ get_error_string(cudnnStatus_t status) {
     NV_FE_CALL_TO_BACKEND(get_error_string, cudnnGetErrorString, status);
 }
 
+inline void
+get_last_error_string(char *message, size_t size) {
+#if CUDNN_VERSION >= 90000
+    NV_FE_CALL_TO_BACKEND(get_last_error_string, cudnnGetLastErrorString, message, size);
+#else
+    std::string default_message = "Can't retrieve backend error messages for CUDNN version < 9.0";
+    strncpy(message, default_message.c_str(), size - 1);
+    message[size - 1] = '\0';  // Ensure null terminator at the end of the string
+#endif
+}
+
 inline cudnnStatus_t
 set_stream(cudnnHandle_t handle, cudaStream_t stream) {
     NV_FE_CALL_TO_BACKEND(set_stream, cudnnSetStream, handle, stream);
@@ -316,4 +326,6 @@ inline cudnnStatus_t
 destroy_filter(cudnnFilterDescriptor_t filter) {
     NV_FE_CALL_TO_BACKEND(destroy_filter, cudnnDestroyFilterDescriptor, filter);
 }
+
+}  // namespace detail
 }  // namespace cudnn_frontend

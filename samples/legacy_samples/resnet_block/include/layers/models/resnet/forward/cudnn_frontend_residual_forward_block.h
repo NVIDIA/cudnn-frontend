@@ -36,8 +36,7 @@ class ResidualForwardBlock : public IBlock {
     ResidualForwardBlock(cudnnHandle_t &handle, ResidualBlockParams const &params)
         : IBlock(IBlock::FORWARD), params_(params) {
         (void)handle;
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Creating ResidualForwardBlock" << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Creating ResidualForwardBlock" << std::endl;
         // Set the block name to be used for debugging
         blockName = "Residual Forward Block";
 
@@ -59,8 +58,7 @@ class ResidualForwardBlock : public IBlock {
     createVariantPacks(ResidualBlockDevPtrStore *devPtrStore) override {
         // Set the internal dev ptr store to the passed in dev ptr store by the user to be used by execute
 
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Creating variant packs for convs" << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Creating variant packs for convs" << std::endl;
 
         // Loops through all the convolution + gen stats + BN Finalize params and creates a variant pack for each of
         // them.
@@ -103,8 +101,7 @@ class ResidualForwardBlock : public IBlock {
             updateVariantPackforPlan("conv_descale_descale_scale_amax" + std::to_string(i), convVariantPack);
         }
 
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Creating variant packs for BNs" << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Creating variant packs for BNs" << std::endl;
         for (int i = ResidualBlockParams::ForwardLocation::ZERO; i < ResidualBlockParams::ForwardLocation::COUNT; i++) {
             if (params_.skip_residual_convolution(i)) {
                 continue;
@@ -261,8 +258,7 @@ class ResidualForwardBlock : public IBlock {
 
     cudnnStatus_t
     createTensors() {
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Creating Tensors for Residual Forward Block!" << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Creating Tensors for Residual Forward Block!" << std::endl;
 
         status_ = createConvTensors();
         if (status_ != CUDNN_STATUS_SUCCESS) {
@@ -281,15 +277,13 @@ class ResidualForwardBlock : public IBlock {
     cudnnStatus_t
     createConvTensors() {
         auto status = CUDNN_STATUS_SUCCESS;
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Creating Conv Tensors for Residual Forward Block!" << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Creating Conv Tensors for Residual Forward Block!" << std::endl;
         for (int i = ResidualBlockParams::ForwardLocation::ZERO; i < ResidualBlockParams::ForwardLocation::COUNT; i++) {
             if (params_.skip_residual_convolution(i)) {
                 continue;
             }
 
-            getLogger() << "[cudnn_frontend] "
-                        << "INFO: Input Residual Forward Block " << i << std::endl;
+            getLogger() << "[cudnn_frontend] " << "INFO: Input Residual Forward Block " << i << std::endl;
             auto &tensor_params = params_.conv_params[i];
             generateStrides(
                 tensor_params.input_dim, tensor_params.input_stride, tensor_params.dim_count, CUDNN_TENSOR_NHWC);
@@ -302,8 +296,7 @@ class ResidualForwardBlock : public IBlock {
                              .setVirtual(false)
                              .setByValue(false)
                              .build();
-            getLogger() << "[cudnn_frontend] "
-                        << "INFO: Weight Residual Forward Block " << i << std::endl;
+            getLogger() << "[cudnn_frontend] " << "INFO: Weight Residual Forward Block " << i << std::endl;
 
             generateStrides(
                 tensor_params.weight_dim, tensor_params.weight_stride, tensor_params.dim_count, CUDNN_TENSOR_NHWC);
@@ -316,8 +309,7 @@ class ResidualForwardBlock : public IBlock {
                               .setVirtual(false)
                               .setByValue(false)
                               .build();
-            getLogger() << "[cudnn_frontend] "
-                        << "INFO: afterConv Residual Forward Block " << i << std::endl;
+            getLogger() << "[cudnn_frontend] " << "INFO: afterConv Residual Forward Block " << i << std::endl;
             generateStrides(
                 tensor_params.output_dim, tensor_params.output_stride, tensor_params.dim_count, CUDNN_TENSOR_NHWC);
             auto afterConv = TensorBuilder()
@@ -329,8 +321,7 @@ class ResidualForwardBlock : public IBlock {
                                  .setVirtual(true)
                                  .setByValue(false)
                                  .build();
-            getLogger() << "[cudnn_frontend] "
-                        << "INFO: Amax Residual Forward Block " << i << std::endl;
+            getLogger() << "[cudnn_frontend] " << "INFO: Amax Residual Forward Block " << i << std::endl;
             auto tensor_amax = TensorBuilder()
                                    .setDim(amax_dim_stride.size(), amax_dim_stride.data())
                                    .setStrides(amax_dim_stride.size(), amax_dim_stride.data())
@@ -340,8 +331,7 @@ class ResidualForwardBlock : public IBlock {
                                    .setVirtual(false)
                                    .setByValue(false)
                                    .build();
-            getLogger() << "[cudnn_frontend] "
-                        << "INFO: Input Descale Forward Block " << i << std::endl;
+            getLogger() << "[cudnn_frontend] " << "INFO: Input Descale Forward Block " << i << std::endl;
             auto tensor_x_descale = TensorBuilder()
                                         .setDim(amax_dim_stride.size(), amax_dim_stride.data())
                                         .setStrides(amax_dim_stride.size(), amax_dim_stride.data())
@@ -351,8 +341,7 @@ class ResidualForwardBlock : public IBlock {
                                         .setVirtual(false)
                                         .setByValue(false)
                                         .build();
-            getLogger() << "[cudnn_frontend] "
-                        << "INFO: Weight Descale Forward Block " << i << std::endl;
+            getLogger() << "[cudnn_frontend] " << "INFO: Weight Descale Forward Block " << i << std::endl;
             auto tensor_w_descale = TensorBuilder()
                                         .setDim(amax_dim_stride.size(), amax_dim_stride.data())
                                         .setStrides(amax_dim_stride.size(), amax_dim_stride.data())
@@ -362,8 +351,7 @@ class ResidualForwardBlock : public IBlock {
                                         .setVirtual(false)
                                         .setByValue(false)
                                         .build();
-            getLogger() << "[cudnn_frontend] "
-                        << "INFO: Weight Descale Forward Block " << i << std::endl;
+            getLogger() << "[cudnn_frontend] " << "INFO: Weight Descale Forward Block " << i << std::endl;
             auto tensor_y_scale = TensorBuilder()
                                       .setDim(amax_dim_stride.size(), amax_dim_stride.data())
                                       .setStrides(amax_dim_stride.size(), amax_dim_stride.data())
@@ -373,8 +361,8 @@ class ResidualForwardBlock : public IBlock {
                                       .setVirtual(false)
                                       .setByValue(false)
                                       .build();
-            getLogger() << "[cudnn_frontend] "
-                        << "INFO: AFTER_INPUT_DESCALE_UID Residual Forward Block " << i << std::endl;
+            getLogger() << "[cudnn_frontend] " << "INFO: AFTER_INPUT_DESCALE_UID Residual Forward Block " << i
+                        << std::endl;
             auto afterxDescale = TensorBuilder()
                                      .setDim(tensor_params.dim_count, tensor_params.output_dim)
                                      .setStrides(tensor_params.dim_count, tensor_params.output_stride)
@@ -384,8 +372,8 @@ class ResidualForwardBlock : public IBlock {
                                      .setVirtual(true)
                                      .setByValue(false)
                                      .build();
-            getLogger() << "[cudnn_frontend] "
-                        << "INFO: AFTER_WEIGHT_DESCALE_UID Residual Forward Block " << i << std::endl;
+            getLogger() << "[cudnn_frontend] " << "INFO: AFTER_WEIGHT_DESCALE_UID Residual Forward Block " << i
+                        << std::endl;
             auto afterwDescale = TensorBuilder()
                                      .setDim(tensor_params.dim_count, tensor_params.output_dim)
                                      .setStrides(tensor_params.dim_count, tensor_params.output_stride)
@@ -395,8 +383,7 @@ class ResidualForwardBlock : public IBlock {
                                      .setVirtual(true)
                                      .setByValue(false)
                                      .build();
-            getLogger() << "[cudnn_frontend] "
-                        << "INFO: Output Residual Forward Block " << i << std::endl;
+            getLogger() << "[cudnn_frontend] " << "INFO: Output Residual Forward Block " << i << std::endl;
             auto output = TensorBuilder()
                               .setDim(tensor_params.dim_count, tensor_params.output_dim)
                               .setStrides(tensor_params.dim_count, tensor_params.output_stride)
@@ -424,15 +411,14 @@ class ResidualForwardBlock : public IBlock {
     cudnnStatus_t
     createBNFusionTensors() {
         auto status = CUDNN_STATUS_SUCCESS;
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Creating BN Fusion Tensors for Residual Forward Block!" << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Creating BN Fusion Tensors for Residual Forward Block!"
+                    << std::endl;
         for (int i = ResidualBlockParams::ForwardLocation::ZERO; i < ResidualBlockParams::ForwardLocation::COUNT; i++) {
             if (params_.skip_residual_convolution(i)) {
                 continue;
             }
 
-            getLogger() << "[cudnn_frontend] "
-                        << "INFO: Input Residual Forward Block " << i << std::endl;
+            getLogger() << "[cudnn_frontend] " << "INFO: Input Residual Forward Block " << i << std::endl;
             auto &tensor_params = params_.bn_params[i];
             generateStrides(
                 tensor_params.input_dim, tensor_params.input_strides, tensor_params.dim_count, CUDNN_TENSOR_NHWC);
@@ -568,8 +554,7 @@ class ResidualForwardBlock : public IBlock {
                       std::make_shared<Tensor>(std::move(savedInvVarTensor)));
 
             if (tensor_params.has_relu) {
-                getLogger() << "[cudnn_frontend] "
-                            << "INFO: Input Residual Forward Block After Relu" << i << std::endl;
+                getLogger() << "[cudnn_frontend] " << "INFO: Input Residual Forward Block After Relu" << i << std::endl;
                 auto afterRelu = TensorBuilder()
                                      .setDim(tensor_params.dim_count, tensor_params.input_dim)
                                      .setStrides(tensor_params.dim_count, tensor_params.input_strides)
@@ -583,8 +568,8 @@ class ResidualForwardBlock : public IBlock {
             }
 
             if (tensor_params.has_add_relu) {
-                getLogger() << "[cudnn_frontend] "
-                            << "INFO: Input Residual Forward Block BN-ADD-Relu" << i << std::endl;
+                getLogger() << "[cudnn_frontend] " << "INFO: Input Residual Forward Block BN-ADD-Relu" << i
+                            << std::endl;
                 auto add_input = TensorBuilder()
                                      .setDim(tensor_params.dim_count, tensor_params.input_dim)
                                      .setStrides(tensor_params.dim_count, tensor_params.input_strides)
@@ -693,8 +678,7 @@ class ResidualForwardBlock : public IBlock {
      */
     void
     createSubGraphs() {
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Creating sub graph" << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Creating sub graph" << std::endl;
         for (int i = ResidualBlockParams::ForwardLocation::ZERO; i < ResidualBlockParams::ForwardLocation::COUNT; i++) {
             if (params_.skip_residual_convolution(i)) {
                 continue;
@@ -871,23 +855,21 @@ class ResidualForwardBlock : public IBlock {
                          compute_tensor_size(tensor_map["BN::X_" + std::to_string(i)]->getDim(), 4));
         }
 
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Intermidiate tensors require " << intermediate_tensor_workspace_size << " bytes."
-                    << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Intermidiate tensors require "
+                    << intermediate_tensor_workspace_size << " bytes." << std::endl;
     }
 
     cudnnStatus_t
     buildOpGraph(cudnnHandle_t &handle, SubGraph const &sub_graph, const std::string &graph_name) override {
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Building Operation Graph for Residual Forward Block." << graph_name << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Building Operation Graph for Residual Forward Block." << graph_name
+                    << std::endl;
 
         // Instantiate a vector of operations for the OperationGraphBuilder,
         std::vector<Operation> ops;
 
         // We loop through all the nodes in the subgraph
         for (auto &node : sub_graph) {
-            getLogger() << "[cudnn_frontend] "
-                        << "INFO: Creating Operation for node: " << node.op_name << std::endl;
+            getLogger() << "[cudnn_frontend] " << "INFO: Creating Operation for node: " << node.op_name << std::endl;
 
             // The way the subgraph is constructed, the edges represent connectivity with respect to tensors.
             // In this case, a convolution node edge list represents the connectivity between
@@ -950,8 +932,7 @@ class ResidualForwardBlock : public IBlock {
                         throw cudnnException(error_message.c_str(), e.getCudnnStatus());
                     }
 #endif
-                    getLogger() << "[cudnn_frontend] "
-                                << "INFO: Built Convolution " << node.op_name << std::endl;
+                    getLogger() << "[cudnn_frontend] " << "INFO: Built Convolution " << node.op_name << std::endl;
                 } break;
 
                 // A pointwise descriptor can be a scale, a bias, or an activation (ReLu) operation.
@@ -1021,8 +1002,7 @@ class ResidualForwardBlock : public IBlock {
                         throw cudnnException(error_message.c_str(), e.getCudnnStatus());
                     }
 #endif
-                    getLogger() << "[cudnn_frontend] "
-                                << "INFO: Built Pointwise " << node.op_name << std::endl;
+                    getLogger() << "[cudnn_frontend] " << "INFO: Built Pointwise " << node.op_name << std::endl;
                 } break;
 
                 // A reduction descriptor can be a scale, a bias, or an activation (ReLu) operation.
@@ -1067,8 +1047,7 @@ class ResidualForwardBlock : public IBlock {
                         throw cudnnException(error_message.c_str(), e.getCudnnStatus());
                     }
 #endif
-                    getLogger() << "[cudnn_frontend] "
-                                << "INFO: Built Reduction " << node.op_name << std::endl;
+                    getLogger() << "[cudnn_frontend] " << "INFO: Built Reduction " << node.op_name << std::endl;
                 } break;
 
                 case cudnnBackendDescriptorType_t::CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR: {
@@ -1113,8 +1092,8 @@ class ResidualForwardBlock : public IBlock {
 #endif
                 } break;
                 default:
-                    getLogger() << "[cudnn_frontend] "
-                                << "WARN: Unhandled Node type for node: " << node.op_name << std::endl;
+                    getLogger() << "[cudnn_frontend] " << "WARN: Unhandled Node type for node: " << node.op_name
+                                << std::endl;
                     break;
             }
         }
@@ -1132,8 +1111,7 @@ class ResidualForwardBlock : public IBlock {
             // Add the op graph to the vector of operation graphs
             op_graphs.emplace(graph_name, std::move(opGraph));
 
-            getLogger() << "[cudnn_frontend] "
-                        << "Done building Operation Graph!" << std::endl;
+            getLogger() << "[cudnn_frontend] " << "Done building Operation Graph!" << std::endl;
 
             return CUDNN_STATUS_SUCCESS;
 

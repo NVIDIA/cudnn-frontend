@@ -124,8 +124,8 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating LayerNormNode " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating LayerNormNode " << attributes.name << "..."
+                    << std::endl;
 
         // Norm forward phase should be set
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.forward_phase == NormFwdPhase_t::NOT_SET,
@@ -151,8 +151,8 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building LayerNormNode operations " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Building LayerNormNode operations " << attributes.name << "..."
+                    << std::endl;
 
         auto&& layernorm_operation_builder =
             cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_FORWARD_DESCRIPTOR);

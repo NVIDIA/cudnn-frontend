@@ -257,9 +257,7 @@ class Graph : public INode {
 
     error_t
     check_support(cudnnHandle_t h) {
-        for (auto &plan_list : plans) {
-            CHECK_CUDNN_FRONTEND_ERROR(plan_list.check_support(h));
-        }
+        CHECK_CUDNN_FRONTEND_ERROR(plans.check_support(h));
         return {error_code_t::OK, ""};
     }
 
@@ -273,60 +271,48 @@ class Graph : public INode {
 
     Graph &
     deselect_workspace_greater_than(int64_t const workspace) {
-        for (auto &plan_list : plans) {
-            plan_list.set_max_workspace_allowed(workspace);
-        }
+        plans.set_max_workspace_allowed(workspace);
         return *this;
     }
 
     Graph &
     deselect_engines(std::vector<std::string> const &engine_names) {
-        for (auto &plan_list : plans) {
-            plan_list.set_barred_names(engine_names);
-        }
+        plans.set_barred_names(engine_names);
         return *this;
     }
 
     Graph &
     select_behavior_notes(std::vector<BehaviorNote_t> const &notes) {
-        for (auto &plan_list : plans) {
-            auto status = plan_list.filter_behavior_notes(notes, true);
-            if (status.is_bad()) {
-                getLogger() << status.get_message() << std::endl;
-            }
+        auto status = plans.filter_behavior_notes(notes, true);
+        if (status.is_bad()) {
+            getLogger() << status.get_message() << std::endl;
         }
         return *this;
     }
 
     Graph &
     select_numeric_notes(std::vector<NumericalNote_t> const &notes) {
-        for (auto &plan_list : plans) {
-            auto status = plan_list.filter_numeric_notes(notes, true);
-            if (status.is_bad()) {
-                getLogger() << status.get_message() << std::endl;
-            }
+        auto status = plans.filter_numeric_notes(notes, true);
+        if (status.is_bad()) {
+            getLogger() << status.get_message() << std::endl;
         }
         return *this;
     }
 
     Graph &
     deselect_behavior_notes(std::vector<BehaviorNote_t> const &notes) {
-        for (auto &plan_list : plans) {
-            auto status = plan_list.filter_behavior_notes(notes, false);
-            if (status.is_bad()) {
-                getLogger() << status.get_message() << std::endl;
-            }
+        auto status = plans.filter_behavior_notes(notes, false);
+        if (status.is_bad()) {
+            getLogger() << status.get_message() << std::endl;
         }
         return *this;
     }
 
     Graph &
     deselect_numeric_notes(std::vector<NumericalNote_t> const &notes) {
-        for (auto &plan_list : plans) {
-            auto status = plan_list.filter_numeric_notes(notes, false);
-            if (status.is_bad()) {
-                getLogger() << status.get_message() << std::endl;
-            }
+        auto status = plans.filter_numeric_notes(notes, false);
+        if (status.is_bad()) {
+            getLogger() << status.get_message() << std::endl;
         }
         return *this;
     }
@@ -392,48 +378,34 @@ class Graph : public INode {
 
 inline int64_t
 Graph::get_execution_plan_count() const {
-    int64_t plan_count = 0;
-    for (auto &plan_list : plans) {
-        plan_count += plan_list.execution_plans.size();
-    }
-    return plan_count;
+    return plans.execution_plans.size();
 }
 
 inline error_t
 Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
-    std::unordered_map<std::string, EngineConfigList> op_graph_to_configs;
-    CHECK_CUDNN_FRONTEND_ERROR(detail::query_heuristics(operation_graphs, op_graph_to_configs, mode));
+    EngineConfigList op_graph_to_configs;
+    CHECK_CUDNN_FRONTEND_ERROR(detail::query_heuristics(operation_graph, op_graph_to_configs, mode));
 
     getLogger() << "[cudnn_frontend] INFO: Extracting engine configs." << std::endl;
 
-    for (auto const &op : op_graph_to_configs) {
-        Execution_plan_list plan_list;
+    plans.set_tag(operation_graph->getTag());
+    plans.set_engine_configs(op_graph_to_configs);
 
-        plan_list.set_tag(op.first);
-        plan_list.set_engine_configs(op.second);
-
-        getLogger() << "[cudnn_frontend] INFO: Querying engine config properties\n";
-        CHECK_CUDNN_FRONTEND_ERROR(plan_list.query_properties());
-
-        plans.emplace_back(std::move(plan_list));
-    }
+    getLogger() << "[cudnn_frontend] INFO: Querying engine config properties\n";
+    CHECK_CUDNN_FRONTEND_ERROR(plans.query_properties());
 
     return {error_code_t::OK, ""};
 }
 
 inline error_t
 Graph::build_plan_at_index(cudnnHandle_t const &handle, int64_t plan_index) {
-    for (auto i = 0u; i < plans.size(); i++) {
-        CHECK_CUDNN_FRONTEND_ERROR(plans[i].build_plan_at_index(handle, plan_index));
-    }
+    CHECK_CUDNN_FRONTEND_ERROR(plans.build_plan_at_index(handle, plan_index));
     return {error_code_t::OK, ""};
 }
 
 inline error_t
 Graph::build_plans(cudnnHandle_t const &handle, BuildPlanPolicy_t const policy, bool const do_multithreaded_builds) {
-    for (auto &plan_list : plans) {
-        CHECK_CUDNN_FRONTEND_ERROR(plan_list.build_plans(handle, policy, do_multithreaded_builds));
-    }
+    CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, policy, do_multithreaded_builds));
     return {error_code_t::OK, ""};
 }
 

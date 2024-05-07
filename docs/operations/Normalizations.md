@@ -23,11 +23,11 @@ The API to achieve above equations is:
 std::array<std::shared_ptr<Tensor_attributes>, 5> batchnorm(std::shared_ptr<Tensor_attributes>& input,
                                                             std::shared_ptr<Tensor_attributes>& scale,
                                                             std::shared_ptr<Tensor_attributes>& bias,
-                                                            Batchnorm_attributes attribues); 
+                                                            Batchnorm_attributes attributes); 
 ```
 where the output array has tensors in order of: `[output, saved_mean, saved_invariance, next_running_mean, next_running_variance]`
 
-Batchnorm attributes is a lighweight structure with setters for providing optoinal input tensors and other operation attributes:  
+Batchnorm attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:  
 ```
 Batchnorm_attributes&
 set_previous_running_stats(std::shared_ptr<Tensor_attributes>& previous_running_mean,
@@ -69,7 +69,7 @@ Python API:
 with outputs as `[EQ_SCALE, EQ_BIAS, MEAN, INV_VARIANCE, NEXT_RUNNING_MEAN, NEXT_RUNNING_VAR]`
 
 ### Batchnorm Backward(DBN)
-DBN operation computes data graident, scale gradient, bias gradient during backpropagation of batchnorm forward operation.
+DBN operation computes data gradient, scale gradient, bias gradient during backpropagation of batchnorm forward operation.
 
 The API to achieve above is:  
 ```
@@ -80,7 +80,7 @@ std::array<std::shared_ptr<Tensor_attributes>, 3> batchnorm_backward(std::shared
 ```
 where the output array has tensors in order of: `[input gradient, scale gradient, bias gradient]`.
 
-DBN attributes is a lighweight structure with setters:  
+DBN attributes is a lightweight structure with setters:  
 ```
 Batchnorm_backward_attributes&
 set_saved_mean_and_inv_variance(std::shared_ptr<Tensor_attributes> saved_mean,
@@ -107,7 +107,7 @@ cudnn_frontend::graph::genstats(std::shared_ptr<Tensor_attributes>, Genstats_att
 ```
 where the output array has tensors in order of: `[sum, square_sum]`
 
-Genstats attributes is a lighweight structure with setters:  
+Genstats attributes is a lightweight structure with setters:  
 ```
 Genstats_attributes&
 set_name(std::string const&)
@@ -136,11 +136,11 @@ The API to achieve above equations is:
 std::array<std::shared_ptr<Tensor_attributes>, 3> layernorm(std::shared_ptr<Tensor_attributes>& input,
                                                             std::shared_ptr<Tensor_attributes>& scale,
                                                             std::shared_ptr<Tensor_attributes>& bias,
-                                                            Layernorm_attributes attribues); 
+                                                            Layernorm_attributes attributes); 
 ```
 where the output array has tensors in order of: `[output, mean, variance]`
 
-Layernorm_attributes is a lighweight structure with setters for providing optoinal input tensors and other operation attributes:  
+Layernorm_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:  
 ```
 Layernorm_attributes&
 set_name(std::string const&)
@@ -162,7 +162,7 @@ Python API:
 
 ### Layernorm Backward
 
-DLN operation computes data graident, scale gradient, bias gradient during backpropagation of layernorm forward operation.
+DLN operation computes data gradient, scale gradient, bias gradient during backpropagation of layernorm forward operation.
 
 The API to achieve above is:  
 ```
@@ -174,7 +174,7 @@ std::array<std::shared_ptr<Tensor_attributes>, 3>
 ```
 where the output array has tensors in order of: `[input gradient, scale gradient, bias gradient]`.
 
-Layernorm_attributes is a lighweight structure with setters for providing optoinal input tensors and other operation attributes:  
+Layernorm_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:  
 ```
 Layernorm_attributes&
 set_name(std::string const&)
@@ -205,11 +205,11 @@ The API to achieve above equations is:
 std::array<std::shared_ptr<Tensor_attributes>, 3> instancenorm(std::shared_ptr<Tensor_attributes>& input,
                                                             std::shared_ptr<Tensor_attributes>& scale,
                                                             std::shared_ptr<Tensor_attributes>& bias,
-                                                            Instancenorm_attributes attribues); 
+                                                            Instancenorm_attributes attributes); 
 ```
 where the output array has tensors in order of: `[output, mean, variance]`
 
-Instancenorm_attributes is a lighweight structure with setters for providing optional input tensors and other operation attributes:  
+Instancenorm_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:  
 ```
 Instancenorm_attributes&
 set_name(std::string const&)
@@ -231,7 +231,7 @@ Python API:
 
 ### Instancenorm Backward
 
-DIN operation computes data graident, scale gradient, bias gradient during backpropagation of instancenorm forward operation.
+DIN operation computes data gradient, scale gradient, bias gradient during backpropagation of instancenorm forward operation.
 
 The API to achieve above is:  
 ```
@@ -243,7 +243,7 @@ std::array<std::shared_ptr<Tensor_attributes>, 3>
 ```
 where the output array has tensors in order of: `[input gradient, scale gradient, bias gradient]`.
 
-Instancenorm_attributes is a lighweight structure with setters for providing optoinal input tensors and other operation attributes:  
+Instancenorm_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:  
 ```
 Instancenorm_attributes&
 set_name(std::string const&)

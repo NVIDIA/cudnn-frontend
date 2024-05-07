@@ -106,8 +106,7 @@ static auto
 filter(Predicate pred, executionPlans_t &plans) -> executionPlans_t {
     executionPlans_t filtered_plans;
     for (auto &plan : plans) {
-        getLogger() << "[cudnn_frontend] "
-                    << "Filtered ";
+        getLogger() << "[cudnn_frontend] " << "Filtered ";
         if (!pred(plan)) {
             getLogger() << "and Added ";
             filtered_plans.emplace_back(std::move(plan));

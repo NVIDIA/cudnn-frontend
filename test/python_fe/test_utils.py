@@ -1,6 +1,7 @@
 import torch
 import functools
 
+
 # decorator function to fork the RNG and set the seed for each tests
 def torch_fork_set_rng(seed=None):
     def decorator_(func):
@@ -10,5 +11,7 @@ def torch_fork_set_rng(seed=None):
                 if seed is not None:
                     torch.manual_seed(seed)
                 return func(*args, **kwargs)
+
         return wrapper_
+
     return decorator_

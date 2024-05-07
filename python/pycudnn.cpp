@@ -67,8 +67,8 @@ set_dlhandle_cudnn(std::intptr_t dlhandle) {
 }
 
 PYBIND11_MODULE(_compiled_module, m) {
-    m.def("backend_version", &cudnn_frontend::get_backend_version);
-    m.def("backend_version_string", &cudnn_frontend::get_backend_version_string);
+    m.def("backend_version", &detail::get_backend_version);
+    m.def("backend_version_string", &detail::get_backend_version_string);
 
     init_properties(m);
     init_pygraph_submodule(m);

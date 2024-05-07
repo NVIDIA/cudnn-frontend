@@ -25,8 +25,7 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating SoftmaxNode " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating SoftmaxNode " << attributes.name << "..." << std::endl;
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             attributes.use_stats.has_value() == false, error_code_t::ATTRIBUTE_NOT_SET, "use_stats attribute not set.");

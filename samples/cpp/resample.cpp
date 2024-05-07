@@ -61,8 +61,8 @@ TEST_CASE("Resample Max Pooling NHWC Inference", "[resample][pooling][max][graph
 
     REQUIRE(graph.validate().is_good());
     REQUIRE(graph.build_operation_graph(handle).is_good());
-    REQUIRE(graph.check_support(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
+    REQUIRE(graph.check_support(handle).is_good());
     REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     Surface<half> X_gpu(N * H * W * C, false);
@@ -114,14 +114,14 @@ TEST_CASE("Resample Max Pooling NHWC Training", "[resample][pooling][max][graph]
     REQUIRE(graph.validate().is_good());
 
     auto const status = graph.build_operation_graph(handle);
-    if (cudnn_frontend::get_backend_version() >= 8600)
+    if (cudnn_frontend::detail::get_backend_version() >= 8600)
         REQUIRE(status.is_good());
     else {
         REQUIRE(status.is_bad());
         SKIP("Using index tensor is not supported pre 8.6.");
     }
-    REQUIRE(graph.check_support(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
+    REQUIRE(graph.check_support(handle).is_good());
     REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     Surface<half> X_gpu(N * H * W * C, false);
@@ -172,8 +172,8 @@ TEST_CASE("Resample Avg Pooling", "[resample][pooling][average][graph]") {
 
     REQUIRE(graph.validate().is_good());
     REQUIRE(graph.build_operation_graph(handle).is_good());
-    REQUIRE(graph.check_support(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
+    REQUIRE(graph.check_support(handle).is_good());
     REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     Surface<half> X_gpu(N * H * W * C, false);

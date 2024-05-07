@@ -6,6 +6,7 @@ from pathlib import Path
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 
+
 # A CMakeExtension needs a sourcedir instead of a file list.
 # The name must be the _single_ output extension from the CMake build.
 # If you need multiple extensions, see scikit-build.
@@ -38,7 +39,7 @@ class CMakeBuild(build_ext):
             # All these are handled by pip
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}{os.sep}",
             f"-DCUDNN_FRONTEND_KEEP_PYBINDS_IN_BINARY_DIR=OFF",
-            f"-DCUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE=OFF"
+            f"-DCUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE=OFF",
         ]
 
         if "CUDA_PATH" in os.environ:

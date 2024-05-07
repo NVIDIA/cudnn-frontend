@@ -48,10 +48,9 @@ class ResampleDesc_v8 : public BackendDescriptor {
     describe() const override {
         std::stringstream ss;
         char sep = ',';
-        ss << "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: "
-           << "Compute Type: " << json{computeType} << ", Resample Mode: " << json{resample_mode}
-           << ", Spatial Dimensions: " << spatialDim << ", Nan Propagation: " << std::to_string(nanOpt)
-           << ", Padding Mode: " << json{padding_mode};
+        ss << "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: " << "Compute Type: " << json{computeType}
+           << ", Resample Mode: " << json{resample_mode} << ", Spatial Dimensions: " << spatialDim
+           << ", Nan Propagation: " << std::to_string(nanOpt) << ", Padding Mode: " << json{padding_mode};
         ss << ", WindowDim: [";
         for (auto i = 0; i < spatialDim; i++) {
             ss << '(' << windowDim[i].numerator << sep << windowDim[i].denominator << ')' << sep;
@@ -322,11 +321,11 @@ class ResampleDescBuilder_v8 {
                 "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: SetAttribute CUDNN_ATTR_RESAMPLE_MODE Failed");
             return std::move(m_resampleDesc);
         }
-        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RESAMPLE_MODE,
-                                               CUDNN_TYPE_RESAMPLE_MODE,
-                                               1,
-                                               &cudnn_resample_mode);
+        status = detail::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RESAMPLE_MODE,
+                                       CUDNN_TYPE_RESAMPLE_MODE,
+                                       1,
+                                       &cudnn_resample_mode);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -344,11 +343,11 @@ class ResampleDescBuilder_v8 {
                 "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: SetAttribute CUDNN_ATTR_RESAMPLE_COMP_TYPE Failed");
             return std::move(m_resampleDesc);
         }
-        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RESAMPLE_COMP_TYPE,
-                                               CUDNN_TYPE_DATA_TYPE,
-                                               1,
-                                               &cudnn_data_type);
+        status = detail::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RESAMPLE_COMP_TYPE,
+                                       CUDNN_TYPE_DATA_TYPE,
+                                       1,
+                                       &cudnn_data_type);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -357,11 +356,11 @@ class ResampleDescBuilder_v8 {
             return std::move(m_resampleDesc);
         }
 
-        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RESAMPLE_NAN_PROPAGATION,
-                                               CUDNN_TYPE_NAN_PROPOGATION,
-                                               1,
-                                               &(m_resampleDesc.nanOpt));
+        status = detail::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RESAMPLE_NAN_PROPAGATION,
+                                       CUDNN_TYPE_NAN_PROPOGATION,
+                                       1,
+                                       &(m_resampleDesc.nanOpt));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -379,11 +378,11 @@ class ResampleDescBuilder_v8 {
                 "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: SetAttribute CUDNN_ATTR_RESAMPLE_PADDING_MODE Failed");
             return std::move(m_resampleDesc);
         }
-        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RESAMPLE_PADDING_MODE,
-                                               CUDNN_TYPE_PADDING_MODE,
-                                               1,
-                                               &cudnn_padding_mode);
+        status = detail::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RESAMPLE_PADDING_MODE,
+                                       CUDNN_TYPE_PADDING_MODE,
+                                       1,
+                                       &cudnn_padding_mode);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -392,11 +391,11 @@ class ResampleDescBuilder_v8 {
             return std::move(m_resampleDesc);
         }
 
-        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS,
-                                               CUDNN_TYPE_INT64,
-                                               1,
-                                               &(m_resampleDesc.spatialDim));
+        status = detail::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS,
+                                       CUDNN_TYPE_INT64,
+                                       1,
+                                       &(m_resampleDesc.spatialDim));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -405,11 +404,11 @@ class ResampleDescBuilder_v8 {
             return std::move(m_resampleDesc);
         }
 
-        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RESAMPLE_WINDOW_DIMS,
-                                               CUDNN_TYPE_FRACTION,
-                                               m_resampleDesc.spatialDim,
-                                               m_resampleDesc.windowDim);
+        status = detail::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RESAMPLE_WINDOW_DIMS,
+                                       CUDNN_TYPE_FRACTION,
+                                       m_resampleDesc.spatialDim,
+                                       m_resampleDesc.windowDim);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -418,11 +417,11 @@ class ResampleDescBuilder_v8 {
             return std::move(m_resampleDesc);
         }
 
-        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RESAMPLE_PRE_PADDINGS,
-                                               CUDNN_TYPE_FRACTION,
-                                               m_resampleDesc.spatialDim,
-                                               m_resampleDesc.prePadding);
+        status = detail::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RESAMPLE_PRE_PADDINGS,
+                                       CUDNN_TYPE_FRACTION,
+                                       m_resampleDesc.spatialDim,
+                                       m_resampleDesc.prePadding);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -431,11 +430,11 @@ class ResampleDescBuilder_v8 {
             return std::move(m_resampleDesc);
         }
 
-        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RESAMPLE_POST_PADDINGS,
-                                               CUDNN_TYPE_FRACTION,
-                                               m_resampleDesc.spatialDim,
-                                               m_resampleDesc.postPadding);
+        status = detail::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RESAMPLE_POST_PADDINGS,
+                                       CUDNN_TYPE_FRACTION,
+                                       m_resampleDesc.spatialDim,
+                                       m_resampleDesc.postPadding);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -444,11 +443,11 @@ class ResampleDescBuilder_v8 {
             return std::move(m_resampleDesc);
         }
 
-        status = cudnn_frontend::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RESAMPLE_STRIDES,
-                                               CUDNN_TYPE_FRACTION,
-                                               m_resampleDesc.spatialDim,
-                                               m_resampleDesc.stride);
+        status = detail::set_attribute(m_resampleDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RESAMPLE_STRIDES,
+                                       CUDNN_TYPE_FRACTION,
+                                       m_resampleDesc.spatialDim,
+                                       m_resampleDesc.stride);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc,
@@ -458,7 +457,7 @@ class ResampleDescBuilder_v8 {
         }
 
         // Finalizing the descriptor
-        status = cudnn_frontend::finalize(m_resampleDesc.pointer->get_backend_descriptor());
+        status = detail::finalize(m_resampleDesc.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_resampleDesc, status, "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: cudnnFinalize Failed");

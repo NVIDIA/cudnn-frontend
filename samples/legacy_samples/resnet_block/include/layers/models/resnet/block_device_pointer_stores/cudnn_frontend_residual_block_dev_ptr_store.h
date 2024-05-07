@@ -185,9 +185,8 @@ class ResidualBlockDevPtrStore {
         return *this;
     }
     auto
-    setBNExponentialAverageFactors(
-        std::vector<std::pair<ResidualBlockParams::ForwardLocation, float>> const& exp_avg_factors)
-        -> ResidualBlockDevPtrStore& {
+    setBNExponentialAverageFactors(std::vector<std::pair<ResidualBlockParams::ForwardLocation, float>> const&
+                                       exp_avg_factors) -> ResidualBlockDevPtrStore& {
         for (auto const& p : exp_avg_factors) {
             BN_exp_avg_factors[p.first] = p.second;
         }

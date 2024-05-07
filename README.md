@@ -1,7 +1,7 @@
 # cuDNN FrontEnd(FE) API
 
 ## Introduction
-The cuDNN FrontEnd(FE) API is a C++ header-only library that wraps the [cuDNN C backend API](https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnn-backend-api). Both the FE and backend APIs are entry points to the same set of functionality that is commonly referred to as the "[graph API](https://docs.nvidia.com/deeplearning/cudnn/developer-guide/index.html#op-fusion)".
+The cuDNN FrontEnd(FE) API is a C++ header-only library that wraps the [cuDNN C backend API](https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnn-backend-api). Both the FE and backend APIs are entry points to the same set of functionality that is commonly referred to as the "[graph API](https://docs.nvidia.com/deeplearning/cudnn/latest/developer/graph-api.html#graph-api)".
 
 While there are two entry points to the graph API (i.e. backend and frontend), it is expected that most users will use the FE API. Reasons being:
 
@@ -10,7 +10,7 @@ While there are two entry points to the graph API (i.e. backend and frontend), i
 
 Also, for those using backend API, FE API source and samples can serve as reference implementation.
 
-In FE v1.0 API, users can describe multiple operations that form subgraph through a persistent `cudnn_frontend::graph::Graph` object. Unlike the FE v0.x API, users dont need to worry about specifying shapes and sizes of the intermediate virtual tensors. FE v1.0 API extends the groundwork of earlier versions and introduces a new set of APIs to further simplify the workflow.  For detailed information of FE v1.0 API, see [README.FE.v1.0.md](README.FE.1.0.md). 
+In FE v1.0 API, users can describe multiple operations that form subgraph through a persistent `cudnn_frontend::graph::Graph` object. Unlike the FE v0.x API, users don't need to worry about specifying shapes and sizes of the intermediate virtual tensors. FE v1.0 API extends the groundwork of earlier versions and introduces a new set of APIs to further simplify the workflow.  For detailed information of FE v1.0 API, see [README.FE.1.0.md](README.FE.1.0.md).
 
 Additionally, FE v1.0 API provides python bindings to all API through pybind11. It is recommended that new users of cuDNN start with the frontend v1.0 API. See `samples/cpp` and `samples/python` for more details on its usage.
 
@@ -25,8 +25,8 @@ With the release of v1.0, we are bumping up the minimum supported cudnn version 
 cuda can be downloaded from the [nvidia dev-zone](https://developer.nvidia.com/cuda-downloads)
 
 cudnn can be installed from 
-    - [nvidia dev-zone] (https://developer.nvidia.com/cudnn)
-    - [pypi wheels] (https://pypi.org/project/nvidia-cudnn-cu12/)
+    - [nvidia dev-zone](https://developer.nvidia.com/cudnn)
+    - [pypi wheels](https://pypi.org/project/nvidia-cudnn-cu12/)
 
 Minimum python version needed 3.6
 The python binding compilation requires development package which can be installed by running `apt-get install python-dev`.
@@ -61,7 +61,7 @@ pip install nvidia_cudnn_frontend-1.2.0-*.whl
 #### Checking the installation
 To test whether installation is successful, run:
 ```
-pytest tests/python_fe
+pytest test/python_fe
 ```
 
 NOTE: Only v1.0 API is exposed via python bindings.
@@ -114,7 +114,7 @@ cuDNN Frontend API logging records execution flow through cuDNN frontend API. Th
 Calling `cudnn_frontend::isLoggingEnabled() = true|false` has same effect of setting the environment variable.
 Calling `cudnn_frontend::getStream() = stream_name` can be used to assign the output stream directly.
 
-For further debugging, please turn on the cudnn backend logs described here https://docs.nvidia.com/deeplearning/cudnn/developer-guide/index.html#api-logging
+For further debugging, please turn on the cudnn backend logs described here https://docs.nvidia.com/deeplearning/cudnn/latest/reference/troubleshooting.html#error-reporting-and-api-logging
 
 ## Documentation
 - See [README.FE.1.0.md](README.FE.1.0.md) for v1.0 API documentation.
@@ -126,4 +126,4 @@ Please refer to our [contribution guide](CONTRIBUTING.md)
 ## Feedback
 Support, resources, and information about cuDNN can be found online at https://developer.nvidia.com/cudnn. 
 
-Also, bugs and rfes can be reported in the issues section.
+Also, bugs and RFEs can be reported in the issues section.

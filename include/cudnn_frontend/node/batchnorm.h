@@ -71,8 +71,8 @@ class BatchNormNode : public NodeCRTP<BatchNormNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating BatchNormNode " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating BatchNormNode " << attributes.name << "..."
+                    << std::endl;
 
         // Ensure all needed input output tensors are valid
         CUDNN_FE_VALIDATE_INPUT_TENSOR(Batchnorm_attributes::input_names::X);
@@ -111,8 +111,8 @@ class BatchNormNode : public NodeCRTP<BatchNormNode> {
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building BatchNormNode operations " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Building BatchNormNode operations " << attributes.name << "..."
+                    << std::endl;
 
         std::vector<cudnn_frontend::Tensor> peer_stats;
         for (auto const& peer_stat : attributes.peer_stats) {

@@ -71,13 +71,11 @@ class ExecutionPlan_v8 : public BackendDescriptor {
         std::stringstream ss;
         ss << "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR : ";
         ss << getTag() << ", ";
-        ss << "numeric_notes:"
-           << "[";
+        ss << "numeric_notes:" << "[";
         for (auto note : numeric_notes_vec) {
             ss << cudnn_frontend::to_string(note) << ",";
         }
-        ss << "] behavior_notes:"
-           << "[";
+        ss << "] behavior_notes:" << "[";
         for (auto note : behavior_notes_vec) {
             ss << cudnn_frontend::to_string(note) << ",";
         }
@@ -124,12 +122,12 @@ class ExecutionPlan_v8 : public BackendDescriptor {
         auto status = CUDNN_STATUS_SUCCESS;
         int64_t serializationSize;
         std::vector<char> serialization_buf;
-        status = cudnn_frontend::get_attribute(pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
-                                               CUDNN_TYPE_CHAR,
-                                               0,
-                                               &serializationSize,
-                                               nullptr);
+        status = detail::get_attribute(pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
+                                       CUDNN_TYPE_CHAR,
+                                       0,
+                                       &serializationSize,
+                                       nullptr);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
                                           status,
@@ -137,12 +135,12 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                           "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
         }
         serialization_buf.resize(static_cast<size_t>(serializationSize));
-        status = cudnn_frontend::get_attribute(pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
-                                               CUDNN_TYPE_CHAR,
-                                               serializationSize,
-                                               &serializationSize,
-                                               serialization_buf.data());
+        status = detail::get_attribute(pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
+                                       CUDNN_TYPE_CHAR,
+                                       serializationSize,
+                                       &serializationSize,
+                                       serialization_buf.data());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
                                           status,
@@ -163,19 +161,19 @@ class ExecutionPlan_v8 : public BackendDescriptor {
         auto status                               = CUDNN_STATUS_SUCCESS;
         int64_t elem_count                        = 0;
         cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
-        status                                    = cudnn_frontend::get_attribute(extractedEngine_,
-                                               CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
-                                               CUDNN_TYPE_NUMERICAL_NOTE,
-                                               CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
-                                               &elem_count,
-                                               nullptr);
+        status                                    = detail::get_attribute(extractedEngine_,
+                                       CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
+                                       CUDNN_TYPE_NUMERICAL_NOTE,
+                                       CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
+                                       &elem_count,
+                                       nullptr);
         numeric_notes_vec.resize(static_cast<size_t>(elem_count));
-        status = cudnn_frontend::get_attribute(extractedEngine_,
-                                               CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
-                                               CUDNN_TYPE_NUMERICAL_NOTE,
-                                               CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
-                                               &elem_count,
-                                               numeric_notes_vec.data());
+        status = detail::get_attribute(extractedEngine_,
+                                       CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
+                                       CUDNN_TYPE_NUMERICAL_NOTE,
+                                       CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
+                                       &elem_count,
+                                       numeric_notes_vec.data());
         ptrdiff_t end =
             static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_NUMERICAL_NOTE_TYPE_COUNT)));
         std::copy(numeric_notes_vec.begin(), numeric_notes_vec.begin() + end, numeric_notes.begin());
@@ -189,19 +187,19 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                           "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
                                           "CUDNN_ATTR_ENGINE_NUMERICAL_NOTE Failed");
         }
-        status = cudnn_frontend::get_attribute(extractedEngine_,
-                                               CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
-                                               CUDNN_TYPE_BEHAVIOR_NOTE,
-                                               CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
-                                               &elem_count,
-                                               nullptr);
+        status = detail::get_attribute(extractedEngine_,
+                                       CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
+                                       CUDNN_TYPE_BEHAVIOR_NOTE,
+                                       CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
+                                       &elem_count,
+                                       nullptr);
         behavior_notes_vec.resize(static_cast<size_t>(elem_count));
-        status = cudnn_frontend::get_attribute(extractedEngine_,
-                                               CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
-                                               CUDNN_TYPE_BEHAVIOR_NOTE,
-                                               CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
-                                               &elem_count,
-                                               behavior_notes_vec.data());
+        status = detail::get_attribute(extractedEngine_,
+                                       CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
+                                       CUDNN_TYPE_BEHAVIOR_NOTE,
+                                       CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
+                                       &elem_count,
+                                       behavior_notes_vec.data());
         end    = static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_BEHAVIOR_NOTE_TYPE_COUNT)));
         std::copy(behavior_notes_vec.begin(), behavior_notes_vec.begin() + end, behavior_notes.begin());
         if (static_cast<size_t>(elem_count) < behavior_notes.size())
@@ -239,7 +237,7 @@ class ExecutionPlan_v8 : public BackendDescriptor {
             extractedKnobs_[i] = extractedKnobs[i]->get_backend_descriptor();
         }
 
-        status = cudnn_frontend::get_attribute(
+        status = detail::get_attribute(
             extractedEngine_, CUDNN_ATTR_ENGINE_GLOBAL_INDEX, CUDNN_TYPE_INT64, 1, &elemCount, &engineId);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
@@ -249,12 +247,12 @@ class ExecutionPlan_v8 : public BackendDescriptor {
         }
         tag << "eng" << engineId;
 
-        status = cudnn_frontend::get_attribute(engine_config->get_backend_descriptor(),
-                                               CUDNN_ATTR_ENGINECFG_KNOB_CHOICES,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               CUDNN_KNOB_TYPE_COUNTS,
-                                               &numKnobs,
-                                               &(extractedKnobs_[0]));
+        status = detail::get_attribute(engine_config->get_backend_descriptor(),
+                                       CUDNN_ATTR_ENGINECFG_KNOB_CHOICES,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       CUDNN_KNOB_TYPE_COUNTS,
+                                       &numKnobs,
+                                       &(extractedKnobs_[0]));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
                                           status,
@@ -271,16 +269,16 @@ class ExecutionPlan_v8 : public BackendDescriptor {
             const cudnnBackendDescriptor_t &knob = extractedKnobs_[idx];
             cudnnBackendKnobType_t type          = CUDNN_KNOB_TYPE_COUNTS;
             int64_t choice                       = -2;
-            status                               = cudnn_frontend::get_attribute(
-                knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_TYPE, CUDNN_TYPE_KNOB_TYPE, 1, nullptr, &type);
+            status =
+                detail::get_attribute(knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_TYPE, CUDNN_TYPE_KNOB_TYPE, 1, nullptr, &type);
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(this,
                                               status,
                                               "computeTag CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
                                               "CUDNN_ATTR_KNOB_CHOICE_KNOB_TYPE Failed");
             }
-            status = cudnn_frontend::get_attribute(
-                knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_VALUE, CUDNN_TYPE_INT64, 1, nullptr, &choice);
+            status =
+                detail::get_attribute(knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_VALUE, CUDNN_TYPE_INT64, 1, nullptr, &choice);
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(this,
                                               status,
@@ -294,12 +292,12 @@ class ExecutionPlan_v8 : public BackendDescriptor {
 
     void
     computeWorkSpaceSize() {
-        auto status = cudnn_frontend::get_attribute(pointer->get_backend_descriptor(),
-                                                    CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
-                                                    CUDNN_TYPE_INT64,
-                                                    1,
-                                                    nullptr,
-                                                    &workSpaceSize);
+        auto status = detail::get_attribute(pointer->get_backend_descriptor(),
+                                            CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
+                                            CUDNN_TYPE_INT64,
+                                            1,
+                                            nullptr,
+                                            &workSpaceSize);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
                                           status,
@@ -358,8 +356,8 @@ class ExecutionPlanBuilder_v8 {
     }
 
     auto
-    setEngineConfig(ManagedOpaqueDescriptor const &desc, std::string const &opGraphTag_ = "")
-        -> ExecutionPlanBuilder_v8 & {
+    setEngineConfig(ManagedOpaqueDescriptor const &desc,
+                    std::string const &opGraphTag_ = "") -> ExecutionPlanBuilder_v8 & {
         m_execution_plan.engine_config = desc;
         m_execution_plan.planTag       = opGraphTag_;
         return *this;
@@ -393,11 +391,11 @@ class ExecutionPlanBuilder_v8 {
             return std::move(m_execution_plan);
         }
 
-        status = cudnn_frontend::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &(m_execution_plan.engine_config->get_backend_descriptor()));
+        status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_execution_plan.engine_config->get_backend_descriptor()));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_execution_plan,
@@ -405,11 +403,11 @@ class ExecutionPlanBuilder_v8 {
                 "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG Failed");
             return std::move(m_execution_plan);
         }
-        status = cudnn_frontend::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_EXECUTION_PLAN_HANDLE,
-                                               CUDNN_TYPE_HANDLE,
-                                               1,
-                                               &m_execution_plan.handle);
+        status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_EXECUTION_PLAN_HANDLE,
+                                       CUDNN_TYPE_HANDLE,
+                                       1,
+                                       &m_execution_plan.handle);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_execution_plan,
@@ -418,7 +416,7 @@ class ExecutionPlanBuilder_v8 {
             return std::move(m_execution_plan);
         }
         // Finalizing the descriptor
-        status = cudnn_frontend::finalize(m_execution_plan.pointer->get_backend_descriptor());
+        status = detail::finalize(m_execution_plan.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_execution_plan, status, "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnFinalize Descriptor Failed");
@@ -436,12 +434,12 @@ class ExecutionPlanBuilder_v8 {
         }
         cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
         int64_t elemCount                         = 0;
-        status = cudnn_frontend::get_attribute(m_execution_plan.engine_config->get_backend_descriptor(),
-                                               CUDNN_ATTR_ENGINECFG_ENGINE,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &elemCount,
-                                               &extractedEngine_);
+        status = detail::get_attribute(m_execution_plan.engine_config->get_backend_descriptor(),
+                                       CUDNN_ATTR_ENGINECFG_ENGINE,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &elemCount,
+                                       &extractedEngine_);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_execution_plan,
                                           status,
@@ -481,11 +479,11 @@ class ExecutionPlanBuilder_v8 {
 
         std::vector<char> serialization_buf;
         serialization_buf.assign(json_plan.begin(), json_plan.end());
-        status = cudnn_frontend::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
-                                               CUDNN_TYPE_CHAR,
-                                               serialization_buf.size(),
-                                               serialization_buf.data());
+        status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
+                                       CUDNN_TYPE_CHAR,
+                                       serialization_buf.size(),
+                                       serialization_buf.data());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_execution_plan,
                                           status,
@@ -494,11 +492,11 @@ class ExecutionPlanBuilder_v8 {
             return std::move(m_execution_plan);
         }
 
-        status = cudnn_frontend::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_EXECUTION_PLAN_HANDLE,
-                                               CUDNN_TYPE_HANDLE,
-                                               1,
-                                               &m_execution_plan.handle);
+        status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_EXECUTION_PLAN_HANDLE,
+                                       CUDNN_TYPE_HANDLE,
+                                       1,
+                                       &m_execution_plan.handle);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_execution_plan,
@@ -507,7 +505,7 @@ class ExecutionPlanBuilder_v8 {
             return std::move(m_execution_plan);
         }
 
-        status = cudnn_frontend::finalize(m_execution_plan.pointer->get_backend_descriptor());
+        status = detail::finalize(m_execution_plan.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_execution_plan, status, "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnFinalize Descriptor Failed");
@@ -526,12 +524,12 @@ class ExecutionPlanBuilder_v8 {
 
         cudnnBackendDescriptor_t engCfgDesc = m_execution_plan.engine_config->get_backend_descriptor();
         int64_t elemCount                   = 0;
-        status = cudnn_frontend::get_attribute(m_execution_plan.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &elemCount,
-                                               &engCfgDesc);
+        status                              = detail::get_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &elemCount,
+                                       &engCfgDesc);
 
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_execution_plan,
@@ -552,12 +550,12 @@ class ExecutionPlanBuilder_v8 {
 
         cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
 
-        status = cudnn_frontend::get_attribute(m_execution_plan.engine_config->get_backend_descriptor(),
-                                               CUDNN_ATTR_ENGINECFG_ENGINE,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                               1,
-                                               &elemCount,
-                                               &extractedEngine_);
+        status = detail::get_attribute(m_execution_plan.engine_config->get_backend_descriptor(),
+                                       CUDNN_ATTR_ENGINECFG_ENGINE,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &elemCount,
+                                       &extractedEngine_);
 
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_execution_plan,

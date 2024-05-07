@@ -24,8 +24,7 @@ class DBNNode : public NodeCRTP<DBNNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating DBNNode " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating DBNNode " << attributes.name << "..." << std::endl;
 
         CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
         return {error_code_t::OK, ""};
@@ -91,8 +90,8 @@ class DBNNode : public NodeCRTP<DBNNode> {
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building DBNNode operations " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Building DBNNode operations " << attributes.name << "..."
+                    << std::endl;
 
         std::vector<cudnn_frontend::Tensor> peer_stats;
         for (auto const& peer_stat : attributes.peer_stats) {

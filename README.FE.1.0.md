@@ -22,8 +22,8 @@ The steps involved in building and running a cudnn graph are as follows:
 6. Create the execution plan, based on the heuristics type of your choice.
 7. [Optional] Check support of the operation graph.
 8. [Optional] Filter out the plans by your custom criteria (Optional).
-9. Build (one or all) the execution plans. 
-10. [Optional] Run autotuning on the filter plan (Optional). 
+9. Build (one or all) the execution plans.
+10. [Optional] Run autotuning on the filter plan (Optional).
 11. Execute the graph with the relevant data pointers.
     
 ## APIs
@@ -62,7 +62,7 @@ Users create input tensors to provide to operations within a graph. To add tenso
 `std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> cudnn_frontend::graph::tensor(cudnn_frontend::graph::Tensor_attributes)`.  
 As the API returns a shared pointer, both the user and FE graph are owners of the tensor.  
 
-Tensor attributes is a lighweight structure with setters for each attribute.  
+Tensor attributes is a lightweight structure with setters for each attribute.
 - `cudnn_frontend::graph::Tensor_attributes& set_data_type(cudnn_frontend::DataType_t)`
 - `cudnn_frontend::graph::Tensor_attributes& set_dim(std::vector<int64_t>&)`
 - `cudnn_frontend::graph::Tensor_attributes& set_stride(std::vector<int64_t>&)`
@@ -117,11 +117,11 @@ cudnn_frontend::error_t cudnn_frontend::graph::Graph::check_support(cudnnHandle_
 
 ### Build plans
 
-This function builds execution plans queired with `create_execution_plan(...)`` API.
+This function builds execution plans queried with `create_execution_plan(...)`` API.
 
 There are two flavours of this API:
 
-Use this method to build execution plans according to a policy. Suitable when trusting cudnn heuristics to return nest suitable execition plan with top priority.
+Use this method to build execution plans according to a policy. Suitable when trusting cudnn heuristics to return nest suitable execution plan with top priority.
 ```
 cudnn_frontend::error_t
 cudnn_frontend::graph::Graph::build_plan(
@@ -131,7 +131,7 @@ cudnn_frontend::graph::Graph::build_plan(
 );
 ```
 
-Use this method to build individual plan indicies. Main usecase is to parallely build execution plans when autotuning.
+Use this method to build individual plan indices. Main use case is to build execution plans in parallel when autotuning.
 Plan index to be used here can be queried with `get_execution_plan_count(...)` API.
 ```
 cudnn_frontend::error_t
@@ -161,7 +161,7 @@ Autotuning provides a way to execute different execution plans for a given graph
 This generally helps validate and improve upon the results provided by the heuristics. Please refer to [samples](samples/cpp/autotuning.cpp)
 
 ### Execute
-Executing graph requires device pointers to all input output tensors and a user alloaction device workspace pointer.
+Executing graph requires device pointers to all input output tensors and a user allocated device workspace pointer.
 
 Two flavours of execute exists, corresponding to `build_plans(...)`` API.
 
@@ -178,7 +178,7 @@ cudnn_frontend::graph::Graph::execute(
 );
 ```
 
-execute API also takes a plan index to target a specific plan. This may be used when autotuning, in conjuction with `build_plan_at_index(...)` API.
+execute API also takes a plan index to target a specific plan. This may be used when autotuning, in conjunction with `build_plan_at_index(...)` API.
 ```
 cudnn_frontend::error_t
 cudnn_frontend::graph::Graph::execute(
@@ -193,7 +193,7 @@ cudnn_frontend::graph::Graph::execute(
 
 Get workspace to execute the current selected execution plan.
 
-Can also take in a plan index to query workspace for. This may be used when autotuning, in conjuction with `build_plan_at_index(...)` API.
+Can also take in a plan index to query workspace for. This may be used when autotuning, in conjunction with `build_plan_at_index(...)` API.
 
 `int64_t get_workspace_size() const`
 `int64_t get_workspace_size_plan_index(int64_t plan_index) const`

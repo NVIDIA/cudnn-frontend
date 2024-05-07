@@ -232,8 +232,7 @@ class IBlock {
      */
     virtual cudnnStatus_t
     calculatePlanExecutionWorkspaceSize() {
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Calculating Plan execution workspace size" << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Calculating Plan execution workspace size" << std::endl;
         int64_t max_workspace_size = -1;
 
         for (auto const &execution_plan : execution_plans) {
@@ -244,8 +243,8 @@ class IBlock {
             return CUDNN_STATUS_BAD_PARAM;
         }
 
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Plan execution Workspace size is " << max_workspace_size << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Plan execution Workspace size is " << max_workspace_size
+                    << std::endl;
         plan_execution_workspace_size = max_workspace_size;
         return CUDNN_STATUS_SUCCESS;
     };
@@ -260,26 +259,23 @@ class IBlock {
      */
     ExecutionPlan_v8
     getPlanFromHeuristics(const std::string &graph_name, OperationGraph_v8 &opGraph, cudnnHandle_t &handle) {
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Getting plan from heuristics" << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Getting plan from heuristics" << std::endl;
 
         cudnn_frontend::EngineConfigList filtered_configs;
         auto statuses = cudnn_frontend::get_heuristics_list<2>(
             {"heuristics_instant", "heuristics_fallback"}, opGraph, AllowAll, filtered_configs, true);
 
-        getLogger() << "[cudnn_frontend] "
-                    << "get_heuristics_list Statuses: ";
+        getLogger() << "[cudnn_frontend] " << "get_heuristics_list Statuses: ";
         for (size_t i = 0; i < statuses.size(); i++) {
             getLogger() << "[cudnn_frontend] " << cudnn_frontend::to_string(statuses[i]) << " ";
         }
 
         getLogger() << "[cudnn_frontend] " << std::endl;
-        getLogger() << "[cudnn_frontend] "
-                    << "Filter config list has " << filtered_configs.size() << " configurations " << std::endl;
+        getLogger() << "[cudnn_frontend] " << "Filter config list has " << filtered_configs.size() << " configurations "
+                    << std::endl;
 
         for (size_t i = 0; i < filtered_configs.size(); i++) {
-            getLogger() << "[cudnn_frontend] "
-                        << "Trying config: " << i << std::endl;
+            getLogger() << "[cudnn_frontend] " << "Trying config: " << i << std::endl;
 
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
             try {
@@ -303,8 +299,7 @@ class IBlock {
                 } else if (plan.get_status() != CUDNN_STATUS_SUCCESS) {
                     continue;
                 }
-                getLogger() << "[cudnn_frontend] "
-                            << "Config " << i << " succeeded! Plan has built!" << std::endl;
+                getLogger() << "[cudnn_frontend] " << "Config " << i << " succeeded! Plan has built!" << std::endl;
                 getLogger() << "[cudnn_frontend] " << plan.describe() << std::endl;
                 getLogger() << "[cudnn_frontend] "
                             << "========================================================" << std::endl;
@@ -464,22 +459,19 @@ class IBlock {
      */
     cudnnStatus_t
     build(cudnnHandle_t handle) {
-        getLogger() << "[cudnn_frontend]"
-                    << "INFO: Building " << sub_graphs.size() << " subgraphs. " << std::endl;
+        getLogger() << "[cudnn_frontend]" << "INFO: Building " << sub_graphs.size() << " subgraphs. " << std::endl;
 
         for (auto &sub_graph : sub_graphs) {
             auto opGraphStatus = buildOpGraph(handle, sub_graph.second, sub_graph.first);
             if (opGraphStatus != CUDNN_STATUS_SUCCESS) {
-                getLogger() << "[cudnn_frontend] "
-                            << "[ERROR] building operation graph for graph " << sub_graph.first
+                getLogger() << "[cudnn_frontend] " << "[ERROR] building operation graph for graph " << sub_graph.first
                             << ". Error message: " << error_message << std::endl;
                 return opGraphStatus;
             }
 
             auto plan = getPlanFromHeuristics(sub_graph.first, op_graphs.at(sub_graph.first), handle);
             if (plan.get_status() != CUDNN_STATUS_SUCCESS) {
-                getLogger() << "[cudnn_frontend] "
-                            << "[ERROR] building execution plan for graph " << sub_graph.first
+                getLogger() << "[cudnn_frontend] " << "[ERROR] building execution plan for graph " << sub_graph.first
                             << ". Error message: " << error_message << std::endl;
                 return plan.get_status();
             }
@@ -510,8 +502,7 @@ class IBlock {
         if (it != variant_packs.end()) {
             it->second = std::move(variant_pack);
         } else {
-            getLogger() << "[cudnn_frontend] "
-                        << "INFO: Could not find plan " << name
+            getLogger() << "[cudnn_frontend] " << "INFO: Could not find plan " << name
                         << " in variant pack map. Creating new variant pack for plan." << std::endl;
             variant_packs.emplace(name, std::move(variant_pack));
         }
@@ -567,8 +558,7 @@ class IBlock {
      */
     cudnnStatus_t
     executePlan(cudnnHandle_t &handle, const std::string &plan) {
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Executing plan " << plan << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Executing plan " << plan << std::endl;
 
         if (execution_plans.find(plan) == execution_plans.end()) {
             error_message = "[ERROR]: Could not find plan " + plan;
@@ -597,8 +587,7 @@ class IBlock {
 #endif
             return status;
         }
-        getLogger() << "[cudnn_frontend] "
-                    << "INFO: Plan " << plan << " executed successfully" << std::endl;
+        getLogger() << "[cudnn_frontend] " << "INFO: Plan " << plan << " executed successfully" << std::endl;
 
         return CUDNN_STATUS_SUCCESS;
     }

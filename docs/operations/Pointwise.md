@@ -25,7 +25,7 @@ pointwise(std::shared_ptr<Tensor_attributes>,
 where the pointwise mode dictates the API among the choices above.
 Please refer to documentation of `cudnn_frontend::PointwiseMode_t` for details.
 
-Pointwise attributes is a lighweight structure with setters:  
+Pointwise attributes is a lightweight structure with setters:  
 ```
 Pointwise_attributes&
 set_mode(PointwiseMode_t)
@@ -98,7 +98,7 @@ std::shared_ptr<Tensor_attributes>
 reduction(std::shared_ptr<Tensor_attributes> input, Reduction_attributes);
 ```
 
-Reduction attributes is a lighweight structure with setters:  
+Reduction attributes is a lightweight structure with setters:  
 ```
 Reduction_attributes&
 set_mode(ReductionMode_t)

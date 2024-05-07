@@ -48,8 +48,8 @@ class RngDesc_v8 : public BackendDescriptor {
     describe() const override {
         std::stringstream ss;
 #if (CUDNN_VERSION >= 8700)
-        ss << "CUDNN_BACKEND_RNG_DESCRIPTOR: "
-           << "Distribution Type: " << json{distribution} << ", Normal Distribution Mean: " << normal_dist_mean
+        ss << "CUDNN_BACKEND_RNG_DESCRIPTOR: " << "Distribution Type: " << json{distribution}
+           << ", Normal Distribution Mean: " << normal_dist_mean
            << ", Normal Distribution Standard Deviation: " << normal_dist_std_dev
            << ", Uniform Distribution Maximum: " << uniform_dist_max
            << ", Uniform Distribution Minimum: " << uniform_dist_min
@@ -221,22 +221,22 @@ class RngDescBuilder_v8 {
             return std::move(m_RngDesc);
         }
 
-        status = cudnn_frontend::set_attribute(m_RngDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RNG_DISTRIBUTION,
-                                               CUDNN_TYPE_RNG_DISTRIBUTION,
-                                               1,
-                                               &cudnn_rng_distribution);
+        status = detail::set_attribute(m_RngDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RNG_DISTRIBUTION,
+                                       CUDNN_TYPE_RNG_DISTRIBUTION,
+                                       1,
+                                       &cudnn_rng_distribution);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_RngDesc, status, "CUDNN_BACKEND_RNG_DESCRIPTOR: SetAttribute CUDNN_ATTR_RNG_DISTRIBUTION Failed");
             return std::move(m_RngDesc);
         }
 
-        status = cudnn_frontend::set_attribute(m_RngDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RNG_NORMAL_DIST_MEAN,
-                                               CUDNN_TYPE_DOUBLE,
-                                               1,
-                                               &(m_RngDesc.normal_dist_mean));
+        status = detail::set_attribute(m_RngDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RNG_NORMAL_DIST_MEAN,
+                                       CUDNN_TYPE_DOUBLE,
+                                       1,
+                                       &(m_RngDesc.normal_dist_mean));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_RngDesc,
@@ -245,11 +245,11 @@ class RngDescBuilder_v8 {
             return std::move(m_RngDesc);
         }
 
-        status = cudnn_frontend::set_attribute(m_RngDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RNG_NORMAL_DIST_STANDARD_DEVIATION,
-                                               CUDNN_TYPE_DOUBLE,
-                                               1,
-                                               &(m_RngDesc.normal_dist_std_dev));
+        status = detail::set_attribute(m_RngDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RNG_NORMAL_DIST_STANDARD_DEVIATION,
+                                       CUDNN_TYPE_DOUBLE,
+                                       1,
+                                       &(m_RngDesc.normal_dist_std_dev));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_RngDesc,
@@ -258,11 +258,11 @@ class RngDescBuilder_v8 {
             return std::move(m_RngDesc);
         }
 
-        status = cudnn_frontend::set_attribute(m_RngDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RNG_UNIFORM_DIST_MAXIMUM,
-                                               CUDNN_TYPE_DOUBLE,
-                                               1,
-                                               &(m_RngDesc.uniform_dist_max));
+        status = detail::set_attribute(m_RngDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RNG_UNIFORM_DIST_MAXIMUM,
+                                       CUDNN_TYPE_DOUBLE,
+                                       1,
+                                       &(m_RngDesc.uniform_dist_max));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_RngDesc,
@@ -271,11 +271,11 @@ class RngDescBuilder_v8 {
             return std::move(m_RngDesc);
         }
 
-        status = cudnn_frontend::set_attribute(m_RngDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RNG_UNIFORM_DIST_MINIMUM,
-                                               CUDNN_TYPE_DOUBLE,
-                                               1,
-                                               &(m_RngDesc.uniform_dist_min));
+        status = detail::set_attribute(m_RngDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RNG_UNIFORM_DIST_MINIMUM,
+                                       CUDNN_TYPE_DOUBLE,
+                                       1,
+                                       &(m_RngDesc.uniform_dist_min));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_RngDesc,
@@ -284,11 +284,11 @@ class RngDescBuilder_v8 {
             return std::move(m_RngDesc);
         }
 
-        status = cudnn_frontend::set_attribute(m_RngDesc.pointer->get_backend_descriptor(),
-                                               CUDNN_ATTR_RNG_BERNOULLI_DIST_PROBABILITY,
-                                               CUDNN_TYPE_DOUBLE,
-                                               1,
-                                               &(m_RngDesc.bernoulli_dist_probability));
+        status = detail::set_attribute(m_RngDesc.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_RNG_BERNOULLI_DIST_PROBABILITY,
+                                       CUDNN_TYPE_DOUBLE,
+                                       1,
+                                       &(m_RngDesc.bernoulli_dist_probability));
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_RngDesc,
@@ -298,7 +298,7 @@ class RngDescBuilder_v8 {
         }
 
         // Finalizing the descriptor
-        status = cudnn_frontend::finalize(m_RngDesc.pointer->get_backend_descriptor());
+        status = detail::finalize(m_RngDesc.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_RngDesc, status, "CUDNN_BACKEND_RNG_DESCRIPTOR: cudnnFinalize Failed");
             return std::move(m_RngDesc);

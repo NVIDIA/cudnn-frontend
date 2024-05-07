@@ -22,8 +22,7 @@ class ResampleNode : public NodeCRTP<ResampleNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Validating ResampleNode " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating ResampleNode " << attributes.name << "..." << std::endl;
 
         CUDNN_FE_VALIDATE_INPUT_TENSOR(Resample_attributes::input_names::X);
         CUDNN_FE_VALIDATE_OUTPUT_TENSOR(Resample_attributes::output_names::Y);
@@ -115,8 +114,8 @@ class ResampleNode : public NodeCRTP<ResampleNode> {
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: "
-                    << "Building ResampleNode operations " << attributes.name << "..." << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Building ResampleNode operations " << attributes.name << "..."
+                    << std::endl;
 
         auto number_of_spatial_dim = static_cast<int64_t>(attributes.window.size());
 
