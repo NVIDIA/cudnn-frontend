@@ -92,3 +92,4 @@ set_source_files_properties(
     PROPERTIES 
     INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/samples/legacy_samples/resnet_block/include"
 )
+

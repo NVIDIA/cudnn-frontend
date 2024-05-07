@@ -103,3 +103,4 @@ install(FILES
     "${CMAKE_SOURCE_DIR}/cmake/cuDNN.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cudnn_frontend
 )
+

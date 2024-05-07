@@ -68,5 +68,5 @@ foreach (test_source ${CUDNN_FRONTEND_UNIT_TESTS})
         NAME ${test_name}
         COMMAND ${test_name}
     )
-
 endforeach ()
+
