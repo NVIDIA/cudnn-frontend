@@ -7,10 +7,8 @@ option(CUDNN_FRONTEND_BUILD_SAMPLES "Defines if samples are built or not." ON)
 option(CUDNN_FRONTEND_BUILD_UNIT_TESTS "Defines if unittests are built or not." ON)
 
 if(MSVC OR MSYS OR MINGW)
-    option(CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS "Defines if python bindings are built or not." OFF)
     add_compile_options(/W4 /WX)
 else()
-    option(CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS "Defines if python bindings are built or not." OFF)
     add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wno-error=attributes -Wno-attributes -Wno-error=unused-function -Wno-unused-function)
 endif()
 
@@ -52,10 +50,6 @@ endif()
 if (CUDNN_FRONTEND_BUILD_UNIT_TESTS)
     enable_testing()
     add_subdirectory(test)
-endif()
-
-if (CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS)
-    add_subdirectory(python)
 endif()
 
 # Introduce variables:

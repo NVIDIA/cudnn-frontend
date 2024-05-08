@@ -4,10 +4,12 @@ Include(FetchContent)
 
 # Fetch and build dlpack
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
-set(BUILD_MOCK OFF)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 
 find_package(dlpack)
 if(NOT dlpack_FOUND)
+    set(BUILD_MOCK OFF)
     FetchContent_Declare(
       dlpack
       GIT_REPOSITORY https://github.com/dmlc/dlpack
@@ -28,6 +30,8 @@ if(NOT pybind11_FOUND)
     )
     FetchContent_MakeAvailable(pybind11)
 endif()
+
+find_package(cudnn_frontend REQUIRED)
 # Add a library using FindPython's tooling (pybind11 also provides a helper like
 # this)
 python_add_library(
@@ -44,23 +48,19 @@ python_add_library(
 
     WITH_SOABI
 )
-target_link_libraries(_compiled_module PRIVATE pybind11::headers)
-
-target_compile_features(_compiled_module PRIVATE cxx_std_17)
-
-target_include_directories(
-    _compiled_module
-    PRIVATE $<TARGET_PROPERTY:cudnn_frontend,INTERFACE_INCLUDE_DIRECTORIES>
-    PRIVATE $<TARGET_PROPERTY:CUDNN::cudnn_all,INTERFACE_INCLUDE_DIRECTORIES>
-)
-
-target_compile_definitions(_compiled_module PRIVATE NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)
 
 target_link_libraries(
     _compiled_module
-    
-    PRIVATE dlpack::dlpack
+    PRIVATE
+    pybind11::headers
+    dlpack::dlpack
+    cudnn_frontend::cudnn_frontend
 )
+
+target_compile_features(_compiled_module PRIVATE cxx_std_17)
+
+target_compile_definitions(_compiled_module PRIVATE NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)
+
 
 set_target_properties(
     _compiled_module

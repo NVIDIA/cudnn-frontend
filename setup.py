@@ -1,7 +1,9 @@
 import os
 import subprocess
 import sys
+import shutil
 from pathlib import Path
+from pprint import pprint
 
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
@@ -15,12 +17,23 @@ class CMakeExtension(Extension):
         super().__init__(name, sources=[])
         self.sourcedir = os.fspath(Path(sourcedir).resolve())
 
-
 class CMakeBuild(build_ext):
     def build_extension(self, ext: CMakeExtension) -> None:
         # Must be in this form due to bug in .resolve() only fixed in Python 3.10+
         ext_fullpath = Path.cwd() / self.get_ext_fullpath(ext.name)
         extdir = ext_fullpath.parent.resolve()
+
+        if "propagatedBuildInputs" in os.environ:
+            pprint(os.environ.items())
+            # We're in a Nix build - pull out the pre-compiled extension
+            # and just use that.
+            inputs = os.environ["propagatedBuildInputs"].split(" ")
+            for i in inputs:
+                if i.endswith("cudnn-frontend-python-compiled-extension"):
+                    so_root = Path(i) / "python/cudnn/"
+                    for f in so_root.glob("*.so"):
+                        shutil.copy(f, ext_fullpath)
+                    return
 
         # Using this requires trailing slash for auto-detection & inclusion of
         # auxiliary "native" libs
@@ -28,29 +41,17 @@ class CMakeBuild(build_ext):
         debug = int(os.environ.get("DEBUG", 0)) if self.debug is None else self.debug
         cfg = "Debug" if debug else "Release"
 
+
         # Set Python_EXECUTABLE instead if you use PYBIND11_FINDPYTHON
-        cmake_args = [
+        python_cmake_args = [
             f"-DPython_EXECUTABLE={sys.executable}",
-            f"-DCMAKE_BUILD_TYPE={cfg}",  # not used on MSVC, but no harm
-            f"-DCUDNN_FRONTEND_BUILD_PYTHON_BINDINGS=ON",
-            # There's no need to build cpp samples and tests with python
-            f"-DCUDNN_FRONTEND_BUILD_SAMPLES=OFF",
-            f"-DCUDNN_FRONTEND_BUILD_UNIT_TESTS=OFF",
-            # All these are handled by pip
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}{os.sep}",
             f"-DCUDNN_FRONTEND_KEEP_PYBINDS_IN_BINARY_DIR=OFF",
             f"-DCUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE=OFF",
         ]
-
-        if "CUDA_PATH" in os.environ:
-            cmake_args.append(f"-DCUDAToolkit_ROOT={os.environ['CUDA_PATH']}")
-
-        if "CUDAToolkit_ROOT" in os.environ:
-            cmake_args.append(f"-DCUDAToolkit_ROOT={os.environ['CUDAToolkit_ROOT']}")
-
-        if "CUDNN_PATH" in os.environ:
-            cmake_args.append(f"-DCUDNN_PATH={os.environ['CUDNN_PATH']}")
-
+        
+        default_cmake_args = []
+        
         # Using Ninja-build since it a) is available as a wheel and b)
         # multithreads automatically. MSVC would require all variables be
         # exported for Ninja to pick it up, which is a little tricky to do.
@@ -60,10 +61,11 @@ class CMakeBuild(build_ext):
             import ninja
 
             ninja_executable_path = Path(ninja.BIN_DIR) / "ninja"
-            cmake_args += [
+            default_cmake_args += [
                 "-GNinja",
                 f"-DCMAKE_MAKE_PROGRAM:FILEPATH={ninja_executable_path}",
             ]
+
         except ImportError:
             pass
 
@@ -77,17 +79,48 @@ class CMakeBuild(build_ext):
                 # CMake 3.12+ only.
                 build_args += [f"-j{self.parallel}"]
 
-        build_temp = Path(self.build_temp) / ext.name
-        if not build_temp.exists():
-            build_temp.mkdir(parents=True)
+        if "CUDA_PATH" in os.environ:
+            default_cmake_args.append(f"-DCUDAToolkit_ROOT={os.environ['CUDA_PATH']}")
 
+        if "CUDAToolkit_ROOT" in os.environ:
+            default_cmake_args.append(f"-DCUDAToolkit_ROOT={os.environ['CUDAToolkit_ROOT']}")
+
+        if "CUDNN_PATH" in os.environ:
+            default_cmake_args.append(f"-DCUDNN_PATH={os.environ['CUDNN_PATH']}")
+
+        if "cudnn-frontend_PATH" in os.environ:
+            default_cmake_args.append(f"-DCUDNN_FRONTEND_PATH={os.environ['cudnn-frontend_PATH']}")
+        else:
+            # build C++ library
+            cpp_cmake_args = [
+                f"-DCMAKE_BUILD_TYPE={cfg}",  # not used on MSVC, but no harm
+                f"-DCUDNN_FRONTEND_BUILD_SAMPLES=OFF",
+                f"-DCUDNN_FRONTEND_BUILD_UNIT_TESTS=OFF",
+            ]
+            cpp_build_temp = Path(self.build_temp) / f"{ext.name}_cpp"
+            if not cpp_build_temp.exists():
+                cpp_build_temp.mkdir(parents=True)
+            subprocess.run(
+                ["cmake", ext.sourcedir, *cpp_cmake_args, *default_cmake_args], cwd=cpp_build_temp, check=True
+            )
+            subprocess.run(
+                ["cmake", "--build", ".", *build_args], cwd=cpp_build_temp, check=True
+            )
+            python_cmake_args.append(f"-Dcudnn-frontend_PATH={cpp_build_temp}")
+
+
+        python_build_temp = Path(self.build_temp) / ext.name
+        if not python_build_temp.exists():
+            python_build_temp.mkdir(parents=True)
+
+        # build Python bindings
         subprocess.run(
-            ["cmake", ext.sourcedir, *cmake_args], cwd=build_temp, check=True
+            ["cmake", ext.sourcedir / "python", *python_cmake_args, *default_cmake_args],
+            cwd=python_build_temp, check=True
         )
         subprocess.run(
-            ["cmake", "--build", ".", *build_args], cwd=build_temp, check=True
+            ["cmake", "--build", ".", *build_args], cwd=python_build_temp, check=True
         )
-
 
 setup(
     ext_modules=[CMakeExtension("cudnn/_compiled_module")],
