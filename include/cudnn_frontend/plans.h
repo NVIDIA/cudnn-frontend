@@ -177,6 +177,7 @@ create_cudnn_execution_plan(std::shared_ptr<ExecutionPlan>& plan,
         getLogger() << "[cudnn_frontend] ERROR: " << e.what() << ". ";
         getLogger() << error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED << " because plan building failed at "
                     << __FILE__ << ":" << __LINE__ << "\n";
+        getLogger() << "[cudaGetLastError] ERROR: " << cudaGetLastError() << "\n";
         return {error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED, e.what()};
     }
 #endif
