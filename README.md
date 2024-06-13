@@ -15,7 +15,9 @@ In FE v1.0 API, users can describe multiple operations that form subgraph throug
 Additionally, FE v1.0 API provides python bindings to all API through pybind11. It is recommended that new users of cuDNN start with the frontend v1.0 API. See `samples/cpp` and `samples/python` for more details on its usage.
 
 ## Usage
-In order to include the entire library, include the cudnn_frontend header file `include/cudnn_frontend.h` into your compilation unit.
+For c++ users, in order to include the entire library, include the cudnn_frontend header file `include/cudnn_frontend.h` into your compilation unit.
+
+For Python users, run `import cudnn`
 
 ## Build:
 
@@ -31,32 +33,29 @@ cudnn can be installed from
 Minimum python version needed 3.6
 The python binding compilation requires development package which can be installed by running `apt-get install python-dev`.
 
-To run the python samples, additionally, you will need the following python packages:
-- pytest
-- torch
-- jupyter
-
+To run the Python samples, you will need the dependencies mentioned in `requirements.txt`. This can be be installed by running:
+`pip install -r requirements.txt`
 
 ### Python API
-
-#### Source installation:
-Install FE python API by running:
-```
-pip install git+https://github.com/NVIDIA/cudnn-frontend.git
-```
-
-Above command picks cuda and cudnn from default system paths.
-
-To provide a custom CUDA installation path, use environment variable: `CUDAToolkit_ROOT`.  
-To provide a custom CUDNN installation path, use environment variable: `CUDNN_PATH`.
 
 #### pip wheel installation
 
 Download the pip wheel corresponding to your python installation.
 
 ```
-pip install nvidia_cudnn_frontend-1.2.0-*.whl
+pip install nvidia_cudnn_frontend
 ```
+
+#### Source installation:
+Install FE python API by running:
+```
+pip install -v git+https://github.com/NVIDIA/cudnn-frontend.git
+```
+
+Above command picks cuda and cudnn from default system paths.
+
+To provide a custom CUDA installation path, use environment variable: `CUDAToolkit_ROOT`.  
+To provide a custom CUDNN installation path, use environment variable: `CUDNN_PATH`.
 
 #### Checking the installation
 To test whether installation is successful, run:
@@ -66,7 +65,6 @@ pytest test/python_fe
 
 NOTE: Only v1.0 API is exposed via python bindings.
 
-
 ### C++ API
 
 C++ API is header only library.
@@ -74,7 +72,7 @@ C++ API is header only library.
 The root CMakeLists.txt can be used as reference to include the cudnn_frontend in your project's build system.
 
 #### Building samples
-The following compilation steps are only required for building the samples and/or python bindings.
+The following compilation steps are only required for building the samples.
 
 Provide CUDA installation path according to: https://cmake.org/cmake/help/latest/module/FindCUDAToolkit.html  
 

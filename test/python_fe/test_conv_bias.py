@@ -7,13 +7,23 @@ from test_utils import torch_fork_set_rng
 
 
 class CSBR(torch.nn.Module):
-    def forward(self, x, w, b=None, padding=[1, 1], stride=[1, 1], dilation=[1, 1]):
+    def forward(
+        self,
+        x,
+        w,
+        b=None,
+        padding=[1, 1],
+        stride=[1, 1],
+        dilation=[1, 1],
+        lower_clip=0.0,
+        upper_clip=128,
+    ):
         if b is not None:
             b = b.reshape(-1)  # Conv2d needs a 1D tensor
         conv_output = torch.nn.functional.conv2d(
             x, w, bias=b, padding=padding, stride=stride, dilation=dilation
         )
-        return torch.nn.functional.relu(conv_output)
+        return torch.clamp(conv_output, min=lower_clip, max=upper_clip)
 
 
 @torch_fork_set_rng(seed=0)
@@ -34,11 +44,18 @@ def test_conv_bias_relu():
     dilation = [1, 1]
     model = CSBR().eval().to("cuda").to(torch.float16)
     Y_expected = model(
-        X_gpu, W_gpu, b=B_gpu, padding=padding, stride=stride, dilation=dilation
+        X_gpu,
+        W_gpu,
+        b=B_gpu,
+        padding=padding,
+        stride=stride,
+        dilation=dilation,
+        lower_clip=0.5,
+        upper_clip=0.55,
     )
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     graph = cudnn.pygraph(
@@ -69,7 +86,7 @@ def test_conv_bias_relu():
 
     bias_output = graph.bias(name="bias", input=conv_output, bias=B)
 
-    Y = graph.relu(name="relu", input=bias_output)
+    Y = graph.relu(name="relu", input=bias_output, lower_clip=0.5, upper_clip=0.55)
     Y.set_output(True)
 
     graph.validate()
@@ -84,6 +101,8 @@ def test_conv_bias_relu():
 
     Y_actual = torch.zeros_like(Y_expected)
     graph.execute({X: X_gpu, W: W_gpu, B: B_gpu, Y: Y_actual}, workspace, handle=handle)
+
+    torch.cuda.synchronize()
 
     torch.testing.assert_close(Y_expected, Y_actual, atol=0.05, rtol=1e-2)
 
@@ -104,10 +123,18 @@ def test_conv_relu():
     stride = [2, 3]
     dilation = [1, 1]
     model = CSBR().eval().to("cuda").to(torch.float16)
-    Y_expected = model(X_gpu, W_gpu, padding=padding, stride=stride, dilation=dilation)
+    Y_expected = model(
+        X_gpu,
+        W_gpu,
+        padding=padding,
+        stride=stride,
+        dilation=dilation,
+        lower_clip=0.5,
+        upper_clip=0.55,
+    )
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     # Cudnn code
@@ -129,7 +156,7 @@ def test_conv_relu():
         image=X, weight=W, padding=padding, stride=stride, dilation=dilation
     )
 
-    Y = graph.relu(name="relu", input=conv_output)
+    Y = graph.relu(name="relu", input=conv_output, lower_clip=0.5, upper_clip=0.55)
     Y.set_output(True)
 
     graph.validate()
@@ -146,7 +173,9 @@ def test_conv_relu():
     handle = cudnn.create_handle()
     graph.execute({X: X_gpu, W: W_gpu, Y: Y_actual}, workspace, handle=handle)
     # Compare
+    torch.cuda.synchronize()
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-3, rtol=1e-3)
+    cudnn.destroy_handle(handle)
 
 
 @torch_fork_set_rng(seed=0)
@@ -187,7 +216,7 @@ def test_conv3d_bias_leaky_relu():
     )
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     graph = cudnn.pygraph(
@@ -234,6 +263,7 @@ def test_conv3d_bias_leaky_relu():
     torch.cuda.synchronize()
 
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-2, rtol=1e-2)
+    cudnn.destroy_handle(handle)
 
 
 @torch_fork_set_rng(seed=0)
@@ -256,7 +286,7 @@ def test_leaky_relu_backward():
     Y_expected = dleaky_relu(loss_gpu, input_gpu, negative_slope)
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     graph = cudnn.pygraph(
@@ -297,7 +327,9 @@ def test_leaky_relu_backward():
         {loss: loss_gpu, input: input_gpu, Y: Y_actual}, workspace, handle=handle
     )
 
+    torch.cuda.synchronize()
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-4, rtol=1e-4)
+    cudnn.destroy_handle(handle)
 
 
 @pytest.mark.skipif(
@@ -338,7 +370,7 @@ def test_conv_int8():
         compare_output = False
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     graph = cudnn.pygraph(
@@ -377,6 +409,8 @@ def test_conv_int8():
 
     if compare_output:
         torch.testing.assert_close(Y_expected, Y_actual, atol=1e-2, rtol=1e-2)
+
+    cudnn.destroy_handle(handle)
 
 
 if __name__ == "__main__":

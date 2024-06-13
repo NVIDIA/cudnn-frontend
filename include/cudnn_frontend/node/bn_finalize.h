@@ -156,11 +156,13 @@ class BatchNormFinalizeNode : public NodeCRTP<BatchNormFinalizeNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"( {"tag": "BN_FINALIZE"})"_json);
     }
+#endif
 };
 
 }  // namespace graph

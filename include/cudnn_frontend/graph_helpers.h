@@ -24,7 +24,8 @@ enum class [[nodiscard]] error_code_t {
     CUDA_API_FAILED,
     CUDNN_BACKEND_API_FAILED,
     INVALID_CUDA_DEVICE,
-    HANDLE_ERROR
+    HANDLE_ERROR,
+    INVALID_VALUE
 };
 
 typedef struct [[nodiscard]] error_object {
@@ -100,10 +101,8 @@ typedef struct [[nodiscard]] error_object {
     do {                                                                                                          \
         if (auto cudnn_retval = x; cudnn_retval != CUDNN_STATUS_SUCCESS) {                                        \
             std::stringstream error_msg;                                                                          \
-            char last_error[1024];                                                                                \
-            detail::get_last_error_string(last_error, sizeof(last_error));                                        \
-            error_msg << #x << " failed with code: " << detail::get_error_string(cudnn_retval)                    \
-                      << ", and message: " << last_error;                                                         \
+            error_msg << #x << " failed with code: " << detail::get_last_error_string_()                          \
+                      << ", and message: " << detail::get_error_string(cudnn_retval);                             \
             getLogger() << "[cudnn_frontend] ERROR: " << error_msg.str() << " at " << __FILE__ << ":" << __LINE__ \
                         << std::endl;                                                                             \
             return {error_code_t::CUDNN_BACKEND_API_FAILED, error_msg.str()};                                     \
@@ -140,11 +139,16 @@ NLOHMANN_JSON_SERIALIZE_ENUM(error_code_t,
                                  {error_code_t::INVALID_CUDA_DEVICE, "INVALID_CUDA_DEVICE"},
                                  {error_code_t::UNSUPPORTED_GRAPH_FORMAT, "UNSUPPORTED_GRAPH_FORMAT"},
                                  {error_code_t::HANDLE_ERROR, "HANDLE_ERROR"},
+                                 {error_code_t::INVALID_VALUE, "INVALID_VALUE"},
                              })
 
 static inline std::ostream&
 operator<<(std::ostream& os, const error_code_t& mode) {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     os << json{mode};
+#else
+    os << int(mode);
+#endif
     return os;
 }
 

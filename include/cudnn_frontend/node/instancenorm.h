@@ -162,11 +162,13 @@ class InstanceNormNode : public NodeCRTP<InstanceNormNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"( {"tag": "INSTANCE_NORM"})"_json);
     }
+#endif
 };
 
 class DINNode : public NodeCRTP<DINNode> {
@@ -331,11 +333,13 @@ class DINNode : public NodeCRTP<DINNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"( {"tag": "INSTANCE_NORM_BPROP"})"_json);
     }
+#endif
 };
 
 }  // namespace graph

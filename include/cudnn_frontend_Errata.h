@@ -32,6 +32,7 @@ namespace cudnn_frontend {
 // json file is defined by environment variable
 // CUDNN_ERRATA_JSON_FILE. If the environment variable
 // is not set the value set in the API is considered.
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
 [[maybe_unused]] static bool
 load_from_config(json &json_handle, const std::string &errata_json) {
     const char *err_json = get_environment("CUDNN_ERRATA_JSON_FILE");
@@ -48,6 +49,7 @@ load_from_config(json &json_handle, const std::string &errata_json) {
     ifs >> json_handle;
     return true;
 }
+#endif
 
 /**
  * @brief Checks the shape of an operation to compare against errata filter height and width for kernel blocking
@@ -112,6 +114,7 @@ check_shape(cudnnBackendDescriptor_t &op,
     return blocked;
 }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
 template <typename T>
 static bool
 check_rule(const json &json_handle, const std::string &executionPlanTag, cudnnHandle_t handle, T fn) {
@@ -248,6 +251,7 @@ check_rule(const json &json_handle,
 // Takes in an initialzed json handle and checks if it satisfies the
 // condition for running it. Returns true if the given executionPlanTag
 // is faulty.
+
 template <typename T>
 static bool
 check_errata(const json &json_handle, const std::string &executionPlanTag, cudnnHandle_t handle, T fn) {
@@ -283,5 +287,6 @@ check_errata(const json &json_handle,
     cudnn_frontend::getLogger() << ". Passed." << std::endl;
     return false;
 }
+#endif
 
 }  // namespace cudnn_frontend

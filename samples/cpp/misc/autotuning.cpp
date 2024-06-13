@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -21,7 +21,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
-#include "../utils/helpers.h"
+#include "../../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
@@ -77,7 +77,11 @@ TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
 
         REQUIRE(graph.build_operation_graph(handle).is_good());
 
+        graph.deselect_workspace_greater_than(0);
+
         REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
+
+        graph.deselect_workspace_greater_than(1024 * 1024);
 
         REQUIRE(graph.check_support(handle).is_good());
 
@@ -86,13 +90,12 @@ TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
 
     auto graph = create_graph();
 
-    graph.deselect_workspace_greater_than(0);
     auto plan_count = graph.get_execution_plan_count();
     std::cout << "Graph has " << plan_count << " plan candidates." << std::endl;
 
     REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::ALL).is_good());
 
-    std::unordered_map<int64_t, void*> variant_pack = {
+    std::unordered_map<int64_t, void *> variant_pack = {
         {a_uid, A_gpu.devPtr}, {b_uid, B_gpu.devPtr}, {c_uid, C_gpu.devPtr}};
 
     auto autotune = [&]() -> int64_t {

@@ -3953,7 +3953,9 @@ run_bn_bwd_weight(int64_t* xDim,
         // Create cudnn handle
         checkCudnnErr(cudnnCreate(&handle_));
 
-        if (check_device_arch_newer_than("ampere") == false) {
+        // this example is only for Ampere and Hopper cards
+        bool is_supported = (is_ampere_arch() || is_hopper_arch());
+        if (is_supported == false) {
             cudnn_frontend::set_error_and_throw_exception(
                 nullptr,
                 CUDNN_STATUS_ARCH_MISMATCH,

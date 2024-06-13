@@ -56,7 +56,11 @@ class Tensor_v8 : public BackendDescriptor {
     std::string
     describe() const override {
         std::stringstream ss;
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         ss << "CUDNN_BACKEND_TENSOR_DESCRIPTOR :" << " Datatype: " << json{data_type} << " Id: " << std::to_string(id)
+#else
+        ss << "CUDNN_BACKEND_TENSOR_DESCRIPTOR :" << " Datatype: " << int(data_type) << " Id: " << std::to_string(id)
+#endif
            << " nDims " << nDims << " VectorCount: " << vectorCount << " vectorDimension " << vectorDimension;
         ss << " Dim [ ";
         for (auto i = 0; i < nDims; i++) {
@@ -74,7 +78,11 @@ class Tensor_v8 : public BackendDescriptor {
         }
         ss << " ]";
         ss << " isVirtual: " << isVirtual << " isByValue: " << isByValue << " Alignment: " << alignment;
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         ss << " reorder_type: " << json{reorder_type};
+#else
+        ss << " reorder_type: " << int(reorder_type);
+#endif
         return ss.str();
     }
 

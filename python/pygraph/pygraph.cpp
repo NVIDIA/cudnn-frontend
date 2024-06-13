@@ -270,6 +270,14 @@ PyGraph::reduction(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& in
     return OUT_0;
 }
 
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input, std::string const& name) {
+    auto attributes = cudnn_frontend::graph::Reshape_attributes().set_name(name);
+
+    auto OUT = graph.reshape(input, attributes);
+    return OUT;
+}
+
 void
 PyGraph::validate() {
     auto status = graph.validate();
@@ -335,9 +343,20 @@ PyGraph::serialize() const {
 }
 
 void
-PyGraph::deserialize(std::vector<uint8_t> const& data) {
-    auto status = graph.deserialize(handle, data);
-    throw_if(status.is_bad(), status.get_code(), status.get_message());
+PyGraph::deserialize(py::object const& pyobj) {
+    if (py::isinstance<py::str>(pyobj)) {
+        json j = json::parse(pyobj.cast<std::string>());
+
+        auto status = graph.deserialize(j);
+
+        throw_if(status.is_bad(), status.get_code(), status.get_message());
+
+    } else {
+        std::vector<uint8_t> data = pyobj.cast<std::vector<uint8_t>>();
+        auto status               = graph.deserialize(handle, data);
+
+        throw_if(status.is_bad(), status.get_code(), status.get_message());
+    }
 }
 
 void
@@ -588,6 +607,21 @@ init_pygraph_submodule(py::module_& m) {
 
                 Returns:
                     cudnn_tensor: The result of reduction operation.
+            )pbdoc")
+        .def("reshape",
+             &PyGraph::reshape,
+             py::arg("input"),
+             py::arg_v("name", ""),
+             R"pbdoc(
+                Reshape an input tensor to other dimensions without changing the actual memory layout.
+                These dimensions to reshape to are inferred from output tensor shape.
+
+                Args:
+                    input (cudnn_tensor): The input tensor.
+                    name (Optional[str]): A name for the operation to be performed.
+
+                Returns:
+                    cudnn_tensor: The result of reshape operation. Please set the dims for the output tensor.
             )pbdoc")
         .def("deselect_numeric_notes", &PyGraph::deselect_numeric_notes)
         .def("deselect_behavior_notes", &PyGraph::deselect_behavior_notes)

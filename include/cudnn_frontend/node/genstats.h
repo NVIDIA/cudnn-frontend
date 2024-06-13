@@ -125,11 +125,13 @@ class GenstatsNode : public NodeCRTP<GenstatsNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"( {"tag": "GENSTATS"})"_json);
     }
+#endif
 };
 
 }  // namespace graph

@@ -80,7 +80,7 @@ def test_layernorm(param_extract):
     )
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     graph = cudnn.pygraph(
@@ -223,9 +223,12 @@ def test_layernorm(param_extract):
         handle=handle,
     )
 
+    torch.cuda.synchronize()
+
     torch.testing.assert_close(x_gpu.grad, DX_actual, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(scale_gpu.grad, DScale_actual, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(bias_gpu.grad, Dbias_actual, atol=2e-4, rtol=2e-4)
+    cudnn.destroy_handle(handle)
 
 
 if __name__ == "__main__":

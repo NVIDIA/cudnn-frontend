@@ -57,7 +57,7 @@ def test_bn_relu_with_mask():
     )
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     # Cudnn code
@@ -181,12 +181,15 @@ def test_bn_relu_with_mask():
     )
 
     # Compare
+    torch.cuda.synchronize()
     print("Comparing outputs")
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(mean_expected, saved_mean_actual, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(
         inv_var_expected, saved_inv_var_actual, atol=1e-3, rtol=1e-3
     )
+
+    cudnn.destroy_handle(handle)
     # torch.testing.assert_close(mask_expected, mask_actual)
 
 
@@ -220,7 +223,7 @@ def test_drelu_dadd_dbn():
     ).to(memory_format=torch.channels_last)
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     # Cudnn code
@@ -342,7 +345,7 @@ def test_bn_infer_drelu_dbn():
     ).to(memory_format=torch.channels_last)
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     # Cudnn code

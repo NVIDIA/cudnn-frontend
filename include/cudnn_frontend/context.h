@@ -9,6 +9,8 @@ class Context {
     DataType_t intermediate_data_type = DataType_t::NOT_SET;
     DataType_t io_data_type           = DataType_t::NOT_SET;
 
+    std::string name = "";
+
    public:
     Context&
     set_intermediate_data_type(DataType_t const type) {
@@ -41,6 +43,17 @@ class Context {
     DataType_t
     get_compute_data_type() const {
         return compute_data_type;
+    }
+
+    Context&
+    set_name(std::string const& name_) {
+        name = name_;
+        return *this;
+    }
+
+    std::string
+    get_name() const {
+        return name;
     }
 
     Context&

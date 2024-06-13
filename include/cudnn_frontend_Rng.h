@@ -48,7 +48,11 @@ class RngDesc_v8 : public BackendDescriptor {
     describe() const override {
         std::stringstream ss;
 #if (CUDNN_VERSION >= 8700)
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         ss << "CUDNN_BACKEND_RNG_DESCRIPTOR: " << "Distribution Type: " << json{distribution}
+#else
+        ss << "CUDNN_BACKEND_RNG_DESCRIPTOR: " << "Distribution Type: " << int(distribution)
+#endif
            << ", Normal Distribution Mean: " << normal_dist_mean
            << ", Normal Distribution Standard Deviation: " << normal_dist_std_dev
            << ", Uniform Distribution Maximum: " << uniform_dist_max

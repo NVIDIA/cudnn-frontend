@@ -21,7 +21,9 @@ class HandleManagement {
     static std::intptr_t
     create_handle() {
         cudnnHandle_t handle;
-        detail::create_handle(&handle);
+        auto status = detail::create_handle(&handle);
+        throw_if(
+            status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnHandle Create failed");
         return reinterpret_cast<std::intptr_t>(handle);
     }
 
@@ -47,6 +49,11 @@ class HandleManagement {
         return reinterpret_cast<std::intptr_t>(streamId);
     }
 };
+
+static std::string
+get_last_error_string() {
+    return detail::get_last_error_string_();
+}
 
 void
 init_properties(py::module_& m) {
@@ -99,6 +106,8 @@ init_properties(py::module_& m) {
             out << json{props};
             return out.str();
         });
+
+    m.def("get_last_error_string", &get_last_error_string);
 
     m.def("create_handle", &HandleManagement::create_handle);
     m.def("destroy_handle", &HandleManagement::destroy_handle);

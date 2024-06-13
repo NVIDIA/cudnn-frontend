@@ -47,7 +47,11 @@ class MatMulDesc_v8 : public BackendDescriptor {
     std::string
     describe() const override {
         std::stringstream ss;
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         ss << "CUDNN_BACKEND_MATMUL_DESCRIPTOR :" << " Math precision " << json{compute_type};
+#else
+        ss << "CUDNN_BACKEND_MATMUL_DESCRIPTOR :" << " Math precision " << int(compute_type);
+#endif
         return ss.str();
     }
 

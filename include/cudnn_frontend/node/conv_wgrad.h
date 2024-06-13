@@ -141,11 +141,13 @@ class WgradNode : public NodeCRTP<WgradNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"( {"tag": "CONV_WGRAD"})"_json);
     }
+#endif
 };
 
 }  // namespace cudnn_frontend::graph

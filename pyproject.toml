@@ -14,8 +14,9 @@ classifiers = [
 ]
 
 [tool.setuptools]
-packages = ["cudnn"]
-package-dir = {"" = "python"}
+packages = ["cudnn", "include"]
+package-dir = {"" = "python", "include" = "include"}
+include-package-data = true
 
 [project.urls]
 "Homepage" = "https://github.com/nvidia/cudnn-frontend"
@@ -23,3 +24,6 @@ package-dir = {"" = "python"}
 
 [tool.setuptools.dynamic]
 version = {attr = "cudnn.__version__"}
+
+[tool.setuptools.package-data]
+include = ["**/*"]

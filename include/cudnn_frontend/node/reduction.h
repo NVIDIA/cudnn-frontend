@@ -118,11 +118,13 @@ class ReductionNode : public NodeCRTP<ReductionNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"({"tag": "REDUCTION"})"_json);
     }
+#endif
 };
 
 inline void

@@ -145,11 +145,13 @@ class RMSNormNode : public NodeCRTP<RMSNormNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"( {"tag": "RMS_NORM"})"_json);
     }
+#endif
 };
 
 class DRMSNormNode : public NodeCRTP<DRMSNormNode> {
@@ -312,11 +314,13 @@ class DRMSNormNode : public NodeCRTP<DRMSNormNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"( {"tag": "RMS_NORM_BPROP"})"_json);
     }
+#endif
 };
 
 }  // namespace graph

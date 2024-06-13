@@ -26,18 +26,20 @@
 #include <string>
 #include <variant>
 #include <vector>
+#include <iomanip>
+#include <sstream>
+#include <cmath>
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
-#ifndef CUDNN_FRONTEND_SKIP_NLOHMANN_JSON
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
 #include "cudnn_frontend/thirdparty/nlohmann/json.hpp"
 #endif
 
 using json = nlohmann::json;
-
-#include <iomanip>
-#include <sstream>
 
 template <>
 struct nlohmann::adl_serializer<float> {
@@ -173,6 +175,11 @@ struct nlohmann::adl_serializer<cudnnFraction_t> {
         fraction.numerator = j;
     }
 };
+
+#else
+#define NLOHMANN_JSON_SERIALIZE_ENUM(ENUM_TYPE, ...)
+#define NLOHMANN_DEFINE_TYPE_INTRUSIVE(Type, ...)
+#endif
 
 #include "cudnn_frontend_shim.h"
 #include "cudnn_backend_base.h"
