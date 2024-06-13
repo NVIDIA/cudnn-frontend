@@ -12,6 +12,11 @@
 FE v1.0 API is aimed to extend functionality and usage exposed by the [cuDNN C backend API](https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnn-backend-api). Both C++ and python APIs are provided, and both have functional parity.  
 For a general introduction to FE, please start with README.md.
 
+In the frontend v1 API, you can describe multiple operations that form subgraphs through a persistent cudnn_frontend::graph::Graph object. Unlike the frontend v0.x API, you don't have to worry about specifying shapes and sizes of the intermediate virtual tensors. The frontend v1 API extends the groundwork of earlier versions and introduces a new set of APIs to further simplify the workflow. 
+
+Additionally, the frontend v1 API provides Python bindings to all API. Refer to samples/cpp and samples/python for more details on its usage.
+With the release of v1, we are bumping up the minimum supported cuDNN version to 8.5.0.
+
 ## Workflow
 The steps involved in building and running a cudnn graph are as follows:
 1. Create a cudnn graph and specify the global properties. The global properties like compute precision and input/output data type help infer properties that are not explicitly mentioned.
@@ -20,10 +25,10 @@ The steps involved in building and running a cudnn graph are as follows:
 4. Validate the operation graph. This step makes sure the graph is well built and does not have hanging tensors or node.
 5. Build the cudnn operation graph. This step lowers the graph into cudnn dialect.
 6. Create the execution plan, based on the heuristics type of your choice.
-7. [Optional] Check support of the operation graph.
+7. Check support of the operation graph.
 8. [Optional] Filter out the plans by your custom criteria (Optional).
 9. Build (one or all) the execution plans.
-10. [Optional] Run autotuning on the filter plan (Optional).
+10. [Optional] Run autotuning on the filtered plan (Optional).
 11. Execute the graph with the relevant data pointers.
     
 ## APIs
@@ -48,7 +53,7 @@ FE v1.0 API follows a functional style of building a graph. Operations take in i
 | [Scale dot product attention FP8](docs/operations/Attention.md)          | sdpa_fp8<br> SDPA_fp8_attributes                     | sdpa_fp8                                                                                         |
 | [Scale dot product attention backward FP8](docs/operations/Attention.md) | sdpa_fp8_backward<br> SDPA_fp8_backward_attributes   | sdpa_fp8_backward                                                                                |
 
-### Create Graph
+### Creating the Graph
 Instantiate an object of class `cudnn_frontend::graph::Graph` which will house tensors and operations.  
 
 Optional graph level attributes can be set on the object:
@@ -71,14 +76,14 @@ Tensor attributes is a lightweight structure with setters for each attribute.
 - `cudnn_frontend::graph::Tensor_attributes& set_reordering_type(cudnn_frontend::TensorReordering_t)`
 - `cudnn_frontend::graph::Tensor_attributes& set_name(std::string&)`
 
-### Define Operations
+### Defining Operations
 Operations take in mandatory input tensor via positional arguments. Optional input tensors are provided using corresponding setters in operation attributes. 
 
 Operations return an ordered array of output tensors. Any optional outputs if not present will have their shared pointers pointing to `std::nullptr`.
 
 Please looks at [operations](#Operations) section for more details. 
 
-### Validate graph
+### Validating the Graph
 Validate API ensures API usage is sound, checks against dangling tensors, etc.
 Internally, any unspecified properties like dimensions, strides, etc are inferred.
 
@@ -86,21 +91,21 @@ Internally, any unspecified properties like dimensions, strides, etc are inferre
 cudnn_frontend::error_t cudnn_frontend::graph::Graph::validate()
 ```
 
-### Build cudnn backend graph
+### Building the Backend Graph
 This method creates cudnn backend descriptors for all constituents of the graph.
 
 ```
 cudnn_frontend::error_t cudnn_frontend::graph::Graph::build_operation_graph(cudnnHandle_t handle)
 ```
 
-### Create Execution plans
+### Creating the Execution Plan
 This method internally queries the heuristics for engine configs for the given heuristics modes.
 
 ```
 cudnn_frontend::error_t cudnn_frontend::graph::Graph::get_execution_plans(std::vector<heur_mode_t>)
 ```
 
-### Get execution plan count
+### Getting the Execution Plan Count
 This method returns the number of execution plans returned by cudnn heuristics. Each plan gets an index from 0 to #plans-1, with 0 having top priority.
 
 ```
@@ -108,16 +113,16 @@ cudnn_frontend::int64_t
 cudnn_frontend::Graph::get_execution_plan_count() const;
 ```
 
-### Check graph support
+### Checking Graph Support
 This method guarantees that executing the graph using plans queried will succeed.
 
 ```
 cudnn_frontend::error_t cudnn_frontend::graph::Graph::check_support(cudnnHandle_t h);
 ```
 
-### Build plans
+###  Building the Execution Plan
 
-This function builds execution plans queried with `create_execution_plan(...)`` API.
+This function builds execution plans queried with `create_execution_plan(...)` API.
 
 There are two flavours of this API:
 
@@ -140,10 +145,7 @@ cudnn_frontend::Graph::build_plan_at_index(
     int64_t plan_index
 );
 ```
-
-
-
-### Filter plans (optional)
+### Filtering Plans (Optional)
 Users can filter plans on numerical, behavioral notes, or plans that do not provide desired functional correctness.
 
 ```
@@ -155,15 +157,15 @@ cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_behavior_no
 cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_workspace_greater_than(int64_t const workspace);
 ```
 
-### Autotune
+### Autotuning
 
 Autotuning provides a way to execute different execution plans for a given graph and measure their relative performance under run time conditions.
 This generally helps validate and improve upon the results provided by the heuristics. Please refer to [samples](samples/cpp/autotuning.cpp)
 
-### Execute
-Executing graph requires device pointers to all input output tensors and a user allocated device workspace pointer.
+### Executing the Graph
+Executing the graph requires device pointers to all input output tensors and a user allocated device workspace pointer.
 
-Two flavours of execute exists, corresponding to `build_plans(...)`` API.
+Two flavours of execute exists, corresponding to `build_plans(...)` API.
 
 This API already has a candidate execution plan set. Candidate execution plan get internally set either:
 - if build_policy_t::HEURISTIC_CHOICE is used, or

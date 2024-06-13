@@ -122,11 +122,13 @@ class ReshapeNode : public NodeCRTP<ReshapeNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"( {"tag": "RESHAPE"})"_json);
     }
+#endif
 };
 
 inline std::shared_ptr<Tensor_attributes>

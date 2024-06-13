@@ -77,7 +77,7 @@ def test_apply_rope():
     sin2_gpu = sin_gpu[..., rope_n_elem // 2 :]
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     graph = cudnn.pygraph(
@@ -129,5 +129,8 @@ def test_apply_rope():
         handle=handle,
     )
 
+    torch.cuda.synchronize()
     # Compare
     torch.testing.assert_close(Y_expected, x_gpu, atol=1e-2, rtol=1e-2)
+
+    cudnn.destroy_handle(handle)

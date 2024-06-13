@@ -62,7 +62,7 @@ def test_conv_genstats():
     )
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     # Cudnn code
@@ -128,9 +128,11 @@ def test_conv_genstats():
     )
 
     # Compare
+    torch.cuda.synchronize()
     torch.testing.assert_close(sum_expected, sum_dev, atol=0.5, rtol=1e-2)
     torch.testing.assert_close(sq_sum_expected, sq_sum_dev, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-3, rtol=1e-3)
+    cudnn.destroy_handle(handle)
 
 
 if __name__ == "__main__":

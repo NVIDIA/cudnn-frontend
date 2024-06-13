@@ -28,7 +28,7 @@ def test_reduction():
         Y_expected = conv_output.sum(dim=1)
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     # Cudnn code
@@ -66,8 +66,11 @@ def test_reduction():
 
     graph.execute({X: X_gpu, Weight: W_gpu, Y: Y_actual}, workspace, handle=handle)
 
+    torch.cuda.synchronize()
     # Compare
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-3, rtol=1e-3)
+
+    cudnn.destroy_handle(handle)
 
 
 if __name__ == "__main__":

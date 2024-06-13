@@ -61,7 +61,7 @@ def test_scale_bias_relu_wgrad():
         ).to(memory_format=torch.channels_last)
 
         handle = cudnn.create_handle()
-        stream = torch.cuda.Stream().cuda_stream
+        stream = torch.cuda.current_stream().cuda_stream
         cudnn.set_stream(handle=handle, stream=stream)
 
         graph = cudnn.pygraph(
@@ -118,6 +118,9 @@ def test_scale_bias_relu_wgrad():
             workspace,
             handle=handle,
         )
+
+        torch.cuda.synchronize()
+        cudnn.destroy_handle(handle)
 
     except cudnn.cudnnGraphNotSupportedError as ex:
         print(ex)

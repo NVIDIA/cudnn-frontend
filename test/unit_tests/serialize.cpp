@@ -69,7 +69,7 @@ TEST_CASE("Conv fprop attributes", "[conv_fprop][serialize]") {
     REQUIRE(conv_fprop_attributes_deserialized == conv_fprop_attributes);
 }
 
-TEST_CASE("Graph key", "[serialize]") {
+TEST_CASE("Graph key", "[graph][key]") {
     namespace fe = cudnn_frontend;
 
     fe::graph::Graph graph;
@@ -115,6 +115,95 @@ TEST_CASE("Graph key", "[serialize]") {
 
     REQUIRE(graph.build_plans(handle).is_good());
     REQUIRE(key == graph.key());
+}
+
+TEST_CASE("Matmul fp8 fusion", "[graph][serialize]") {
+    namespace fe = cudnn_frontend;
+    // matmul problem size
+    int64_t const b = 16;
+    int64_t const m = 32;
+    int64_t const n = 64;
+    int64_t const k = 128;
+
+    fe::graph::Graph graph{};
+
+    // Create the two non-virtual input tensors A and B.
+    // There are read from global memory.
+    auto A_attributes = fe::graph::Tensor_attributes()
+                            .set_name("A")
+                            .set_dim({b, m, k})
+                            .set_stride({m * k, k, 1})
+                            .set_data_type(fe::DataType_t::FP8_E4M3);
+    auto A = graph.tensor(A_attributes);
+
+    auto B_attributes = fe::graph::Tensor_attributes()
+                            .set_name("B")
+                            .set_dim({b, k, n})
+                            .set_stride({k * n, 1, k})
+                            .set_data_type(fe::DataType_t::FP8_E4M3);
+    auto B = graph.tensor(B_attributes);
+
+    auto A_descale_attributes = fe::graph::Tensor_attributes()
+                                    .set_name("descale0")
+                                    .set_dim({1, 1, 1})
+                                    .set_stride({1, 1, 1})
+                                    .set_data_type(fe::DataType_t::FLOAT);
+    auto B_descale_attributes = fe::graph::Tensor_attributes()
+                                    .set_name("descale1")
+                                    .set_dim({1, 1, 1})
+                                    .set_stride({1, 1, 1})
+                                    .set_data_type(fe::DataType_t::FLOAT);
+
+    auto A_descale = graph.tensor(A_descale_attributes);
+    auto B_descale = graph.tensor(B_descale_attributes);
+
+    auto matmul_attributes =
+        // fe::graph::Matmul_attributes().set_name("GEMM").set_compute_data_type(fe::DataType_t::FLOAT);
+        fe::graph::Matmul_attributes().set_name("GEMM").set_compute_data_type(fe::DataType_t::FLOAT);
+    auto C = graph.matmul(A, B, matmul_attributes);
+    C->set_data_type(fe::DataType_t::FLOAT);
+
+    // Add scale_A operation
+    auto pw_0_attributes = fe::graph::Pointwise_attributes()
+                               //    .set_name("pw0_Mul")
+                               .set_mode(fe::PointwiseMode_t::MUL)
+                               .set_compute_data_type(fe::DataType_t::FLOAT);
+    auto C_after_pw_0 = graph.pointwise(C, A_descale, pw_0_attributes);
+    C_after_pw_0->set_data_type(fe::DataType_t::FLOAT);
+
+    // Add descale_B operation
+    auto pw_1_attributes = fe::graph::Pointwise_attributes()
+                               //    .set_name("pw1_Mul")
+                               .set_mode(fe::PointwiseMode_t::MUL)
+                               .set_compute_data_type(fe::DataType_t::FLOAT);
+    auto C_after_pw_1 = graph.pointwise(C_after_pw_0, B_descale, pw_1_attributes);
+    C_after_pw_1->set_output(true).set_data_type(fe::DataType_t::BFLOAT16);
+
+    json j = graph;
+
+    std::cout << j << std::endl;
+
+    fe::graph::Graph graph_deserialized;
+
+    REQUIRE(graph_deserialized.deserialize(j).is_good());
+
+    json j2 = graph_deserialized;
+
+    REQUIRE(j == j2);
+
+    REQUIRE(graph.validate().is_good());
+
+    std::cout << "Validating deserialized graph" << std::endl;
+
+    cudnnHandle_t handle;  // Handle to use during deserialize and execute
+
+    cudnnCreate(&handle);
+
+    REQUIRE(graph_deserialized.validate().is_good());
+
+    REQUIRE(graph_deserialized.build_operation_graph(handle).is_good());
+
+    cudnnDestroy(handle);
 }
 
 TEST_CASE("conv graph serialization", "[graph][serialize]") {
@@ -173,14 +262,17 @@ TEST_CASE("conv graph serialization", "[graph][serialize]") {
 
     r->set_output(true).set_data_type(fe::DataType_t::HALF);
 
-    REQUIRE(graph.validate().is_good());
-
     json j = graph;
+
     fe::graph::Graph graph_deserialized;
+
     REQUIRE(graph_deserialized.deserialize(j).is_good());
+
     json j2 = graph_deserialized;
 
     REQUIRE(j == j2);
+
+    REQUIRE(graph_deserialized.validate().is_good());
 }
 
 TEST_CASE("sdpa graph serialization", "[graph][serialize]") {
@@ -261,14 +353,15 @@ TEST_CASE("sdpa graph serialization", "[graph][serialize]") {
     O->set_output(true).set_dim({b, h, s_q, d}).set_stride({h * d, d, b * h * d, 1});
     stats->set_output(true).set_data_type(fe::DataType_t::FLOAT);
 
-    REQUIRE(graph.validate().is_good());
-
     json j = graph;
+
     fe::graph::Graph graph_deserialized;
     REQUIRE(graph_deserialized.deserialize(j).is_good());
     json j2 = graph_deserialized;
 
     REQUIRE(j == j2);
+
+    REQUIRE(graph_deserialized.validate().is_good());
 }
 
 TEST_CASE("sdpa backward graph serialization", "[graph][serialize]") {
@@ -335,7 +428,8 @@ TEST_CASE("sdpa backward graph serialization", "[graph][serialize]") {
                                      .set_causal_mask(true)
                                      .set_attn_scale(attn_scale)
                                      .set_bias(bias)
-                                     .set_dropout(0.1f, dropout_seed, dropout_offset);
+                                     .set_dropout(0.1f, dropout_seed, dropout_offset)
+                                     .set_deterministic_algorithm(true);
 
     auto [dQ, dK, dV] = graph.sdpa_backward(q, k, v, o, dO, stats, sdpa_backward_options);
 
@@ -343,12 +437,12 @@ TEST_CASE("sdpa backward graph serialization", "[graph][serialize]") {
     dK->set_output(true).set_dim({b, h, s_kv, d}).set_stride({h * s_kv * d, s_kv * d, d, 1});
     dV->set_output(true).set_dim({b, h, s_kv, d}).set_stride({h * s_kv * d, s_kv * d, d, 1});
 
-    REQUIRE(graph.validate().is_good());
-
     json j = graph;
     fe::graph::Graph graph_deserialized;
     REQUIRE(graph_deserialized.deserialize(j).is_good());
     json j2 = graph_deserialized;
 
     REQUIRE(j == j2);
+
+    REQUIRE(graph_deserialized.validate().is_good());
 }

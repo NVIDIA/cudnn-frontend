@@ -69,7 +69,7 @@ class INode : public ICudnn {
     }
 
     int64_t
-    get_cudnn_workspace_size(int64_t plan_index = -1) const {
+    get_cudnn_workspace_size(int64_t plan_index) const {
         int64_t cudnn_workspace_size = 0;
 
         auto status = get_cudnn_workspace_size_node(plan_index, cudnn_workspace_size);
@@ -423,7 +423,7 @@ class INode : public ICudnn {
         // There are two workspaces:
         // - cudnn execution plan workspace
         // - FE node workspace (example: alibiSlope for fmha)
-        return get_fe_workspace_size() + get_cudnn_workspace_size();
+        return get_fe_workspace_size() + get_cudnn_workspace_size(plans.candidate);
     }
 
     int64_t
@@ -571,13 +571,15 @@ class INode : public ICudnn {
         // this is where cudnn backend can start using workspace for its execution plans
         void* cudnn_workspace = static_cast<char*>(workspace) + get_fe_workspace_size();
 
-        CHECK_CUDNN_FRONTEND_ERROR(execute_cudnn_plan_with_uid(handle, tensor_uid_to_pointer_map, cudnn_workspace));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            execute_cudnn_plan_with_uid(handle, tensor_uid_to_pointer_map, cudnn_workspace, plans.candidate));
 
         return {error_code_t::OK, ""};
     }
 
     error_t
     deserialize(cudnnHandle_t handle, std::vector<uint8_t> const& data) {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j = json::from_ubjson(data);
 
         auto serialized_plan = j["cudnn_backend_data"];
@@ -592,10 +594,16 @@ class INode : public ICudnn {
         fe_workspace_size = j["fe_workspace_size"];
 
         return {error_code_t::OK, ""};
+#else
+        CUDNN_FRONTEND_UNUSED(handle);
+        CUDNN_FRONTEND_UNUSED(data);
+        return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
+#endif
     }
 
     error_t
     serialize(std::vector<uint8_t>& data) const {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j;
         serialize(j);
 
@@ -620,28 +628,40 @@ class INode : public ICudnn {
 
         data = json::to_ubjson(j);
         return {error_code_t::OK, ""};
+#else
+        CUDNN_FRONTEND_UNUSED(data);
+        return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
+#endif
     }
 
     INode(detail::Context const& context) : context(context) {}
 
     // Make sure each node implements a public serialize function
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const = 0;
+#endif
 
     size_t
     key() {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j;
         serialize(j);
         return std::hash<json>{}(j);
+#else
+        return 1;
+#endif
     }
 
     virtual ~INode() = default;
 };
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
 [[maybe_unused]] static void
 to_json(json& j, const INode& p) {
     p.serialize(j);
 }
+#endif
 
 template <typename DerivedT>
 class NodeCRTP : public INode {

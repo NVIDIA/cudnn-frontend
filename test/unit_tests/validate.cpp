@@ -53,10 +53,8 @@ TEST_CASE("Validate conv node", "[conv][validate]") {
 }
 
 TEST_CASE("Move", "[move]") {
-    namespace fe = cudnn_frontend;
-    auto validate = [](fe::graph::Graph graph) {
-        REQUIRE(graph.validate().is_good());
-    };
+    namespace fe   = cudnn_frontend;
+    auto validate  = [](fe::graph::Graph graph) { REQUIRE(graph.validate().is_good()); };
     auto construct = []() {
         fe::graph::Graph graph;
         REQUIRE(graph.validate().is_good());

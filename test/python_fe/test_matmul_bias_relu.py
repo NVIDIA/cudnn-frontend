@@ -56,7 +56,7 @@ def test_int8_bf16_matmul():
     )
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     # Make cudnn graph
@@ -88,8 +88,10 @@ def test_int8_bf16_matmul():
     )
     graph.execute({A: A_gpu, B: B_gpu, C: C_actual}, workspace, handle=handle)
 
+    torch.cuda.synchronize()
     # compare'em
     torch.testing.assert_close(C_expected, C_actual)
+    cudnn.destroy_handle(handle)
 
 
 A_data_type_options = [torch.int8, torch.bfloat16, torch.float16]
@@ -149,7 +151,7 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
     B_gpu = torch.as_strided(B_gpu_strided, (B, K, N), (N * K, 1, N))
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     # Make cudnn graph
@@ -198,8 +200,10 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
     )
     graph.execute({A: A_gpu, B: B_gpu, C: C_actual}, workspace, handle=handle)
 
+    torch.cuda.synchronize()
     # compare'em
     torch.testing.assert_close(C_expected, C_actual, atol=1e-4, rtol=1e-4)
+    cudnn.destroy_handle(handle)
 
 
 problem_size_options = [(1, 128, 768), (16, 512, 1600), (1, 128, 1024)]
@@ -240,7 +244,7 @@ def test_matmul_bias_relu(param_extract):
     )
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     graph = cudnn.pygraph(
@@ -292,6 +296,8 @@ def test_matmul_bias_relu(param_extract):
     torch.cuda.synchronize()
 
     torch.testing.assert_close(Y_expected, Y_actual, atol=atol, rtol=rtol)
+
+    cudnn.destroy_handle(handle)
 
 
 if __name__ == "__main__":

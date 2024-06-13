@@ -335,11 +335,13 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"({"tag": "SDPA_FP8_BWD"})"_json);
     }
+#endif
 };
 
 }  // namespace cudnn_frontend::graph

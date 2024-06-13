@@ -300,6 +300,10 @@ struct Surface {
     T_ELEM* hostPtr = NULL;
     int64_t n_elems = 0;
 
+   protected:
+    explicit Surface() {}
+
+   public:
     explicit Surface(int64_t n_elems, [[maybe_unused]] bool hasRef) : n_elems(n_elems) {
         checkCudaErr(cudaMalloc((void**)&(devPtr), (size_t)((n_elems) * sizeof(devPtr[0]))));
         hostPtr = (T_ELEM*)calloc((size_t)n_elems, sizeof(hostPtr[0]));
@@ -330,6 +334,32 @@ struct Surface {
         }
         checkCudaErr(cudaMemcpy(devPtr, hostPtr, sizeof(hostPtr[0]) * n_elems, cudaMemcpyHostToDevice));
         checkCudaErr(cudaDeviceSynchronize());
+    }
+
+    Surface(const Surface& other) : n_elems(n_elems) {
+        checkCudaErr(cudaMalloc((void**)&(devPtr), (size_t)((n_elems) * sizeof(devPtr[0]))));
+        hostPtr = (T_ELEM*)calloc((size_t)n_elems, sizeof(hostPtr[0]));
+        std::copy(other.hostPtr, other.hostPtr + n_elems, hostPtr);
+        checkCudaErr(cudaMemcpy(devPtr, hostPtr, size_t(sizeof(hostPtr[0]) * n_elems), cudaMemcpyHostToDevice));
+        checkCudaErr(cudaDeviceSynchronize());
+    }
+
+    Surface(Surface&& other) noexcept : Surface() { swap(*this, other); }
+
+    Surface&
+    operator=(Surface other) {
+        swap(*this, other);
+
+        return *this;
+    }
+
+    friend void
+    swap(Surface& first, Surface& second) {
+        using std::swap;
+
+        swap(first.n_elems, second.n_elems);
+        swap(first.hostPtr, second.hostPtr);
+        swap(first.devPtr, second.devPtr);
     }
 
     ~Surface() {

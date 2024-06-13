@@ -106,6 +106,12 @@ class Graph : public INode {
     Graph &
     set_compute_data_type(DataType_t type);
 
+    Graph &
+    set_name(std::string const &name) {
+        context.set_name(name);
+        return *this;
+    }
+
     std::shared_ptr<Tensor_attributes>
     tensor(Tensor_attributes const &tensor);
 
@@ -262,6 +268,12 @@ class Graph : public INode {
     }
 
     error_t
+    build(cudnnHandle_t const &handle,
+          std::vector<HeurMode_t> const &mode,
+          BuildPlanPolicy_t const policy     = BuildPlanPolicy_t::HEURISTICS_CHOICE,
+          bool const do_multithreaded_builds = false);
+
+    error_t
     build_plans(cudnnHandle_t const &handle,
                 BuildPlanPolicy_t const policy     = BuildPlanPolicy_t::HEURISTICS_CHOICE,
                 bool const do_multithreaded_builds = false);
@@ -272,6 +284,12 @@ class Graph : public INode {
     Graph &
     deselect_workspace_greater_than(int64_t const workspace) {
         plans.set_max_workspace_allowed(workspace);
+        return *this;
+    }
+
+    Graph &
+    deselect_shared_mem_greater_than(int64_t const workspace) {
+        plans.set_max_shared_mem_allowed(workspace);
         return *this;
     }
 
@@ -320,59 +338,203 @@ class Graph : public INode {
     using INode::deserialize;
     using INode::serialize;
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json &j) const override final {
         // Different from serialization of other INodes.
         // Go over each subnode and serialize them.
-        j["nodes"];
+        json full_json;
+        full_json["context"]["name"]                   = context.get_name();
+        full_json["context"]["compute_data_type"]      = context.get_compute_data_type();
+        full_json["context"]["intermediate_data_type"] = context.get_intermediate_data_type();
+        full_json["context"]["io_data_type"]           = context.get_io_data_type();
+
+        full_json.update(R"( {"tag": "GRAPH"})"_json);
+        full_json["nodes"];
         for (auto const &sub_node : sub_nodes) {
             json j_sub_node;
             sub_node->serialize(j_sub_node);
-            j["nodes"].push_back(j_sub_node);
+            full_json["nodes"].push_back(j_sub_node);
+        }
+
+        j["context"] = full_json["context"];
+        j["nodes"];
+        j["tensors"];
+        std::unordered_set<std::string> tensors;
+
+        for (const auto &sub_node : full_json["nodes"]) {
+            // Create a short version of the node
+            auto short_node       = sub_node;
+            short_node["inputs"]  = {};
+            short_node["outputs"] = {};
+
+            // Process node inputs
+            for (const auto &input : sub_node["inputs"]) {
+                // Extract port_name and tensor_name
+                auto port_name   = input[0].get<std::string>();
+                auto tensor_info = input[1];
+
+                if (tensor_info.is_null()) {
+                    continue;
+                }
+
+                std::string tensor_name = tensor_info["name"].get<std::string>();
+
+                // Update short_node inputs
+                short_node["inputs"][port_name] = tensor_name;
+
+                // Check if the tensor is already in the tensors map
+                if (tensors.find(tensor_name) == tensors.end()) {
+                    // If not, add it to the j["tensors"]
+                    j["tensors"][tensor_name] = tensor_info;
+                }
+            }
+
+            // Process node outputs
+            for (const auto &output : sub_node["outputs"]) {
+                // Extract port_name and tensor_name
+                auto port_name   = output[0].get<std::string>();
+                auto tensor_info = output[1];
+
+                if (tensor_info.is_null()) {
+                    continue;
+                }
+
+                std::string tensor_name = tensor_info["name"].get<std::string>();
+
+                // Update short_node outputs
+                short_node["outputs"][port_name] = tensor_name;
+
+                // Check if the tensor is already in the tensors map
+                if (tensors.find(tensor_name) == tensors.end()) {
+                    // If not, add it to the j["tensors"]
+                    j["tensors"][tensor_name] = tensor_info;
+                }
+            }
+
+            // Add the short_node to j["nodes"]
+            j["nodes"].push_back(short_node);
         }
     };
+#endif
 
     // TODO: temparorily placed in graphs class. This function needs to be a free standing function.
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     error_t
     deserialize(const json &j) {
+        if (j.contains("context")) {
+            const auto &j_context = j["context"];
+            if (j_context["compute_data_type"].is_null() == false) {
+                context.set_compute_data_type(j_context["compute_data_type"].get<DataType_t>());
+            }
+            if (j_context["intermediate_data_type"].is_null() == false) {
+                context.set_intermediate_data_type(j_context["intermediate_data_type"].get<DataType_t>());
+            }
+            if (j_context["io_data_type"].is_null() == false) {
+                context.set_io_data_type(j_context["io_data_type"].get<DataType_t>());
+            }
+            if (j_context["name"].is_null() == false) {
+                context.set_name(j_context["name"].get<std::string>());
+            }
+        }
+
+        std::map<std::string, std::shared_ptr<Tensor_attributes>> created_tensors;
+        // Iterate through each sub-node in the full JSON
         if (j.contains("nodes") && j["nodes"].is_array()) {
-            for (const auto &j_sub_node : j["nodes"]) {
+            for (auto j_sub_node : j["nodes"]) {
+                // Create a JSON object for inputs
+                json inputs;
+
+                // Iterate through each input of the sub-node
+                for (auto &[port_name, tensor_name] : j_sub_node["inputs"].items()) {
+                    // Add the input to the inputs JSON object
+                    inputs.push_back({port_name, j["tensors"][tensor_name]});
+                }
+
+                // Create a JSON object for outputs
+                json outputs;
+
+                // Iterate through each output of the sub-node
+                for (auto &[port_name, tensor_name] : j_sub_node["outputs"].items()) {
+                    // Add the output to the outputs JSON object
+                    outputs.push_back({port_name, j["tensors"][tensor_name]});
+                }
+
+                // Replace the original inputs and outputs of the sub-node with the new JSON objects
+                j_sub_node["inputs"]  = inputs;
+                j_sub_node["outputs"] = outputs;
+
+                auto check_if_pre_created_tensor = [&created_tensors](std::shared_ptr<Tensor_attributes> t) {
+                    if (t == nullptr) {
+                        return t;
+                    }
+
+                    if (created_tensors.find(t->get_name()) == created_tensors.end()) {
+                        created_tensors.insert({t->get_name(), t});
+                        return t;
+                    } else {
+                        return created_tensors[t->get_name()];
+                    }
+                };
+
+#define CHECK_TENSORS(attributes)                                      \
+    for (const auto &[key, tensor] : attributes.inputs) {              \
+        attributes.inputs[key] = check_if_pre_created_tensor(tensor);  \
+    }                                                                  \
+    for (const auto &[key, tensor] : attributes.outputs) {             \
+        attributes.outputs[key] = check_if_pre_created_tensor(tensor); \
+    }
+
                 if (j_sub_node.contains("tag") && j_sub_node["tag"].is_string()) {
                     auto tag = j_sub_node["tag"].get<std::string>();
                     if (tag == "CONV_FPROP") {
                         auto conv_fprop_attributes = j_sub_node.get<Conv_fprop_attributes>();
+                        CHECK_TENSORS(conv_fprop_attributes);
                         sub_nodes.emplace_back(
-                            std::make_unique<ConvolutionNode>(std::move(conv_fprop_attributes), detail::Context()));
+                            std::make_unique<ConvolutionNode>(std::move(conv_fprop_attributes), context));
                     } else if (tag == "POINTWISE") {
                         auto pointwise_attributes = j_sub_node.get<Pointwise_attributes>();
+                        CHECK_TENSORS(pointwise_attributes);
                         sub_nodes.emplace_back(
-                            std::make_unique<PointwiseNode>(std::move(pointwise_attributes), detail::Context()));
+                            std::make_unique<PointwiseNode>(std::move(pointwise_attributes), context));
                     } else if (tag == "REDUCTION") {
                         auto reduction_attributes = j_sub_node.get<Reduction_attributes>();
+                        CHECK_TENSORS(reduction_attributes);
                         sub_nodes.emplace_back(
-                            std::make_unique<ReductionNode>(std::move(reduction_attributes), detail::Context()));
+                            std::make_unique<ReductionNode>(std::move(reduction_attributes), context));
                     } else if (tag == "SDPA_FWD") {
                         auto sdpa_attributes = j_sub_node.get<SDPA_attributes>();
-                        sub_nodes.emplace_back(
-                            std::make_unique<SDPANode>(std::move(sdpa_attributes), detail::Context()));
+                        CHECK_TENSORS(sdpa_attributes);
+                        sub_nodes.emplace_back(std::make_unique<SDPANode>(std::move(sdpa_attributes), context));
                     } else if (tag == "SDPA_BWD") {
                         auto sdpa_bwd_attributes = j_sub_node.get<SDPA_backward_attributes>();
+                        CHECK_TENSORS(sdpa_bwd_attributes);
                         sub_nodes.emplace_back(
-                            std::make_unique<SDPABackwardNode>(std::move(sdpa_bwd_attributes), detail::Context()));
+                            std::make_unique<SDPABackwardNode>(std::move(sdpa_bwd_attributes), context));
+                    } else if (tag == "MATMUL") {
+                        auto matmul_attributes = j_sub_node.get<Matmul_attributes>();
+                        CHECK_TENSORS(matmul_attributes);
+                        sub_nodes.emplace_back(std::make_unique<MatmulNode>(std::move(matmul_attributes), context));
                     }
                 }
+#undef CHECK_TENSORS
             }
         }
 
         return {error_code_t::OK, ""};
     }
+#endif
 
     std::string
     print(void) const {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         std::stringstream ss;
         json j = *this;
-        ss << j.dump(4);
+        ss << j;
         return ss.str();
+#else
+        return "print is unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB";
+#endif
     }
 };
 
@@ -406,6 +568,19 @@ Graph::build_plan_at_index(cudnnHandle_t const &handle, int64_t plan_index) {
 inline error_t
 Graph::build_plans(cudnnHandle_t const &handle, BuildPlanPolicy_t const policy, bool const do_multithreaded_builds) {
     CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, policy, do_multithreaded_builds));
+    return {error_code_t::OK, ""};
+}
+
+inline error_t
+Graph::build(cudnnHandle_t const &handle,
+             std::vector<HeurMode_t> const &modes,
+             BuildPlanPolicy_t const policy,
+             bool const do_multithreaded_builds) {
+    CHECK_CUDNN_FRONTEND_ERROR(this->validate());
+    CHECK_CUDNN_FRONTEND_ERROR(this->build_operation_graph(handle));
+    CHECK_CUDNN_FRONTEND_ERROR(this->create_execution_plans(modes));
+    CHECK_CUDNN_FRONTEND_ERROR(this->check_support(handle));
+    CHECK_CUDNN_FRONTEND_ERROR(this->build_plans(handle, policy, do_multithreaded_builds));
     return {error_code_t::OK, ""};
 }
 

@@ -94,7 +94,7 @@ def test_rmsnorm(param_extract):
     print("Building cudnn graph")
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     graph = cudnn.pygraph(
@@ -147,10 +147,12 @@ def test_rmsnorm(param_extract):
         handle=handle,
     )
 
+    torch.cuda.synchronize()
     print("Comparing with reference")
     torch.testing.assert_close(Y_expected, Y_actual, atol=0.03125, rtol=0.03125)
     torch.testing.assert_close(inv_var_expected, inv_var_actual, atol=0.005, rtol=0.005)
     print("Success!!")
+    cudnn.destroy_handle(handle)
 
     target = torch.randn_like(Y_expected)
     criterion = nn.MSELoss()
@@ -164,7 +166,7 @@ def test_rmsnorm(param_extract):
     loss.backward()
 
     handle = cudnn.create_handle()
-    stream = torch.cuda.Stream().cuda_stream
+    stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=handle, stream=stream)
 
     bwd_graph = cudnn.pygraph(
@@ -223,12 +225,14 @@ def test_rmsnorm(param_extract):
         handle=handle,
     )
 
+    torch.cuda.synchronize()
     print("Comparing with reference")
     torch.testing.assert_close(x_gpu.grad, DX_actual, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(scale_gpu.grad, DScale_actual, atol=5e-4, rtol=5e-4)
     if has_bias:
         torch.testing.assert_close(bias_gpu.grad, Dbias_actual, atol=5e-4, rtol=5e-4)
     print("Success!!")
+    cudnn.destroy_handle(handle)
 
 
 if __name__ == "__main__":

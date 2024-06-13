@@ -16,7 +16,7 @@ void *cudnn_dlhandle = nullptr;
 namespace python_bindings {
 
 // Raise C++ exceptions corresponding to C++ FE error codes.
-// Pybinds will automatically convert C++ exceptions to pythpn exceptions.
+// Pybinds will automatically convert C++ exceptions to python exceptions.
 void
 throw_if(bool const cond, cudnn_frontend::error_code_t const error_code, std::string const &error_msg) {
     if (cond == false) return;
@@ -37,7 +37,7 @@ throw_if(bool const cond, cudnn_frontend::error_code_t const error_code, std::st
         case cudnn_frontend::error_code_t::GRAPH_EXECUTION_FAILED:
             throw std::runtime_error(error_msg);
         case cudnn_frontend::error_code_t::HEURISTIC_QUERY_FAILED:
-            throw std::runtime_error(error_msg);
+            throw cudnn_frontend::cudnnGraphNotSupportedException(error_msg.c_str());
         case cudnn_frontend::error_code_t::CUDNN_BACKEND_API_FAILED:
             throw std::runtime_error(error_msg);
         case cudnn_frontend::error_code_t::CUDA_API_FAILED:
@@ -49,6 +49,8 @@ throw_if(bool const cond, cudnn_frontend::error_code_t const error_code, std::st
         case cudnn_frontend::error_code_t::GRAPH_NOT_SUPPORTED:
             throw cudnn_frontend::cudnnGraphNotSupportedException(error_msg.c_str());
         case cudnn_frontend::error_code_t::HANDLE_ERROR:
+            throw std::runtime_error(error_msg);
+        case cudnn_frontend::error_code_t::INVALID_VALUE:
             throw std::runtime_error(error_msg);
     }
 }

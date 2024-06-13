@@ -28,3 +28,8 @@ def pytest_addoption(parser):
     parser.addoption(
         "--mha_h_v", default=None, help="[test_mhas.py] value number of heads"
     )
+    parser.addoption(
+        "--mha_deterministic",
+        default=None,
+        help="[test_mhas.py] force deterministic algorithm",
+    )

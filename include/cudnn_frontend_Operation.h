@@ -389,8 +389,12 @@ class OperationBuilder_v8 {
     build_pointwise_op() {
         auto status = CUDNN_STATUS_SUCCESS;
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j                   = m_operation.pointwise_mode;
         m_operation.operationTag = j;
+#else
+        m_operation.operationTag = std::to_string((int)m_operation.pointwise_mode);
+#endif
 
         status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
                                        CUDNN_ATTR_OPERATION_POINTWISE_PW_DESCRIPTOR,

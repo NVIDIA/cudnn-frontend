@@ -4,7 +4,7 @@
 #include "../graph_helpers.h"
 
 namespace cudnn_frontend::graph {
-
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
 NLOHMANN_JSON_SERIALIZE_ENUM(BN_finalize_attributes::input_names,
                              {
                                  {BN_finalize_attributes::input_names::SUM, "SUM"},
@@ -248,6 +248,15 @@ NLOHMANN_JSON_SERIALIZE_ENUM(Reduction_attributes::input_names,
 
 NLOHMANN_JSON_SERIALIZE_ENUM(Reduction_attributes::output_names, {{Reduction_attributes::output_names::Y, "Y"}})
 
+NLOHMANN_JSON_SERIALIZE_ENUM(Resample_attributes::input_names,
+                             {
+                                 {Resample_attributes::input_names::X, "X"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(Resample_attributes::output_names,
+                             {{Resample_attributes::output_names::Y, "Y"},
+                              {Resample_attributes::output_names::Index, "Index"}})
+
 NLOHMANN_JSON_SERIALIZE_ENUM(Reshape_attributes::input_names,
                              {
                                  {Reshape_attributes::input_names::X, "X"},
@@ -392,5 +401,5 @@ from_json(const nlohmann::json& j, Tensor_attributes& ta) {
         ta.pass_by_value = j.at("pass_by_value");
     }
 }
-
+#endif
 }  // namespace cudnn_frontend::graph

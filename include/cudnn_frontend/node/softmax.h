@@ -122,10 +122,12 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
     }
+#endif
 };
 
 inline void

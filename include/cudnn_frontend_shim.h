@@ -277,6 +277,19 @@ get_last_error_string(char *message, size_t size) {
 #endif
 }
 
+inline std::string
+get_last_error_string_() {
+    const size_t size = 65535;
+
+    std::string message;
+
+    message.reserve(size);
+
+    get_last_error_string(message.data(), size);
+
+    return message;
+}
+
 inline cudnnStatus_t
 set_stream(cudnnHandle_t handle, cudaStream_t stream) {
     NV_FE_CALL_TO_BACKEND(set_stream, cudnnSetStream, handle, stream);

@@ -88,12 +88,27 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
         getLogger() << "[cudnn_frontend] INFO: " << "Building PointwiseNode operations " << attributes.name << "..."
                     << std::endl;
 
-        auto pointwise_descriptor = cudnn_frontend::PointwiseDescBuilder()
-                                        .setAxis(attributes.get_axis().value_or(-1))
-                                        .setReluLowerClipSlope(attributes.relu_lower_clip_slope.value_or(0.0))
-                                        .setComputeType(attributes.compute_data_type)
-                                        .setMode(attributes.mode)
-                                        .build();
+        auto&& pointwise_descriptor_builder = cudnn_frontend::PointwiseDescBuilder();
+
+        if (attributes.get_axis().has_value()) {
+            pointwise_descriptor_builder.setAxis(attributes.get_axis().value());
+        }
+
+        if (attributes.relu_lower_clip_slope.has_value()) {
+            pointwise_descriptor_builder.setReluLowerClipSlope(attributes.relu_lower_clip_slope.value());
+        }
+
+        if (attributes.relu_lower_clip.has_value()) {
+            pointwise_descriptor_builder.setReluLowerClip(attributes.relu_lower_clip.value());
+        }
+
+        if (attributes.relu_upper_clip.has_value()) {
+            pointwise_descriptor_builder.setReluUpperClip(attributes.relu_upper_clip.value());
+        }
+
+        pointwise_descriptor_builder.setComputeType(attributes.compute_data_type);
+        pointwise_descriptor_builder.setMode(attributes.mode);
+        auto pointwise_descriptor = pointwise_descriptor_builder.build();
 
         auto const port_count = get_pointwise_mode_port_count(attributes.mode);
 
@@ -153,11 +168,13 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"({"tag": "POINTWISE"})"_json);
     }
+#endif
 };
 
 inline void
@@ -182,7 +199,13 @@ INode::pointwise(std::shared_ptr<Tensor_attributes> a,
 
 inline std::shared_ptr<Tensor_attributes>
 INode::pointwise(std::shared_ptr<Tensor_attributes> a, Pointwise_attributes attributes) {
+    if (attributes.name.empty()) {
+        attributes.name += std::to_string(sub_nodes.size());
+    }
     attributes.inputs[Pointwise_attributes::input_names::IN_0] = a;
+    if (a->get_name().empty()) {
+        a->set_name(attributes.name + "::IN_0");
+    };
     auto OUT_0 = attributes.outputs[Pointwise_attributes::output_names::OUT_0] =
         output_tensor(attributes.name + "::OUT_0");
 
@@ -194,8 +217,17 @@ inline std::shared_ptr<Tensor_attributes>
 INode::pointwise(std::shared_ptr<Tensor_attributes> a,
                  std::shared_ptr<Tensor_attributes> b,
                  Pointwise_attributes attributes) {
+    if (attributes.name.empty()) {
+        attributes.name += std::to_string(sub_nodes.size());
+    }
     attributes.inputs[Pointwise_attributes::input_names::IN_0] = a;
     attributes.inputs[Pointwise_attributes::input_names::IN_1] = b;
+    if (a->get_name().empty()) {
+        a->set_name(attributes.name + "::IN_0");
+    };
+    if (b->get_name().empty()) {
+        b->set_name(attributes.name + "::IN_1");
+    };
     auto OUT_0 = attributes.outputs[Pointwise_attributes::output_names::OUT_0] =
         output_tensor(attributes.name + "::OUT_0");
 
@@ -208,9 +240,21 @@ INode::pointwise(std::shared_ptr<Tensor_attributes> a,
                  std::shared_ptr<Tensor_attributes> b,
                  std::shared_ptr<Tensor_attributes> c,
                  Pointwise_attributes attributes) {
+    if (attributes.name.empty()) {
+        attributes.name += std::to_string(sub_nodes.size());
+    }
     attributes.inputs[Pointwise_attributes::input_names::IN_0] = a;
     attributes.inputs[Pointwise_attributes::input_names::IN_1] = b;
     attributes.inputs[Pointwise_attributes::input_names::IN_2] = c;
+    if (a->get_name().empty()) {
+        a->set_name(attributes.name + "::IN_0");
+    };
+    if (b->get_name().empty()) {
+        b->set_name(attributes.name + "::IN_1");
+    };
+    if (c->get_name().empty()) {
+        c->set_name(attributes.name + "::IN_2");
+    };
     auto OUT_0 = attributes.outputs[Pointwise_attributes::output_names::OUT_0] =
         output_tensor(attributes.name + "::OUT_0");
 

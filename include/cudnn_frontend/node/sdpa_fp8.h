@@ -267,11 +267,13 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"({"tag": "SDPA_FP8_FWD"})"_json);
     }
+#endif
 };
 
 }  // namespace cudnn_frontend::graph

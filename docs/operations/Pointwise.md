@@ -34,6 +34,15 @@ Pointwise_attributes&
 set_axis(int64_t)
 
 Pointwise_attributes&
+set_relu_lower_clip(float)
+
+Pointwise_attributes&
+set_relu_upper_clip(float)
+
+Pointwise_attributes&
+set_relu_lower_clip_slope(float)
+
+Pointwise_attributes&
 set_name(std::string const&)
 
 Pointwise_attributes&

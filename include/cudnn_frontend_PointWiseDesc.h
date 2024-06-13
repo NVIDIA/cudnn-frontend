@@ -56,8 +56,13 @@ class PointWiseDesc_v8 : public BackendDescriptor {
     std::string
     describe() const override {
         std::stringstream ss;
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         ss << "CUDNN_BACKEND_POINTWISE_DESCRIPTOR :" << " Mode: " << json{mode} << " Math precision "
            << json{compute_type};
+#else
+        ss << "CUDNN_BACKEND_POINTWISE_DESCRIPTOR :" << " Mode: " << int(mode) << " Math precision "
+           << int(compute_type);
+#endif
         return ss.str();
     }
 

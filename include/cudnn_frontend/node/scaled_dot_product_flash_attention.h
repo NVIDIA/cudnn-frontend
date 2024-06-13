@@ -75,28 +75,38 @@ class SDPANode : public NodeCRTP<SDPANode> {
 #undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
 
         // validate backend limitations for the operation
+        // clang-format off
         int64_t s_q  = attributes.inputs.at(input_names::Q)->get_dim()[2];
+        int64_t s_kv = attributes.inputs.at(input_names::K)->get_dim()[2];
         int64_t h_q  = attributes.inputs.at(input_names::Q)->get_dim()[1];
         int64_t h_k  = attributes.inputs.at(input_names::K)->get_dim()[1];
         int64_t h_v  = attributes.inputs.at(input_names::V)->get_dim()[1];
         int64_t d_qk = attributes.inputs.at(input_names::Q)->get_dim()[3];
         int64_t d_v  = attributes.inputs.at(input_names::V)->get_dim()[3];
+
+        bool const is_ragged = attributes.inputs.at(input_names::Q)->get_ragged_offset() ||
+                               attributes.inputs.at(input_names::K)->get_ragged_offset() ||
+                               attributes.inputs.at(input_names::V)->get_ragged_offset() ||
+                               attributes.outputs.at(output_names::O)->get_ragged_offset();
+
+        auto const& bias_mask = attributes.inputs.find(input_names::Bias);
+        bool const is_bias   = (bias_mask != attributes.inputs.end() && bias_mask->second != nullptr);
+
+        auto const& dropout_mask     = attributes.inputs.find(input_names::Dropout_mask);
+        bool const is_dropout_custom = (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
+        bool const is_dropout        = attributes.dropout_probability.has_value() || is_dropout_custom;
+
+        // validation TODO:
+        //    - validate stats has valid dims
+
+        // validate basic dimension requirements
+        RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 256) || (d_qk % 8 != 0) || (d_v > 256) || (d_v % 8 != 0),
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "hidden_dim shoud be less than 256 and hidden_dim should be multiple of 8");
+
         RETURN_CUDNN_FRONTEND_ERROR_IF((h_q % h_k != 0) || (h_q % h_v != 0),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "For group-query attention, number of heads for key and query must be a factor "
-                                       "of number of heads for query");
-
-        if (detail::get_backend_version() >= 90000) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                (d_qk > 256) || (d_qk % 8 != 0) || (d_v > 256) || (d_v % 8 != 0),
-                error_code_t::GRAPH_NOT_SUPPORTED,
-                "Num hidden_dim shoud be less than 256 and hidden_dim should be multiple of 8");
-        } else {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                (d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
-                error_code_t::GRAPH_NOT_SUPPORTED,
-                "Num hidden_dim shoud be less than 128 and hidden_dim should be multiple of 8");
-        }
+                                       "For group-query attention, number of heads for key and query must be a factor of number of heads for query");
 
         // validate options for attn_scale
         auto const& attn_scale    = attributes.inputs.find(input_names::Attn_scale);
@@ -106,36 +116,9 @@ class SDPANode : public NodeCRTP<SDPANode> {
                                        "attn_scale with tensor and value cannot be set at the same time.");
 
         // validate options for bias mask
-        auto bias_mask = attributes.inputs.find(input_names::Bias);
-        if (bias_mask != attributes.inputs.end() && bias_mask->second != nullptr) {
-            auto bias_mask_dtype = bias_mask->second->get_data_type();
-            RETURN_CUDNN_FRONTEND_ERROR_IF((bias_mask_dtype == DataType_t::BOOLEAN),
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Bias mask data type cannot be boolean");
-        }
-
-        auto const& v_dim = attributes.inputs.at(input_names::V)->get_dim();
-        auto s_kv         = v_dim[2];
-        if ((s_kv % 64 != 0) && (!(attributes.padding_mask)) && (detail::get_backend_version() < 90000)) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF((detail::get_backend_version() <= 8905),
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "s_kv not a multiple of 64 required cudnn version atleast 8.9.5");
-            auto const& dropout_mask = attributes.inputs.find(input_names::Dropout_mask);
-            bool const has_dropout_mask =
-                (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
-            bool const has_dropout = attributes.dropout_probability.has_value() || has_dropout_mask;
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                has_dropout,
-                error_code_t::GRAPH_NOT_SUPPORTED,
-                "s_kv not a multiple of 64 with dropout enabled is not supported with cudnn version below 9.0.0");
-        }
-
-        if (((s_kv % 64 != 0) || (d_qk % 64 != 0)) && (detail::get_backend_version() <= 8905)) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                true,
-                error_code_t::GRAPH_NOT_SUPPORTED,
-                "s_kv not a multiple of 64 or d not a multiple of 64 is not supported with cudnn version below 8.9.6");
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(is_bias && (bias_mask->second->get_data_type() == DataType_t::BOOLEAN),
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Bias mask data type cannot be boolean");
 
         // validate options for padding mask
         auto const& seq_len_q     = attributes.inputs.find(input_names::SEQ_LEN_Q);
@@ -149,31 +132,69 @@ class SDPANode : public NodeCRTP<SDPANode> {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "seq_len_q and seq_len_kv needs to be set only if padding mask is enabled.");
 
-        // validate options for dropout mask
-        auto const& dropout_mask    = attributes.inputs.find(input_names::Dropout_mask);
-        bool const has_dropout_mask = (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.dropout_probability.has_value() && has_dropout_mask,
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "Using both, custom dropout mask and internal-mask generation using dropout "
-                                       "probability, is ill-formed.");
+        // validate options for bottom right causal mask
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask && attributes.causal_mask_bottom_right,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Bottom right causal mask and causal mask cannot be both enabled");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            attributes.dropout_probability.has_value() && attributes.dropout_probability.value() == 1.0,
-            error_code_t::ATTRIBUTE_NOT_SET,
-            "Dropout probability cannot be 1 as corresponding scale wont be well formed.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && s_q > s_kv,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Bottom right causal mask does not support s_q > s_kv. Please virtually slice the Q tensor and pass it as s_q == s_kv");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && (is_bias || attributes.alibi_mask || is_ragged || attributes.padding_mask || is_dropout),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Bottom right causal mask is only supported with is_bias=False, is_alibi=False, is_ragged=False, padding_mask=False, is_dropout=False");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && ((s_q % 64 != 0) || (s_kv % 64 != 0)),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Bottom right causal mask is only supported with s_q multiple of 64, and s_kv multiple of 64");
+
+        // validate options for sliding window length
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && attributes.sliding_window_length.value() < 0,
+                                       error_code_t::INVALID_VALUE,
+                                       "Sliding window length should be greater than or equals to zero when set.");
+
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && (attributes.padding_mask || !attributes.causal_mask || is_dropout || is_bias || is_ragged),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Sliding window attention is only supported with padding_mask=False, causal_mask=True, is_dropout=False, is_bias=False, is_ragged=False");
+
+        // validate options for dropout mask
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.dropout_probability.has_value() && is_dropout_custom,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Using both, custom dropout mask and internal-mask generation using dropout probability, is ill-formed.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.dropout_probability.has_value() && attributes.dropout_probability.value() == 1.0,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Dropout probability cannot be 1 as corresponding scale wont be well formed.");
+
+        // version specific validation
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 8906 && ((s_kv % 64 != 0) || (d_qk % 64 != 0)),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For cuDNN version below 8.9.6, s_kv not a multiple of 64 or d not a multiple of 64 is not supported");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 8907 && (s_kv % 64 != 0) && (!(attributes.padding_mask)),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For cuDNN version below 8.9.7, s_kv not a multiple of 64 is not supported");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90000 && ((s_q % 64 != 0) || (s_kv % 64 != 0)) && (attributes.padding_mask || is_dropout),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For cuDNN version below 9.0.0, s_q/s_kv not a multiple of 64 with padding/dropout mask is not supported");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90000 && ((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0)),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For cuDNN version below 9.0.0, hidden_dim shoud be less than 128 and hidden_dim should be multiple of 8");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90200 && attributes.sliding_window_length.has_value(),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For cuDNN version below 9.2.0, sliding window attention is not supported");
+
 
         // validate that datatype is set for the graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_intermediate_data_type() == DataType_t::NOT_SET,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Intermediate tensor data type needs to be set as internal tensors require it.");
-
-        if (((s_q % 64 != 0) || (s_kv % 64 != 0)) && (attributes.padding_mask || has_dropout_mask) &&
-            (detail::get_backend_version() < 90000)) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(true,
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "s_q/s_kv not a multiple of 64 with padding/dropout mask is not supported "
-                                           "with cudnn version below 9.0.0");
-        }
+        // clang-format on
 
         CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
         return {error_code_t::OK, ""};
@@ -371,7 +392,77 @@ class SDPANode : public NodeCRTP<SDPANode> {
             last_output = padding_mask_output;
         }
 
-        if (attributes.causal_mask) {
+        if (attributes.causal_mask || attributes.causal_mask_bottom_right) {
+            std::shared_ptr<Tensor_attributes> row_index;
+
+            row_index = pointwise(last_output,
+                                  Pointwise_attributes()
+                                      .set_name("gen_row_idx_causal")
+                                      .set_mode(PointwiseMode_t::GEN_INDEX)
+                                      .set_axis(2)
+                                      .set_compute_data_type(DataType_t::INT32));
+            row_index->set_data_type(DataType_t::INT32);
+
+            if (attributes.causal_mask_bottom_right) {
+                if (attributes.inputs[input_names::SEQ_LEN_KV]) {
+                    row_index = pointwise(row_index,
+                                          attributes.inputs[input_names::SEQ_LEN_KV],
+                                          Pointwise_attributes()
+                                              .set_name("row_idx_add_skv")
+                                              .set_mode(PointwiseMode_t::ADD)
+                                              .set_compute_data_type(DataType_t::INT32));
+                } else {
+                    row_index = pointwise(row_index,
+                                          std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv)),
+                                          Pointwise_attributes()
+                                              .set_name("row_idx_add_skv")
+                                              .set_mode(PointwiseMode_t::ADD)
+                                              .set_compute_data_type(DataType_t::INT32));
+                }
+                row_index->set_data_type(DataType_t::INT32);
+
+                if (attributes.inputs[input_names::SEQ_LEN_Q]) {
+                    row_index = pointwise(row_index,
+                                          attributes.inputs[input_names::SEQ_LEN_Q],
+                                          Pointwise_attributes()
+                                              .set_name("row_idx_add_sq_sub_sq")
+                                              .set_mode(PointwiseMode_t::SUB)
+                                              .set_compute_data_type(DataType_t::INT32));
+                } else {
+                    row_index = pointwise(row_index,
+                                          std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q)),
+                                          Pointwise_attributes()
+                                              .set_name("row_idx_add_sq_sub_sq")
+                                              .set_mode(PointwiseMode_t::SUB)
+                                              .set_compute_data_type(DataType_t::INT32));
+                }
+                row_index->set_data_type(DataType_t::INT32);
+            }
+
+            auto const& col_index = pointwise(last_output,
+                                              Pointwise_attributes()
+                                                  .set_name("gen_col_idx_causal")
+                                                  .set_mode(PointwiseMode_t::GEN_INDEX)
+                                                  .set_axis(3)
+                                                  .set_compute_data_type(DataType_t::INT32));
+            col_index->set_data_type(DataType_t::INT32);
+
+            auto const& bool_mask = pointwise(row_index,
+                                              col_index,
+                                              Pointwise_attributes()
+                                                  .set_name("row_greater_than_col")
+                                                  .set_mode(PointwiseMode_t::CMP_GE)
+                                                  .set_compute_data_type(DataType_t::BOOLEAN));
+            bool_mask->set_data_type(DataType_t::BOOLEAN);
+
+            last_output =
+                pointwise(last_output,
+                          std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest()),
+                          bool_mask,
+                          Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT));
+        }
+
+        if (attributes.sliding_window_length.has_value()) {
             auto row_index_attributes =
                 Pointwise_attributes().set_name("gen_row_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(2);
             auto const& row_index_output = pointwise(last_output, row_index_attributes);
@@ -380,22 +471,38 @@ class SDPANode : public NodeCRTP<SDPANode> {
                 Pointwise_attributes().set_name("gen_col_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(3);
             auto const& col_index_output = pointwise(last_output, col_index_attributes);
 
+            // sliding window length parameter should be of float type
+            auto const& sliding_window_length =
+                std::make_shared<Tensor_attributes>((float)attributes.sliding_window_length.value());
+
+            auto add_col_attributes = Pointwise_attributes()
+                                          .set_name("add_window_len")
+                                          .set_mode(PointwiseMode_t::ADD)
+                                          .set_compute_data_type(DataType_t::FLOAT)
+                                          .set_axis(3);
+
+            auto const& col_index_lower_output = pointwise(col_index_output, sliding_window_length, add_col_attributes);
+
             auto greater_than_attributes = Pointwise_attributes()
-                                               .set_name("row_greater_than_col")
-                                               .set_mode(PointwiseMode_t::CMP_GE)
+                                               .set_name("greaterthan_row<col+ws")
+                                               .set_mode(PointwiseMode_t::CMP_GT)
                                                .set_compute_data_type(DataType_t::BOOLEAN);
-            auto const& row_greater_than_col_output =
-                pointwise(row_index_output, col_index_output, greater_than_attributes);
-            row_greater_than_col_output->set_data_type(DataType_t::BOOLEAN);
+
+            auto const& row_lesser_than_col_ws_output =
+                pointwise(col_index_lower_output, row_index_output, greater_than_attributes);
+
+            row_lesser_than_col_ws_output->set_data_type(DataType_t::BOOLEAN);
 
             // Lower attributes to binary select attributes
-            auto negative_inf_causal = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
+            auto negative_inf_swa = std::make_shared<Tensor_attributes>(-1024.0f * 1024.0f * 1024.0f);
 
             auto binary_select_attributes =
                 Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT);
-            auto const& causal_mask_output =
-                pointwise(last_output, negative_inf_causal, row_greater_than_col_output, binary_select_attributes);
-            last_output = causal_mask_output;
+
+            auto const& swa_mask_output =
+                pointwise(last_output, negative_inf_swa, row_lesser_than_col_ws_output, binary_select_attributes);
+
+            last_output = swa_mask_output;
         }
 
         // Lower attributes to softmax attributes
@@ -534,11 +641,13 @@ class SDPANode : public NodeCRTP<SDPANode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"({"tag": "SDPA_FWD"})"_json);
     }
+#endif
 };
 
 class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
@@ -610,27 +719,39 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
 #undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
 
         // validate backend limitations for the operation
-        int64_t h_q  = attributes.inputs.at(input_names::Q)->get_dim()[1];
+        // clang-format off
         int64_t s_q  = attributes.inputs.at(input_names::Q)->get_dim()[2];
+        int64_t s_kv = attributes.inputs.at(input_names::V)->get_dim()[2];
+        int64_t h_q  = attributes.inputs.at(input_names::Q)->get_dim()[1];
         int64_t h_k  = attributes.inputs.at(input_names::K)->get_dim()[1];
         int64_t h_v  = attributes.inputs.at(input_names::V)->get_dim()[1];
         int64_t d_qk = attributes.inputs.at(input_names::Q)->get_dim()[3];
-        int64_t s_kv = attributes.inputs.at(input_names::V)->get_dim()[2];
         int64_t d_v  = attributes.inputs.at(input_names::V)->get_dim()[3];
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            (s_q < 64) && detail::get_backend_version() < 90000,
-            error_code_t::GRAPH_NOT_SUPPORTED,
-            "Sequence length must be greater than or equal to 64 for cudnn version prior to v9.0.0");
+        bool const is_ragged = attributes.inputs.at(input_names::Q)->get_ragged_offset() ||
+                               attributes.inputs.at(input_names::K)->get_ragged_offset() ||
+                               attributes.inputs.at(input_names::V)->get_ragged_offset() ||
+                               attributes.inputs.at(input_names::O)->get_ragged_offset();
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF((h_q % h_k != 0) || (h_q % h_v != 0),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "For group-query attention, number of heads for key and query must be a factor "
-                                       "of number of heads for query");
+        auto const& bias_mask = attributes.inputs.find(input_names::Bias);
+        bool const is_bias   = (bias_mask != attributes.inputs.end() && bias_mask->second != nullptr);
 
+        auto const& dropout_mask     = attributes.inputs.find(input_names::Dropout_mask);
+        bool const is_dropout_custom = (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
+        bool const is_dropout        = attributes.dropout_probability.has_value() || is_dropout_custom;
+
+        // validation TODO:
+        //    - validate stats has valid dims
+        //    - validate Q and dQ have the same dims
+
+        // validate basic dimension requirements
         RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "Num hidden_dim shoud be less than 128 and hidden_dim should be multiple of 8");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF((h_q % h_k != 0) || (h_q % h_v != 0),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For group-query attention, number of heads for key and query must be a factor of number of heads for query");
 
         // validate options for attn_scale
         auto const& attn_scale    = attributes.inputs.find(input_names::Attn_scale);
@@ -640,14 +761,9 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                                        "attn_scale with tensor and value cannot be set at the same time.");
 
         // validate options for bias mask
-        auto bias_mask      = attributes.inputs.find(input_names::Bias);
-        bool const has_bias = (bias_mask != attributes.inputs.end() && bias_mask->second != nullptr);
-        if (has_bias) {
-            auto bias_mask_dtype = bias_mask->second->get_data_type();
-            RETURN_CUDNN_FRONTEND_ERROR_IF((bias_mask_dtype == DataType_t::BOOLEAN),
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Bias mask data type cannot be boolean");
-        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(is_bias && (bias_mask->second->get_data_type() == DataType_t::BOOLEAN),
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Bias mask data type cannot be boolean");
 
         // validate options for padding mask
         auto const& seq_len_q     = attributes.inputs.find(input_names::SEQ_LEN_Q);
@@ -661,31 +777,68 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "seq_len_q and seq_len_kv needs to be set only if padding mask is enabled.");
 
-        // validate options for dropout mask
-        auto const& dropout_mask    = attributes.inputs.find(input_names::Dropout_mask);
-        bool const has_dropout_mask = (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.dropout_probability.has_value() && has_dropout_mask,
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "Using both, custom dropout mask and internal-mask generation using dropout "
-                                       "probability, is ill-formed.");
+        // validate options for bottom right causal mask
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask && attributes.causal_mask_bottom_right,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Bottom right causal mask and causal mask cannot be both enabled");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            attributes.dropout_probability.has_value() && attributes.dropout_probability.value() == 1.0,
-            error_code_t::ATTRIBUTE_NOT_SET,
-            "Dropout probability cannot be 1 as corresponding scale wont be well formed.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && s_q > s_kv,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Bottom right causal mask does not support s_q > s_kv. Please virtually slice the Q tensor and pass it as s_q == s_kv");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && (is_bias || attributes.alibi_mask || is_ragged || attributes.padding_mask || is_dropout),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Bottom right causal mask is only supported with is_bias=False, is_alibi=False, is_ragged=False, padding_mask=False, is_dropout=False");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && ((s_q % 64 != 0) || (s_kv % 64 != 0)),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Bottom right causal mask is only supported with s_q multiple of 64, and s_kv multiple of 64");
+
+        // validate options for sliding window length
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && attributes.sliding_window_length.value() < 0,
+                                       error_code_t::INVALID_VALUE,
+                                       "Sliding window length should be greater than or equals to zero when set.");
+
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && (attributes.padding_mask || !attributes.causal_mask || is_dropout || is_bias || is_ragged),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Sliding window attention is only supported with padding_mask=False, causal_mask=True, is_dropout=False, is_bias=False, is_ragged=False");
+
+        // validate options for dropout mask
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.dropout_probability.has_value() && is_dropout_custom,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Using both, custom dropout mask and internal-mask generation using dropout probability, is ill-formed.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.dropout_probability.has_value() && attributes.dropout_probability.value() == 1.0,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Dropout probability cannot be 1 as corresponding scale wont be well formed.");
+
+        // version specific validation
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 8906 && ((s_kv % 64 != 0) || (d_qk % 64 != 0)),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For cuDNN version below 8.9.6, s_kv not a multiple of 64 or d not a multiple of 64 is not supported");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 8907 && (s_kv % 64 != 0) && (!(attributes.padding_mask)),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For cuDNN version below 8.9.7, s_kv not a multiple of 64 is not supported");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90000 && ((s_q % 64 != 0) || (s_kv % 64 != 0)) && (attributes.padding_mask || is_dropout),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For cuDNN version below 9.0.0, s_q/s_kv not a multiple of 64 with padding/dropout mask is not supported");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90000 && (s_q < 64),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+            "                          Sequence length must be greater than or equal to 64 for cudnn version prior to v9.0.0");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90200 && attributes.sliding_window_length.has_value(),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For cuDNN version below 9.2.0, sliding window attention is not supported");
 
         // validate that datatype is set for the graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_intermediate_data_type() == DataType_t::NOT_SET,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Intermediate tensor data type needs to be set as internal tensors require it.");
-
-        if (((s_q % 64 != 0) || (s_kv % 64 != 0)) && (attributes.padding_mask || has_dropout_mask) &&
-            (detail::get_backend_version() < 90000)) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(true,
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "s_q/s_kv not a multiple of 64 with padding/dropout mask is not supported "
-                                           "with cudnn version below 9.0.0");
-        }
+        // clang-format on
 
         CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
         return {error_code_t::OK, ""};
@@ -783,53 +936,60 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
 
         // ---------------------input tensor workarounds---------------------------
 
-        // workspace optimization is only supported on
-        // cudnn verision >= 8.9.5
-        // device version >= hopper
-        // sizeof(dp tensor) <= max_dp_workspace
-
-        // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=unset  - enable workspace opt. until the default 256MB limit.
-        // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=-1     - always enable workspace opt.
-        // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=0      - always disable workspace opt.
-        // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=n      - enable workspace opt. until the n byte limit
         bool use_workspace_opt = false;
 
-        struct cudaDeviceProp prop;
-        CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, 0));
-        if ((detail::get_backend_version() >= 8905 && prop.major >= 9) || (detail::get_backend_version() >= 9000)) {
-            // default upper limit for workspace 256MB
-            int64_t max_dp_workspace_bytes = 256 * 1024 * 1024;
+        if (detail::get_backend_version() >= 8905 && detail::get_backend_version() < 90000) {
+            // workspace optimization is enabled by default when:
+            //   8.9.5 <= cudnn version < 9.0.0
+            //   device >= hopper
+            //   batch * num_heads * seq_len_q * seq_len_kv * 2 <= dP workspace limit
+            //
+            // This following environment variable allows you to control the dP workspace limit.
+            // From cuDNN version 9.0.0, this option is obsolete will be ignored.
+            // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=unset  - enable workspace opt. until the default 256MB limit.
+            // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=-1     - always enable workspace opt.
+            // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=0      - always disable workspace opt.
+            // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=n      - enable workspace opt. until the n byte limit
+            struct cudaDeviceProp prop;
+            CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, 0));
 
-            // allow setting the upper limit with envvars
-            char* env_dp_workspace_limit_char = std::getenv("CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT");
-            if (env_dp_workspace_limit_char) {
-                try {
-                    std::string env_dp_workspace_limit_str(env_dp_workspace_limit_char);
-                    max_dp_workspace_bytes = static_cast<int64_t>(std::stoll(env_dp_workspace_limit_str));
-                } catch (...) {
-                    RETURN_CUDNN_FRONTEND_ERROR_IF(true,
-                                                   error_code_t::ATTRIBUTE_NOT_SET,
-                                                   "Invalid argument for CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT "
-                                                   "(int64_t; in bytes)");
+            // hopper or above
+            if (prop.major >= 9) {
+                // default upper limit for workspace 256MB
+                int64_t max_dp_workspace_bytes = 256 * 1024 * 1024;
+
+                // allow setting the upper limit with envvars
+                char* env_dp_workspace_limit_char = std::getenv("CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT");
+                if (env_dp_workspace_limit_char) {
+                    try {
+                        std::string env_dp_workspace_limit_str(env_dp_workspace_limit_char);
+                        max_dp_workspace_bytes = static_cast<int64_t>(std::stoll(env_dp_workspace_limit_str));
+                    } catch (...) {
+                        RETURN_CUDNN_FRONTEND_ERROR_IF(true,
+                                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                                       "Invalid argument for CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT "
+                                                       "(int64_t; in bytes)");
+                    }
                 }
-            }
 
-            int64_t workspace_s_q               = ((s_q + 64 - 1) / 64) * 64;
-            int64_t workspace_s_kv              = ((s_kv + 64 - 1) / 64) * 64;
-            int64_t required_dp_workspace_bytes = b * h_q * workspace_s_q * workspace_s_kv * 2;
+                int64_t workspace_s_q               = ((s_q + 64 - 1) / 64) * 64;
+                int64_t workspace_s_kv              = ((s_kv + 64 - 1) / 64) * 64;
+                int64_t required_dp_workspace_bytes = b * h_q * workspace_s_q * workspace_s_kv * 2;
 
-            if (max_dp_workspace_bytes == -1) {
-                use_workspace_opt = true;
-            } else if (max_dp_workspace_bytes == 0) {
-                use_workspace_opt = false;
-            } else {
-                use_workspace_opt = (required_dp_workspace_bytes <= max_dp_workspace_bytes);
+                if (max_dp_workspace_bytes == -1) {
+                    use_workspace_opt = true;
+                } else if (max_dp_workspace_bytes == 0) {
+                    use_workspace_opt = false;
+                } else {
+                    use_workspace_opt = (required_dp_workspace_bytes <= max_dp_workspace_bytes);
+                }
             }
         }
 
-        // WAR force dP workspace implementation if dBias is enabled
-        // since dBias only works with workspace implementation
-        if (attributes.outputs[output_names::dBias]) {
+        // Force dP workspace implementation if:
+        //  - dBias is enabled (dBias is only supported on workspace implementation)
+        //  - the user force requests deterministic algorithm
+        if (attributes.outputs[output_names::dBias] || attributes.is_deterministic_algorithm) {
             use_workspace_opt = true;
         }
 
@@ -1000,38 +1160,74 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                           Pointwise_attributes().set_name("select_padding").set_mode(PointwiseMode_t::BINARY_SELECT));
         }
 
-        // Causal Mask DAG
-        if (attributes.causal_mask) {
-            auto row_idx_output = pointwise(last_output,
-                                            Pointwise_attributes()
-                                                .set_name("gen_row_idx_causal")
-                                                .set_mode(PointwiseMode_t::GEN_INDEX)
-                                                .set_axis(2)
-                                                .set_compute_data_type(DataType_t::INT32));
-            row_idx_output->set_data_type(DataType_t::INT32);
+        if (attributes.causal_mask || attributes.causal_mask_bottom_right) {
+            std::shared_ptr<Tensor_attributes> row_index;
 
-            auto col_idx_output = pointwise(last_output,
-                                            Pointwise_attributes()
-                                                .set_name("gen_col_idx_causal")
-                                                .set_mode(PointwiseMode_t::GEN_INDEX)
-                                                .set_axis(3)
-                                                .set_compute_data_type(DataType_t::INT32));
-            col_idx_output->set_data_type(DataType_t::INT32);
+            row_index = pointwise(last_output,
+                                  Pointwise_attributes()
+                                      .set_name("gen_row_idx_causal")
+                                      .set_mode(PointwiseMode_t::GEN_INDEX)
+                                      .set_axis(2)
+                                      .set_compute_data_type(DataType_t::INT32));
+            row_index->set_data_type(DataType_t::INT32);
 
-            auto causal_mask_output = pointwise(row_idx_output,
-                                                col_idx_output,
-                                                Pointwise_attributes()
-                                                    .set_name("gt_row_col_causal")
-                                                    .set_mode(PointwiseMode_t::CMP_GE)
-                                                    .set_compute_data_type(DataType_t::BOOLEAN));
-            causal_mask_output->set_data_type(DataType_t::BOOLEAN);
-            auto negative_inf_causal = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
+            if (attributes.causal_mask_bottom_right) {
+                if (attributes.inputs[input_names::SEQ_LEN_KV]) {
+                    row_index = pointwise(row_index,
+                                          attributes.inputs[input_names::SEQ_LEN_KV],
+                                          Pointwise_attributes()
+                                              .set_name("row_idx_add_skv")
+                                              .set_mode(PointwiseMode_t::ADD)
+                                              .set_compute_data_type(DataType_t::INT32));
+                } else {
+                    row_index = pointwise(row_index,
+                                          std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv)),
+                                          Pointwise_attributes()
+                                              .set_name("row_idx_add_skv")
+                                              .set_mode(PointwiseMode_t::ADD)
+                                              .set_compute_data_type(DataType_t::INT32));
+                }
+                row_index->set_data_type(DataType_t::INT32);
+
+                if (attributes.inputs[input_names::SEQ_LEN_Q]) {
+                    row_index = pointwise(row_index,
+                                          attributes.inputs[input_names::SEQ_LEN_Q],
+                                          Pointwise_attributes()
+                                              .set_name("row_idx_add_sq_sub_sq")
+                                              .set_mode(PointwiseMode_t::SUB)
+                                              .set_compute_data_type(DataType_t::INT32));
+                } else {
+                    row_index = pointwise(row_index,
+                                          std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q)),
+                                          Pointwise_attributes()
+                                              .set_name("row_idx_add_sq_sub_sq")
+                                              .set_mode(PointwiseMode_t::SUB)
+                                              .set_compute_data_type(DataType_t::INT32));
+                }
+                row_index->set_data_type(DataType_t::INT32);
+            }
+
+            auto const& col_index = pointwise(last_output,
+                                              Pointwise_attributes()
+                                                  .set_name("gen_col_idx_causal")
+                                                  .set_mode(PointwiseMode_t::GEN_INDEX)
+                                                  .set_axis(3)
+                                                  .set_compute_data_type(DataType_t::INT32));
+            col_index->set_data_type(DataType_t::INT32);
+
+            auto const& bool_mask = pointwise(row_index,
+                                              col_index,
+                                              Pointwise_attributes()
+                                                  .set_name("row_greater_than_col")
+                                                  .set_mode(PointwiseMode_t::CMP_GE)
+                                                  .set_compute_data_type(DataType_t::BOOLEAN));
+            bool_mask->set_data_type(DataType_t::BOOLEAN);
 
             last_output =
                 pointwise(last_output,
-                          negative_inf_causal,
-                          causal_mask_output,
-                          Pointwise_attributes().set_name("select_causal").set_mode(PointwiseMode_t::BINARY_SELECT));
+                          std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest()),
+                          bool_mask,
+                          Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT));
         }
 
         // last_output = last_output - stats
@@ -1089,8 +1285,52 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                 Pointwise_attributes().set_name("select_2nd_padding").set_mode(PointwiseMode_t::BINARY_SELECT));
         }
 
+        if (attributes.sliding_window_length.has_value()) {
+            auto row_index_attributes =
+                Pointwise_attributes().set_name("gen_row_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(2);
+            auto const& row_index_output = pointwise(last_output, row_index_attributes);
+
+            auto col_index_attributes =
+                Pointwise_attributes().set_name("gen_col_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(3);
+            auto const& col_index_output = pointwise(last_output, col_index_attributes);
+
+            // sliding window length parameter should be of float type
+            auto const& sliding_window_length =
+                std::make_shared<Tensor_attributes>((float)attributes.sliding_window_length.value());
+
+            auto add_col_attributes = Pointwise_attributes()
+                                          .set_name("add_window_len")
+                                          .set_mode(PointwiseMode_t::ADD)
+                                          .set_compute_data_type(DataType_t::FLOAT)
+                                          .set_axis(3);
+
+            auto const& col_index_lower_output = pointwise(col_index_output, sliding_window_length, add_col_attributes);
+
+            auto greater_than_attributes = Pointwise_attributes()
+                                               .set_name("greaterthan_row<col+ws")
+                                               .set_mode(PointwiseMode_t::CMP_GT)
+                                               .set_compute_data_type(DataType_t::BOOLEAN);
+
+            auto const& row_lesser_than_col_ws_output =
+                pointwise(col_index_lower_output, row_index_output, greater_than_attributes);
+
+            row_lesser_than_col_ws_output->set_data_type(DataType_t::BOOLEAN);
+
+            // Lower attributes to binary select attributes
+            auto negative_inf_swa = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
+
+            auto binary_select_attributes =
+                Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT);
+
+            auto const& swa_mask_output =
+                pointwise(last_output, negative_inf_swa, row_lesser_than_col_ws_output, binary_select_attributes);
+
+            last_output = swa_mask_output;
+        }
+
         // last_output = exp(last_output)
-        last_output  = pointwise(last_output, Pointwise_attributes().set_name("exp_s").set_mode(PointwiseMode_t::EXP));
+        last_output = pointwise(last_output, Pointwise_attributes().set_name("exp_s").set_mode(PointwiseMode_t::EXP));
+
         exp_s_output = last_output;
 
         // (optional) last_output = last_output * dropout rng_output
@@ -1302,11 +1542,13 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"({"tag": "SDPA_BWD"})"_json);
     }
+#endif
 };
 
 }  // namespace cudnn_frontend::graph

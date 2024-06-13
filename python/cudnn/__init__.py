@@ -6,6 +6,7 @@ import sysconfig
 from ._compiled_module import (
     backend_version,
     backend_version_string,
+    get_last_error_string,
     destroy_handle,
     norm_forward_phase,
     reduction_mode,
@@ -24,7 +25,7 @@ from ._compiled_module import (
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 
 def _tensor(

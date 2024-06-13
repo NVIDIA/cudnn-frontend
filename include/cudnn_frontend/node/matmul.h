@@ -63,6 +63,16 @@ class MatmulNode : public NodeCRTP<MatmulNode> {
                 c_tensor_dim[1] = a_tensor_dim[1];  // M
                 c_tensor_dim[2] = b_tensor_dim[2];  // N
             }
+
+            int64_t gemm_start_dim           = a_tensor_dim.size() - 2;
+            c_tensor_dim[gemm_start_dim]     = a_tensor_dim[gemm_start_dim];      // M
+            c_tensor_dim[gemm_start_dim + 1] = b_tensor_dim[gemm_start_dim + 1];  // N
+
+            // Broadcast the batches
+            for (int64_t i = 0; i < gemm_start_dim; ++i) {
+                c_tensor_dim[i] = std::max(a_tensor_dim[i], b_tensor_dim[i]);
+            }
+
             c_tensor->set_dim(c_tensor_dim);
         }
         if (c_tensor->get_stride().empty()) {
@@ -151,11 +161,13 @@ class MatmulNode : public NodeCRTP<MatmulNode> {
         return {error_code_t::OK, ""};
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
         j = attributes;
         j.update(R"( {"tag": "MATMUL"})"_json);
     }
+#endif
 };
 
 inline void
@@ -173,8 +185,42 @@ inline std::shared_ptr<Tensor_attributes>
 INode::matmul(std::shared_ptr<Tensor_attributes> a,
               std::shared_ptr<Tensor_attributes> b,
               Matmul_attributes attributes) {
+    if (attributes.name.empty()) {
+        attributes.name += std::to_string(sub_nodes.size());
+    }
     attributes.inputs[Matmul_attributes::input_names::A] = a;
     attributes.inputs[Matmul_attributes::input_names::B] = b;
+
+    if (a->get_name().empty()) {
+        a->set_name(attributes.name + "::A");
+    };
+    if (b->get_name().empty()) {
+        b->set_name(attributes.name + "::B");
+    };
+
+    auto m_override = attributes.inputs.find(Matmul_attributes::input_names::M_override);
+    auto n_override = attributes.inputs.find(Matmul_attributes::input_names::N_override);
+    auto k_override = attributes.inputs.find(Matmul_attributes::input_names::K_override);
+
+    if (m_override != attributes.inputs.end()) {
+        auto tensor = m_override->second;
+        if (tensor && tensor->get_name().empty()) {
+            tensor->set_name(attributes.name + "::M_override");
+        }
+    }
+    if (n_override != attributes.inputs.end()) {
+        auto tensor = n_override->second;
+        if (tensor && tensor->get_name().empty()) {
+            tensor->set_name(attributes.name + "::N_override");
+        }
+    }
+    if (k_override != attributes.inputs.end()) {
+        auto tensor = k_override->second;
+        if (tensor && tensor->get_name().empty()) {
+            tensor->set_name(attributes.name + "::K_override");
+        }
+    }
+
     auto C = attributes.outputs[Matmul_attributes::output_names::C] = output_tensor(attributes.name + "::C");
 
     sub_nodes.emplace_back(std::make_unique<MatmulNode>(std::move(attributes), context));
