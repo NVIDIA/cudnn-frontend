@@ -225,7 +225,7 @@ class Execution_plan_list {
         }
 
         // workspace check for 9.2+ is already done at engine config level
-        if (detail::get_backend_version() < 90200) {
+        if (detail::get_backend_version() < 90200 || detail::get_compiled_version() < 90200) {
             if (execution_plans[index]->getWorkspaceSize() > max_workspace_allowed) {
                 barred_indices[index] = true;
                 return {error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
@@ -427,7 +427,7 @@ class Execution_plan_list {
                         std::to_string(index)};
         }
 
-        if (detail::get_backend_version() >= 90200) {
+        if (detail::get_backend_version() >= 90200 && detail::get_compiled_version() >= 90200) {
             // Ignore kernels that require larger than tolerable shared memory.
             int32_t shared_memory_size = INT32_MAX;
             auto status                = detail::get_shared_memory_size(engine_configs[index], shared_memory_size);

@@ -190,6 +190,11 @@ get_backend_version(void) {
 #endif
 }
 
+inline constexpr size_t
+get_compiled_version(void) {
+    return CUDNN_VERSION;
+}
+
 inline std::string
 convert_version_to_str(size_t const version) {
     // The multiplier for major version pre-v9 and post-v9 are different.
