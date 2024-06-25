@@ -25,7 +25,7 @@ from ._compiled_module import (
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 
 
 def _tensor(
