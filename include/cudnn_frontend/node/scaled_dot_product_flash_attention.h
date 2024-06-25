@@ -38,20 +38,25 @@ class SDPANode : public NodeCRTP<SDPANode> {
 
         // check that Q, K, V, O tensors has been assigned
         // check that dim and strides has been assigned and last stride is 1
-#define CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(port, port_map)                                                       \
-    {                                                                                                           \
-        std::shared_ptr<Tensor_attributes> tensor_ptr = port_map.at(port);                                      \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_dim().size() != 4,                                       \
-                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
-                                       "The dim for " + std::string(#port) + " is invalid");                    \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_stride().size() != 4,                                    \
-                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
-                                       "The stride for " + std::string(#port) + " is invalid");                 \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                         \
-            tensor_ptr->get_stride()[3] != 1,                                                                   \
-            error_code_t::GRAPH_NOT_SUPPORTED,                                                                  \
-            "The stride for the last dimension corresponding to the embedding size per head should be 1 for " + \
-                std::string(#port));                                                                            \
+#define CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(port, port_map)                                                        \
+    {                                                                                                            \
+        std::shared_ptr<Tensor_attributes> tensor_ptr = port_map.at(port);                                       \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_dim().size() != 4,                                        \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                          \
+                                       "The dim for " + std::string(#port) + " is invalid");                     \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_stride().size() != 4,                                     \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                          \
+                                       "The stride for " + std::string(#port) + " is invalid");                  \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                          \
+            tensor_ptr->get_stride()[3] != 1,                                                                    \
+            error_code_t::GRAPH_NOT_SUPPORTED,                                                                   \
+            "The stride for the last dimension corresponding to the embedding size per head should be 1 for " +  \
+                std::string(#port));                                                                             \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                          \
+            tensor_ptr->get_stride()[2] == 0,                                                                    \
+            error_code_t::GRAPH_NOT_SUPPORTED,                                                                   \
+            "The stride for the dimension corresponding to the sequence lengths per head should not be 0 for " + \
+                std::string(#port));                                                                             \
     }
 
         CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::Q);
@@ -681,20 +686,25 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
 
         // check that Q, K, V, O, stats, dO, dQ, dK, dV tensors has been assigned
         // check that dim and strides has been assigned and last stride is 1
-#define CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(port, port_map)                                                       \
-    {                                                                                                           \
-        std::shared_ptr<Tensor_attributes> tensor_ptr = port_map.at(port);                                      \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_dim().size() != 4,                                       \
-                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
-                                       "The dim for " + std::string(#port) + " is invalid");                    \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_stride().size() != 4,                                    \
-                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
-                                       "The stride for " + std::string(#port) + " is invalid");                 \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                         \
-            tensor_ptr->get_stride()[3] != 1,                                                                   \
-            error_code_t::GRAPH_NOT_SUPPORTED,                                                                  \
-            "The stride for the last dimension corresponding to the embedding size per head should be 1 for " + \
-                std::string(#port));                                                                            \
+#define CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(port, port_map)                                                        \
+    {                                                                                                            \
+        std::shared_ptr<Tensor_attributes> tensor_ptr = port_map.at(port);                                       \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_dim().size() != 4,                                        \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                          \
+                                       "The dim for " + std::string(#port) + " is invalid");                     \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_stride().size() != 4,                                     \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                          \
+                                       "The stride for " + std::string(#port) + " is invalid");                  \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                          \
+            tensor_ptr->get_stride()[3] != 1,                                                                    \
+            error_code_t::GRAPH_NOT_SUPPORTED,                                                                   \
+            "The stride for the last dimension corresponding to the embedding size per head should be 1 for " +  \
+                std::string(#port));                                                                             \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                          \
+            tensor_ptr->get_stride()[2] == 0,                                                                    \
+            error_code_t::GRAPH_NOT_SUPPORTED,                                                                   \
+            "The stride for the dimension corresponding to the sequence lengths per head should not be 0 for " + \
+                std::string(#port));                                                                             \
     }
 
         CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::Q);
