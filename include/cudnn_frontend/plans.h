@@ -41,7 +41,8 @@ execute(cudnnHandle_t handle,
 inline error_t
 query_cudnn_heuristics_impl(std::shared_ptr<OperationGraph_v8> const& operation_graph,
                             cudnn_frontend::EngineConfigList& configs,
-                            std::vector<HeurMode_t> const& modes) {
+                            std::vector<HeurMode_t> const& modes,
+                            int32_t sm_count) {
     auto const& operation_graph_tag = operation_graph->getTag();
     getLogger() << "[cudnn_frontend] INFO: " << " Getting plan from heuristics for " << operation_graph_tag << " ..."
                 << std::endl;
@@ -50,12 +51,12 @@ query_cudnn_heuristics_impl(std::shared_ptr<OperationGraph_v8> const& operation_
 #ifdef NV_CUDNN_DISABLE_EXCEPTION
     // disable exception macro is defined. Calling build will not throw.
     // Check status of desc and return error.
-    statuses = cudnn_frontend::get_heuristics_list(modes, *operation_graph, allowAllConfig, configs, true);
+    statuses = cudnn_frontend::get_heuristics_list(modes, *operation_graph, allowAllConfig, configs, true, sm_count);
 #else
     // build() can throw
     // wrap in try catch
     try {
-        statuses = cudnn_frontend::get_heuristics_list(modes, *operation_graph, allowAllConfig, configs, true);
+        statuses = cudnn_frontend::get_heuristics_list(modes, *operation_graph, allowAllConfig, configs, true, sm_count);
     } catch (cudnn_frontend::cudnnException& e) {
         // Silly MSVC error that thinks below condition is constexpr
         // RETURN_CUDNN_FRONTEND_ERROR_IF(
@@ -79,34 +80,6 @@ query_cudnn_heuristics_impl(std::shared_ptr<OperationGraph_v8> const& operation_
         getLogger() << "[cudnn_frontend] ERROR: No valid engine configs returned from heuristics.";
         return {error_code_t::HEURISTIC_QUERY_FAILED, "No valid engine configs for " + operation_graph_tag};
     }
-    return {error_code_t::OK, ""};
-}
-
-inline error_t
-query_heuristics(std::shared_ptr<OperationGraph_v8> const& operation_graph,
-                 EngineConfigList& op_graph_to_configs,
-                 std::vector<HeurMode_t> const& modes) {
-    cudnn_frontend::EngineConfigList configs;
-    CHECK_CUDNN_FRONTEND_ERROR(detail::query_cudnn_heuristics_impl(operation_graph, configs, modes));
-
-    for (auto& engine_config : configs) {
-        int64_t elem_count                        = 0;
-        ManagedOpaqueDescriptor extractedEngine   = make_shared_backend_pointer(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
-        cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
-        auto status                               = detail::get_attribute(engine_config->get_backend_descriptor(),
-                                            CUDNN_ATTR_ENGINECFG_ENGINE,
-                                            CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                            1,
-                                            &elem_count,
-                                            &extractedEngine_);
-        if (status == CUDNN_STATUS_SUCCESS) {
-            op_graph_to_configs.push_back(engine_config);
-        }
-    }
-
-    getLogger() << "[cudnn_frontend] INFO: config list has " << op_graph_to_configs.size() << " good configurations."
-                << std::endl;
-
     return {error_code_t::OK, ""};
 }
 

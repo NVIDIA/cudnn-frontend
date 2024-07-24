@@ -66,6 +66,7 @@ def test_bn_relu_with_mask():
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
         handle=handle,
+        sm_count=8
     )
 
     X = graph.tensor(

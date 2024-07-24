@@ -60,6 +60,7 @@ Optional graph level attributes can be set on the object:
 - `cudnn_frontend::graph::Graph& set_io_data_type(cudnn_frontend::DataType_t)`
 - `cudnn_frontend::graph::Graph& set_intermediate_data_type(cudnn_frontend::DataType_t)`
 - `cudnn_frontend::graph::Graph& set_compute_data_type(cudnn_frontend::DataType_t)`
+- `cudnn_frontend::graph::Graph& set_sm_count(int32_t)`
 These attributes are meant to used as default in case they are not provided for constituent tensors and operations.
 
 ### Define Tensors

@@ -43,6 +43,31 @@ TEST_CASE("Tensor attributes", "[tensor][serialize]") {
     REQUIRE(tensor_attributes_deserialized == tensor_attributes);
 }
 
+TEST_CASE("Context serialization", "[context][serialize]") {
+    namespace fe = cudnn_frontend;
+
+    fe::graph::Graph graph;
+
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT)
+        .set_sm_count(24);
+
+    json j = graph;
+
+    std::cout << j << std::endl;
+
+    fe::graph::Graph graph_deserialized;
+
+    REQUIRE(graph_deserialized.deserialize(j).is_good());
+
+    json j2 = graph_deserialized;
+
+    REQUIRE(j == j2);
+
+    REQUIRE(graph.validate().is_good());
+}
+
 TEST_CASE("Conv fprop attributes", "[conv_fprop][serialize]") {
     namespace fe = cudnn_frontend;
 

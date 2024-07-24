@@ -8,6 +8,7 @@ class Context {
     DataType_t compute_data_type      = DataType_t::NOT_SET;
     DataType_t intermediate_data_type = DataType_t::NOT_SET;
     DataType_t io_data_type           = DataType_t::NOT_SET;
+    int32_t target_sm_count           = -1;
 
     std::string name = "";
 
@@ -54,6 +55,17 @@ class Context {
     std::string
     get_name() const {
         return name;
+    }
+
+    Context&
+    set_target_sm_count(int32_t count) {
+        target_sm_count = count;
+        return *this;
+    }
+
+    int32_t
+    get_target_sm_count() const {
+        return target_sm_count;
     }
 
     Context&
