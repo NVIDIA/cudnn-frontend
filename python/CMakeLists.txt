@@ -16,7 +16,7 @@ FetchContent_MakeAvailable(dlpack)
 find_package(Python 3.8 COMPONENTS Interpreter Development.Module REQUIRED)
 
 # Find cudnn
-include(${CMAKE_SOURCE_DIR}/cmake/cuDNN.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/cuDNN.cmake)
 
 option(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE "Whether cmake build system should fetch pybinds." ON)
 if(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE)
@@ -81,7 +81,7 @@ set_target_properties(
         _compiled_module
 
         PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/cudnn
+        LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/cudnn
     )
-    file(COPY ${CMAKE_SOURCE_DIR}/python/cudnn DESTINATION ${CMAKE_BINARY_DIR})
+    file(COPY ${PROJECT_SOURCE_DIR}/python/cudnn DESTINATION ${PROJECT_BINARY_DIR})
 endif()
