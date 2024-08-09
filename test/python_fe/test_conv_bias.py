@@ -27,7 +27,7 @@ class CSBR(torch.nn.Module):
 
 
 @torch_fork_set_rng(seed=0)
-def test_conv_bias_relu():
+def test_conv_bias_relu(cudnn_handle):
 
     # Reference code
     X_gpu = torch.randn(
@@ -54,15 +54,14 @@ def test_conv_bias_relu():
         upper_clip=0.55,
     )
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     X = graph.tensor(
@@ -100,17 +99,17 @@ def test_conv_bias_relu():
     )
 
     Y_actual = torch.zeros_like(Y_expected)
-    graph.execute({X: X_gpu, W: W_gpu, B: B_gpu, Y: Y_actual}, workspace, handle=handle)
+    graph.execute(
+        {X: X_gpu, W: W_gpu, B: B_gpu, Y: Y_actual}, workspace, handle=cudnn_handle
+    )
 
     torch.cuda.synchronize()
 
     torch.testing.assert_close(Y_expected, Y_actual, atol=0.05, rtol=1e-2)
 
-    cudnn.destroy_handle(handle)
-
 
 @torch_fork_set_rng(seed=0)
-def test_conv_relu():
+def test_conv_relu(cudnn_handle):
 
     # Reference code
     X_gpu = torch.randn(
@@ -133,16 +132,15 @@ def test_conv_relu():
         upper_clip=0.55,
     )
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     # Cudnn code
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     X = graph.tensor(
@@ -170,16 +168,14 @@ def test_conv_relu():
     )
 
     Y_actual = torch.zeros_like(Y_expected)
-    handle = cudnn.create_handle()
-    graph.execute({X: X_gpu, W: W_gpu, Y: Y_actual}, workspace, handle=handle)
+    graph.execute({X: X_gpu, W: W_gpu, Y: Y_actual}, workspace, handle=cudnn_handle)
     # Compare
     torch.cuda.synchronize()
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-3, rtol=1e-3)
-    cudnn.destroy_handle(handle)
 
 
 @torch_fork_set_rng(seed=0)
-def test_conv3d_bias_leaky_relu():
+def test_conv3d_bias_leaky_relu(cudnn_handle):
 
     N, C, D, H, W = 4, 16, 52, 54, 56
     K, R, S, T = 32, 3, 3, 3
@@ -215,15 +211,14 @@ def test_conv3d_bias_leaky_relu():
         conv_out_expected, negative_slope=negative_slope
     )
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     X = graph.tensor(
@@ -257,17 +252,16 @@ def test_conv3d_bias_leaky_relu():
 
     Y_actual = torch.zeros_like(Y_expected)
     graph.execute(
-        {X: X_gpu, Weight: W_gpu, B: B_gpu, Y: Y_actual}, workspace, handle=handle
+        {X: X_gpu, Weight: W_gpu, B: B_gpu, Y: Y_actual}, workspace, handle=cudnn_handle
     )
 
     torch.cuda.synchronize()
 
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-2, rtol=1e-2)
-    cudnn.destroy_handle(handle)
 
 
 @torch_fork_set_rng(seed=0)
-def test_leaky_relu_backward():
+def test_leaky_relu_backward(cudnn_handle):
 
     N, C, H, W = 4, 16, 56, 56
     negative_slope = 0.01
@@ -285,15 +279,14 @@ def test_leaky_relu_backward():
 
     Y_expected = dleaky_relu(loss_gpu, input_gpu, negative_slope)
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     loss = graph.tensor(
@@ -324,12 +317,11 @@ def test_leaky_relu_backward():
 
     Y_actual = torch.zeros_like(Y_expected)
     graph.execute(
-        {loss: loss_gpu, input: input_gpu, Y: Y_actual}, workspace, handle=handle
+        {loss: loss_gpu, input: input_gpu, Y: Y_actual}, workspace, handle=cudnn_handle
     )
 
     torch.cuda.synchronize()
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-4, rtol=1e-4)
-    cudnn.destroy_handle(handle)
 
 
 @pytest.mark.skipif(
@@ -337,7 +329,7 @@ def test_leaky_relu_backward():
     reason="requires cudnn 8.6.0 or higher",
 )
 @torch_fork_set_rng(seed=0)
-def test_conv_int8():
+def test_conv_int8(cudnn_handle):
 
     N, C, H, W = 1, 64, 32, 32
     K, R, S = 4, 3, 3
@@ -369,15 +361,14 @@ def test_conv_int8():
         )
         compare_output = False
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.INT8,
         intermediate_data_type=cudnn.data_type.INT32,
         compute_data_type=cudnn.data_type.INT32,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     X = graph.tensor_like(X_gpu)
@@ -403,19 +394,17 @@ def test_conv_int8():
     Y_actual = torch.randint(
         0, 127, tuple(Y.get_dim()), device="cuda", dtype=torch.int32
     ).to(memory_format=torch.channels_last)
-    graph.execute({X: X_gpu, W: W_gpu, Y: Y_actual}, workspace, handle=handle)
+    graph.execute({X: X_gpu, W: W_gpu, Y: Y_actual}, workspace, handle=cudnn_handle)
 
     torch.cuda.synchronize()
 
     if compare_output:
         torch.testing.assert_close(Y_expected, Y_actual, atol=1e-2, rtol=1e-2)
 
-    cudnn.destroy_handle(handle)
-
 
 if __name__ == "__main__":
     # test_conv_int8()
-    test_conv_relu()
+    test_conv_relu(cudnn_handle)
     # test_conv_bias_relu()
     # test_conv3d_bias_leaky_relu()
     # test_leaky_relu_backward()

@@ -2,6 +2,7 @@
 
 #include <unordered_map>
 
+#include "../cudnn_frontend_version.h"
 #include "node/batchnorm.h"
 #include "node/batchnorm_inference.h"
 #include "node/bn_finalize.h"
@@ -17,6 +18,7 @@
 #include "node/rmsnorm.h"
 #include "node/resample.h"
 #include "node/reshape.h"
+#include "node/slice.h"
 // #include "node/scaled_dot_product_attention.h"
 #include "node/scaled_dot_product_flash_attention.h"
 #include "node/sdpa_fp8.h"
@@ -29,27 +31,41 @@ namespace cudnn_frontend::graph {
 
 class Graph : public INode {
    private:
-    std::unordered_set<std::shared_ptr<Tensor_attributes>> tensors;
+    std::unordered_set<std::shared_ptr<Tensor_attributes>> full_graph_inputs;
+    std::unordered_set<Tensor_attributes::uid_t> used_uids;
+    int64_t fe_workspace_size = 0;
 
-    void
-    add_to_tensor_map(std::shared_ptr<Tensor_attributes> tensor) {
-        tensors.emplace(tensor);
+    std::unordered_map<uid_t, pass_by_values_t> deserialized_pass_by_value;
+    std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> deserialized_workspace_modifications;
+
+    error_t
+    get_pre_assigned_uids(std::unordered_set<Tensor_attributes::uid_t> &used_uids) {
+        for (auto const &input : full_graph_inputs) {
+            if (input->has_uid()) {
+                auto uid  = input->get_uid();
+                auto iter = used_uids.find(uid);
+                RETURN_CUDNN_FRONTEND_ERROR_IF(iter != used_uids.end(),
+                                               error_code_t::INVALID_VALUE,
+                                               "uid " + std::to_string(uid) + " for tensor named " + input->get_name() +
+                                                   " has been already assigned to another tensor.");
+                used_uids.insert(uid);
+            }
+        }
+        for (auto const &output : full_graph_outputs) {
+            if (output->has_uid()) {
+                auto uid  = output->get_uid();
+                auto iter = used_uids.find(uid);
+                RETURN_CUDNN_FRONTEND_ERROR_IF(iter != used_uids.end(),
+                                               error_code_t::INVALID_VALUE,
+                                               "uid " + std::to_string(uid) + " for tensor named " +
+                                                   output->get_name() +
+                                                   " has been already assigned to another tensor.");
+                used_uids.insert(uid);
+            }
+        }
+
+        return {error_code_t::OK, ""};
     }
-
-    std::shared_ptr<Tensor_attributes>
-    output_tensor(std::string const &name) {
-        auto tensor = std::make_shared<Tensor_attributes>();
-        tensor->set_name(name).set_is_virtual(true);
-        add_to_tensor_map(tensor);
-        return tensor;
-    }
-
-    // This API is still work in progress and unverified.
-    // std::array<std::shared_ptr<Tensor_attributes>, 2> scaled_dot_product_attention(
-    //     std::shared_ptr<Tensor_attributes>,
-    //     std::shared_ptr<Tensor_attributes>,
-    //     std::shared_ptr<Tensor_attributes>,
-    //     Scaled_dot_product_attention_attributes);
 
     error_t
     pre_validate_node() const override final {
@@ -57,7 +73,7 @@ class Graph : public INode {
     }
 
     error_t
-    expand_and_infer_properties_node() override final {
+    infer_properties_node() override final {
         return {error_code_t::OK, ""};
     }
 
@@ -67,7 +83,8 @@ class Graph : public INode {
     }
 
     virtual error_t
-    pass_by_value_tensors_(std::unordered_map<uid_t, pass_by_values_t> &pass_by_values) const override final {
+    collect_pass_by_value_tensors_node(
+        std::unordered_map<uid_t, pass_by_values_t> &pass_by_values) const override final {
         for (auto [uid, value] : deserialized_pass_by_value) {
             pass_by_values.emplace(uid, value);
         }
@@ -75,24 +92,408 @@ class Graph : public INode {
     }
 
     virtual error_t
-    collect_pre_assigned_uids_([[maybe_unused]] std::unordered_set<int64_t> &pre_assigned_uids) const override final {
+    collect_tensors_in_workspace_node(
+        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> &worskspace_modifications,
+        int64_t &) const {
+        for (auto [uid, value] : deserialized_workspace_modifications) {
+            worskspace_modifications.emplace(uid, value);
+        }
         return {error_code_t::OK, ""};
     }
 
     virtual error_t
-    create_cudnn_tensors_([[maybe_unused]] std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>
-                              &tensors) const override final {
+    create_cudnn_tensors_node(std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>> &,
+                              int64_t &,
+                              std::unordered_set<int64_t> const &) const override final {
         return {error_code_t::OK, ""};
     }
 
-    virtual error_t
-    set_uids_([[maybe_unused]] int64_t &potential_uid,
-              [[maybe_unused]] std::unordered_set<int64_t> const &pre_assigned_uids) const override final {
+    error_t
+    extend_tensor_map_with_workspace_tensors_(
+        std::unordered_map<int64_t, void *> &tensor_to_pointer_map,
+        void *workspace,
+        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> const &worskspace_modifications)
+        const {
+        for (auto const &[uid, data] : worskspace_modifications) {
+            tensor_to_pointer_map.emplace(uid, static_cast<char *>(workspace) + std::get<1>(data));
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    extend_tensor_map_with_pass_by_value_tensors_(
+        std::unordered_map<int64_t, void *> &tensor_to_pointer_map,
+        std::unordered_map<uid_t, pass_by_values_t> &tensor_to_pass_by_value) const {
+        for (auto &[uid, value] : tensor_to_pass_by_value) {
+            if (half *half_value_ptr = std::get_if<half>(&value)) {
+                tensor_to_pointer_map.emplace(uid, half_value_ptr);
+            } else if (nv_bfloat16 *nv_bfloat16_value_ptr = std::get_if<nv_bfloat16>(&value)) {
+                tensor_to_pointer_map.emplace(uid, nv_bfloat16_value_ptr);
+            } else if (int32_t *int32_t_value_ptr = std::get_if<int32_t>(&value)) {
+                tensor_to_pointer_map.emplace(uid, int32_t_value_ptr);
+            } else if (float *float_value_ptr = std::get_if<float>(&value)) {
+                tensor_to_pointer_map.emplace(uid, float_value_ptr);
+            } else {
+                RETURN_CUDNN_FRONTEND_ERROR_IF(
+                    true, error_code_t::INVALID_VARIANT_PACK, "Unexpected type for pass by value tensor.");
+            }
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    make_variant_pack_replacements(
+        std::unordered_map<int64_t, void *> &tensor_to_pointer_map,
+        std::unordered_map<Tensor_attributes::uid_t, std::pair<Tensor_attributes::uid_t, int64_t>> replacements) const {
+        for (auto &[from_uid, value] : replacements) {
+            const auto &[to_uid, start_offset] = value;
+
+            // Check if from_uid exists in the map
+            auto it = tensor_to_pointer_map.find(from_uid);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(it == tensor_to_pointer_map.end(),
+                                           error_code_t::INVALID_VARIANT_PACK,
+                                           "Variant pack expected uid " + std::to_string(from_uid) + " but not found.");
+
+            // Perform pointer arithmetic
+            tensor_to_pointer_map[to_uid] = static_cast<void *>(static_cast<char *>(it->second) + start_offset);
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    int64_t
+    get_cudnn_workspace_size(int64_t plan_index) const {
+        int64_t cudnn_workspace_size = 0;
+
+        auto status = get_cudnn_workspace_size_node(plan_index, cudnn_workspace_size);
+        if (status.is_bad()) {
+            CUDNN_FE_LOG_LABEL_ENDL("ERROR: Querying workspace failed.");
+        }
+
+        return cudnn_workspace_size;
+    }
+
+    int64_t
+    get_max_cudnn_workspace_size() const {
+        return get_max_cudnn_workspace_size_node();
+    }
+
+    // Key: uid to replace in variant pack
+    // Value: uid to replace with, start offset to add to pointer
+    std::unordered_map<Tensor_attributes::uid_t, std::pair<Tensor_attributes::uid_t, int64_t>>
+        variant_pack_replacements;
+
+    error_t
+    run_auxiliary_kernels(
+        cudnnHandle_t handle,
+        void *fe_workspace,
+        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> &workspace_modifications) const {
+        cudaStream_t stream;
+        CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+        char *workspace = static_cast<char *>(fe_workspace);
+
+        for (auto [uid, data] : workspace_modifications) {
+            (void)uid;
+            if (std::get<0>(data) == 0) {
+                auto &vec_data = std::get<2>(data);
+                CHECK_CUDA_ERROR(detail::cuda_mem_cpy_async(workspace + std::get<1>(data),
+                                                            vec_data.data(),
+                                                            vec_data.size() * sizeof(float),
+                                                            cudaMemcpyHostToDevice,
+                                                            stream));
+            } else if (std::get<0>(data) == 1) {
+                int64_t memset_size = (int64_t)std::get<2>(data)[0];
+                CHECK_CUDA_ERROR(detail::cuda_mem_set_async(workspace + std::get<1>(data), 0, memset_size, stream));
+            }
+        }
         return {error_code_t::OK, ""};
     }
 
    public:
     Graph() : INode(detail::Context{}) {}
+
+    error_t
+    validate() {
+        CUDNN_FE_LOG_LABEL_ENDL("");
+        CUDNN_FE_LOG(*this << std::endl;);
+
+        // First validate all inputs that the user set.
+        for (auto const &input : full_graph_inputs) {
+            CHECK_CUDNN_FRONTEND_ERROR(input->validate());
+        }
+
+        // Validate the nodes, which in turn also infers missing tensor attributes.
+        CHECK_CUDNN_FRONTEND_ERROR(validate_subtree());
+
+        // Validate all outputs, which should now have everything set to be lowered to backend.
+        for (auto const &output : full_graph_outputs) {
+            CHECK_CUDNN_FRONTEND_ERROR(output->validate());
+        }
+
+        // Get all the pre assigned uids
+        CHECK_CUDNN_FRONTEND_ERROR(get_pre_assigned_uids(used_uids));
+
+        // Clear state
+        used_uids.clear();
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    build_operation_graph(cudnnHandle_t handle) {
+        // expand composite nodes
+        CHECK_CUDNN_FRONTEND_ERROR(expand_subtree());
+
+        // Get all the pre assigned uids
+        CHECK_CUDNN_FRONTEND_ERROR(get_pre_assigned_uids(used_uids));
+
+        Tensor_attributes::uid_t start_uid = 1;
+        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensors_subtree(uid_to_tensors, start_uid, used_uids));
+
+        // INode keeps track of all uids that an operation graph uses.
+        // This helps to return errors to user during execution, without relying on backend to do so.
+        // Also, as uid in a variant pack have to be unique, keep a set of them.
+        CHECK_CUDNN_FRONTEND_ERROR(
+            create_cudnn_operations(variant_pack_uids, operations, raw_operations, uid_to_tensors));
+
+        // Collect variant pack modifiers when lowering to backend.
+        // The collected map is used everytime when execute is called.
+        CHECK_CUDNN_FRONTEND_ERROR(collect_variant_pack_replacements_subtree(variant_pack_replacements));
+
+        fe_workspace_size = get_fe_workspace_size_subtree();
+
+        // The method here fuses all operations. There will be 1 operation graph in total.
+        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_operation_graph(handle));
+
+        return {error_code_t::OK, ""};
+    }
+
+    int64_t
+    get_workspace_size() const {
+        // There are two workspaces:
+        // - cudnn execution plan workspace
+        // - FE node workspace (example: alibiSlope for fmha)
+        return fe_workspace_size + get_cudnn_workspace_size(plans.candidate);
+    }
+
+    int64_t
+    get_workspace_size_plan_at_index(int64_t plan_index) const {
+        // There are two workspaces:
+        // - cudnn execution plan workspace
+        // - FE node workspace (example: alibiSlope for fmha)
+        return fe_workspace_size + get_cudnn_workspace_size(plan_index);
+    }
+
+    int64_t
+    get_autotune_workspace_size() const {
+        // There are two workspaces:
+        // - cudnn execution plan workspace
+        // - FE node workspace (example: alibiSlope for fmha)
+        return fe_workspace_size + get_max_cudnn_workspace_size();
+    }
+
+    error_t
+    autotune(cudnnHandle_t handle,
+             std::unordered_map<int64_t, void *> &tensor_uid_to_pointer_map,
+             void *workspace,
+             void *user_impl = nullptr) {
+        // Add pass_by_value data pointers to tensor_uid_to_pointer map
+        // object lifetime is controlled by tensor_to_pass_by_value which means the pointer should stay valid during
+        // execute.
+        std::unordered_map<uid_t, pass_by_values_t> tensor_to_pass_by_value;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, tensor_to_pass_by_value));
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            make_variant_pack_replacements(tensor_uid_to_pointer_map, variant_pack_replacements));
+
+        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> workspace_modifications;
+        int64_t workspace_offset = 0;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_in_workspace_subtree(workspace_modifications, workspace_offset));
+
+        CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, workspace_modifications));
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            extend_tensor_map_with_workspace_tensors_(tensor_uid_to_pointer_map, workspace, workspace_modifications));
+
+        // offset workspace by the already used fe graph workspace
+        // this is where cudnn backend can start using workspace for its execution plans
+        void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+
+        CHECK_CUDNN_FRONTEND_ERROR(plans.autotune(handle, tensor_uid_to_pointer_map, cudnn_workspace, user_impl));
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    autotune(cudnnHandle_t handle,
+             std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
+             void *workspace,
+             void *user_impl = nullptr) {
+        // First get all the uids from the map
+        std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
+        for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
+            tensor_uid_to_pointer_map.emplace(tensor->get_uid(), pointer);
+        }
+
+        return autotune(handle, tensor_uid_to_pointer_map, workspace, user_impl);
+    }
+
+    error_t
+    execute_plan_at_index(cudnnHandle_t handle,
+                          std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
+                          void *workspace,
+                          int64_t plan_index) const {
+        // First get all the uids from the map
+        std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
+        for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
+            tensor_uid_to_pointer_map.emplace(tensor->get_uid(), pointer);
+        }
+
+        return execute_plan_at_index(handle, tensor_uid_to_pointer_map, workspace, plan_index);
+    }
+
+    error_t
+    execute(cudnnHandle_t handle,
+            std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
+            void *workspace) const {
+        // First get all the uids from the map
+        std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
+        for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
+            tensor_uid_to_pointer_map.emplace(tensor->get_uid(), pointer);
+        }
+
+        return execute(handle, tensor_uid_to_pointer_map, workspace);
+    }
+
+    error_t
+    execute_plan_at_index(cudnnHandle_t handle,
+                          std::unordered_map<int64_t, void *> &tensor_uid_to_pointer_map,
+                          void *workspace,
+                          int64_t plan_index) const {
+        // Add pass_by_value data pointers to uid_to_pointer map
+        // object lifetime is controlled by tensor_to_pass_by_value which means the pointer should stay valid during
+        // execute.
+        std::unordered_map<uid_t, pass_by_values_t> tensor_to_pass_by_value;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, tensor_to_pass_by_value));
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            make_variant_pack_replacements(tensor_uid_to_pointer_map, variant_pack_replacements));
+
+        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> workspace_modifications;
+        int64_t workspace_offset = 0;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_in_workspace_subtree(workspace_modifications, workspace_offset));
+
+        CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, workspace_modifications));
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            extend_tensor_map_with_workspace_tensors_(tensor_uid_to_pointer_map, workspace, workspace_modifications));
+        // offset workspace by the already used fe graph workspace
+        // this is where cudnn backend can start using workspace for its execution plans
+        void *cudnn_workspace = static_cast<char *>(workspace) + get_fe_workspace_size_subtree();
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            execute_cudnn_plan_with_uid(handle, tensor_uid_to_pointer_map, cudnn_workspace, plan_index));
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    execute(cudnnHandle_t handle,
+            std::unordered_map<int64_t, void *> &tensor_uid_to_pointer_map,
+            void *workspace) const {
+        // Add pass_by_value data pointers to uid_to_pointer map
+        // object lifetime is controlled by tensor_to_pass_by_value which means the pointer should stay valid during
+        // execute.
+        std::unordered_map<uid_t, pass_by_values_t> tensor_to_pass_by_value;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, tensor_to_pass_by_value));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            make_variant_pack_replacements(tensor_uid_to_pointer_map, variant_pack_replacements));
+
+        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> workspace_modifications;
+        int64_t workspace_offset = 0;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_in_workspace_subtree(workspace_modifications, workspace_offset));
+
+        CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, workspace_modifications));
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            extend_tensor_map_with_workspace_tensors_(tensor_uid_to_pointer_map, workspace, workspace_modifications));
+        // offset workspace by the already used fe graph workspace
+        // this is where cudnn backend can start using workspace for its execution plans
+        void *cudnn_workspace = static_cast<char *>(workspace) + get_fe_workspace_size_subtree();
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            execute_cudnn_plan_with_uid(handle, tensor_uid_to_pointer_map, cudnn_workspace, plans.candidate));
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    serialize(std::vector<uint8_t> &data) const {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+        json j;
+        serialize(j);
+
+        auto const candidate = plans.candidate;
+        auto execution_plan  = plans.execution_plans[candidate];
+        if (execution_plan != nullptr) {
+            auto serialized_plan    = execution_plan->getJsonRepresentation();
+            j["cudnn_backend_data"] = serialized_plan;
+            j["variant_pack_uids"]  = variant_pack_uids;
+        }
+
+        std::unordered_map<uid_t, pass_by_values_t> tensor_to_pass_by_value;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
+        j["pass_by_values"] = tensor_to_pass_by_value;
+
+        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> workspace_modifications;
+        int64_t workspace_offset = 0;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_in_workspace_subtree(workspace_modifications, workspace_offset));
+        j["workspace_modifications"] = workspace_modifications;
+
+        j["variant_pack_replacements"] = variant_pack_replacements;
+
+        j["fe_workspace_size"] = fe_workspace_size;
+
+        data = json::to_ubjson(j);
+        return {error_code_t::OK, ""};
+#else
+        CUDNN_FRONTEND_UNUSED(data);
+        return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
+#endif
+    }
+
+    error_t
+    deserialize(cudnnHandle_t handle, std::vector<uint8_t> const &data) {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+        json j = json::from_ubjson(data);
+
+        auto serialized_plan = j["cudnn_backend_data"];
+        CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, serialized_plan));
+
+        variant_pack_uids = j["variant_pack_uids"].get<std::unordered_set<graph::Tensor_attributes::uid_t>>();
+
+        deserialized_pass_by_value = j["pass_by_values"];
+
+        deserialized_workspace_modifications = j["workspace_modifications"];
+
+        variant_pack_replacements = j["variant_pack_replacements"];
+
+        fe_workspace_size = j["fe_workspace_size"];
+
+        return {error_code_t::OK, ""};
+#else
+        CUDNN_FRONTEND_UNUSED(handle);
+        CUDNN_FRONTEND_UNUSED(data);
+        return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
+#endif
+    }
 
     Type
     getType() override {
@@ -105,6 +506,8 @@ class Graph : public INode {
     set_io_data_type(DataType_t type);
     Graph &
     set_compute_data_type(DataType_t type);
+    Graph &
+    set_sm_count(int32_t type);
 
     Graph &
     set_name(std::string const &name) {
@@ -237,6 +640,8 @@ class Graph : public INode {
                                                                     std::shared_ptr<Tensor_attributes>,
                                                                     SDPA_backward_attributes);
 
+    std::shared_ptr<Tensor_attributes> slice(std::shared_ptr<Tensor_attributes>, Slice_attributes);
+
     [[deprecated]] std::array<std::shared_ptr<Tensor_attributes>, 2>
     scaled_dot_product_flash_attention(std::shared_ptr<Tensor_attributes> q,
                                        std::shared_ptr<Tensor_attributes> k,
@@ -303,7 +708,7 @@ class Graph : public INode {
     select_behavior_notes(std::vector<BehaviorNote_t> const &notes) {
         auto status = plans.filter_behavior_notes(notes, true);
         if (status.is_bad()) {
-            getLogger() << status.get_message() << std::endl;
+            CUDNN_FE_LOG(status.get_message() << std::endl);
         }
         return *this;
     }
@@ -312,7 +717,7 @@ class Graph : public INode {
     select_numeric_notes(std::vector<NumericalNote_t> const &notes) {
         auto status = plans.filter_numeric_notes(notes, true);
         if (status.is_bad()) {
-            getLogger() << status.get_message() << std::endl;
+            CUDNN_FE_LOG(status.get_message() << std::endl);
         }
         return *this;
     }
@@ -321,7 +726,7 @@ class Graph : public INode {
     deselect_behavior_notes(std::vector<BehaviorNote_t> const &notes) {
         auto status = plans.filter_behavior_notes(notes, false);
         if (status.is_bad()) {
-            getLogger() << status.get_message() << std::endl;
+            CUDNN_FE_LOG(status.get_message() << std::endl);
         }
         return *this;
     }
@@ -330,13 +735,10 @@ class Graph : public INode {
     deselect_numeric_notes(std::vector<NumericalNote_t> const &notes) {
         auto status = plans.filter_numeric_notes(notes, false);
         if (status.is_bad()) {
-            getLogger() << status.get_message() << std::endl;
+            CUDNN_FE_LOG(status.get_message() << std::endl);
         }
         return *this;
     }
-
-    using INode::deserialize;
-    using INode::serialize;
 
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
@@ -344,10 +746,12 @@ class Graph : public INode {
         // Different from serialization of other INodes.
         // Go over each subnode and serialize them.
         json full_json;
+
         full_json["context"]["name"]                   = context.get_name();
         full_json["context"]["compute_data_type"]      = context.get_compute_data_type();
         full_json["context"]["intermediate_data_type"] = context.get_intermediate_data_type();
         full_json["context"]["io_data_type"]           = context.get_io_data_type();
+        full_json["context"]["sm_count"]               = context.get_target_sm_count();
 
         full_json.update(R"( {"tag": "GRAPH"})"_json);
         full_json["nodes"];
@@ -358,6 +762,10 @@ class Graph : public INode {
         }
 
         j["context"] = full_json["context"];
+
+        j["json_version"]           = "1.0";
+        j["cudnn_backend_version"]  = detail::get_backend_version_string();
+        j["cudnn_frontend_version"] = CUDNN_FRONTEND_VERSION;
         j["nodes"];
         j["tensors"];
         std::unordered_set<std::string> tensors;
@@ -424,17 +832,20 @@ class Graph : public INode {
     deserialize(const json &j) {
         if (j.contains("context")) {
             const auto &j_context = j["context"];
-            if (j_context["compute_data_type"].is_null() == false) {
+            if (j_context.contains("compute_data_type") && !j_context["compute_data_type"].is_null()) {
                 context.set_compute_data_type(j_context["compute_data_type"].get<DataType_t>());
             }
-            if (j_context["intermediate_data_type"].is_null() == false) {
+            if (j_context.contains("intermediate_data_type") && !j_context["intermediate_data_type"].is_null()) {
                 context.set_intermediate_data_type(j_context["intermediate_data_type"].get<DataType_t>());
             }
-            if (j_context["io_data_type"].is_null() == false) {
+            if (j_context.contains("io_data_type") && !j_context["io_data_type"].is_null()) {
                 context.set_io_data_type(j_context["io_data_type"].get<DataType_t>());
             }
-            if (j_context["name"].is_null() == false) {
+            if (j_context.contains("name") && !j_context["name"].is_null()) {
                 context.set_name(j_context["name"].get<std::string>());
+            }
+            if (j_context.contains("sm_count") && !j_context["sm_count"].is_null()) {
+                context.set_target_sm_count(j_context["sm_count"].get<int32_t>());
             }
         }
 
@@ -446,18 +857,26 @@ class Graph : public INode {
                 json inputs;
 
                 // Iterate through each input of the sub-node
-                for (auto &[port_name, tensor_name] : j_sub_node["inputs"].items()) {
-                    // Add the input to the inputs JSON object
-                    inputs.push_back({port_name, j["tensors"][tensor_name]});
+                if (j_sub_node.contains("inputs") && j_sub_node["inputs"].is_object()) {
+                    for (auto &[port_name, tensor_name] : j_sub_node["inputs"].items()) {
+                        if (j.contains("tensors") && j["tensors"].contains(tensor_name)) {
+                            // Add the input to the inputs JSON object
+                            inputs.push_back({port_name, j["tensors"][tensor_name]});
+                        }
+                    }
                 }
 
                 // Create a JSON object for outputs
                 json outputs;
 
                 // Iterate through each output of the sub-node
-                for (auto &[port_name, tensor_name] : j_sub_node["outputs"].items()) {
-                    // Add the output to the outputs JSON object
-                    outputs.push_back({port_name, j["tensors"][tensor_name]});
+                if (j_sub_node.contains("outputs") && j_sub_node["outputs"].is_object()) {
+                    for (auto &[port_name, tensor_name] : j_sub_node["outputs"].items()) {
+                        if (j.contains("tensors") && j["tensors"].contains(tensor_name)) {
+                            // Add the output to the outputs JSON object
+                            outputs.push_back({port_name, j["tensors"][tensor_name]});
+                        }
+                    }
                 }
 
                 // Replace the original inputs and outputs of the sub-node with the new JSON objects
@@ -485,36 +904,59 @@ class Graph : public INode {
         attributes.outputs[key] = check_if_pre_created_tensor(tensor); \
     }
 
+#define FILL_GLOBAL_IO_TENSOR_MAP(attributes)                              \
+    for (auto input_name_to_attr_pair : attributes.inputs) {               \
+        if (input_name_to_attr_pair.second != nullptr &&                   \
+            (input_name_to_attr_pair.second->get_is_virtual() == false)) { \
+            full_graph_inputs.emplace(input_name_to_attr_pair.second);     \
+        }                                                                  \
+    }                                                                      \
+    for (auto output_name_to_attr_pair : attributes.outputs) {             \
+        if (output_name_to_attr_pair.second != nullptr) {                  \
+            full_graph_outputs.emplace(output_name_to_attr_pair.second);   \
+        }                                                                  \
+    }
                 if (j_sub_node.contains("tag") && j_sub_node["tag"].is_string()) {
                     auto tag = j_sub_node["tag"].get<std::string>();
                     if (tag == "CONV_FPROP") {
                         auto conv_fprop_attributes = j_sub_node.get<Conv_fprop_attributes>();
                         CHECK_TENSORS(conv_fprop_attributes);
+                        FILL_GLOBAL_IO_TENSOR_MAP(conv_fprop_attributes);
                         sub_nodes.emplace_back(
                             std::make_unique<ConvolutionNode>(std::move(conv_fprop_attributes), context));
                     } else if (tag == "POINTWISE") {
                         auto pointwise_attributes = j_sub_node.get<Pointwise_attributes>();
                         CHECK_TENSORS(pointwise_attributes);
+                        FILL_GLOBAL_IO_TENSOR_MAP(pointwise_attributes);
                         sub_nodes.emplace_back(
                             std::make_unique<PointwiseNode>(std::move(pointwise_attributes), context));
                     } else if (tag == "REDUCTION") {
                         auto reduction_attributes = j_sub_node.get<Reduction_attributes>();
                         CHECK_TENSORS(reduction_attributes);
+                        FILL_GLOBAL_IO_TENSOR_MAP(reduction_attributes);
                         sub_nodes.emplace_back(
                             std::make_unique<ReductionNode>(std::move(reduction_attributes), context));
                     } else if (tag == "SDPA_FWD") {
                         auto sdpa_attributes = j_sub_node.get<SDPA_attributes>();
                         CHECK_TENSORS(sdpa_attributes);
+                        FILL_GLOBAL_IO_TENSOR_MAP(sdpa_attributes);
                         sub_nodes.emplace_back(std::make_unique<SDPANode>(std::move(sdpa_attributes), context));
                     } else if (tag == "SDPA_BWD") {
                         auto sdpa_bwd_attributes = j_sub_node.get<SDPA_backward_attributes>();
                         CHECK_TENSORS(sdpa_bwd_attributes);
+                        FILL_GLOBAL_IO_TENSOR_MAP(sdpa_bwd_attributes);
                         sub_nodes.emplace_back(
                             std::make_unique<SDPABackwardNode>(std::move(sdpa_bwd_attributes), context));
                     } else if (tag == "MATMUL") {
                         auto matmul_attributes = j_sub_node.get<Matmul_attributes>();
                         CHECK_TENSORS(matmul_attributes);
+                        FILL_GLOBAL_IO_TENSOR_MAP(matmul_attributes);
                         sub_nodes.emplace_back(std::make_unique<MatmulNode>(std::move(matmul_attributes), context));
+                    } else if (tag == "SLICE") {
+                        auto slice_attributes = j_sub_node.get<Slice_attributes>();
+                        CHECK_TENSORS(slice_attributes);
+                        FILL_GLOBAL_IO_TENSOR_MAP(slice_attributes);
+                        sub_nodes.emplace_back(std::make_unique<SliceNode>(std::move(slice_attributes), context));
                     }
                 }
 #undef CHECK_TENSORS
@@ -546,14 +988,15 @@ Graph::get_execution_plan_count() const {
 inline error_t
 Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
     EngineConfigList op_graph_to_configs;
-    CHECK_CUDNN_FRONTEND_ERROR(detail::query_heuristics(operation_graph, op_graph_to_configs, mode));
+    CHECK_CUDNN_FRONTEND_ERROR(
+        detail::query_cudnn_heuristics_impl(operation_graph, op_graph_to_configs, mode, context.get_target_sm_count()));
 
-    getLogger() << "[cudnn_frontend] INFO: Extracting engine configs." << std::endl;
+    CUDNN_FE_LOG_LABEL_ENDL("INFO: Extracting engine configs.");
 
     plans.set_tag(operation_graph->getTag());
     plans.set_engine_configs(op_graph_to_configs);
 
-    getLogger() << "[cudnn_frontend] INFO: Querying engine config properties\n";
+    CUDNN_FE_LOG_LABEL_ENDL("INFO: Querying engine config properties.");
     CHECK_CUDNN_FRONTEND_ERROR(plans.query_properties());
 
     return {error_code_t::OK, ""};
@@ -602,10 +1045,16 @@ Graph::set_compute_data_type(DataType_t const type) {
     return *this;
 }
 
+inline Graph &
+Graph::set_sm_count(int32_t count) {
+    context.set_target_sm_count(count);
+    return *this;
+}
+
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(Tensor_attributes const &tensor) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(tensor);
-    add_to_tensor_map(tensor_ptr);
+    full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
 
@@ -624,6 +1073,7 @@ Graph::tensor_like(std::shared_ptr<Tensor_attributes> const &tensor, std::string
 
     // reset the name too. Defaults to empty string.
     tensor_ptr->set_name(name);
+    full_graph_inputs.emplace(tensor_ptr);
 
     return tensor_ptr;
 }
@@ -1157,6 +1607,15 @@ Graph::sdpa_backward(std::shared_ptr<Tensor_attributes> q,
     sub_nodes.emplace_back(std::make_unique<SDPABackwardNode>(std::move(attributes), context));
 
     return {dQ, dK, dV};
+}
+
+inline std::shared_ptr<Tensor_attributes>
+Graph::slice(std::shared_ptr<Tensor_attributes> input, Slice_attributes attributes) {
+    attributes.inputs[Slice_attributes::input_names::X] = input;
+    auto Y = attributes.outputs[Slice_attributes::output_names::Y] = output_tensor(attributes.name + "::Y");
+
+    sub_nodes.emplace_back(std::make_unique<SliceNode>(std::move(attributes), context));
+    return Y;
 }
 
 static inline std::ostream &

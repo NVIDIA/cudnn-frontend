@@ -56,11 +56,11 @@ class ConvDesc_v8 : public BackendDescriptor {
         std::stringstream ss;
         char sep = ' ';
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
-        ss << "CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR :" << " Datatype: " << json{compute_type}
+        ss << "CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR :" << " Datatype: " << json{compute_type} << " Mode: " << json{mode}
 #else
-        ss << "CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR :" << " Datatype: " << int(compute_type)
+        ss << "CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR :" << " Datatype: " << int(compute_type) << " Mode: " << int(mode)
 #endif
-           << " Mode: " << std::to_string(mode) << " Num Dimensions: " << nDims;
+           << " Num Dimensions: " << nDims;
         ss << " PadLower [";
         for (auto i = 0; i < nDims; i++) {
             ss << sep << padLower[i];
@@ -124,7 +124,7 @@ class ConvDesc_v8 : public BackendDescriptor {
 
     cudnnConvolutionMode_t
     getMathMode() const {
-        return mode;
+        return detail::convert_to_cudnn_type(mode);
     }
 
     // TODO: Deprecate in v1.0
@@ -145,13 +145,13 @@ class ConvDesc_v8 : public BackendDescriptor {
     ConvDesc_v8 &
     operator=(ConvDesc_v8 const &) = delete;
 
-    DataType_t compute_type             = DataType_t::FLOAT;  //! Convolution operation data type
-    cudnnConvolutionMode_t mode         = CUDNN_CONVOLUTION;  //! Convolution vs cross correlation
-    int64_t nDims                       = -1;                 //! number of dimensions
-    int64_t padLower[CUDNN_DIM_MAX + 1] = {0};                //! d, h, w
-    int64_t padUpper[CUDNN_DIM_MAX + 1] = {0};                //! d, h, w
-    int64_t dilation[CUDNN_DIM_MAX + 1] = {0};                //! d, h, w
-    int64_t stride[CUDNN_DIM_MAX + 1]   = {-1};               //! d, h, w
+    DataType_t compute_type             = DataType_t::FLOAT;               //! Convolution operation data type
+    ConvolutionMode_t mode              = ConvolutionMode_t::CONVOLUTION;  //! Convolution vs cross correlation
+    int64_t nDims                       = -1;                              //! number of dimensions
+    int64_t padLower[CUDNN_DIM_MAX + 1] = {0};                             //! d, h, w
+    int64_t padUpper[CUDNN_DIM_MAX + 1] = {0};                             //! d, h, w
+    int64_t dilation[CUDNN_DIM_MAX + 1] = {0};                             //! d, h, w
+    int64_t stride[CUDNN_DIM_MAX + 1]   = {-1};                            //! d, h, w
 };
 
 ///
@@ -207,8 +207,14 @@ class ConvDescBuilder_v8 {
     }
     //! Set Convolution Mode of the convolution Operation
     auto
-    setMathMode(cudnnConvolutionMode_t mode_) -> ConvDescBuilder_v8 & {
+    setMathMode(ConvolutionMode_t mode_) -> ConvDescBuilder_v8 & {
         m_convDesc.mode = mode_;
+        return *this;
+    }
+
+    auto
+    setMathMode(cudnnConvolutionMode_t mode_) -> ConvDescBuilder_v8 & {
+        m_convDesc.mode = detail::convert_from_cudnn_type(mode_);
         return *this;
     }
     /** @} */
@@ -291,11 +297,13 @@ class ConvDescBuilder_v8 {
             return std::move(m_convDesc);
         }
 
+        cudnnConvolutionMode_t mode_ = detail::convert_to_cudnn_type(m_convDesc.mode);
+
         status = detail::set_attribute(m_convDesc.pointer->get_backend_descriptor(),
                                        CUDNN_ATTR_CONVOLUTION_CONV_MODE,
                                        CUDNN_TYPE_CONVOLUTION_MODE,
                                        1,
-                                       &m_convDesc.mode);
+                                       &mode_);
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
                 &m_convDesc,
@@ -377,7 +385,7 @@ class ConvDescBuilder_v8 {
             return std::move(m_convDesc);
         }
 
-        getLogger() << "[cudnn_frontend] " << m_convDesc << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL(m_convDesc)
         return std::move(m_convDesc);
     }
 

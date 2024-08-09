@@ -14,7 +14,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
     hasattr(torch, "float8_e4m3fn") is False,
     reason="torch does not have fp8 data types",
 )
-def test_gemm_silu_and_mul():
+def test_gemm_silu_and_mul(cudnn_handle):
 
     # setup
     M = 64
@@ -22,9 +22,8 @@ def test_gemm_silu_and_mul():
     K = 64
 
     # cudnn graph
-    handle = cudnn.create_handle()
     graph = cudnn.pygraph(
-        handle=handle,
+        handle=cudnn_handle,
         name="cudnn_graph_0",
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
@@ -108,10 +107,8 @@ def test_gemm_silu_and_mul():
     try:
         graph.build([cudnn.heur_mode.A])
     except cudnn.cudnnGraphNotSupportedError as e:
-        cudnn.destroy_handle(handle)
         pytest.xfail(repr(e))
     except Exception as e:
-        cudnn.destroy_handle(handle)
         pytest.fail(repr(e))
 
     workspace = torch.empty(
@@ -129,30 +126,27 @@ def test_gemm_silu_and_mul():
                 C: C_gpu,
             },
             workspace,
-            handle=handle,
+            handle=cudnn_handle,
         )
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
     # Compare
     torch.cuda.synchronize()
 
-    cudnn.destroy_handle(handle)
-
 
 @pytest.mark.skipif(
     hasattr(torch, "float8_e4m3fn") is False,
     reason="torch does not have fp8 data types",
 )
-def test_silu_and_mul_and_quantization():
+def test_silu_and_mul_and_quantization(cudnn_handle):
 
     # setup
     M = 64
     N = 64
 
     # cudnn graph
-    handle = cudnn.create_handle()
     graph = cudnn.pygraph(
-        handle=handle,
+        handle=cudnn_handle,
         name="cudnn_graph_0",
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
@@ -223,14 +217,12 @@ def test_silu_and_mul_and_quantization():
                 C_fp8: C_gpu,
             },
             workspace,
-            handle=handle,
+            handle=cudnn_handle,
         )
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
     # Compare
     torch.cuda.synchronize()
-
-    cudnn.destroy_handle(handle)
 
 
 if __name__ == "__main__":

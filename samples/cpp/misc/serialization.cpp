@@ -29,9 +29,9 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
     enum UIDs {
         x_tensor,
         w_tensor,
-        y_tensor,
         scale_tensor,
         bias_tensor,
+        y_tensor,
     };
 
 #if (CUDNN_VERSION < 8905)
@@ -67,6 +67,7 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
         auto conv_options =
             cudnn_frontend::graph::Conv_fprop_attributes().set_padding({1, 1}).set_stride({1, 1}).set_dilation({1, 1});
         auto conv_output = graph->conv_fprop(X, W, conv_options);
+        conv_output->set_name("conv_output");
 
         auto S = graph->tensor(cudnn_frontend::graph::Tensor_attributes()
                                    .set_uid(scale_tensor)
@@ -76,6 +77,7 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
         auto scale_options =
             cudnn_frontend::graph::Pointwise_attributes().set_mode(cudnn_frontend::PointwiseMode_t::MUL);
         auto scale_output = graph->pointwise(conv_output, S, scale_options);
+        scale_output->set_name("scale_output");
 
         auto B = graph->tensor(cudnn_frontend::graph::Tensor_attributes()
                                    .set_name("bias")
@@ -85,11 +87,12 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
         auto bias_options =
             cudnn_frontend::graph::Pointwise_attributes().set_mode(cudnn_frontend::PointwiseMode_t::ADD);
         auto bias_output = graph->pointwise(scale_output, B, bias_options);
+        bias_output->set_name("bias_output");
 
         auto relu_options =
             cudnn_frontend::graph::Pointwise_attributes().set_mode(cudnn_frontend::PointwiseMode_t::RELU_FWD);
         auto Y = graph->pointwise(bias_output, relu_options);
-        Y->set_output(true).set_uid(y_tensor);
+        Y->set_output(true).set_uid(y_tensor).set_name("final_output");
 
         REQUIRE(graph->validate().is_good());
 

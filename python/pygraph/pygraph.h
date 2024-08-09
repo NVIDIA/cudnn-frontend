@@ -47,7 +47,8 @@ class PyGraph {
             cudnn_frontend::DataType_t io_data_type,
             cudnn_frontend::DataType_t intermediate_data_type,
             cudnn_frontend::DataType_t compute_data_type,
-            std::optional<std::intptr_t> handle_) {
+            std::optional<std::intptr_t> handle_,
+            py::object sm_count) {
         graph.set_compute_data_type(compute_data_type)
             .set_intermediate_data_type(intermediate_data_type)
             .set_io_data_type(io_data_type);
@@ -57,6 +58,10 @@ class PyGraph {
         } else {
             detail::create_handle(&handle);
             is_handle_owner = true;
+        }
+
+        if (sm_count.is(py::none()) == false) {
+            graph.set_sm_count(sm_count.cast<int32_t>());
         }
     }
 
@@ -131,12 +136,19 @@ class PyGraph {
                        std::string const& name);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    slice(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+          std::vector<py::slice> const& slices,
+          cudnn_frontend::DataType_t const& compute_data_type,
+          std::string const& name);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     conv_fprop(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& image,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& weight,
                std::vector<int64_t> const& pre_padding,
                std::vector<int64_t> const& post_padding,
                std::vector<int64_t> const& stride,
                std::vector<int64_t> const& dilation,
+               cudnn_frontend::ConvolutionMode_t const& conv_mode,
                cudnn_frontend::DataType_t const& compute_data_type,
                std::string const& name);
 
@@ -147,6 +159,7 @@ class PyGraph {
                std::vector<int64_t> const& post_padding,
                std::vector<int64_t> const& stride,
                std::vector<int64_t> const& dilation,
+               cudnn_frontend::ConvolutionMode_t const& conv_mode,
                cudnn_frontend::DataType_t const& compute_data_type,
                std::string const& name);
 
@@ -157,6 +170,7 @@ class PyGraph {
                std::vector<int64_t> const& post_padding,
                std::vector<int64_t> const& stride,
                std::vector<int64_t> const& dilation,
+               cudnn_frontend::ConvolutionMode_t const& conv_mode,
                cudnn_frontend::DataType_t const& compute_data_type,
                std::string const& name);
 

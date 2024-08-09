@@ -324,7 +324,7 @@ class EngineBuilder_v8 {
                 "CUDNN_BACKEND_ENGINE_DESCRIPTOR: GetAttribute CUDNN_ATTR_ENGINE_KNOB_INFO Query Failed");
         }
         m_engine.buildKnobs();
-        getLogger() << "[cudnn_frontend] " << m_engine << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL(m_engine);
         return std::move(m_engine);
     }
 

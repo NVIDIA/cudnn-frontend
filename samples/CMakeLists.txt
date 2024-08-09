@@ -25,6 +25,7 @@ add_executable(
     cpp/sdpa/fp16_fwd.cpp
     cpp/sdpa/fp16_bwd.cpp
     cpp/sdpa/fp16_cached.cpp
+    cpp/sdpa/fp16_benchmark.cpp
     cpp/sdpa/fp8_fwd.cpp
     cpp/sdpa/fp8_bwd.cpp
 
@@ -48,10 +49,10 @@ add_executable(
     cpp/misc/parallel_compilation.cpp
     cpp/misc/pointwise.cpp
     cpp/misc/resample.cpp
+    cpp/misc/slice.cpp
+    cpp/misc/sm_carveout.cpp
 
     legacy_samples/conv_sample.cpp 
-    legacy_samples/resnet_test_list.cpp
-    legacy_samples/resnet_sample.cpp
     legacy_samples/test_list.cpp 
     legacy_samples/fp16_emu.cpp 
     legacy_samples/helpers.cpp 
@@ -98,7 +99,7 @@ target_link_libraries(
     Catch2::Catch2WithMain
 
 
-    CUDNN::cudnn_all
+    CUDNN::cudnn
 )
 
 # cuDNN dlopen's its libraries
@@ -108,10 +109,4 @@ set_target_properties(
     PROPERTIES
     LINK_WHAT_YOU_USE TRUE
     RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin
-)
-
-set_source_files_properties(
-    legacy_samples/resnet_test_list.cpp legacy_samples/resnet_sample.cpp
-    PROPERTIES 
-    INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/samples/legacy_samples/resnet_block/include"
 )

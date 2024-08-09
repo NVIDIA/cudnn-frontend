@@ -55,7 +55,7 @@ class OperationGraph_v8 : public BackendDescriptor {
     std::string
     describe() const override {
         std::stringstream ss;
-        ss << "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR has " << numOps << "operations." << std::endl;
+        ss << "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR has " << numOps << " perations." << std::endl;
         ss << "Tag: " << opGraphTag << std::endl;
         return ss.str();
     }
@@ -173,6 +173,13 @@ class OperationGraphBuilder_v8 {
         }
         return *this;
     }
+
+    auto
+    addOperation(ManagedOpaqueDescriptor desc) -> OperationGraphBuilder_v8 & {
+        m_operationGraph.ops[m_operationGraph.numOps] = desc;
+        ++m_operationGraph.numOps;
+        return *this;
+    }
     /** @} */
 
     //! constructs the OperationGraph_v8 by calling the cudnn API
@@ -247,7 +254,7 @@ class OperationGraphBuilder_v8 {
             return std::move(m_operationGraph);
         }
 
-        getLogger() << "[cudnn_frontend] " << m_operationGraph << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL(m_operationGraph);
         return std::move(m_operationGraph);
     }
 

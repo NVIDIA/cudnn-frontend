@@ -108,7 +108,7 @@ class ExecutionPlanCache_v1 {
     add_plan_to_cache(const cudnn_frontend::OperationGraph &op_graph, const cudnn_frontend::ExecutionPlan &plan) {
         std::lock_guard<std::mutex> guard(cache_mutex);
         cache.insert(std::make_pair(op_graph.getFeatureVector(), plan));
-        getLogger() << "[cudnn_frontend] Added to " << name << " " << op_graph.getTag() << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("Added to " << name << " " << op_graph.getTag());
     }
 
     ExecutionPlanCache_v1(const char *name_) { name = name_; }
@@ -127,12 +127,12 @@ class ExecutionPlanCache_v1 {
             auto it = cache.find(op_graph.getFeatureVector());
 
             if (it == cache.end()) {
-                getLogger() << "[cudnn_frontend] Cached Plan Not Found in " << name << std::endl;
+                CUDNN_FE_LOG_LABEL_ENDL("Cached Plan Not Found in " << name);
                 return false;
             }
             plan = &(it->second);
         }
-        getLogger() << "[cudnn_frontend] Cached Plan Found in " << name << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("Cached Plan Found in " << name);
         return true;
     }
 
@@ -156,16 +156,15 @@ class ExecutionPlanCache_v2 : public ExecutionPlanCache_v1 {
         // Ideally, one will auto-tune only if the plan cache has no plan for the op_graph.
         cudnn_frontend::ExecutionPlan const *plan = nullptr;
         if (get_plan_from_cache(op_graph, plan)) {
-            getLogger() << "[cudnn_frontend] SaturationTracker " << name << " " << op_graph.getTag() << " " << tag
-                        << " plan already in cache." << std::endl;
+            CUDNN_FE_LOG_LABEL_ENDL("SaturationTracker " << name << " " << op_graph.getTag() << " " << tag
+                                                         << " plan already in cache.");
             return false;
         }
 
         // Lock the cache and increase the count till we saturate
         std::lock_guard<std::mutex> guard(cache_mutex);
         auto cnt = tracker[std::make_pair(op_graph.getFeatureVector(), tag)] += 1;
-        getLogger() << "[cudnn_frontend] SaturationTracker " << name << " " << op_graph.getTag() << " " << tag << " "
-                    << cnt << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("SaturationTracker " << name << " " << op_graph.getTag() << " " << tag << " " << cnt);
         return cnt >= saturationCount;
     }
 

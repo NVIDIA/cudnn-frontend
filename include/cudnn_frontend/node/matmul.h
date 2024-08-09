@@ -22,22 +22,8 @@ class MatmulNode : public NodeCRTP<MatmulNode> {
     }
 
     error_t
-    pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating matmul node " << attributes.name << "..." << std::endl;
-
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(Matmul_attributes::input_names::A);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(Matmul_attributes::input_names::B);
-        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(Matmul_attributes::output_names::C);
-
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for matmul node " << attributes.name << "..."
-                    << std::endl;
+    infer_properties_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for matmul node " << attributes.name << "...");
 
         attributes.fill_from_context(context);
 
@@ -52,18 +38,9 @@ class MatmulNode : public NodeCRTP<MatmulNode> {
 
         // Only infer dims and strides if user did not set them
         if (c_tensor_dim.empty()) {
-            c_tensor_dim.resize(a_tensor_dim.size());
-            if (a_tensor_dim.size() == 4) {
-                c_tensor_dim[0] = a_tensor_dim[0];  // B
-                c_tensor_dim[1] = a_tensor_dim[1];  // H
-                c_tensor_dim[2] = a_tensor_dim[2];  // M
-                c_tensor_dim[3] = b_tensor_dim[3];  // N
-            } else {
-                c_tensor_dim[0] = a_tensor_dim[0];  // B
-                c_tensor_dim[1] = a_tensor_dim[1];  // M
-                c_tensor_dim[2] = b_tensor_dim[2];  // N
-            }
+            // CHECK_CUDNN_FRONTEND_ERROR(detail::generate_matmul_output_dim(a_tensor_dim, b_tensor_dim, c_tensor_dim));
 
+            c_tensor_dim.resize(a_tensor_dim.size());
             int64_t gemm_start_dim           = a_tensor_dim.size() - 2;
             c_tensor_dim[gemm_start_dim]     = a_tensor_dim[gemm_start_dim];      // M
             c_tensor_dim[gemm_start_dim + 1] = b_tensor_dim[gemm_start_dim + 1];  // N
@@ -86,21 +63,13 @@ class MatmulNode : public NodeCRTP<MatmulNode> {
     }
 
     error_t
-    post_validate_node() const override final {
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
+        managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Building MatmulNode operations " << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FRONTEND_UNUSED(raw_operations);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Building MatmulNode operations " << attributes.name << "...");
 
         // matmul descriptor
         auto matmul_descriptor = cudnn_frontend::MatMulDescBuilder()

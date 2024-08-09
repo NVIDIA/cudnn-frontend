@@ -23,17 +23,8 @@ class DBNNode : public NodeCRTP<DBNNode> {
     }
 
     error_t
-    pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating DBNNode " << attributes.name << "..." << std::endl;
-
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferencing properties for DBN node " << attributes.name << "..."
-                    << std::endl;
+    infer_properties_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferencing properties for DBN node " << attributes.name << "...");
 
         attributes.fill_from_context(context);
 
@@ -77,21 +68,13 @@ class DBNNode : public NodeCRTP<DBNNode> {
     }
 
     error_t
-    post_validate_node() const override final {
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
+        managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Building DBNNode operations " << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FRONTEND_UNUSED(raw_operations);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Building DBNNode operations " << attributes.name << "...");
 
         std::vector<cudnn_frontend::Tensor> peer_stats;
         for (auto const& peer_stat : attributes.peer_stats) {

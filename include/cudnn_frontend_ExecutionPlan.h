@@ -452,7 +452,7 @@ class ExecutionPlanBuilder_v8 {
         m_execution_plan.fetchNotes(extractedEngine);
         m_execution_plan.computeWorkSpaceSize();
 
-        getLogger() << "[cudnn_frontend] " << m_execution_plan << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL(m_execution_plan);
         return std::move(m_execution_plan);
     }
 
@@ -569,7 +569,7 @@ class ExecutionPlanBuilder_v8 {
         m_execution_plan.fetchNotes(extractedEngine);
         m_execution_plan.computeWorkSpaceSize();
 
-        getLogger() << "[cudnn_frontend] " << m_execution_plan << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL(m_execution_plan);
         return std::move(m_execution_plan);
     }
 

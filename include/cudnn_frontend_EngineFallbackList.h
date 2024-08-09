@@ -163,7 +163,7 @@ class EngineFallbackListBuilder_v8 {
                                        .build();
         auto count                       = fallback_heuristics.getEngineConfigCount();
         m_fallback_list.m_engine_configs = fallback_heuristics.getEngineConfig(count);
-        getLogger() << "[cudnn_frontend] " << m_fallback_list << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL(m_fallback_list);
         return std::move(m_fallback_list);
     }
 

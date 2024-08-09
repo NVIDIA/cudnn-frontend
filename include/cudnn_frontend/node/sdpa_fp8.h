@@ -30,7 +30,7 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating SDPAFP8Node " << attributes.name << "..." << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating SDPAFP8Node " << attributes.name << "...");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90100,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -65,13 +65,9 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
                 std::string(#port));                                                                            \
     }
 
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::Q);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Q, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::K);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::K, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::V);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::V, attributes.inputs);
-        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::O);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::O, attributes.outputs);
 
         // validate options for is_inference and stats tensor
@@ -79,13 +75,7 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "is_inference attribute not set");
 
-        if (attributes.is_inference.value() == false) {
-            CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::Stats);
-        }
-
 #undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
-
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
 
         int64_t d_qk = attributes.inputs.at(input_names::Q)->get_dim()[3];
         int64_t d_v  = attributes.inputs.at(input_names::V)->get_dim()[3];
@@ -105,9 +95,24 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
     }
 
     error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for Scaled_dot_product_flash_attention node  "
-                    << attributes.name << "..." << std::endl;
+    infer_properties_node() override final {
+        auto stats     = attributes.outputs.at(output_names::Stats);
+        auto stats_dim = stats->get_dim();
+
+        if (stats_dim.empty()) {
+            // Fill properties of virtual tensors
+            auto const& p_dim = attributes.inputs[input_names::Q]->get_dim();
+            auto b            = p_dim[0];
+            auto h            = p_dim[1];
+            auto s_q          = p_dim[2];
+            stats->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+        }
+        return {error_code_t::OK, ""};
+    }
+    error_t
+    expand_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for Scaled_dot_product_flash_attention node  "
+                                << attributes.name << "...");
 
         // DO NOT REMOVE
         // input data type is needed for:
@@ -259,10 +264,6 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
         CUDNN_FE_VALIDATE_STRIDE(output_names::O, attributes.outputs);
 
 #undef CUDNN_FE_VALIDATE_STRIDE
-
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
 
         return {error_code_t::OK, ""};
     }

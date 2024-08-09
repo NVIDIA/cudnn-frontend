@@ -273,13 +273,15 @@ get_error_string(cudnnStatus_t status) {
 
 inline void
 get_last_error_string(char *message, size_t size) {
+    if (detail::get_backend_version() > 90000 && detail::get_compiled_version() < 90000) {
 #if CUDNN_VERSION >= 90000
-    NV_FE_CALL_TO_BACKEND(get_last_error_string, cudnnGetLastErrorString, message, size);
-#else
-    std::string default_message = "Can't retrieve backend error messages for CUDNN version < 9.0";
-    strncpy(message, default_message.c_str(), size - 1);
-    message[size - 1] = '\0';  // Ensure null terminator at the end of the string
+        NV_FE_CALL_TO_BACKEND(get_last_error_string, cudnnGetLastErrorString, message, size);
 #endif
+    } else {
+        std::string default_message = "Can't retrieve backend error messages for CUDNN version < 9.0";
+        strncpy(message, default_message.c_str(), size - 1);
+        message[size - 1] = '\0';  // Ensure null terminator at the end of the string
+    }
 }
 
 inline std::string

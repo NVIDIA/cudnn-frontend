@@ -90,6 +90,27 @@ getLogger() {
     return opt;
 }
 
+#define CUDNN_FE_LOG(X)           \
+    do {                          \
+        if (isLoggingEnabled()) { \
+            getLogger() << X;     \
+        }                         \
+    } while (0);
+
+#define CUDNN_FE_LOG_LABEL(X)                        \
+    do {                                             \
+        if (isLoggingEnabled()) {                    \
+            getLogger() << "[cudnn_frontend] " << X; \
+        }                                            \
+    } while (0);
+
+#define CUDNN_FE_LOG_LABEL_ENDL(X)                                \
+    do {                                                          \
+        if (isLoggingEnabled()) {                                 \
+            getLogger() << "[cudnn_frontend] " << X << std::endl; \
+        }                                                         \
+    } while (0);
+
 static std::ostream &
 operator<<(std::ostream &os, const BackendDescriptor &desc) {
     if (isLoggingEnabled()) {
