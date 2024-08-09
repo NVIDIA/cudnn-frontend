@@ -184,7 +184,7 @@ check_rule(const json &json_handle,
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
             throw cudnnException(message.c_str(), CUDNN_STATUS_BAD_PARAM);
 #endif
-            getLogger() << message << std::endl;
+            CUDNN_FE_LOG(message << std::endl);
             return blocked;
         }
 
@@ -255,15 +255,15 @@ check_rule(const json &json_handle,
 template <typename T>
 static bool
 check_errata(const json &json_handle, const std::string &executionPlanTag, cudnnHandle_t handle, T fn) {
-    cudnn_frontend::getLogger() << "[cudnn_frontend] " << "Verifying " << executionPlanTag;
+    CUDNN_FE_LOG_LABEL("Verifying " << executionPlanTag);
     for (auto const &rule : json_handle["rules"]) {
         if (check_rule<T>(rule, executionPlanTag, handle, fn)) {
-            cudnn_frontend::getLogger() << ". Blocking." << std::endl;
+            CUDNN_FE_LOG(". Blocking." << std::endl);
             return true;
         }
     }
 
-    cudnn_frontend::getLogger() << ". Passed." << std::endl;
+    CUDNN_FE_LOG(". Passed." << std::endl);
     return false;
 }
 
@@ -276,15 +276,15 @@ check_errata(const json &json_handle,
              cudnnHandle_t handle,
              const OperationGraph &opGraph,
              T fn) {
-    cudnn_frontend::getLogger() << "[cudnn_frontend] " << "Verifying " << executionPlanTag;
+    CUDNN_FE_LOG_LABEL("Verifying " << executionPlanTag);
     for (auto const &rule : json_handle["rules"]) {
         if (check_rule<T>(rule, executionPlanTag, handle, fn, opGraph)) {
-            cudnn_frontend::getLogger() << ". Blocking." << std::endl;
+            CUDNN_FE_LOG(". Blocking." << std::endl);
             return true;
         }
     }
 
-    cudnn_frontend::getLogger() << ". Passed." << std::endl;
+    CUDNN_FE_LOG(". Passed." << std::endl);
     return false;
 }
 #endif

@@ -22,60 +22,34 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
     }
 
     error_t
-    pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating pointwise node " << attributes.name << "..."
-                    << std::endl;
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            attributes.mode == PointwiseMode_t::NOT_SET, error_code_t::ATTRIBUTE_NOT_SET, "pointwise mode not set.");
-
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(Pointwise_attributes::input_names::IN_0);
-
-        auto const port_count = get_pointwise_mode_port_count(attributes.mode);
-        if (port_count >= 3) {
-            CUDNN_FE_VALIDATE_INPUT_TENSOR(Pointwise_attributes::input_names::IN_1);
-        }
-
-        if (port_count >= 4) {
-            CUDNN_FE_VALIDATE_INPUT_TENSOR(Pointwise_attributes::input_names::IN_2);
-        }
-
-        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(Pointwise_attributes::output_names::OUT_0);
-
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for pointwise node " << attributes.name << "..."
-                    << std::endl;
+    infer_properties_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for pointwise node " << attributes.name << "...");
 
         attributes.fill_from_context(context);
 
-        // Only inferrencing from IN_0 to OUT_0 works today.
-        auto in_0_tensor  = attributes.inputs[Pointwise_attributes::input_names::IN_0];
-        auto out_0_tensor = attributes.outputs[Pointwise_attributes::output_names::OUT_0];
+        auto out_0_tensor = attributes.outputs.at(Pointwise_attributes::output_names::OUT_0);
 
-        auto out_0_tensor_dim = out_0_tensor->get_dim();
+        auto output_dim = out_0_tensor->get_dim();
         // Only infer dims and strides if user did not set them
-        if (out_0_tensor_dim.empty()) {
-            out_0_tensor->set_dim(in_0_tensor->get_dim());
+        if (output_dim.empty()) {
+            std::vector<std::vector<int64_t>> input_shapes;
+            for (const auto& [input_name, input_tensor] : attributes.inputs) {
+                if (!input_tensor) {
+                    continue;
+                }
+                input_shapes.push_back(input_tensor->get_dim());
+            }
+
+            CHECK_CUDNN_FRONTEND_ERROR(detail::compute_broadcast_shape(input_shapes, output_dim));
+            out_0_tensor->set_dim(output_dim);
         }
-        // Special case here where input strides are being copied over
+
         if (out_0_tensor->get_stride().empty()) {
-            out_0_tensor->set_stride(in_0_tensor->get_stride());
+            auto input_stride = attributes.inputs.at(Pointwise_attributes::input_names::IN_0)->get_stride();
+            std::vector<int64_t> stride_order =
+                detail::generate_stride_order_preserving_format(input_stride, output_dim.size());
+            out_0_tensor->set_stride(detail::generate_stride(output_dim, stride_order));
         }
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    post_validate_node() const override final {
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
 
         return {error_code_t::OK, ""};
     }
@@ -84,9 +58,10 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
+        managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Building PointwiseNode operations " << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FRONTEND_UNUSED(raw_operations);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Building PointwiseNode operations " << attributes.name << "...");
 
         auto&& pointwise_descriptor_builder = cudnn_frontend::PointwiseDescBuilder();
 

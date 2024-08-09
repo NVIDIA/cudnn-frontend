@@ -624,7 +624,7 @@ class OperationBuilder_v8 {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
         }
-        getLogger() << "Extracting the feature vector" << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("Extracting the feature vector");
         extract_feature_vector(DescriptorType_t::OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR);
         return std::move(m_operation);
     }
@@ -1004,7 +1004,7 @@ class OperationBuilder_v8 {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
             return std::move(m_operation);
         }
-        getLogger() << "Extracting the feature vector" << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("Extracting the feature vector");
         extract_feature_vector(DescriptorType_t::OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR);
         return std::move(m_operation);
     }
@@ -1906,7 +1906,7 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
 
-        getLogger() << "Extracting the feature vector" << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("Extracting the feature vector");
         extract_feature_vector(DescriptorType_t::OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR);
         return std::move(m_operation);
     }
@@ -2926,7 +2926,7 @@ class OperationBuilder_v8 {
             set_error_and_throw_exception(
                 &m_operation, status, "CUDNN_BACKEND_OPERATION: unimplemented operation in frontend");
         }
-        getLogger() << "[cudnn_frontend] " << m_operation << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL(m_operation);
         return std::move(m_operation);
     }
 };

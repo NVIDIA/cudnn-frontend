@@ -123,11 +123,7 @@
 #include "cudnn_frontend/graph_interface.h"
 #include "cudnn_frontend/utils/serialize.h"
 
-#define CUDNN_FRONTEND_MAJOR_VERSION 1
-#define CUDNN_FRONTEND_MINOR_VERSION 5
-#define CUDNN_FRONTEND_PATCH_VERSION 2
-#define CUDNN_FRONTEND_VERSION \
-    ((CUDNN_FRONTEND_MAJOR_VERSION * 10000) + (CUDNN_FRONTEND_MINOR_VERSION * 100) + CUDNN_FRONTEND_PATCH_VERSION)
+#include "cudnn_frontend_version.h"
 
 namespace cudnn_frontend {
 using ConvDesc                  = ConvDesc_v8;

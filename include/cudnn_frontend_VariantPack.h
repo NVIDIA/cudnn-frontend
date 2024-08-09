@@ -181,7 +181,7 @@ class VariantPackBuilder_v8 {
                 &m_variant_pack, status, "CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR: cudnnFinalize Failed");
             return std::move(m_variant_pack);
         }
-        getLogger() << "[cudnn_frontend] " << m_variant_pack << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL(m_variant_pack);
         return std::move(m_variant_pack);
     }
 

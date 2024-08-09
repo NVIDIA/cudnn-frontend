@@ -20,26 +20,8 @@ class ReshapeNode : public NodeCRTP<ReshapeNode> {
     }
 
     error_t
-    pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating ReshapeNode " << attributes.name << "..." << std::endl;
-
-        auto const& x    = attributes.inputs.find(Reshape_attributes::input_names::X);
-        bool const has_x = (x != attributes.inputs.end()) && (x->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_x, error_code_t::ATTRIBUTE_NOT_SET, "reshape input not set.");
-
-        auto const& y    = attributes.outputs.find(Reshape_attributes::output_names::Y);
-        bool const has_y = (y != attributes.outputs.end()) && (y->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_y, error_code_t::ATTRIBUTE_NOT_SET, "reshape output not set.");
-
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for reshape node " << attributes.name << "..."
-                    << std::endl;
+    infer_properties_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for reshape node " << attributes.name << "...");
 
         auto y_tensor = attributes.outputs[Reshape_attributes::output_names::Y];
 
@@ -72,21 +54,13 @@ class ReshapeNode : public NodeCRTP<ReshapeNode> {
     }
 
     error_t
-    post_validate_node() const override final {
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
+        managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Building ReshapeNode operations " << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FRONTEND_UNUSED(raw_operations);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Building ReshapeNode operations " << attributes.name << "...");
 
         auto&& reshape_op_builder = cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_RESHAPE_DESCRIPTOR);
 

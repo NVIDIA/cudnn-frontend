@@ -56,7 +56,7 @@ def param_extract(request):
     reason="RmsNorm not supported below cudnn 8.9.6",
 )
 @torch_fork_set_rng(seed=0)
-def test_rmsnorm(param_extract):
+def test_rmsnorm(param_extract, cudnn_handle):
 
     embedding_dim, input_type, has_bias = param_extract
 
@@ -93,14 +93,13 @@ def test_rmsnorm(param_extract):
 
     print("Building cudnn graph")
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     graph = cudnn.pygraph(
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     X = graph.tensor_like(x_gpu.detach())
@@ -144,15 +143,12 @@ def test_rmsnorm(param_extract):
             inv_var: inv_var_actual,
         },
         workspace,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     torch.cuda.synchronize()
-    print("Comparing with reference")
     torch.testing.assert_close(Y_expected, Y_actual, atol=0.03125, rtol=0.03125)
     torch.testing.assert_close(inv_var_expected, inv_var_actual, atol=0.005, rtol=0.005)
-    print("Success!!")
-    cudnn.destroy_handle(handle)
 
     target = torch.randn_like(Y_expected)
     criterion = nn.MSELoss()
@@ -165,14 +161,13 @@ def test_rmsnorm(param_extract):
 
     loss.backward()
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     bwd_graph = cudnn.pygraph(
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     DY = bwd_graph.tensor_like(Y_expected.grad)
@@ -222,7 +217,7 @@ def test_rmsnorm(param_extract):
             Dbias: Dbias_actual,
         },
         workspace,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     torch.cuda.synchronize()
@@ -232,7 +227,6 @@ def test_rmsnorm(param_extract):
     if has_bias:
         torch.testing.assert_close(bias_gpu.grad, Dbias_actual, atol=5e-4, rtol=5e-4)
     print("Success!!")
-    cudnn.destroy_handle(handle)
 
 
 if __name__ == "__main__":

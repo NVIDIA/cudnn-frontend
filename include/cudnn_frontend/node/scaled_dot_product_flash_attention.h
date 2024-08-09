@@ -34,7 +34,7 @@ class SDPANode : public NodeCRTP<SDPANode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating SDPANode " << attributes.name << "..." << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating SDPANode " << attributes.name << "...");
 
         // check that Q, K, V, O tensors has been assigned
         // check that dim and strides has been assigned and last stride is 1
@@ -59,13 +59,9 @@ class SDPANode : public NodeCRTP<SDPANode> {
                 std::string(#port));                                                                             \
     }
 
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::Q);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Q, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::K);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::K, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::V);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::V, attributes.inputs);
-        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::O);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::O, attributes.outputs);
 
         // validate options for is_inference and stats tensor
@@ -200,15 +196,31 @@ class SDPANode : public NodeCRTP<SDPANode> {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Intermediate tensor data type needs to be set as internal tensors require it.");
         // clang-format on
-
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
         return {error_code_t::OK, ""};
     }
 
     error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for Scaled_dot_product_flash_attention node  "
-                    << attributes.name << "..." << std::endl;
+    infer_properties_node() override final {
+        if (attributes.is_inference.value() == false) {
+            auto stats     = attributes.outputs.at(output_names::Stats);
+            auto stats_dim = stats->get_dim();
+
+            if (stats_dim.empty()) {
+                // Fill properties of virtual tensors
+                auto const& p_dim = attributes.inputs[input_names::Q]->get_dim();
+                auto b            = p_dim[0];
+                auto h            = p_dim[1];
+                auto s_q          = p_dim[2];
+                stats->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+            }
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    expand_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for Scaled_dot_product_flash_attention node  "
+                                << attributes.name << "...");
 
         // DO NOT REMOVE
         // input data type is needed for:
@@ -614,10 +626,6 @@ class SDPANode : public NodeCRTP<SDPANode> {
 
 #undef CUDNN_FE_VALIDATE_STRIDE
 
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
-
         return {error_code_t::OK, ""};
     }
 
@@ -632,7 +640,7 @@ class SDPANode : public NodeCRTP<SDPANode> {
     }
 
     virtual error_t
-    workspace_modifications_tensors_(
+    collect_tensors_in_workspace_node(
         std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>>& workspace_modifications,
         int64_t& offset) const override final {
         if (attributes.alibi_mask) {
@@ -681,8 +689,7 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating SDPABackwardNode" << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating SDPABackwardNode" << attributes.name << "...");
 
         // check that Q, K, V, O, stats, dO, dQ, dK, dV tensors has been assigned
         // check that dim and strides has been assigned and last stride is 1
@@ -707,23 +714,14 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                 std::string(#port));                                                                             \
     }
 
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::Q);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Q, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::K);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::K, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::V);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::V, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::O);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::O, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::Stats);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Stats, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::dO);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::dO, attributes.inputs);
-        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::dQ);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dQ, attributes.outputs);
-        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::dK);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dK, attributes.outputs);
-        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::dV);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dV, attributes.outputs);
 
 #undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
@@ -850,23 +848,17 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                                        "Intermediate tensor data type needs to be set as internal tensors require it.");
         // clang-format on
 
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
         return {error_code_t::OK, ""};
     }
 
     error_t
-    post_validate_node() const override final {
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
-
+    infer_properties_node() override final {
         return {error_code_t::OK, ""};
     }
 
     error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for SDPABackwardNode " << attributes.name
-                    << "..." << std::endl;
+    expand_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for SDPABackwardNode " << attributes.name);
 
         attributes.fill_from_context(context);
 
@@ -1525,7 +1517,7 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
     }
 
     virtual error_t
-    workspace_modifications_tensors_(
+    collect_tensors_in_workspace_node(
         std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>>& workspace_modifications,
         int64_t& offset) const override final {
         if (attributes.alibi_mask) {

@@ -28,10 +28,9 @@ def param_extract(request):
     reason="IN not supported below cudnn 8.9.5",
 )
 @torch_fork_set_rng(seed=0)
-def test_in(param_extract):
+def test_in(param_extract, cudnn_handle):
 
     (input_type,) = param_extract
-    print(input_type)
 
     if input_type == torch.bfloat16:
         atol, rtol = 0.125, 0.125
@@ -59,8 +58,6 @@ def test_in(param_extract):
         dtype=torch.float32,
     )
 
-    print("Running reference")
-
     Y_expected = torch.nn.functional.instance_norm(
         x_gpu, weight=scale_gpu.view(C), bias=bias_gpu.view(C)
     )
@@ -68,16 +65,13 @@ def test_in(param_extract):
     inv_var_expected = torch.rsqrt(
         torch.var(x_gpu.to(torch.float32), dim=(2, 3), keepdim=True) + epsilon_value
     )
-    print("Building cudnn graph")
-
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     graph = cudnn.pygraph(
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     X = graph.tensor_like(x_gpu.detach())
@@ -111,7 +105,6 @@ def test_in(param_extract):
     workspace = torch.empty(
         graph.get_workspace_size(), device="cuda", dtype=torch.uint8
     )
-    print("Executing cudnn graph")
 
     graph.execute(
         {
@@ -124,7 +117,7 @@ def test_in(param_extract):
             inv_var: inv_var_actual,
         },
         workspace,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     torch.cuda.synchronize()
@@ -133,7 +126,6 @@ def test_in(param_extract):
     torch.testing.assert_close(mean_expected, mean_actual, atol=atol, rtol=rtol)
     torch.testing.assert_close(inv_var_expected, inv_var_actual, atol=atol, rtol=rtol)
     print("Success!!")
-    cudnn.destroy_handle(handle)
 
     target = torch.randn_like(Y_expected)
     criterion = torch.nn.MSELoss()
@@ -146,14 +138,13 @@ def test_in(param_extract):
 
     loss.backward()
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     bwd_graph = cudnn.pygraph(
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     # https://github.com/pytorch/pytorch/issues/72341
@@ -193,7 +184,6 @@ def test_in(param_extract):
     workspace = torch.empty(
         bwd_graph.get_workspace_size(), device="cuda", dtype=torch.uint8
     )
-    print("Executing cudnn bwd_graph")
 
     bwd_graph.execute(
         {
@@ -208,17 +198,14 @@ def test_in(param_extract):
             Dbias: Dbias_actual,
         },
         workspace,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     torch.cuda.synchronize()
-    print("Comparing with reference")
     torch.testing.assert_close(x_gpu.grad, DX_actual, atol=2e-3, rtol=2e-3)
     torch.testing.assert_close(scale_gpu.grad, DScale_actual, atol=2e-3, rtol=2e-3)
     torch.testing.assert_close(bias_gpu.grad, Dbias_actual, atol=2e-3, rtol=2e-3)
-    cudnn.destroy_handle(handle)
-    print("Success!!")
 
 
 if __name__ == "__main__":
-    test_in((torch.float16,))
+    test_in((torch.float16,), cudnn_handle)

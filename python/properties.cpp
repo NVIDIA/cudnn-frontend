@@ -124,6 +124,10 @@ init_properties(py::module_& m) {
         .value("B", cudnn_frontend::HeurMode_t::B)
         .value("FALLBACK", cudnn_frontend::HeurMode_t::FALLBACK);
 
+    py::enum_<cudnn_frontend::ConvolutionMode_t>(m, "convolution_mode")
+        .value("CONVOLUTION", cudnn_frontend::ConvolutionMode_t::CONVOLUTION)
+        .value("CROSS_CORRELATION", cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION);
+
     py::enum_<cudnn_frontend::ReductionMode_t>(m, "reduction_mode")
         .value("ADD", cudnn_frontend::ReductionMode_t::ADD)
         .value("MUL", cudnn_frontend::ReductionMode_t::MUL)

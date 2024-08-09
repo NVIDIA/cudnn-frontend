@@ -371,6 +371,49 @@ NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_backward_attributes::output_names,
                                  {SDPA_backward_attributes::output_names::RNG_DUMP, "RNG_DUMP"},
                              })
 
+NLOHMANN_JSON_SERIALIZE_ENUM(Slice_attributes::output_names,
+                             {
+                                 {Slice_attributes::output_names::Y, "Y"},
+                             })
+NLOHMANN_JSON_SERIALIZE_ENUM(Slice_attributes::input_names,
+                             {
+                                 {Slice_attributes::input_names::X, "X"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_fp8_backward_attributes::input_names,
+                             {
+                                 {SDPA_fp8_backward_attributes::input_names::Q, "Q"},
+                                 {SDPA_fp8_backward_attributes::input_names::K, "K"},
+                                 {SDPA_fp8_backward_attributes::input_names::V, "V"},
+                                 {SDPA_fp8_backward_attributes::input_names::O, "O"},
+                                 {SDPA_fp8_backward_attributes::input_names::dO, "dO"},
+                                 {SDPA_fp8_backward_attributes::input_names::Stats, "Stats"},
+                                 {SDPA_fp8_backward_attributes::input_names::Attn_scale, "Attn_scale"},
+                                 {SDPA_fp8_backward_attributes::input_names::Descale_Q, "Descale_Q"},
+                                 {SDPA_fp8_backward_attributes::input_names::Descale_K, "Descale_K"},
+                                 {SDPA_fp8_backward_attributes::input_names::Descale_V, "Descale_V"},
+                                 {SDPA_fp8_backward_attributes::input_names::Descale_O, "Descale_O"},
+                                 {SDPA_fp8_backward_attributes::input_names::Descale_dO, "Descale_dO"},
+                                 {SDPA_fp8_backward_attributes::input_names::Descale_S, "Descale_S"},
+                                 {SDPA_fp8_backward_attributes::input_names::Descale_dP, "Descale_dP"},
+                                 {SDPA_fp8_backward_attributes::input_names::Scale_dQ, "Scale_dQ"},
+                                 {SDPA_fp8_backward_attributes::input_names::Scale_dK, "Scale_dK"},
+                                 {SDPA_fp8_backward_attributes::input_names::Scale_dV, "Scale_dV"},
+                                 {SDPA_fp8_backward_attributes::input_names::Scale_S, "Scale_S"},
+                                 {SDPA_fp8_backward_attributes::input_names::Scale_dP, "Scale_dP"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_fp8_backward_attributes::output_names,
+                             {
+                                 {SDPA_fp8_backward_attributes::output_names::dQ, "dQ"},
+                                 {SDPA_fp8_backward_attributes::output_names::dK, "dK"},
+                                 {SDPA_fp8_backward_attributes::output_names::dV, "dV"},
+                                 {SDPA_fp8_backward_attributes::output_names::Amax_dQ, "Amax_dQ"},
+                                 {SDPA_fp8_backward_attributes::output_names::Amax_dK, "Amax_dK"},
+                                 {SDPA_fp8_backward_attributes::output_names::Amax_dV, "Amax_dV"},
+                                 {SDPA_fp8_backward_attributes::output_names::Amax_dP, "Amax_d"},
+                             })
+
 inline void
 to_json(nlohmann::json& j, const Tensor_attributes& ta) {
     j = nlohmann::json{{"name", ta.name},

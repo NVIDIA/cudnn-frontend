@@ -21,23 +21,8 @@ class RngNode : public NodeCRTP<RngNode> {
     }
 
     error_t
-    pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating RngNode " << attributes.name << "..." << std::endl;
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            attributes.outputs.find(Rng_attributes::output_names::Y) == attributes.outputs.end(),
-            error_code_t::ATTRIBUTE_NOT_SET,
-            "rng output not set.");
-
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for rng node " << attributes.name << "..."
-                    << std::endl;
+    infer_properties_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for rng node " << attributes.name << "...");
 
         auto y_tensor = attributes.outputs[Rng_attributes::output_names::Y];
 
@@ -70,21 +55,13 @@ class RngNode : public NodeCRTP<RngNode> {
     }
 
     error_t
-    post_validate_node() const override final {
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
+        managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Building RngNode operations " << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FRONTEND_UNUSED(raw_operations);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Building RngNode operations " << attributes.name << "...");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.get_distribution() != RngDistribution_t::BERNOULLI,
                                        error_code_t::ATTRIBUTE_NOT_SET,

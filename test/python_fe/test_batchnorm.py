@@ -25,7 +25,7 @@ class SGBN(torch.nn.Module):
     reason="BN with mask output not supported below cudnn 8.8",
 )
 @torch_fork_set_rng(seed=0)
-def test_bn_relu_with_mask():
+def test_bn_relu_with_mask(cudnn_handle):
 
     N, C, H, W = 4, 16, 56, 56
     x_gpu = torch.randn(
@@ -56,16 +56,15 @@ def test_bn_relu_with_mask():
         (1, 1, 1, 1), 0.1, requires_grad=False, device="cpu", dtype=torch.float32
     )
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     # Cudnn code
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.FLOAT,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     X = graph.tensor(
@@ -177,7 +176,7 @@ def test_bn_relu_with_mask():
             mask: mask_actual,
         },
         workspace,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     # Compare
@@ -189,7 +188,6 @@ def test_bn_relu_with_mask():
         inv_var_expected, saved_inv_var_actual, atol=1e-3, rtol=1e-3
     )
 
-    cudnn.destroy_handle(handle)
     # torch.testing.assert_close(mask_expected, mask_actual)
 
 
@@ -198,7 +196,7 @@ def test_bn_relu_with_mask():
     reason="DBN fusions not supported below cudnn 8.9",
 )
 @torch_fork_set_rng(seed=0)
-def test_drelu_dadd_dbn():
+def test_drelu_dadd_dbn(cudnn_handle):
 
     # Tensors
     N, C, H, W = 4, 16, 56, 56
@@ -222,16 +220,15 @@ def test_drelu_dadd_dbn():
         0, 2, [N, C, H, W], requires_grad=False, device="cuda", dtype=torch.bool
     ).to(memory_format=torch.channels_last)
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     # Cudnn code
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     X = graph.tensor(
@@ -312,7 +309,7 @@ def test_drelu_dadd_dbn():
     if should_dump_dx_drelu is True:
         DX_drelu_actual = torch.zeros_like(dy_gpu)
         device_buffers[DX_drelu] = DX_drelu_actual
-    graph.execute(device_buffers, workspace, handle=handle)
+    graph.execute(device_buffers, workspace, handle=cudnn_handle)
 
 
 @pytest.mark.skipif(
@@ -320,7 +317,7 @@ def test_drelu_dadd_dbn():
     reason="BN_infer-Drelu-DBN not supported below cudnn 8.9.4",
 )
 @torch_fork_set_rng(seed=0)
-def test_bn_infer_drelu_dbn():
+def test_bn_infer_drelu_dbn(cudnn_handle):
 
     # Tensors
     N, C, H, W = 4, 16, 56, 56
@@ -344,16 +341,15 @@ def test_bn_infer_drelu_dbn():
         N, C, H, W, requires_grad=False, device="cuda", dtype=torch.float16
     ).to(memory_format=torch.channels_last)
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     # Cudnn code
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     # Bool type is not supported by dlpack
@@ -437,7 +433,7 @@ def test_bn_infer_drelu_dbn():
         DScale: DScale_actual,
         DBias: DBias_actual,
     }
-    graph.execute(device_buffers, workspace, handle=handle)
+    graph.execute(device_buffers, workspace, handle=cudnn_handle)
 
 
 if __name__ == "__main__":

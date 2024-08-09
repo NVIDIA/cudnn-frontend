@@ -35,8 +35,8 @@ auto inline EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationG
 #endif
             plans.push_back(
                 ExecutionPlanBuilder().setHandle(handle).setEngineConfig(engine_config, opGraph.getTag()).build());
-            getLogger() << "[cudnn_frontend] Added plan " << plans.back().getTag() << " "
-                        << to_string(plans.back().get_status()) << std::endl;
+            CUDNN_FE_LOG_LABEL_ENDL("Added plan " << plans.back().getTag() << " "
+                                                  << to_string(plans.back().get_status()));
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
         } catch (cudnnException& e) {
             CUDNN_FRONTEND_UNUSED(e);

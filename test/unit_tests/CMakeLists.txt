@@ -15,7 +15,7 @@ if(NOT Catch2_FOUND)
 endif()
 
 # Find cudnn
-include(${CMAKE_SOURCE_DIR}/cmake/cuDNN.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/cuDNN.cmake)
 
 add_executable(
     unit_tests

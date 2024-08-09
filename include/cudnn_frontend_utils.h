@@ -230,13 +230,15 @@ to_string(cudnnStatus_t const status) {
 #endif
 static inline void
 set_error_and_throw_exception(BackendDescriptor const* desc, cudnnStatus_t status, const char* message) {
+
+    std::string padded_message = detail::get_last_error_string_() + std::string(message);
     if (desc != nullptr) {
         desc->set_status(status);
-        desc->set_error(message);
+        desc->set_error(padded_message.c_str());
     }
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
-    throw cudnnException(std::string(std::string(message) + std::string(" cudnn_status: ") + to_string(status)).c_str(),
-                         status);
+    throw cudnnException(
+        std::string(std::string(padded_message) + std::string(" cudnn_status: ") + to_string(status)).c_str(), status);
 #endif
 }
 
@@ -369,6 +371,19 @@ enum class PaddingMode_t {
     NEG_INF_PAD,
     ZERO_PAD
 };
+
+enum class ConvolutionMode_t {
+    NOT_SET,
+
+    CONVOLUTION,
+    CROSS_CORRELATION,
+};
+
+NLOHMANN_JSON_SERIALIZE_ENUM(ConvolutionMode_t,
+                             {
+                                 {ConvolutionMode_t::CONVOLUTION, "CONVOLUTION"},
+                                 {ConvolutionMode_t::CROSS_CORRELATION, "CROSS_CORRELATION"},
+                             })
 
 NLOHMANN_JSON_SERIALIZE_ENUM(PaddingMode_t,
                              {
@@ -876,6 +891,39 @@ operator<<(std::ostream& os, const DescriptorType_t& mode) {
 }
 
 namespace detail {
+
+inline size_t
+get_data_type_size(DataType_t const data_type) {
+    switch (data_type) {
+        case DataType_t::FLOAT:
+            return sizeof(float);
+        case DataType_t::DOUBLE:
+            return sizeof(double);
+        case DataType_t::HALF:
+            return 2;  // 16-bit float
+        case DataType_t::INT8:
+        case DataType_t::UINT8:
+            return 1;
+        case DataType_t::INT32:
+            return sizeof(int32_t);
+        case DataType_t::INT8x4:
+        case DataType_t::UINT8x4:
+            return 4;
+        case DataType_t::INT8x32:
+            return 32;
+        case DataType_t::BFLOAT16:
+            return 2;
+        case DataType_t::INT64:
+            return sizeof(int64_t);
+        case DataType_t::FP8_E4M3:
+        case DataType_t::FP8_E5M2:
+            return 1;  // 8-bit float
+        case DataType_t::NOT_SET:
+        case DataType_t::BOOLEAN:
+        default:
+            return 0;
+    }
+}
 
 inline std::vector<float>
 get_abili_slope(int64_t const n_heads) {
@@ -1499,6 +1547,33 @@ convert_from_cudnn_type(cudnnPaddingMode_t const cudnn_mode, cudnn_frontend::Pad
     }
 }
 
+static inline cudnn_frontend::ConvolutionMode_t
+convert_from_cudnn_type(cudnnConvolutionMode_t const cudnn_mode) {
+    switch (cudnn_mode) {
+        case CUDNN_CONVOLUTION:
+            return cudnn_frontend::ConvolutionMode_t::CONVOLUTION;
+        case CUDNN_CROSS_CORRELATION:
+            return cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION;
+#ifndef NO_DEFAULT_IN_SWITCH
+        default:
+            return cudnn_frontend::ConvolutionMode_t::NOT_SET;
+#endif
+    }
+    return cudnn_frontend::ConvolutionMode_t::NOT_SET;
+}
+
+static inline cudnnConvolutionMode_t
+convert_to_cudnn_type(cudnn_frontend::ConvolutionMode_t const cudnn_mode) {
+    switch (cudnn_mode) {
+        case cudnn_frontend::ConvolutionMode_t::CONVOLUTION:
+            return CUDNN_CONVOLUTION;
+        case cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION:
+            return CUDNN_CROSS_CORRELATION;
+        case cudnn_frontend::ConvolutionMode_t::NOT_SET:
+            return CUDNN_CROSS_CORRELATION;
+    }
+    return CUDNN_CROSS_CORRELATION;
+}
 // To be deprecated. Only exists as setResampleMode(cudnnResampleMode_t) requires it.
 static inline void
 convert_from_cudnn_type(cudnnResampleMode_t const cudnn_mode, cudnn_frontend::ResampleMode_t& mode) {

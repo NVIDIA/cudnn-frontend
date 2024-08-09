@@ -132,5 +132,9 @@ How to serialize a graph into a file and read it back on another thread/process.
 
 How to choose the best performing plan among multiple plans suggested by the heuristics.
 
+- [SM Carveout](cpp/misc/sm_carveout.cpp)
+
+Showcases a Batch norm example, where only a partial number of SMs participate in executing the kernel.
+
 ## [Deprecated] C++ v0.x Interface Samples
 Samples leveraging FE's C++ 0.x interface are located in [samples/legacy_samples](legacy_samples/).

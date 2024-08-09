@@ -470,7 +470,7 @@ class ResampleDescBuilder_v8 {
                 &m_resampleDesc, status, "CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: cudnnFinalize Failed");
             return std::move(m_resampleDesc);
         }
-        getLogger() << "[cudnn_frontend] " << m_resampleDesc << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL(m_resampleDesc);
         return std::move(m_resampleDesc);
     }
 

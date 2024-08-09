@@ -30,8 +30,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating SDPAFP8BackwardNode " << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating SDPAFP8BackwardNode " << attributes.name << "...");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90100,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -66,23 +65,14 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                 std::string(#port));                                                                            \
     }
 
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::Q);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Q, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::K);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::K, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::V);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::V, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::O);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::O, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::Stats);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Stats, attributes.inputs);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(input_names::dO);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::dO, attributes.inputs);
-        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::dQ);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dQ, attributes.outputs);
-        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::dK);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dK, attributes.outputs);
-        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::dV);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dV, attributes.outputs);
 
 #undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
@@ -93,15 +83,17 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(has_attn_scale && attributes.attn_scale_value.has_value(),
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "attn_scale with tensor and value cannot be set at the same time.");
-
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
         return {error_code_t::OK, ""};
     }
 
     error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for Scaled_dot_product_flash_attention node  "
-                    << attributes.name << "..." << std::endl;
+    infer_properties_node() override final {
+        return {error_code_t::OK, ""};
+    }
+    error_t
+    expand_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for Scaled_dot_product_flash_attention node  "
+                                << attributes.name << "...");
 
         attributes.fill_from_context(context);
 
@@ -322,15 +314,6 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                    bmm_dP_T_Q_attributes,
                    attributes.outputs[output_names::dK],
                    attributes.outputs[output_names::Amax_dK]);
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    post_validate_node() const override final {
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
 
         return {error_code_t::OK, ""};
     }

@@ -23,11 +23,6 @@ ragged_options = [False, True]
 is_infer_options = [False, True]
 
 
-@pytest.fixture(scope="session")
-def arg_params(request):
-    return request.config.option
-
-
 def convert_to_cudnn_type(torch_type):
     if torch_type == torch.float16:
         return cudnn.data_type.HALF
@@ -448,7 +443,7 @@ def test_sdpa(
     is_ragged,
     is_infer,
     request,
-    arg_params,
+    cudnn_handle
 ):
 
     cudnn_version = LooseVersion(cudnn.backend_version_string())
@@ -517,16 +512,16 @@ def test_sdpa(
         assert False, "Head group must be either MHA, GQA, or MQA"
 
     # -------------------------- override test parameters if args are provided ----------------
-    b = int(arg_params.mha_b) if arg_params.mha_b != None else b
-    s_q = int(arg_params.mha_s_q) if arg_params.mha_s_q != None else s_q
-    s_kv = int(arg_params.mha_s_kv) if arg_params.mha_s_kv != None else s_kv
+    b = int(request.config.option.mha_b) if request.config.option.mha_b != None else b
+    s_q = int(request.config.option.mha_s_q) if request.config.option.mha_s_q != None else s_q
+    s_kv = int(request.config.option.mha_s_kv) if request.config.option.mha_s_kv != None else s_kv
     if is_sliding_window:
         s_kv = s_q
-    d_qk = int(arg_params.mha_d_qk) if arg_params.mha_d_qk != None else d_qk
-    d_v = int(arg_params.mha_d_v) if arg_params.mha_d_v != None else d_v
-    h_q = int(arg_params.mha_h_q) if arg_params.mha_h_q != None else h_q
-    h_k = int(arg_params.mha_h_k) if arg_params.mha_h_k != None else h_k
-    h_v = int(arg_params.mha_h_v) if arg_params.mha_h_v != None else h_v
+    d_qk = int(request.config.option.mha_d_qk) if request.config.option.mha_d_qk != None else d_qk
+    d_v = int(request.config.option.mha_d_v) if request.config.option.mha_d_v != None else d_v
+    h_q = int(request.config.option.mha_h_q) if request.config.option.mha_h_q != None else h_q
+    h_k = int(request.config.option.mha_h_k) if request.config.option.mha_h_k != None else h_k
+    h_v = int(request.config.option.mha_h_v) if request.config.option.mha_h_v != None else h_v
 
     if d_qk != d_v and cudnn_version < "8.9.6":
         pytest.skip("d_qk != d_v is only supported on 8.9.6 onwards.")
@@ -623,16 +618,15 @@ def test_sdpa(
         else None
     )
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     # cuDNN graph
     graph = cudnn.pygraph(
         io_data_type=convert_to_cudnn_type(input_type),
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     q = graph.tensor_like(q_gpu)
@@ -694,10 +688,8 @@ def test_sdpa(
     try:
         graph.validate()
     except cudnn.cudnnGraphNotSupportedError as e:
-        cudnn.destroy_handle(handle)
         pytest.xfail(repr(e))
     except Exception as e:
-        cudnn.destroy_handle(handle)
         pytest.fail(repr(e))
 
     graph.build_operation_graph()
@@ -728,7 +720,7 @@ def test_sdpa(
     workspace = torch.empty(
         graph.get_workspace_size(), device="cuda", dtype=torch.uint8
     )
-    graph.execute(variant_pack, workspace, handle=handle)
+    graph.execute(variant_pack, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
 
     # compare with torch autograd reference
@@ -787,7 +779,6 @@ def test_sdpa(
     if is_infer == False:
         torch.testing.assert_close(stats_ref, stats_gpu, atol=2e-2, rtol=2e-2)
 
-    cudnn.destroy_handle(handle)
 
 
 # fmt: off
@@ -817,7 +808,7 @@ def test_sdpa_backward(
     is_dropout,
     is_ragged,
     request,
-    arg_params,
+    cudnn_handle
 ):
 
     cudnn_version = LooseVersion(cudnn.backend_version_string())
@@ -906,17 +897,17 @@ def test_sdpa_backward(
     is_deterministic = random.choice([True, False])
 
     # -------------------------- override test parameters if args are provided ----------------
-    b = int(arg_params.mha_b) if arg_params.mha_b != None else b
-    s_q = int(arg_params.mha_s_q) if arg_params.mha_s_q != None else s_q
-    s_kv = int(arg_params.mha_s_kv) if arg_params.mha_s_kv != None else s_kv
-    d_qk = int(arg_params.mha_d_qk) if arg_params.mha_d_qk != None else d_qk
-    d_v = int(arg_params.mha_d_v) if arg_params.mha_d_v != None else d_v
-    h_q = int(arg_params.mha_h_q) if arg_params.mha_h_q != None else h_q
-    h_k = int(arg_params.mha_h_k) if arg_params.mha_h_k != None else h_k
-    h_v = int(arg_params.mha_h_v) if arg_params.mha_h_v != None else h_v
+    b = int(request.config.option.mha_b) if request.config.option.mha_b != None else b
+    s_q = int(request.config.option.mha_s_q) if request.config.option.mha_s_q != None else s_q
+    s_kv = int(request.config.option.mha_s_kv) if request.config.option.mha_s_kv != None else s_kv
+    d_qk = int(request.config.option.mha_d_qk) if request.config.option.mha_d_qk != None else d_qk
+    d_v = int(request.config.option.mha_d_v) if request.config.option.mha_d_v != None else d_v
+    h_q = int(request.config.option.mha_h_q) if request.config.option.mha_h_q != None else h_q
+    h_k = int(request.config.option.mha_h_k) if request.config.option.mha_h_k != None else h_k
+    h_v = int(request.config.option.mha_h_v) if request.config.option.mha_h_v != None else h_v
     is_deterministic = (
-        bool(int(arg_params.mha_deterministic))
-        if arg_params.mha_deterministic != None
+        bool(int(request.config.option.mha_deterministic))
+        if request.config.option.mha_deterministic != None
         else is_deterministic
     )
 
@@ -1037,16 +1028,15 @@ def test_sdpa_backward(
     ).as_strided(shape_o, stride_o)
     stats_gpu = torch.empty(b, h_q, s_q, 1, dtype=torch.float32, device="cuda")
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     # forward cuDNN graph
     graph = cudnn.pygraph(
         io_data_type=convert_to_cudnn_type(input_type),
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     q = graph.tensor_like(q_gpu)
@@ -1107,10 +1097,8 @@ def test_sdpa_backward(
     try:
         graph.validate()
     except cudnn.cudnnGraphNotSupportedError as e:
-        cudnn.destroy_handle(handle)
         pytest.xfail(repr(e))
     except Exception as e:
-        cudnn.destroy_handle(handle)
         pytest.fail(repr(e))
 
     graph.build_operation_graph()
@@ -1141,7 +1129,7 @@ def test_sdpa_backward(
     workspace = torch.empty(
         graph.get_workspace_size(), device="cuda", dtype=torch.uint8
     )
-    graph.execute(variant_pack, workspace, handle=handle)
+    graph.execute(variant_pack, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
 
     if cudnn_version < "8.9.6" and is_padding:
@@ -1150,16 +1138,15 @@ def test_sdpa_backward(
             o_gpu[i, :, m:, :] = 0
             stats_gpu[i, :, m:, :] = 0
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     # backward cuDNN graph
     graph = cudnn.pygraph(
         io_data_type=convert_to_cudnn_type(input_type),
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     q = graph.tensor_like(q_gpu)
@@ -1229,10 +1216,8 @@ def test_sdpa_backward(
     try:
         graph.validate()
     except cudnn.cudnnGraphNotSupportedError as e:
-        cudnn.destroy_handle(handle)
         pytest.xfail(repr(e))
     except Exception as e:
-        cudnn.destroy_handle(handle)
         pytest.fail(repr(e))
 
     graph.build_operation_graph()
@@ -1267,7 +1252,7 @@ def test_sdpa_backward(
     workspace = torch.empty(
         graph.get_workspace_size(), device="cuda", dtype=torch.uint8
     )
-    graph.execute(variant_pack, workspace, handle=handle)
+    graph.execute(variant_pack, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
 
     # compare with torch autograd reference
@@ -1360,7 +1345,6 @@ def test_sdpa_backward(
         torch.testing.assert_close(
             dBias_ref, dBias_gpu, check_dtype=False, atol=2e-2, rtol=2e-2
         )
-    cudnn.destroy_handle(handle)
 
 
 if __name__ == "__main__":
