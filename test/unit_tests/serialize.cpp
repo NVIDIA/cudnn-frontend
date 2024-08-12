@@ -43,6 +43,31 @@ TEST_CASE("Tensor attributes", "[tensor][serialize]") {
     REQUIRE(tensor_attributes_deserialized == tensor_attributes);
 }
 
+TEST_CASE("Context serialization", "[context][serialize]") {
+    namespace fe = cudnn_frontend;
+
+    fe::graph::Graph graph;
+
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT)
+        .set_sm_count(24);
+
+    json j = graph;
+
+    std::cout << j << std::endl;
+
+    fe::graph::Graph graph_deserialized;
+
+    REQUIRE(graph_deserialized.deserialize(j).is_good());
+
+    json j2 = graph_deserialized;
+
+    REQUIRE(j == j2);
+
+    REQUIRE(graph.validate().is_good());
+}
+
 TEST_CASE("Conv fprop attributes", "[conv_fprop][serialize]") {
     namespace fe = cudnn_frontend;
 
@@ -240,8 +265,8 @@ TEST_CASE("conv graph serialization", "[graph][serialize]") {
 
     auto b = graph.tensor(fe::graph::Tensor_attributes());
     b->set_name("bias")
-        .set_dim({1, 32, 1, 1})
-        .set_stride({32, 1, 32, 32})
+        .set_dim({1, 64, 1, 1})
+        .set_stride({64, 1, 64, 64})
         .set_is_virtual(false)
         .set_is_pass_by_value(false)
         .set_reordering_type(fe::TensorReordering_t::NONE)

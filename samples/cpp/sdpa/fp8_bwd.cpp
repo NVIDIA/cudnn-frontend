@@ -127,10 +127,10 @@ TEST_CASE("sdpa_fp8_bprop", "[graph][sdpa][fp8][backward]") {
     dQ->set_output(true).set_dim(Q_dQ_O_dO_dims).set_stride(O_dO_strides);
     dK->set_output(true).set_dim(Q_dQ_O_dO_dims).set_stride(O_dO_strides);
     dV->set_output(true).set_dim(Q_dQ_O_dO_dims).set_stride(O_dO_strides);
-    Amax_dQ->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-    Amax_dK->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-    Amax_dV->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-    Amax_dP->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
+    Amax_dQ->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
+    Amax_dK->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
+    Amax_dV->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
+    Amax_dP->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
 
     cudnnHandle_t handle;
     checkCudnnErr(cudnnCreate(&handle));
@@ -295,10 +295,10 @@ TEST_CASE("sdpa_fp8_gqa_bprop", "[graph][sdpa][fp8][backward]") {
     dQ->set_output(true).set_dim(qo_dim).set_stride(qo_stride);
     dK->set_output(true).set_dim(kv_dim).set_stride(kv_stride);
     dV->set_output(true).set_dim(kv_dim).set_stride(kv_stride);
-    amax_dQ->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-    amax_dK->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-    amax_dV->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-    amax_dP->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
+    amax_dQ->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
+    amax_dK->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
+    amax_dV->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
+    amax_dP->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
 
     cudnnHandle_t handle;
     checkCudnnErr(cudnnCreate(&handle));

@@ -73,53 +73,51 @@ typedef struct [[nodiscard]] error_object {
 #define CUDNN_FRONTEND_WHILE_FALSE while (0)
 #endif
 
-#define CHECK_CUDNN_FRONTEND_ERROR(x)                                                                              \
+#define CHECK_CUDNN_FRONTEND_ERROR(x)                                                          \
+    do {                                                                                       \
+        if (auto retval = x; retval.is_bad()) {                                                \
+            CUDNN_FE_LOG_LABEL_ENDL("ERROR: " << #x << " at " << __FILE__ << ":" << __LINE__); \
+            return retval;                                                                     \
+        }                                                                                      \
+    }                                                                                          \
+    CUDNN_FRONTEND_WHILE_FALSE
+
+#define RETURN_CUDNN_FRONTEND_ERROR_IF(cond, retval, message)                                                      \
     do {                                                                                                           \
-        if (auto retval = x; retval.is_bad()) {                                                                    \
-            getLogger() << "[cudnn_frontend] ERROR: " << #x << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
-            return retval;                                                                                         \
+        if (cond) {                                                                                                \
+            if (retval == error_code_t::OK) {                                                                      \
+                CUDNN_FE_LOG_LABEL("INFO: ");                                                                      \
+            } else {                                                                                               \
+                CUDNN_FE_LOG_LABEL("ERROR: ");                                                                     \
+            }                                                                                                      \
+            CUDNN_FE_LOG(message << ". " << retval << " because (" << #cond ") at " << __FILE__ << ":" << __LINE__ \
+                                 << "\n");                                                                         \
+            return {retval, message};                                                                              \
         }                                                                                                          \
     }                                                                                                              \
     CUDNN_FRONTEND_WHILE_FALSE
 
-#define RETURN_CUDNN_FRONTEND_ERROR_IF(cond, retval, message)                                                        \
-    do {                                                                                                             \
-        if (cond) {                                                                                                  \
-            if (retval == error_code_t::OK) {                                                                        \
-                getLogger() << "[cudnn_frontend] INFO: ";                                                            \
-            } else {                                                                                                 \
-                getLogger() << "[cudnn_frontend] ERROR: ";                                                           \
-            }                                                                                                        \
-            getLogger() << message << ". " << retval << " because (" << #cond ") at " << __FILE__ << ":" << __LINE__ \
-                        << "\n";                                                                                     \
-            return {retval, message};                                                                                \
-        }                                                                                                            \
-    }                                                                                                                \
+#define CHECK_CUDNN_ERROR(x)                                                                                \
+    do {                                                                                                    \
+        if (auto cudnn_retval = x; cudnn_retval != CUDNN_STATUS_SUCCESS) {                                  \
+            std::stringstream error_msg;                                                                    \
+            error_msg << #x << " failed with message: " << detail::get_last_error_string_()                 \
+                      << ", and code: " << detail::get_error_string(cudnn_retval);                          \
+            CUDNN_FE_LOG_LABEL_ENDL("ERROR: " << error_msg.str() << " at " << __FILE__ << ":" << __LINE__); \
+            return {error_code_t::CUDNN_BACKEND_API_FAILED, error_msg.str()};                               \
+        }                                                                                                   \
+    }                                                                                                       \
     CUDNN_FRONTEND_WHILE_FALSE
 
-#define CHECK_CUDNN_ERROR(x)                                                                                      \
-    do {                                                                                                          \
-        if (auto cudnn_retval = x; cudnn_retval != CUDNN_STATUS_SUCCESS) {                                        \
-            std::stringstream error_msg;                                                                          \
-            error_msg << #x << " failed with code: " << detail::get_last_error_string_()                          \
-                      << ", and message: " << detail::get_error_string(cudnn_retval);                             \
-            getLogger() << "[cudnn_frontend] ERROR: " << error_msg.str() << " at " << __FILE__ << ":" << __LINE__ \
-                        << std::endl;                                                                             \
-            return {error_code_t::CUDNN_BACKEND_API_FAILED, error_msg.str()};                                     \
-        }                                                                                                         \
-    }                                                                                                             \
-    CUDNN_FRONTEND_WHILE_FALSE
-
-#define CHECK_CUDA_ERROR(x)                                                                                       \
-    do {                                                                                                          \
-        if (auto cuda_retval = x; cuda_retval != cudaSuccess) {                                                   \
-            std::stringstream error_msg;                                                                          \
-            error_msg << #x << " failed with " << detail::cuda_get_error_string(cuda_retval);                     \
-            getLogger() << "[cudnn_frontend] ERROR: " << error_msg.str() << " at " << __FILE__ << ":" << __LINE__ \
-                        << std::endl;                                                                             \
-            return {error_code_t::CUDA_API_FAILED, error_msg.str()};                                              \
-        }                                                                                                         \
-    }                                                                                                             \
+#define CHECK_CUDA_ERROR(x)                                                                                 \
+    do {                                                                                                    \
+        if (auto cuda_retval = x; cuda_retval != cudaSuccess) {                                             \
+            std::stringstream error_msg;                                                                    \
+            error_msg << #x << " failed with " << detail::cuda_get_error_string(cuda_retval);               \
+            CUDNN_FE_LOG_LABEL_ENDL("ERROR: " << error_msg.str() << " at " << __FILE__ << ":" << __LINE__); \
+            return {error_code_t::CUDA_API_FAILED, error_msg.str()};                                        \
+        }                                                                                                   \
+    }                                                                                                       \
     CUDNN_FRONTEND_WHILE_FALSE
 
 NLOHMANN_JSON_SERIALIZE_ENUM(error_code_t,
@@ -231,16 +229,159 @@ generate_row_major_stride_order(int64_t const num_dims) {
 }
 
 // Generate column major stride_order for matrices
-// dim = (M, N)
-// strides should be (1, M)
+// dim = (*, M, N)
+// strides should be (*, 1, M)
 inline std::vector<int64_t>
 generate_column_major_stride_order(int64_t const num_dims) {
-    std::vector<int64_t> stride_order(num_dims);
+    std::vector<int64_t> stride_order = generate_row_major_stride_order(num_dims);
+    if (num_dims > 2) {
+        std::swap(stride_order[num_dims - 1], stride_order[num_dims - 2]);
+    }
+    return stride_order;
+}
 
-    int64_t order = 1;
-    std::generate(stride_order.begin(), stride_order.end(), [&order] { return order++; });
+/**
+ * @brief Computes the common shape with the fewest dimensions that all input shapes can be broadcast to.
+ *
+ * This function takes a vector of shapes and calculates a common shape that all input shapes
+ * can be broadcast to. It follows broadcasting rules similar to those used in NumPy.
+ *
+ * @param _shapes A vector of vectors, where each inner vector represents a shape.
+ *                Each shape is a sequence of dimension sizes.
+ * @param[out] common_shape The computed broadcast shape is stored in this vector.
+ *                          It will be cleared and resized as necessary.
+ *
+ * @return error_t An error code indicating the result of the operation
+ *
+ * @note
+ * - Shapes are processed from right to left (last dimension to first).
+ * - A dimension of size 1 can be broadcast to any size.
+ * - Non-1 dimensions must match exactly for broadcasting.
+ * - The resulting shape will have the maximum number of dimensions among all input shapes.
+ *
+ * @example
+ *   std::vector<std::vector<int64_t>> shapes = {{3, 1, 4}, {1, 2, 4}, {2, 4}};
+ *   std::vector<int64_t> result;
+ *   error_t err = compute_broadcast_shape(shapes, result);
+ *   // If err == error_code_t::OK, result will be {3, 2, 4}
+ */
+inline error_t
+compute_broadcast_shape(const std::vector<std::vector<int64_t>>& _shapes, std::vector<int64_t>& common_shape) {
+    // Filter out empty shapes
+    std::vector<std::vector<int64_t>> shapes;
+    std::copy_if(_shapes.begin(), _shapes.end(), std::back_inserter(shapes), [](const std::vector<int64_t>& shape) {
+        return !shape.empty();
+    });
+
+    // Short-circuits if there are no input shapes
+    RETURN_CUDNN_FRONTEND_ERROR_IF(
+        shapes.empty(), error_code_t::SHAPE_DEDUCTION_FAILED, "All input shapes provided are empty.");
+
+    // Find the maximum dimension
+    int64_t max_dim = std::max_element(shapes.begin(),
+                                       shapes.end(),
+                                       [](const std::vector<int64_t>& a, const std::vector<int64_t>& b) {
+                                           return a.size() < b.size();
+                                       })
+                          ->size();
+
+    // Initialize common_shape with 1s
+    common_shape.assign(max_dim, 1);
+
+    for (const auto& shape : shapes) {
+        for (int idx = -1; idx >= -static_cast<int>(shape.size()); --idx) {
+            int64_t common_idx = common_shape.size() + idx;
+            int64_t shape_idx  = shape.size() + idx;
+
+            if (common_shape[common_idx] == 1) {
+                common_shape[common_idx] = shape[shape_idx];
+            }
+
+            RETURN_CUDNN_FRONTEND_ERROR_IF((shape[shape_idx] != 1) && (common_shape[common_idx] != shape[shape_idx]),
+                                           error_code_t::SHAPE_DEDUCTION_FAILED,
+                                           "dimensions mismatch as broadcasting 2 non-one dimension sizes.");
+        }
+    }
+
+    return {error_code_t::OK, ""};
+}
+/**
+ * @brief Generates a stride order preserving the format of the input tensor.
+ *
+ * This function derives the exact stride order from the input tensor's strides.
+ * It returns the indices of the strides in ascending order of stride values.
+ *
+ * @param input_stride The stride of the input tensor
+ * @param output_dim_size The number of dimensions in the output tensor
+ * @return std::vector<int64_t> The generated stride order
+ */
+inline std::vector<int64_t>
+generate_stride_order_preserving_format(const std::vector<int64_t>& input_stride, size_t output_dim_size) {
+    std::vector<int64_t> indices(input_stride.size());
+    std::iota(indices.begin(), indices.end(), 0);
+
+    // Sort indices based on stride values in descending order
+    std::sort(indices.begin(), indices.end(), [&input_stride](int64_t i, int64_t j) {
+        return input_stride[i] < input_stride[j];
+    });
+
+    // Create the stride order
+    std::vector<int64_t> stride_order(input_stride.size());
+    for (size_t i = 0; i < indices.size(); ++i) {
+        stride_order[indices[i]] = i;
+    }
+
+    // If output_dim_size is larger, pad with remaining dimensions
+    if (output_dim_size > input_stride.size()) {
+        size_t start = stride_order.size();
+        stride_order.resize(output_dim_size);
+        std::iota(stride_order.begin() + start, stride_order.end(), start);
+    }
 
     return stride_order;
+}
+
+/**
+ * @brief Infers the output dimensions for a matrix multiplication operation.
+ *
+ * This function calculates the output dimensions of a matrix multiplication
+ * based on the input dimensions of tensors A and B. It uses compute_broadcast_shape
+ * for batch dimensions and ensures the last two dimensions are correct for matrix multiplication.
+ *
+ * @param a_dim Dimensions of the first input tensor (A).
+ * @param b_dim Dimensions of the second input tensor (B).
+ * @param output_dim Reference to the vector where the output dimensions will be stored.
+ * @return error_t An error code indicating the result of the operation.
+ */
+inline error_t
+generate_matmul_output_dim(const std::vector<int64_t>& a_dim,
+                           const std::vector<int64_t>& b_dim,
+                           std::vector<int64_t>& output_dim) {
+    // Ensure a_dim and b_dim have at least 2 dimensions
+    if (a_dim.size() < 2 || b_dim.size() < 2) {
+        return {error_code_t::SHAPE_DEDUCTION_FAILED, "Input tensors must have at least 2 dimensions for matmul."};
+    }
+
+    // Check if inner dimensions are compatible
+    if (a_dim[a_dim.size() - 1] != b_dim[b_dim.size() - 2]) {
+        return {error_code_t::SHAPE_DEDUCTION_FAILED,
+                "Inner dimensions of input tensors are not compatible for matmul."};
+    }
+
+    // Prepare shapes for broadcasting
+    std::vector<int64_t> a_batch_dim(a_dim.begin(), a_dim.end() - 2);
+    std::vector<int64_t> b_batch_dim(b_dim.begin(), b_dim.end() - 2);
+
+    // Compute broadcast shape for batch dimensions
+    std::vector<int64_t> broadcasted_batch;
+    CHECK_CUDNN_FRONTEND_ERROR(detail::compute_broadcast_shape({a_batch_dim, b_batch_dim}, broadcasted_batch));
+
+    // Construct final output shape
+    output_dim = broadcasted_batch;
+    output_dim.push_back(a_dim[a_dim.size() - 2]);  // M from A
+    output_dim.push_back(b_dim[b_dim.size() - 1]);  // N from B
+
+    return {error_code_t::OK, ""};
 }
 
 }  // namespace detail

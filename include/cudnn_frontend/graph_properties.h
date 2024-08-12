@@ -14,6 +14,9 @@
 namespace cudnn_frontend {
 
 namespace graph {
+
+using managed_backend_descriptor_t = std::vector<ManagedOpaqueDescriptor>;
+
 // simple structure to hold all properties of a tensor.
 // Each property has a getter setter.
 class Tensor_attributes {
@@ -27,25 +30,6 @@ class Tensor_attributes {
     // In approach 2, users set is_pass_by_value boolean and then pass a pointer to scalar value with execute() API.
     // A closed set of types that are allowed to be passed by value.
     using pass_by_values_t = std::variant<int32_t, half, float, nv_bfloat16>;
-
-   private:
-    template <typename>
-    friend class Attributes;
-
-    std::string name;
-    DataType_t data_type        = DataType_t::NOT_SET;
-    std::vector<int64_t> dim    = {};
-    std::vector<int64_t> stride = {};
-    bool is_virtual             = false;
-
-    std::optional<pass_by_values_t> pass_by_value = std::nullopt;
-    bool is_pass_by_value                         = false;
-
-    TensorReordering_t reordering_type = TensorReordering_t::NONE;
-    uid_t uid                          = 0;
-    bool uid_assigned                  = false;
-
-    std::shared_ptr<Tensor_attributes> ragged_offset;
 
     error_t
     validate() const {
@@ -68,6 +52,25 @@ class Tensor_attributes {
 
         return {error_code_t::OK, ""};
     }
+
+   private:
+    template <typename>
+    friend class Attributes;
+
+    std::string name;
+    DataType_t data_type        = DataType_t::NOT_SET;
+    std::vector<int64_t> dim    = {};
+    std::vector<int64_t> stride = {};
+    bool is_virtual             = false;
+
+    std::optional<pass_by_values_t> pass_by_value = std::nullopt;
+    bool is_pass_by_value                         = false;
+
+    TensorReordering_t reordering_type = TensorReordering_t::NONE;
+    uid_t uid                          = 0;
+    bool uid_assigned                  = false;
+
+    std::shared_ptr<Tensor_attributes> ragged_offset;
 
     auto
     fill_from_context(detail::Context const& context) -> Tensor_attributes& {
@@ -387,123 +390,6 @@ class Attributes {
         compute_data_type = value;
         return self();
     }
-
-    error_t
-    validate_inputs() const {
-        auto derived = static_cast<DerivedT const*>(this);
-        for (auto const& [enum_name, tensor] : derived->inputs) {
-            (void)enum_name;
-            if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(tensor->validate());
-            }
-        }
-
-        // Handle special case of BN where peer_stats is also an input
-        if constexpr (std::is_same_v<DerivedT, Batchnorm_attributes> ||
-                      std::is_same_v<DerivedT, Batchnorm_backward_attributes>) {
-            for (auto const& tensor : derived->peer_stats) {
-                if (tensor) {
-                    CHECK_CUDNN_FRONTEND_ERROR(tensor->validate());
-                }
-            }
-        }
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    validate_outputs() const {
-        auto derived = static_cast<DerivedT const*>(this);
-        for (auto const& [enum_name, tensor] : derived->outputs) {
-            (void)enum_name;
-            if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(tensor->validate());
-            }
-        }
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    get_prefilled_uids(std::unordered_set<int64_t>& pre_assigned_uids) const {
-        auto derived = static_cast<DerivedT const*>(this);
-
-        for (auto& [name, tensor] : derived->inputs) {
-            (void)name;
-            if (tensor && tensor->has_uid()) {
-                pre_assigned_uids.insert(tensor->get_uid());
-                if (auto ragged_offset = tensor->get_ragged_offset()) {
-                    pre_assigned_uids.insert(ragged_offset->get_uid());
-                }
-            }
-        }
-        for (auto& [name, tensor] : derived->outputs) {
-            (void)name;
-            if (tensor && tensor->has_uid()) {
-                pre_assigned_uids.insert(tensor->get_uid());
-                if (auto ragged_offset = tensor->get_ragged_offset()) {
-                    pre_assigned_uids.insert(ragged_offset->get_uid());
-                }
-            }
-        }
-
-        // Handle special case of BN where peer_stats is also an input
-        if constexpr (std::is_same_v<DerivedT, Batchnorm_attributes> ||
-                      std::is_same_v<DerivedT, Batchnorm_backward_attributes>) {
-            for (auto& tensor : derived->peer_stats) {
-                if (tensor && tensor->has_uid()) {
-                    pre_assigned_uids.insert(tensor->get_uid());
-                    if (auto ragged_offset = tensor->get_ragged_offset()) {
-                        pre_assigned_uids.insert(ragged_offset->get_uid());
-                    }
-                }
-            }
-        }
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    set_uids(int64_t& potential_uid, std::unordered_set<int64_t> const& pre_assigned_uids) const {
-        auto derived = static_cast<DerivedT const*>(this);
-
-        auto get_next_potential_uid = [&]() -> void {
-            do {
-                ++potential_uid;
-            } while (pre_assigned_uids.find(potential_uid) != pre_assigned_uids.end());
-        };
-
-        std::function<void(std::shared_ptr<Tensor_attributes>)> assign_uid_to_tensor =
-            [&](std::shared_ptr<Tensor_attributes> tensor) {
-                if (!tensor) return;
-                if (tensor->has_uid() == false) {
-                    get_next_potential_uid();
-                    tensor->set_uid(potential_uid);
-                }
-                if (auto ragged_offset = tensor->get_ragged_offset()) {
-                    assign_uid_to_tensor(ragged_offset);
-                }
-            };
-
-        for (auto [name, tensor] : derived->inputs) {
-            (void)name;
-            assign_uid_to_tensor(tensor);
-        }
-
-        for (auto [name, tensor] : derived->outputs) {
-            (void)name;
-            assign_uid_to_tensor(tensor);
-        }
-
-        // Handle special case of BN where peer_stats is also an input
-        if constexpr (std::is_same_v<DerivedT, Batchnorm_attributes> ||
-                      std::is_same_v<DerivedT, Batchnorm_backward_attributes>) {
-            for (auto& tensor : derived->peer_stats) {
-                assign_uid_to_tensor(tensor);
-            }
-        }
-
-        return {error_code_t::OK, ""};
-    }
 };
 
 class BN_finalize_attributes : public Attributes<BN_finalize_attributes> {
@@ -564,6 +450,8 @@ class Conv_fprop_attributes : public Attributes<Conv_fprop_attributes> {
     std::vector<int64_t> stride;
     std::vector<int64_t> dilation;
 
+    ConvolutionMode_t math_mode = ConvolutionMode_t::CROSS_CORRELATION;
+
    public:
     enum class input_names { X, W };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
@@ -577,7 +465,13 @@ class Conv_fprop_attributes : public Attributes<Conv_fprop_attributes> {
                                    pre_padding,
                                    post_padding,
                                    stride,
-                                   dilation)
+                                   dilation,
+                                   math_mode)
+
+    ConvolutionMode_t
+    get_convolution_mode() const {
+        return math_mode;
+    }
 
     std::vector<int64_t>
     get_pre_padding() const {
@@ -605,6 +499,12 @@ class Conv_fprop_attributes : public Attributes<Conv_fprop_attributes> {
     Conv_fprop_attributes&
     set_post_padding(std::vector<int64_t> value) {
         post_padding = value;
+        return *this;
+    }
+
+    Conv_fprop_attributes&
+    set_convolution_mode(ConvolutionMode_t mode_) {
+        math_mode = mode_;
         return *this;
     }
 
@@ -683,6 +583,8 @@ class Conv_dgrad_attributes : public Attributes<Conv_dgrad_attributes> {
     std::vector<int64_t> stride;
     std::vector<int64_t> dilation;
 
+    ConvolutionMode_t math_mode = ConvolutionMode_t::CROSS_CORRELATION;
+
    public:
     enum class input_names { DY, W };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
@@ -696,7 +598,13 @@ class Conv_dgrad_attributes : public Attributes<Conv_dgrad_attributes> {
                                    pre_padding,
                                    post_padding,
                                    stride,
-                                   dilation)
+                                   dilation,
+                                   math_mode)
+
+    ConvolutionMode_t
+    get_convolution_mode() const {
+        return math_mode;
+    }
 
     std::vector<int64_t>
     get_pre_padding() const {
@@ -730,6 +638,13 @@ class Conv_dgrad_attributes : public Attributes<Conv_dgrad_attributes> {
     std::vector<int64_t>
     get_stride() const {
         return stride;
+    }
+
+    Conv_dgrad_attributes&
+    set_convolution_mode(ConvolutionMode_t mode_) {
+        math_mode = mode_;
+        ;
+        return *this;
     }
 
     Conv_dgrad_attributes&
@@ -1900,6 +1815,7 @@ class Conv_wgrad_attributes : public Attributes<Conv_wgrad_attributes> {
     std::vector<int64_t> post_padding;
     std::vector<int64_t> stride;
     std::vector<int64_t> dilation;
+    ConvolutionMode_t math_mode = ConvolutionMode_t::CROSS_CORRELATION;
 
    public:
     enum class input_names { DY, X };
@@ -1915,7 +1831,13 @@ class Conv_wgrad_attributes : public Attributes<Conv_wgrad_attributes> {
                                    pre_padding,
                                    post_padding,
                                    stride,
-                                   dilation)
+                                   dilation,
+                                   math_mode)
+
+    ConvolutionMode_t
+    get_convolution_mode() const {
+        return math_mode;
+    }
 
     std::vector<int64_t>
     get_pre_padding() const {
@@ -1925,6 +1847,13 @@ class Conv_wgrad_attributes : public Attributes<Conv_wgrad_attributes> {
     std::vector<int64_t>
     get_post_padding() const {
         return post_padding;
+    }
+
+    Conv_wgrad_attributes&
+    set_convolution_mode(ConvolutionMode_t mode_) {
+        math_mode = mode_;
+        ;
+        return *this;
     }
 
     Conv_wgrad_attributes&
@@ -1966,6 +1895,44 @@ class Conv_wgrad_attributes : public Attributes<Conv_wgrad_attributes> {
     set_dilation(std::vector<int64_t> value) {
         dilation = value;
         return *this;
+    }
+};
+
+class Slice_attributes : public Attributes<Slice_attributes> {
+    friend class Attributes<Slice_attributes>;
+    friend class SliceNode;
+    friend class INode;
+
+    std::vector<std::pair<int64_t, int64_t>> slices;
+
+   public:
+    enum class input_names { X };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { Y };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Slice_attributes, name, compute_data_type, inputs, outputs, slices)
+
+    Slice_attributes&
+    set_slices(std::vector<std::pair<int64_t, int64_t>> const value) {
+        slices = value;
+        return *this;
+    }
+
+    int64_t
+    get_offset() const {
+        auto& input             = inputs.at(input_names::X);
+        auto const input_stride = input->get_stride();
+
+        int64_t offset = 0;
+
+        // Get number of elements to skip
+        for (size_t i = 0; i < slices.size(); ++i) {
+            offset += slices[i].first * input_stride[i];
+        }
+
+        // multiply by element size to get offset in bytes
+        offset *= detail::get_data_type_size(input->get_data_type());
+        return offset;
     }
 };
 

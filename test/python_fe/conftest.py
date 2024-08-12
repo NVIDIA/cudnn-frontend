@@ -1,4 +1,12 @@
 import pytest
+import cudnn
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cudnn_handle():
+    cudnn_handle = cudnn.create_handle()
+    yield cudnn_handle
+    cudnn.destroy_handle(cudnn_handle)
 
 
 def pytest_addoption(parser):

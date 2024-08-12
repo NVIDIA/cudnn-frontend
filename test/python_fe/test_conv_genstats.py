@@ -36,7 +36,7 @@ dilation = [1, 1]
     reason="requires cudnn 8.8 or higher",
 )
 @torch_fork_set_rng(seed=0)
-def test_conv_genstats():
+def test_conv_genstats(cudnn_handle):
 
     # Reference
     X_gpu = torch.randn(
@@ -61,16 +61,15 @@ def test_conv_genstats():
         scale, bias, X_gpu, W_gpu, padding=padding, stride=stride, dilation=dilation
     )
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     # Cudnn code
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.HALF,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     X = graph.tensor(
@@ -124,7 +123,7 @@ def test_conv_genstats():
             B: bias,
         },
         workspace.data_ptr(),
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     # Compare
@@ -132,8 +131,7 @@ def test_conv_genstats():
     torch.testing.assert_close(sum_expected, sum_dev, atol=0.5, rtol=1e-2)
     torch.testing.assert_close(sq_sum_expected, sq_sum_dev, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-3, rtol=1e-3)
-    cudnn.destroy_handle(handle)
 
 
 if __name__ == "__main__":
-    test_conv_genstats()
+    test_conv_genstats(cudnn_handle)

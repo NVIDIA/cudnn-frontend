@@ -136,6 +136,7 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT);
 
+    bool has_running_stats = true;
     auto X                 = graph.tensor(fe::graph::Tensor_attributes()
                               .set_name("X")
                               .set_dim({4, 32, 16, 16})
@@ -183,14 +184,23 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
 
     auto batchnorm_options = fe::graph::Batchnorm_attributes()
                                  .set_epsilon(epsilon)
-                                 .set_previous_running_stats(prev_running_mean, prev_running_var, momentum)
+
                                  .set_peer_stats({peer_stats_0, peer_stats_1});
+    if (has_running_stats) {
+        batchnorm_options.set_previous_running_stats(prev_running_mean, prev_running_var, momentum);
+    }
+
     auto [bn_output, mean, inv_variance, next_running_mean, next_running_var] =
         graph.batchnorm(X, scale, bias, batchnorm_options);
     mean->set_output(true).set_data_type(fe::DataType_t::FLOAT);
     inv_variance->set_output(true).set_data_type(fe::DataType_t::FLOAT);
-    next_running_mean->set_output(true).set_data_type(fe::DataType_t::FLOAT);
-    next_running_var->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+
+    if (has_running_stats) {
+        next_running_mean->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+    }
+    if (has_running_stats) {
+        next_running_var->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+    }
 
     auto A           = graph.tensor(fe::graph::Tensor_attributes()
                               .set_name("A")
@@ -244,10 +254,6 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
         {X, X_tensor.devPtr},
         {mean, Mean_tensor.devPtr},
         {inv_variance, Var_tensor.devPtr},
-        {prev_running_mean, Previous_running_mean_tensor.devPtr},
-        {prev_running_var, Previous_running_var_tensor.devPtr},
-        {next_running_mean, Next_running_mean_tensor.devPtr},
-        {next_running_var, Next_running_var_tensor.devPtr},
         {scale, Scale_tensor.devPtr},
         {bias, Bias_tensor.devPtr},
         {epsilon, &epsilon_cpu},
@@ -256,6 +262,14 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
         {Y, Y_tensor.devPtr},
         {peer_stats_0, Peer_stats_0_tensor.devPtr},
         {peer_stats_1, Peer_stats_1_tensor.devPtr}};
+
+    if (has_running_stats) {
+        variant_pack[prev_running_mean] = Previous_running_mean_tensor.devPtr;
+        variant_pack[prev_running_var]  = Previous_running_var_tensor.devPtr;
+        variant_pack[next_running_mean] = Next_running_mean_tensor.devPtr;
+        variant_pack[next_running_var]  = Next_running_var_tensor.devPtr;
+        variant_pack[momentum]          = &momentum_cpu;
+    }
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 
     cudnnDestroy(handle);

@@ -219,7 +219,7 @@ class EngineConfigBuilder_v8 {
                 &m_engine_config, status, "CUDNN_BACKEND_ENGINECFG_DESCRIPTOR: cudnnFinalize Failed");
             return std::move(m_engine_config);
         }
-        getLogger() << "[cudnn_frontend] " << m_engine_config << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL(m_engine_config);
         return std::move(m_engine_config);
     }
 

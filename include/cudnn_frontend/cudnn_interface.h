@@ -33,26 +33,42 @@ class ICudnn {
     // Hence using uid, as that uniquely identifies both types of tensors.
     std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>> uid_to_tensors;
     std::vector<std::shared_ptr<cudnn_frontend::Operation>> operations;
+    graph::managed_backend_descriptor_t raw_operations;
 
     std::shared_ptr<OperationGraph_v8> operation_graph;
     std::unordered_set<graph::Tensor_attributes::uid_t> variant_pack_uids;
 
     graph::Execution_plan_list plans;
 
+    void
+    assign_uid(graph::Tensor_attributes* const tensor,
+               int64_t& potential_uid,
+               std::unordered_set<int64_t> const& used_uids) const {
+        // get_next_potential_uid
+        while (used_uids.find(potential_uid) != used_uids.end()) {
+            ++potential_uid;
+        }
+
+        tensor->set_uid(potential_uid);
+        ++potential_uid;  // increment, as used its used now
+    }
+
     // TODO: Always returns OK. Can the status and error message be accessed from tensor descriptor?
     error_t
     create_cudnn_tensor(std::shared_ptr<graph::Tensor_attributes> const& props,
-                        std::unordered_map<uid_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const {
-        // TODO: uid check has to be moved to validate stage.
-        RETURN_CUDNN_FRONTEND_ERROR_IF(props->has_uid() == false,
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "Tensor named '" + props->get_name() + "' has no uid assigned.");
+                        std::unordered_map<uid_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors,
+                        int64_t& potential_uid,
+                        std::unordered_set<int64_t> const& used_uids) const {
+        // Assign tensor a uid
+        if (props->has_uid() == false) {
+            assign_uid(props.get(), potential_uid, used_uids);
+        }
 
-        // Check whether tensor already created
+        // Check whether backend tensor already created
         auto tensor_uid = props->get_uid();
         if (tensors.find(tensor_uid) != tensors.end()) {
-            getLogger() << "[cudnn_frontend] INFO: Backend Tensor named '" << props->get_name() << "' with UID "
-                        << tensor_uid << " already created." << std::endl;
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Backend Tensor named '" << props->get_name() << "' with UID " << tensor_uid
+                                                                   << " already created.");
             return {error_code_t::OK, ""};
         }
 
@@ -68,7 +84,7 @@ class ICudnn {
             .setReorderType(props->get_reordering_type());
 
         if (auto ragged_offset_props = props->get_ragged_offset()) {
-            CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(ragged_offset_props, tensors));
+            CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(ragged_offset_props, tensors, potential_uid, used_uids));
             tensor_builder.setRaggedOffset(tensors.at(ragged_offset_props->get_uid()));
         }
 
@@ -104,6 +120,9 @@ class ICudnn {
         auto&& cudnn_operation_graph_builder = cudnn_frontend::OperationGraphBuilder();
         cudnn_operation_graph_builder.setHandle(handle).setOperationGraph(cudnn_operations.size(),
                                                                           cudnn_operations.data());
+        for (auto& op : raw_operations) {
+            cudnn_operation_graph_builder.addOperation(op);
+        }
 
 #ifdef NV_CUDNN_DISABLE_EXCEPTION
         // disable exception macro is defined. Calling build will not throw.
@@ -161,7 +180,7 @@ class ICudnn {
 
         CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(plan_index));
 
-        getLogger() << "[cudnn_frontend] INFO: Executing plan at index " << plan_index << "." << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing plan at index " << plan_index << ".");
 
         CHECK_CUDNN_FRONTEND_ERROR(
             detail::execute(handle, plans.execution_plans[plan_index].get(), device_ptrs, uids, workspace_ptr));

@@ -37,7 +37,7 @@ def get_cc():
     torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch"
 )
 @torch_fork_set_rng(seed=0)
-def test_int8_bf16_matmul():
+def test_int8_bf16_matmul(cudnn_handle):
 
     # matmul problem size
     B, M, N, K = 16, 32, 64, 128
@@ -55,12 +55,11 @@ def test_int8_bf16_matmul():
         - 1.25
     )
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     # Make cudnn graph
-    graph = cudnn.pygraph(handle=handle)
+    graph = cudnn.pygraph(handle=cudnn_handle)
 
     # Create the two non-virtual input tensors A and B.
     # There are read from global memory.
@@ -86,12 +85,11 @@ def test_int8_bf16_matmul():
     workspace = torch.empty(
         graph.get_workspace_size(), device="cuda", dtype=torch.uint8
     )
-    graph.execute({A: A_gpu, B: B_gpu, C: C_actual}, workspace, handle=handle)
+    graph.execute({A: A_gpu, B: B_gpu, C: C_actual}, workspace, handle=cudnn_handle)
 
     torch.cuda.synchronize()
     # compare'em
     torch.testing.assert_close(C_expected, C_actual)
-    cudnn.destroy_handle(handle)
 
 
 A_data_type_options = [torch.int8, torch.bfloat16, torch.float16]
@@ -110,7 +108,7 @@ MMA_data_type_options = [torch.bfloat16, torch.float16, torch.float32]
 @pytest.mark.parametrize("B_data_type", B_data_type_options)
 @pytest.mark.parametrize("MMA_data_type", MMA_data_type_options)
 @torch_fork_set_rng(seed=0)
-def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
+def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type, cudnn_handle):
 
     # matmul problem size
     B, M, N, K = 16, 32, 64, 128
@@ -150,12 +148,11 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
 
     B_gpu = torch.as_strided(B_gpu_strided, (B, K, N), (N * K, 1, N))
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     # Make cudnn graph
-    graph = cudnn.pygraph(handle=handle)
+    graph = cudnn.pygraph(handle=cudnn_handle)
 
     # Create the two non-virtual input tensors A and B.
     # There are read from global memory.
@@ -198,12 +195,11 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type):
     workspace = torch.empty(
         graph.get_workspace_size(), device="cuda", dtype=torch.uint8
     )
-    graph.execute({A: A_gpu, B: B_gpu, C: C_actual}, workspace, handle=handle)
+    graph.execute({A: A_gpu, B: B_gpu, C: C_actual}, workspace, handle=cudnn_handle)
 
     torch.cuda.synchronize()
     # compare'em
     torch.testing.assert_close(C_expected, C_actual, atol=1e-4, rtol=1e-4)
-    cudnn.destroy_handle(handle)
 
 
 problem_size_options = [(1, 128, 768), (16, 512, 1600), (1, 128, 1024)]
@@ -220,7 +216,7 @@ def param_extract(request):
 
 
 @torch_fork_set_rng(seed=0)
-def test_matmul_bias_relu(param_extract):
+def test_matmul_bias_relu(param_extract, cudnn_handle):
 
     problem_size_options, input_type = param_extract
     b, s, e = problem_size_options
@@ -243,14 +239,13 @@ def test_matmul_bias_relu(param_extract):
         X_gpu, W_gpu.squeeze().T, bias=B_gpu.squeeze()
     )
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     graph = cudnn.pygraph(
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     X = graph.tensor(
@@ -288,7 +283,9 @@ def test_matmul_bias_relu(param_extract):
 
     Y_actual = torch.zeros_like(Y_expected)
 
-    graph.execute({X: X_gpu, W: W_gpu, B: B_gpu, Y: Y_actual}, workspace, handle=handle)
+    graph.execute(
+        {X: X_gpu, W: W_gpu, B: B_gpu, Y: Y_actual}, workspace, handle=cudnn_handle
+    )
 
     atol = 0.0625 if get_cc() == 89 else 1e-3
     rtol = 1e-2 if input_type == torch.bfloat16 else 1e-3
@@ -296,8 +293,6 @@ def test_matmul_bias_relu(param_extract):
     torch.cuda.synchronize()
 
     torch.testing.assert_close(Y_expected, Y_actual, atol=atol, rtol=rtol)
-
-    cudnn.destroy_handle(handle)
 
 
 if __name__ == "__main__":

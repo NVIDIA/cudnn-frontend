@@ -307,7 +307,7 @@ class RngDescBuilder_v8 {
             set_error_and_throw_exception(&m_RngDesc, status, "CUDNN_BACKEND_RNG_DESCRIPTOR: cudnnFinalize Failed");
             return std::move(m_RngDesc);
         }
-        getLogger() << "[cudnn_frontend] " << m_RngDesc << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL(m_RngDesc);
         return std::move(m_RngDesc);
 #else
         set_error_and_throw_exception(

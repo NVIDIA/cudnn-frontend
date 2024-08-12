@@ -31,7 +31,7 @@ dilation = [1, 1]
     reason="requires cudnn 8.8 or higher",
 )
 @torch_fork_set_rng(seed=0)
-def test_scale_bias_relu_wgrad():
+def test_scale_bias_relu_wgrad(cudnn_handle):
 
     try:
         if not is_ampere_arch() and not is_hopper_arch():
@@ -60,15 +60,14 @@ def test_scale_bias_relu_wgrad():
             k, c, 3, 3, requires_grad=False, device="cuda", dtype=torch.float16
         ).to(memory_format=torch.channels_last)
 
-        handle = cudnn.create_handle()
         stream = torch.cuda.current_stream().cuda_stream
-        cudnn.set_stream(handle=handle, stream=stream)
+        cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
         graph = cudnn.pygraph(
             io_data_type=cudnn.data_type.HALF,
             intermediate_data_type=cudnn.data_type.FLOAT,
             compute_data_type=cudnn.data_type.FLOAT,
-            handle=handle,
+            handle=cudnn_handle,
         )
 
         # X  = graph.tensor(name = "X",  dim = X_gpu.size(), stride = X_gpu.stride(), data_type = cudnn._compiled_module.data_type.DOUBLE)
@@ -116,11 +115,10 @@ def test_scale_bias_relu_wgrad():
         graph.execute(
             {X: X_gpu, DY: DY_gpu, B: bias, S: scale, wgrad_output: DW_actual},
             workspace,
-            handle=handle,
+            handle=cudnn_handle,
         )
 
         torch.cuda.synchronize()
-        cudnn.destroy_handle(handle)
 
     except cudnn.cudnnGraphNotSupportedError as ex:
         print(ex)

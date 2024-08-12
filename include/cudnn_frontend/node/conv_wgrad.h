@@ -23,13 +23,7 @@ class WgradNode : public NodeCRTP<WgradNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating Node Type::WGRAD " << attributes.name << "..."
-                    << std::endl;
-
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(Conv_wgrad_attributes::input_names::X);
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(Conv_wgrad_attributes::input_names::DY);
-
-        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(Conv_wgrad_attributes::output_names::DW);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating Node Type::WGRAD " << attributes.name << "...");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             attributes.get_pre_padding().empty(), error_code_t::ATTRIBUTE_NOT_SET, "Pre padding not set.");
@@ -40,14 +34,12 @@ class WgradNode : public NodeCRTP<WgradNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             attributes.get_dilation().empty(), error_code_t::ATTRIBUTE_NOT_SET, "Conv dilation not set.");
 
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
         return {error_code_t::OK, ""};
     }
 
     error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for conv node " << attributes.name << "."
-                    << std::endl;
+    infer_properties_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for conv node " << attributes.name << ".");
 
         attributes.fill_from_context(context);
 
@@ -73,27 +65,19 @@ class WgradNode : public NodeCRTP<WgradNode> {
     }
 
     error_t
-    post_validate_node() const override final {
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
+        managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Building WgradNode operations " << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FRONTEND_UNUSED(raw_operations);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Building WgradNode operations " << attributes.name << "...");
 
         // wgrad descriptor
         int64_t const spatial_dim_count = attributes.get_pre_padding().size();
         auto wgrad_descriptor           = cudnn_frontend::ConvDescBuilder()
                                     .setComputeType(attributes.compute_data_type)
-                                    .setMathMode(CUDNN_CROSS_CORRELATION)
+                                    .setMathMode(attributes.math_mode)
                                     .setSpatialDimCount(spatial_dim_count)
                                     .setSpatialStride(spatial_dim_count, attributes.get_stride().data())
                                     .setPrePadding(spatial_dim_count, attributes.get_pre_padding().data())

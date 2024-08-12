@@ -22,9 +22,8 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
     }
 
     error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferencing properties for layernorm node " << attributes.name << "..."
-                    << std::endl;
+    infer_properties_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferencing properties for layernorm node " << attributes.name << "...");
 
         attributes.fill_from_context(context);
 
@@ -124,24 +123,12 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating LayerNormNode " << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Validating LayerNormNode " << attributes.name << "...");
 
         // Norm forward phase should be set
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.forward_phase == NormFwdPhase_t::NOT_SET,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Forward phase not set of layernorm node.");
-
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    post_validate_node() const override final {
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
 
         return {error_code_t::OK, ""};
     }
@@ -150,9 +137,10 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
+        managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Building LayerNormNode operations " << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FRONTEND_UNUSED(raw_operations);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Building LayerNormNode operations " << attributes.name << "...");
 
         auto&& layernorm_operation_builder =
             cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_FORWARD_DESCRIPTOR);

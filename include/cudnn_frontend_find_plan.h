@@ -68,8 +68,7 @@ time_sorted_plan(cudnnHandle_t handle,
         // Warm-up run
         auto warmup_status = detail::execute(handle, plan.get_raw_desc(), variantPack.get_raw_desc());
         if (warmup_status != CUDNN_STATUS_SUCCESS) {
-            getLogger() << "[cudnn_frontend] Plan " << plan.getTag() << " failed with " << to_string(warmup_status)
-                        << std::endl;
+            CUDNN_FE_LOG_LABEL_ENDL("Plan " << plan.getTag() << " failed with " << to_string(warmup_status));
             continue;
         }
         successful_plan_count++;
@@ -103,12 +102,11 @@ time_sorted_plan(cudnnHandle_t handle,
                 final_time_ms = time_ms;
             }
         }
-        getLogger() << "[cudnn_frontend] Plan " << plan.getTag() << " took " << std::setw(10) << final_time_ms
-                    << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("Plan " << plan.getTag() << " took " << std::setw(10) << final_time_ms);
         plan.setExecutionTime(final_time_ms);
         timed_execution_plans.insert(plan);
         if (successful_plan_count >= max_plans_to_evaluate) {
-            getLogger() << "[cudnn_frontend] Successfully profiled " << max_plans_to_evaluate << "plans." << std::endl;
+            CUDNN_FE_LOG_LABEL_ENDL("Successfully profiled " << max_plans_to_evaluate << "plans.");
             break;
         }
     }
@@ -120,7 +118,7 @@ time_sorted_plan(cudnnHandle_t handle,
     detail::cuda_event_destroy(start);
     detail::cuda_event_destroy(stop);
 
-    getLogger() << "[cudnn_frontend] Auto-tuning returns " << time_sorted_plans.size() << " plans." << std::endl;
+    CUDNN_FE_LOG_LABEL_ENDL("Auto-tuning returns " << time_sorted_plans.size() << " plans.");
 
     return time_sorted_plans;
 }

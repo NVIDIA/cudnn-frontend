@@ -24,7 +24,7 @@ def param_extract(request):
     reason="LN not supported below cudnn 8.9.5",
 )
 @torch_fork_set_rng(seed=0)
-def test_layernorm(param_extract):
+def test_layernorm(param_extract, cudnn_handle):
 
     embedding_dim, input_type = param_extract
 
@@ -79,14 +79,13 @@ def test_layernorm(param_extract):
         torch.var(x_gpu.to(torch.float32), dim=(1, 2, 3), keepdim=True) + epsilon_value
     )
 
-    handle = cudnn.create_handle()
     stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
     graph = cudnn.pygraph(
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     X = graph.tensor(
@@ -150,7 +149,7 @@ def test_layernorm(param_extract):
             inv_var: inv_var_actual,
         },
         workspace,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     torch.testing.assert_close(Y_expected, Y_actual, atol=atol, rtol=rtol)
@@ -220,7 +219,7 @@ def test_layernorm(param_extract):
             Dbias: Dbias_actual,
         },
         workspace,
-        handle=handle,
+        handle=cudnn_handle,
     )
 
     torch.cuda.synchronize()
@@ -228,8 +227,7 @@ def test_layernorm(param_extract):
     torch.testing.assert_close(x_gpu.grad, DX_actual, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(scale_gpu.grad, DScale_actual, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(bias_gpu.grad, Dbias_actual, atol=2e-4, rtol=2e-4)
-    cudnn.destroy_handle(handle)
 
 
 if __name__ == "__main__":
-    test_layernorm((1600, torch.bfloat16))
+    test_layernorm((1600, torch.bfloat16), cudnn_handle)

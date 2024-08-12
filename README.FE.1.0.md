@@ -51,7 +51,8 @@ FE v1.0 API follows a functional style of building a graph. Operations take in i
 | [Scale dot product attention](docs/operations/Attention.md)              | sdpa<br> SDPA_attributes                             | sdpa                                                                                             |
 | [Scale dot product attention backward](docs/operations/Attention.md)     | sdpa_backward<br> SDPA_backward_attributes           | sdpa_backward                                                                                    |
 | [Scale dot product attention FP8](docs/operations/Attention.md)          | sdpa_fp8<br> SDPA_fp8_attributes                     | sdpa_fp8                                                                                         |
-| [Scale dot product attention backward FP8](docs/operations/Attention.md) | sdpa_fp8_backward<br> SDPA_fp8_backward_attributes   | sdpa_fp8_backward                                                                                |
+| [Scale dot product attention backward FP8](docs/operations/Attention.md) | sdpa_fp8_backward<br> SDPA_fp8_backward_attributes   | sdpa_fp8_backward    
+| Slice | slice<br> Slice_attributes   | slice                                                                                |
 
 ### Creating the Graph
 Instantiate an object of class `cudnn_frontend::graph::Graph` which will house tensors and operations.  

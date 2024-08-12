@@ -22,9 +22,8 @@ class RMSNormNode : public NodeCRTP<RMSNormNode> {
     }
 
     error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferencing properties for rmsnorm node " << attributes.name << "..."
-                    << std::endl;
+    infer_properties_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferencing properties for rmsnorm node " << attributes.name << "...");
 
         attributes.fill_from_context(context);
 
@@ -65,23 +64,12 @@ class RMSNormNode : public NodeCRTP<RMSNormNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating RMSNormNode " << attributes.name << "..." << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating RMSNormNode " << attributes.name << "...");
 
         // Norm forward phase should be set
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.forward_phase == NormFwdPhase_t::NOT_SET,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Forward phase not set of rmsnorm node.");
-
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
-    post_validate_node() const override final {
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
 
         return {error_code_t::OK, ""};
     }
@@ -90,9 +78,10 @@ class RMSNormNode : public NodeCRTP<RMSNormNode> {
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
+        managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Building RMSNormNode operations " << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FRONTEND_UNUSED(raw_operations);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Building RMSNormNode operations " << attributes.name << "...");
 
         auto&& rmsnorm_operation_builder =
             cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_FORWARD_DESCRIPTOR);
@@ -168,22 +157,18 @@ class DRMSNormNode : public NodeCRTP<DRMSNormNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating DRMSNormNode node " << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating DRMSNormNode node " << attributes.name << "...");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.use_dbias.has_value() == false,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "DRMSNormNode node needs has_bias(bool) to be called.");
 
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
-
         return {error_code_t::OK, ""};
     }
 
     error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferencing properties for DRMSNorm node " << attributes.name << "..."
-                    << std::endl;
+    infer_properties_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferencing properties for DRMSNorm node " << attributes.name << "...");
 
         attributes.fill_from_context(context);
 
@@ -247,21 +232,13 @@ class DRMSNormNode : public NodeCRTP<DRMSNormNode> {
     }
 
     error_t
-    post_validate_node() const override final {
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
+        managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Building DRMSNormNode operations " << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FRONTEND_UNUSED(raw_operations);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Building DRMSNormNode operations " << attributes.name << "...");
 
         auto&& DRMSNorm_operation_builder =
             cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_BACKWARD_DESCRIPTOR);

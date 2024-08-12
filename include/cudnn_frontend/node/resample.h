@@ -22,10 +22,7 @@ class ResampleNode : public NodeCRTP<ResampleNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating ResampleNode " << attributes.name << "..." << std::endl;
-
-        CUDNN_FE_VALIDATE_INPUT_TENSOR(Resample_attributes::input_names::X);
-        CUDNN_FE_VALIDATE_OUTPUT_TENSOR(Resample_attributes::output_names::Y);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Validating ResampleNode " << attributes.name << "...");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.is_inference.has_value() == false,
                                        error_code_t::ATTRIBUTE_NOT_SET,
@@ -42,15 +39,12 @@ class ResampleNode : public NodeCRTP<ResampleNode> {
             error_code_t::ATTRIBUTE_NOT_SET,
             "Invalid resample mode.");
 
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_inputs());
-
         return {error_code_t::OK, ""};
     }
 
     error_t
-    expand_and_infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for resample node " << attributes.name << "..."
-                    << std::endl;
+    infer_properties_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for resample node " << attributes.name << "...");
 
         auto y_tensor = attributes.outputs[Resample_attributes::output_names::Y];
         auto x_tensor = attributes.inputs[Resample_attributes::input_names::X];
@@ -101,21 +95,13 @@ class ResampleNode : public NodeCRTP<ResampleNode> {
     }
 
     error_t
-    post_validate_node() const override final {
-        // Validate outputs
-        // All properties of output tensors should have been set now.
-        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_outputs());
-
-        return {error_code_t::OK, ""};
-    }
-
-    error_t
     create_cudnn_operations(
         std::unordered_set<uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
+        managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Building ResampleNode operations " << attributes.name << "..."
-                    << std::endl;
+        CUDNN_FRONTEND_UNUSED(raw_operations);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Building ResampleNode operations " << attributes.name << "...");
 
         auto number_of_spatial_dim = static_cast<int64_t>(attributes.window.size());
 
