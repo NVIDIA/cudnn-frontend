@@ -19,6 +19,7 @@ find_package(Python 3.8 COMPONENTS Interpreter Development.Module REQUIRED)
 include(${PROJECT_SOURCE_DIR}/cmake/cuDNN.cmake)
 
 option(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE "Whether cmake build system should fetch pybinds." ON)
+
 if(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE)
     FetchContent_Declare(
         pybind11
@@ -29,6 +30,9 @@ if(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE)
 else()
     find_package(pybind11 CONFIG REQUIRED)
 endif()
+
+add_compile_options(-fvisibility=hidden)
+
 # Add a library using FindPython's tooling (pybind11 also provides a helper like
 # this)
 python_add_library(

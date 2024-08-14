@@ -41,7 +41,7 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
     int64_t s = 512;  // q,k,v tensor is padded to this seq length
     int64_t d = 128;  // hidden dim
 
-    bool is_inference = false;
+    bool is_inference = true;
 
     fe::graph::Graph mha_graph;
     mha_graph.set_io_data_type(fe::DataType_t::FP8_E4M3)

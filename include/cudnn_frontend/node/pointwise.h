@@ -46,8 +46,9 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
 
         if (out_0_tensor->get_stride().empty()) {
             auto input_stride = attributes.inputs.at(Pointwise_attributes::input_names::IN_0)->get_stride();
-            std::vector<int64_t> stride_order =
-                detail::generate_stride_order_preserving_format(input_stride, output_dim.size());
+            std::vector<int64_t> stride_order;
+            CHECK_CUDNN_FRONTEND_ERROR(
+                detail::generate_stride_order_preserving_format(input_stride, output_dim.size(), stride_order));
             out_0_tensor->set_stride(detail::generate_stride(output_dim, stride_order));
         }
 

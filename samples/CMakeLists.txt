@@ -26,6 +26,7 @@ add_executable(
     cpp/sdpa/fp16_bwd.cpp
     cpp/sdpa/fp16_cached.cpp
     cpp/sdpa/fp16_benchmark.cpp
+    cpp/sdpa/fp16_fwd_with_custom_dropout.cpp
     cpp/sdpa/fp8_fwd.cpp
     cpp/sdpa/fp8_bwd.cpp
 

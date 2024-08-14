@@ -152,10 +152,12 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         // Descale dO
         mul_attributes.set_name("descale_dO");
         last_output = pointwise(last_output, attributes.inputs.at(input_names::Descale_dO), mul_attributes);
+        last_output->set_dim({b, h_q, s_q, 1}).set_stride({h_q * s_q, s_q, 1, 1});
 
         // Descale O
         mul_attributes.set_name("descale_O");
         auto softmax_sum = pointwise(last_output, attributes.inputs.at(input_names::Descale_O), mul_attributes);
+        softmax_sum->set_dim({b, h_q, s_q, 1}).set_stride({h_q * s_q, s_q, 1, 1});
 
         //// Q * K
         auto bmm_Q_K_attributes = Matmul_attributes().set_name("bmm_Q_K");

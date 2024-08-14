@@ -84,9 +84,13 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
         if (attributes.use_stats.value()) {
             auto log_attributes    = Pointwise_attributes().set_name("log").set_mode(PointwiseMode_t::LOG);
             auto const& log_output = pointwise(sum_output, log_attributes);
+            log_output->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
 
             auto add_attributes = Pointwise_attributes().set_name("add").set_mode(PointwiseMode_t::ADD);
             // Special non-functional-style call. Needed because output already created and provided to user.
+            attributes.outputs[Softmax_attributes::output_names::Stats]
+                ->set_dim({b, h, s_q, 1})
+                .set_stride({h * s_q, s_q, 1, 1});
             pointwise(
                 max_output, log_output, add_attributes, attributes.outputs[Softmax_attributes::output_names::Stats]);
         }
@@ -95,6 +99,9 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
             auto reciprocal_attributes =
                 Pointwise_attributes().set_name("reciprocal").set_mode(PointwiseMode_t::RECIPROCAL);
             // Special non-functional-style call. Needed because output already created and provided to user.
+            attributes.outputs[Softmax_attributes::output_names::Zinv]
+                ->set_dim({b, h, s_q, 1})
+                .set_stride({h * s_q, s_q, 1, 1});
             pointwise(sum_output, reciprocal_attributes, attributes.outputs[Softmax_attributes::output_names::Zinv]);
         }
 

@@ -75,6 +75,10 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "is_inference attribute not set");
 
+        if (attributes.is_inference.value() == false) {
+            CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::Stats);
+        }
+
 #undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
 
         int64_t d_qk = attributes.inputs.at(input_names::Q)->get_dim()[3];
@@ -96,16 +100,18 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
 
     error_t
     infer_properties_node() override final {
-        auto stats     = attributes.outputs.at(output_names::Stats);
-        auto stats_dim = stats->get_dim();
+        if (attributes.is_inference.value() == false) {
+            auto stats     = attributes.outputs.at(output_names::Stats);
+            auto stats_dim = stats->get_dim();
 
-        if (stats_dim.empty()) {
-            // Fill properties of virtual tensors
-            auto const& p_dim = attributes.inputs[input_names::Q]->get_dim();
-            auto b            = p_dim[0];
-            auto h            = p_dim[1];
-            auto s_q          = p_dim[2];
-            stats->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+            if (stats_dim.empty()) {
+                // Fill properties of virtual tensors
+                auto const& p_dim = attributes.inputs[input_names::Q]->get_dim();
+                auto b            = p_dim[0];
+                auto h            = p_dim[1];
+                auto s_q          = p_dim[2];
+                stats->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+            }
         }
         return {error_code_t::OK, ""};
     }
