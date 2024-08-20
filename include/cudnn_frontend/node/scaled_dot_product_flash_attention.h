@@ -540,58 +540,74 @@ class SDPANode : public NodeCRTP<SDPANode> {
         last_output = softmax_output;
 
         // Two cases for training: dropout present or not
-        bool dropout_present = false;
+        bool dropout_present         = false;
+        auto const& dropout_mask     = attributes.inputs.find(input_names::Dropout_mask);
+        bool const is_dropout_custom = (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
         if (attributes.dropout_probability.has_value()) {
             dropout_present = true;
             // Special case: Skip dropout when 0.0 probability. Only do for 8.9.3 and up as rng isn't optional earlier.
             if (detail::get_backend_version() > 8902 && attributes.dropout_probability.value() == 0.0) {
                 dropout_present = false;
             }
-        } else if (attributes.inputs[input_names::Dropout_mask]) {
+        } else if (is_dropout_custom) {
             dropout_present = true;
         }
 
         if (dropout_present) {
-            if (attributes.outputs[output_names::RNG_DUMP] != nullptr) {
-                rng_output = attributes.outputs[output_names::RNG_DUMP];
-                rng(attributes.inputs[input_names::Seed],
-                    attributes.inputs[input_names::Offset],
-                    Rng_attributes()
-                        .set_name("rng")
-                        .set_distribution(RngDistribution_t::BERNOULLI)
-                        .set_bernoulli_probability(1.0 - attributes.dropout_probability.value()),
-                    rng_output);
+            if (is_dropout_custom) {
+                auto dropout_scale_attributes =
+                    Pointwise_attributes().set_name("dropout_scale_mul").set_mode(PointwiseMode_t::MUL);
+                auto const& dropout_scale_output =
+                    pointwise(last_output, attributes.inputs[input_names::Dropout_scale], dropout_scale_attributes);
+
+                auto mask_attributes =
+                    Pointwise_attributes().set_name("dropout_mask_mul").set_mode(PointwiseMode_t::MUL);
+                auto const& dropout_mask_output =
+                    pointwise(dropout_scale_output, dropout_mask->second, mask_attributes);
+                last_output = dropout_mask_output;
             } else {
-                rng_output = rng(attributes.inputs[input_names::Seed],
-                                 attributes.inputs[input_names::Offset],
-                                 Rng_attributes()
-                                     .set_name("rng")
-                                     .set_distribution(RngDistribution_t::BERNOULLI)
-                                     .set_bernoulli_probability(1.0 - attributes.dropout_probability.value()));
-                rng_output
-                    // Hard coding dim and strides as rng output can no inputs to infer it from.
-                    ->set_dim({b, h, s_q, s_kv})
-                    .set_stride({h * s_q * s_kv, s_q * s_kv, s_kv, 1});
+                if (attributes.outputs[output_names::RNG_DUMP] != nullptr) {
+                    rng_output = attributes.outputs[output_names::RNG_DUMP];
+                    rng(attributes.inputs[input_names::Seed],
+                        attributes.inputs[input_names::Offset],
+                        Rng_attributes()
+                            .set_name("rng")
+                            .set_distribution(RngDistribution_t::BERNOULLI)
+                            .set_bernoulli_probability(1.0 - attributes.dropout_probability.value()),
+                        rng_output);
+                } else {
+                    rng_output = rng(attributes.inputs[input_names::Seed],
+                                     attributes.inputs[input_names::Offset],
+                                     Rng_attributes()
+                                         .set_name("rng")
+                                         .set_distribution(RngDistribution_t::BERNOULLI)
+                                         .set_bernoulli_probability(1.0 - attributes.dropout_probability.value()));
+                    rng_output
+                        // Hard coding dim and strides as rng output can no inputs to infer it from.
+                        ->set_dim({b, h, s_q, s_kv})
+                        .set_stride({h * s_q * s_kv, s_q * s_kv, s_kv, 1});
+                }
+
+                auto mask_attributes =
+                    Pointwise_attributes().set_name("dropout_mask_mul").set_mode(PointwiseMode_t::MUL);
+                auto const& dropout_mask_output = pointwise(last_output, rng_output, mask_attributes);
+                last_output                     = dropout_mask_output;
+
+                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dropout_scale = nullptr;
+
+                if (detail::get_backend_version() < 8903) {
+                    half dropout_scale_value = __float2half(1.0f / (1.0f - attributes.dropout_probability.value()));
+                    dropout_scale            = std::make_shared<Tensor_attributes>(dropout_scale_value);
+                } else {
+                    float dropout_scale_value = (1.0f / (1.0f - attributes.dropout_probability.value()));
+                    dropout_scale             = std::make_shared<Tensor_attributes>(dropout_scale_value);
+                }
+
+                auto dropout_scale_attributes =
+                    Pointwise_attributes().set_name("dropout_scale").set_mode(PointwiseMode_t::MUL);
+                auto const& dropout_scale_output = pointwise(last_output, dropout_scale, dropout_scale_attributes);
+                last_output                      = dropout_scale_output;
             }
-
-            auto mask_attributes = Pointwise_attributes().set_name("dropout_mask_mul").set_mode(PointwiseMode_t::MUL);
-            auto const& dropout_mask_output = pointwise(last_output, rng_output, mask_attributes);
-            last_output                     = dropout_mask_output;
-
-            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dropout_scale = nullptr;
-
-            if (detail::get_backend_version() < 8903) {
-                half dropout_scale_value = __float2half(1.0f / (1.0f - attributes.dropout_probability.value()));
-                dropout_scale            = std::make_shared<Tensor_attributes>(dropout_scale_value);
-            } else {
-                float dropout_scale_value = (1.0f / (1.0f - attributes.dropout_probability.value()));
-                dropout_scale             = std::make_shared<Tensor_attributes>(dropout_scale_value);
-            }
-
-            auto dropout_scale_attributes =
-                Pointwise_attributes().set_name("dropout_scale").set_mode(PointwiseMode_t::MUL);
-            auto const& dropout_scale_output = pointwise(last_output, dropout_scale, dropout_scale_attributes);
-            last_output                      = dropout_scale_output;
         }
 
         // Lower attributes to bmm2 attributes
@@ -1048,6 +1064,7 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                                     ? attributes.inputs[input_names::Dropout_scale_inv]
                                     : one_tensor,
                                 Pointwise_attributes().set_name("scale_dropout_inv").set_mode(PointwiseMode_t::MUL));
+        last_output->set_dim({b, h_q, s_q, 1}).set_stride({h_q * s_q, s_q, 1, 1});
 
         softmax_sum = last_output;
 

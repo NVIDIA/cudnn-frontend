@@ -406,3 +406,70 @@ TEST_CASE("CBR Graph NCHW", "[conv][graph][caching]") {
 
     cudnnDestroy(handle);
 }
+
+TEST_CASE("Convolution fprop large", "[conv][graph][caching]") {
+    namespace fe = cudnn_frontend;
+
+    if (is_arch_supported_by_cudnn() == false) {
+        SKIP("Architecture is not supported by current cudnn version");
+    }
+
+#if (CUDNN_VERSION < 90300)
+    SKIP("Large tensors > int32_t require cudnn 9.3.0 and up.");
+#endif
+
+    int64_t n = 1, c = 128, d = 128, h = 363, w = 363, k = 128, t = 3, r = 3, s = 3;
+
+    auto build_new_graph = [=](cudnnHandle_t handle) {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::HALF).set_compute_data_type(fe::DataType_t::FLOAT);
+
+        auto X = graph->tensor(fe::graph::Tensor_attributes()
+                                   .set_name("image")
+                                   .set_dim({n, c, d, h, w})
+                                   .set_stride({c * d * h * w, 1, c * h * w, c * w, c}));
+
+        auto W = graph->tensor(fe::graph::Tensor_attributes()
+                                   .set_name("filter")
+                                   .set_dim({k, c, t, r, s})
+                                   .set_stride({c * t * r * s, 1, c * r * s, c * s, c}));
+
+        auto conv_options =
+            fe::graph::Conv_fprop_attributes().set_padding({1, 1, 1}).set_stride({1, 1, 1}).set_dilation({1, 1, 1});
+        auto Y = graph->conv_fprop(X, W, conv_options);
+
+        Y->set_output(true);
+
+        REQUIRE(graph->validate().is_good());
+
+        REQUIRE(graph->build_operation_graph(handle).is_good());
+
+        REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
+
+        REQUIRE(graph->check_support(handle).is_good());
+
+        REQUIRE(graph->build_plans(handle).is_good());
+
+        return std::make_tuple(graph, X, W, Y);
+    };
+
+    cudnnHandle_t handle;
+
+    checkCudnnErr(cudnnCreate(&handle));
+
+    auto [graph, X, W, Y] = build_new_graph(handle);
+
+    Surface<half> x_tensor(n * c * d * h * w, false);
+    Surface<half> w_tensor(k * c * t * r * s, false);
+    Surface<half> y_tensor(n * k * d * h * w, false);  // Should be p, q.
+
+    std::unordered_map<int64_t, void*> variant_pack = {
+        {X->get_uid(), x_tensor.devPtr}, {W->get_uid(), w_tensor.devPtr}, {Y->get_uid(), y_tensor.devPtr}};
+
+    Surface<int8_t> workspace(graph->get_workspace_size(), false);
+
+    std::cout << *graph << std::endl;
+
+    REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+    cudnnDestroy(handle);
+}

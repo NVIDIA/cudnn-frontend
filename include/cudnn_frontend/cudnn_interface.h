@@ -71,6 +71,8 @@ class ICudnn {
                                                                    << " already created.");
             return {error_code_t::OK, ""};
         }
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Creating Backend Tensor named '" << props->get_name() << "' with UID "
+                                                                        << tensor_uid);
 
         auto&& tensor_builder = cudnn_frontend::TensorBuilder();
 

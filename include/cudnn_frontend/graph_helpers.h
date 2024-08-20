@@ -315,8 +315,10 @@ compute_broadcast_shape(const std::vector<std::vector<int64_t>>& _shapes, std::v
  * @param output_dim_size The number of dimensions in the output tensor
  * @return std::vector<int64_t> The generated stride order
  */
-inline std::vector<int64_t>
-generate_stride_order_preserving_format(const std::vector<int64_t>& input_stride, size_t output_dim_size) {
+inline error_t
+generate_stride_order_preserving_format(const std::vector<int64_t>& input_stride,
+                                        size_t output_dim_size,
+                                        std::vector<int64_t>& stride_order) {
     std::vector<int64_t> indices(input_stride.size());
     std::iota(indices.begin(), indices.end(), 0);
 
@@ -325,8 +327,14 @@ generate_stride_order_preserving_format(const std::vector<int64_t>& input_stride
         return input_stride[i] < input_stride[j];
     });
 
+    // Enable this after further debug
+    // std::set<int64_t> stride_set(input_stride.begin(), input_stride.end());
+    // RETURN_CUDNN_FRONTEND_ERROR_IF((stride_set.size() != input_stride.size()),
+    //                                error_code_t::SHAPE_DEDUCTION_FAILED,
+    //                                "Have multiple stride with same value. Cant determine stride order");
+
     // Create the stride order
-    std::vector<int64_t> stride_order(input_stride.size());
+    stride_order.resize(input_stride.size());
     for (size_t i = 0; i < indices.size(); ++i) {
         stride_order[indices[i]] = i;
     }
@@ -338,7 +346,7 @@ generate_stride_order_preserving_format(const std::vector<int64_t>& input_stride
         std::iota(stride_order.begin() + start, stride_order.end(), start);
     }
 
-    return stride_order;
+    return {error_code_t::OK, ""};
 }
 
 /**
