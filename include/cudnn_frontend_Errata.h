@@ -183,9 +183,10 @@ check_rule(const json &json_handle,
                 "shape";
 #ifndef NV_CUDNN_DISABLE_EXCEPTION
             throw cudnnException(message.c_str(), CUDNN_STATUS_BAD_PARAM);
-#endif
+#else
             CUDNN_FE_LOG(message << std::endl);
             return blocked;
+#endif
         }
 
         std::array<ManagedOpaqueDescriptor, MAX_OPGRAPH_OPS> ops = opGraph.getOps();
