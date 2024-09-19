@@ -331,7 +331,7 @@ def test_leaky_relu_backward(cudnn_handle):
 @torch_fork_set_rng(seed=0)
 def test_conv_int8(cudnn_handle):
 
-    N, C, H, W = 1, 64, 32, 32
+    N, C, H, W = 2, 64, 32, 32
     K, R, S = 4, 3, 3
     padding = [1, 1]
     stride = [1, 1]

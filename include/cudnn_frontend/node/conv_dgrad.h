@@ -52,6 +52,10 @@ class DgradNode : public NodeCRTP<DgradNode> {
         auto const dy_tensor_dim = DY->get_dim();
         auto dx_tensor_dim       = DX->get_dim();
 
+        RETURN_CUDNN_FRONTEND_ERROR_IF(DX->get_dim().empty(),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "For dgrad node, output dimension inferencing is not possible.");
+
         // No dim inferencing as inverse mapping from DY, W to DX is not unique.
         // Only infer strides if user did not set them
         if (DX->get_stride().empty()) {

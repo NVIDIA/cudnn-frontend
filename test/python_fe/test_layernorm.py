@@ -128,7 +128,7 @@ def test_layernorm(param_extract, cudnn_handle):
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     graph.check_support()
-    graph.build_plans(cudnn.build_plan_policy.ALL)
+    graph.build_plans()
 
     Y_actual = torch.empty_like(x_gpu)
     mean_actual = torch.empty_like(mean_expected)
@@ -197,7 +197,7 @@ def test_layernorm(param_extract, cudnn_handle):
     bwd_graph.build_operation_graph()
     bwd_graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     bwd_graph.check_support()
-    bwd_graph.build_plans(cudnn.build_plan_policy.ALL)
+    bwd_graph.build_plans()
 
     DX_actual = torch.empty_like(x_gpu)
     DScale_actual = torch.empty_like(scale_gpu)

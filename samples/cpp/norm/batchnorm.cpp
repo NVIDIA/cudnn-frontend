@@ -107,7 +107,10 @@ TEST_CASE("BN Finalize Graph", "[batchnorm][graph]") {
     float MOMENTUM_scalar = 0.001f;
     int64_t nhw           = 64;
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {sum, Sum_tensor.devPtr},
         {sq_sum, Sq_sum_tensor.devPtr},
@@ -249,7 +252,10 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
     Surface<float> Peer_stats_0_tensor(2 * 4 * 32, false, true);
     Surface<float> Peer_stats_1_tensor(2 * 4 * 32, false);
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
         {mean, Mean_tensor.devPtr},
@@ -369,7 +375,10 @@ TEST_CASE("DBN Add Relu Graph", "[BN][graph][backward]") {
     Surface<float> Peer_stats_0_tensor(2 * 4 * 32, false, true);
     Surface<float> Peer_stats_1_tensor(2 * 4 * 32, false);
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
         {input_mask, Mask_tensor.devPtr},
@@ -474,7 +483,10 @@ TEST_CASE("BN_inference DRelu DBN Graph", "[Batchnorm][graph][backward]") {
     Surface<float> Dbias_tensor(32, false);
     Surface<half> DX_tensor(4 * 32 * 16 * 16, false);
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {BN_X, BN_X_tensor.devPtr},
         {DY, DY_tensor.devPtr},

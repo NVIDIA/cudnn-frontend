@@ -77,12 +77,79 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
 #undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
 
+        // validate backend limitations for the operation
+        // clang-format off
+        // int64_t s_q  = attributes.inputs.at(input_names::Q)->get_dim()[2];
+        // int64_t s_kv = attributes.inputs.at(input_names::K)->get_dim()[2];
+        int64_t h_q  = attributes.inputs.at(input_names::Q)->get_dim()[1];
+        int64_t h_k  = attributes.inputs.at(input_names::K)->get_dim()[1];
+        int64_t h_v  = attributes.inputs.at(input_names::V)->get_dim()[1];
+        int64_t d_qk = attributes.inputs.at(input_names::Q)->get_dim()[3];
+        int64_t d_v  = attributes.inputs.at(input_names::V)->get_dim()[3];
+
+        auto const& bias_mask = attributes.inputs.find(input_names::Bias);
+        bool const is_bias    = (bias_mask != attributes.inputs.end() && bias_mask->second != nullptr);
+
+        auto const& dropout_mask     = attributes.inputs.find(input_names::Dropout_mask);
+        bool const is_dropout_custom = (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
+
+        // validation TODO:
+        //    - validate stats has valid dims
+
+        // validate basic dimension requirements
+        if(prop.major >= 10) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 16 != 0) || (d_v > 128) || (d_v % 16 != 0),
+                                            error_code_t::GRAPH_NOT_SUPPORTED,
+                                            "hidden_dim shoud be less than 128 and hidden_dim should be multiple of 16");
+        }
+        else {
+            RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk != 128) || (d_qk % 16 != 0) || (d_v != 128) || (d_v % 16 != 0),
+                                error_code_t::GRAPH_NOT_SUPPORTED,
+                                "hidden_dim shoud be equal to 128 and hidden_dim should be multiple of 16");
+        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF((h_q % h_k != 0) || (h_q % h_v != 0),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For group-query attention, number of heads for key and query must be a factor of number of heads for query");
+
         // validate options for attn_scale
         auto const& attn_scale    = attributes.inputs.find(input_names::Attn_scale);
         bool const has_attn_scale = (attn_scale != attributes.inputs.end()) && (attn_scale->second != nullptr);
         RETURN_CUDNN_FRONTEND_ERROR_IF(has_attn_scale && attributes.attn_scale_value.has_value(),
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "attn_scale with tensor and value cannot be set at the same time.");
+
+        // validate options for bias mask
+        RETURN_CUDNN_FRONTEND_ERROR_IF(is_bias && (bias_mask->second->get_data_type() == DataType_t::BOOLEAN),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Bias mask data type cannot be boolean");
+
+        // validate options for padding mask
+        auto const& seq_len_q     = attributes.inputs.find(input_names::SEQ_LEN_Q);
+        bool const has_seq_len_q  = (seq_len_q != attributes.inputs.end()) && (seq_len_q->second != nullptr);
+        auto const& seq_len_kv    = attributes.inputs.find(input_names::SEQ_LEN_KV);
+        bool const has_seq_len_kv = (seq_len_kv != attributes.inputs.end()) && (seq_len_kv->second != nullptr);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.padding_mask && (!has_seq_len_q || !has_seq_len_kv),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Padding mask requires seq_len_q and seq_len_kv to be set.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF((!attributes.padding_mask) && (has_seq_len_q || has_seq_len_kv),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "seq_len_q and seq_len_kv needs to be set only if padding mask is enabled.");
+
+        // validate options for dropout mask
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            attributes.dropout_probability.has_value() && is_dropout_custom,
+            error_code_t::ATTRIBUTE_NOT_SET,
+            "Using both, custom dropout mask and internal-mask generation using dropout probability, is ill-formed.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            attributes.dropout_probability.has_value() && attributes.dropout_probability.value() == 1.0,
+            error_code_t::ATTRIBUTE_NOT_SET,
+            "Dropout probability cannot be 1 as corresponding scale wont be well formed.");
+
+        // validate that datatype is set for the graph
+        RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_intermediate_data_type() == DataType_t::NOT_SET,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Intermediate tensor data type needs to be set as internal tensors require it.");
         return {error_code_t::OK, ""};
     }
 
@@ -90,6 +157,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
     infer_properties_node() override final {
         return {error_code_t::OK, ""};
     }
+
     error_t
     expand_node() override final {
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for Scaled_dot_product_flash_attention node  "
@@ -137,7 +205,36 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         std::swap(temp_vec[2], temp_vec[3]);
         attributes.inputs[input_names::V]->set_stride(temp_vec);
 
+        std::shared_ptr<Tensor_attributes> rng_output;
+
         auto mul_attributes = Pointwise_attributes().set_mode(PointwiseMode_t::MUL);
+
+        // if dropout_prob is used, then the node passes scale and scale inverse
+        // if dropout_mask is used, then the user passes scale and scale_inverse
+        bool is_dropout_prob = (attributes.dropout_probability.has_value());
+        bool is_dropout_mask = (attributes.inputs[input_names::Dropout_mask] != nullptr);
+        if (is_dropout_prob) {
+            float dropout_scale_value     = 1.0f / (1.0f - attributes.dropout_probability.value());
+            float dropout_scale_inv_value = (1.0f - attributes.dropout_probability.value());
+
+            attributes.inputs[input_names::Dropout_scale] = std::make_shared<Tensor_attributes>(dropout_scale_value);
+            attributes.inputs[input_names::Dropout_scale_inv] =
+                std::make_shared<Tensor_attributes>(dropout_scale_inv_value);
+        }
+
+        // --------------RNG node--------------------
+
+        if (is_dropout_prob) {
+                rng_output = rng(attributes.inputs[input_names::Seed],
+                                 attributes.inputs[input_names::Offset],
+                                 Rng_attributes()
+                                     .set_name("rng")
+                                     .set_distribution(RngDistribution_t::BERNOULLI)
+                                     .set_bernoulli_probability(1.0f - attributes.dropout_probability.value()));
+                rng_output->set_dim({b, h_q, s_q, s_kv}).set_stride({h_q * s_q * s_kv, s_q * s_kv, s_kv, 1});
+        } else if (is_dropout_mask) {
+            rng_output = attributes.inputs[input_names::Dropout_mask];
+        }
 
         //// dO * O
         mul_attributes.set_name("mul_dO_O");
@@ -156,11 +253,20 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
         // Descale O
         mul_attributes.set_name("descale_O");
-        auto softmax_sum = pointwise(last_output, attributes.inputs.at(input_names::Descale_O), mul_attributes);
-        softmax_sum->set_dim({b, h_q, s_q, 1}).set_stride({h_q * s_q, s_q, 1, 1});
+        last_output = pointwise(last_output, attributes.inputs.at(input_names::Descale_O), mul_attributes);
+
+        // softmax_sum = last_output * dropout_scale
+        if(attributes.inputs[input_names::Dropout_scale_inv]) {
+            last_output = pointwise(last_output,
+                                    attributes.inputs[input_names::Dropout_scale_inv],
+                                    Pointwise_attributes().set_name("scale_dropout_inv").set_mode(PointwiseMode_t::MUL));
+        }
+        auto softmax_sum = last_output;
 
         //// Q * K
-        auto bmm_Q_K_attributes = Matmul_attributes().set_name("bmm_Q_K");
+        auto bmm_Q_K_attributes = Matmul_attributes().set_name("bmm_Q_K")
+                                 .set_m_override(attributes.inputs[input_names::SEQ_LEN_Q])
+                                 .set_n_override(attributes.inputs[input_names::SEQ_LEN_KV]);
         auto last_dV = matmul(attributes.inputs[input_names::Q], attributes.inputs[input_names::K], bmm_Q_K_attributes);
 
         //// Optional Attn scale
@@ -171,9 +277,9 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         }
 
         // If attn scale present, add a pointwise mul node
-        if (attributes.inputs[input_names::Attn_scale]) {
+        if (auto attn_scale_it = attributes.inputs.find(input_names::Attn_scale); attn_scale_it != attributes.inputs.end()) {
             mul_attributes.set_name("attn_scale");
-            last_dV = pointwise(last_dV, attributes.inputs[input_names::Attn_scale], mul_attributes);
+            last_dV = pointwise(last_dV, attn_scale_it->second, mul_attributes);
         }
 
         //// Descales
@@ -184,6 +290,63 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         // Descale K
         mul_attributes.set_name("descale_k");
         last_dV = pointwise(last_dV, attributes.inputs.at(input_names::Descale_K), mul_attributes);
+
+        // (optional) last_dV = last_dV + bias
+        if (auto bias_it = attributes.inputs.find(input_names::Bias); bias_it != attributes.inputs.end()) {
+            last_dV = pointwise(last_dV,
+                                    bias_it->second,
+                                    Pointwise_attributes().set_name("add_bias").set_mode(PointwiseMode_t::ADD));
+        }
+
+        // (optional) Apply padding mask
+        if (attributes.padding_mask) {
+            auto row_idx_output = pointwise(last_dV,
+                                            Pointwise_attributes()
+                                                .set_name("gen_row_idx_padding")
+                                                .set_mode(PointwiseMode_t::GEN_INDEX)
+                                                .set_axis(2)
+                                                .set_compute_data_type(DataType_t::INT32));
+            row_idx_output->set_data_type(DataType_t::INT32);
+
+            auto col_idx_output = pointwise(last_dV,
+                                            Pointwise_attributes()
+                                                .set_name("gen_col_idx_padding")
+                                                .set_mode(PointwiseMode_t::GEN_INDEX)
+                                                .set_axis(3)
+                                                .set_compute_data_type(DataType_t::INT32));
+            col_idx_output->set_data_type(DataType_t::INT32);
+
+            auto row_mask_output = pointwise(row_idx_output,
+                                             attributes.inputs[input_names::SEQ_LEN_Q],
+                                             Pointwise_attributes()
+                                                 .set_name("lt_row_sq_padding")
+                                                 .set_mode(PointwiseMode_t::CMP_LT)
+                                                 .set_compute_data_type(DataType_t::BOOLEAN));
+            row_mask_output->set_data_type(DataType_t::BOOLEAN);
+
+            auto col_mask_output = pointwise(col_idx_output,
+                                             attributes.inputs[input_names::SEQ_LEN_KV],
+                                             Pointwise_attributes()
+                                                 .set_name("lt_col_skv_padding")
+                                                 .set_mode(PointwiseMode_t::CMP_LT)
+                                                 .set_compute_data_type(DataType_t::BOOLEAN));
+            col_mask_output->set_data_type(DataType_t::BOOLEAN);
+
+            auto padding_mask_output = pointwise(row_mask_output,
+                                                 col_mask_output,
+                                                 Pointwise_attributes()
+                                                     .set_name("and_row_col_padding")
+                                                     .set_mode(PointwiseMode_t::LOGICAL_AND)
+                                                     .set_compute_data_type(DataType_t::BOOLEAN));
+            padding_mask_output->set_data_type(DataType_t::BOOLEAN);
+            auto negative_inf_padding = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
+
+            last_dV =
+                pointwise(last_dV,
+                          negative_inf_padding,
+                          padding_mask_output,
+                          Pointwise_attributes().set_name("select_padding").set_mode(PointwiseMode_t::BINARY_SELECT));
+        }
 
         //// Optional causal masking
         if (attributes.causal_mask) {
@@ -221,6 +384,22 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         last_dV    = pointwise(last_dV, Pointwise_attributes().set_name("exp_dV").set_mode(PointwiseMode_t::EXP));
         auto exp_S = last_dV;
 
+        // (optional) last_dV = last_dV * dropout rng_output
+        if (is_dropout_prob || is_dropout_mask) {
+            last_dV =
+                pointwise(last_dV,
+                          rng_output,
+                          Pointwise_attributes().set_name("mul_p_dropout_mask").set_mode(PointwiseMode_t::MUL));
+        }
+
+        // (optional) last_dV = last_dV * dropout_scale
+        if (attributes.inputs[input_names::Dropout_scale]) {
+            last_dV =
+                pointwise(last_dV,
+                          attributes.inputs[input_names::Dropout_scale],
+                          Pointwise_attributes().set_name("mul_dS_dropout_scale").set_mode(PointwiseMode_t::MUL));
+        }
+
         // Scale S
         mul_attributes.set_name("scale_S");
         last_dV = pointwise(last_dV, attributes.inputs.at(input_names::Scale_S), mul_attributes);
@@ -238,12 +417,16 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                    attributes.inputs[input_names::Descale_S],
                    attributes.inputs[input_names::Descale_dO],
                    attributes.inputs[input_names::Scale_dV],
-                   Matmul_fp8_attributes().set_name("bmm_S_T_dO"),
+                   Matmul_fp8_attributes().set_name("bmm_S_T_dO")
+                       .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
+                       .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]),
                    attributes.outputs[output_names::dV],
                    attributes.outputs[output_names::Amax_dV]);
 
         //// dO * V_T
-        auto bmm_dO_V_T_attributes = Matmul_attributes().set_name("bmm_dO_V_T");
+        auto bmm_dO_V_T_attributes = Matmul_attributes().set_name("bmm_dO_V_T")
+                                 .set_m_override(attributes.inputs[input_names::SEQ_LEN_Q])
+                                 .set_n_override(attributes.inputs[input_names::SEQ_LEN_KV]);
         last_output =
             matmul(attributes.inputs[input_names::dO], attributes.inputs[input_names::V], bmm_dO_V_T_attributes);
 
@@ -265,10 +448,24 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         mul_attributes.set_name("mul_dP_exp_S");
         dP = pointwise(dP, exp_S, mul_attributes);
 
+        // (optional) dP = dP * dropout_scale
+        if (attributes.inputs[input_names::Dropout_scale]) {
+            dP =
+                pointwise(dP,
+                          attributes.inputs[input_names::Dropout_scale],
+                          Pointwise_attributes().set_name("mul_dS_dropout_scale").set_mode(PointwiseMode_t::MUL));
+        }
+
+        // if (attributes.outputs[output_names::dBias]) {
+        //     reduction(dP,
+        //               Reduction_attributes().set_name("red_dP_dBias").set_mode(ReductionMode_t::ADD),
+        //               attributes.outputs[output_names::dBias]);
+        // }
+
         // (optional) dP = dP * attn_scale
-        if (attributes.inputs[input_names::Attn_scale]) {
+        if (auto attn_scale_it = attributes.inputs.find(input_names::Attn_scale); attn_scale_it != attributes.inputs.end()) {
             mul_attributes.set_name("mul_dS_attn_scale");
-            dP = pointwise(dP, attributes.inputs[input_names::Attn_scale], mul_attributes);
+            dP = pointwise(dP, attn_scale_it->second, mul_attributes);
         }
 
         // Amax dP
@@ -289,7 +486,9 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         K->set_dim({kt_dim[0], kt_dim[1], kt_dim[3], kt_dim[2]})
             .set_stride({kt_stride[0], kt_stride[1], kt_stride[3], kt_stride[2]});
 
-        auto bmm_dP_K_attributes = Matmul_fp8_attributes().set_name("bmm_dP_K");
+        auto bmm_dP_K_attributes = Matmul_fp8_attributes().set_name("bmm_dP_K")
+                   .set_m_override(attributes.inputs[input_names::SEQ_LEN_Q])
+                   .set_k_override(attributes.inputs[input_names::SEQ_LEN_KV]);
         // Special non-functional-style call. Needed because output already created and provided to user.
         matmul_fp8(dP,
                    K,
@@ -306,7 +505,9 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         dP_T->set_data_type(attributes.inputs.at(input_names::dO)->get_data_type());
         dP_T->set_name("dP_T").set_dim({b, h_q, s_kv, s_q}).set_stride({h_q * s_q * s_kv, s_q * s_kv, 1, s_kv});
 
-        auto bmm_dP_T_Q_attributes = Matmul_fp8_attributes().set_name("bmm_dP_T_Q");
+        auto bmm_dP_T_Q_attributes = Matmul_fp8_attributes().set_name("bmm_dP_T_Q")
+                       .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
+                       .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]);
         // Special non-functional-style call. Needed because output already created and provided to user.
         matmul_fp8(dP_T,
                    attributes.inputs[input_names::Q],

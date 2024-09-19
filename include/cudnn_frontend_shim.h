@@ -273,7 +273,7 @@ get_error_string(cudnnStatus_t status) {
 
 inline void
 get_last_error_string(char *message, size_t size) {
-    if (detail::get_backend_version() > 90000 && detail::get_compiled_version() < 90000) {
+    if (detail::get_backend_version() >= 90000 && detail::get_compiled_version() >= 90000) {
 #if CUDNN_VERSION >= 90000
         NV_FE_CALL_TO_BACKEND(get_last_error_string, cudnnGetLastErrorString, message, size);
 #endif

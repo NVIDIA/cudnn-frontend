@@ -32,7 +32,6 @@
 
 #include "cudnn_frontend_Operation.h"
 #include "cudnn_frontend_utils.h"
-
 // Compile time constant for max ops in a op graph
 constexpr int64_t MAX_OPGRAPH_OPS = 50;
 
@@ -131,6 +130,7 @@ class OperationGraph_v8 : public BackendDescriptor {
     int64_t numOps         = -1;
     std::string opGraphTag = "";
     std::vector<feature_vector_t> feature_vectors;
+    bool is_dynamic_shape_enabled = false;
 };
 
 ///
@@ -181,6 +181,12 @@ class OperationGraphBuilder_v8 {
         return *this;
     }
     /** @} */
+
+    auto
+    setIsDynamicShapeEnabled(bool is_enabled) -> OperationGraphBuilder_v8 & {
+        m_operationGraph.is_dynamic_shape_enabled = is_enabled;
+        return *this;
+    }
 
     //! constructs the OperationGraph_v8 by calling the cudnn API
     //! Throws the appropriate error message
@@ -245,6 +251,22 @@ class OperationGraphBuilder_v8 {
                 "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: SetAttribute CUDNN_ATTR_OPERATIONGRAPH_HANDLE Failed");
             return std::move(m_operationGraph);
         }
+#if (CUDNN_VERSION >= 90400)
+        if (m_operationGraph.is_dynamic_shape_enabled) {
+            status = detail::set_attribute(m_operationGraph.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATIONGRAPH_IS_DYNAMIC_SHAPE_ENABLED,
+                                           CUDNN_TYPE_BOOLEAN,
+                                           1,
+                                           &m_operationGraph.is_dynamic_shape_enabled);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(&m_operationGraph,
+                                              status,
+                                              "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: SetAttribute "
+                                              "CUDNN_ATTR_OPERATIONGRAPH_IS_DYNAMIC_SHAPE_ENABLED Failed");
+                return std::move(m_operationGraph);
+            }
+        }
+#endif
 
         // Finalizing the descriptor
         status = detail::finalize(m_operationGraph.pointer->get_backend_descriptor());

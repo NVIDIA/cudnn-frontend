@@ -33,6 +33,7 @@
 #include "cudnn_frontend_EngineConfig.h"
 #include "cudnn_frontend_Engine.h"
 #include "cudnn_frontend_utils.h"
+#include "cudnn_frontend/backend/kernel_cache.h"
 
 namespace cudnn_frontend {
 ///
@@ -321,7 +322,8 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     std::array<cudnnBackendBehaviorNote_t, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT> behavior_notes;
     std::vector<cudnnBackendBehaviorNote_t> behavior_notes_vec;
 
-    float execution_time_ms = 0.0f;
+    float execution_time_ms                   = 0.0f;
+    std::shared_ptr<KernelCache> kernel_cache = nullptr;
 };
 
 ///
@@ -344,6 +346,12 @@ class ExecutionPlanBuilder_v8 {
     setEngineConfig(EngineConfig_v8 const &engine_config_) -> ExecutionPlanBuilder_v8 & {
         m_execution_plan.engine_config = engine_config_.get_desc();
         m_execution_plan.planTag       = engine_config_.getTag();
+        return *this;
+    }
+
+    auto
+    setKernelCache(std::shared_ptr<KernelCache> kernel_cache) -> ExecutionPlanBuilder_v8 & {
+        m_execution_plan.kernel_cache = kernel_cache;
         return *this;
     }
 
@@ -415,6 +423,22 @@ class ExecutionPlanBuilder_v8 {
                 "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute CUDNN_ATTR_EXECUTION_PLAN_HANDLE Failed");
             return std::move(m_execution_plan);
         }
+#if (CUDNN_VERSION >= 90400)
+        if (m_execution_plan.kernel_cache) {
+            status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_EXECUTION_PLAN_KERNEL_CACHE,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &m_execution_plan.kernel_cache->get_ptr());
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(&m_execution_plan,
+                                              status,
+                                              "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute "
+                                              "CUDNN_ATTR_EXECUTION_PLAN_KERNEL_CACHE Failed");
+                return std::move(m_execution_plan);
+            }
+        }
+#endif
         // Finalizing the descriptor
         status = detail::finalize(m_execution_plan.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {

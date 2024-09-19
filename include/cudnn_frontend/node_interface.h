@@ -319,7 +319,7 @@ class INode : public ICudnn {
     serialize(json& j) const = 0;
 #endif
 
-    size_t
+    virtual size_t
     key() {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j;

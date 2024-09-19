@@ -26,6 +26,7 @@
 
 #include "plans.h"
 #include "graph_helpers.h"
+#include "backend/kernel_cache.h"
 
 namespace cudnn_frontend::graph {
 
@@ -35,6 +36,7 @@ class Graph : public INode {
     std::unordered_set<Tensor_attributes::uid_t> used_uids;
     int64_t fe_workspace_size = 0;
 
+    std::unordered_set<std::shared_ptr<Tensor_attributes>> deserialized_tensor_properties;
     std::unordered_map<uid_t, pass_by_values_t> deserialized_pass_by_value;
     std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> deserialized_workspace_modifications;
 
@@ -69,6 +71,10 @@ class Graph : public INode {
 
     error_t
     pre_validate_node() const override final {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            (is_dynamic_shape_enabled || kernel_cache != nullptr) && detail::get_backend_version() < 90400,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "Dynamic shapes or kernel caching enabled, but cuDNN version < 9.4!");
         return {error_code_t::OK, ""};
     }
 
@@ -161,18 +167,6 @@ class Graph : public INode {
     }
 
     int64_t
-    get_cudnn_workspace_size(int64_t plan_index) const {
-        int64_t cudnn_workspace_size = 0;
-
-        auto status = get_cudnn_workspace_size_node(plan_index, cudnn_workspace_size);
-        if (status.is_bad()) {
-            CUDNN_FE_LOG_LABEL_ENDL("ERROR: Querying workspace failed.");
-        }
-
-        return cudnn_workspace_size;
-    }
-
-    int64_t
     get_max_cudnn_workspace_size() const {
         return get_max_cudnn_workspace_size_node();
     }
@@ -206,6 +200,24 @@ class Graph : public INode {
             }
         }
         return {error_code_t::OK, ""};
+    }
+
+    size_t
+    key(bool remove_shape) {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+        json j;
+        serialize(j);
+        if (remove_shape) {
+            for (auto &tensor : j["tensors"]) {
+                tensor["dim"].clear();
+                tensor["stride"].clear();
+            }
+        }
+        return std::hash<json>{}(j);
+#else
+        CUDNN_FRONTEND_UNUSED(remove_shape);
+        return 1;
+#endif
     }
 
    public:
@@ -264,25 +276,55 @@ class Graph : public INode {
         // The method here fuses all operations. There will be 1 operation graph in total.
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_operation_graph(handle));
 
+        if (is_dynamic_shape_enabled && kernel_cache && !kernel_cache->is_finalized()) {
+            CHECK_CUDNN_FRONTEND_ERROR(kernel_cache->build(operation_graph->get_raw_desc()));
+        }
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    get_plan_name(std::string &name) const {
+        return get_plan_name_at_index(plans.candidate, name);
+    }
+
+    error_t
+    get_plan_name_at_index(int64_t plan_index, std::string &name) const {
+        auto ret_val = plans.get_name_at_index(plan_index, name);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: get_plan_name_at_index(" << plan_index << ") is " + name);
+        return ret_val;
+    }
+
+    error_t
+    get_workspace_size(int64_t &cudnn_workspace_size) const {
+        return get_workspace_size_plan_at_index(plans.candidate, cudnn_workspace_size);
+    }
+
+    error_t
+    get_workspace_size_plan_at_index(int64_t plan_index, int64_t &cudnn_workspace_size) const {
+        // There are two workspaces:
+        // - cudnn execution plan workspace
+        // - FE node workspace (example: alibiSlope for fmha)
+        int64_t cudnn_ws = 0;
+        CHECK_CUDNN_FRONTEND_ERROR(get_cudnn_workspace_size_node(plan_index, cudnn_ws));
+        cudnn_workspace_size = cudnn_ws + fe_workspace_size;
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is " << cudnn_workspace_size);
         return {error_code_t::OK, ""};
     }
 
     int64_t
     get_workspace_size() const {
-        // There are two workspaces:
-        // - cudnn execution plan workspace
-        // - FE node workspace (example: alibiSlope for fmha)
         return get_workspace_size_plan_at_index(plans.candidate);
     }
 
     int64_t
     get_workspace_size_plan_at_index(int64_t plan_index) const {
-        // There are two workspaces:
-        // - cudnn execution plan workspace
-        // - FE node workspace (example: alibiSlope for fmha)
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is "
-                                << fe_workspace_size + get_cudnn_workspace_size(plan_index));
-        return fe_workspace_size + get_cudnn_workspace_size(plan_index);
+        int64_t cudnn_workspace = 0;
+        auto status             = get_workspace_size_plan_at_index(plan_index, cudnn_workspace);
+        if (status.is_bad()) {
+            CUDNN_FE_LOG_LABEL_ENDL("ERROR: Querying workspace failed.");
+        }
+        return cudnn_workspace;
     }
 
     int64_t
@@ -476,6 +518,15 @@ class Graph : public INode {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j = json::from_ubjson(data);
 
+        if (j.contains("tensors")) {
+            auto tensor_map = j["tensors"].get<std::unordered_map<std::string, json>>();
+            for (const auto &tensor_info : tensor_map) {
+                auto tensor_attributes = std::make_shared<Tensor_attributes>();
+                from_json(tensor_info.second, *tensor_attributes);
+                deserialized_tensor_properties.insert(tensor_attributes);
+            }
+        }
+
         auto serialized_plan = j["cudnn_backend_data"];
         CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, serialized_plan));
 
@@ -509,13 +560,20 @@ class Graph : public INode {
     Graph &
     set_compute_data_type(DataType_t type);
     Graph &
+    set_dynamic_shape_enabled(bool is_enabled);
+    Graph &
     set_sm_count(int32_t type);
+    Graph &
+    set_kernel_cache(std::shared_ptr<KernelCache> cache);
 
     Graph &
     set_name(std::string const &name) {
         context.set_name(name);
         return *this;
     }
+
+    error_t
+    query_tensor_attributes_of_uid(int64_t const uid, Tensor_attributes &tensor) const;
 
     std::shared_ptr<Tensor_attributes>
     tensor(Tensor_attributes const &tensor);
@@ -828,6 +886,11 @@ class Graph : public INode {
     };
 #endif
 
+    size_t
+    key() override final {
+        return key(is_dynamic_shape_enabled);
+    }
+
     // TODO: temparorily placed in graphs class. This function needs to be a free standing function.
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     error_t
@@ -1002,6 +1065,7 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
 
     plans.set_tag(operation_graph->getTag());
     plans.set_engine_configs(op_graph_to_configs);
+    plans.set_kernel_cache(kernel_cache);
 
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Querying engine config properties.");
     CHECK_CUDNN_FRONTEND_ERROR(plans.query_properties());
@@ -1053,6 +1117,18 @@ Graph::set_compute_data_type(DataType_t const type) {
 }
 
 inline Graph &
+Graph::set_dynamic_shape_enabled(bool is_enabled) {
+    is_dynamic_shape_enabled = is_enabled;
+    return *this;
+}
+
+inline Graph &
+Graph::set_kernel_cache(std::shared_ptr<KernelCache> cache) {
+    kernel_cache = cache;
+    return *this;
+}
+
+inline Graph &
 Graph::set_sm_count(int32_t count) {
     context.set_target_sm_count(count);
     return *this;
@@ -1063,6 +1139,32 @@ Graph::tensor(Tensor_attributes const &tensor) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(tensor);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
+}
+
+inline error_t
+Graph::query_tensor_attributes_of_uid(int64_t const uid, Tensor_attributes &tensor) const {
+    for (auto const &o_tensor : full_graph_outputs) {
+        if (uid == o_tensor->get_uid()) {
+            tensor = *o_tensor;
+            return {error_code_t::OK, ""};
+        }
+    }
+
+    for (auto const &i_tensor : full_graph_inputs) {
+        if (uid == i_tensor->get_uid()) {
+            tensor = *i_tensor;
+            return {error_code_t::OK, ""};
+        }
+    }
+
+    for (auto const &d_tensor : deserialized_tensor_properties) {
+        if (uid == d_tensor->get_uid()) {
+            tensor = *d_tensor;
+            return {error_code_t::OK, ""};
+        }
+    }
+
+    return {error_code_t::INVALID_VALUE, "No matching tensor for this UID"};
 }
 
 // tensor_like is meant to create "useable" copies of a tensor.

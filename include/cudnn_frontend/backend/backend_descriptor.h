@@ -2,6 +2,7 @@
 
 #include <memory>
 
+#include "../graph_helpers.h"
 #include "cudnn.h"
 
 namespace cudnn_frontend::detail {
@@ -64,7 +65,11 @@ class backend_descriptor {
      *
      * Destroys the `cudnnBackendDescriptor_t` object and frees the associated resources.
      */
-    ~backend_descriptor() { detail::destroy_descriptor(desc); }
+    ~backend_descriptor() {
+        if (desc) {
+            detail::destroy_descriptor(desc);
+        }
+    }
 
     /**
      * @brief Deleted copy constructor and assignment operator.
@@ -75,6 +80,27 @@ class backend_descriptor {
     backend_descriptor(backend_descriptor const&) = delete;
     backend_descriptor&
     operator=(backend_descriptor const&) = delete;
+
+    /**
+     * @brief Initializes a `backend_descriptor` object.
+     *
+     * @param type The type of the backend descriptor to create.
+     */
+    error_t
+    initialize(cudnnBackendDescriptorType_t type) {
+        CHECK_CUDNN_ERROR(detail::create_descriptor(type, &desc));
+        return {error_code_t::OK, ""};
+    }
+
+    /**
+     * @brief Finalizes a `backend_descriptor` object.
+     *
+     */
+    error_t
+    finalize() {
+        CHECK_CUDNN_ERROR(detail::finalize(desc));
+        return {error_code_t::OK, ""};
+    }
 
     /**
      * @brief Accessor for the underlying `cudnnBackendDescriptor_t` object.
@@ -95,6 +121,14 @@ class backend_descriptor {
     get_status() const {
         return status;
     }
+
+   protected:
+    /**
+     * @brief Constructs a default `backend_descriptor` object, but without initializing descriptor
+     *
+     * Used to return an error code to user for incorrect cuDNN version
+     */
+    backend_descriptor() {}
 
    private:
     cudnnBackendDescriptor_t desc = nullptr;               //!< Raw pointer to the backend descriptor.

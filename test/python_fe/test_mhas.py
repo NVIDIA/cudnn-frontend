@@ -515,8 +515,6 @@ def test_sdpa(
     b = int(request.config.option.mha_b) if request.config.option.mha_b != None else b
     s_q = int(request.config.option.mha_s_q) if request.config.option.mha_s_q != None else s_q
     s_kv = int(request.config.option.mha_s_kv) if request.config.option.mha_s_kv != None else s_kv
-    if is_sliding_window:
-        s_kv = s_q
     d_qk = int(request.config.option.mha_d_qk) if request.config.option.mha_d_qk != None else d_qk
     d_v = int(request.config.option.mha_d_v) if request.config.option.mha_d_v != None else d_v
     h_q = int(request.config.option.mha_h_q) if request.config.option.mha_h_q != None else h_q
@@ -528,6 +526,9 @@ def test_sdpa(
 
     if d_qk != d_v and is_ragged and cudnn_version < "9.1":
         pytest.skip("d_qk != d_v is not supported with ragged offset")
+
+    if s_q > s_kv and is_sliding_window:
+        pytest.skip("s_q > s_kv is not supported with sliding window attention")
 
     print("\n=============== TEST CMD TO REPRODUCE ===============")
     print(
@@ -823,10 +824,7 @@ def test_sdpa_backward(
         pytest.skip("dBias is only supported 8.9.6 onwards.")
 
     if is_bias and cudnn_version < "9" and torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("dBias is only supported on hopper onwards.")
-
-    if is_bias and is_padding:
-        pytest.skip("dBias is not supported with padding mask")
+        pytest.skip("dBias is only supported on hopper before v9.")
 
     if is_alibi and not is_causal:
         pytest.skip("ALiBi mask is only supported with causal mask")
@@ -913,11 +911,6 @@ def test_sdpa_backward(
 
     if d_qk != d_v and cudnn_version < "8.9.6":
         pytest.skip("d_qk != d_v is only supported on 8.9.6 onwards.")
-
-    if ((s_q % 64 != 0) or (s_kv % 64 != 0)) and is_bias:
-        pytest.skip(
-            "cudnn backend does not support bias with non-64-aligned seq_q or seq_kv."
-        )
 
     if d_qk != d_v and is_ragged and cudnn_version < "9.1":
         pytest.skip("d_qk != d_v is not supported with ragged offset")
@@ -1320,9 +1313,6 @@ def test_sdpa_backward(
             dK_gpu[i, :, n:, :] = 0
             dV_ref[i, :, n:, :] = 0
             dV_gpu[i, :, n:, :] = 0
-            if is_bias:
-                dBias_ref[i, :, m:, :] = 0
-                dBias_ref[i, :, :, n:] = 0
 
     torch.cuda.synchronize()
 

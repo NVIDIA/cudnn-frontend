@@ -142,6 +142,85 @@ TEST_CASE("Graph key", "[graph][key]") {
     REQUIRE(key == graph.key());
 }
 
+TEST_CASE("Graph key dynamic shape", "[graph][key][dynamic_shape]") {
+    namespace fe = cudnn_frontend;
+    if (cudnnGetCudartVersion() < 12000) {
+        SKIP("Test requires cuda toolkit 12.0 or above");
+    }
+    // clang-format off
+    struct {
+        int64_t b,    m,    n,    k;
+    } shapes[] = {
+        {       4,   16,   32,   64},
+        {       8,   32,   64,  128},
+    };
+    // clang-format on
+
+    constexpr int shapes_count = sizeof(shapes) / sizeof(shapes[0]);
+    size_t key                 = 0;  // Save key between runs to verify that dim and stride information is deleted
+
+    for (int idx_shape = 0; idx_shape < shapes_count; idx_shape++) {
+        auto b = shapes[idx_shape].b;
+        auto m = shapes[idx_shape].m;
+        auto n = shapes[idx_shape].n;
+        auto k = shapes[idx_shape].k;
+
+        fe::graph::Graph graph;
+        graph.set_io_data_type(fe::DataType_t::HALF)
+            .set_intermediate_data_type(fe::DataType_t::FLOAT)
+            .set_compute_data_type(fe::DataType_t::FLOAT)
+            .set_dynamic_shape_enabled(true);
+
+        auto X =
+            graph.tensor(fe::graph::Tensor_attributes().set_name("image").set_dim({b, m, k}).set_stride({m * k, 1, m}));
+        auto Y = graph.tensor(
+            fe::graph::Tensor_attributes().set_name("filter").set_dim({b, k, n}).set_stride({n * k, 1, k}));
+
+        fe::graph::Matmul_attributes matmul;
+        auto Z = graph.matmul(X, Y, matmul);
+
+        auto scale_options = fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::MUL);
+        auto S =
+            graph.tensor(fe::graph::Tensor_attributes().set_name("scale").set_dim({b, m, n}).set_stride({m * n, n, 1}));
+        auto scale_output = graph.pointwise(Z, S, scale_options);
+
+        auto bias_options = fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::ADD);
+        auto B =
+            graph.tensor(fe::graph::Tensor_attributes().set_name("bias").set_dim({b, m, n}).set_stride({m * n, n, 1}));
+        auto bias_output = graph.pointwise(scale_output, B, bias_options);
+
+        auto relu_options = fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::RELU_FWD);
+        auto O            = graph.pointwise(bias_output, relu_options);
+        O->set_output(true);
+
+        cudnnHandle_t handle;
+        cudnnCreate(&handle);
+
+        auto status = graph.validate();
+        if (cudnnGetVersion() >= 90400) {
+            REQUIRE(status.is_good());
+        } else {
+            REQUIRE(status.is_bad());
+            SKIP("Dynamic shapes not supported pre 9.4");
+        }
+
+        REQUIRE(graph.build_operation_graph(handle).is_good());
+
+        if (!key) {
+            key = graph.key();
+        }
+
+        REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
+        REQUIRE(key == graph.key());
+
+        REQUIRE(graph.check_support(handle).is_good());
+        REQUIRE(key == graph.key());
+
+        REQUIRE(graph.build_plans(handle).is_good());
+        REQUIRE(key == graph.key());
+    }
+}
+
 TEST_CASE("Matmul fp8 fusion", "[graph][serialize]") {
     namespace fe = cudnn_frontend;
     // matmul problem size

@@ -146,7 +146,10 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
         variant_pack[Stats] = stats_tensor.devPtr;
     }
 
-    Surface<int8_t> workspace(mha_graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     REQUIRE(mha_graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 
     checkCudaErr(cudaDeviceSynchronize());

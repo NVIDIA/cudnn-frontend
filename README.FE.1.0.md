@@ -51,8 +51,8 @@ FE v1.0 API follows a functional style of building a graph. Operations take in i
 | [Scale dot product attention](docs/operations/Attention.md)              | sdpa<br> SDPA_attributes                             | sdpa                                                                                             |
 | [Scale dot product attention backward](docs/operations/Attention.md)     | sdpa_backward<br> SDPA_backward_attributes           | sdpa_backward                                                                                    |
 | [Scale dot product attention FP8](docs/operations/Attention.md)          | sdpa_fp8<br> SDPA_fp8_attributes                     | sdpa_fp8                                                                                         |
-| [Scale dot product attention backward FP8](docs/operations/Attention.md) | sdpa_fp8_backward<br> SDPA_fp8_backward_attributes   | sdpa_fp8_backward    
-| Slice | slice<br> Slice_attributes   | slice                                                                                |
+| [Scale dot product attention backward FP8](docs/operations/Attention.md) | sdpa_fp8_backward<br> SDPA_fp8_backward_attributes   | sdpa_fp8_backward                                                                                |
+| [Slice](docs/operations/Slice.md)                                        | slice<br> Slice_attributes                           | slice                                                                                            |
 
 ### Creating the Graph
 Instantiate an object of class `cudnn_frontend::graph::Graph` which will house tensors and operations.  
@@ -156,6 +156,7 @@ cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::select_behavior_note
 cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_numeric_notes(std::vector<cudnn_frontend::NumericalNote_t> const&);
 cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_behavior_notes(std::vector<cudnn_frontend::BehaviorNote_t> const&);
 cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_workspace_greater_than(int64_t const workspace);
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_shared_mem_greater_than(int64_t const shared_memory);
 ```
 
 ### Autotuning
@@ -204,6 +205,23 @@ Can also take in a plan index to query workspace for. This may be used when auto
 Get workspace to run autotune on all plans.
 
 `get_autotune_workspace_size() const`
+
+
+### Serialization
+
+Frontend v1.0 API provides two flavors of serialization. One is to checkpoint after the initial graph specification (before calling validate) and other after building the execution plan (to save on plan creation).
+
+`void serialize(json &j) const`
+`void deserialize(const json &j)`
+The above two APIs are meant to capture the user specified input tensors and nodes into the graph. This can be used to generate the log (for debugging) or to visualize the graph being created.
+
+`error_t serialize(std::vector<uint8_t> &data) const`
+`error_t deserialize(cudnnHandle_t handle, std::vector<uint8_t> const &data)`
+
+A fully built graph can be serialized into a binary blob of data with the above two APIs. 
+Note: 
+1. Not all engine configs support serialization.
+2. It is the users responsibility to make sure the UIDs of tensor being passed to the variant pack remain consistent before and after serialization.
 
 ### Error handling
 

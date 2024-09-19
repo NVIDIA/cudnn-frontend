@@ -149,7 +149,9 @@ TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
 
     auto candidate_index = autotune();
 
-    std::cout << "Successful candidate is at index " << candidate_index << std::endl;
+    std::string name;
+    REQUIRE(graph.get_plan_name_at_index(candidate_index, name).is_good());
+    std::cout << "Successful candidate " << name << " is at index " << candidate_index << std::endl;
 
     REQUIRE(graph.build_plan_at_index(handle, candidate_index).is_good());
 

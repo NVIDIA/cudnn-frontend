@@ -129,10 +129,11 @@ inline error_t
 create_cudnn_execution_plan(std::shared_ptr<ExecutionPlan>& plan,
                             ManagedOpaqueDescriptor const& config,
                             std::string const& operation_graph_tag,
+                            std::shared_ptr<KernelCache> kernel_cache,
                             cudnnHandle_t handle) {
     auto&& plan_builder = cudnn_frontend::ExecutionPlanBuilder();
 
-    plan_builder.setHandle(handle).setEngineConfig(config, operation_graph_tag);
+    plan_builder.setHandle(handle).setEngineConfig(config, operation_graph_tag).setKernelCache(kernel_cache);
 
 #ifdef NV_CUDNN_DISABLE_EXCEPTION
     // disable exception macro is defined. Calling build will not throw.
@@ -171,6 +172,7 @@ class Execution_plan_list {
     std::vector<std::vector<cudnnBackendNumericalNote_t>> numeric_notes;
     std::vector<std::vector<cudnnBackendNumericalNote_t>> behavior_notes;
     std::vector<bool> barred_indices;
+    std::shared_ptr<KernelCache> kernel_cache;
 
     int64_t max_workspace_allowed  = std::numeric_limits<int64_t>::max();
     int64_t max_shared_mem_allowed = 1024 * 1024 * 1024;  // Crazy high number (2GB) which will never be hit
@@ -182,7 +184,7 @@ class Execution_plan_list {
     _build_plan_at_index_impl(cudnnHandle_t handle, int64_t index) {
         if (execution_plans[index] == nullptr) {
             CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_execution_plan(
-                execution_plans[index], engine_configs[index], operation_tag, handle));
+                execution_plans[index], engine_configs[index], operation_tag, kernel_cache, handle));
         }
 
         auto is_blocked = [](std::string const& full_name, std::vector<std::string> const& blocked_names) -> bool {
@@ -232,6 +234,10 @@ class Execution_plan_list {
     void
     set_engine_configs(EngineConfigList list) {
         engine_configs = list;
+    }
+    void
+    set_kernel_cache(std::shared_ptr<KernelCache> kernel_cache_) {
+        kernel_cache = kernel_cache_;
     }
 
     std::vector<std::shared_ptr<ExecutionPlan>>&
@@ -371,6 +377,12 @@ class Execution_plan_list {
         }
         CUDNN_FE_LOG_LABEL_ENDL("INFO: " << " barred engine_configs ..." << barred_engine_configs.size());
         return barred_engine_configs;
+    }
+
+    error_t
+    get_name_at_index(int64_t index, std::string& name) const {
+        name = detail::get_engine_tag(engine_configs[index]);
+        return {error_code_t::OK, ""};
     }
 
     error_t

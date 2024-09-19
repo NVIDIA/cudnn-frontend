@@ -115,7 +115,10 @@ TEST_CASE("Convolution fp8 precision", "[conv][graph]") {
     Surface<float> Y_scale_gpu(1, false);
     Surface<float> amax_gpu(1, false);
 
-    Surface<int8_t> workspace(graph->get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_gpu.devPtr},
         {W, W_gpu.devPtr},
