@@ -104,7 +104,7 @@ struct nlohmann::adl_serializer<std::variant<int32_t, half, float, nv_bfloat16>>
     static void
     from_json(const nlohmann::json& j, std::variant<int32_t, half, float, nv_bfloat16>& data) {
         if (!j.is_object() || !j.contains("index") || !j.contains("value")) {
-            throw std::invalid_argument("Invalid JSON format for std::variant");
+            return;
         }
 
         size_t type_index = j.at("index").get<size_t>();
@@ -117,7 +117,7 @@ struct nlohmann::adl_serializer<std::variant<int32_t, half, float, nv_bfloat16>>
         } else if (type_index == 3) {
             data = j.at("value").get<nv_bfloat16>();
         } else {
-            throw std::out_of_range("Variant index out of range");
+            return;
         }
     }
 };

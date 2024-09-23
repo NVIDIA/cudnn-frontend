@@ -40,6 +40,9 @@ class ICudnn {
 
     graph::Execution_plan_list plans;
 
+    bool is_dynamic_shape_enabled             = false;
+    std::shared_ptr<KernelCache> kernel_cache = nullptr;
+
     void
     assign_uid(graph::Tensor_attributes* const tensor,
                int64_t& potential_uid,
@@ -120,8 +123,9 @@ class ICudnn {
         }
 
         auto&& cudnn_operation_graph_builder = cudnn_frontend::OperationGraphBuilder();
-        cudnn_operation_graph_builder.setHandle(handle).setOperationGraph(cudnn_operations.size(),
-                                                                          cudnn_operations.data());
+        cudnn_operation_graph_builder.setHandle(handle)
+            .setOperationGraph(cudnn_operations.size(), cudnn_operations.data())
+            .setIsDynamicShapeEnabled(is_dynamic_shape_enabled);
         for (auto& op : raw_operations) {
             cudnn_operation_graph_builder.addOperation(op);
         }

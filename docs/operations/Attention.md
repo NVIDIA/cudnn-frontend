@@ -356,6 +356,13 @@ $O = SV$
 | Descale Q             | GPU        | FP32         | $(1, 1, 1, 1)$               |
 | Descale K             | GPU        | FP32         | $(1, 1, 1, 1)$               |
 | Descale V             | GPU        | FP32         | $(1, 1, 1, 1)$               |
+| (Bias mask) Bias Mask               | GPU        | E4M3 or E5M2   | $(1, 1, S_{q}, S_{kv})$, $(1, H_{q}, S_{q}, S_{kv})$, $(B, 1, S_{q}, S_{kv})$, or $(B, H_{q}, S_{q}, S_{kv})$  |
+| (Padding mask) Sequence Length Q    | GPU        | INT32          | $(B, 1, 1, 1)$                                                                                                 |
+| (Padding mask) Sequence Length KV   | GPU        | INT32          | $(B, 1, 1, 1)$                                                                                                 |
+| (Philoc RNG Dropout) Seed           | CPU or GPU | INT32 or INT64 | $(1, 1, 1, 1)$                                                                                                 |
+| (Philoc RNG Dropout) Offset         | CPU or GPU | INT32 or INT64 | $(1, 1, 1, 1)$                                                                                                 |
+| (Custom Dropout Mask) Mask          | GPU        | E4M3 or E5M2   | $(1, 1, S_{q}, S_{kv})$, $(1, H_{q}, S_{q}, S_{kv})$, $(B, 1, S_{q}, S_{kv})$, or $(B, H_{q}, S_{q}, S_{kv})$  |
+| (Custom Dropout Mask) Scale         | GPU        | FP32           | $(1, 1, 1, 1)$                                                                                                 |
 | Descale S             | GPU        | FP32         | $(1, 1, 1, 1)$               |
 | Scale S               | GPU        | FP32         | $(1, 1, 1, 1)$               |
 
@@ -421,7 +428,29 @@ set_attn_scale(float const value);
 
 SDPA_fp8_attributes&
 set_causal_mask(bool const value);
+
+SDPA_fp8_attributes&
+set_bias(std::shared_ptr<Tensor_attributes> value);
+
+SDPA_fp8_attributes&
+set_padding_mask(bool const value);
+
+SDPA_fp8_attributes&
+set_seq_len_q(std::shared_ptr<Tensor_attributes> value);
+
+SDPA_fp8_attributes&
+set_seq_len_kv(std::shared_ptr<Tensor_attributes> value);
+
+SDPA_fp8_attributes&
+set_dropout(float const probability,
+            std::shared_ptr<Tensor_attributes> seed,
+            std::shared_ptr<Tensor_attributes> offset);
+
+SDPA_fp8_attributes&
+set_dropout(std::shared_ptr<Tensor_attributes> mask,
+            std::shared_ptr<Tensor_attributes> scale);
 ```
+
 
 #### Python API: 
 ```

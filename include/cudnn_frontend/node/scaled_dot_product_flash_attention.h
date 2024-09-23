@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdlib>
+
 #include "../../cudnn_frontend_Heuristics.h"
 #include "../../cudnn_frontend_Logging.h"
 
@@ -154,7 +156,10 @@ class SDPANode : public NodeCRTP<SDPANode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && attributes.sliding_window_length.value() < 0,
                                        error_code_t::INVALID_VALUE,
                                        "Sliding window length should be greater than or equals to zero when set.");
-
+                                       
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && s_q > s_kv,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Sliding window attention is only supported with s_q <= s_kv.");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && (attributes.padding_mask || !attributes.causal_mask || is_dropout || is_bias || is_ragged),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -823,6 +828,9 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                                        error_code_t::INVALID_VALUE,
                                        "Sliding window length should be greater than or equals to zero when set.");
 
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && s_q > s_kv,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Sliding window attention is only supported with s_q <= s_kv.");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && (attributes.padding_mask || !attributes.causal_mask || is_dropout || is_bias || is_ragged),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -857,6 +865,14 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90200 && attributes.sliding_window_length.has_value(),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "For cuDNN version below 9.2.0, sliding window attention is not supported");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90500 && is_bias && attributes.padding_mask,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For cuDNN version below 9.5.0, dBias with variable sequence lengths is not supported");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90500 && is_bias && ((s_q % 64 != 0) || (s_kv % 64 != 0)),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For cuDNN version below 9.5.0, dBias not support s_q/s_kv which aren't multiple of 64");
 
         // validate that datatype is set for the graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_intermediate_data_type() == DataType_t::NOT_SET,
@@ -979,10 +995,10 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                 // allow setting the upper limit with envvars
                 char* env_dp_workspace_limit_char = std::getenv("CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT");
                 if (env_dp_workspace_limit_char) {
-                    try {
-                        std::string env_dp_workspace_limit_str(env_dp_workspace_limit_char);
-                        max_dp_workspace_bytes = static_cast<int64_t>(std::stoll(env_dp_workspace_limit_str));
-                    } catch (...) {
+                    char* end_ptr          = nullptr;
+                    max_dp_workspace_bytes = std::strtoll(env_dp_workspace_limit_char, &end_ptr, 10);
+
+                    if (*end_ptr != '\0') {
                         RETURN_CUDNN_FRONTEND_ERROR_IF(true,
                                                        error_code_t::ATTRIBUTE_NOT_SET,
                                                        "Invalid argument for CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT "

@@ -77,14 +77,139 @@ TEST_CASE("Convolution fprop", "[conv][graph][caching]") {
     Surface<half> w_tensor(k * c * r * s, false);
     Surface<half> y_tensor(n * k * h * w, false);  // Should be p, q.
 
-    std::unordered_map<int64_t, void*> variant_pack = {
+    std::unordered_map<int64_t, void *> variant_pack = {
         {X->get_uid(), x_tensor.devPtr}, {W->get_uid(), w_tensor.devPtr}, {Y->get_uid(), y_tensor.devPtr}};
 
-    Surface<int8_t> workspace(graph->get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
 
     std::cout << *graph << std::endl;
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+    cudnnDestroy(handle);
+}
+
+TEST_CASE("Convolution fprop dynamic shape", "[conv][graph][dynamic_shape]") {
+    namespace fe = cudnn_frontend;
+
+    if (cudnnGetCudartVersion() < 12000) {
+        SKIP("Test requires cuda toolkit 12.0 or above");
+    }
+
+    // clang-format off
+    struct {
+        int64_t n,    c,    h,    w,    k,    r,    s;
+    } conv_shapes[] = {
+        {      16,  128,   56,   56,  256,    3,    3},
+        {      16,  128,   64,   64,  256,    3,    3},
+        {      16,  128,   80,   64,  256,    3,    3},
+        {      32,  128,   80,   80,  256,    3,    3},
+        {      32,  256,   32,   32,  256,    3,    3},
+    };
+    // clang-format on
+
+    constexpr int conv_shapes_count = sizeof(conv_shapes) / sizeof(conv_shapes[0]);
+    int64_t max_x_volume = 0, max_w_volume = 0, max_y_volume = 0;
+    for (int idx_shape = 0; idx_shape < conv_shapes_count; ++idx_shape) {
+        const auto &conv_shape = conv_shapes[idx_shape];
+        max_x_volume           = std::max(max_x_volume, conv_shape.n * conv_shape.c * conv_shape.h * conv_shape.w);
+        max_w_volume           = std::max(max_w_volume, conv_shape.k * conv_shape.c * conv_shape.r * conv_shape.s);
+        max_y_volume           = std::max(max_y_volume, conv_shape.n * conv_shape.k * conv_shape.h * conv_shape.w);
+    }
+
+    auto kernel_cache = std::make_shared<fe::KernelCache>();
+
+    const auto build_new_graph = [&conv_shapes, &kernel_cache](cudnnHandle_t handle, int idx_shape) {
+        const auto &conv_shape = conv_shapes[idx_shape];
+
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::HALF)
+            .set_compute_data_type(fe::DataType_t::FLOAT)
+            .set_dynamic_shape_enabled(true)
+            .set_kernel_cache(kernel_cache);
+
+        auto X = graph->tensor(
+            fe::graph::Tensor_attributes()
+                .set_name("image")
+                .set_dim({conv_shape.n, conv_shape.c, conv_shape.h, conv_shape.w})
+                .set_stride(
+                    {conv_shape.c * conv_shape.h * conv_shape.w, 1, conv_shape.c * conv_shape.w, conv_shape.c}));
+
+        auto W = graph->tensor(
+            fe::graph::Tensor_attributes()
+                .set_name("filter")
+                .set_dim({conv_shape.k, conv_shape.c, conv_shape.r, conv_shape.s})
+                .set_stride(
+                    {conv_shape.c * conv_shape.r * conv_shape.s, 1, conv_shape.c * conv_shape.s, conv_shape.c}));
+
+        auto conv_options = fe::graph::Conv_fprop_attributes()
+                                .set_pre_padding({1, 1})  // padding such that P=H, Q=W
+                                .set_post_padding({0, 0})
+                                .set_stride({1, 1})
+                                .set_dilation({1, 1});
+
+        auto Y1 = graph->conv_fprop(X, W, conv_options);
+        Y1->set_data_type(fe::DataType_t::HALF);
+
+        auto Y = graph->pointwise(Y1,
+                                  fe::graph::Pointwise_attributes()
+                                      .set_mode(fe::PointwiseMode_t::RELU_FWD)
+                                      .set_compute_data_type(fe::DataType_t::FLOAT));
+
+        Y->set_output(true);
+        auto status = graph->validate();
+        if (cudnnGetVersion() >= 90400) {
+            REQUIRE(status.is_good());
+        } else {
+            REQUIRE(status.is_bad());
+            SKIP("Dynamic shapes not supported pre 9.4");
+        }
+
+        status = graph->build_operation_graph(handle);
+        if (cudnnGetVersion() >= 90400) {
+            REQUIRE(status.is_good());
+        } else {
+            REQUIRE(status.is_bad());
+            SKIP("Kernel cache not supported pre 9.4");
+        }
+
+        REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
+
+        REQUIRE(graph->check_support(handle).is_good());
+
+        REQUIRE(graph->build_plans(handle).is_good());
+
+        return std::make_tuple(graph, X, W, Y);
+    };
+
+    const auto execute_graph = [&max_x_volume, &max_w_volume, &max_y_volume](cudnnHandle_t handle,
+                                                                             const fe::graph::Graph *graph,
+                                                                             const fe::graph::Tensor_attributes *X,
+                                                                             const fe::graph::Tensor_attributes *W,
+                                                                             const fe::graph::Tensor_attributes *Y) {
+        Surface<half> x_tensor(max_x_volume, false);
+        Surface<half> w_tensor(max_w_volume, false);
+        Surface<half> y_tensor(max_y_volume, false);
+
+        std::unordered_map<int64_t, void *> variant_pack = {
+            {X->get_uid(), x_tensor.devPtr}, {W->get_uid(), w_tensor.devPtr}, {Y->get_uid(), y_tensor.devPtr}};
+
+        Surface<int8_t> workspace(graph->get_workspace_size(), false);
+
+        std::cout << *graph << std::endl;
+
+        REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+    };
+
+    cudnnHandle_t handle;
+    checkCudnnErr(cudnnCreate(&handle));
+
+    for (int idx_shape = 0; idx_shape < conv_shapes_count; ++idx_shape) {
+        auto [graph, X, W, Y] = build_new_graph(handle, idx_shape);
+        execute_graph(handle, graph.get(), X.get(), W.get(), Y.get());
+    }
+
     cudnnDestroy(handle);
 }
 
@@ -178,23 +303,156 @@ TEST_CASE("CSBR Graph", "[conv][graph][caching]") {
     Surface<half> b_tensor(k, false);
     Surface<half> y_tensor(n * k * h * w, false);  // Should be p, q.
 
-    Surface<int8_t> workspace(graph->get_workspace_size(), false);
-    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
+    int64_t workspace_size;
+    REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void *> variant_pack = {
         {X, x_tensor.devPtr}, {W, w_tensor.devPtr}, {S, s_tensor.devPtr}, {B, b_tensor.devPtr}, {Y, y_tensor.devPtr}};
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 
     auto [graph_, X_, W_, B_, S_, Y_] = lookup_cache_or_build_graph(handle);
 
-    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack_ = {{X_, x_tensor.devPtr},
-                                                                                              {W_, w_tensor.devPtr},
-                                                                                              {S_, s_tensor.devPtr},
-                                                                                              {B_, b_tensor.devPtr},
-                                                                                              {Y_, y_tensor.devPtr}};
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void *> variant_pack_ = {{X_, x_tensor.devPtr},
+                                                                                               {W_, w_tensor.devPtr},
+                                                                                               {S_, s_tensor.devPtr},
+                                                                                               {B_, b_tensor.devPtr},
+                                                                                               {Y_, y_tensor.devPtr}};
 
     REQUIRE(graph_->execute(handle, variant_pack_, workspace.devPtr).is_good());
 
     REQUIRE(cache_hit == true);
+
+    cudnnDestroy(handle);
+}
+
+TEST_CASE("CSBR Graph dynamic shape", "[conv][graph][dynamic_shape]") {
+    namespace fe = cudnn_frontend;
+
+    if (cudnnGetCudartVersion() < 12000) {
+        SKIP("Test requires cuda toolkit 12.0 or above");
+    }
+
+    // clang-format off
+    struct {
+        int64_t n,    c,    h,    w,    k,    r,    s;
+    } conv_shapes[] = {
+        {       8,   32,   16,   16,   64,    3,    3},
+        {       8,   32,   24,   24,   64,    3,    3},
+        {      16,   32,   32,   32,   64,    3,    3},
+        {      16,   64,   32,   32,   64,    3,    3},
+        {      16,   16,   64,   64,   16,    3,    3},
+    };
+    // clang-format on
+
+    constexpr int conv_shapes_count = sizeof(conv_shapes) / sizeof(conv_shapes[0]);
+    int64_t max_x_volume = 0, max_w_volume = 0, max_y_volume = 0, max_k = 0;
+    for (int idx_shape = 0; idx_shape < conv_shapes_count; ++idx_shape) {
+        const auto &conv_shape = conv_shapes[idx_shape];
+        max_x_volume           = std::max(max_x_volume, conv_shape.n * conv_shape.c * conv_shape.h * conv_shape.w);
+        max_w_volume           = std::max(max_w_volume, conv_shape.k * conv_shape.c * conv_shape.r * conv_shape.s);
+        max_y_volume           = std::max(max_y_volume, conv_shape.n * conv_shape.k * conv_shape.h * conv_shape.w);
+        max_k                  = std::max(max_k, conv_shape.k);
+    }
+
+    auto kernel_cache = std::make_shared<fe::KernelCache>();
+
+    auto lookup_cache_or_build_graph = [&conv_shapes, &kernel_cache](cudnnHandle_t handle, int idx_shape) {
+        const auto &conv_shape = conv_shapes[idx_shape];
+
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::HALF)
+            .set_intermediate_data_type(fe::DataType_t::FLOAT)
+            .set_compute_data_type(fe::DataType_t::FLOAT)
+            .set_dynamic_shape_enabled(true)
+            .set_kernel_cache(kernel_cache);
+
+        auto X = graph->tensor(
+            fe::graph::Tensor_attributes()
+                .set_name("image")
+                .set_dim({conv_shape.n, conv_shape.c, conv_shape.h, conv_shape.w})
+                .set_stride(
+                    {conv_shape.c * conv_shape.h * conv_shape.w, 1, conv_shape.c * conv_shape.w, conv_shape.c}));
+
+        auto W = graph->tensor(
+            fe::graph::Tensor_attributes()
+                .set_name("filter")
+                .set_dim({conv_shape.k, conv_shape.c, conv_shape.r, conv_shape.s})
+                .set_stride(
+                    {conv_shape.c * conv_shape.r * conv_shape.s, 1, conv_shape.c * conv_shape.s, conv_shape.c}));
+
+        auto conv_options =
+            fe::graph::Conv_fprop_attributes().set_padding({1, 1}).set_stride({1, 1}).set_dilation({1, 1});
+
+        auto conv_output = graph->conv_fprop(X, W, conv_options);
+
+        auto S = graph->tensor(fe::graph::Tensor_attributes()
+                                   .set_name("scale")
+                                   .set_dim({1, conv_shape.k, 1, 1})
+                                   .set_stride({conv_shape.k, 1, conv_shape.k, conv_shape.k}));
+
+        auto scale_options = fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::MUL);
+        auto scale_output  = graph->pointwise(conv_output, S, scale_options);
+
+        auto B = graph->tensor(fe::graph::Tensor_attributes()
+                                   .set_name("bias")
+                                   .set_dim({1, conv_shape.k, 1, 1})
+                                   .set_stride({conv_shape.k, 1, conv_shape.k, conv_shape.k}));
+
+        auto bias_options = fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::ADD);
+        auto bias_output  = graph->pointwise(scale_output, B, bias_options);
+
+        auto relu_options = fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::RELU_FWD);
+        auto Y            = graph->pointwise(bias_output, relu_options);
+        Y->set_output(true);
+
+        auto status = graph->validate();
+        if (cudnnGetVersion() >= 90400) {
+            REQUIRE(status.is_good());
+        } else {
+            REQUIRE(status.is_bad());
+            SKIP("Dynamic shapes not supported pre 9.4");
+        }
+
+        status = graph->build_operation_graph(handle);
+        if (cudnnGetVersion() >= 90400) {
+            REQUIRE(status.is_good());
+        } else {
+            REQUIRE(status.is_bad());
+            SKIP("Kernel cache not supported pre 9.4");
+        }
+
+        REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
+
+        REQUIRE(graph->check_support(handle).is_good());
+
+        REQUIRE(graph->build_plans(handle).is_good());
+
+        return std::make_tuple(graph, X, W, S, B, Y);
+    };
+
+    cudnnHandle_t handle;
+    checkCudnnErr(cudnnCreate(&handle));
+
+    for (int idx_shape = 0; idx_shape < conv_shapes_count; idx_shape++) {
+        auto [graph, X, W, B, S, Y] = lookup_cache_or_build_graph(handle, idx_shape);
+
+        Surface<half> x_tensor(max_x_volume, false);
+        Surface<half> w_tensor(max_w_volume, false);
+        Surface<half> s_tensor(max_k, false);
+        Surface<half> b_tensor(max_k, false);
+        Surface<half> y_tensor(max_y_volume, false);  // Should be p, q.
+
+        Surface<int8_t> workspace(graph->get_workspace_size(), false);
+        std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void *> variant_pack = {{X, x_tensor.devPtr},
+                                                                                                  {W, w_tensor.devPtr},
+                                                                                                  {S, s_tensor.devPtr},
+                                                                                                  {B, b_tensor.devPtr},
+                                                                                                  {Y, y_tensor.devPtr}};
+
+        REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+    }
 
     cudnnDestroy(handle);
 }
@@ -279,7 +537,7 @@ TEST_CASE("SBRCS", "[conv][genstats][graph]") {
     Surface<float> sum_tensor(k, false);
     Surface<float> sq_sum_tensor(k, false);
 
-    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void *> variant_pack = {
         {X, x_tensor.devPtr},
         {S, s_tensor.devPtr},
         {B, b_tensor.devPtr},
@@ -288,7 +546,10 @@ TEST_CASE("SBRCS", "[conv][genstats][graph]") {
         {SUM, sum_tensor.devPtr},
         {SQ_SUM, sq_sum_tensor.devPtr}};
 
-    Surface<int8_t> workspace(graph->get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
     cudnnDestroy(handle);
 }
@@ -386,19 +647,22 @@ TEST_CASE("CBR Graph NCHW", "[conv][graph][caching]") {
     Surface<half> y_tensor(n * k * h * w, false);  // Should be p, q.
     Surface<half> z_tensor(n * k * h * w, false);  // Should be p, q.
 
-    Surface<int8_t> workspace(graph->get_workspace_size(), false);
-    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
+    int64_t workspace_size;
+    REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void *> variant_pack = {
         {X, x_tensor.devPtr}, {W, w_tensor.devPtr}, {B, b_tensor.devPtr}, {Z, z_tensor.devPtr}, {Y, y_tensor.devPtr}};
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 
     auto [graph_, X_, W_, Z_, B_, Y_] = lookup_cache_or_build_graph(handle);
 
-    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack_ = {{X_, x_tensor.devPtr},
-                                                                                              {W_, w_tensor.devPtr},
-                                                                                              {B_, b_tensor.devPtr},
-                                                                                              {Z_, z_tensor.devPtr},
-                                                                                              {Y_, y_tensor.devPtr}};
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void *> variant_pack_ = {{X_, x_tensor.devPtr},
+                                                                                               {W_, w_tensor.devPtr},
+                                                                                               {B_, b_tensor.devPtr},
+                                                                                               {Z_, z_tensor.devPtr},
+                                                                                               {Y_, y_tensor.devPtr}};
 
     REQUIRE(graph_->execute(handle, variant_pack_, workspace.devPtr).is_good());
 
@@ -463,10 +727,12 @@ TEST_CASE("Convolution fprop large", "[conv][graph][caching]") {
     Surface<half> w_tensor(k * c * t * r * s, false);
     Surface<half> y_tensor(n * k * d * h * w, false);  // Should be p, q.
 
-    std::unordered_map<int64_t, void*> variant_pack = {
+    std::unordered_map<int64_t, void *> variant_pack = {
         {X->get_uid(), x_tensor.devPtr}, {W->get_uid(), w_tensor.devPtr}, {Y->get_uid(), y_tensor.devPtr}};
 
-    Surface<int8_t> workspace(graph->get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
 
     std::cout << *graph << std::endl;
 

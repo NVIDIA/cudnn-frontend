@@ -83,7 +83,10 @@ TEST_CASE("RmsNorm Training", "[rmsnorm][graph]") {
     float epsilon_cpu = 1e-05f;
     Surface<float> Y_tensor(batch_size * seq_length * hidden_size, false);
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
         {inv_variance, Var_tensor.devPtr},
@@ -161,7 +164,10 @@ TEST_CASE("RmsNorm Inference", "[rmsnorm][graph]") {
     float epsilon_cpu = 1e-05f;
     Surface<float> Y_tensor(batch_size * seq_length * hidden_size, false);
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
         {scale, Scale_tensor.devPtr},
@@ -239,7 +245,10 @@ TEST_CASE("RmsNorm Backward", "[rmsnorm][graph]") {
     Surface<float> Dbias_tensor(hidden_size, false);
     Surface<float> DX_tensor(batch_size * seq_length * hidden_size, false);
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
         {DY, DY_tensor.devPtr},

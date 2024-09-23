@@ -65,7 +65,11 @@ TEST_CASE("Convolution Dgrad", "[dgrad][graph]") {
     Surface<half> w_tensor(64 * 32 * 3 * 3, false);
     Surface<half> dx_tensor(4 * 32 * 16 * 16, false);
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+
+    Surface<int8_t> workspace(workspace_size, false);
+
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {DY, dy_tensor.devPtr}, {W, w_tensor.devPtr}, {DX, dx_tensor.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
@@ -118,7 +122,10 @@ TEST_CASE("Dgrad Drelu Graph", "[dgrad][graph]") {
     Surface<half> x_tensor(4 * 32 * 16 * 16, false);
     Surface<half> dx_tensor(4 * 32 * 16 * 16, false);
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {DY, dy_tensor.devPtr}, {W, w_tensor.devPtr}, {X, x_tensor.devPtr}, {DX, dx_tensor.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
@@ -227,7 +234,10 @@ TEST_CASE("Dgrad Drelu DBNweight Graph", "[dgrad][graph]") {
     Surface<float> eq_scale_x_tensor(1 * 32 * 1 * 1, false);
     Surface<float> eq_bias_tensor(1 * 32 * 1 * 1, false);
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {DY, dy_tensor.devPtr},
         {W, w_tensor.devPtr},

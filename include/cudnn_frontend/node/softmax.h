@@ -88,9 +88,6 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
 
             auto add_attributes = Pointwise_attributes().set_name("add").set_mode(PointwiseMode_t::ADD);
             // Special non-functional-style call. Needed because output already created and provided to user.
-            attributes.outputs[Softmax_attributes::output_names::Stats]
-                ->set_dim({b, h, s_q, 1})
-                .set_stride({h * s_q, s_q, 1, 1});
             pointwise(
                 max_output, log_output, add_attributes, attributes.outputs[Softmax_attributes::output_names::Stats]);
         }

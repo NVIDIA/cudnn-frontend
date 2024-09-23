@@ -23,6 +23,7 @@ add_executable(
     serialize.cpp
     validate.cpp
     version.cpp
+    tensor.cpp
 )
 
 if (MSVC)

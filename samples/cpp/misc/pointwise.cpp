@@ -51,7 +51,10 @@ TEST_CASE("Reduction", "[reduction]") {
     Surface<float> C_gpu(n * n * n * n, false);
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {{A, A_gpu.devPtr},
                                                                                              {C, C_gpu.devPtr}};
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
     checkCudnnErr(cudnnDestroy(handle));
 }
@@ -85,7 +88,9 @@ TEST_CASE("Fused scalar", "[scalar][graph]") {
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {{A, A_gpu.devPtr},
                                                                                              {C, C_gpu.devPtr}};
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 
@@ -143,7 +148,10 @@ TEST_CASE("Fused Amax Reduction and type conversion", "[reduction]") {
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {A, A_gpu.devPtr}, {scale, scale_gpu.devPtr}, {amax, amax_gpu.devPtr}, {C, C_gpu.devPtr}};
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
     checkCudnnErr(cudnnDestroy(handle));
 }

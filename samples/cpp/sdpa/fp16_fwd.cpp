@@ -210,7 +210,10 @@ TEST_CASE("Toy sdpa forward", "[graph][sdpa][flash][forward]") {
         variant_pack[STATS_UID] = statsTensor.devPtr;
     }
 
-    Surface<int8_t> workspace(graph->get_workspace_size(), false);
+    int64_t workspace_size;
+    REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 
     checkCudaErr(cudaDeviceSynchronize());

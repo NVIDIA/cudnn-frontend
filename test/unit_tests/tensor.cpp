@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -19,11 +19,30 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  */
+#include <catch2/catch_test_macros.hpp>
 
-#pragma once
+#include <cudnn_frontend.h>
 
-#define CUDNN_FRONTEND_MAJOR_VERSION 1
-#define CUDNN_FRONTEND_MINOR_VERSION 7
-#define CUDNN_FRONTEND_PATCH_VERSION 0
-#define CUDNN_FRONTEND_VERSION \
-    ((CUDNN_FRONTEND_MAJOR_VERSION * 10000) + (CUDNN_FRONTEND_MINOR_VERSION * 100) + CUDNN_FRONTEND_PATCH_VERSION)
+TEST_CASE("tensor query checks", "[query_tensor_attributes_of_uid]") {
+    namespace fe = cudnn_frontend;
+
+    fe::graph::Graph graph;
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    int64_t uid      = 1;
+    std::string name = "image";
+
+    auto X = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name(name)
+                              .set_dim({8, 32, 16, 16})
+                              .set_stride({32 * 16 * 16, 1, 32 * 16, 32})
+                              .set_uid(uid));
+
+    fe::graph::Tensor_attributes t;
+
+    REQUIRE(graph.query_tensor_attributes_of_uid(uid, t).is_good());
+
+    REQUIRE(t.get_name() == name);
+}
