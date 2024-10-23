@@ -22,7 +22,7 @@
 
 #include <catch2/benchmark/catch_benchmark.hpp>
 #include <catch2/catch_test_macros.hpp>
-#include "../../utils/helpers.h"
+#include "../utils/helpers.h"
 
 #include <cuda_runtime_api.h>
 
@@ -102,7 +102,7 @@ TEST_CASE("Benchmark sdpa graph API runtimes", "[graph][sdpa][flash]") {
     }
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     BENCHMARK_ADVANCED("Create")(Catch::Benchmark::Chronometer meter) {
         meter.measure([&] { auto g = create_sdpa_forward_graph(b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v); });

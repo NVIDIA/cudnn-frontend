@@ -21,7 +21,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
-#include "../../utils/helpers.h"
+#include "../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
@@ -68,7 +68,7 @@ TEST_CASE("Slice gemm", "[slice][gemm][graph][fusion]") {
     C->set_output(true).set_uid(c_uid);
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.build(handle, {fe::HeurMode_t::A}).is_good());
 
@@ -92,5 +92,5 @@ TEST_CASE("Slice gemm", "[slice][gemm][graph][fusion]") {
         REQUIRE(false);
     }
 
-    checkCudnnErr(cudnnDestroy(handle));
+    CUDNN_CHECK(cudnnDestroy(handle));
 }

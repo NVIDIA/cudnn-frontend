@@ -61,19 +61,19 @@ class SliceNode : public NodeCRTP<SliceNode> {
         // But assign it a uid
         auto const input = attributes.inputs.at(Slice_attributes::input_names::X);
         if (input->has_uid() == false) {
-            assign_uid(input.get(), potential_uid, used_uids);
+            detail::assign_uid(input.get(), potential_uid, used_uids);
         }
 
         auto const output = attributes.outputs.at(Slice_attributes::output_names::Y);
         output->set_is_virtual(false);
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(output, tensors, potential_uid, used_uids));
+        CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(output, tensors, potential_uid, used_uids));
 
         return {error_code_t::OK, ""};
     }
 
     error_t
     create_cudnn_operations(
-        std::unordered_set<uid_t>& uids_involved_in_operations,
+        std::unordered_set<Tensor_attributes::uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>&,
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>&) const override final {

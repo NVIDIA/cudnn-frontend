@@ -112,19 +112,12 @@ TEST_CASE("Use global(index) for execution", "[frontend][global_index][wgrad]") 
     }
 
     cudnnConvolutionMode_t mode = CUDNN_CONVOLUTION;
-
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dimA[0], dimA[1], dimA[2], dimA[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           filterdimA[0],
-           filterdimA[1],
-           filterdimA[2],
-           filterdimA[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           outdimA[0],
-           outdimA[1],
-           outdimA[2],
-           outdimA[3]);
+    std::cout << "====DIMENSIONS====\n";
+    std::cout << "input dims are " << dimA[0] << ", " << dimA[1] << ", " << dimA[2] << ", " << dimA[3] << "\n";
+    std::cout << "filter dims are " << filterdimA[0] << ", " << filterdimA[1] << ", " << filterdimA[2] << ", "
+              << filterdimA[3] << "\n";
+    std::cout << "output dims are " << outdimA[0] << ", " << outdimA[1] << ", " << outdimA[2] << ", " << outdimA[3]
+              << "\n";
 
     int64_t Xsize = dimA[0] * dimA[1] * dimA[2] * dimA[3];
     int64_t Wsize = filterdimA[0] * filterdimA[1] * filterdimA[2] * filterdimA[3];
@@ -193,18 +186,12 @@ TEST_CASE("Use heuristics for execution", "[frontend][heuristics][conv]") {
 
     cudnnConvolutionMode_t mode = CUDNN_CONVOLUTION;
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dimA[0], dimA[1], dimA[2], dimA[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           filterdimA[0],
-           filterdimA[1],
-           filterdimA[2],
-           filterdimA[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           outdimA[0],
-           outdimA[1],
-           outdimA[2],
-           outdimA[3]);
+    std::cout << "====DIMENSIONS====\n";
+    std::cout << "input dims are " << dimA[0] << ", " << dimA[1] << ", " << dimA[2] << ", " << dimA[3] << "\n";
+    std::cout << "filter dims are " << filterdimA[0] << ", " << filterdimA[1] << ", " << filterdimA[2] << ", "
+              << filterdimA[3] << "\n";
+    std::cout << "output dims are " << outdimA[0] << ", " << outdimA[1] << ", " << outdimA[2] << ", " << outdimA[3]
+              << "\n";
 
     int64_t Xsize = dimA[0] * dimA[1] * dimA[2] * dimA[3];
     int64_t Wsize = filterdimA[0] * filterdimA[1] * filterdimA[2] * filterdimA[3];
@@ -275,18 +262,12 @@ TEST_CASE("Use DNN based heuristics for execution", "[frontend][dnn_heuristics][
 
     cudnnConvolutionMode_t mode = CUDNN_CONVOLUTION;
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dimA[0], dimA[1], dimA[2], dimA[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           filterdimA[0],
-           filterdimA[1],
-           filterdimA[2],
-           filterdimA[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           outdimA[0],
-           outdimA[1],
-           outdimA[2],
-           outdimA[3]);
+    std::cout << "====DIMENSIONS====\n";
+    std::cout << "input dims are " << dimA[0] << ", " << dimA[1] << ", " << dimA[2] << ", " << dimA[3] << "\n";
+    std::cout << "filter dims are " << filterdimA[0] << ", " << filterdimA[1] << ", " << filterdimA[2] << ", "
+              << filterdimA[3] << "\n";
+    std::cout << "output dims are " << outdimA[0] << ", " << outdimA[1] << ", " << outdimA[2] << ", " << outdimA[3]
+              << "\n";
 
     int64_t Xsize = dimA[0] * dimA[1] * dimA[2] * dimA[3];
     int64_t Wsize = filterdimA[0] * filterdimA[1] * filterdimA[2] * filterdimA[3];
@@ -357,18 +338,12 @@ TEST_CASE("Use fallback for execution", "[frontend][global_index][dgrad]") {
 
     cudnnConvolutionMode_t mode = CUDNN_CONVOLUTION;
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dimA[0], dimA[1], dimA[2], dimA[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           filterdimA[0],
-           filterdimA[1],
-           filterdimA[2],
-           filterdimA[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           outdimA[0],
-           outdimA[1],
-           outdimA[2],
-           outdimA[3]);
+    std::cout << "====DIMENSIONS====\n";
+    std::cout << "input dims are " << dimA[0] << ", " << dimA[1] << ", " << dimA[2] << ", " << dimA[3] << "\n";
+    std::cout << "filter dims are " << filterdimA[0] << ", " << filterdimA[1] << ", " << filterdimA[2] << ", "
+              << filterdimA[3] << "\n";
+    std::cout << "output dims are " << outdimA[0] << ", " << outdimA[1] << ", " << outdimA[2] << ", " << outdimA[3]
+              << "\n";
 
     int64_t Xsize = dimA[0] * dimA[1] * dimA[2] * dimA[3];
     int64_t Wsize = filterdimA[0] * filterdimA[1] * filterdimA[2] * filterdimA[3];
@@ -435,22 +410,15 @@ TEST_CASE("ConvBiasAct sample", "[frontend][convAddBiasAct]") {
             getFwdConvOutputDim(xTensorDim[dim + 2], padding[dim], wTensorDim[dim + 2], convstride[dim], dilation[dim]);
     }
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim[0],
-           wTensorDim[1],
-           wTensorDim[2],
-           wTensorDim[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim[0],
-           yTensorDim[1],
-           yTensorDim[2],
-           yTensorDim[3]);
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
+
+    std::cout << "filter dims are " << wTensorDim[0] << ", " << wTensorDim[1] << ", " << wTensorDim[2] << ", "
+              << wTensorDim[3] << std::endl;
+
+    std::cout << "output dims are " << yTensorDim[0] << ", " << yTensorDim[1] << ", " << yTensorDim[2] << ", "
+              << yTensorDim[3] << std::endl;
 
     int64_t Xsize = xTensorDim[0] * xTensorDim[1] * xTensorDim[2] * xTensorDim[3];
     int64_t Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
@@ -500,18 +468,12 @@ TEST_CASE("Use cudnnFindPlan for execution", "[frontend][cudnnFindPlan][conv]") 
 
     cudnnConvolutionMode_t mode = CUDNN_CONVOLUTION;
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dimA[0], dimA[1], dimA[2], dimA[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           filterdimA[0],
-           filterdimA[1],
-           filterdimA[2],
-           filterdimA[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           outdimA[0],
-           outdimA[1],
-           outdimA[2],
-           outdimA[3]);
+    std::cout << "====DIMENSIONS====\n";
+    std::cout << "input dims are " << dimA[0] << ", " << dimA[1] << ", " << dimA[2] << ", " << dimA[3] << "\n";
+    std::cout << "filter dims are " << filterdimA[0] << ", " << filterdimA[1] << ", " << filterdimA[2] << ", "
+              << filterdimA[3] << "\n";
+    std::cout << "output dims are " << outdimA[0] << ", " << outdimA[1] << ", " << outdimA[2] << ", " << outdimA[3]
+              << "\n";
 
     int64_t Xsize = dimA[0] * dimA[1] * dimA[2] * dimA[3];
     int64_t Wsize = filterdimA[0] * filterdimA[1] * filterdimA[2] * filterdimA[3];
@@ -577,22 +539,15 @@ TEST_CASE("ConvBiasAct sample with cudnnFindPlan", "[frontend][cudnnFindPlan][co
             getFwdConvOutputDim(xTensorDim[dim + 2], padding[dim], wTensorDim[dim + 2], convstride[dim], dilation[dim]);
     }
 
-    printf("====PADDING DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim[0],
-           wTensorDim[1],
-           wTensorDim[2],
-           wTensorDim[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim[0],
-           yTensorDim[1],
-           yTensorDim[2],
-           yTensorDim[3]);
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
+
+    std::cout << "filter dims are " << wTensorDim[0] << ", " << wTensorDim[1] << ", " << wTensorDim[2] << ", "
+              << wTensorDim[3] << std::endl;
+
+    std::cout << "output dims are " << yTensorDim[0] << ", " << yTensorDim[1] << ", " << yTensorDim[2] << ", "
+              << yTensorDim[3] << std::endl;
 
     int64_t Xsize = xTensorDim[0] * xTensorDim[1] * xTensorDim[2] * xTensorDim[3];
     int64_t Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
@@ -642,18 +597,12 @@ TEST_CASE("Use cudnnGetPlan for execution", "[frontend][cudnnGetPlan][conv]") {
 
     cudnnConvolutionMode_t mode = CUDNN_CONVOLUTION;
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dimA[0], dimA[1], dimA[2], dimA[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           filterdimA[0],
-           filterdimA[1],
-           filterdimA[2],
-           filterdimA[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           outdimA[0],
-           outdimA[1],
-           outdimA[2],
-           outdimA[3]);
+    std::cout << "====DIMENSIONS====\n";
+    std::cout << "input dims are " << dimA[0] << ", " << dimA[1] << ", " << dimA[2] << ", " << dimA[3] << "\n";
+    std::cout << "filter dims are " << filterdimA[0] << ", " << filterdimA[1] << ", " << filterdimA[2] << ", "
+              << filterdimA[3] << "\n";
+    std::cout << "output dims are " << outdimA[0] << ", " << outdimA[1] << ", " << outdimA[2] << ", " << outdimA[3]
+              << "\n";
 
     int64_t Xsize = dimA[0] * dimA[1] * dimA[2] * dimA[3];
     int64_t Wsize = filterdimA[0] * filterdimA[1] * filterdimA[2] * filterdimA[3];
@@ -717,22 +666,15 @@ TEST_CASE("ConvScaleBiasAddAct sample", "[frontend][fusion][ConvScaleBiasAddAct]
     int64_t bTensorDim[] = {1, 32, 1, 1};    // bias
     int64_t aTensorDim[] = {4, 32, 31, 31};  // add
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim[0],
-           wTensorDim[1],
-           wTensorDim[2],
-           wTensorDim[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim[0],
-           yTensorDim[1],
-           yTensorDim[2],
-           yTensorDim[3]);
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
+
+    std::cout << "filter dims are " << wTensorDim[0] << ", " << wTensorDim[1] << ", " << wTensorDim[2] << ", "
+              << wTensorDim[3] << std::endl;
+
+    std::cout << "output dims are " << yTensorDim[0] << ", " << yTensorDim[1] << ", " << yTensorDim[2] << ", "
+              << yTensorDim[3] << std::endl;
 
     int64_t Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
 
@@ -784,22 +726,15 @@ TEST_CASE("ConvScaleBiasAddAct sample_float", "[frontend][fusion][ConvScaleBiasA
     int64_t bTensorDim[] = {1, 32, 1, 1};      // bias
     int64_t aTensorDim[] = {4, 32, 512, 512};  // add
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim[0],
-           wTensorDim[1],
-           wTensorDim[2],
-           wTensorDim[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim[0],
-           yTensorDim[1],
-           yTensorDim[2],
-           yTensorDim[3]);
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
+
+    std::cout << "filter dims are " << wTensorDim[0] << ", " << wTensorDim[1] << ", " << wTensorDim[2] << ", "
+              << wTensorDim[3] << std::endl;
+
+    std::cout << "output dims are " << yTensorDim[0] << ", " << yTensorDim[1] << ", " << yTensorDim[2] << ", "
+              << yTensorDim[3] << std::endl;
 
     int64_t Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
 
@@ -849,23 +784,15 @@ TEST_CASE("ConvBiasScaleAct sample", "[frontend][fusion][ConvBiasScaleAct]") {
 
     int64_t bTensorDim[] = {1, 64, 1, 1};  // bias
     int64_t sTensorDim[] = {1, 64, 1, 1};  // scale
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim[0],
-           wTensorDim[1],
-           wTensorDim[2],
-           wTensorDim[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim[0],
-           yTensorDim[1],
-           yTensorDim[2],
-           yTensorDim[3]);
+    std::cout << "filter dims are " << wTensorDim[0] << ", " << wTensorDim[1] << ", " << wTensorDim[2] << ", "
+              << wTensorDim[3] << std::endl;
+
+    std::cout << "output dims are " << yTensorDim[0] << ", " << yTensorDim[1] << ", " << yTensorDim[2] << ", "
+              << yTensorDim[3] << std::endl;
 
     int64_t Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
 
@@ -912,23 +839,15 @@ TEST_CASE("ConvBiasScaleActSerialization sample", "[frontend][fusion][serializat
 
     int64_t bTensorDim[] = {1, 64, 1, 1};  // bias
     int64_t sTensorDim[] = {1, 64, 1, 1};  // scale
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim[0],
-           wTensorDim[1],
-           wTensorDim[2],
-           wTensorDim[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim[0],
-           yTensorDim[1],
-           yTensorDim[2],
-           yTensorDim[3]);
+    std::cout << "filter dims are " << wTensorDim[0] << ", " << wTensorDim[1] << ", " << wTensorDim[2] << ", "
+              << wTensorDim[3] << std::endl;
+
+    std::cout << "output dims are " << yTensorDim[0] << ", " << yTensorDim[1] << ", " << yTensorDim[2] << ", "
+              << yTensorDim[3] << std::endl;
 
     int64_t Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
 
@@ -977,23 +896,15 @@ TEST_CASE("ConvScaleBiasActGenIndexSelection sample", "[frontend][fusion][ConvSc
     int64_t sTensorDim[] = {1, 64, 1, 1};  // scale
 
     int64_t thresholdTensorDim[] = {1, 1, 1, 1};  // scalar number
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim[0],
-           wTensorDim[1],
-           wTensorDim[2],
-           wTensorDim[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim[0],
-           yTensorDim[1],
-           yTensorDim[2],
-           yTensorDim[3]);
+    std::cout << "filter dims are " << wTensorDim[0] << ", " << wTensorDim[1] << ", " << wTensorDim[2] << ", "
+              << wTensorDim[3] << std::endl;
+
+    std::cout << "output dims are " << yTensorDim[0] << ", " << yTensorDim[1] << ", " << yTensorDim[2] << ", "
+              << yTensorDim[3] << std::endl;
 
     int64_t Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
 
@@ -1057,22 +968,15 @@ TEST_CASE("ConvScaleBiasAct_int8 sample", "[frontend][fusion][ConvScaleBiasAct_i
     int64_t bTensorDim[] = {1, 256, 1, 1};  // bias
     int64_t sTensorDim[] = {1, 256, 1, 1};  // scale
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim[0],
-           wTensorDim[1],
-           wTensorDim[2],
-           wTensorDim[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim[0],
-           yTensorDim[1],
-           yTensorDim[2],
-           yTensorDim[3]);
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
+
+    std::cout << "filter dims are " << wTensorDim[0] << ", " << wTensorDim[1] << ", " << wTensorDim[2] << ", "
+              << wTensorDim[3] << std::endl;
+
+    std::cout << "output dims are " << yTensorDim[0] << ", " << yTensorDim[1] << ", " << yTensorDim[2] << ", "
+              << yTensorDim[3] << std::endl;
 
     int64_t Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
 
@@ -1141,18 +1045,12 @@ TEST_CASE("PoolScaleBiasAct_int8 sample", "[pooling][forward][avgerage_pooling]"
     int64_t postPaddingA[CUDNN_DIM_MAX] = {0, 0};
     int64_t strideA[CUDNN_DIM_MAX]      = {2, 2};
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
 
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim[0],
-           yTensorDim[1],
-           yTensorDim[2],
-           yTensorDim[3]);
+    std::cout << "output dims are " << yTensorDim[0] << ", " << yTensorDim[1] << ", " << yTensorDim[2] << ", "
+              << yTensorDim[3] << std::endl;
 
     int64_t Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
 
@@ -1197,11 +1095,12 @@ TEST_CASE("MatmulBiasAct sample", "[frontend][fusion][MatmulBiasAct]") {
 
     int64_t zTensorDim[] = {1, 1, 64};  // bias
 
-    printf("====DIMENSIONS====\n");
-    printf("a matrix dims are %" PRId64 ", %" PRId64 ", %" PRId64 "\n", aTensorDim[0], aTensorDim[1], aTensorDim[2]);
-    printf("b matrix dims are %" PRId64 ", %" PRId64 ", %" PRId64 "\n", bTensorDim[0], bTensorDim[1], bTensorDim[2]);
-    printf("c matrix dims are %" PRId64 ", %" PRId64 ", %" PRId64 "\n", cTensorDim[0], cTensorDim[1], cTensorDim[2]);
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "a matrix dims are " << aTensorDim[0] << ", " << aTensorDim[1] << ", " << aTensorDim[2] << std::endl;
 
+    std::cout << "b matrix dims are " << bTensorDim[0] << ", " << bTensorDim[1] << ", " << bTensorDim[2] << std::endl;
+
+    std::cout << "c matrix dims are " << cTensorDim[0] << ", " << cTensorDim[1] << ", " << cTensorDim[2] << std::endl;
     int64_t Csize = cTensorDim[0] * cTensorDim[1] * cTensorDim[2];
 
     Surface<half> A(aTensorDim[0] * aTensorDim[1] * aTensorDim[2], false);
@@ -1240,11 +1139,12 @@ TEST_CASE("MatmulBiasAct sample_float", "[frontend][fusion][MatmulBiasAct]") {
 
     int64_t zTensorDim[] = {1, 1, 64};  // bias
 
-    printf("====DIMENSIONS====\n");
-    printf("a matrix dims are %" PRId64 ", %" PRId64 ", %" PRId64 "\n", aTensorDim[0], aTensorDim[1], aTensorDim[2]);
-    printf("b matrix dims are %" PRId64 ", %" PRId64 ", %" PRId64 "\n", bTensorDim[0], bTensorDim[1], bTensorDim[2]);
-    printf("c matrix dims are %" PRId64 ", %" PRId64 ", %" PRId64 "\n", cTensorDim[0], cTensorDim[1], cTensorDim[2]);
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "a matrix dims are " << aTensorDim[0] << ", " << aTensorDim[1] << ", " << aTensorDim[2] << std::endl;
 
+    std::cout << "b matrix dims are " << bTensorDim[0] << ", " << bTensorDim[1] << ", " << bTensorDim[2] << std::endl;
+
+    std::cout << "c matrix dims are " << cTensorDim[0] << ", " << cTensorDim[1] << ", " << cTensorDim[2] << std::endl;
     int64_t Csize = cTensorDim[0] * cTensorDim[1] * cTensorDim[2];
 
     Surface<float> A(aTensorDim[0] * aTensorDim[1] * aTensorDim[2], false);
@@ -1283,13 +1183,14 @@ TEST_CASE("MatmulDGeluDBias sample", "[frontend][fusion][MatmulDGeluDBias]") {
     int64_t cTensorDim[] = {1, 2048, 4096};  // batch M N
 
     int64_t zTensorDim[] = {1, 1, 4096};  // bias
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "a matrix dims are " << aTensorDim[0] << ", " << aTensorDim[1] << ", " << aTensorDim[2] << std::endl;
 
-    printf("====DIMENSIONS====\n");
-    printf("a matrix dims are %" PRId64 ", %" PRId64 ", %" PRId64 "\n", aTensorDim[0], aTensorDim[1], aTensorDim[2]);
-    printf("b matrix dims are %" PRId64 ", %" PRId64 ", %" PRId64 "\n", bTensorDim[0], bTensorDim[1], bTensorDim[2]);
-    printf("c matrix dims are %" PRId64 ", %" PRId64 ", %" PRId64 "\n", cTensorDim[0], cTensorDim[1], cTensorDim[2]);
-    printf("z matrix dims are %" PRId64 ", %" PRId64 ", %" PRId64 "\n", zTensorDim[0], zTensorDim[1], zTensorDim[2]);
+    std::cout << "b matrix dims are " << bTensorDim[0] << ", " << bTensorDim[1] << ", " << bTensorDim[2] << std::endl;
 
+    std::cout << "c matrix dims are " << cTensorDim[0] << ", " << cTensorDim[1] << ", " << cTensorDim[2] << std::endl;
+
+    std::cout << "z matrix dims are " << zTensorDim[0] << ", " << zTensorDim[1] << ", " << zTensorDim[2] << std::endl;
     int64_t Csize = cTensorDim[0] * cTensorDim[1] * cTensorDim[2];
     int64_t Zsize = zTensorDim[0] * zTensorDim[1] * zTensorDim[2];
 
@@ -1345,22 +1246,15 @@ TEST_CASE("ConvDrelu sample", "[frontend][convDrelu][drelu]") {
         wTensorDim_padded[i] = wTensorDim[i];
     }
 
-    printf("====PADDING DIMENSIONS====\n");
-    printf("padded input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim_padded[0],
-           xTensorDim_padded[1],
-           xTensorDim_padded[2],
-           xTensorDim_padded[3]);
-    printf("padded filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim_padded[0],
-           wTensorDim_padded[1],
-           wTensorDim_padded[2],
-           wTensorDim_padded[3]);
-    printf("padded output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim_padded[0],
-           yTensorDim_padded[1],
-           yTensorDim_padded[2],
-           yTensorDim_padded[3]);
+    std::cout << "====PADDING DIMENSIONS====" << std::endl;
+    std::cout << "input dims are " << xTensorDim_padded[0] << ", " << xTensorDim_padded[1] << ", "
+              << xTensorDim_padded[2] << ", " << xTensorDim_padded[3] << std::endl;
+
+    std::cout << "filter dims are " << wTensorDim_padded[0] << ", " << wTensorDim_padded[1] << ", "
+              << wTensorDim_padded[2] << ", " << wTensorDim_padded[3] << std::endl;
+
+    std::cout << "output dims are " << yTensorDim_padded[0] << ", " << yTensorDim_padded[1] << ", "
+              << yTensorDim_padded[2] << ", " << yTensorDim_padded[3] << std::endl;
 
     int64_t Xsize = xTensorDim_padded[0] * xTensorDim_padded[1] * xTensorDim_padded[2] * xTensorDim_padded[3];
     int64_t Ysize = yTensorDim_padded[0] * yTensorDim_padded[1] * yTensorDim_padded[2] * yTensorDim_padded[3];
@@ -1418,22 +1312,15 @@ TEST_CASE("DgradDrelu sample", "[frontend][dgradDrelu][drelu]") {
         wTensorDim_padded[i] = wTensorDim[i];
     }
 
-    printf("====PADDING DIMENSIONS====\n");
-    printf("padded input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim_padded[0],
-           xTensorDim_padded[1],
-           xTensorDim_padded[2],
-           xTensorDim_padded[3]);
-    printf("padded filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim_padded[0],
-           wTensorDim_padded[1],
-           wTensorDim_padded[2],
-           wTensorDim_padded[3]);
-    printf("padded output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim_padded[0],
-           yTensorDim_padded[1],
-           yTensorDim_padded[2],
-           yTensorDim_padded[3]);
+    std::cout << "====PADDING DIMENSIONS====" << std::endl;
+    std::cout << "input dims are " << xTensorDim_padded[0] << ", " << xTensorDim_padded[1] << ", "
+              << xTensorDim_padded[2] << ", " << xTensorDim_padded[3] << std::endl;
+
+    std::cout << "filter dims are " << wTensorDim_padded[0] << ", " << wTensorDim_padded[1] << ", "
+              << wTensorDim_padded[2] << ", " << wTensorDim_padded[3] << std::endl;
+
+    std::cout << "output dims are " << yTensorDim_padded[0] << ", " << yTensorDim_padded[1] << ", "
+              << yTensorDim_padded[2] << ", " << yTensorDim_padded[3] << std::endl;
 
     int64_t Xsize = xTensorDim_padded[0] * xTensorDim_padded[1] * xTensorDim_padded[2] * xTensorDim_padded[3];
     int64_t Ysize = yTensorDim_padded[0] * yTensorDim_padded[1] * yTensorDim_padded[2] * yTensorDim_padded[3];
@@ -1477,22 +1364,16 @@ TEST_CASE("ConvColReduction sample", "[frontend][fusion][ConvColReduction]") {
 
     int64_t reducedTensorDim[] = {1, 256, 1, 1};  // output is NPQ * C reduced to C column
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim[0],
-           wTensorDim[1],
-           wTensorDim[2],
-           wTensorDim[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           reducedTensorDim[0],
-           reducedTensorDim[1],
-           reducedTensorDim[2],
-           reducedTensorDim[3]);
+    std::cout << "====DIMENSIONS====" << std::endl;
+
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
+
+    std::cout << "filter dims are " << wTensorDim[0] << ", " << wTensorDim[1] << ", " << wTensorDim[2] << ", "
+              << wTensorDim[3] << std::endl;
+
+    std::cout << "output dims are " << reducedTensorDim[0] << ", " << reducedTensorDim[1] << ", " << reducedTensorDim[2]
+              << ", " << reducedTensorDim[3] << std::endl;
 
     int64_t outputSize = reducedTensorDim[0] * reducedTensorDim[1] * reducedTensorDim[2] * reducedTensorDim[3];
 
@@ -1544,18 +1425,12 @@ TEST_CASE("Use errata to block global(index) for execution", "[frontend][errata]
 
     cudnnConvolutionMode_t mode = CUDNN_CONVOLUTION;
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dimA[0], dimA[1], dimA[2], dimA[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           filterdimA[0],
-           filterdimA[1],
-           filterdimA[2],
-           filterdimA[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           outdimA[0],
-           outdimA[1],
-           outdimA[2],
-           outdimA[3]);
+    std::cout << "====DIMENSIONS====\n";
+    std::cout << "input dims are " << dimA[0] << ", " << dimA[1] << ", " << dimA[2] << ", " << dimA[3] << "\n";
+    std::cout << "filter dims are " << filterdimA[0] << ", " << filterdimA[1] << ", " << filterdimA[2] << ", "
+              << filterdimA[3] << "\n";
+    std::cout << "output dims are " << outdimA[0] << ", " << outdimA[1] << ", " << outdimA[2] << ", " << outdimA[3]
+              << "\n";
 
     int64_t Xsize = dimA[0] * dimA[1] * dimA[2] * dimA[3];
     int64_t Wsize = filterdimA[0] * filterdimA[1] * filterdimA[2] * filterdimA[3];
@@ -1603,18 +1478,12 @@ TEST_CASE("DP4A execution with cudnnFindPlan", "[frontend][cudnnFindPlan][conv]"
 
     cudnnConvolutionMode_t mode = CUDNN_CONVOLUTION;
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dimA[0], dimA[1], dimA[2], dimA[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           filterdimA[0],
-           filterdimA[1],
-           filterdimA[2],
-           filterdimA[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           outdimA[0],
-           outdimA[1],
-           outdimA[2],
-           outdimA[3]);
+    std::cout << "====DIMENSIONS====\n";
+    std::cout << "input dims are " << dimA[0] << ", " << dimA[1] << ", " << dimA[2] << ", " << dimA[3] << "\n";
+    std::cout << "filter dims are " << filterdimA[0] << ", " << filterdimA[1] << ", " << filterdimA[2] << ", "
+              << filterdimA[3] << "\n";
+    std::cout << "output dims are " << outdimA[0] << ", " << outdimA[1] << ", " << outdimA[2] << ", " << outdimA[3]
+              << "\n";
 
     int64_t Xsize = vectorCount * dimA[0] * dimA[1] * dimA[2] * dimA[3];
     int64_t Wsize = vectorCount * filterdimA[0] * filterdimA[1] * filterdimA[2] * filterdimA[3];
@@ -1667,18 +1536,12 @@ TEST_CASE("IMMA execution with manual autotuning", "[frontend][cudnnGetPlan][con
 
     cudnnConvolutionMode_t mode = CUDNN_CONVOLUTION;
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dimA[0], dimA[1], dimA[2], dimA[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           filterdimA[0],
-           filterdimA[1],
-           filterdimA[2],
-           filterdimA[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           outdimA[0],
-           outdimA[1],
-           outdimA[2],
-           outdimA[3]);
+    std::cout << "====DIMENSIONS====\n";
+    std::cout << "input dims are " << dimA[0] << ", " << dimA[1] << ", " << dimA[2] << ", " << dimA[3] << "\n";
+    std::cout << "filter dims are " << filterdimA[0] << ", " << filterdimA[1] << ", " << filterdimA[2] << ", "
+              << filterdimA[3] << "\n";
+    std::cout << "output dims are " << outdimA[0] << ", " << outdimA[1] << ", " << outdimA[2] << ", " << outdimA[3]
+              << "\n";
 
     int64_t Xsize = vectorCount * dimA[0] * dimA[1] * dimA[2] * dimA[3];
     int64_t Wsize = vectorCount * filterdimA[0] * filterdimA[1] * filterdimA[2] * filterdimA[3];
@@ -1729,18 +1592,12 @@ TEST_CASE("Use Plan cache for rerunning the same convolution", "[frontend][dnn_h
 
     cudnnConvolutionMode_t mode = CUDNN_CONVOLUTION;
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n", dimA[0], dimA[1], dimA[2], dimA[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           filterdimA[0],
-           filterdimA[1],
-           filterdimA[2],
-           filterdimA[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           outdimA[0],
-           outdimA[1],
-           outdimA[2],
-           outdimA[3]);
+    std::cout << "====DIMENSIONS====\n";
+    std::cout << "input dims are " << dimA[0] << ", " << dimA[1] << ", " << dimA[2] << ", " << dimA[3] << "\n";
+    std::cout << "filter dims are " << filterdimA[0] << ", " << filterdimA[1] << ", " << filterdimA[2] << ", "
+              << filterdimA[3] << "\n";
+    std::cout << "output dims are " << outdimA[0] << ", " << outdimA[1] << ", " << outdimA[2] << ", " << outdimA[3]
+              << "\n";
 
     int64_t Xsize = dimA[0] * dimA[1] * dimA[2] * dimA[3];
     int64_t Wsize = filterdimA[0] * filterdimA[1] * filterdimA[2] * filterdimA[3];
@@ -2318,18 +2175,13 @@ TEST_CASE("Max pooling idx tensor dump", "[pooling][forward][max_pooling]") {
     int64_t postPaddingA[] = {1, 1};
     int64_t strideA[]      = {2, 2};
 
-    printf("====DIMENSIONS====\n");
-    printf("x dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
+    std::cout << "====DIMENSIONS====" << std::endl;
 
-    printf("y dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim[0],
-           yTensorDim[1],
-           yTensorDim[2],
-           yTensorDim[3]);
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
+
+    std::cout << "y dims are " << yTensorDim[0] << ", " << yTensorDim[1] << ", " << yTensorDim[2] << ", "
+              << yTensorDim[3] << std::endl;
 
     int64_t Xsize = xTensorDim[0] * xTensorDim[1] * xTensorDim[2] * xTensorDim[3];
     int64_t Ysize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
@@ -2403,18 +2255,13 @@ TEST_CASE("Backward pooling", "[pooling][backward][max_pooling]") {
     int64_t postPaddingA[] = {0, 0};
     int64_t strideA[]      = {2, 2};
 
-    printf("====DIMENSIONS====\n");
-    printf("dx dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           dxTensorDim[0],
-           dxTensorDim[1],
-           dxTensorDim[2],
-           dxTensorDim[3]);
+    std::cout << "====DIMENSIONS====" << std::endl;
 
-    printf("dy dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           dyTensorDim[0],
-           dyTensorDim[1],
-           dyTensorDim[2],
-           dyTensorDim[3]);
+    std::cout << "dx dims are " << dxTensorDim[0] << ", " << dxTensorDim[1] << ", " << dxTensorDim[2] << ", "
+              << dxTensorDim[3] << std::endl;
+
+    std::cout << "dy dims are " << dyTensorDim[0] << ", " << dyTensorDim[1] << ", " << dyTensorDim[2] << ", "
+              << dyTensorDim[3] << std::endl;
 
     int64_t dXsize = dxTensorDim[0] * dxTensorDim[1] * dxTensorDim[2] * dxTensorDim[3];
     int64_t dYsize = dyTensorDim[0] * dyTensorDim[1] * dyTensorDim[2] * dyTensorDim[3];
@@ -2587,22 +2434,16 @@ TEST_CASE("Conv Scale", "[frontend][fusion][ConvScaleReduction]") {
 
     int64_t amaxTensorDim[] = {1, 1, 1, 1};  // Output is AMAX of conv + scale
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim[0],
-           wTensorDim[1],
-           wTensorDim[2],
-           wTensorDim[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           amaxTensorDim[0],
-           amaxTensorDim[1],
-           amaxTensorDim[2],
-           amaxTensorDim[3]);
+    std::cout << "====DIMENSIONS====" << std::endl;
+
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
+
+    std::cout << "filter dims are " << wTensorDim[0] << ", " << wTensorDim[1] << ", " << wTensorDim[2] << ", "
+              << wTensorDim[3] << std::endl;
+
+    std::cout << "output dims are " << amaxTensorDim[0] << ", " << amaxTensorDim[1] << ", " << amaxTensorDim[2] << ", "
+              << amaxTensorDim[3] << std::endl;
 
     int64_t outputSize = amaxTensorDim[0] * amaxTensorDim[1] * amaxTensorDim[2] * amaxTensorDim[3];
 
@@ -2650,22 +2491,15 @@ TEST_CASE("Conv Descale Descale Amax Scale sample", "[frontend][fusion][ConvScal
 
     int64_t amaxTensorDim[] = {1, 1, 1, 1};  // Output is AMAX of conv + scale
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim[0],
-           wTensorDim[1],
-           wTensorDim[2],
-           wTensorDim[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim[0],
-           yTensorDim[1],
-           yTensorDim[2],
-           yTensorDim[3]);
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
+
+    std::cout << "filter dims are " << wTensorDim[0] << ", " << wTensorDim[1] << ", " << wTensorDim[2] << ", "
+              << wTensorDim[3] << std::endl;
+
+    std::cout << "output dims are " << yTensorDim[0] << ", " << yTensorDim[1] << ", " << yTensorDim[2] << ", "
+              << yTensorDim[3] << std::endl;
 
     int64_t inputSize  = xTensorDim[0] * xTensorDim[1] * xTensorDim[2] * xTensorDim[3];
     int64_t filterSize = wTensorDim[0] * wTensorDim[1] * wTensorDim[2] * wTensorDim[3];
@@ -2719,17 +2553,12 @@ TEST_CASE("Scale transpose convert amax sample", "[frontend][fusion][Transpose]"
 
     int64_t amaxTensorDim[] = {1, 1, 1, 1};  // Output is AMAX of conv + scale
 
-    printf("====DIMENSIONS====\n");
-    printf("input dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           xTensorDim[0],
-           xTensorDim[1],
-           xTensorDim[2],
-           xTensorDim[3]);
-    printf("output dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           yTensorDim[0],
-           yTensorDim[1],
-           yTensorDim[2],
-           yTensorDim[3]);
+    std::cout << "====DIMENSIONS====" << std::endl;
+    std::cout << "input dims are " << xTensorDim[0] << ", " << xTensorDim[1] << ", " << xTensorDim[2] << ", "
+              << xTensorDim[3] << std::endl;
+
+    std::cout << "output dims are " << yTensorDim[0] << ", " << yTensorDim[1] << ", " << yTensorDim[2] << ", "
+              << yTensorDim[3] << std::endl;
 
     int64_t inputSize  = xTensorDim[0] * xTensorDim[1] * xTensorDim[2] * xTensorDim[3];
     int64_t outputSize = yTensorDim[0] * yTensorDim[1] * yTensorDim[2] * yTensorDim[3];
@@ -2782,22 +2611,16 @@ TEST_CASE("Dgrad Descale Descale Amax Scale sample", "[frontend][fusion][ConvSca
     int64_t scaleDim[]      = {1, 1, 1, 1};  // Scalar scale
     int64_t amaxTensorDim[] = {1, 1, 1, 1};  // Output is AMAX of conv + scale
 
-    printf("====DIMENSIONS====\n");
-    printf("dx dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           dxTensorDim[0],
-           dxTensorDim[1],
-           dxTensorDim[2],
-           dxTensorDim[3]);
-    printf("filter dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           wTensorDim[0],
-           wTensorDim[1],
-           wTensorDim[2],
-           wTensorDim[3]);
-    printf("dy dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           dyTensorDim[0],
-           dyTensorDim[1],
-           dyTensorDim[2],
-           dyTensorDim[3]);
+    std::cout << "====DIMENSIONS====" << std::endl;
+
+    std::cout << "dx dims are " << dxTensorDim[0] << ", " << dxTensorDim[1] << ", " << dxTensorDim[2] << ", "
+              << dxTensorDim[3] << std::endl;
+
+    std::cout << "filter dims are " << wTensorDim[0] << ", " << wTensorDim[1] << ", " << wTensorDim[2] << ", "
+              << wTensorDim[3] << std::endl;
+
+    std::cout << "dy dims are " << dyTensorDim[0] << ", " << dyTensorDim[1] << ", " << dyTensorDim[2] << ", "
+              << dyTensorDim[3] << std::endl;
 
     int64_t dxSize     = dxTensorDim[0] * dxTensorDim[1] * dxTensorDim[2] * dxTensorDim[3];
     int64_t filterSize = wTensorDim[0] * wTensorDim[1] * wTensorDim[2] * wTensorDim[3];
@@ -2934,33 +2757,22 @@ TEST_CASE("Back2Back Batch GEMM sample", "[frontend][fusion][back2backBatchGemm]
     int64_t sTensorStride[] = {4194304, 262144, 512, 1};
     int64_t vTensorStride[] = {524288, 64, 1024, 1};
     int64_t oTensorStride[] = {524288, 64, 1024, 1};
+    std::cout << "====DIMENSIONS====" << std::endl;
 
-    printf("====DIMENSIONS====\n");
-    printf("q dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           qTensorDim[0],
-           qTensorDim[1],
-           qTensorDim[2],
-           qTensorDim[3]);
-    printf("k dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           kTensorDim[0],
-           kTensorDim[1],
-           kTensorDim[2],
-           kTensorDim[3]);
-    printf("s dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           sTensorDim[0],
-           sTensorDim[1],
-           sTensorDim[2],
-           sTensorDim[3]);
-    printf("v dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           vTensorDim[0],
-           vTensorDim[1],
-           vTensorDim[2],
-           vTensorDim[3]);
-    printf("o dims are %" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "\n",
-           oTensorDim[0],
-           oTensorDim[1],
-           oTensorDim[2],
-           oTensorDim[3]);
+    std::cout << "q dims are " << qTensorDim[0] << ", " << qTensorDim[1] << ", " << qTensorDim[2] << ", "
+              << qTensorDim[3] << std::endl;
+
+    std::cout << "k dims are " << kTensorDim[0] << ", " << kTensorDim[1] << ", " << kTensorDim[2] << ", "
+              << kTensorDim[3] << std::endl;
+
+    std::cout << "s dims are " << sTensorDim[0] << ", " << sTensorDim[1] << ", " << sTensorDim[2] << ", "
+              << sTensorDim[3] << std::endl;
+
+    std::cout << "v dims are " << vTensorDim[0] << ", " << vTensorDim[1] << ", " << vTensorDim[2] << ", "
+              << vTensorDim[3] << std::endl;
+
+    std::cout << "o dims are " << oTensorDim[0] << ", " << oTensorDim[1] << ", " << oTensorDim[2] << ", "
+              << oTensorDim[3] << std::endl;
 
     int64_t qSize = qTensorDim[0] * qTensorDim[1] * qTensorDim[2] * qTensorDim[3];
     int64_t kSize = kTensorDim[0] * kTensorDim[1] * kTensorDim[2] * kTensorDim[3];
@@ -3025,14 +2837,9 @@ TEST_CASE("MHA Fprop sample", "[frontend][fusion][mhaFprop]") {
 
     bool is_causal_masking = false;  // specify if we need causal masking
 
-    printf("====PARAMETERS====\n");
-    printf("batch is %" PRId64 ", head dim is %" PRId64 ", q sequence length is %" PRId64
-           ", kv sequence length is %" PRId64 ", hidden dim is %" PRId64 "\n",
-           b,
-           h,
-           s_q,
-           s_kv,
-           d);
+    std::cout << "====PARAMETERS====" << std::endl;
+    std::cout << "batch is " << b << ", head dim is " << h << ", q sequence length is " << s_q
+              << ", kv sequence length is " << s_kv << ", hidden dim is " << d << std::endl;
 
     void* devPtrQ    = nullptr;  // queries
     void* devPtrK    = nullptr;  // keys
@@ -3146,14 +2953,9 @@ TEST_CASE("MHA Bprop sample", "[frontend][fusion][mhaBprop]") {
 
     bool is_causal_masking = false;  // specify if we need causal masking
 
-    printf("====PARAMETERS====\n");
-    printf("batch is %" PRId64 ", head dim is %" PRId64 ", q sequence length is %" PRId64
-           ", kv sequence length is %" PRId64 ", hidden dim is %" PRId64 "\n",
-           b,
-           h,
-           s_q,
-           s_kv,
-           d);
+    std::cout << "====PARAMETERS====" << std::endl;
+    std::cout << "batch is " << b << ", head dim is " << h << ", q sequence length is " << s_q
+              << ", kv sequence length is " << s_kv << ", hidden dim is " << d << std::endl;
 
     void* devPtrQ = nullptr;  // queries
     void* devPtrK = nullptr;  // keys
@@ -3291,14 +3093,9 @@ TEST_CASE("BF16 LLM Flash MHA Fprop sample", "[frontend][fusion][BF16LLMFprop]")
     bool isTraining            = true;  // training or inference mode
     double dropout_probability = 0.2f;  // probability of dropout. Should be 0.0 for inference mode
 
-    printf("====PARAMETERS====\n");
-    printf("batch is %" PRId64 ", head dim is %" PRId64 ", q sequence length is %" PRId64
-           ", kv sequence length is %" PRId64 ", hidden dim is %" PRId64 "\n",
-           b,
-           h,
-           s_q,
-           s_kv,
-           d);
+    std::cout << "====PARAMETERS====" << std::endl;
+    std::cout << "batch is " << b << ", head dim is " << h << ", q sequence length is " << s_q
+              << ", kv sequence length is " << s_kv << ", hidden dim is " << d << std::endl;
 
     void* devPtrQ            = nullptr;  // queries
     void* devPtrK            = nullptr;  // keys
@@ -3383,14 +3180,9 @@ TEST_CASE("BF16 LLM Flash MHA Bprop sample", "[frontend][fusion][BF16LLMBprop]")
 
     int64_t seed = 123456;  // seed for generating the dropout mask
 
-    printf("====PARAMETERS====\n");
-    printf("batch is %" PRId64 ", head dim is %" PRId64 ", q sequence length is %" PRId64
-           ", kv sequence length is %" PRId64 ", hidden dim is %" PRId64 "\n",
-           b,
-           h,
-           s_q,
-           s_kv,
-           d);
+    std::cout << "====PARAMETERS====" << std::endl;
+    std::cout << "batch is " << b << ", head dim is " << h << ", q sequence length is " << s_q
+              << ", kv sequence length is " << s_kv << ", hidden dim is " << d << std::endl;
 
     void* devPtrQ          = nullptr;  // queries
     void* devPtrKTranspose = nullptr;  // keys transposed
@@ -3505,14 +3297,9 @@ TEST_CASE("FP8 Flash MHA Fprop sample", "[frontend][fusion][fp8flashmhaFprop]") 
     float dropoutProbability = 0.0f;    // probability of dropout. If inference, dropout should be 0.0f
     int64_t seed             = 123456;  // seed for generating the dropout mask
 
-    printf("====PARAMETERS====\n");
-    printf("batch is %" PRId64 ", head dim is %" PRId64 ", q sequence length is %" PRId64
-           ", kv sequence length is %" PRId64 ", hidden dim is %" PRId64 "\n",
-           b,
-           h,
-           s_q,
-           s_kv,
-           d);
+    std::cout << "====PARAMETERS====" << std::endl;
+    std::cout << "batch is " << b << ", head dim is " << h << ", q sequence length is " << s_q
+              << ", kv sequence length is " << s_kv << ", hidden dim is " << d << std::endl;
 
     void* devPtrQKV  = nullptr;  // QKV interleaved tensor
     void* devPtrM    = nullptr;  // M tensor (row reduction max of QK.T)
@@ -3700,14 +3487,9 @@ TEST_CASE("FP8 Flash MHA Bprop sample", "[frontend][fusion][fp8flashmhaBprop]") 
     float dropoutProbability = 0.0f;    // probability of dropout. If inference, dropout should be 0.0f
     int64_t seed             = 123456;  // seed for generating the dropout mask
 
-    printf("====PARAMETERS====\n");
-    printf("batch is %" PRId64 ", head dim is %" PRId64 ", q sequence length is %" PRId64
-           ", kv sequence length is %" PRId64 ", hidden dim is %" PRId64 "\n",
-           b,
-           h,
-           s_q,
-           s_kv,
-           d);
+    std::cout << "====PARAMETERS====" << std::endl;
+    std::cout << "batch is " << b << ", head dim is " << h << ", q sequence length is " << s_q
+              << ", kv sequence length is " << s_kv << ", hidden dim is " << d << std::endl;
 
     void* devPtrQKV  = nullptr;  // QKV interleaved tensor
     void* devPtrM    = nullptr;  // M tensor (row reduction max of QK.T)

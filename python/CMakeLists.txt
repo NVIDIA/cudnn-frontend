@@ -51,7 +51,7 @@ python_add_library(
 )
 target_link_libraries(_compiled_module PRIVATE pybind11::headers)
 
-target_compile_features(_compiled_module PRIVATE cxx_std_17)
+target_compile_features(_compiled_module PRIVATE cxx_std_20)
 
 target_include_directories(
     _compiled_module

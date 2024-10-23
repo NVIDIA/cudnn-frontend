@@ -17,6 +17,81 @@
 
 namespace cudnn_frontend {
 
+namespace detail {
+inline void
+assign_uid(graph::Tensor_attributes* const tensor,
+           int64_t& potential_uid,
+           std::unordered_set<int64_t> const& used_uids) {
+    // get_next_potential_uid
+    while (used_uids.find(potential_uid) != used_uids.end()) {
+        ++potential_uid;
+    }
+
+    tensor->set_uid(potential_uid);
+    ++potential_uid;  // increment, as used its used now
+}
+
+// TODO: Always returns OK. Can the status and error message be accessed from tensor descriptor?
+inline error_t
+create_cudnn_tensor(
+    std::shared_ptr<graph::Tensor_attributes> const& props,
+    std::unordered_map<graph::Tensor_attributes::uid_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors,
+    int64_t& potential_uid,
+    std::unordered_set<int64_t> const& used_uids) {
+    // Assign tensor a uid
+    if (props->has_uid() == false) {
+        assign_uid(props.get(), potential_uid, used_uids);
+    }
+
+    // Check whether backend tensor already created
+    auto tensor_uid = props->get_uid();
+    if (tensors.find(tensor_uid) != tensors.end()) {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Backend Tensor named '" << props->get_name() << "' with UID " << tensor_uid
+                                                               << " already created.");
+        return {error_code_t::OK, ""};
+    }
+    CUDNN_FE_LOG_LABEL_ENDL("INFO: Creating Backend Tensor named '" << props->get_name() << "' with UID "
+                                                                    << tensor_uid);
+
+    auto&& tensor_builder = cudnn_frontend::TensorBuilder();
+
+    tensor_builder.setDim(props->get_dim().size(), props->get_dim().data())
+        .setStrides(props->get_stride().size(), props->get_stride().data())
+        .setId(tensor_uid)
+        .setAlignment(16)
+        .setDataType(props->get_data_type())
+        .setVirtual(props->get_is_virtual())
+        .setByValue(props->get_is_pass_by_value())
+        .setReorderType(props->get_reordering_type());
+
+    if (auto ragged_offset_props = props->get_ragged_offset()) {
+        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(ragged_offset_props, tensors, potential_uid, used_uids));
+        tensor_builder.setRaggedOffset(tensors.at(ragged_offset_props->get_uid()));
+    }
+
+#ifdef NV_CUDNN_DISABLE_EXCEPTION
+    // disable exception macro is defined. Calling build will not throw.
+    // Check status of desc and return error.
+    auto tensor = tensor_builder.build();
+    RETURN_CUDNN_FRONTEND_ERROR_IF(
+        tensor.get_status() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, tensor.get_error());
+    tensors.emplace(tensor_uid, std::make_shared<Tensor>(std::move(tensor)));
+#else
+    // build() can throw
+    // wrap in try catch
+    try {
+        auto tensor = tensor_builder.build();
+        tensors.emplace(tensor_uid, std::make_shared<Tensor>(std::move(tensor)));
+    } catch (cudnn_frontend::cudnnException& e) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
+    }
+#endif
+
+    return {error_code_t::OK, ""};
+}
+}  // namespace detail
+
 class ICudnn {
    protected:
     using uid_t = int64_t;
@@ -42,78 +117,6 @@ class ICudnn {
 
     bool is_dynamic_shape_enabled             = false;
     std::shared_ptr<KernelCache> kernel_cache = nullptr;
-
-    void
-    assign_uid(graph::Tensor_attributes* const tensor,
-               int64_t& potential_uid,
-               std::unordered_set<int64_t> const& used_uids) const {
-        // get_next_potential_uid
-        while (used_uids.find(potential_uid) != used_uids.end()) {
-            ++potential_uid;
-        }
-
-        tensor->set_uid(potential_uid);
-        ++potential_uid;  // increment, as used its used now
-    }
-
-    // TODO: Always returns OK. Can the status and error message be accessed from tensor descriptor?
-    error_t
-    create_cudnn_tensor(std::shared_ptr<graph::Tensor_attributes> const& props,
-                        std::unordered_map<uid_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors,
-                        int64_t& potential_uid,
-                        std::unordered_set<int64_t> const& used_uids) const {
-        // Assign tensor a uid
-        if (props->has_uid() == false) {
-            assign_uid(props.get(), potential_uid, used_uids);
-        }
-
-        // Check whether backend tensor already created
-        auto tensor_uid = props->get_uid();
-        if (tensors.find(tensor_uid) != tensors.end()) {
-            CUDNN_FE_LOG_LABEL_ENDL("INFO: Backend Tensor named '" << props->get_name() << "' with UID " << tensor_uid
-                                                                   << " already created.");
-            return {error_code_t::OK, ""};
-        }
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Creating Backend Tensor named '" << props->get_name() << "' with UID "
-                                                                        << tensor_uid);
-
-        auto&& tensor_builder = cudnn_frontend::TensorBuilder();
-
-        tensor_builder.setDim(props->get_dim().size(), props->get_dim().data())
-            .setStrides(props->get_stride().size(), props->get_stride().data())
-            .setId(tensor_uid)
-            .setAlignment(16)
-            .setDataType(props->get_data_type())
-            .setVirtual(props->get_is_virtual())
-            .setByValue(props->get_is_pass_by_value())
-            .setReorderType(props->get_reordering_type());
-
-        if (auto ragged_offset_props = props->get_ragged_offset()) {
-            CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(ragged_offset_props, tensors, potential_uid, used_uids));
-            tensor_builder.setRaggedOffset(tensors.at(ragged_offset_props->get_uid()));
-        }
-
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto tensor = tensor_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            tensor.get_status() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, tensor.get_error());
-        tensors.emplace(tensor_uid, std::make_shared<Tensor>(std::move(tensor)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto tensor = tensor_builder.build();
-            tensors.emplace(tensor_uid, std::make_shared<Tensor>(std::move(tensor)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
-        }
-#endif
-
-        return {error_code_t::OK, ""};
-    }
 
     error_t
     create_cudnn_operation_graph(cudnnHandle_t handle) {

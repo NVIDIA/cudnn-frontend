@@ -20,7 +20,7 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#include "../utils/fp16_emu.h"
+#include "./utils/fp16_emu.h"
 
 #define STATIC_ASSERT(cond) \
     { static_assert(cond, "static_assert failed."); }

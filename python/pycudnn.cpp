@@ -59,6 +59,10 @@ throw_if(bool const cond, cudnn_frontend::error_code_t const error_code, std::st
 void
 init_pygraph_submodule(py::module_ &);
 
+// pybinds for kernel_cache class
+void
+create_kernel_cache_submodule(py::module_ &);
+
 // pybinds for all properties and helpers
 void
 init_properties(py::module_ &);

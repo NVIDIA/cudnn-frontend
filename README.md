@@ -60,7 +60,7 @@ To provide a custom CUDNN installation path, use environment variable: `CUDNN_PA
 #### Checking the installation
 To test whether installation is successful, run:
 ```
-pytest test/python_fe
+pytest test/python
 ```
 
 NOTE: Only v1.0 API is exposed via python bindings.
@@ -94,6 +94,8 @@ bin/samples
 To skip building samples, use `-DCUDNN_FRONTEND_BUILD_SAMPLES=OFF`.
 
 To skip building python bindings, use `-DCUDNN_FRONTEND_BUILD_PYTHON_BINDINGS=OFF`.
+
+To add debug symbols, use `-DCMAKE_BUILD_TYPE=Debug`.
 
 In case, you have a stale cmake cache and want to update the cudnn/cuda paths, please delete the cmake cache (or build directory and redo the above steps).
 

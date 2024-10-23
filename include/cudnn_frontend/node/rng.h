@@ -56,7 +56,7 @@ class RngNode : public NodeCRTP<RngNode> {
 
     error_t
     create_cudnn_operations(
-        std::unordered_set<uid_t>& uids_involved_in_operations,
+        std::unordered_set<Tensor_attributes::uid_t>& uids_involved_in_operations,
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {

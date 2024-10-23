@@ -12,6 +12,7 @@ from ._compiled_module import (
     reduction_mode,
     behavior_note,
     create_handle,
+    create_kernel_cache,
     get_stream,
     numerical_note,
     set_stream,
@@ -25,7 +26,7 @@ from ._compiled_module import (
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 
 def _tensor(

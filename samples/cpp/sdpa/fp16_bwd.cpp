@@ -21,7 +21,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
-#include "../../utils/helpers.h"
+#include "../utils/helpers.h"
 
 #include <cuda_runtime_api.h>
 
@@ -198,7 +198,7 @@ TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
     }
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     // Create the SDPA backward graph
     auto graph = create_sdpa_backward_graph(b,
@@ -260,15 +260,15 @@ TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
         std::vector<int32_t> hostActualSeqlenQ(b, 20);
         std::vector<int32_t> hostActualSeqlenKV(b, 20);
 
-        checkCudaErr(cudaMemcpy(devActualSeqlenQ.devPtr,
-                                hostActualSeqlenQ.data(),
-                                sizeof(hostActualSeqlenQ[0]) * b,
-                                cudaMemcpyHostToDevice));
-        checkCudaErr(cudaMemcpy(devActualSeqlenKV.devPtr,
-                                hostActualSeqlenKV.data(),
-                                sizeof(hostActualSeqlenKV[0]) * b,
-                                cudaMemcpyHostToDevice));
-        checkCudaErr(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(devActualSeqlenQ.devPtr,
+                              hostActualSeqlenQ.data(),
+                              sizeof(hostActualSeqlenQ[0]) * b,
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(devActualSeqlenKV.devPtr,
+                              hostActualSeqlenKV.data(),
+                              sizeof(hostActualSeqlenKV[0]) * b,
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaDeviceSynchronize());
 
         variant_pack[SEQ_LEN_Q_UID]  = devActualSeqlenQ.devPtr;
         variant_pack[SEQ_LEN_KV_UID] = devActualSeqlenKV.devPtr;
@@ -281,7 +281,7 @@ TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 
-    checkCudaErr(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     cudnnDestroy(handle);
 }

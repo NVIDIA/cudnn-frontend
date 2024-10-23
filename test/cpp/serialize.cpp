@@ -140,6 +140,8 @@ TEST_CASE("Graph key", "[graph][key]") {
 
     REQUIRE(graph.build_plans(handle).is_good());
     REQUIRE(key == graph.key());
+
+    cudnnDestroy(handle);
 }
 
 TEST_CASE("Graph key dynamic shape", "[graph][key][dynamic_shape]") {
@@ -218,6 +220,8 @@ TEST_CASE("Graph key dynamic shape", "[graph][key][dynamic_shape]") {
 
         REQUIRE(graph.build_plans(handle).is_good());
         REQUIRE(key == graph.key());
+
+        cudnnDestroy(handle);
     }
 }
 

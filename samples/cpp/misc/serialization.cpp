@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -21,7 +21,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
-#include "../../utils/helpers.h"
+#include "../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
@@ -42,7 +42,7 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
 
     cudnnHandle_t handle;  // Handle to use during deserialize and execute
 
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     auto build_and_validate_graph_helper =
         [](int64_t n, int64_t c, int64_t h, int64_t w, int64_t k, int64_t r, int64_t s)
@@ -105,7 +105,7 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
                              int64_t n, int64_t c, int64_t h, int64_t w, int64_t k, int64_t r, int64_t s) -> bool {
         cudnnHandle_t handle;
 
-        checkCudnnErr(cudnnCreate(&handle));
+        CUDNN_CHECK(cudnnCreate(&handle));
 
         auto graph = build_and_validate_graph_helper(n, c, h, w, k, r, s);
 
@@ -129,7 +129,7 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
 
         std::vector<uint8_t> serialized_data;
 
-        checkCudnnErr(cudnnCreate(&handle));
+        CUDNN_CHECK(cudnnCreate(&handle));
 
         auto graph = build_and_validate_graph_helper(n, c, h, w, k, r, s);
 
@@ -316,7 +316,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
                                                            float dropout_probability) -> bool {
         cudnnHandle_t handle;
 
-        checkCudnnErr(cudnnCreate(&handle));
+        CUDNN_CHECK(cudnnCreate(&handle));
 
         auto graph = build_and_validate_graph_helper(
             b, h, s_q, s_kv, d, is_attn_scale, is_inference, use_dropout_with_rng, dropout_probability);
@@ -345,7 +345,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
 
         std::vector<uint8_t> serialized_data;
 
-        checkCudnnErr(cudnnCreate(&handle));
+        CUDNN_CHECK(cudnnCreate(&handle));
 
         auto graph = build_and_validate_graph_helper(
             b, h, s_q, s_kv, d, is_attn_scale, is_inference, use_dropout_with_rng, dropout_probability);
@@ -384,7 +384,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
         serialize(b, h, s_q, s_kv, d, is_attn_scale, is_inference, use_dropout_with_rng, dropout_probability);
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     auto graph = deserialize(handle, serialize_data);
 
@@ -417,5 +417,5 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 
-    checkCudnnErr(cudnnDestroy(handle));
+    CUDNN_CHECK(cudnnDestroy(handle));
 }

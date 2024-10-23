@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -21,7 +21,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
-#include "../../utils/helpers.h"
+#include "../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
@@ -51,11 +51,8 @@ TEST_CASE("LayerNorm Training", "[layernorm][graph]") {
                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
                                  .set_data_type(fe::DataType_t::FLOAT));
 
-    auto epsilon = graph.tensor(fe::graph::Tensor_attributes()
-                                    .set_name("epsilon")
-                                    .set_dim({1, 1, 1, 1})
-                                    .set_stride({1, 1, 1, 1})
-                                    .set_data_type(fe::DataType_t::FLOAT));
+    float epsilon_cpu = 1e-05f;
+    auto epsilon      = graph.tensor(epsilon_cpu);
 
     auto layernorm_options =
         fe::graph::Layernorm_attributes().set_forward_phase(fe::NormFwdPhase_t::TRAINING).set_epsilon(epsilon);
@@ -72,7 +69,7 @@ TEST_CASE("LayerNorm Training", "[layernorm][graph]") {
         SKIP("ConvBNFprop requires Ampere and up");
     }
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.validate().is_good());
 
@@ -89,7 +86,6 @@ TEST_CASE("LayerNorm Training", "[layernorm][graph]") {
     Surface<float> Var_tensor(batch_size * seq_length, false);
     Surface<float> Scale_tensor(hidden_size, false);
     Surface<float> Bias_tensor(hidden_size, false);
-    float epsilon_cpu = 1e-05f;
     Surface<half> Y_tensor(batch_size * seq_length * hidden_size, false);
 
     int64_t workspace_size;
@@ -102,7 +98,6 @@ TEST_CASE("LayerNorm Training", "[layernorm][graph]") {
         {inv_variance, Var_tensor.devPtr},
         {scale, Scale_tensor.devPtr},
         {bias, Bias_tensor.devPtr},
-        {epsilon, &epsilon_cpu},
         {Y, Y_tensor.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
@@ -136,11 +131,8 @@ TEST_CASE("LayerNorm Inference", "[layernorm][graph]") {
                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
                                  .set_data_type(fe::DataType_t::FLOAT));
 
-    auto epsilon = graph.tensor(fe::graph::Tensor_attributes()
-                                    .set_name("epsilon")
-                                    .set_dim({1, 1, 1, 1})
-                                    .set_stride({1, 1, 1, 1})
-                                    .set_data_type(fe::DataType_t::FLOAT));
+    float epsilon_cpu = 1e-05f;
+    auto epsilon      = graph.tensor(epsilon_cpu);
 
     auto layernorm_options =
         fe::graph::Layernorm_attributes().set_forward_phase(fe::NormFwdPhase_t::INFERENCE).set_epsilon(epsilon);
@@ -157,7 +149,7 @@ TEST_CASE("LayerNorm Inference", "[layernorm][graph]") {
         SKIP("ConvBNFprop requires Ampere and up");
     }
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.validate().is_good());
 
@@ -172,7 +164,6 @@ TEST_CASE("LayerNorm Inference", "[layernorm][graph]") {
     Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
     Surface<float> Scale_tensor(hidden_size, false);
     Surface<float> Bias_tensor(hidden_size, false);
-    float epsilon_cpu = 1e-05f;
     Surface<half> Y_tensor(batch_size * seq_length * hidden_size, false);
 
     int64_t workspace_size;
@@ -180,11 +171,7 @@ TEST_CASE("LayerNorm Inference", "[layernorm][graph]") {
     Surface<int8_t> workspace(workspace_size, false);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
-        {X, X_tensor.devPtr},
-        {scale, Scale_tensor.devPtr},
-        {bias, Bias_tensor.devPtr},
-        {epsilon, &epsilon_cpu},
-        {Y, Y_tensor.devPtr}};
+        {X, X_tensor.devPtr}, {scale, Scale_tensor.devPtr}, {bias, Bias_tensor.devPtr}, {Y, Y_tensor.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 
@@ -240,7 +227,7 @@ TEST_CASE("LayerNorm Backward", "[layernorm][graph]") {
         SKIP("LayerNorm Backward requires Ampere and up");
     }
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.validate().is_good());
 

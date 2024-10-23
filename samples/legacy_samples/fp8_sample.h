@@ -33,9 +33,9 @@
 #include <functional>
 
 #include <cudnn.h>
-#include "../utils/fp16_dev.h"
-#include "../utils/fp16_emu.h"
-#include "../utils/helpers.h"
+#include "./utils/fp16_dev.h"
+#include "./utils/fp16_emu.h"
+#include "./utils/helpers.h"
 
 void
 run_fp8_conv_scale(int64_t* x_dim,

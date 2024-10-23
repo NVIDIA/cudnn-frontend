@@ -95,14 +95,14 @@ struct nlohmann::adl_serializer<nv_bfloat16> {
 };
 
 template <>
-struct nlohmann::adl_serializer<std::variant<int32_t, half, float, nv_bfloat16>> {
+struct nlohmann::adl_serializer<std::variant<int64_t, int32_t, half, float, nv_bfloat16>> {
     static void
-    to_json(nlohmann::json& j, const std::variant<int32_t, half, float, nv_bfloat16>& data) {
+    to_json(nlohmann::json& j, const std::variant<int64_t, int32_t, half, float, nv_bfloat16>& data) {
         std::visit([&](const auto& v) { j = {{"index", data.index()}, {"value", v}}; }, data);
     }
 
     static void
-    from_json(const nlohmann::json& j, std::variant<int32_t, half, float, nv_bfloat16>& data) {
+    from_json(const nlohmann::json& j, std::variant<int64_t, int32_t, half, float, nv_bfloat16>& data) {
         if (!j.is_object() || !j.contains("index") || !j.contains("value")) {
             return;
         }
@@ -111,10 +111,12 @@ struct nlohmann::adl_serializer<std::variant<int32_t, half, float, nv_bfloat16>>
         if (type_index == 0) {
             data = j.at("value").get<int32_t>();
         } else if (type_index == 1) {
-            data = j.at("value").get<half>();
+            data = j.at("value").get<int32_t>();
         } else if (type_index == 2) {
-            data = j.at("value").get<float>();
+            data = j.at("value").get<half>();
         } else if (type_index == 3) {
+            data = j.at("value").get<float>();
+        } else if (type_index == 4) {
             data = j.at("value").get<nv_bfloat16>();
         } else {
             return;
@@ -253,6 +255,11 @@ to_string(cudnnBackendBehaviorNote_t note) {
             return std::string("CUDNN_BEHAVIOR_NOTE_REQUIRES_BIAS_INT8x32_REORDER");
         case CUDNN_BEHAVIOR_NOTE_TYPE_COUNT:
             return std::string("CUDNN_BEHAVIOR_NOTE_TYPE_COUNT");
+            // If none of the above cases hit, its definitely strict nan prop and should raise an error.
+#if (CUDNN_VERSION >= 90500)
+        case CUDNN_BEHAVIOR_NOTE_SUPPORTS_CUDA_GRAPH_NATIVE_API:
+            return std::string("CUDNN_BEHAVIOR_NOTE_SUPPORTS_CUDA_GRAPH_NATIVE_API");
+#endif
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
             return std::string("UNKNOWN_BEHAVIOR_NOTE");
@@ -443,7 +450,8 @@ enum class DescriptorType_t {
     OPERATION_NORM_BACKWARD_DESCRIPTOR,
     OPERATION_RESHAPE_DESCRIPTOR,
     RNG_DESCRIPTOR,
-    OPERATION_RNG_DESCRIPTOR
+    OPERATION_RNG_DESCRIPTOR,
+    OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR
 };
 
 enum class NormMode_t {
@@ -593,6 +601,7 @@ enum class BehaviorNote_t {
     RUNTIME_COMPILATION,
     REQUIRES_FILTER_INT8x32_REORDER,
     REQUIRES_BIAS_INT8x32_REORDER,
+    SUPPORTS_CUDA_GRAPH_NATIVE_API,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(BehaviorNote_t,
@@ -600,6 +609,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(BehaviorNote_t,
                                  {BehaviorNote_t::RUNTIME_COMPILATION, "RUNTIME_COMPILATION"},
                                  {BehaviorNote_t::REQUIRES_FILTER_INT8x32_REORDER, "REQUIRES_FILTER_INT8x32_REORDER"},
                                  {BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER, "REQUIRES_BIAS_INT8x32_REORDER"},
+                                 {BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API, "SUPPORTS_CUDA_GRAPH_NATIVE_API"},
                              })
 
 enum class NumericalNote_t {
@@ -882,6 +892,9 @@ operator<<(std::ostream& os, const DescriptorType_t& mode) {
             break;
         case DescriptorType_t::OPERATION_RNG_DESCRIPTOR:
             os << "OPERATION_RNG_DESCRIPTOR";
+            break;
+        case DescriptorType_t::OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR:
+            os << "OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR";
             break;
         case DescriptorType_t::NOT_SET:
             os << "NOT_SET";
@@ -1285,6 +1298,14 @@ convert_to_cudnn_type(cudnn_frontend::BehaviorNote_t const mode, cudnnBackendBeh
         case BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER:
             cudnn_mode = CUDNN_BEHAVIOR_NOTE_REQUIRES_BIAS_INT8x32_REORDER;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API:
+#if (CUDNN_VERSION >= 90500)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90300, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_BEHAVIOR_NOTE_SUPPORTS_CUDA_GRAPH_NATIVE_API;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
     }
     return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 }
@@ -1415,6 +1436,13 @@ convert_to_cudnn_type(cudnn_frontend::DescriptorType_t const mode, cudnnBackendD
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
 #else
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
+
+        case DescriptorType_t::OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR:
+#if (CUDNN_VERSION >= 90500)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90500, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_BACKEND_OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
 #endif
 
 #ifndef NO_DEFAULT_IN_SWITCH
@@ -1790,6 +1818,11 @@ convert_from_cudnn_type(cudnnBackendDescriptorType_t const cudnn_mode) {
             return DescriptorType_t::RNG_DESCRIPTOR;
         case CUDNN_BACKEND_OPERATION_RNG_DESCRIPTOR:
             return DescriptorType_t::OPERATION_RNG_DESCRIPTOR;
+#endif
+
+#if (CUDNN_VERSION >= 90500)
+        case CUDNN_BACKEND_OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR:
+            return DescriptorType_t::OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR;
 #endif
 
 #ifndef NO_DEFAULT_IN_SWITCH
