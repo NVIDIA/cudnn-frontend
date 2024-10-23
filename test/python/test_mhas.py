@@ -1,3 +1,13 @@
+"""
+This test harness allows for testing the various options of the attention operator. See example usage under "main" below.
+
+The full documentation on the attention operator can be found in: https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Attention.md#scaled-dot-product-attention
+
+Notebooks that demonstrate the attention operator can be found here:
+- Introductory example: https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/50_scaled_dot_product_attention.ipynb
+- Example with paged caches: https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/samples/python/52_scaled_dot_product_attention_with_paged_caches.ipynb
+"""
+
 import cudnn
 import pytest
 import torch
@@ -21,6 +31,7 @@ sliding_window_mask_options = [False, True]
 dropout_options = [False, True]
 ragged_options = [False, True]
 is_infer_options = [False, True]
+page_table_options = [False, True]
 
 
 def convert_to_cudnn_type(torch_type):
@@ -424,6 +435,7 @@ def convert_ragged_to_uniform(ragged_tensor, seq_len):
 @pytest.mark.parametrize("is_padding", padding_mask_options, ids=lambda p: f"padding{int(p)}")
 @pytest.mark.parametrize("is_alibi", alibi_mask_options, ids=lambda p: f"alibi{int(p)}")
 @pytest.mark.parametrize("is_bias", bias_options, ids=lambda p: f"bias{int(p)}")
+@pytest.mark.parametrize("is_paged_attention", page_table_options, ids=lambda p: f"paged{int(p)}")
 @pytest.mark.parametrize("head_group", head_group_options)
 @pytest.mark.parametrize("layout", layout_options)
 @pytest.mark.parametrize("input_type", input_type_options, ids=lambda p: str(p))
@@ -433,6 +445,7 @@ def test_sdpa(
     input_type,
     layout,
     head_group,
+    is_paged_attention,
     is_bias,
     is_alibi,
     is_padding,
@@ -445,6 +458,8 @@ def test_sdpa(
     request,
     cudnn_handle
 ):
+    
+    #pytest.set_trace()
 
     cudnn_version = LooseVersion(cudnn.backend_version_string())
 
@@ -477,6 +492,10 @@ def test_sdpa(
 
     if is_ragged and not is_padding:
         pytest.skip("Ragged tensor is only tested with packed variable length tensors")
+
+    if is_paged_attention and (not is_padding or cudnn_version < "9.4" or not layout == "bshd_bshd_bshd" or is_ragged):
+        pytest.skip("Paged attention is only tested with packed variable length tensors, thd_thd_thd, no ragged offsets, and only on cuDNNv9.4 or greater")
+
 
     # -------------------------- default randomized parameter testing ------------------------
     # batch size
@@ -511,6 +530,9 @@ def test_sdpa(
     else:
         assert False, "Head group must be either MHA, GQA, or MQA"
 
+    # block size for paged attention
+    block_size = random.choice([32, 64, 128])
+
     # -------------------------- override test parameters if args are provided ----------------
     b = int(request.config.option.mha_b) if request.config.option.mha_b != None else b
     s_q = int(request.config.option.mha_s_q) if request.config.option.mha_s_q != None else s_q
@@ -520,6 +542,7 @@ def test_sdpa(
     h_q = int(request.config.option.mha_h_q) if request.config.option.mha_h_q != None else h_q
     h_k = int(request.config.option.mha_h_k) if request.config.option.mha_h_k != None else h_k
     h_v = int(request.config.option.mha_h_v) if request.config.option.mha_h_v != None else h_v
+    block_size = int(request.config.option.mha_block_size) if request.config.option.mha_block_size != None else block_size
 
     if d_qk != d_v and cudnn_version < "8.9.6":
         pytest.skip("d_qk != d_v is only supported on 8.9.6 onwards.")
@@ -532,7 +555,7 @@ def test_sdpa(
 
     print("\n=============== TEST CMD TO REPRODUCE ===============")
     print(
-        f"pytest {request.node.nodeid} --mha_b={b} --mha_s_q={s_q} --mha_s_kv={s_kv} --mha_d_qk={d_qk} --mha_d_v={d_v} --mha_h_q={h_q} --mha_h_k={h_k} --mha_h_v={h_v}"
+        f"pytest {request.node.nodeid} --mha_b={b} --mha_s_q={s_q} --mha_s_kv={s_kv} --mha_d_qk={d_qk} --mha_d_v={d_v} --mha_h_q={h_q} --mha_h_k={h_k} --mha_h_v={h_v} --mha_block_size={block_size}"
     )
     print("=====================================================")
 
@@ -619,6 +642,35 @@ def test_sdpa(
         else None
     )
 
+    def create_container_and_page_table(tensor, block_size):
+        B, H, S, D = tensor.shape
+        # num_blocks = math.ceil(S/block_size) * B
+        blocks_per_batch = math.ceil(S/block_size)
+
+        padding_seq = (blocks_per_batch * block_size) - S
+        if padding_seq > 0:
+            zeros = torch.zeros(B,H,padding_seq,D, device='cuda', dtype=tensor.dtype)
+            cat_tensor = torch.cat((tensor, zeros), axis = 2)
+        else:
+            cat_tensor = tensor
+
+        reshaped = torch.cat((cat_tensor.clone()).chunk(blocks_per_batch, dim=2), dim=0)
+
+        table_size = math.ceil(S/block_size)
+        page_table = torch.linspace(0, B*table_size-1, B*table_size, device='cuda', dtype=torch.int32).reshape(table_size,1,B,1)
+        page_table = torch.transpose(page_table,0,2)
+
+        return(reshaped, page_table)
+
+
+    container_k_gpu = None
+    container_v_gpu = None
+    page_table_k_gpu = None
+    page_table_v_gpu = None
+    if is_paged_attention:
+        container_k_gpu, page_table_k_gpu = create_container_and_page_table(k_gpu, block_size)
+        container_v_gpu, page_table_v_gpu = create_container_and_page_table(v_gpu, block_size)
+
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
@@ -631,8 +683,11 @@ def test_sdpa(
     )
 
     q = graph.tensor_like(q_gpu)
-    k = graph.tensor_like(k_gpu)
-    v = graph.tensor_like(v_gpu)
+    k = graph.tensor_like(k_gpu) if not is_paged_attention else graph.tensor_like(container_k_gpu)
+    v = graph.tensor_like(v_gpu) if not is_paged_attention else graph.tensor_like(container_v_gpu)
+
+    page_table_k = graph.tensor_like(page_table_k_gpu) if is_paged_attention else None
+    page_table_v = graph.tensor_like(page_table_v_gpu) if is_paged_attention else None
 
     bias = graph.tensor_like(bias_gpu) if is_bias else None
 
@@ -660,6 +715,8 @@ def test_sdpa(
     if is_sliding_window:
         sliding_window_length = s_kv // 4
 
+
+    
     o, stats = graph.sdpa(
         name="sdpa",
         q=q,
@@ -677,6 +734,9 @@ def test_sdpa(
         sliding_window_length=sliding_window_length,
         dropout=dropout_tuple if is_dropout else None,
         rng_dump=rng_dump,
+        paged_attention_k_table=page_table_k,
+        paged_attention_v_table=page_table_v,
+        paged_attention_max_seq_len_kv=s_kv if is_paged_attention else None
     )
 
     o.set_output(True).set_dim(shape_o).set_stride(stride_o)
@@ -689,19 +749,21 @@ def test_sdpa(
     try:
         graph.validate()
     except cudnn.cudnnGraphNotSupportedError as e:
+        print("Graph not supported")
         pytest.xfail(repr(e))
     except Exception as e:
         pytest.fail(repr(e))
 
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    #graph.create_execution_plans([cudnn.heur_mode.FALLBACK])
     graph.check_support()
     graph.build_plans()
 
     variant_pack = {
         q: q_gpu,
-        k: k_gpu,
-        v: v_gpu,
+        k: k_gpu if not is_paged_attention else container_k_gpu,
+        v: v_gpu if not is_paged_attention else container_v_gpu,
         bias: bias_gpu,
         seq_len_q: seq_len_q_gpu,
         seq_len_kv: seq_len_kv_gpu,
@@ -712,6 +774,8 @@ def test_sdpa(
         o: o_gpu,
         stats: stats_gpu,
         rng_dump: rng_dump_gpu,
+        page_table_k: page_table_k_gpu,
+        page_table_v: page_table_v_gpu
     }
 
     if is_dropout:
@@ -846,9 +910,6 @@ def test_sdpa_backward(
 
     if is_ragged and not (layout == "bshd_bshd_bshd" or layout == "bs3hd"):
         pytest.skip("Ragged tensor is only tested with thd_thd_thd and t3hd")
-
-    if is_ragged and head_group != "multi_head":
-        pytest.skip("Ragged offset is only supported with multi_head")
 
     if is_ragged and layout == "bs3hd" and cudnn_version < "9.1.0":
         pytest.skip("t3hd is only supported on 9.1.0 onwards")
@@ -1342,7 +1403,7 @@ if __name__ == "__main__":
     # ================== forward ==================
     """
     pytest \
-      test/python_fe/test_mhas.py::test_sdpa[torch.float16-bshd_bshd_bshd-group_query-bias0-alibi0-padding0-causal0-causal_bottom_right0-sliding_window0-dropout0-ragged0-infer0] \
+      test/python/test_mhas.py::test_sdpa[torch.float16-bshd_bshd_bshd-group_query-paged0-bias0-alibi0-padding0-causal0-causal_bottom_right0-sliding_window0-dropout0-ragged0-infer0] \
       -s \
       --mha_b 3 \
       --mha_s_q 256 \
@@ -1357,7 +1418,7 @@ if __name__ == "__main__":
     # ================== backward ==================
     """
     pytest \
-      test/python_fe/test_mhas.py::test_sdpa_backward[torch.float16-bshd_bshd_bshd-group_query-bias0-alibi0-padding0-causal0-causal_bottom_right0-sliding_window0-dropout0-ragged0] \
+      test/python/test_mhas.py::test_sdpa_backward[torch.float16-bshd_bshd_bshd-group_query-bias0-alibi0-padding0-causal0-causal_bottom_right0-sliding_window0-dropout0-ragged0] \
       -s \
       --mha_b 3 \
       --mha_s_q 256 \

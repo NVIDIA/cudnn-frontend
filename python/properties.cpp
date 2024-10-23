@@ -3,6 +3,8 @@
 #include "pybind11/pybind11.h"
 #include "pybind11/cast.h"
 #include "pybind11/stl.h"
+#include "pybind11/complex.h"
+#include "pybind11/functional.h"
 
 #include "cudnn_frontend.h"
 
@@ -49,6 +51,13 @@ class HandleManagement {
         return reinterpret_cast<std::intptr_t>(streamId);
     }
 };
+
+std::shared_ptr<cudnn_frontend::KernelCache>
+create_kernel_cache_helper() {
+    auto kernel_cache = std::make_shared<cudnn_frontend::KernelCache>();
+    throw_if(kernel_cache == nullptr, cudnn_frontend::error_code_t::INVALID_VALUE, "kernel cache creation failed");
+    return kernel_cache;
+}
 
 static std::string
 get_last_error_string() {
@@ -109,6 +118,9 @@ init_properties(py::module_& m) {
 
     m.def("get_last_error_string", &get_last_error_string);
 
+    py::class_<cudnn_frontend::KernelCache, std::shared_ptr<cudnn_frontend::KernelCache>>(m, "kernel_cache");
+    m.def("create_kernel_cache", &create_kernel_cache_helper);
+
     m.def("create_handle", &HandleManagement::create_handle);
     m.def("destroy_handle", &HandleManagement::destroy_handle);
     m.def("get_stream", &HandleManagement::get_stream);
@@ -159,8 +171,28 @@ init_properties(py::module_& m) {
     py::enum_<cudnn_frontend::BehaviorNote_t>(m, "behavior_note")
         .value("RUNTIME_COMPILATION", cudnn_frontend::BehaviorNote_t::RUNTIME_COMPILATION)
         .value("REQUIRES_FILTER_INT8x32_REORDER", cudnn_frontend::BehaviorNote_t::REQUIRES_FILTER_INT8x32_REORDER)
-        .value("REQUIRES_BIAS_INT8x32_REORDER", cudnn_frontend::BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER);
+        .value("REQUIRES_BIAS_INT8x32_REORDER", cudnn_frontend::BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER)
+        .value("SUPPORTS_CUDA_GRAPH_NATIVE_API", cudnn_frontend::BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API);
 }
 
 }  // namespace python_bindings
 }  // namespace cudnn_frontend
+
+// namespace pybind11 {
+//     namespace detail {
+//     template <> struct type_caster<std::shared_ptr<cudnn_frontend::KernelCache>> {
+//     public:
+//         PYBIND11_TYPE_CASTER(std::shared_ptr<cudnn_frontend::KernelCache>, _("KernelCachePtr"));
+
+//         bool load(handle , bool) {
+//             return false; // Prevent Python -> C++ conversion
+//         }
+
+//         static handle cast(std::shared_ptr<cudnn_frontend::KernelCache> src, return_value_policy, handle) {
+//             if (!src) return none().release();
+//             return capsule(new std::shared_ptr<cudnn_frontend::KernelCache>(std::move(src)),
+//                            [](void *ptr) { delete static_cast<std::shared_ptr<cudnn_frontend::KernelCache>*>(ptr);
+//                            }).release();
+//         }
+//     };
+// }} // namespace pybind11::detail

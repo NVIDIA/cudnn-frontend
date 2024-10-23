@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -21,7 +21,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
-#include "../../utils/helpers.h"
+#include "../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
@@ -45,12 +45,8 @@ TEST_CASE("RmsNorm Training", "[rmsnorm][graph]") {
                                   .set_stride({hidden_size, 1, hidden_size, hidden_size})
                                   .set_data_type(fe::DataType_t::FLOAT));
 
-    auto epsilon = graph.tensor(fe::graph::Tensor_attributes()
-                                    .set_name("epsilon")
-                                    .set_dim({1, 1, 1, 1})
-                                    .set_stride({1, 1, 1, 1})
-                                    .set_is_pass_by_value(true)
-                                    .set_data_type(fe::DataType_t::FLOAT));
+    float epsilon_cpu = 1e-05f;
+    auto epsilon      = graph.tensor(epsilon_cpu);
 
     auto rmsnorm_options =
         fe::graph::Rmsnorm_attributes().set_forward_phase(fe::NormFwdPhase_t::TRAINING).set_epsilon(epsilon);
@@ -65,7 +61,7 @@ TEST_CASE("RmsNorm Training", "[rmsnorm][graph]") {
         SKIP("RMSNorm requires Ampere and up");
     }
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.validate().is_good());
 
@@ -80,7 +76,6 @@ TEST_CASE("RmsNorm Training", "[rmsnorm][graph]") {
     Surface<float> X_tensor(batch_size * seq_length * hidden_size, false);
     Surface<float> Var_tensor(batch_size * seq_length, false);
     Surface<float> Scale_tensor(hidden_size, false);
-    float epsilon_cpu = 1e-05f;
     Surface<float> Y_tensor(batch_size * seq_length * hidden_size, false);
 
     int64_t workspace_size;
@@ -88,11 +83,7 @@ TEST_CASE("RmsNorm Training", "[rmsnorm][graph]") {
     Surface<int8_t> workspace(workspace_size, false);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
-        {X, X_tensor.devPtr},
-        {inv_variance, Var_tensor.devPtr},
-        {scale, Scale_tensor.devPtr},
-        {epsilon, &epsilon_cpu},
-        {Y, Y_tensor.devPtr}};
+        {X, X_tensor.devPtr}, {inv_variance, Var_tensor.devPtr}, {scale, Scale_tensor.devPtr}, {Y, Y_tensor.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 
@@ -124,12 +115,8 @@ TEST_CASE("RmsNorm Inference", "[rmsnorm][graph]") {
                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
                                  .set_data_type(fe::DataType_t::FLOAT));
 
-    auto epsilon = graph.tensor(fe::graph::Tensor_attributes()
-                                    .set_name("epsilon")
-                                    .set_dim({1, 1, 1, 1})
-                                    .set_stride({1, 1, 1, 1})
-                                    .set_is_pass_by_value(true)
-                                    .set_data_type(fe::DataType_t::FLOAT));
+    float epsilon_cpu = 1e-05f;
+    auto epsilon      = graph.tensor(epsilon_cpu);
 
     auto rmsnorm_options = fe::graph::Rmsnorm_attributes()
                                .set_forward_phase(fe::NormFwdPhase_t::INFERENCE)
@@ -146,7 +133,7 @@ TEST_CASE("RmsNorm Inference", "[rmsnorm][graph]") {
         SKIP("RmsNorm requires Ampere and up");
     }
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.validate().is_good());
 
@@ -161,7 +148,6 @@ TEST_CASE("RmsNorm Inference", "[rmsnorm][graph]") {
     Surface<float> X_tensor(batch_size * seq_length * hidden_size, false);
     Surface<float> Scale_tensor(hidden_size, false);
     Surface<float> Bias_tensor(hidden_size, false);
-    float epsilon_cpu = 1e-05f;
     Surface<float> Y_tensor(batch_size * seq_length * hidden_size, false);
 
     int64_t workspace_size;
@@ -169,11 +155,7 @@ TEST_CASE("RmsNorm Inference", "[rmsnorm][graph]") {
     Surface<int8_t> workspace(workspace_size, false);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
-        {X, X_tensor.devPtr},
-        {scale, Scale_tensor.devPtr},
-        {bias, Bias_tensor.devPtr},
-        {epsilon, &epsilon_cpu},
-        {Y, Y_tensor.devPtr}};
+        {X, X_tensor.devPtr}, {scale, Scale_tensor.devPtr}, {bias, Bias_tensor.devPtr}, {Y, Y_tensor.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 
@@ -224,7 +206,7 @@ TEST_CASE("RmsNorm Backward", "[rmsnorm][graph]") {
         SKIP("RmsNorm Backward requires Ampere and up");
     }
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.validate().is_good());
 

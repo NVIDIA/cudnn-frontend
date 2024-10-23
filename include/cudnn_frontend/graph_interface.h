@@ -30,7 +30,7 @@
 
 namespace cudnn_frontend::graph {
 
-class Graph : public INode {
+class Graph : public ICudnn, public INode {
    private:
     std::unordered_set<std::shared_ptr<Tensor_attributes>> full_graph_inputs;
     std::unordered_set<Tensor_attributes::uid_t> used_uids;
@@ -75,6 +75,9 @@ class Graph : public INode {
             (is_dynamic_shape_enabled || kernel_cache != nullptr) && detail::get_backend_version() < 90400,
             error_code_t::GRAPH_NOT_SUPPORTED,
             "Dynamic shapes or kernel caching enabled, but cuDNN version < 9.4!");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(((is_dynamic_shape_enabled == false) && (kernel_cache != nullptr)),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Kernel caching enabled but dynamic shapes is disabled");
         return {error_code_t::OK, ""};
     }
 
@@ -99,8 +102,9 @@ class Graph : public INode {
 
     virtual error_t
     collect_tensors_in_workspace_node(
-        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> &worskspace_modifications,
-        int64_t &) const {
+        std::unordered_map<Tensor_attributes::uid_t, std::tuple<int64_t, int64_t, std::vector<float>>>
+            &worskspace_modifications,
+        int64_t &) const override {
         for (auto [uid, value] : deserialized_workspace_modifications) {
             worskspace_modifications.emplace(uid, value);
         }
@@ -137,6 +141,8 @@ class Graph : public INode {
                 tensor_to_pointer_map.emplace(uid, nv_bfloat16_value_ptr);
             } else if (int32_t *int32_t_value_ptr = std::get_if<int32_t>(&value)) {
                 tensor_to_pointer_map.emplace(uid, int32_t_value_ptr);
+            } else if (int64_t *int64_t_value_ptr = std::get_if<int64_t>(&value)) {
+                tensor_to_pointer_map.emplace(uid, int64_t_value_ptr);
             } else if (float *float_value_ptr = std::get_if<float>(&value)) {
                 tensor_to_pointer_map.emplace(uid, float_value_ptr);
             } else {
@@ -222,6 +228,293 @@ class Graph : public INode {
 
    public:
     Graph() : INode(detail::Context{}) {}
+
+    error_t
+    update_cuda_graph(cudnnHandle_t handle,
+                      std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
+                      void *workspace,
+                      cudaGraph_t cudnn_cuda_graph) {
+        // First get all the uids from the map
+        std::unordered_map<Tensor_attributes::uid_t, void *> tensor_uid_to_pointer_map;
+        tensor_uid_to_pointer_map.reserve(tensor_to_pointer_map.size());
+        for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
+            tensor_uid_to_pointer_map.emplace(tensor->get_uid(), pointer);
+        }
+
+        return update_cuda_graph(handle, tensor_uid_to_pointer_map, workspace, cudnn_cuda_graph);
+    }
+
+    error_t
+    update_cuda_graph(cudnnHandle_t handle,
+                      std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
+                      void *workspace,
+                      cudaGraph_t cudnn_cuda_graph) {
+        // Initializes this cudnn graph
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            cudnn_cuda_graph == nullptr, error_code_t::INVALID_VALUE, "cudnn_cuda_graph should not be a nullptr");
+
+        size_t num_root_nodes;
+        CHECK_CUDA_ERROR(detail::cuda_graph_get_root_nodes(cudnn_cuda_graph, nullptr, &num_root_nodes));
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            num_root_nodes != 1, error_code_t::INVALID_VALUE, "cudnn_cuda_graph should have exactly 1 root node.");
+
+        cudaGraphNode_t current_node = nullptr;
+        CHECK_CUDA_ERROR(detail::cuda_graph_get_root_nodes(cudnn_cuda_graph, &current_node, &num_root_nodes));
+
+        ///////////////////////////////////////
+        //// PASS BY VALUE TENSOR HANDLING ////
+        ///////////////////////////////////////
+        // Add pass_by_value data pointers to uid_to_pointer map
+        // object lifetime is controlled by tensor_to_pass_by_value which means the pointer should stay valid while
+        // making the cuda graph. cuda graph will then keep a copy of the kernel parameters, meaning that at the time of
+        // launching the cuda_graph executable, tensor_to_pass_by_value being deallocated does not affect these cpu
+        // value's.
+        // No cuda graph nodes are required for handling fe owned pass by value tensors.
+        std::unordered_map<uid_t, pass_by_values_t> tensor_to_pass_by_value;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            extend_tensor_map_with_pass_by_value_tensors_(uid_to_device_ptrs, tensor_to_pass_by_value));
+
+        // Make sure device pointer is provided for all uids expected for this plan
+        std::vector<void *> device_ptrs;
+        std::vector<uid_t> uids;
+
+        device_ptrs.reserve(variant_pack_uids.size());
+        uids.reserve(variant_pack_uids.size());
+
+        for (auto const &uid : variant_pack_uids) {
+            auto search = uid_to_device_ptrs.find(uid);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(search == uid_to_device_ptrs.end(),
+                                           error_code_t::INVALID_VARIANT_PACK,
+                                           "Uid " + std::to_string(uid) + " does not exist in variant pack.");
+            device_ptrs.push_back(search->second);
+            uids.push_back(uid);
+        }
+
+        ////////////////////////////
+        //// WORKSPACE HANDLING ////
+        ////////////////////////////
+        // Get all types of extra calls that FE has to do on user workspace.
+        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> workspace_modifications;
+        int64_t workspace_offset = 0;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_in_workspace_subtree(workspace_modifications, workspace_offset));
+
+        for (auto const &[uid, data] : workspace_modifications) {
+            (void)uid;
+            const auto &[operation_type, offset, vec_data] = data;
+
+            // 0 means memcpy
+            if (operation_type == 0) {
+                CHECK_CUDA_ERROR(
+                    detail::cuda_graph_add_memcpy_node_set_params_1D(current_node,
+                                                                     static_cast<char *>(workspace) + offset,
+                                                                     vec_data.data(),
+                                                                     vec_data.size() * sizeof(float),
+                                                                     cudaMemcpyHostToDevice));
+            }
+            // 1 means memset
+            else if (operation_type == 1) {
+                // offset from workspace
+                void *device_ptr    = static_cast<char *>(workspace) + offset;
+                int64_t memset_size = static_cast<int64_t>(vec_data[0]);
+
+                cudaMemsetParams params;
+                params.dst         = device_ptr;
+                params.elementSize = sizeof(char);
+                params.value       = 0x0;
+                params.width       = memset_size;
+                params.height      = 1;  // 1D memset currently
+                params.pitch       = 0;  // unused
+
+                CHECK_CUDA_ERROR(detail::cuda_graph_add_memset_node_set_params(current_node, &params));
+            }
+            // Other values do not correspond to cuda APIs
+
+            CHECK_CUDA_ERROR(detail::cuda_graph_node_get_dependent_nodes(current_node, nullptr, &num_root_nodes));
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                num_root_nodes != 1, error_code_t::INVALID_VALUE, "cudnn_cuda_graph should have exactly 1 root node.");
+            CHECK_CUDA_ERROR(detail::cuda_graph_node_get_dependent_nodes(current_node, &current_node, &num_root_nodes));
+        }
+
+        ///////////////////
+        //// BE GRAPH ////
+        ///////////////////
+        cudaGraph_t backend_cuda_graph;
+        CHECK_CUDA_ERROR(detail::cuda_graph_child_graph_node_get_graph(current_node, &backend_cuda_graph));
+
+        detail::backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(variant_pack_descriptor.get_status() != CUDNN_STATUS_SUCCESS,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       "Failed to create variant pack's backend descriptor.");
+
+        CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, workspace));
+
+        int64_t candidate = plans.candidate;
+        CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(candidate));
+        CHECK_CUDNN_ERROR(detail::update_cuda_graph(handle,
+                                                    plans.execution_plans[candidate]->get_raw_desc(),
+                                                    variant_pack_descriptor.get_ptr(),
+                                                    backend_cuda_graph));
+
+        // There should be nothing after the backend graph
+        CHECK_CUDA_ERROR(detail::cuda_graph_node_get_dependent_nodes(current_node, nullptr, &num_root_nodes));
+        RETURN_CUDNN_FRONTEND_ERROR_IF(num_root_nodes != 0,
+                                       error_code_t::INVALID_VALUE,
+                                       "cudnn_cuda_graph should have no graph nodes after the backend graph node.");
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    populate_cuda_graph(cudnnHandle_t handle,
+                        std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
+                        void *workspace,
+                        cudaGraph_t cudnn_cuda_graph) {
+        // First get all the uids from the map
+        std::unordered_map<Tensor_attributes::uid_t, void *> tensor_uid_to_pointer_map;
+        tensor_uid_to_pointer_map.reserve(tensor_to_pointer_map.size());
+        for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
+            tensor_uid_to_pointer_map.emplace(tensor->get_uid(), pointer);
+        }
+
+        return populate_cuda_graph(handle, tensor_uid_to_pointer_map, workspace, cudnn_cuda_graph);
+    }
+
+    error_t
+    populate_cuda_graph(cudnnHandle_t handle,
+                        std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
+                        void *workspace,
+                        cudaGraph_t cudnn_cuda_graph) {
+        // Check if the cuda graph is empty
+        size_t numNodes = 0;
+        CHECK_CU_ERROR(detail::cu_graph_get_nodes(cudnn_cuda_graph, nullptr, &numNodes));
+        RETURN_CUDNN_FRONTEND_ERROR_IF(numNodes != 0,
+                                       error_code_t::INVALID_VALUE,
+                                       "cuda graph provided to populate is not empty. cuDNN requires it to be empty "
+                                       "for the corresponding update APIs to work correctly.");
+
+        // This function makes linear cuda graphs. And that makes it easy to walk
+        // the graph when updating it.
+        // So just keeping track of the last node in the cuda graph is sufficient.
+        cudaGraphNode_t last_node = nullptr;
+
+        ///////////////////////////////////////
+        //// PASS BY VALUE TENSOR HANDLING ////
+        ///////////////////////////////////////
+        // Add pass_by_value data pointers to uid_to_pointer map
+        // object lifetime is controlled by tensor_to_pass_by_value which means the pointer should stay valid while
+        // making the cuda graph. cuda graph will then keep a copy of the kernel parameters, meaning that at the time of
+        // launching the cuda_graph executable, tensor_to_pass_by_value being deallocated does not affect these cpu
+        // value's.
+        // No cuda graph nodes are required for handling fe owned pass by value tensors.
+        std::unordered_map<uid_t, pass_by_values_t> tensor_to_pass_by_value;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            extend_tensor_map_with_pass_by_value_tensors_(uid_to_device_ptrs, tensor_to_pass_by_value));
+
+        /////////////////////////////////
+        //// WORKSPACE HANDLING ////
+        /////////////////////////////////
+        // Get all types of extra calls that FE has to do on user workspace.
+        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> workspace_modifications;
+        int64_t workspace_offset = 0;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_in_workspace_subtree(workspace_modifications, workspace_offset));
+
+        for (auto const &[uid, data] : workspace_modifications) {
+            (void)uid;
+            const auto &[operation_type, offset, vec_data] = data;
+
+            cudaGraphNode_t node = nullptr;
+
+            // 0 means memcpy
+            if (operation_type == 0) {
+                CHECK_CUDA_ERROR(detail::cuda_graph_add_memcpy_node_1D(&node,
+                                                                       cudnn_cuda_graph,
+                                                                       &last_node,
+                                                                       last_node != nullptr,
+                                                                       static_cast<char *>(workspace) + offset,
+                                                                       vec_data.data(),
+                                                                       vec_data.size() * sizeof(float),
+                                                                       cudaMemcpyHostToDevice));
+            }
+            // 1 means memset
+            else if (operation_type == 1) {
+                // offset from workspace
+                void *device_ptr    = static_cast<char *>(workspace) + offset;
+                int64_t memset_size = static_cast<int64_t>(vec_data[0]);
+
+                cudaMemsetParams params;
+                params.dst         = device_ptr;
+                params.elementSize = sizeof(char);
+                params.value       = 0x0;
+                params.width       = memset_size;
+                params.height      = 1;  // 1D memset currently
+                params.pitch       = 0;  // unused
+
+                CHECK_CUDA_ERROR(detail::cuda_graph_add_memset_node(
+                    &node, cudnn_cuda_graph, &last_node, last_node != nullptr, &params));
+            }
+            // Other values do not correspond to cuda APIs
+
+            last_node = node;
+        }
+
+        //////////////
+        // BE graph //
+        //////////////
+
+        // Get the BE's cuda graph
+
+        // Make sure device pointer is provided for all uids expected for this plan
+        std::vector<void *> device_ptrs;
+        device_ptrs.reserve(variant_pack_uids.size());
+        std::vector<uid_t> uids;
+        uids.reserve(variant_pack_uids.size());
+        for (auto const &uid : variant_pack_uids) {
+            auto search = uid_to_device_ptrs.find(uid);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(search == uid_to_device_ptrs.end(),
+                                           error_code_t::INVALID_VARIANT_PACK,
+                                           "Uid " + std::to_string(uid) + " does not exist in variant pack.");
+            device_ptrs.push_back(search->second);
+            uids.push_back(uid);
+        }
+
+        // Create the variant pack to pass to backend
+        detail::backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(variant_pack_descriptor.get_status() != CUDNN_STATUS_SUCCESS,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       "Failed to create variant pack's backend descriptor.");
+        CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, workspace));
+
+        // Get the plan candidate. It only makes to sense to make cuda graph after execution plan has been built.
+        // And in that case the candidate would have been set.
+        int64_t candidate = plans.candidate;
+        CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(candidate));
+
+        // Finally get the backend cuda graph.
+        cudaGraph_t backend_cuda_graph;
+        // Initialize the cudnn cuda graph.
+        // The responsibility to destroy is on the user.
+        detail::cu_graph_create(&backend_cuda_graph, 0);  // 0 is just what the API says to pass
+
+        CHECK_CUDNN_ERROR(detail::populate_cuda_graph(handle,
+                                                      plans.execution_plans[candidate]->get_raw_desc(),
+                                                      variant_pack_descriptor.get_ptr(),
+                                                      backend_cuda_graph));
+
+        // Clone BE graph into a graph_node
+        // This same call also places the newly created into FE's graph
+        // TODO: BE graph is at the end, so put in appropriate dependencies
+        cudaGraphNode_t backend_cuda_graph_node;
+        detail::cuda_graph_add_child_graph_node(
+            &backend_cuda_graph_node, cudnn_cuda_graph, &last_node, last_node != nullptr, backend_cuda_graph);
+
+        // Destroy the BE graph as it now has been cloned into a node
+        // It was initialized by internals of backend, but the responsibility to destroy it is on FE.
+        CHECK_CUDA_ERROR(detail::cuda_graph_destroy(backend_cuda_graph));
+
+        return {error_code_t::OK, ""};
+    }
 
     error_t
     validate() {
@@ -1544,25 +1837,6 @@ Graph::rmsnorm_backward(std::shared_ptr<Tensor_attributes> dy,
 
     return {DX, DScale, DBias};
 }
-
-// inline std::array<std::shared_ptr<Tensor_attributes>, 2>
-// Graph::scaled_dot_product_attention(std::shared_ptr<Tensor_attributes> q,
-//                                     std::shared_ptr<Tensor_attributes> k,
-//                                     std::shared_ptr<Tensor_attributes> v,
-//                                     Scaled_dot_product_attention_attributes options) {
-//     // Make required output tensors
-//     auto O = options.outputs.O = output_tensor(options.get_name() + "_output");
-//     auto S = options.outputs.S = output_tensor(options.get_name() + "_softmax_output");
-
-//     // Set inputs
-//     options.inputs.Q = q;
-//     options.inputs.K = k;
-//     options.inputs.V = v;
-
-//     sub_nodes.emplace_back(std::make_unique<ScaledDotProductAttentionNode>(std::move(options), context));
-
-//     return {O, S};
-// }
 
 inline std::array<std::shared_ptr<Tensor_attributes>, 2>
 Graph::sdpa(std::shared_ptr<Tensor_attributes> q,

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -24,7 +24,7 @@
 
 #include <random>
 
-#include "../../utils/helpers.h"
+#include "../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
@@ -152,7 +152,7 @@ matmul_dynamic_shapes(bool use_abs = false, bool use_bias = false) {
 
     // Run cudnn graph
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     for (int idx_shape = 0; idx_shape < matmul_shapes_count; idx_shape++) {
         auto [graph, A, B, C, Bias] = build_new_graph(handle, idx_shape);
@@ -172,7 +172,7 @@ matmul_dynamic_shapes(bool use_abs = false, bool use_bias = false) {
         REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
     }
 
-    checkCudnnErr(cudnnDestroy(handle));
+    CUDNN_CHECK(cudnnDestroy(handle));
 }
 
 TEST_CASE("Matmul dynamic shape", "[matmul][graph][dynamic_shape]") {
@@ -238,7 +238,7 @@ TEST_CASE("Matmul", "[matmul][graph]") {
     REQUIRE(graph.validate().is_good());
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
@@ -257,7 +257,7 @@ TEST_CASE("Matmul", "[matmul][graph]") {
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {A, A_gpu.devPtr}, {B, B_gpu.devPtr}, {C, C_gpu.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-    checkCudnnErr(cudnnDestroy(handle));
+    CUDNN_CHECK(cudnnDestroy(handle));
 }
 
 TEST_CASE("Abs + Matmul", "[matmul][graph]") {
@@ -307,7 +307,7 @@ TEST_CASE("Abs + Matmul", "[matmul][graph]") {
     REQUIRE(graph.validate().is_good());
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
@@ -326,7 +326,7 @@ TEST_CASE("Abs + Matmul", "[matmul][graph]") {
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {A, A_gpu.devPtr}, {B, B_gpu.devPtr}, {C, C_gpu.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-    checkCudnnErr(cudnnDestroy(handle));
+    CUDNN_CHECK(cudnnDestroy(handle));
 }
 
 TEST_CASE("Bias + Matmul", "[matmul][graph]") {
@@ -392,7 +392,7 @@ TEST_CASE("Bias + Matmul", "[matmul][graph]") {
     REQUIRE(graph.validate().is_good());
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
@@ -435,7 +435,7 @@ TEST_CASE("Bias + Matmul", "[matmul][graph]") {
                 std::mt19937{std::random_device{}()});
     Surface<int8_t> workspace(graph.get_workspace_size_plan_at_index(random_successful.front()), false);
     REQUIRE(graph.execute_plan_at_index(handle, variant_pack, workspace.devPtr, random_successful.front()).is_good());
-    checkCudnnErr(cudnnDestroy(handle));
+    CUDNN_CHECK(cudnnDestroy(handle));
 }
 
 TEST_CASE("Matmul SBR Graph", "[matmul][graph]") {
@@ -528,7 +528,7 @@ TEST_CASE("Matmul SBR Graph", "[matmul][graph]") {
         };
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     Surface<half> x_tensor(4 * 16 * 64, false);
     Surface<half> w_tensor(4 * 64 * 32, false);
@@ -594,7 +594,7 @@ TEST_CASE("Matmul with restricted shared memory", "[matmul][graph]") {
     REQUIRE(graph.validate().is_good());
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
@@ -613,5 +613,5 @@ TEST_CASE("Matmul with restricted shared memory", "[matmul][graph]") {
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {A, A_gpu.devPtr}, {B, B_gpu.devPtr}, {C, C_gpu.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-    checkCudnnErr(cudnnDestroy(handle));
+    CUDNN_CHECK(cudnnDestroy(handle));
 }

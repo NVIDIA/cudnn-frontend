@@ -21,7 +21,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
-#include "../../utils/helpers.h"
+#include "../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
@@ -96,7 +96,7 @@ TEST_CASE("Convolution fp8 precision", "[conv][graph]") {
     REQUIRE(graph->validate().is_good());
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph->build_operation_graph(handle).is_good());
     REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
@@ -130,5 +130,5 @@ TEST_CASE("Convolution fp8 precision", "[conv][graph]") {
 
     std::cout << graph->print() << std::endl;
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
-    checkCudnnErr(cudnnDestroy(handle));
+    CUDNN_CHECK(cudnnDestroy(handle));
 }

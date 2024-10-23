@@ -25,7 +25,7 @@
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/generators/catch_generators_range.hpp>
 
-#include "../../utils/helpers.h"
+#include "../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
@@ -57,7 +57,7 @@ TEST_CASE("Parallel build", "[matmul][graph][parallel]") {
     int64_t a_uid = 0, b_uid = 1, c_uid = 2;
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     auto create_graph = [&]() -> fe::graph::Graph {
         // Make cudnn graph
@@ -148,5 +148,5 @@ TEST_CASE("Parallel build", "[matmul][graph][parallel]") {
         };
     }
 
-    checkCudnnErr(cudnnDestroy(handle));
+    CUDNN_CHECK(cudnnDestroy(handle));
 }

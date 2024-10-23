@@ -22,11 +22,12 @@
 
 #pragma once
 
-#include <ostream>
-#include <iostream>
+#include <cuda.h>
+
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
 #include <dlfcn.h>
 #include <mutex>
+#include <stdexcept>
 #endif
 
 namespace cudnn_frontend {
@@ -44,23 +45,54 @@ get_symbol(const char *function_name) {
     return ret;
 }
 
+enum class CudaLibrary { CUDART, CUDA };
+
 inline void *
-get_cuda_symbol(const char *function_name) {
-    static std::mutex cuda_fe_lib_mutex;
-    std::lock_guard<std::mutex> lock(cuda_fe_lib_mutex);
-    char *c                = NULL;
-    c                      = dlerror();
-    static void *dl_handle = dlopen("libcudart.so", RTLD_NOW);
-    c                      = dlerror();
-    (void)c;
-    if (dl_handle == nullptr) {
-        std::string error_msg = std::string("Unable to dlopen libcudart.so") + std::string(c);
-        throw std::runtime_error(error_msg.c_str());
+get_cuda_symbol(CudaLibrary library, const char *function_name) {
+    // Static mutex to ensure thread-safety
+    static std::mutex cuda_lib_mutex;
+    // Static map to store handles for different libraries
+    static std::unordered_map<CudaLibrary, void *> dl_handles;
+
+    // Determine the library name based on the provided library parameter
+    const char *library_name = (library == CudaLibrary::CUDART) ? "libcudart.so" : "libcuda.so";
+
+    // Lock the mutex to ensure thread-safe access
+    std::lock_guard<std::mutex> lock(cuda_lib_mutex);
+
+    // If the library hasn't been opened yet, open it
+    if (dl_handles.find(library) == dl_handles.end()) {
+        // Clear any existing error
+        dlerror();
+
+        // Attempt to open the specified CUDA library
+        void *handle      = dlopen(library_name, RTLD_NOW);
+        const char *error = dlerror();
+        if (!handle || error) {
+            // If opening the library fails, throw an exception with the error message
+            throw std::runtime_error("Unable to dlopen " + std::string(library_name) + ": " +
+                                     std::string(error ? error : "Unknown error"));
+        }
+        // Store the handle for future use
+        dl_handles[library] = handle;
     }
 
-    void *ret = dlsym(dl_handle, function_name);
-    return ret;
+    // Clear any existing error before calling dlsym
+    dlerror();
+
+    // Try to find the symbol (function) in the library
+    void *symbol      = dlsym(dl_handles[library], function_name);
+    const char *error = dlerror();
+    if (!symbol || error) {
+        // If the symbol is not found, throw an exception with details
+        throw std::runtime_error("Unable to find symbol " + std::string(function_name) + ": " +
+                                 std::string(error ? error : "Unknown error"));
+    }
+
+    // Return the pointer to the function
+    return symbol;
 }
+
 #endif
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
@@ -94,15 +126,117 @@ get_cuda_symbol(const char *function_name) {
 #endif
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
-#define NV_FE_CALL_TO_CUDA(function_name, cuda_symbol, ...)              \
-    static void *fptr = get_cuda_symbol(#cuda_symbol);                   \
-    if (fptr == nullptr) {                                               \
-        throw std::runtime_error("Unable to find symbol " #cuda_symbol); \
-    }                                                                    \
-    return reinterpret_cast<decltype(function_name) *>(fptr)(__VA_ARGS__);
+
+#define NV_FE_CALL_TO_CUDA(function_name, cuda_symbol, ...) \
+    return reinterpret_cast<decltype(function_name) *>(get_cuda_symbol(CudaLibrary::CUDART, #cuda_symbol))(__VA_ARGS__);
+#define NV_FE_CALL_TO_CU(function_name, cuda_symbol, ...) \
+    return reinterpret_cast<decltype(function_name) *>(get_cuda_symbol(CudaLibrary::CUDA, #cuda_symbol))(__VA_ARGS__);
+
 #else
+
 #define NV_FE_CALL_TO_CUDA(function_name, cuda_symbol, ...) return cuda_symbol(__VA_ARGS__);
+#define NV_FE_CALL_TO_CU(function_name, cuda_symbol, ...) return cuda_symbol(__VA_ARGS__);
+
 #endif
+
+inline CUresult
+cu_graph_create(CUgraph *pGraph, unsigned int flags) {
+    NV_FE_CALL_TO_CU(cu_graph_create, cuGraphCreate, pGraph, flags);
+}
+
+inline CUresult
+cu_graph_get_nodes(CUgraph hGraph, CUgraphNode *nodes, size_t *numNodes) {
+    NV_FE_CALL_TO_CU(cu_graph_get_nodes, cuGraphGetNodes, hGraph, nodes, numNodes);
+}
+
+inline cudaError_t
+cuda_graph_add_child_graph_node(cudaGraphNode_t *pGraphNode,
+                                cudaGraph_t graph,
+                                const cudaGraphNode_t *pDependencies,
+                                size_t numDependencies,
+                                cudaGraph_t childGraph) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_add_child_graph_node,
+                       cudaGraphAddChildGraphNode,
+                       pGraphNode,
+                       graph,
+                       pDependencies,
+                       numDependencies,
+                       childGraph);
+}
+
+inline cudaError_t
+cuda_graph_add_memcpy_node_1D(cudaGraphNode_t *pGraphNode,
+                              cudaGraph_t graph,
+                              const cudaGraphNode_t *pDependencies,
+                              size_t numDependencies,
+                              void *dst,
+                              const void *src,
+                              size_t count,
+                              cudaMemcpyKind kind) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_add_memcpy_node_1D,
+                       cudaGraphAddMemcpyNode1D,
+                       pGraphNode,
+                       graph,
+                       pDependencies,
+                       numDependencies,
+                       dst,
+                       src,
+                       count,
+                       kind);
+}
+
+inline cudaError_t
+cuda_graph_add_memset_node(cudaGraphNode_t *pGraphNode,
+                           cudaGraph_t graph,
+                           const cudaGraphNode_t *pDependencies,
+                           size_t numDependencies,
+                           const cudaMemsetParams *pMemsetParams) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_add_memset_node,
+                       cudaGraphAddMemsetNode,
+                       pGraphNode,
+                       graph,
+                       pDependencies,
+                       numDependencies,
+                       pMemsetParams);
+}
+
+inline cudaError_t
+cuda_graph_get_root_nodes(cudaGraph_t hGraph, cudaGraphNode_t *phNodes, size_t *pNumNodes) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_get_root_nodes, cudaGraphGetRootNodes, hGraph, phNodes, pNumNodes);
+}
+
+inline cudaError_t
+cuda_graph_child_graph_node_get_graph(cudaGraphNode_t hNode, cudaGraph_t *phGraph) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_child_graph_node_get_graph, cudaGraphChildGraphNodeGetGraph, hNode, phGraph);
+}
+
+inline cudaError_t
+cuda_graph_node_get_dependent_nodes(cudaGraphNode_t node,
+                                    cudaGraphNode_t *pDependentNodes,
+                                    size_t *pNumDependentNodes) {
+    NV_FE_CALL_TO_CUDA(
+        cuda_graph_node_get_dependent_nodes, cudaGraphNodeGetDependentNodes, node, pDependentNodes, pNumDependentNodes);
+}
+
+inline cudaError_t
+cuda_graph_add_memcpy_node_set_params_1D(cudaGraphNode_t node,
+                                         void *dst,
+                                         const void *src,
+                                         size_t count,
+                                         cudaMemcpyKind kind) {
+    NV_FE_CALL_TO_CUDA(
+        cuda_graph_add_memcpy_node_set_params_1D, cudaGraphMemcpyNodeSetParams1D, node, dst, src, count, kind);
+}
+
+inline cudaError_t
+cuda_graph_add_memset_node_set_params(cudaGraphNode_t node, const cudaMemsetParams *pMemsetParams) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_add_memset_node_set_params, cudaGraphMemsetNodeSetParams, node, pMemsetParams);
+}
+
+inline cudaError_t
+cuda_graph_destroy(cudaGraph_t graph) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_destroy, cudaGraphDestroy, graph);
+}
 
 inline cudaError_t
 cuda_event_create(cudaEvent_t *event) {
@@ -154,17 +288,14 @@ cuda_get_error_string(cudaError_t error) {
     NV_FE_CALL_TO_CUDA(cuda_get_error_string, cudaGetErrorString, error);
 }
 
+inline CUresult
+cu_get_error_string(CUresult error, const char **pStr) {
+    NV_FE_CALL_TO_CU(cu_get_error_string, cuGetErrorString, error, pStr);
+}
+
 inline cudaError_t
 cuda_device_synchronize() {
-#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
-    static void *fptr = get_cuda_symbol("cudaDeviceSynchronize");
-    if (fptr == nullptr) {
-        throw std::runtime_error("Unable to find symbol cudaDeviceSynchronize");
-    }
-    return reinterpret_cast<decltype(cuda_device_synchronize) *>(fptr)();
-#else
-    return cudaDeviceSynchronize();
-#endif
+    NV_FE_CALL_TO_CUDA(cuda_device_synchronize, cudaDeviceSynchronize);
 }
 
 inline cudnnStatus_t
@@ -266,6 +397,40 @@ execute(cudnnHandle_t handle, cudnnBackendDescriptor_t executionPlan, cudnnBacke
     NV_FE_CALL_TO_BACKEND(execute, cudnnBackendExecute, handle, executionPlan, variantPack);
 }
 
+inline cudnnStatus_t
+populate_cuda_graph(cudnnHandle_t handle,
+                    cudnnBackendDescriptor_t executionPlan,
+                    cudnnBackendDescriptor_t variantPack,
+                    cudaGraph_t cuda_graph) {
+#if CUDNN_VERSION >= 90500
+    NV_FE_CALL_TO_BACKEND(
+        populate_cuda_graph, cudnnBackendPopulateCudaGraph, handle, executionPlan, variantPack, cuda_graph);
+#else
+    (void)handle;
+    (void)executionPlan;
+    (void)variantPack;
+    (void)cuda_graph;
+    return CUDNN_STATUS_VERSION_MISMATCH;
+#endif
+}
+
+inline cudnnStatus_t
+update_cuda_graph(cudnnHandle_t handle,
+                  cudnnBackendDescriptor_t executionPlan,
+                  cudnnBackendDescriptor_t variantPack,
+                  cudaGraph_t cuda_graph) {
+#if CUDNN_VERSION >= 90500
+    NV_FE_CALL_TO_BACKEND(
+        update_cuda_graph, cudnnBackendUpdateCudaGraph, handle, executionPlan, variantPack, cuda_graph);
+#else
+    (void)handle;
+    (void)executionPlan;
+    (void)variantPack;
+    (void)cuda_graph;
+    return CUDNN_STATUS_VERSION_MISMATCH;
+#endif
+}
+
 inline const char *
 get_error_string(cudnnStatus_t status) {
     NV_FE_CALL_TO_BACKEND(get_error_string, cudnnGetErrorString, status);
@@ -290,7 +455,7 @@ get_last_error_string_() {
 
     std::string message;
 
-    message.reserve(size);
+    message.resize(size);
 
     get_last_error_string(message.data(), size);
 

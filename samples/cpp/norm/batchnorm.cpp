@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -21,7 +21,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
-#include "../../utils/helpers.h"
+#include "../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
@@ -46,22 +46,14 @@ TEST_CASE("BN Finalize Graph", "[batchnorm][graph]") {
         fe::graph::Tensor_attributes().set_name("scale").set_dim({1, 32, 1, 1}).set_stride({32, 1, 32, 32}));
     auto bias = graph.tensor(
         fe::graph::Tensor_attributes().set_name("bias").set_dim({1, 32, 1, 1}).set_stride({32, 1, 32, 32}));
-    auto epsilon     = graph.tensor(fe::graph::Tensor_attributes()
-                                    .set_name("epsilon")
-                                    .set_dim({1, 1, 1, 1})
-                                    .set_stride({1, 1, 1, 1})
-                                    .set_is_pass_by_value(true));
-    auto momentum    = graph.tensor(fe::graph::Tensor_attributes()
-                                     .set_name("momentum")
-                                     .set_dim({1, 1, 1, 1})
-                                     .set_stride({1, 1, 1, 1})
-                                     .set_is_pass_by_value(true));
-    auto accum_count = graph.tensor(fe::graph::Tensor_attributes()
-                                        .set_name("accum_count")
-                                        .set_dim({1, 1, 1, 1})
-                                        .set_stride({1, 1, 1, 1})
-                                        .set_is_pass_by_value(true)
-                                        .set_data_type(fe::DataType_t::INT64));
+
+    float EPS_scalar      = 0.001f;
+    float MOMENTUM_scalar = 0.001f;
+    int64_t nhw           = 64;
+
+    auto epsilon     = graph.tensor(EPS_scalar);
+    auto momentum    = graph.tensor(MOMENTUM_scalar);
+    auto accum_count = graph.tensor(nhw);
 
     auto bn_finalize_options =
         fe::graph::BN_finalize_attributes().set_previous_running_stats(prev_running_mean, prev_running_var, momentum);
@@ -79,7 +71,7 @@ TEST_CASE("BN Finalize Graph", "[batchnorm][graph]") {
 #endif
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.validate().is_good());
 
@@ -103,9 +95,6 @@ TEST_CASE("BN Finalize Graph", "[batchnorm][graph]") {
     Surface<float> Bias_tensor(32, false);
     Surface<float> eq_scale_tensor(32, false);
     Surface<float> eq_bias_tensor(32, false);
-    float EPS_scalar      = 0.001f;
-    float MOMENTUM_scalar = 0.001f;
-    int64_t nhw           = 64;
 
     int64_t workspace_size;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
@@ -116,11 +105,8 @@ TEST_CASE("BN Finalize Graph", "[batchnorm][graph]") {
         {sq_sum, Sq_sum_tensor.devPtr},
         {scale, Scale_tensor.devPtr},
         {bias, Bias_tensor.devPtr},
-        {epsilon, &EPS_scalar},
-        {accum_count, &nhw},
         {prev_running_mean, Previous_running_mean_tensor.devPtr},
         {prev_running_var, Previous_running_var_tensor.devPtr},
-        {momentum, &MOMENTUM_scalar},
         {eq_scale, eq_scale_tensor.devPtr},
         {eq_bias, eq_bias_tensor.devPtr},
         {saved_mean, Mean_tensor.devPtr},
@@ -174,21 +160,11 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
                                          .set_stride({4 * 32, 1, 4 * 32, 4 * 32})
                                          .set_data_type(fe::DataType_t::FLOAT));
 
-    auto epsilon  = graph.tensor(fe::graph::Tensor_attributes()
-                                    .set_name("epsilon")
-                                    .set_dim({1, 1, 1, 1})
-                                    .set_stride({1, 1, 1, 1})
-                                    .set_data_type(fe::DataType_t::FLOAT));
-    auto momentum = graph.tensor(fe::graph::Tensor_attributes()
-                                     .set_name("momentum")
-                                     .set_dim({1, 1, 1, 1})
-                                     .set_stride({1, 1, 1, 1})
-                                     .set_data_type(fe::DataType_t::FLOAT));
+    auto epsilon  = graph.tensor(1e-05f);
+    auto momentum = graph.tensor(1e-01f);
 
-    auto batchnorm_options = fe::graph::Batchnorm_attributes()
-                                 .set_epsilon(epsilon)
-
-                                 .set_peer_stats({peer_stats_0, peer_stats_1});
+    auto batchnorm_options =
+        fe::graph::Batchnorm_attributes().set_epsilon(epsilon).set_peer_stats({peer_stats_0, peer_stats_1});
     if (has_running_stats) {
         batchnorm_options.set_previous_running_stats(prev_running_mean, prev_running_var, momentum);
     }
@@ -224,7 +200,7 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
         SKIP("ConvBNFprop requires Ampere and up");
     }
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.validate().is_good());
 
@@ -245,8 +221,6 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
     Surface<float> Next_running_var_tensor(32, false);
     Surface<float> Scale_tensor(32, false);
     Surface<float> Bias_tensor(32, false);
-    float epsilon_cpu  = 1e-05f;
-    float momentum_cpu = 1e-01f;
     Surface<half> A_tensor(4 * 32 * 16 * 16, false);
     Surface<half> Y_tensor(4 * 32 * 16 * 16, false);
     Surface<float> Peer_stats_0_tensor(2 * 4 * 32, false, true);
@@ -262,8 +236,6 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
         {inv_variance, Var_tensor.devPtr},
         {scale, Scale_tensor.devPtr},
         {bias, Bias_tensor.devPtr},
-        {epsilon, &epsilon_cpu},
-        {momentum, &momentum_cpu},
         {A, A_tensor.devPtr},
         {Y, Y_tensor.devPtr},
         {peer_stats_0, Peer_stats_0_tensor.devPtr},
@@ -274,7 +246,6 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
         variant_pack[prev_running_var]  = Previous_running_var_tensor.devPtr;
         variant_pack[next_running_mean] = Next_running_mean_tensor.devPtr;
         variant_pack[next_running_var]  = Next_running_var_tensor.devPtr;
-        variant_pack[momentum]          = &momentum_cpu;
     }
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 
@@ -351,7 +322,7 @@ TEST_CASE("DBN Add Relu Graph", "[BN][graph][backward]") {
         SKIP("BatchNorm Backward requires Ampere and up");
     }
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.validate().is_good());
 
@@ -461,7 +432,7 @@ TEST_CASE("BN_inference DRelu DBN Graph", "[Batchnorm][graph][backward]") {
 #endif
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     REQUIRE(graph.validate().is_good());
 

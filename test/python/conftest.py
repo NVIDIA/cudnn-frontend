@@ -41,3 +41,8 @@ def pytest_addoption(parser):
         default=None,
         help="[test_mhas.py] force deterministic algorithm",
     )
+    parser.addoption(
+        "--mha_block_size",
+        default=None,
+        help="[test_mhas.py] block size for paged attention",
+    )

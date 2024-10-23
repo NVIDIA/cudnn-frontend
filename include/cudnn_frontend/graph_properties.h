@@ -29,7 +29,7 @@ class Tensor_attributes {
     // In approach 1, users provide a value to embed into the graph.
     // In approach 2, users set is_pass_by_value boolean and then pass a pointer to scalar value with execute() API.
     // A closed set of types that are allowed to be passed by value.
-    using pass_by_values_t = std::variant<int32_t, half, float, nv_bfloat16>;
+    using pass_by_values_t = std::variant<int64_t, int32_t, half, float, nv_bfloat16>;
 
     error_t
     validate() const {
@@ -121,6 +121,13 @@ class Tensor_attributes {
         is_pass_by_value = true;
         dim = stride = {1};
         data_type    = DataType_t::INT32;
+    }
+
+    Tensor_attributes(int64_t const& scalar) {
+        pass_by_value    = scalar;
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::INT64;
     }
 
     std::string
@@ -1408,6 +1415,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     std::optional<int> sliding_window_length;
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
+    std::optional<int> max_seq_len_kv;
 
    public:
     enum class input_names {
@@ -1422,6 +1430,8 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         Offset,
         Dropout_mask,
         Dropout_scale,
+        Page_table_K,
+        Page_table_V
     };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { O, Stats, RNG_DUMP };
@@ -1447,7 +1457,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
 
     SDPA_attributes&
     set_attn_scale(std::shared_ptr<Tensor_attributes> value) {
-        inputs[SDPA_attributes::input_names::Attn_scale] = value;
+        inputs[SDPA_attributes::input_names::Attn_scale] = std::move(value);
         return *this;
     }
 
@@ -1459,7 +1469,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
 
     SDPA_attributes&
     set_bias(std::shared_ptr<Tensor_attributes> value) {
-        inputs[SDPA_attributes::input_names::Bias] = value;
+        inputs[SDPA_attributes::input_names::Bias] = std::move(value);
         return *this;
     }
 
@@ -1477,13 +1487,13 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
 
     SDPA_attributes&
     set_seq_len_q(std::shared_ptr<Tensor_attributes> value) {
-        inputs[SDPA_attributes::input_names::SEQ_LEN_Q] = value;
+        inputs[SDPA_attributes::input_names::SEQ_LEN_Q] = std::move(value);
         return *this;
     }
 
     SDPA_attributes&
     set_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
-        inputs[SDPA_attributes::input_names::SEQ_LEN_KV] = value;
+        inputs[SDPA_attributes::input_names::SEQ_LEN_KV] = std::move(value);
         return *this;
     }
 
@@ -1510,22 +1520,40 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
                 std::shared_ptr<Tensor_attributes> seed,
                 std::shared_ptr<Tensor_attributes> offset) {
         dropout_probability                          = probability;
-        inputs[SDPA_attributes::input_names::Seed]   = seed;
-        inputs[SDPA_attributes::input_names::Offset] = offset;
+        inputs[SDPA_attributes::input_names::Seed]   = std::move(seed);
+        inputs[SDPA_attributes::input_names::Offset] = std::move(offset);
         return *this;
     }
 
     SDPA_attributes&
     set_dropout(std::shared_ptr<Tensor_attributes> mask, std::shared_ptr<Tensor_attributes> scale) {
-        inputs[SDPA_attributes::input_names::Dropout_mask]  = mask;
-        inputs[SDPA_attributes::input_names::Dropout_scale] = scale;
+        inputs[SDPA_attributes::input_names::Dropout_mask]  = std::move(mask);
+        inputs[SDPA_attributes::input_names::Dropout_scale] = std::move(scale);
         return *this;
     }
 
     // For debugging purposes only.
     SDPA_attributes&
     set_rng_dump(std::shared_ptr<Tensor_attributes> value) {
-        outputs[SDPA_attributes::output_names::RNG_DUMP] = value;
+        outputs[SDPA_attributes::output_names::RNG_DUMP] = std::move(value);
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_paged_attention_k_table(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_attributes::input_names::Page_table_K] = std::move(value);
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_paged_attention_v_table(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_attributes::input_names::Page_table_V] = std::move(value);
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_paged_attention_max_seq_len_kv(int const value) {
+        max_seq_len_kv = value;
         return *this;
     }
 };
@@ -1657,6 +1685,9 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
 
+    std::optional<int64_t> max_total_seq_len_q;
+    std::optional<int64_t> max_total_seq_len_kv;
+
     bool is_deterministic_algorithm = false;
 
    public:
@@ -1738,6 +1769,18 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     SDPA_backward_attributes&
     set_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
         inputs[SDPA_backward_attributes::input_names::SEQ_LEN_KV] = value;
+        return *this;
+    }
+
+    SDPA_backward_attributes&
+    set_max_total_seq_len_q(int64_t const value) {
+        max_total_seq_len_q = value;
+        return *this;
+    }
+
+    SDPA_backward_attributes&
+    set_max_total_seq_len_kv(int64_t const value) {
+        max_total_seq_len_kv = value;
         return *this;
     }
 
@@ -2072,6 +2115,19 @@ class Slice_attributes : public Attributes<Slice_attributes> {
         offset *= detail::get_data_type_size(input->get_data_type());
         return offset;
     }
+};
+
+class PagedCacheLoad_attributes : public Attributes<PagedCacheLoad_attributes> {
+    friend class Attributes<PagedCacheLoad_attributes>;
+    friend class PagedCacheLoadNode;
+    friend class INode;
+
+   public:
+    enum class input_names { container, seqLen, pageTable };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { yOut };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(PagedCacheLoad_attributes, name, compute_data_type, inputs, outputs)
 };
 
 }  // namespace graph

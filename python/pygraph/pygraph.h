@@ -48,7 +48,8 @@ class PyGraph {
             cudnn_frontend::DataType_t intermediate_data_type,
             cudnn_frontend::DataType_t compute_data_type,
             std::optional<std::intptr_t> handle_,
-            py::object sm_count) {
+            py::object sm_count,
+            std::shared_ptr<KernelCache> kernel_cache) {
         graph.set_compute_data_type(compute_data_type)
             .set_intermediate_data_type(intermediate_data_type)
             .set_io_data_type(io_data_type);
@@ -62,6 +63,11 @@ class PyGraph {
 
         if (sm_count.is(py::none()) == false) {
             graph.set_sm_count(sm_count.cast<int32_t>());
+        }
+
+        if (kernel_cache) {
+            graph.set_kernel_cache(kernel_cache);
+            graph.set_dynamic_shape_enabled(true);
         }
     }
 
@@ -285,6 +291,9 @@ class PyGraph {
          py::object const& sliding_window_length,
          py::object const& dropout,
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_k_table,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_v_table,
+         py::object const& paged_attention_max_seq_len_kv,
          cudnn_frontend::DataType_t const& compute_data_type,
          std::string const& name);
 
@@ -303,6 +312,8 @@ class PyGraph {
                   bool const use_padding_mask,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                  py::object const& max_total_seq_len_q,
+                  py::object const& max_total_seq_len_kv,
                   bool const use_causal_mask,
                   bool const use_causal_mask_bottom_right,
                   py::object const& sliding_window_length,
@@ -325,7 +336,11 @@ class PyGraph {
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& scale_o,
              bool const is_inference,
              py::object const& attn_scale,
+             bool const use_padding_mask,
+             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
+             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
              bool const use_causal_mask,
+             py::object const& dropout,
              cudnn_frontend::DataType_t const& compute_data_type,
              std::string const& name);
 
@@ -350,7 +365,11 @@ class PyGraph {
                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& scale_dV,
                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& scale_dP,
                       py::object const& attn_scale,
+                      bool const use_padding_mask,
+                      std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
+                      std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
                       bool const use_causal_mask,
+                      py::object const& dropout,
                       cudnn_frontend::DataType_t const& compute_data_type,
                       std::string const& name);
 
@@ -382,6 +401,18 @@ class PyGraph {
     get_workspace_size();
 
     void
+    populate_cuda_graph(std::intptr_t handle,
+                        std::unordered_map<cudnn_frontend::graph::Tensor_attributes::uid_t, int64_t> var_pack,
+                        std::intptr_t workspace,
+                        std::intptr_t cuda_graph);
+
+    void
+    update_cuda_graph(std::intptr_t handle,
+                      std::unordered_map<cudnn_frontend::graph::Tensor_attributes::uid_t, int64_t> var_pack,
+                      std::intptr_t workspace,
+                      std::intptr_t cuda_graph);
+
+    void
     execute(std::unordered_map<int64_t, int64_t> var_pack, int64_t workspace, std::optional<std::intptr_t>);
 
     void
@@ -399,6 +430,12 @@ class PyGraph {
     void
     select_behavior_notes(std::vector<BehaviorNote_t> const& notes) {
         graph.select_behavior_notes(notes);
+        return;
+    }
+
+    void
+    deselect_engines(std::vector<std::string> const& engine_names) {
+        graph.deselect_engines(engine_names);
         return;
     }
 

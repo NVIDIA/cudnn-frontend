@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -22,7 +22,7 @@
 
 #include "fp8_flash_mha_sample.h"
 #include <cudnn_frontend.h>
-#include "../utils/error_util.h"
+#include "./utils/error_util.h"
 
 #if (CUDNN_VERSION >= 8900)
 std::unordered_map<std::string, int> tensor_name_to_uid = {{"Q", 1},

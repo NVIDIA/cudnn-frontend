@@ -304,6 +304,18 @@ NLOHMANN_JSON_SERIALIZE_ENUM(Rng_attributes::input_names,
 
 NLOHMANN_JSON_SERIALIZE_ENUM(Rng_attributes::output_names, {{Rng_attributes::output_names::Y, "Y"}})
 
+NLOHMANN_JSON_SERIALIZE_ENUM(PagedCacheLoad_attributes::input_names,
+                             {
+                                 {PagedCacheLoad_attributes::input_names::container, "container"},
+                                 {PagedCacheLoad_attributes::input_names::seqLen, "seqLen"},
+                                 {PagedCacheLoad_attributes::input_names::pageTable, "pageTable"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(PagedCacheLoad_attributes::output_names,
+                             {
+                                 {PagedCacheLoad_attributes::output_names::yOut, "yOut"},
+                             })
+
 NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_attributes::input_names,
                              {
                                  {SDPA_attributes::input_names::Q, "Q"},
@@ -317,6 +329,8 @@ NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_attributes::input_names,
                                  {SDPA_attributes::input_names::Offset, "Offset"},
                                  {SDPA_attributes::input_names::Dropout_mask, "Dropout_mask"},
                                  {SDPA_attributes::input_names::Dropout_scale, "Dropout_scale"},
+                                 {SDPA_attributes::input_names::Page_table_K, "Page_table_K"},
+                                 {SDPA_attributes::input_names::Page_table_V, "Page_table_V"},
                              })
 
 NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_attributes::output_names,

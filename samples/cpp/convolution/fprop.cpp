@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -21,7 +21,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
-#include "../../utils/helpers.h"
+#include "../utils/helpers.h"
 
 #include <cudnn_frontend.h>
 
@@ -69,7 +69,7 @@ TEST_CASE("Convolution fprop", "[conv][graph][caching]") {
 
     cudnnHandle_t handle;
 
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     auto [graph, X, W, Y] = build_new_graph(handle);
 
@@ -203,7 +203,7 @@ TEST_CASE("Convolution fprop dynamic shape", "[conv][graph][dynamic_shape]") {
     };
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     for (int idx_shape = 0; idx_shape < conv_shapes_count; ++idx_shape) {
         auto [graph, X, W, Y] = build_new_graph(handle, idx_shape);
@@ -291,7 +291,7 @@ TEST_CASE("CSBR Graph", "[conv][graph][caching]") {
     };
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     auto [graph, X, W, B, S, Y] = lookup_cache_or_build_graph(handle);
 
@@ -433,7 +433,7 @@ TEST_CASE("CSBR Graph dynamic shape", "[conv][graph][dynamic_shape]") {
     };
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     for (int idx_shape = 0; idx_shape < conv_shapes_count; idx_shape++) {
         auto [graph, X, W, B, S, Y] = lookup_cache_or_build_graph(handle, idx_shape);
@@ -525,7 +525,7 @@ TEST_CASE("SBRCS", "[conv][genstats][graph]") {
         SKIP("SBRCS requires Ampere or Hopper");
     }
 
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     auto [graph, X, W, B, S, Y, SUM, SQ_SUM] = build_new_graph(handle);
 
@@ -635,7 +635,7 @@ TEST_CASE("CBR Graph NCHW", "[conv][graph][caching]") {
     };
 
     cudnnHandle_t handle;
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     auto [graph, X, W, Z, B, Y] = lookup_cache_or_build_graph(handle);
 
@@ -719,7 +719,7 @@ TEST_CASE("Convolution fprop large", "[conv][graph][caching]") {
 
     cudnnHandle_t handle;
 
-    checkCudnnErr(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnCreate(&handle));
 
     auto [graph, X, W, Y] = build_new_graph(handle);
 

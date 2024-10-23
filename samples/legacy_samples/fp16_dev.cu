@@ -20,8 +20,8 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#include "utils/error_util.h"
-#include "utils/fp16_dev.h"
+#include "./utils/error_util.h"
+#include "./utils/fp16_dev.h"
 
 #define BLOCK_SIZE 128
 template <class value_type>

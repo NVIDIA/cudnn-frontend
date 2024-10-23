@@ -120,6 +120,20 @@ typedef struct [[nodiscard]] error_object {
     }                                                                                                       \
     CUDNN_FRONTEND_WHILE_FALSE
 
+#define CHECK_CU_ERROR(x)                                                                                         \
+    do {                                                                                                          \
+        if (auto cu_retval = x; cu_retval != CUDA_SUCCESS) {                                                      \
+            std::stringstream error_msg;                                                                          \
+            const char* error_code_string;                                                                        \
+            detail::cu_get_error_string(cu_retval, &error_code_string);                                           \
+            error_msg << #x << " failed with " << error_code_string;                                              \
+            getLogger() << "[cudnn_frontend] ERROR: " << error_msg.str() << " at " << __FILE__ << ":" << __LINE__ \
+                        << std::endl;                                                                             \
+            return {error_code_t::CUDA_API_FAILED, error_msg.str()};                                              \
+        }                                                                                                         \
+    }                                                                                                             \
+    CUDNN_FRONTEND_WHILE_FALSE
+
 NLOHMANN_JSON_SERIALIZE_ENUM(error_code_t,
                              {
                                  {error_code_t::OK, "OK"},

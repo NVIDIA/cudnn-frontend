@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -33,9 +33,9 @@
 #include <functional>
 
 #include <cudnn.h>
-#include "../utils/fp16_dev.h"
-#include "../utils/fp16_emu.h"
-#include "../utils/helpers.h"
+#include "./utils/fp16_dev.h"
+#include "./utils/fp16_emu.h"
+#include "./utils/helpers.h"
 
 #if (CUDNN_VERSION >= 8700)
 void
