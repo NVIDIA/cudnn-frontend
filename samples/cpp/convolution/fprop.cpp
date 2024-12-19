@@ -458,6 +458,10 @@ TEST_CASE("CSBR Graph dynamic shape", "[conv][graph][dynamic_shape]") {
 }
 
 TEST_CASE("SBRCS", "[conv][genstats][graph]") {
+    if (!is_ampere_arch() && !is_hopper_arch()) {
+        SKIP("scale-bias-relu-covn-genstats requires Ampere or Hopper");
+    }
+
     namespace fe = cudnn_frontend;
 
     int64_t n = 4, c = 64, h = 16, w = 16, k = 32, r = 3, s = 3;

@@ -2969,10 +2969,9 @@ class OperationBuilder_v8 {
         cudnnBackendDescriptorType_t cudnn_backend_descriptor_type;
         auto status = detail::convert_to_cudnn_type(m_operation.op_mode, cudnn_backend_descriptor_type);
         if (status != CUDNN_STATUS_SUCCESS) {
-            set_error_and_throw_exception(
-                &m_operation,
-                status,
-                "CUDNN_BACKEND_OPERATION: cudnnCreate Failed with Invalid backend descriptor type.");
+            std::stringstream ss;
+            ss << "CUDNN_BACKEND_OPERATION: unable to identify backend operation for " << m_operation.op_mode;
+            set_error_and_throw_exception(&m_operation, status, (ss.str()).c_str());
             return std::move(m_operation);
         }
         status = m_operation.initialize_managed_backend_pointer(cudnn_backend_descriptor_type);

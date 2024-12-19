@@ -459,6 +459,8 @@ get_last_error_string_() {
 
     get_last_error_string(message.data(), size);
 
+    message.resize(std::strlen(message.c_str()));
+
     return message;
 }
 

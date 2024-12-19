@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -364,8 +364,8 @@ class ExecutionPlanBuilder_v8 {
     }
 
     auto
-    setEngineConfig(ManagedOpaqueDescriptor const &desc,
-                    std::string const &opGraphTag_ = "") -> ExecutionPlanBuilder_v8 & {
+    setEngineConfig(ManagedOpaqueDescriptor const &desc, std::string const &opGraphTag_ = "")
+        -> ExecutionPlanBuilder_v8 & {
         m_execution_plan.engine_config = desc;
         m_execution_plan.planTag       = opGraphTag_;
         return *this;

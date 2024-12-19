@@ -74,7 +74,11 @@ TEST_CASE("Convolution Wgrad", "[wgrad][graph][wgrad][Conv_wgrad]") {
     cudnnDestroy(handle);
 }
 
-TEST_CASE("Wgrad Graph", "[wgrad][graph][scale-bias-relu-wgrad][ConvBNwgrad]") {
+TEST_CASE("scale-bias-relu-wgrad Graph", "[wgrad][graph][scale-bias-relu-wgrad][ConvBNwgrad]") {
+    if (!is_ampere_arch() && !is_hopper_arch()) {
+        SKIP("scale-bias-relu-wgrad requires Ampere or Hopper");
+    }
+
     namespace fe = cudnn_frontend;
     fe::graph::Graph graph;
     graph.set_io_data_type(fe::DataType_t::HALF)

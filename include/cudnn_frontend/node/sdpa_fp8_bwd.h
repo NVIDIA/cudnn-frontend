@@ -339,7 +339,11 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                                                      .set_mode(PointwiseMode_t::LOGICAL_AND)
                                                      .set_compute_data_type(DataType_t::BOOLEAN));
             padding_mask_output->set_data_type(DataType_t::BOOLEAN);
-            auto negative_inf_padding = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
+
+            // Use a smaller value of neg infinity so that the softmax stats for rows that are fully padded dont
+            // go towards NaNs/Infs when multipled by the numerous scale/descale
+            // auto negative_inf_padding = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
+            auto negative_inf_padding = std::make_shared<Tensor_attributes>(-1024.f*1024.f*1024.f);
 
             last_dV =
                 pointwise(last_dV,

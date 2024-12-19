@@ -169,6 +169,9 @@ class ResampleNode : public NodeCRTP<ResampleNode> {
 
 inline std::array<std::shared_ptr<Tensor_attributes>, 2>
 INode::resample(std::shared_ptr<Tensor_attributes> input, Resample_attributes attributes) {
+    if (attributes.name.empty()) {
+        attributes.name += std::to_string(sub_nodes.size());
+    }
     attributes.inputs[Resample_attributes::input_names::X] = input;
     auto Y = attributes.outputs[Resample_attributes::output_names::Y] = output_tensor(attributes.name + "::Y");
     std::shared_ptr<Tensor_attributes> Index                          = nullptr;

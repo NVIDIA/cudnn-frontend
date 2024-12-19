@@ -175,6 +175,8 @@ set_paged_attention_v_table(std::shared_ptr<Tensor_attributes> value);
 SDPA_attributes&
 set_paged_attention_max_seq_len_kv(int const value);
 
+SDPA_attributes&
+set_score_mod(std::function<Tensor_t(Graph_t, Tensor_t)>);
 ```
 
 #### Python API:
@@ -307,6 +309,9 @@ set_deterministic_algorithm(bool const value);
 
 SDPA_backward_attributes&
 set_compute_data_type(DataType_t const value);
+
+SDPA_backward_attributes&
+set_score_mod(std::function<Tensor_t(Graph_t, Tensor_t)>);
 ```
 
 #### Python API: 
@@ -720,3 +725,8 @@ cuDNN layout support for variable sequence length includes (but is not limited t
   - Valid tokens are not packed together\
     `Q = a0abbb00bb000000`\
     Ragged offset is insufficient to represent this. This case is NOT supported.
+
+
+### cudnn Flex Attention API
+
+SDPA and SDPA_backward ops now accept functors `set_score_mod` and `set_score_mod_bprop`, which allows modification of the attention score matrix. This function can be used to program a sub-graph of pointwise operations that can be subsequently used to program the score modifier. Note that this function usage is exclusive to the usage of ready made options.

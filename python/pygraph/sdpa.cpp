@@ -176,12 +176,12 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     }
 
     if (!max_total_seq_len_q.is_none()) {
-        int const max_total_seq_len_q_value = max_total_seq_len_q.cast<int>();
+        int64_t const max_total_seq_len_q_value = max_total_seq_len_q.cast<int64_t>();
         attributes.set_max_total_seq_len_q(max_total_seq_len_q_value);
     }
 
     if (!max_total_seq_len_kv.is_none()) {
-        int const max_total_seq_len_kv_value = max_total_seq_len_kv.cast<int>();
+        int64_t const max_total_seq_len_kv_value = max_total_seq_len_kv.cast<int64_t>();
         attributes.set_max_total_seq_len_kv(max_total_seq_len_kv_value);
     }
 

@@ -82,8 +82,10 @@ query_cudnn_heuristics_impl(std::shared_ptr<OperationGraph_v8> const& operation_
     CUDNN_FE_LOG_LABEL_ENDL("INFO: config list has " << configs.size() << " configurations.");
 
     if (configs.empty()) {
-        CUDNN_FE_LOG_LABEL_ENDL("ERROR: No valid engine configs returned from heuristics.");
-        return {error_code_t::HEURISTIC_QUERY_FAILED, "No valid engine configs for " + operation_graph_tag};
+        std::string err_msg = detail::get_last_error_string_();
+        CUDNN_FE_LOG_LABEL_ENDL("ERROR: No valid engine configs returned from heuristics.\n" << err_msg);
+        return {error_code_t::HEURISTIC_QUERY_FAILED,
+                "No valid engine configs for " + operation_graph_tag + "\n" + err_msg};
     }
     return {error_code_t::OK, ""};
 }
@@ -459,8 +461,10 @@ class Execution_plan_list {
             }
         }
 
+        std::string err_msg = detail::get_last_error_string_();
+        CUDNN_FE_LOG_LABEL_ENDL("ERROR: No valid engine configs returned from heuristics.\n" << err_msg);
         return {error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
-                "[cudnn_frontend] Error: No execution plans support the graph."};
+                "[cudnn_frontend] Error: No execution plans support the graph." + err_msg};
     }
 
     error_t

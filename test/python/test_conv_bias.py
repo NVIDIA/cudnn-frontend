@@ -106,6 +106,13 @@ def test_conv_bias_relu(cudnn_handle):
     torch.cuda.synchronize()
 
     torch.testing.assert_close(Y_expected, Y_actual, atol=0.05, rtol=1e-2)
+    num_execution_plans = graph.get_execution_plan_count()
+    assert (
+        num_execution_plans > 0
+    ), "Graph was executed, number of execution plans must be >0"
+    for i in range(num_execution_plans):
+        name = graph.get_plan_name_at_index(i)
+        assert name is not None and len(name) > 0, "Plan name should be valid."
 
 
 @torch_fork_set_rng(seed=0)

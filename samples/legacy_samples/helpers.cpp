@@ -44,7 +44,7 @@ is_ada_arch() {
 bool
 is_hopper_arch() {
     auto cc = get_compute_capability();
-    return (90 <= cc);
+    return (90 <= cc && cc < 100);
 }
 
 bool
