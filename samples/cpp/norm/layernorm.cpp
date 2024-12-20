@@ -25,6 +25,150 @@
 
 #include <cudnn_frontend.h>
 
+void
+layernorm_fwd_dynamic_shapes(bool train = true) {
+    if (is_arch_supported_by_cudnn() == false) {
+        SKIP("Architecture is not supported by current cudnn version");
+    }
+    namespace fe = cudnn_frontend;
+
+    // clang-format off
+    struct {
+        int64_t b,    s,    d;
+    } layernorm_shapes[] = {
+        {       4, 1024,  128},
+        {       8, 1024,  128},
+        {       4,  512,  128},
+        {       8,  512,  128},
+    };
+    // clang-format on
+
+    constexpr int layernorm_shapes_count = sizeof(layernorm_shapes) / sizeof(layernorm_shapes[0]);
+    int64_t max_x_volume = 0, max_stats_volume = 0, max_weights_volume = 0;
+    for (int idx_shape = 0; idx_shape < layernorm_shapes_count; ++idx_shape) {
+        const auto& ln_shape = layernorm_shapes[idx_shape];
+        max_x_volume         = std::max(max_x_volume, ln_shape.b * ln_shape.s * ln_shape.d);
+        max_stats_volume     = std::max(max_stats_volume, ln_shape.b * ln_shape.s);
+        max_weights_volume   = std::max(max_weights_volume, ln_shape.d);
+    }
+
+    auto kernel_cache = std::make_shared<fe::KernelCache>();
+
+    const auto build_new_graph = [&layernorm_shapes, &kernel_cache, &train](cudnnHandle_t handle, int idx_shape) {
+        const auto& ln_shape = layernorm_shapes[idx_shape];
+
+        fe::graph::Graph graph;
+        graph.set_io_data_type(fe::DataType_t::BFLOAT16)
+            .set_intermediate_data_type(fe::DataType_t::FLOAT)
+            .set_compute_data_type(fe::DataType_t::FLOAT);
+
+        graph.set_dynamic_shape_enabled(true).set_kernel_cache(kernel_cache);
+
+        auto X     = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("X")
+                                  .set_dim({ln_shape.b * ln_shape.s, ln_shape.d, 1, 1})
+                                  .set_stride({ln_shape.d, 1, ln_shape.d, ln_shape.d}));
+        auto scale = graph.tensor(fe::graph::Tensor_attributes()
+                                      .set_name("scale")
+                                      .set_dim({1, ln_shape.d, 1, 1})
+                                      .set_stride({ln_shape.d, 1, ln_shape.d, ln_shape.d})
+                                      .set_data_type(fe::DataType_t::FLOAT));
+        auto bias  = graph.tensor(fe::graph::Tensor_attributes()
+                                     .set_name("bias")
+                                     .set_dim({1, ln_shape.d, 1, 1})
+                                     .set_stride({ln_shape.d, 1, ln_shape.d, ln_shape.d})
+                                     .set_data_type(fe::DataType_t::FLOAT));
+
+        float epsilon_cpu = 1e-05f;
+        auto epsilon      = graph.tensor(epsilon_cpu);
+
+        auto layernorm_options =
+            fe::graph::Layernorm_attributes()
+                .set_forward_phase(train ? fe::NormFwdPhase_t::TRAINING : fe::NormFwdPhase_t::INFERENCE)
+                .set_epsilon(epsilon);
+        auto [Y, mean, inv_variance] = graph.layernorm(X, scale, bias, layernorm_options);
+
+        Y->set_output(true);
+        if (train) {
+            mean->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+            inv_variance->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+        }
+
+        std::cout << graph << std::endl;
+        auto status = graph.validate();
+        if (cudnnGetVersion() >= 90400) {
+            REQUIRE(status.is_good());
+        } else {
+            REQUIRE(status.is_bad());
+            SKIP("Dynamic shapes not supported pre 9.4");
+        }
+
+        status = graph.build_operation_graph(handle);
+        if (cudnnGetVersion() >= 90400) {
+            REQUIRE(status.is_good());
+        } else {
+            REQUIRE(status.is_bad());
+            SKIP("Kernel cache not supported pre 9.4");
+        }
+
+        REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
+
+        REQUIRE(graph.check_support(handle).is_good());
+
+        REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::ALL).is_good());
+
+        return std::make_tuple(graph, X, scale, bias, Y, mean, inv_variance);
+    };
+
+    cudnnHandle_t handle;
+    CUDNN_CHECK(cudnnCreate(&handle));
+
+    for (int idx_shape = 0; idx_shape < layernorm_shapes_count; idx_shape++) {
+        auto [graph, X, scale, bias, Y, mean, inv_variance] = build_new_graph(handle, idx_shape);
+
+        Surface<half> X_tensor(max_x_volume, false);
+        Surface<float> Scale_tensor(max_weights_volume, false);
+        Surface<float> Bias_tensor(max_weights_volume, false);
+        Surface<half> Y_tensor(max_x_volume, false);
+        Surface<float> Mean_tensor(max_stats_volume, false);
+        Surface<float> Var_tensor(max_stats_volume, false);
+
+        int64_t workspace_size;
+        REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+        Surface<int8_t> workspace(workspace_size, false);
+
+        std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack;
+        if (train) {
+            variant_pack = {{X, X_tensor.devPtr},
+                            {scale, Scale_tensor.devPtr},
+                            {bias, Bias_tensor.devPtr},
+                            {Y, Y_tensor.devPtr},
+                            {mean, Mean_tensor.devPtr},
+                            {inv_variance, Var_tensor.devPtr}};
+        } else {
+            variant_pack = {
+                {X, X_tensor.devPtr}, {scale, Scale_tensor.devPtr}, {bias, Bias_tensor.devPtr}, {Y, Y_tensor.devPtr}};
+        }
+        REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
+    }
+
+    CUDNN_CHECK(cudnnDestroy(handle));
+}
+
+TEST_CASE("LayerNorm training dynamic shape", "[layernorm][graph][dynamic_shape]") {
+    if (cudnnGetCudartVersion() < 12000) {
+        SKIP("Test requires cuda toolkit 12.0 or above");
+    }
+    layernorm_fwd_dynamic_shapes(true);
+}
+
+TEST_CASE("LayerNorm inference dynamic shape", "[layernorm][graph][dynamic_shape]") {
+    if (cudnnGetCudartVersion() < 12000) {
+        SKIP("Test requires cuda toolkit 12.0 or above");
+    }
+    layernorm_fwd_dynamic_shapes(false);
+}
+
 TEST_CASE("LayerNorm Training", "[layernorm][graph]") {
     namespace fe = cudnn_frontend;
     fe::graph::Graph graph;

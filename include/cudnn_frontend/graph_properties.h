@@ -1103,6 +1103,7 @@ class Resample_attributes : public Attributes<Resample_attributes> {
                                    name,
                                    inputs,
                                    outputs,
+                                   is_inference,
                                    resample_mode,
                                    padding_mode,
                                    pre_padding,
@@ -1407,6 +1408,11 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     friend class SDPANode;
     friend class Graph;
 
+    using Tensor_t = std::shared_ptr<Tensor_attributes>;
+    using Graph_t  = std::shared_ptr<Graph>;
+
+    using AttentionScoreModifier_t = std::function<Tensor_t(Graph_t, Tensor_t)>;
+
     std::optional<bool> is_inference;
     bool alibi_mask               = false;
     bool padding_mask             = false;
@@ -1416,6 +1422,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
     std::optional<int> max_seq_len_kv;
+    AttentionScoreModifier_t attention_score_modifier = nullptr;
 
    public:
     enum class input_names {
@@ -1506,6 +1513,12 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     SDPA_attributes&
     set_causal_mask_bottom_right(bool const value) {
         causal_mask_bottom_right = value;
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_score_mod(AttentionScoreModifier_t fn) {
+        attention_score_modifier = std::move(fn);
         return *this;
     }
 
@@ -1675,6 +1688,10 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     friend class Attributes<SDPA_backward_attributes>;
     friend class SDPABackwardNode;
     friend class Graph;
+    using Tensor_t = std::shared_ptr<Tensor_attributes>;
+    using Graph_t  = std::shared_ptr<Graph>;
+
+    using AttentionScoreModifier_t = std::function<Tensor_t(Graph_t, Tensor_t)>;
 
     bool alibi_mask               = false;
     bool padding_mask             = false;
@@ -1688,7 +1705,9 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     std::optional<int64_t> max_total_seq_len_q;
     std::optional<int64_t> max_total_seq_len_kv;
 
-    bool is_deterministic_algorithm = false;
+    bool is_deterministic_algorithm                         = false;
+    AttentionScoreModifier_t attention_score_modifier       = nullptr;
+    AttentionScoreModifier_t attention_score_modifier_bprop = nullptr;
 
    public:
     enum class input_names {
@@ -1757,6 +1776,18 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     SDPA_backward_attributes&
     set_padding_mask(bool const value) {
         padding_mask = value;
+        return *this;
+    }
+
+    SDPA_backward_attributes&
+    set_score_mod(AttentionScoreModifier_t fn) {
+        attention_score_modifier = std::move(fn);
+        return *this;
+    }
+
+    SDPA_backward_attributes&
+    set_score_mod_bprop(AttentionScoreModifier_t fn) {
+        attention_score_modifier_bprop = std::move(fn);
         return *this;
     }
 

@@ -30,7 +30,8 @@ namespace cudnn_frontend {
 /// OpaqueBackendPointer class
 /// Holds the raws pointer to backend_descriptor
 /// Usage is to wrap this into a smart pointer as
-/// it helps to create and destroy the backencpointer
+/// it helps to create and destroy the backendpointer
+
 class OpaqueBackendPointer {
     cudnnBackendDescriptor_t m_desc = nullptr;               //!< Raw void pointer
     cudnnStatus_t status            = CUDNN_STATUS_SUCCESS;  //!< status of creation of the Descriptor
@@ -153,7 +154,7 @@ class BackendDescriptor {
         : pointer(pointer_), status(status_), err_msg(err_msg_) {}
     BackendDescriptor() = default;
 
-    virtual ~BackendDescriptor(){};
+    virtual ~BackendDescriptor() {};
 
     ManagedOpaqueDescriptor pointer;  //! Shared pointer of the OpaqueBackendPointer
 

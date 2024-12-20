@@ -75,6 +75,12 @@ class PagedCacheLoadNode : public NodeCRTP<PagedCacheLoadNode> {
     error_t
     pre_validate_node() const override final {
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating PagedCacheLoadNode " << attributes.name << "...");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90500 || detail::get_compiled_version() < 90500,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       "The cuDNN backend version must be at least 9.5.0 at compile time and runtime "
+                                       "in order to use PagedCacheLoadNode.");
+
         auto const yOut_dims      = attributes.outputs.at(PagedCacheLoad_attributes::output_names::yOut)->get_dim();
         auto const yOut_strides   = attributes.outputs.at(PagedCacheLoad_attributes::output_names::yOut)->get_stride();
         auto const container_dims = attributes.inputs.at(PagedCacheLoad_attributes::input_names::container)->get_dim();

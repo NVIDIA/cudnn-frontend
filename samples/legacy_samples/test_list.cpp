@@ -1820,6 +1820,11 @@ TEST_CASE("Dual Scale Bias Act Relu with CPU Reference", "[frontend][fusion][DSB
 TEST_CASE("Scale Bias Conv BNGenstats with CPU Reference", "[frontend][fusion][bn_genstats][cpu]") {
     std::cout << "\n========================================================================================\n";
     std::cout << "Scale Bias Conv BNGenstats with CPU Reference" << std::endl;
+
+    if (!is_ampere_arch() && !is_hopper_arch()) {
+        SKIP("Scale Bias Conv BNGenstats requires Ampere or Hopper");
+    }
+
     int64_t perChannelScaleDim[] = {1, 32, 1, 1};
     int64_t perChannelBiasDim[]  = {1, 32, 1, 1};
     int64_t xTensorDim[]         = {32, 32, 7, 7};

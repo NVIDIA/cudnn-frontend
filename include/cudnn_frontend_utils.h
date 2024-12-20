@@ -233,7 +233,7 @@ to_string(cudnnStatus_t const status) {
 static inline void
 set_error_and_throw_exception(BackendDescriptor const* desc, cudnnStatus_t status, const char* message) {
 
-    std::string padded_message = detail::get_last_error_string_() + std::string(message);
+    std::string padded_message = std::string(message) + detail::get_last_error_string_();
     if (desc != nullptr) {
         desc->set_status(status);
         desc->set_error(padded_message.c_str());

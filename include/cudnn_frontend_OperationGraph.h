@@ -54,7 +54,7 @@ class OperationGraph_v8 : public BackendDescriptor {
     std::string
     describe() const override {
         std::stringstream ss;
-        ss << "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR has " << numOps << " perations." << std::endl;
+        ss << "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR has " << numOps << " operations." << std::endl;
         ss << "Tag: " << opGraphTag << std::endl;
         return ss.str();
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -22,8 +22,10 @@
 
 #include "./utils/fp16_emu.h"
 
-#define STATIC_ASSERT(cond) \
-    { static_assert(cond, "static_assert failed."); }
+#define STATIC_ASSERT(cond)                           \
+    {                                                 \
+        static_assert(cond, "static_assert failed."); \
+    }
 
 // Host functions for converting between FP32 and FP16 formats
 // Paulius Micikevicius (pauliusm@nvidia.com)

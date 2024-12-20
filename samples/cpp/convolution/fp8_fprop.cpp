@@ -58,7 +58,8 @@ TEST_CASE("Convolution fp8 precision", "[conv][graph]") {
                                .set_stride({c * r * s, 1, c * s, c})
                                .set_data_type(fe::DataType_t::FP8_E4M3));
 
-    auto conv_options = fe::graph::Conv_fprop_attributes().set_padding({0, 0}).set_stride({1, 1}).set_dilation({1, 1});
+    auto conv_options =
+        fe::graph::Conv_fprop_attributes().set_padding({0, 0}).set_stride({1, 1}).set_dilation({1, 1}).set_name("conv");
     auto conv_output_fp8 = graph->conv_fprop(X, W, conv_options);
 
     auto descale_x = graph->tensor(fe::graph::Tensor_attributes()

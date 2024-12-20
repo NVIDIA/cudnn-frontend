@@ -78,6 +78,11 @@ class Graph : public ICudnn, public INode {
         RETURN_CUDNN_FRONTEND_ERROR_IF(((is_dynamic_shape_enabled == false) && (kernel_cache != nullptr)),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "Kernel caching enabled but dynamic shapes is disabled");
+        if (detail::get_backend_version() != detail::get_compiled_version()) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: The cuDNN version used at compilation ("
+                                    << detail::get_compiled_version() << ") and the one used at runtime ("
+                                    << detail::get_backend_version() << ") differ.");
+        }
         return {error_code_t::OK, ""};
     }
 
@@ -311,6 +316,7 @@ class Graph : public ICudnn, public INode {
                                                                      vec_data.data(),
                                                                      vec_data.size() * sizeof(float),
                                                                      cudaMemcpyHostToDevice));
+                uid_to_device_ptrs[uid] = static_cast<char *>(workspace) + offset;
             }
             // 1 means memset
             else if (operation_type == 1) {
@@ -436,6 +442,7 @@ class Graph : public ICudnn, public INode {
                                                                        vec_data.data(),
                                                                        vec_data.size() * sizeof(float),
                                                                        cudaMemcpyHostToDevice));
+                uid_to_device_ptrs[uid] = static_cast<char *>(workspace) + offset;
             }
             // 1 means memset
             else if (operation_type == 1) {
@@ -1320,6 +1327,21 @@ class Graph : public ICudnn, public INode {
                         CHECK_TENSORS(sdpa_fp8_attributes);
                         FILL_GLOBAL_IO_TENSOR_MAP(sdpa_fp8_attributes);
                         sub_nodes.emplace_back(std::make_unique<SDPAFP8Node>(std::move(sdpa_fp8_attributes), context));
+                    } else if (tag == "RESAMPLE") {
+                        auto resample_attributes = j_sub_node.get<Resample_attributes>();
+                        CHECK_TENSORS(resample_attributes);
+                        FILL_GLOBAL_IO_TENSOR_MAP(resample_attributes);
+                        sub_nodes.emplace_back(std::make_unique<ResampleNode>(std::move(resample_attributes), context));
+                    } else if (tag == "CONV_DGRAD") {
+                        auto dgrad_attributes = j_sub_node.get<Conv_dgrad_attributes>();
+                        CHECK_TENSORS(dgrad_attributes);
+                        FILL_GLOBAL_IO_TENSOR_MAP(dgrad_attributes);
+                        sub_nodes.emplace_back(std::make_unique<DgradNode>(std::move(dgrad_attributes), context));
+                    } else if (tag == "CONV_WGRAD") {
+                        auto wgrad_attributes = j_sub_node.get<Conv_wgrad_attributes>();
+                        CHECK_TENSORS(wgrad_attributes);
+                        FILL_GLOBAL_IO_TENSOR_MAP(wgrad_attributes);
+                        sub_nodes.emplace_back(std::make_unique<WgradNode>(std::move(wgrad_attributes), context));
                     }
                 }
 #undef CHECK_TENSORS
@@ -1699,6 +1721,9 @@ Graph::conv_fprop(std::shared_ptr<Tensor_attributes> x,
                   std::shared_ptr<Tensor_attributes> w,
                   Conv_fprop_attributes attributes) {
     // Make required output tensors
+    if (attributes.name.empty()) {
+        attributes.name += std::to_string(sub_nodes.size());
+    }
     auto Y                                                     = output_tensor(attributes.name + "::Y");
     attributes.outputs[Conv_fprop_attributes::output_names::Y] = Y;
 
@@ -1718,6 +1743,9 @@ Graph::dbn_weight(std::shared_ptr<Tensor_attributes> dy,
                   std::shared_ptr<Tensor_attributes> inv_variance,
                   std::shared_ptr<Tensor_attributes> scale,
                   DBN_weight_attributes attributes) {
+    if (attributes.name.empty()) {
+        attributes.name += std::to_string(sub_nodes.size());
+    }
     // Make required output tensors
     auto DBIAS = attributes.outputs[DBN_weight_attributes::output_names::DBIAS] =
         output_tensor(attributes.name + "::DBIAS");

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -27,8 +27,8 @@
 
 namespace cudnn_frontend {
 
-[[maybe_unused]] auto static get_fallback_engine_list(DescriptorType_t mode,
-                                                      const std::string &opGraphTag) -> std::vector<int> {
+[[maybe_unused]] auto static get_fallback_engine_list(DescriptorType_t mode, const std::string &opGraphTag)
+    -> std::vector<int> {
     auto major_version = detail::get_backend_version() / 1000;
 
     auto minor_version = (detail::get_backend_version() / 100) % 10;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -47,9 +47,8 @@ auto inline EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationG
     return plans;
 }
 
-auto inline EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle,
-                                                OperationGraph& opGraph,
-                                                Predicate pred) -> executionPlans_t {
+auto inline EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph& opGraph, Predicate pred)
+    -> executionPlans_t {
     // Creating a set of execution plans that are supported.
     executionPlans_t plans = cudnnGetPlan(handle, opGraph);
     return filter(pred, plans);

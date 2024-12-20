@@ -495,6 +495,14 @@ PyGraph::query_tensor_attributes_of_uid(int64_t const uid) const {
     return std::make_shared<graph::Tensor_attributes>(tensor);
 }
 
+std::string
+PyGraph::get_plan_name_at_index(int64_t index) {
+    std::string plan_name;
+    auto status = graph.get_plan_name_at_index(index, plan_name);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+    return plan_name;
+}
+
 std::vector<int64_t>
 default_vector(void) {
     return {};
@@ -805,6 +813,14 @@ init_pygraph_submodule(py::module_& m) {
                     Args:
                     uid (int): The uid of tensor to be queried
                     If the graph does not have the UID, this will raise an error
+                )pbdoc")
+        .def("get_plan_name_at_index",
+             &PyGraph::get_plan_name_at_index,
+             py::arg("index"),
+             R"pbdoc(
+                    Get the name for a plan at the given index.
+                    Args:
+                    index (int): The index of the plan to get workspace from.
                 )pbdoc")
         .def("_execute", &PyGraph::execute)
         .def("populate_cuda_graph", &PyGraph::populate_cuda_graph)
