@@ -70,11 +70,21 @@ include(GNUInstallDirs)
 # See https://cmake.org/cmake/help/latest/module/CMakePackageConfigHelpers.html#example-generating-package-files
 include(CMakePackageConfigHelpers)
 
-# Install and export the header files
+# Install the components
 install(
     TARGETS cudnn_frontend
     EXPORT cudnn_frontend_targets FILE_SET HEADERS
 )
+
+if (CUDNN_FRONTEND_BUILD_SAMPLES)
+    install(TARGETS legacy_samples samples RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+if (CUDNN_FRONTEND_BUILD_TESTS)
+    install(TARGETS tests RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+# Export the targets
 export(
     EXPORT cudnn_frontend_targets
     FILE "${CMAKE_CURRENT_BINARY_DIR}/cudnn_frontend/cudnn_frontend-targets.cmake"

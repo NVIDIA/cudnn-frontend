@@ -44,7 +44,9 @@ target_link_libraries(
     _cudnn_frontend_pch
     CUDNN::cudnn
 
+    CUDA::cublasLt
     CUDA::cudart
+    CUDA::nvrtc
 )
 
 # target cmake properties
