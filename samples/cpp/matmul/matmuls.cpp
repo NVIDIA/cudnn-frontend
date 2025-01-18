@@ -250,7 +250,7 @@ TEST_CASE("Matmul", "[matmul][graph]") {
 
     // Run cudnn graph
     Surface<float> C_gpu(b * m * n, false);
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
@@ -319,7 +319,7 @@ TEST_CASE("Abs + Matmul", "[matmul][graph]") {
 
     // Run cudnn graph
     Surface<float> C_gpu(b * m * n, false);
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
@@ -539,7 +539,7 @@ TEST_CASE("Matmul SBR Graph", "[matmul][graph]") {
     auto [graph, A, B, bias, scale, O] = lookup_cache_or_build_graph(
         handle, x_tensor.devPtr, w_tensor.devPtr, s_tensor.devPtr, b_tensor.devPtr, y_tensor.devPtr);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
@@ -606,7 +606,7 @@ TEST_CASE("Matmul with restricted shared memory", "[matmul][graph]") {
 
     // Run cudnn graph
     Surface<float> C_gpu(b * m * n, false);
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
