@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.17)
+cmake_minimum_required(VERSION 3.23)
 
 project(cudnn_frontend VERSION 1.11.0)
 
@@ -14,6 +14,15 @@ else()
 endif()
 
 add_library(cudnn_frontend INTERFACE)
+
+# Add header files to library
+file(GLOB_RECURSE CUDNN_FRONTEND_INCLUDE_FILES "include/*")
+target_sources(
+    cudnn_frontend PUBLIC FILE_SET HEADERS
+    BASE_DIRS "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+    FILES "${CUDNN_FRONTEND_INCLUDE_FILES}"
+)
+unset(CUDNN_FRONTEND_INCLUDE_FILES)
 
 target_compile_definitions(
     cudnn_frontend INTERFACE
@@ -58,7 +67,31 @@ endif()
 # * CMAKE_INSTALL_INCLUDEDIR
 include(GNUInstallDirs)
 
+# See https://cmake.org/cmake/help/latest/module/CMakePackageConfigHelpers.html#example-generating-package-files
+include(CMakePackageConfigHelpers)
+
+# Install and export the header files
 install(
-    DIRECTORY ${PROJECT_SOURCE_DIR}/include/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    TARGETS cudnn_frontend
+    EXPORT cudnn_frontend_targets FILE_SET HEADERS
+)
+export(
+    EXPORT cudnn_frontend_targets
+    FILE "${CMAKE_CURRENT_BINARY_DIR}/cudnn_frontend/cudnn_frontend-targets.cmake"
+)
+install(
+    EXPORT cudnn_frontend_targets
+    FILE cudnn_frontend-targets.cmake
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cudnn_frontend"
+)
+
+# Install the CMake configuration file for header discovery
+configure_package_config_file(
+    cudnn_frontend-config.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/cudnn_frontend-config.cmake"
+    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cudnn_frontend"
+)
+install(
+    FILES "${CMAKE_CURRENT_BINARY_DIR}/cudnn_frontend-config.cmake"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cudnn_frontend"
 )
