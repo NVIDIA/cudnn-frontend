@@ -65,7 +65,7 @@ TEST_CASE("Convolution Wgrad", "[wgrad][graph][wgrad][Conv_wgrad]") {
     Surface<half> dy_tensor(4 * 64 * 16 * 16, false);
     Surface<half> dw_tensor(64 * 64 * 3 * 3, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
@@ -138,7 +138,7 @@ TEST_CASE("scale-bias-relu-wgrad Graph", "[wgrad][graph][scale-bias-relu-wgrad][
     Surface<half> dy_tensor(4 * 64 * 16 * 16, false);
     Surface<half> dw_tensor(64 * 64 * 3 * 3, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

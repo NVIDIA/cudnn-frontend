@@ -234,7 +234,7 @@ TEST_CASE("Toy sdpa forward as CUDA graph", "[graph][sdpa][flash][forward][cudag
     REQUIRE(graph->check_support(handle).is_good());
     REQUIRE(graph->build_plans(handle).is_good());
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
 
     //// Create a CUDA graph.

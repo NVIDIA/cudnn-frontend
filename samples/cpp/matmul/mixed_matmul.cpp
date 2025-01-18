@@ -97,7 +97,7 @@ TEST_CASE("Mixed Precision Matmul", "[matmul][graph]") {
     //// Run cudnn graph
     // note this is a bf16 tensor, but half is used just for memory allocation
     Surface<half> C_gpu(b * m * n, false);
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

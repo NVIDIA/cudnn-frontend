@@ -97,7 +97,7 @@ TEST_CASE("BN Finalize Graph", "[batchnorm][graph]") {
     Surface<float> eq_scale_tensor(32, false);
     Surface<float> eq_bias_tensor(32, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
@@ -226,7 +226,7 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
     Surface<float> Peer_stats_0_tensor(2 * 4 * 32, false, true);
     Surface<float> Peer_stats_1_tensor(2 * 4 * 32, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
@@ -345,7 +345,7 @@ TEST_CASE("DBN Add Relu Graph", "[BN][graph][backward]") {
     Surface<float> Peer_stats_0_tensor(2 * 4 * 32, false, true);
     Surface<float> Peer_stats_1_tensor(2 * 4 * 32, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
@@ -452,7 +452,7 @@ TEST_CASE("BN_inference DRelu DBN Graph", "[Batchnorm][graph][backward]") {
     Surface<float> Dbias_tensor(32, false);
     Surface<half> DX_tensor(4 * 32 * 16 * 16, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

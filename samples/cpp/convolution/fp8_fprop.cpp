@@ -117,7 +117,7 @@ TEST_CASE("Convolution fp8 precision", "[conv][graph]") {
     Surface<float> Y_scale_gpu(1, false);
     Surface<float> amax_gpu(1, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

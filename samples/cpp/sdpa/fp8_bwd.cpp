@@ -213,7 +213,7 @@ TEST_CASE("sdpa_fp8_bprop", "[graph][sdpa][fp8][backward]") {
         {Amax_dV, AMax_dV_Tensor.devPtr},
         {Amax_dP, AMax_dP_Tensor.devPtr}};
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
@@ -381,7 +381,7 @@ TEST_CASE("sdpa_fp8_gqa_bprop", "[graph][sdpa][fp8][backward]") {
         {amax_dV, amax_dV_gpu.devPtr},
         {amax_dP, amax_dP_gpu.devPtr}};
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
