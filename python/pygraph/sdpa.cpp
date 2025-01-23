@@ -25,7 +25,10 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
               bool const use_causal_mask,
               bool const use_causal_mask_bottom_right,
-              py::object const& sliding_window_length,
+              py::object const& sliding_window,
+              cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
+              py::object const& left_bound,
+              py::object const& right_bound,
               py::object const& dropout,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_k_table,
@@ -33,17 +36,20 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               py::object const& paged_attention_max_seq_len_kv,
               cudnn_frontend::DataType_t const& compute_data_type,
               std::string const& name) {
-    auto attributes = cudnn_frontend::graph::SDPA_attributes()
-                          .set_is_inference(is_inference)
-                          .set_bias(bias)
-                          .set_alibi_mask(use_alibi_mask)
-                          .set_padding_mask(use_padding_mask)
-                          .set_seq_len_q(seq_len_q)
-                          .set_seq_len_kv(seq_len_kv)
-                          .set_causal_mask(use_causal_mask)
-                          .set_causal_mask_bottom_right(use_causal_mask_bottom_right)
-                          .set_compute_data_type(compute_data_type)
-                          .set_name(name);
+    auto attributes =
+        cudnn_frontend::graph::SDPA_attributes()
+            .set_is_inference(is_inference)
+            .set_bias(bias)
+            .set_alibi_mask(use_alibi_mask)
+            .set_padding_mask(use_padding_mask)
+            .set_seq_len_q(seq_len_q)
+            .set_seq_len_kv(seq_len_kv)
+            .set_diagonal_alignment(
+                diagonal_alignment)  // for backwards compatibility, this must be called prior to set_causal_mask_*
+            .set_causal_mask(use_causal_mask)
+            .set_causal_mask_bottom_right(use_causal_mask_bottom_right)
+            .set_compute_data_type(compute_data_type)
+            .set_name(name);
 
     if (paged_attention_k_table) {
         attributes.set_paged_attention_k_table(paged_attention_k_table);
@@ -74,9 +80,29 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
         }
     }
 
-    if (!sliding_window_length.is_none()) {
-        int const sliding_window_value = sliding_window_length.cast<int>();
-        attributes.set_sliding_window_length(sliding_window_value);
+    if (!sliding_window.is_none()) {
+        if (py::isinstance<py::int_>(sliding_window)) {
+            int sliding_window_value = sliding_window.cast<int64_t>();
+            attributes.set_diagonal_band_left_bound(sliding_window_value);
+        } else {
+            throw std::runtime_error("sliding window must be an int (or None)");
+        }
+    }
+
+    if (!left_bound.is_none()) {
+        if (py::isinstance<py::int_>(left_bound)) {
+            attributes.set_diagonal_band_left_bound(left_bound.cast<int64_t>());
+        } else {
+            throw std::runtime_error("diagonal_band_left_bound must be an int (or None)");
+        }
+    }
+
+    if (!right_bound.is_none()) {
+        if (py::isinstance<py::int_>(right_bound)) {
+            attributes.set_diagonal_band_right_bound(right_bound.cast<int32_t>());
+        } else {
+            throw std::runtime_error("diagonal_band_right_bound must be an int (or None)");
+        }
     }
 
     if (!dropout.is_none()) {
@@ -117,8 +143,6 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
         }
     }
 
-    // Add page table attributes
-
     auto [O, Stats] = graph.sdpa(q, k, v, attributes);
     return {O, Stats};
 }
@@ -141,24 +165,30 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        py::object const& max_total_seq_len_kv,
                        bool const use_causal_mask,
                        bool const use_causal_mask_bottom_right,
-                       py::object const& sliding_window_length,
+                       py::object const& sliding_window,
+                       cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
+                       py::object const& left_bound,
+                       py::object const& right_bound,
                        py::object const& dropout,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
                        bool const use_deterministic_algorithm,
                        cudnn_frontend::DataType_t const& compute_data_type,
                        std::string const& name) {
-    auto attributes = cudnn_frontend::graph::SDPA_backward_attributes()
-                          .set_bias(bias)
-                          .set_dbias(dBias)
-                          .set_alibi_mask(use_alibi_mask)
-                          .set_padding_mask(use_padding_mask)
-                          .set_seq_len_q(seq_len_q)
-                          .set_seq_len_kv(seq_len_kv)
-                          .set_causal_mask(use_causal_mask)
-                          .set_causal_mask_bottom_right(use_causal_mask_bottom_right)
-                          .set_deterministic_algorithm(use_deterministic_algorithm)
-                          .set_compute_data_type(compute_data_type)
-                          .set_name(name);
+    auto attributes =
+        cudnn_frontend::graph::SDPA_backward_attributes()
+            .set_bias(bias)
+            .set_dbias(dBias)
+            .set_alibi_mask(use_alibi_mask)
+            .set_padding_mask(use_padding_mask)
+            .set_seq_len_q(seq_len_q)
+            .set_seq_len_kv(seq_len_kv)
+            .set_diagonal_alignment(
+                diagonal_alignment)  // for backwards compatibility, this must be called prior to set_causal_mask_*
+            .set_causal_mask(use_causal_mask)
+            .set_causal_mask_bottom_right(use_causal_mask_bottom_right)
+            .set_deterministic_algorithm(use_deterministic_algorithm)
+            .set_compute_data_type(compute_data_type)
+            .set_name(name);
 
     py::object cudnn_tensor_type = py::module_::import("cudnn").attr("tensor");
 
@@ -185,9 +215,29 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
         attributes.set_max_total_seq_len_kv(max_total_seq_len_kv_value);
     }
 
-    if (!sliding_window_length.is_none()) {
-        int const sliding_window_value = sliding_window_length.cast<int>();
-        attributes.set_sliding_window_length(sliding_window_value);
+    if (!sliding_window.is_none()) {
+        if (py::isinstance<py::int_>(sliding_window)) {
+            int sliding_window_value = sliding_window.cast<int64_t>();
+            attributes.set_diagonal_band_left_bound(sliding_window_value);
+        } else {
+            throw std::runtime_error("sliding window must be an int (or None)");
+        }
+    }
+
+    if (!left_bound.is_none()) {
+        if (py::isinstance<py::int_>(left_bound)) {
+            attributes.set_diagonal_band_left_bound(left_bound.cast<int64_t>());
+        } else {
+            throw std::runtime_error("diagonal_band_left_bound must be an int (or None)");
+        }
+    }
+
+    if (!right_bound.is_none()) {
+        if (py::isinstance<py::int_>(right_bound)) {
+            attributes.set_diagonal_band_right_bound(right_bound.cast<int64_t>());
+        } else {
+            throw std::runtime_error("diagonal_band_right_bound must be an int (or None)");
+        }
     }
 
     if (!dropout.is_none()) {
@@ -246,6 +296,7 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
                   bool const use_causal_mask,
+                  bool const use_causal_mask_bottom_right,
                   py::object const& dropout,
                   cudnn_frontend::DataType_t const& compute_data_type,
                   std::string const& name) {
@@ -255,6 +306,7 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                           .set_seq_len_q(seq_len_q)
                           .set_seq_len_kv(seq_len_kv)
                           .set_causal_mask(use_causal_mask)
+                          .set_causal_mask_bottom_right(use_causal_mask_bottom_right)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
 
@@ -335,6 +387,7 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
                            bool const use_causal_mask,
+                           bool const use_causal_mask_bottom_right,
                            py::object const& dropout,
                            cudnn_frontend::DataType_t const& compute_data_type,
                            std::string const& name) {
@@ -343,6 +396,7 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
                           .set_seq_len_q(seq_len_q)
                           .set_seq_len_kv(seq_len_kv)
                           .set_causal_mask(use_causal_mask)
+                          .set_causal_mask_bottom_right(use_causal_mask_bottom_right)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
 
@@ -433,6 +487,9 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("use_causal_mask", false),
           py::arg_v("use_causal_mask_bottom_right", false),
           py::arg_v("sliding_window_length", py::none()),
+          py::arg_v("diagonal_alignment", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT),
+          py::arg_v("diagonal_band_left_bound", py::none()),
+          py::arg_v("diagonal_band_right_bound", py::none()),
           py::arg_v("dropout", py::none()),
           py::arg_v("rng_dump", nullptr),
           py::arg_v("paged_attention_k_table", py::none()),
@@ -454,9 +511,6 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     use_padding_mask (Optional[bool]): Whether to use padding mask. Default is False.
                     seq_len_q (Optional[cudnn_tensor]): The sequence length of the query.
                     seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key.
-                    use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
-                    use_causal_mask_bottom_right (Optional[bool]): Whether to use bottom right aligned causal mask. Default is False.
-                    sliding_window_length (Optional[int]): The length of sliding window. Default is None.
                     dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
                     rng_dump (Optional[cudnn_tensor]): Debug tensor to dump the Philox RNG dropout mask. Default is None.
                     paged_attention_k_table (Optional[cudnn_tensor]): The page table to look up offsets into 'k'
@@ -464,6 +518,14 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     paged_attention_max_seq_len_kv (Optional[integer]): The maximum sequence length for k/v caches when paged attention is active.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                     name (Optional[str]): The name of the operation.
+                Preferred masking Args:
+                    diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and diagonal_band_right_bound=0. Default is TOP_LEFT.
+                    left_bround (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
+                    diagonal_band_right_bound (Optional[int]): An integer >= 0 specifying the offset to the right of the main diagonal to attend to. Default is None, implying +Inf.
+                Deprecated masking Args (can cause undetermined behavior when combined with the Preferred masking args):
+                    sliding_window_length (Optional[int]): A positive int specifying the left bound sliding window length
+                    use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
+                    use_causal_mask_bottom_right (Optional[bool]): Whether to use bottom right aligned causal mask. Default is False.
 
                 Returns:
                     o (cudnn_tensor): The output data.
@@ -489,6 +551,9 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("use_causal_mask", false),
           py::arg_v("use_causal_mask_bottom_right", false),
           py::arg_v("sliding_window_length", py::none()),
+          py::arg_v("diagonal_alignment", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT),
+          py::arg_v("diagonal_band_left_bound", py::none()),
+          py::arg_v("diagonal_band_right_bound", py::none()),
           py::arg_v("dropout", py::none()),
           py::arg_v("rng_dump", nullptr),
           py::arg_v("use_deterministic_algorithm", false),
@@ -511,14 +576,21 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     use_padding_mask (Optional[bool]): Whether to use padding mask. Default is False.
                     seq_len_q (Optional[cudnn_tensor]): The sequence length of the query.
                     seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key.
-                    use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
-                    use_causal_mask_bottom_right (Optional[bool]): Whether to use bottom right aligned causal mask. Default is False.
-                    sliding_window_length (Optional[int]): The length of sliding window. Default is None.
+                    max_total_seq_len_q (Optional[int]): The maximum number of query sequence tokens for all batches, used for workspace allocation,
+                    max_total_seq_len_kv (Optional[int]): The maximum number of key/value sequence tokens for all batches, used for workspace allocation,
                     dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
                     rng_dump (Optional[cudnn_tensor]): Debug tensor to dump the Philox RNG dropout mask. Default is None.
                     use_deterministic_algorithm (Optional[bool]): Whether to always use deterministic algorithm. Default is False.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                     name (Optional[str]): The name of the operation.
+                Preferred masking Args:
+                    diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and diagonal_band_right_bound=0. Default is TOP_LEFT.
+                    diagonal_band_left_bround (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
+                    diagonal_band_right_bound (Optional[int]): An integer >= 0 specifying the offset to the right of the main diagonal to attend to. Default is None, implying +Inf.
+                Deprecated masking Args (can cause undetermined behavior when combined with the Preferred masking args):
+                    sliding_window_length (Optional[int]): A positive int specifying the left bound sliding window length
+                    use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
+                    use_causal_mask_bottom_right (Optional[bool]): Whether to use bottom right aligned causal mask. Default is False.
 
                 Returns:
                     dQ (cudnn_tensor): The query gradient data.
@@ -539,6 +611,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg("is_inference"),
           py::arg_v("attn_scale", py::none()),
           py::arg("use_padding_mask"),
+          py::arg_v("use_causal_mask_bottom_right", false),
           py::arg_v("seq_len_q", nullptr),
           py::arg_v("seq_len_kv", nullptr),
           py::arg_v("use_causal_mask", false),
@@ -596,6 +669,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg("scale_dP"),
           py::arg_v("attn_scale", py::none()),
           py::arg_v("use_padding_mask", false),
+          py::arg_v("use_causal_mask_bottom_right", false),
           py::arg_v("seq_len_q", nullptr),
           py::arg_v("seq_len_kv", nullptr),
           py::arg_v("use_causal_mask", false),

@@ -1,11 +1,12 @@
-## Table of Contents
-1. [Pointwise](#Pointwise)
-2. [Reduction](#Reduction)
+# Pointwise and Reduction
 
-### Pointwise
-Pointwise performs an elementwise operation between two tensors. The operation used is controlled by pointwise mode `cudnn_frontend::PointwiseMode_t`.   
+(pointwise)=
+## Pointwise
 
-The API to achieve above is:  
+The pointwise operation performs an elementwise operation between two tensors. The operation used is controlled by pointwise mode `cudnn_frontend::PointwiseMode_t`.   
+
+### C++ API
+
 ```
 std::shared_ptr<Tensor_attributes>
 pointwise(std::shared_ptr<Tensor_attributes>,
@@ -22,8 +23,7 @@ pointwise(std::shared_ptr<Tensor_attributes>,
           std::shared_ptr<Tensor_attributes>,
           Pointwise_attributes);
 ```
-where the pointwise mode dictates the API among the choices above.
-Please refer to documentation of `cudnn_frontend::PointwiseMode_t` for details.
+The pointwise mode dictates the API among the choices above. Refer to the documentation of `cudnn_frontend::PointwiseMode_t` for details.
 
 Pointwise attributes is a lightweight structure with setters:  
 ```
@@ -49,7 +49,8 @@ Pointwise_attributes&
 set_compute_data_type(DataType_t value)
 ```
 
-Python API: 
+### Python API
+
 - add
     - a
     - b
@@ -97,11 +98,13 @@ Python API:
     - compute_data_type
     - name
 
-### Reduction
-Reduction operation reduces an input tensor using an operation controlled by `cudnn_frontend::ReductionMode_t`.
-The dimensions in input tensors to reduce are deduced using output tensor dimensions.
+(reduction)=
+## Reduction
 
-The API to achieve above is:  
+The reduction operation reduces an input tensor using an operation controlled by `cudnn_frontend::ReductionMode_t`. The dimensions in input tensors to reduce are deduced using output tensor dimensions.
+
+### C++ API
+
 ```
 std::shared_ptr<Tensor_attributes>
 reduction(std::shared_ptr<Tensor_attributes> input, Reduction_attributes);

@@ -28,21 +28,14 @@ class BatchnormInferenceNode : public NodeCRTP<BatchnormInferenceNode> {
 
         attributes.fill_from_context(context);
 
-        auto X                  = attributes.inputs[Batchnorm_inference_attributes::input_names::X];
-        auto const x_tensor_dim = X->get_dim();
-
-        auto Y            = attributes.outputs[Batchnorm_inference_attributes::output_names::Y];
-        auto y_tensor_dim = Y->get_dim();
+        auto X = attributes.inputs[Batchnorm_inference_attributes::input_names::X];
+        auto Y = attributes.outputs[Batchnorm_inference_attributes::output_names::Y];
         // Only infer dims and strides if user did not set them
-        if (y_tensor_dim.empty()) {
-            y_tensor_dim.resize(x_tensor_dim.size());
-            Y->set_dim(x_tensor_dim);
+        if (Y->get_dim().empty()) {
+            Y->set_dim(X->get_dim());
         }
         if (Y->get_stride().empty()) {
-            auto const& Y_dim = Y->get_dim();
-            // Default to NHWC
-            auto const& stride_order = detail::generate_NHWC_stride_order(Y_dim.size());
-            Y->set_stride(detail::generate_stride(Y_dim, stride_order));
+            Y->set_stride(X->get_stride());
         }
 
         return {error_code_t::OK, ""};

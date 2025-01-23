@@ -9,6 +9,7 @@ class Context {
     DataType_t intermediate_data_type = DataType_t::NOT_SET;
     DataType_t io_data_type           = DataType_t::NOT_SET;
     int32_t target_sm_count           = -1;
+    int32_t target_sm_version         = -1;
 
     std::string name = "";
 
@@ -63,9 +64,20 @@ class Context {
         return *this;
     }
 
+    Context&
+    set_sm_version(int32_t version) {
+        target_sm_version = version;
+        return *this;
+    }
+
     int32_t
     get_target_sm_count() const {
         return target_sm_count;
+    }
+
+    int32_t
+    get_sm_version() const {
+        return target_sm_version;
     }
 
     Context&

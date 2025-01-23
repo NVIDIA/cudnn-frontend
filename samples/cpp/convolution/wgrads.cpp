@@ -47,8 +47,9 @@ TEST_CASE("Convolution Wgrad", "[wgrad][graph][wgrad][Conv_wgrad]") {
     auto DW            = graph.conv_wgrad(DY, X, wgrad_options);
     DW->set_output(true).set_dim({64, 64, 3, 3});
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -71,7 +72,6 @@ TEST_CASE("Convolution Wgrad", "[wgrad][graph][wgrad][Conv_wgrad]") {
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, x_tensor.devPtr}, {DY, dy_tensor.devPtr}, {DW, dw_tensor.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("scale-bias-relu-wgrad Graph", "[wgrad][graph][scale-bias-relu-wgrad][ConvBNwgrad]") {
@@ -118,8 +118,9 @@ TEST_CASE("scale-bias-relu-wgrad Graph", "[wgrad][graph][scale-bias-relu-wgrad][
         SKIP("ConvBNwgrad requires hopper and above architecture.");
     }
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -147,5 +148,4 @@ TEST_CASE("scale-bias-relu-wgrad Graph", "[wgrad][graph][scale-bias-relu-wgrad][
                                                                                              {DY, dy_tensor.devPtr},
                                                                                              {DW, dw_tensor.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-    cudnnDestroy(handle);
 }

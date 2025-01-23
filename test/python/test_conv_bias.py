@@ -182,6 +182,90 @@ def test_conv_relu(cudnn_handle):
 
 
 @torch_fork_set_rng(seed=0)
+def test_conv_relu_execution_plan_creation(cudnn_handle):
+    # Reference code
+    X_gpu = torch.randn(
+        20, 40, 30, 40, requires_grad=False, device="cuda", dtype=torch.float16
+    ).to(memory_format=torch.channels_last)
+    W_gpu = torch.randn(
+        54, 40, 3, 4, requires_grad=False, device="cuda", dtype=torch.float16
+    ).to(memory_format=torch.channels_last)
+    padding = [0, 1]
+    stride = [2, 3]
+    dilation = [1, 1]
+    model = CSBR().eval().to("cuda").to(torch.float16)
+    Y_expected = model(
+        X_gpu,
+        W_gpu,
+        padding=padding,
+        stride=stride,
+        dilation=dilation,
+        lower_clip=0.5,
+        upper_clip=0.55,
+    )
+
+    stream = torch.cuda.current_stream().cuda_stream
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
+
+    # Cudnn code
+    graph = cudnn.pygraph(
+        io_data_type=cudnn.data_type.HALF,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        handle=cudnn_handle,
+    )
+
+    X = graph.tensor(
+        name="X", dim=X_gpu.size(), stride=X_gpu.stride(), data_type=X_gpu.dtype
+    )
+    W = graph.tensor(
+        name="W", dim=W_gpu.size(), stride=W_gpu.stride(), data_type=W_gpu.dtype
+    )
+
+    conv_output = graph.conv_fprop(
+        image=X, weight=W, padding=padding, stride=stride, dilation=dilation
+    )
+
+    Y = graph.relu(name="relu", input=conv_output, lower_clip=0.5, upper_clip=0.55)
+    Y.set_output(True)
+
+    graph.validate()
+    graph.build_operation_graph()
+
+    # Build all unique kernel cfg plans
+    for engine in range(graph.get_engine_count()):
+        try:
+            knobs = graph.get_knobs_for_engine(engine)
+        except RuntimeError:
+            continue
+
+        for knob in knobs:
+            if knob.type == cudnn.knob_type.KERNEL_CFG:
+                for kernel_cfg in range(
+                    knob.min_value, knob.max_value + 1, knob.stride
+                ):
+                    try:
+                        graph.create_execution_plan(
+                            engine, {cudnn.knob_type.KERNEL_CFG: kernel_cfg}
+                        )
+                    except RuntimeError:
+                        continue
+
+    graph.check_support()
+    graph.build_plans()
+
+    workspace = torch.empty(
+        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
+    )
+
+    Y_actual = torch.zeros_like(Y_expected)
+    graph.execute({X: X_gpu, W: W_gpu, Y: Y_actual}, workspace, handle=cudnn_handle)
+    # Compare
+    torch.cuda.synchronize()
+    torch.testing.assert_close(Y_expected, Y_actual, atol=1e-3, rtol=1e-3)
+
+
+@torch_fork_set_rng(seed=0)
 def test_conv3d_bias_leaky_relu(cudnn_handle):
 
     N, C, D, H, W = 4, 16, 52, 54, 56
@@ -407,11 +491,3 @@ def test_conv_int8(cudnn_handle):
 
     if compare_output:
         torch.testing.assert_close(Y_expected, Y_actual, atol=1e-2, rtol=1e-2)
-
-
-if __name__ == "__main__":
-    # test_conv_int8()
-    test_conv_relu(cudnn_handle)
-    # test_conv_bias_relu()
-    # test_conv3d_bias_leaky_relu()
-    # test_leaky_relu_backward()

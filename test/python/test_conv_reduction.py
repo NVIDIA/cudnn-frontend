@@ -70,7 +70,3 @@ def test_reduction(cudnn_handle):
     torch.cuda.synchronize()
     # Compare
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-3, rtol=1e-3)
-
-
-if __name__ == "__main__":
-    test_reduction(cudnn_handle)

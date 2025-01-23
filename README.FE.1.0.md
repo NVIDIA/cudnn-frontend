@@ -121,6 +121,30 @@ This method guarantees that executing the graph using plans queried will succeed
 cudnn_frontend::error_t cudnn_frontend::graph::Graph::check_support(cudnnHandle_t h);
 ```
 
+### Querying Plan Properties (Optional)
+You can query the properties of the plan at a given index, or of the candidate plan using the following methods:
+
+```
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::get_behavior_notes_for_plan_at_index(int64_t const plan_index, std::vector<cudnn_frontend::BehaviorNote_t> &);
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::get_behavior_notes(std::vector<cudnn_frontend::BehaviorNote_t> &);
+```
+
+The `notes` argument acts as the out parameter.
+
+### Filtering Plans (Optional)
+Users can filter plans on numerical, behavioral notes, or plans that do not provide desired functional correctness.
+
+```
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::select_numeric_notes(std::vector<cudnn_frontend::NumericalNote_t> const&);
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::select_behavior_notes(std::vector<cudnn_frontend::BehaviorNote_t> const&);
+
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_numeric_notes(std::vector<cudnn_frontend::NumericalNote_t> const&);
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_behavior_notes(std::vector<cudnn_frontend::BehaviorNote_t> const&);
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_workspace_greater_than(int64_t const workspace);
+cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_shared_mem_greater_than(int64_t const shared_memory);
+```
+
+
 ###  Building the Execution Plan
 
 This function builds execution plans queried with `create_execution_plan(...)` API.
@@ -145,18 +169,6 @@ cudnn_frontend::Graph::build_plan_at_index(
     cudnnHandle_t const &handle,
     int64_t plan_index
 );
-```
-### Filtering Plans (Optional)
-Users can filter plans on numerical, behavioral notes, or plans that do not provide desired functional correctness.
-
-```
-cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::select_numeric_notes(std::vector<cudnn_frontend::NumericalNote_t> const&);
-cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::select_behavior_notes(std::vector<cudnn_frontend::BehaviorNote_t> const&);
-
-cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_numeric_notes(std::vector<cudnn_frontend::NumericalNote_t> const&);
-cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_behavior_notes(std::vector<cudnn_frontend::BehaviorNote_t> const&);
-cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_workspace_greater_than(int64_t const workspace);
-cudnn_frontend::graph::Graph& cudnn_frontend::graph::Plans::deselect_shared_mem_greater_than(int64_t const shared_memory);
 ```
 
 ### Autotuning

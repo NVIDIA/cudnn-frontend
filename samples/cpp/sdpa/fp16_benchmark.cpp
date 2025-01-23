@@ -101,8 +101,9 @@ TEST_CASE("Benchmark sdpa graph API runtimes", "[graph][sdpa][flash]") {
         return;
     }
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     BENCHMARK_ADVANCED("Create")(Catch::Benchmark::Chronometer meter) {
         meter.measure([&] { auto g = create_sdpa_forward_graph(b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v); });
@@ -159,6 +160,4 @@ TEST_CASE("Benchmark sdpa graph API runtimes", "[graph][sdpa][flash]") {
 
         meter.measure([&] { return g->get_workspace_size(); });
     };
-
-    cudnnDestroy(handle);
 }

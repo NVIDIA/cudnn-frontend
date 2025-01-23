@@ -1,14 +1,16 @@
 
-## Table of Contents
-1. [Fprop](#Convolution-Fprop)
-2. [Dgrad](#Convolution-Dgrad)
-3. [Wgrad](#Convolution-Wgrad)
+# Convolutions
 
-### Convolution Fprop
+(convolution-fprop)=
+## Convolution Fprop
+
 Convolution fprop computes:
+
 $$ response = image * filter $$
 
-The API to achieve above is:  
+### C++ API
+
+
 ```
 std::shared_ptr<Tensor_attributes> conv_fprop(std::shared_ptr<Tensor_attributes> image,
                                                   std::shared_ptr<Tensor_attributes> filter,
@@ -36,7 +38,8 @@ Conv_fprop_attributes&
 set_convolution_mode(ConvolutionMode_t mode_)
 ```
 
-Python API: 
+### Python API
+
 - conv_fprop
     - image
     - weight
@@ -46,10 +49,13 @@ Python API:
     - compute_data_type
     - name
 
-### Convolution Dgrad
+(convolution-dgrad)=
+## Convolution Dgrad
+
 Convolution dgrad computes data gradient during backpropagation.
 
-The API to achieve above is:  
+### C++ API
+
 ```
 std::shared_ptr<Tensor_attributes> conv_dgrad(std::shared_ptr<Tensor_attributes> image,
                                                   std::shared_ptr<Tensor_attributes> filter,
@@ -77,7 +83,8 @@ Conv_dgrad_attributes&
 set_convolution_mode(ConvolutionMode_t mode_)
 ```
 
-Python API: 
+### Python API
+
 - conv_dgrad
     - filter
     - loss
@@ -87,10 +94,13 @@ Python API:
     - compute_data_type
     - name
 
-### Convolution Wgrad
+(convolution-wgrad)=
+## Convolution Wgrad
+
 Convolution wgrad computes weight gradient during backpropagation.
 
-The API to achieve above is:  
+### C++ API
+
 ```
 std::shared_ptr<Tensor_attributes> conv_wgrad(std::shared_ptr<Tensor_attributes> image,
                                                   std::shared_ptr<Tensor_attributes> filter,
@@ -118,7 +128,8 @@ Conv_wgrad_attributes&
 set_convolution_mode(ConvolutionMode_t mode_)
 ```
 
-Python API: 
+### Python API
+
 - conv_wgrad
     - image
     - loss

@@ -141,11 +141,11 @@ run_b2b_batch_gemm(int64_t* q_dim,
                    int64_t* s_stride,
                    int64_t* v_stride,
                    int64_t* o_stride) {
-    cudnnHandle_t handle_;
     CUDNN_FRONTEND_UNUSED(nbDims);
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Creates the necessary tensor descriptors
         auto qTensor = tensor_create(tensorType, 'q', q_dim, q_stride, false, false);
@@ -226,8 +226,6 @@ run_b2b_batch_gemm(int64_t* q_dim,
         if (workspace_size > 0) {
             checkCudaErr(cudaFree(workspace_ptr));
         }
-
-        checkCudnnErr(cudnnDestroy(handle_));
 
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
@@ -919,10 +917,10 @@ run_mha_fprop(int64_t b,
               void* devActualSeqlenQ,
               void* devActualSeqlenK,
               cudnnDataType_t tensorType) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         std::vector<cudnn_frontend::Operation const*> all_ops;
         std::vector<cudnn_frontend::Operation> ops;
@@ -1017,8 +1015,6 @@ run_mha_fprop(int64_t b,
 
         execute_cached_plan(handle_, plan_cache, opGraph, data_ptrs);
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
     } catch (cudnn_frontend::cudnnException& e) {
         struct cudaDeviceProp prop;
         checkCudaErrors(cudaGetDeviceProperties(&prop, 0));
@@ -1057,10 +1053,10 @@ run_mha_bprop(int64_t b,
               void* devActualSeqlenQ,
               void* devActualSeqlenK,
               cudnnDataType_t tensorType) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         std::vector<cudnn_frontend::Operation const*> all_ops;
         std::vector<cudnn_frontend::Operation> ops;
@@ -1336,8 +1332,6 @@ run_mha_bprop(int64_t b,
         execute_cached_plan(handle_, plan_cache, opGraph, data_ptrs);
 
         execute_cached_plan(handle_, plan_cache, opGraph, data_ptrs);
-
-        checkCudnnErr(cudnnDestroy(handle_));
 
     } catch (cudnn_frontend::cudnnException& e) {
         struct cudaDeviceProp prop;

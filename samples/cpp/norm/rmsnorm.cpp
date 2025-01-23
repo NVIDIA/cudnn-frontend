@@ -60,8 +60,9 @@ TEST_CASE("RmsNorm Training", "[rmsnorm][graph]") {
     if (check_device_arch_newer_than("ampere") == false) {
         SKIP("RMSNorm requires Ampere and up");
     }
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -86,8 +87,6 @@ TEST_CASE("RmsNorm Training", "[rmsnorm][graph]") {
         {X, X_tensor.devPtr}, {inv_variance, Var_tensor.devPtr}, {scale, Scale_tensor.devPtr}, {Y, Y_tensor.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("RmsNorm Inference", "[rmsnorm][graph]") {
@@ -132,8 +131,9 @@ TEST_CASE("RmsNorm Inference", "[rmsnorm][graph]") {
     if (check_device_arch_newer_than("ampere") == false) {
         SKIP("RmsNorm requires Ampere and up");
     }
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -158,8 +158,6 @@ TEST_CASE("RmsNorm Inference", "[rmsnorm][graph]") {
         {X, X_tensor.devPtr}, {scale, Scale_tensor.devPtr}, {bias, Bias_tensor.devPtr}, {Y, Y_tensor.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("RmsNorm Backward", "[rmsnorm][graph]") {
@@ -205,8 +203,9 @@ TEST_CASE("RmsNorm Backward", "[rmsnorm][graph]") {
     if (check_device_arch_newer_than("ampere") == false) {
         SKIP("RmsNorm Backward requires Ampere and up");
     }
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -240,6 +239,4 @@ TEST_CASE("RmsNorm Backward", "[rmsnorm][graph]") {
         {DX, DX_tensor.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    cudnnDestroy(handle);
 }

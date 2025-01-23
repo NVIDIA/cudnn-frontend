@@ -44,8 +44,9 @@ TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
 
     int64_t a_uid = 0, b_uid = 1, c_uid = 2;
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     auto create_graph = [&]() -> fe::graph::Graph {
         // Make cudnn graph
@@ -158,5 +159,4 @@ TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
     Surface<int8_t> workspace(graph.get_workspace_size_plan_at_index(candidate_index), false);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-    CUDNN_CHECK(cudnnDestroy(handle));
 }

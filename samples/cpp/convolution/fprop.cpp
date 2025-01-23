@@ -67,9 +67,9 @@ TEST_CASE("Convolution fprop", "[conv][graph][caching]") {
         return std::make_tuple(graph, X, W, Y);
     };
 
-    cudnnHandle_t handle;
-
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     auto [graph, X, W, Y] = build_new_graph(handle);
 
@@ -87,7 +87,6 @@ TEST_CASE("Convolution fprop", "[conv][graph][caching]") {
     std::cout << *graph << std::endl;
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("Convolution fprop dynamic shape", "[conv][graph][dynamic_shape]") {
@@ -202,15 +201,14 @@ TEST_CASE("Convolution fprop dynamic shape", "[conv][graph][dynamic_shape]") {
         REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
     };
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     for (int idx_shape = 0; idx_shape < conv_shapes_count; ++idx_shape) {
         auto [graph, X, W, Y] = build_new_graph(handle, idx_shape);
         execute_graph(handle, graph.get(), X.get(), W.get(), Y.get());
     }
-
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("CSBR Graph", "[conv][graph][caching]") {
@@ -290,8 +288,9 @@ TEST_CASE("CSBR Graph", "[conv][graph][caching]") {
         return std::make_tuple(graph, X, W, S, B, Y);
     };
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     auto [graph, X, W, B, S, Y] = lookup_cache_or_build_graph(handle);
 
@@ -323,8 +322,6 @@ TEST_CASE("CSBR Graph", "[conv][graph][caching]") {
     REQUIRE(graph_->execute(handle, variant_pack_, workspace.devPtr).is_good());
 
     REQUIRE(cache_hit == true);
-
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("CSBR Graph dynamic shape", "[conv][graph][dynamic_shape]") {
@@ -432,8 +429,9 @@ TEST_CASE("CSBR Graph dynamic shape", "[conv][graph][dynamic_shape]") {
         return std::make_tuple(graph, X, W, S, B, Y);
     };
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     for (int idx_shape = 0; idx_shape < conv_shapes_count; idx_shape++) {
         auto [graph, X, W, B, S, Y] = lookup_cache_or_build_graph(handle, idx_shape);
@@ -453,8 +451,6 @@ TEST_CASE("CSBR Graph dynamic shape", "[conv][graph][dynamic_shape]") {
 
         REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
     }
-
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("SBRCS", "[conv][genstats][graph]") {
@@ -520,7 +516,9 @@ TEST_CASE("SBRCS", "[conv][genstats][graph]") {
         return std::make_tuple(graph, X, W, S, B, Y, SUM, SQ_SUM);
     };
 
-    cudnnHandle_t handle;
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
 #if (CUDNN_VERSION < 8800)
     SKIP("SBRCS requires cudnn 8.8 and up");
@@ -528,8 +526,6 @@ TEST_CASE("SBRCS", "[conv][genstats][graph]") {
     if (!is_ampere_arch() && !is_hopper_arch()) {
         SKIP("SBRCS requires Ampere or Hopper");
     }
-
-    CUDNN_CHECK(cudnnCreate(&handle));
 
     auto [graph, X, W, B, S, Y, SUM, SQ_SUM] = build_new_graph(handle);
 
@@ -555,7 +551,6 @@ TEST_CASE("SBRCS", "[conv][genstats][graph]") {
     Surface<int8_t> workspace(workspace_size, false);
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("CBR Graph NCHW", "[conv][graph][caching]") {
@@ -638,8 +633,9 @@ TEST_CASE("CBR Graph NCHW", "[conv][graph][caching]") {
         return std::make_tuple(graph, X, W, Z, B, Y);
     };
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     auto [graph, X, W, Z, B, Y] = lookup_cache_or_build_graph(handle);
 
@@ -671,8 +667,6 @@ TEST_CASE("CBR Graph NCHW", "[conv][graph][caching]") {
     REQUIRE(graph_->execute(handle, variant_pack_, workspace.devPtr).is_good());
 
     REQUIRE(cache_hit == true);
-
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("Convolution fprop large", "[conv][graph][caching]") {
@@ -721,9 +715,9 @@ TEST_CASE("Convolution fprop large", "[conv][graph][caching]") {
         return std::make_tuple(graph, X, W, Y);
     };
 
-    cudnnHandle_t handle;
-
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     auto [graph, X, W, Y] = build_new_graph(handle);
 
@@ -741,5 +735,4 @@ TEST_CASE("Convolution fprop large", "[conv][graph][caching]") {
     std::cout << *graph << std::endl;
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
-    cudnnDestroy(handle);
 }

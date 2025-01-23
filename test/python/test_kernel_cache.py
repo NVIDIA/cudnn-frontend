@@ -90,7 +90,3 @@ def test_kernel_cache(cudnn_handle):
 
         print("Executing", shape)
         graph.execute({0: A, 1: B, 2: C}, workspace, handle=cudnn_handle)
-
-
-if __name__ == "__main__":
-    test_kernel_cache(cudnn_handle)
