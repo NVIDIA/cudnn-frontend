@@ -43,8 +43,11 @@ TEST_CASE("Reduction", "[reduction]") {
                                  .set_compute_data_type(fe::DataType_t::FLOAT));
     C->set_output(true).set_data_type(fe::DataType_t::FLOAT).set_dim({1, 1, 1, 1});
     REQUIRE(graph.validate().is_good());
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
     REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
@@ -56,7 +59,6 @@ TEST_CASE("Reduction", "[reduction]") {
     Surface<int8_t> workspace(workspace_size, false);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-    CUDNN_CHECK(cudnnDestroy(handle));
 }
 
 TEST_CASE("Fused scalar", "[scalar][graph]") {
@@ -77,8 +79,9 @@ TEST_CASE("Fused scalar", "[scalar][graph]") {
     C->set_output(true).set_data_type(fe::DataType_t::HALF);
 
     REQUIRE(graph.validate().is_good());
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
     REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
@@ -93,8 +96,6 @@ TEST_CASE("Fused scalar", "[scalar][graph]") {
     Surface<int8_t> workspace(workspace_size, false);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    CUDNN_CHECK(cudnnDestroy(handle));
 }
 
 TEST_CASE("Fused Amax Reduction and type conversion", "[reduction]") {
@@ -135,8 +136,9 @@ TEST_CASE("Fused Amax Reduction and type conversion", "[reduction]") {
     C->set_output(true).set_data_type(fe::DataType_t::FP8_E4M3);
 
     REQUIRE(graph.validate().is_good());
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
     REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
@@ -153,5 +155,4 @@ TEST_CASE("Fused Amax Reduction and type conversion", "[reduction]") {
     Surface<int8_t> workspace(workspace_size, false);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-    CUDNN_CHECK(cudnnDestroy(handle));
 }

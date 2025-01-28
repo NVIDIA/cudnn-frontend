@@ -48,17 +48,14 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT);
 
-    auto Q_dQ_O_dO_dims = std::vector<int64_t>({b, h, s, d});
+    auto QKVO_dims = std::vector<int64_t>({b, h, s, d});
 
-    auto QKV_strides  = std::vector<int64_t>({s * 3 * h * d, d, 3 * h * d, 1});  // bs3hd
-    auto O_dO_strides = std::vector<int64_t>({s * h * d, d, h * d, 1});          // bhsd
+    auto QKV_strides = std::vector<int64_t>({s * 3 * h * d, d, 3 * h * d, 1});  // bs3hd
+    auto O_strides   = std::vector<int64_t>({s * h * d, d, h * d, 1});          // bhsd
 
-    auto Q =
-        mha_graph.tensor(fe::graph::Tensor_attributes().set_name("Q").set_dim(Q_dQ_O_dO_dims).set_stride(QKV_strides));
-    auto K =
-        mha_graph.tensor(fe::graph::Tensor_attributes().set_name("K").set_dim(Q_dQ_O_dO_dims).set_stride(QKV_strides));
-    auto V =
-        mha_graph.tensor(fe::graph::Tensor_attributes().set_name("V").set_dim(Q_dQ_O_dO_dims).set_stride(QKV_strides));
+    auto Q = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("Q").set_dim(QKVO_dims).set_stride(QKV_strides));
+    auto K = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("K").set_dim(QKVO_dims).set_stride(QKV_strides));
+    auto V = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("V").set_dim(QKVO_dims).set_stride(QKV_strides));
 
     float attn_scale = 0.123f;
 
@@ -82,7 +79,7 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
     auto [O, Stats, Amax_S, Amax_O] =
         mha_graph.sdpa_fp8(Q, K, V, descale_q, descale_k, descale_v, descale_s, scale_s, scale_o, sdpa_fp8_options);
 
-    O->set_output(true).set_dim(Q_dQ_O_dO_dims).set_stride(O_dO_strides);
+    O->set_output(true).set_dim(QKVO_dims).set_stride(O_strides);
     Amax_O->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
     Amax_S->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
 
@@ -93,15 +90,15 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
         Stats->set_output(true).set_data_type(fe::DataType_t::FLOAT);
     }
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     auto status = mha_graph.validate();
     if ((cudnnGetVersion() >= 90100) && check_device_arch_newer_than("hopper")) {
         REQUIRE(status.is_good());
     } else {
         REQUIRE(status.get_code() == fe::error_code_t::GRAPH_NOT_SUPPORTED);
-        cudnnDestroy(handle);
         return;
     }
 
@@ -153,6 +150,4 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
     REQUIRE(mha_graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    cudnnDestroy(handle);
 }

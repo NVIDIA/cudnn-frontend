@@ -70,8 +70,9 @@ TEST_CASE("BN Finalize Graph", "[batchnorm][graph]") {
     SKIP("BNFinalize requires cudnn 8.4 and up");
 #endif
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -114,8 +115,6 @@ TEST_CASE("BN Finalize Graph", "[batchnorm][graph]") {
         {next_running_mean, Next_running_mean_tensor.devPtr},
         {next_running_var, Next_running_var_tensor.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
@@ -199,8 +198,9 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
     if (check_device_arch_newer_than("ampere") == false) {
         SKIP("ConvBNFprop requires Ampere and up");
     }
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -248,8 +248,6 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
         variant_pack[next_running_var]  = Next_running_var_tensor.devPtr;
     }
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("DBN Add Relu Graph", "[BN][graph][backward]") {
@@ -321,8 +319,9 @@ TEST_CASE("DBN Add Relu Graph", "[BN][graph][backward]") {
     if (check_device_arch_newer_than("ampere") == false) {
         SKIP("BatchNorm Backward requires Ampere and up");
     }
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -371,8 +370,6 @@ TEST_CASE("DBN Add Relu Graph", "[BN][graph][backward]") {
     }
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("BN_inference DRelu DBN Graph", "[Batchnorm][graph][backward]") {
@@ -431,8 +428,9 @@ TEST_CASE("BN_inference DRelu DBN Graph", "[Batchnorm][graph][backward]") {
     SKIP("BN_infer->Drelu->DBN is not supported in cudnn versions prior to 8.9.4");
 #endif
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -470,6 +468,4 @@ TEST_CASE("BN_inference DRelu DBN Graph", "[Batchnorm][graph][backward]") {
         {DX, DX_tensor.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    cudnnDestroy(handle);
 }

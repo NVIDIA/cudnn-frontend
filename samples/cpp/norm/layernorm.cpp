@@ -120,8 +120,9 @@ layernorm_fwd_dynamic_shapes(bool train = true) {
         return std::make_tuple(graph, X, scale, bias, Y, mean, inv_variance);
     };
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     for (int idx_shape = 0; idx_shape < layernorm_shapes_count; idx_shape++) {
         auto [graph, X, scale, bias, Y, mean, inv_variance] = build_new_graph(handle, idx_shape);
@@ -151,8 +152,6 @@ layernorm_fwd_dynamic_shapes(bool train = true) {
         }
         REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
     }
-
-    CUDNN_CHECK(cudnnDestroy(handle));
 }
 
 TEST_CASE("LayerNorm training dynamic shape", "[layernorm][graph][dynamic_shape]") {
@@ -210,10 +209,11 @@ TEST_CASE("LayerNorm Training", "[layernorm][graph]") {
     SKIP("LayerNorm is not supported in cudnn versions prior to 8.9.5");
 #endif
     if (check_device_arch_newer_than("ampere") == false) {
-        SKIP("ConvBNFprop requires Ampere and up");
+        SKIP("LayerNorm requires Ampere and up");
     }
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -245,8 +245,6 @@ TEST_CASE("LayerNorm Training", "[layernorm][graph]") {
         {Y, Y_tensor.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("LayerNorm Inference", "[layernorm][graph]") {
@@ -290,10 +288,11 @@ TEST_CASE("LayerNorm Inference", "[layernorm][graph]") {
     SKIP("LayerNorm is not supported in cudnn versions prior to 8.9.5");
 #endif
     if (check_device_arch_newer_than("ampere") == false) {
-        SKIP("ConvBNFprop requires Ampere and up");
+        SKIP("LayerNorm requires Ampere and up");
     }
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -318,8 +317,6 @@ TEST_CASE("LayerNorm Inference", "[layernorm][graph]") {
         {X, X_tensor.devPtr}, {scale, Scale_tensor.devPtr}, {bias, Bias_tensor.devPtr}, {Y, Y_tensor.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("LayerNorm Backward", "[layernorm][graph]") {
@@ -370,8 +367,9 @@ TEST_CASE("LayerNorm Backward", "[layernorm][graph]") {
     if (check_device_arch_newer_than("ampere") == false) {
         SKIP("LayerNorm Backward requires Ampere and up");
     }
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -407,6 +405,4 @@ TEST_CASE("LayerNorm Backward", "[layernorm][graph]") {
         {DX, DX_tensor.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    cudnnDestroy(handle);
 }

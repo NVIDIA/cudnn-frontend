@@ -114,8 +114,9 @@ TEST_CASE("Cached sdpa", "[graph][sdpa][flash]") {
         return;
     }
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     auto fwd_graph = create_sdpa_forward_graph(b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v);
     auto bwd_graph = create_sdpa_backward_graph(b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v);
@@ -176,6 +177,4 @@ TEST_CASE("Cached sdpa", "[graph][sdpa][flash]") {
     REQUIRE(bwd_graph2->execute(handle, variant_pack, bwd_workspace.devPtr).is_good());
 
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    cudnnDestroy(handle);
 }

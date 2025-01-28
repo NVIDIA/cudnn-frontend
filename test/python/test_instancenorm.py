@@ -205,7 +205,3 @@ def test_in(param_extract, cudnn_handle):
     torch.testing.assert_close(x_gpu.grad, DX_actual, atol=2e-3, rtol=2e-3)
     torch.testing.assert_close(scale_gpu.grad, DScale_actual, atol=2e-3, rtol=2e-3)
     torch.testing.assert_close(bias_gpu.grad, Dbias_actual, atol=2e-3, rtol=2e-3)
-
-
-if __name__ == "__main__":
-    test_in((torch.float16,), cudnn_handle)

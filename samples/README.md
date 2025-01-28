@@ -59,6 +59,10 @@ Similar to [Fwd SDPA](cpp/sdpa/fp16_fwd.cpp), but here with the ability to use n
 
 Extends the sdpa sample to fp8 precision.
 
+- [Fwd SDPA with CUDA graph](cpp/sdpa/fp16_fwd_with_cudagraphs.cpp)
+
+Demonstrates the building and execution of a CUDA graph representing the SDPA operation, followed by the update (and another execution) of the CUDA graph with new variant pointers.
+
 ### Convolution fusion examples
 
 ##### [samples/cpp/convolution](cpp/convolution/) shows how to use cudnn fprop, dgrad, wgrad operation and some fusions with them.
@@ -118,6 +122,10 @@ Eg for rmsnorm training, inference and back propagation
 - [BatchNorm](cpp/norm/batchnorm.cpp)
 
 Shows different fusions in batch norm fprop and bprop. And split batch norm fusions.
+
+- [Block scale quantize](cpp/norm/norm_block_scale.cpp)
+
+Showcases normalization with block scale quantize epilogue fusion.
 
 ### Miscellaneous examples
 

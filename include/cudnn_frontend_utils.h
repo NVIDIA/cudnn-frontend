@@ -342,6 +342,7 @@ enum class TensorReordering_t {
     NONE,
     INT8x32,
     F16x16,
+    F8_128x4,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(TensorReordering_t,
@@ -349,6 +350,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(TensorReordering_t,
                                  {TensorReordering_t::NONE, "NONE"},
                                  {TensorReordering_t::INT8x32, "INT8x32"},
                                  {TensorReordering_t::F16x16, "F16x16"},
+                                 {TensorReordering_t::F8_128x4, "F8_128x4"},
                              })
 
 enum class ResampleMode_t {
@@ -451,7 +453,9 @@ enum class DescriptorType_t {
     OPERATION_RESHAPE_DESCRIPTOR,
     RNG_DESCRIPTOR,
     OPERATION_RNG_DESCRIPTOR,
-    OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR
+    OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR,
+    OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR,
+    OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR
 };
 
 enum class NormMode_t {
@@ -598,6 +602,8 @@ NLOHMANN_JSON_SERIALIZE_ENUM(HeurMode_t,
                              })
 
 enum class BehaviorNote_t {
+    NOT_SET,
+
     RUNTIME_COMPILATION,
     REQUIRES_FILTER_INT8x32_REORDER,
     REQUIRES_BIAS_INT8x32_REORDER,
@@ -606,6 +612,7 @@ enum class BehaviorNote_t {
 
 NLOHMANN_JSON_SERIALIZE_ENUM(BehaviorNote_t,
                              {
+                                 {BehaviorNote_t::NOT_SET, "NOT_SET"},
                                  {BehaviorNote_t::RUNTIME_COMPILATION, "RUNTIME_COMPILATION"},
                                  {BehaviorNote_t::REQUIRES_FILTER_INT8x32_REORDER, "REQUIRES_FILTER_INT8x32_REORDER"},
                                  {BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER, "REQUIRES_BIAS_INT8x32_REORDER"},
@@ -613,6 +620,8 @@ NLOHMANN_JSON_SERIALIZE_ENUM(BehaviorNote_t,
                              })
 
 enum class NumericalNote_t {
+    NOT_SET,
+
     TENSOR_CORE,
     DOWN_CONVERT_INPUTS,
     REDUCED_PRECISION_REDUCTION,
@@ -627,6 +636,7 @@ enum class NumericalNote_t {
 
 NLOHMANN_JSON_SERIALIZE_ENUM(NumericalNote_t,
                              {
+                                 {NumericalNote_t::NOT_SET, "NOT_SET"},
                                  {NumericalNote_t::TENSOR_CORE, "TENSOR_CORE"},
                                  {NumericalNote_t::DOWN_CONVERT_INPUTS, "DOWN_CONVERT_INPUTS"},
                                  {NumericalNote_t::REDUCED_PRECISION_REDUCTION, "REDUCED_PRECISION_REDUCTION"},
@@ -657,6 +667,8 @@ enum class DataType_t {
     FP8_E4M3,
     FP8_E5M2,
     FAST_FLOAT_FOR_FP8,
+    FP8_E8M0,
+    FP4_E2M1,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(DataType_t,
@@ -677,6 +689,8 @@ NLOHMANN_JSON_SERIALIZE_ENUM(DataType_t,
                                  {DataType_t::FP8_E4M3, "FP8_E4M3"},
                                  {DataType_t::FP8_E5M2, "FP8_E5M2"},
                                  {DataType_t::FAST_FLOAT_FOR_FP8, "FAST_FLOAT_FOR_FP8"},
+                                 {DataType_t::FP8_E8M0, "FP8_E8M0"},
+                                 {DataType_t::FP4_E2M1, "FP4_E2M1"},
                              })
 
 enum class ReductionMode_t {
@@ -896,12 +910,25 @@ operator<<(std::ostream& os, const DescriptorType_t& mode) {
         case DescriptorType_t::OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR:
             os << "OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR";
             break;
+        case DescriptorType_t::OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR:
+            os << "OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR";
+            break;
+        case DescriptorType_t::OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR:
+            os << "OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR";
+            break;
         case DescriptorType_t::NOT_SET:
             os << "NOT_SET";
             break;
     }
     return os;
 }
+
+enum class DiagonalAlignment_t { TOP_LEFT, BOTTOM_RIGHT };
+NLOHMANN_JSON_SERIALIZE_ENUM(DiagonalAlignment_t,
+                             {
+                                 {DiagonalAlignment_t::TOP_LEFT, "TOP_LEFT"},
+                                 {DiagonalAlignment_t::BOTTOM_RIGHT, "BOTTOM_RIGHT"},
+                             })
 
 namespace detail {
 
@@ -1025,6 +1052,22 @@ convert_to_cudnn_type(cudnn_frontend::DataType_t const mode, cudnnDataType_t& cu
 #if (CUDNN_VERSION >= 8700)
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(8700, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
             cudnn_mode = CUDNN_DATA_FAST_FLOAT_FOR_FP8;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
+        case DataType_t::FP8_E8M0:
+#if (CUDNN_VERSION >= 90700)  // TODO: v9.99 is new feature branch; switch to release branch when ready
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90700, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_DATA_FP8_E8M0;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
+        case DataType_t::FP4_E2M1:
+#if (CUDNN_VERSION >= 90700)  // TODO: v9.99 is new feature branch; switch to release branch when ready
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90700, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_DATA_FP4_E2M1;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
 #else
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
@@ -1282,6 +1325,11 @@ convert_to_cudnn_type(cudnn_frontend::NumericalNote_t const mode, cudnnBackendNu
 #else
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
+
+#ifndef NO_DEFAULT_IN_SWITCH
+        default:
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
     }
     return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 }
@@ -1306,8 +1354,71 @@ convert_to_cudnn_type(cudnn_frontend::BehaviorNote_t const mode, cudnnBackendBeh
 #else
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
+
+#ifndef NO_DEFAULT_IN_SWITCH
+        default:
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
     }
     return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+}
+
+static inline cudnn_frontend::BehaviorNote_t
+convert_from_cudnn_type(cudnnBackendBehaviorNote_t const cudnn_mode) {
+    switch (cudnn_mode) {
+        case CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION:
+            return BehaviorNote_t::RUNTIME_COMPILATION;
+        case CUDNN_BEHAVIOR_NOTE_REQUIRES_FILTER_INT8x32_REORDER:
+            return BehaviorNote_t::REQUIRES_FILTER_INT8x32_REORDER;
+        case CUDNN_BEHAVIOR_NOTE_REQUIRES_BIAS_INT8x32_REORDER:
+            return BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER;
+#if (CUDNN_VERSION >= 90500)
+        case CUDNN_BEHAVIOR_NOTE_SUPPORTS_CUDA_GRAPH_NATIVE_API:
+            return BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API;
+#endif
+
+#ifndef NO_DEFAULT_IN_SWITCH
+        default:
+            return BehaviorNote_t::NOT_SET;
+            break;
+#endif
+    }
+    return BehaviorNote_t::NOT_SET;
+}
+
+static inline cudnn_frontend::NumericalNote_t
+convert_from_cudnn_type(cudnnBackendNumericalNote_t const cudnn_mode) {
+    switch (cudnn_mode) {
+        case CUDNN_NUMERICAL_NOTE_TENSOR_CORE:
+            return NumericalNote_t::TENSOR_CORE;
+        case CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS:
+            return NumericalNote_t::DOWN_CONVERT_INPUTS;
+        case CUDNN_NUMERICAL_NOTE_REDUCED_PRECISION_REDUCTION:
+            return NumericalNote_t::REDUCED_PRECISION_REDUCTION;
+        case CUDNN_NUMERICAL_NOTE_FFT:
+            return NumericalNote_t::FFT;
+        case CUDNN_NUMERICAL_NOTE_NONDETERMINISTIC:
+            return NumericalNote_t::NONDETERMINISTIC;
+        case CUDNN_NUMERICAL_NOTE_WINOGRAD:
+            return NumericalNote_t::WINOGRAD;
+        case CUDNN_NUMERICAL_NOTE_WINOGRAD_TILE_4x4:
+            return NumericalNote_t::WINOGRAD_TILE_4x4;
+        case CUDNN_NUMERICAL_NOTE_WINOGRAD_TILE_6x6:
+            return NumericalNote_t::WINOGRAD_TILE_6x6;
+        case CUDNN_NUMERICAL_NOTE_WINOGRAD_TILE_13x13:
+            return NumericalNote_t::WINOGRAD_TILE_13x13;
+#if (CUDNN_VERSION >= 90100)
+        case CUDNN_NUMERICAL_NOTE_STRICT_NAN_PROP:
+            return NumericalNote_t::STRICT_NAN_PROP;
+#endif
+
+#ifndef NO_DEFAULT_IN_SWITCH
+        default:
+            return NumericalNote_t::NOT_SET;
+            break;
+#endif
+    }
+    return NumericalNote_t::NOT_SET;
 }
 
 static inline cudnnStatus_t
@@ -1443,6 +1554,22 @@ convert_to_cudnn_type(cudnn_frontend::DescriptorType_t const mode, cudnnBackendD
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90500, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
             cudnn_mode = CUDNN_BACKEND_OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#endif
+        case DescriptorType_t::OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR:
+#if (CUDNN_VERSION >= 90700)  // TODO: v9.99 is new feature branch; switch to release branch when ready
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90700, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_BACKEND_OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
+        case DescriptorType_t::OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR:
+#if (CUDNN_VERSION >= 90700)  // TODO: v9.99 is new feature branch; switch to release branch when ready
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90700, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_BACKEND_OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
 
 #ifndef NO_DEFAULT_IN_SWITCH
@@ -1715,6 +1842,11 @@ convert_to_cudnn_type(cudnn_frontend::TensorReordering_t const mode, cudnnBacken
 #else
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
+        case cudnn_frontend::TensorReordering_t::F8_128x4:
+#if CUDNN_VERSION >= 90700
+            cudnn_mode = CUDNN_TENSOR_REORDERING_F8_128x4;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#endif
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
@@ -1734,6 +1866,11 @@ convert_from_cudnn_type(cudnnBackendTensorReordering_t const cudnn_mode, cudnn_f
 #if CUDNN_VERSION >= 8800
         case CUDNN_TENSOR_REORDERING_F16x16:
             mode = cudnn_frontend::TensorReordering_t::F16x16;
+            break;
+#endif
+#if CUDNN_VERSION >= 90700
+        case CUDNN_TENSOR_REORDERING_F8_128x4:
+            mode = cudnn_frontend::TensorReordering_t::F8_128x4;
             break;
 #endif
 #ifndef NO_DEFAULT_IN_SWITCH
@@ -1823,6 +1960,12 @@ convert_from_cudnn_type(cudnnBackendDescriptorType_t const cudnn_mode) {
 #if (CUDNN_VERSION >= 90500)
         case CUDNN_BACKEND_OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR:
             return DescriptorType_t::OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR;
+#endif
+#if (CUDNN_VERSION >= 90700)  // TODO: v9.99 is new feature branch; switch to release branch when ready
+        case CUDNN_BACKEND_OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR:
+            return DescriptorType_t::OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR;
+        case CUDNN_BACKEND_OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR:
+            return DescriptorType_t::OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR;
 #endif
 
 #ifndef NO_DEFAULT_IN_SWITCH
@@ -1986,6 +2129,14 @@ convert_from_cudnn_type(cudnnDataType_t const cudnn_mode) {
 #if (CUDNN_VERSION >= 8700)
         case CUDNN_DATA_FAST_FLOAT_FOR_FP8:
             return DataType_t::FAST_FLOAT_FOR_FP8;
+#endif
+#if (CUDNN_VERSION >= 90700)  // TODO: v9.99 is new feature branch; switch to release branch when ready
+        case CUDNN_DATA_FP8_E8M0:
+            return DataType_t::FP8_E8M0;
+#endif
+#if (CUDNN_VERSION >= 90700)  // TODO: v9.99 is new feature branch; switch to release branch when ready
+        case CUDNN_DATA_FP4_E2M1:
+            return DataType_t::FP4_E2M1;
 #endif
 #ifndef NO_DEFAULT_IN_SWITCH
         default:

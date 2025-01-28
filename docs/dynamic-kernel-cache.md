@@ -1,8 +1,7 @@
-## Table of Contents
-1. [Dynamic Shapes APIs](#Dynamic-Shapes)
-2. [Kernel Cache APIs](#Kernel-Cache)
+# Dynamic Shapes and Kernel Cache
 
-### Dynamic Shapes
+## Dynamic Shapes
+
 Causes other APIs (such as the kernel cache) to treat the graph as a dynamic shape graph.
 
 The API to achieve the above is:
@@ -10,7 +9,7 @@ The API to achieve the above is:
 graph.set_dynamic_shape_enabled(true)
 ```
 
-### Kernel Cache
+## Kernel Cache
 The kernel cache significantly reduces plan build time by re-using a previously compiled kernel for a given execution plan. Kernel caching is enabled only for dynamic shape graphs.
 
 If a graph's kernel cache attribute is set, the kernel cache will store the kernel which was compiled for the graph's execution plan. 
@@ -25,4 +24,3 @@ The API to set a dynamic shape graph's kernel cache is:
 ```cpp
 graph.set_kernel_cache(kernel_cache)
 ```
-

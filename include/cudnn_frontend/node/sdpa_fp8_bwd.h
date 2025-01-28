@@ -79,8 +79,8 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
         // validate backend limitations for the operation
         // clang-format off
-        // int64_t s_q  = attributes.inputs.at(input_names::Q)->get_dim()[2];
-        // int64_t s_kv = attributes.inputs.at(input_names::K)->get_dim()[2];
+        int64_t s_q  = attributes.inputs.at(input_names::Q)->get_dim()[2];
+        int64_t s_kv = attributes.inputs.at(input_names::K)->get_dim()[2];
         int64_t h_q  = attributes.inputs.at(input_names::Q)->get_dim()[1];
         int64_t h_k  = attributes.inputs.at(input_names::K)->get_dim()[1];
         int64_t h_v  = attributes.inputs.at(input_names::V)->get_dim()[1];
@@ -92,6 +92,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
         auto const& dropout_mask     = attributes.inputs.find(input_names::Dropout_mask);
         bool const is_dropout_custom = (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
+        bool const is_dropout        = attributes.dropout_probability.has_value();
 
         // validation TODO:
         //    - validate stats has valid dims
@@ -145,6 +146,33 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             attributes.dropout_probability.has_value() && attributes.dropout_probability.value() == 1.0,
             error_code_t::ATTRIBUTE_NOT_SET,
             "Dropout probability cannot be 1 as corresponding scale wont be well formed.");
+
+
+        // Validate options for causal_mask_bottom_right
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && detail::get_backend_version() < 90700,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "For cuDNN version below 9.7.0, bottom right causal masking is not supported.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && prop.major < 10, 
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "sdpa fp8 forward operation is only supported on Blackwell architecture and newer. Please "
+            "consider using a newer architecture.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask && attributes.causal_mask_bottom_right,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "Bottom right causal mask and causal mask cannot be both enabled");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && s_q > s_kv,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "Bottom right causal mask does not support s_q > s_kv. Please virtually slice the Q tensor and pass it as s_q == s_kv");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && (is_bias || is_dropout),
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "Bottom right causal mask is only supported with is_bias=False, is_dropout=False.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && ((s_q % 64 != 0) || (s_kv % 64 != 0)),
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "Bottom right causal mask is only supported with s_q multiple of 64, and s_kv multiple of 64");
 
         // validate that datatype is set for the graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_intermediate_data_type() == DataType_t::NOT_SET,
@@ -356,11 +384,49 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         if (attributes.causal_mask) {
             auto row_index_attributes =
                 Pointwise_attributes().set_name("gen_row_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(2);
-            auto const& row_index_output = pointwise(last_dV, row_index_attributes);
+            std::shared_ptr<Tensor_attributes> row_index_output = pointwise(last_dV, row_index_attributes);
+            row_index_output->set_data_type(DataType_t::INT32);
 
             auto col_index_attributes =
                 Pointwise_attributes().set_name("gen_col_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(3);
             auto const& col_index_output = pointwise(last_dV, col_index_attributes);
+            col_index_output->set_data_type(DataType_t::INT32);
+
+            if (attributes.causal_mask_bottom_right) {
+                if (attributes.inputs[input_names::SEQ_LEN_KV]) {
+                    row_index_output = pointwise(row_index_output,
+                                          attributes.inputs[input_names::SEQ_LEN_KV],
+                                          Pointwise_attributes()
+                                              .set_name("row_idx_add_skv")
+                                              .set_mode(PointwiseMode_t::ADD)
+                                              .set_compute_data_type(DataType_t::INT32));
+                } else {
+                    row_index_output = pointwise(row_index_output,
+                                          std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv)),
+                                          Pointwise_attributes()
+                                              .set_name("row_idx_add_skv")
+                                              .set_mode(PointwiseMode_t::ADD)
+                                              .set_compute_data_type(DataType_t::INT32));
+                }
+                row_index_output->set_data_type(DataType_t::INT32);
+
+                if (attributes.inputs[input_names::SEQ_LEN_Q]) {
+                    row_index_output = pointwise(row_index_output,
+                                          attributes.inputs[input_names::SEQ_LEN_Q],
+                                          Pointwise_attributes()
+                                              .set_name("row_idx_add_sq_sub_sq")
+                                              .set_mode(PointwiseMode_t::SUB)
+                                              .set_compute_data_type(DataType_t::INT32));
+                } else {
+                    row_index_output = pointwise(row_index_output,
+                                          std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q)),
+                                          Pointwise_attributes()
+                                              .set_name("row_idx_add_sq_sub_sq")
+                                              .set_mode(PointwiseMode_t::SUB)
+                                              .set_compute_data_type(DataType_t::INT32));
+                }
+                row_index_output->set_data_type(DataType_t::INT32);
+            }
 
             auto greater_than_attributes = Pointwise_attributes()
                                                .set_name("row_greater_than_col")

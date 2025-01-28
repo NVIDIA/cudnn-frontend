@@ -448,6 +448,28 @@ NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_fp8_backward_attributes::output_names,
                                  {SDPA_fp8_backward_attributes::output_names::Amax_dP, "Amax_d"},
                              })
 
+NLOHMANN_JSON_SERIALIZE_ENUM(Block_scale_quantize_attributes::input_names,
+                             {
+                                 {Block_scale_quantize_attributes::input_names::X, "X"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(Block_scale_quantize_attributes::output_names,
+                             {
+                                 {Block_scale_quantize_attributes::output_names::Y, "Y"},
+                                 {Block_scale_quantize_attributes::output_names::scale, "scale"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(Block_scale_dequantize_attributes::input_names,
+                             {
+                                 {Block_scale_dequantize_attributes::input_names::X, "X"},
+                                 {Block_scale_dequantize_attributes::input_names::scale, "scale"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(Block_scale_dequantize_attributes::output_names,
+                             {
+                                 {Block_scale_dequantize_attributes::output_names::Y, "Y"},
+                             })
+
 inline void
 to_json(nlohmann::json& j, const Tensor_attributes& ta) {
     j = nlohmann::json{{"name", ta.name},
@@ -478,5 +500,39 @@ from_json(const nlohmann::json& j, Tensor_attributes& ta) {
         ta.pass_by_value = j.at("pass_by_value");
     }
 }
+
+NLOHMANN_JSON_SERIALIZE_ENUM(KnobType_t,
+                             {
+                                 {KnobType_t::NOT_SET, nullptr},
+                                 {KnobType_t::SWIZZLE, "SWIZZLE"},
+                                 {KnobType_t::TILE_SIZE, "TILE_SIZE"},
+                                 {KnobType_t::EDGE, "EDGE"},
+                                 {KnobType_t::MULTIPLY, "MULTIPLY"},
+                                 {KnobType_t::SPLIT_K_BUF, "SPLIT_K_BUF"},
+                                 {KnobType_t::TILEK, "TILEK"},
+                                 {KnobType_t::STAGES, "STAGES"},
+                                 {KnobType_t::REDUCTION_MODE, "REDUCTION_MODE"},
+                                 {KnobType_t::SPLIT_K_SLC, "SPLIT_K_SLC"},
+                                 {KnobType_t::IDX_MODE, "IDX_MODE"},
+                                 {KnobType_t::SPECFILT, "SPECFILT"},
+                                 {KnobType_t::KERNEL_CFG, "KERNEL_CFG"},
+                                 {KnobType_t::WORKSPACE, "WORKSPACE"},
+                                 {KnobType_t::TILE_CGA_M, "TILE_CGA_M"},
+                                 {KnobType_t::TILE_CGA_N, "TILE_CGA_N"},
+                                 {KnobType_t::BLOCK_SIZE, "BLOCK_SIZE"},
+                                 {KnobType_t::OCCUPANCY, "OCCUPANCY"},
+                                 {KnobType_t::ARRAY_SIZE_PER_THREAD, "ARRAY_SIZE_PER_THREAD"},
+                                 {KnobType_t::SPLIT_COLS, "SPLIT_COLS"},
+                                 {KnobType_t::TILE_ROWS, "TILE_ROWS"},
+                                 {KnobType_t::TILE_COLS, "TILE_COLS"},
+                                 {KnobType_t::LOAD_SIZE, "LOAD_SIZE"},
+                                 {KnobType_t::CTA_COUNT, "CTA_COUNT"},
+                                 {KnobType_t::STREAM_K, "STREAM_K"},
+                                 {KnobType_t::SPLIT_P_SLC, "SPLIT_P_SLC"},
+                                 {KnobType_t::TILE_M, "TILE_M"},
+                                 {KnobType_t::TILE_N, "TILE_N"},
+                                 {KnobType_t::WARP_SPEC_CFG, "WARP_SPEC_CFG"},
+                             })
+
 #endif
 }  // namespace cudnn_frontend::graph

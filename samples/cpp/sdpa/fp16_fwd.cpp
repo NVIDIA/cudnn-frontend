@@ -88,8 +88,12 @@ create_sdpa_forward_graph(int64_t const b,
                             .set_name("flash_attention")
                             .set_is_inference(is_inference)
                             .set_alibi_mask(alibi_mask)
-                            .set_causal_mask(causal_mask)
                             .set_attn_scale(attn_scale);
+
+    if (causal_mask) {
+        sdpa_options.set_diagonal_alignment(cudnn_frontend::DiagonalAlignment_t::TOP_LEFT)
+            .set_diagonal_band_right_bound(0);
+    }
 
     if (has_attn_bias) {
         auto bias = graph->tensor(fe::graph::Tensor_attributes()
@@ -150,8 +154,15 @@ TEST_CASE("Toy sdpa forward", "[graph][sdpa][flash][forward]") {
         return;
     }
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // switch off certain features on blackwell
+    if (is_blackwell_arch()) {
+        alibi_mask    = false;
+        has_attn_bias = false;
+    }
+
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     auto graph = create_sdpa_forward_graph(b,
                                            h_q,
@@ -217,6 +228,4 @@ TEST_CASE("Toy sdpa forward", "[graph][sdpa][flash][forward]") {
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    cudnnDestroy(handle);
 }

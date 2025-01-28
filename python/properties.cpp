@@ -82,6 +82,8 @@ init_properties(py::module_& m) {
         .value("FP8_E4M3", cudnn_frontend::DataType_t::FP8_E4M3)
         .value("FP8_E5M2", cudnn_frontend::DataType_t::FP8_E5M2)
         .value("FAST_FLOAT_FOR_FP8", cudnn_frontend::DataType_t::FAST_FLOAT_FOR_FP8)
+        .value("FP8_E8M0", cudnn_frontend::DataType_t::FP8_E8M0)
+        .value("FP4_E2M1", cudnn_frontend::DataType_t::FP4_E2M1)
         .value("NOT_SET", cudnn_frontend::DataType_t::NOT_SET);
 
     py::class_<cudnn_frontend::graph::Tensor_attributes, std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(
@@ -114,6 +116,58 @@ init_properties(py::module_& m) {
             std::ostringstream out;
             out << json{props};
             return out.str();
+        });
+
+    py::enum_<cudnn_frontend::KnobType_t>(m, "knob_type")
+        .value("NOT_SET", cudnn_frontend::KnobType_t::NOT_SET)
+        .value("SWIZZLE", cudnn_frontend::KnobType_t::SWIZZLE)
+        .value("TILE_SIZE", cudnn_frontend::KnobType_t::TILE_SIZE)
+        .value("EDGE", cudnn_frontend::KnobType_t::EDGE)
+        .value("MULTIPLY", cudnn_frontend::KnobType_t::MULTIPLY)
+        .value("SPLIT_K_BUF", cudnn_frontend::KnobType_t::SPLIT_K_BUF)
+        .value("TILEK", cudnn_frontend::KnobType_t::TILEK)
+        .value("STAGES", cudnn_frontend::KnobType_t::STAGES)
+        .value("REDUCTION_MODE", cudnn_frontend::KnobType_t::REDUCTION_MODE)
+        .value("SPLIT_K_SLC", cudnn_frontend::KnobType_t::SPLIT_K_SLC)
+        .value("IDX_MODE", cudnn_frontend::KnobType_t::IDX_MODE)
+        .value("SPECFILT", cudnn_frontend::KnobType_t::SPECFILT)
+        .value("KERNEL_CFG", cudnn_frontend::KnobType_t::KERNEL_CFG)
+        .value("WORKSPACE", cudnn_frontend::KnobType_t::WORKSPACE)
+        .value("TILE_CGA_M", cudnn_frontend::KnobType_t::TILE_CGA_M)
+        .value("TILE_CGA_N", cudnn_frontend::KnobType_t::TILE_CGA_N)
+        .value("BLOCK_SIZE", cudnn_frontend::KnobType_t::BLOCK_SIZE)
+        .value("OCCUPANCY", cudnn_frontend::KnobType_t::OCCUPANCY)
+        .value("ARRAY_SIZE_PER_THREAD", cudnn_frontend::KnobType_t::ARRAY_SIZE_PER_THREAD)
+        .value("SPLIT_COLS", cudnn_frontend::KnobType_t::SPLIT_COLS)
+        .value("TILE_ROWS", cudnn_frontend::KnobType_t::TILE_ROWS)
+        .value("TILE_COLS", cudnn_frontend::KnobType_t::TILE_COLS)
+        .value("LOAD_SIZE", cudnn_frontend::KnobType_t::LOAD_SIZE)
+        .value("CTA_COUNT", cudnn_frontend::KnobType_t::CTA_COUNT)
+        .value("STREAM_K", cudnn_frontend::KnobType_t::STREAM_K)
+        .value("SPLIT_P_SLC", cudnn_frontend::KnobType_t::SPLIT_P_SLC)
+        .value("TILE_M", cudnn_frontend::KnobType_t::TILE_M)
+        .value("TILE_N", cudnn_frontend::KnobType_t::TILE_N)
+        .value("WARP_SPEC_CFG", cudnn_frontend::KnobType_t::WARP_SPEC_CFG);
+
+    py::class_<cudnn_frontend::Knob, std::shared_ptr<cudnn_frontend::Knob>>(m, "knob")
+        .def(py::init<cudnn_frontend::KnobType_t, int64_t, int64_t, int64_t>(),
+             py::arg_v("knob_type", cudnn_frontend::KnobType_t::NOT_SET),
+             py::arg_v("max_value", py::none()),
+             py::arg_v("min_value", py::none()),
+             py::arg_v("stride", py::none()))
+        .def_readonly("type", &cudnn_frontend::Knob::type)
+        .def_readonly("max_value", &cudnn_frontend::Knob::maxValue)
+        .def_readonly("min_value", &cudnn_frontend::Knob::minValue)
+        .def_readonly("stride", &cudnn_frontend::Knob::stride)
+        .def("__repr__", [](cudnn_frontend::Knob const& knob) {
+            std::stringstream ss;
+            json j;
+            j["knob_type"] = knob.type;
+            j["max_value"] = knob.maxValue;
+            j["min_value"] = knob.minValue;
+            j["stride"]    = knob.stride;
+            ss << j.dump();
+            return ss.str();
         });
 
     m.def("get_last_error_string", &get_last_error_string);
@@ -173,6 +227,10 @@ init_properties(py::module_& m) {
         .value("REQUIRES_FILTER_INT8x32_REORDER", cudnn_frontend::BehaviorNote_t::REQUIRES_FILTER_INT8x32_REORDER)
         .value("REQUIRES_BIAS_INT8x32_REORDER", cudnn_frontend::BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER)
         .value("SUPPORTS_CUDA_GRAPH_NATIVE_API", cudnn_frontend::BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API);
+
+    py::enum_<cudnn_frontend::DiagonalAlignment_t>(m, "diagonal_alignment")
+        .value("TOP_LEFT", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT)
+        .value("BOTTOM_RIGHT", cudnn_frontend::DiagonalAlignment_t::BOTTOM_RIGHT);
 }
 
 }  // namespace python_bindings

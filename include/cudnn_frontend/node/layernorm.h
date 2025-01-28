@@ -27,93 +27,92 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
 
         attributes.fill_from_context(context);
 
-        auto X                  = attributes.inputs[Layernorm_attributes::input_names::X];
-        auto const x_tensor_dim = X->get_dim();
-
-        auto Y            = attributes.outputs[Layernorm_attributes::output_names::Y];
-        auto y_tensor_dim = Y->get_dim();
+        auto X = attributes.inputs[Layernorm_attributes::input_names::X];
+        auto Y = attributes.outputs[Layernorm_attributes::output_names::Y];
 
         // Only infer dims and strides if user did not set them
-        if (y_tensor_dim.empty()) {
-            y_tensor_dim.resize(x_tensor_dim.size());
-            Y->set_dim(x_tensor_dim);
+        if (Y->get_dim().empty()) {
+            Y->set_dim(X->get_dim());
         }
         if (Y->get_stride().empty()) {
-            auto const& Y_dim = Y->get_dim();
-            // Default to NHWC
-            auto const& stride_order = detail::generate_NHWC_stride_order(Y_dim.size());
-            Y->set_stride(detail::generate_stride(Y_dim, stride_order));
+            Y->set_stride(X->get_stride());
         }
 
-        // scale_bias   dim is 1,c,h,w
-        // mean inv_var dim is n,1,1,1
+        // scale_bias dim is 1,c,h,w
         auto scale_bias_dim = X->get_dim();
         scale_bias_dim[0]   = 1;
 
-        auto stats_dim = X->get_dim();
-        for (size_t i = 1; i < stats_dim.size(); i++) {
-            stats_dim[i] = 1;
-        }
-
         auto scale = attributes.inputs[Layernorm_attributes::input_names::SCALE];
+        // Only infer dims and strides if user did not set them
         if (scale->get_dim().empty()) {
             scale->set_dim(scale_bias_dim);
         }
         if (scale->get_stride().empty()) {
             auto const& scale_dim = scale->get_dim();
-            // Default to NHWC
-            auto const& stride_order = detail::generate_NHWC_stride_order(scale_dim.size());
+            std::vector<int64_t> stride_order;
+            CHECK_CUDNN_FRONTEND_ERROR(
+                detail::generate_stride_order_preserving_format(X->get_stride(), scale_dim.size(), stride_order));
             scale->set_stride(detail::generate_stride(scale_dim, stride_order));
         }
 
         auto bias = attributes.inputs[Layernorm_attributes::input_names::BIAS];
+        // Only infer dims and strides if user did not set them
         if (bias->get_dim().empty()) {
             bias->set_dim(scale_bias_dim);
         }
         if (bias->get_stride().empty()) {
             auto const& bias_dim = bias->get_dim();
-            // Default to NHWC
-            auto const& stride_order = detail::generate_NHWC_stride_order(bias_dim.size());
+            std::vector<int64_t> stride_order;
+            CHECK_CUDNN_FRONTEND_ERROR(
+                detail::generate_stride_order_preserving_format(X->get_stride(), bias_dim.size(), stride_order));
             bias->set_stride(detail::generate_stride(bias_dim, stride_order));
         }
 
         if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
+            // stats dim is x where scale == 1 else 1
+            auto stats_dim = X->get_dim();
+            for (size_t i = 0; i < stats_dim.size(); i++) {
+                if (scale->get_dim()[i] != 1) {
+                    stats_dim[i] = 1;
+                }
+            }
+
             auto mean = attributes.outputs[Layernorm_attributes::output_names::MEAN];
+            // Only infer dims and strides if user did not set them
             if (mean->get_dim().empty()) {
                 mean->set_dim(stats_dim);
             }
             if (mean->get_stride().empty()) {
                 auto const& mean_dim = mean->get_dim();
-                // Default to NHWC
-                auto const& stride_order = detail::generate_NHWC_stride_order(mean_dim.size());
+                std::vector<int64_t> stride_order;
+                CHECK_CUDNN_FRONTEND_ERROR(
+                    detail::generate_stride_order_preserving_format(X->get_stride(), mean_dim.size(), stride_order));
                 mean->set_stride(detail::generate_stride(mean_dim, stride_order));
             }
 
             auto inv_var = attributes.outputs[Layernorm_attributes::output_names::INV_VARIANCE];
+            // Only infer dims and strides if user did not set them
             if (inv_var->get_dim().empty()) {
                 inv_var->set_dim(stats_dim);
             }
             if (inv_var->get_stride().empty()) {
                 auto const& inv_var_dim = inv_var->get_dim();
-                // Default to NHWC
-                auto const& stride_order = detail::generate_NHWC_stride_order(inv_var_dim.size());
+                std::vector<int64_t> stride_order;
+                CHECK_CUDNN_FRONTEND_ERROR(
+                    detail::generate_stride_order_preserving_format(X->get_stride(), inv_var_dim.size(), stride_order));
                 inv_var->set_stride(detail::generate_stride(inv_var_dim, stride_order));
             }
         }
 
         // Set scalar tensors
-        auto infer_scalar_tensors = [&x_tensor_dim](std::shared_ptr<Tensor_attributes>& T) {
-            auto tensor_dim = T->get_dim();
+        std::vector<int64_t> ones(X->get_dim().size(), 1);
+        auto infer_scalar_tensors = [&ones](std::shared_ptr<Tensor_attributes>& T) {
             // Only infer dims and strides if user did not set them
-            if (tensor_dim.empty()) {
-                tensor_dim.resize(x_tensor_dim.size(), 1);
-                T->set_dim(tensor_dim);
+            if (T->get_dim().empty()) {
+                T->set_dim(ones);
             }
             if (T->get_stride().empty()) {
-                auto const& T_dim = T->get_dim();
-                // Default to NHWC
-                auto const& stride_order = detail::generate_NHWC_stride_order(T_dim.size());
-                T->set_stride(detail::generate_stride(T_dim, stride_order));
+                T->set_stride(ones);
             }
         };
         infer_scalar_tensors(attributes.inputs[Layernorm_attributes::input_names::EPSILON]);

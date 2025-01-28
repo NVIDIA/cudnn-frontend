@@ -1193,10 +1193,10 @@ run_fp8_flash_mha_fprop(int64_t b,
                         void* devPtrORaggedOffset,
                         void* devPtrMNKOverride,
                         cudnnDataType_t tensorType) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // FP8 BERT Flash Attention only runs on cudnn v8.9 and above and only on Hopper
         if (check_device_arch_newer_than("hopper") == false) {
@@ -1416,8 +1416,6 @@ run_fp8_flash_mha_fprop(int64_t b,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnn_frontend::cudnnException& e) {
@@ -1472,10 +1470,10 @@ run_fp8_flash_mha_bprop(int64_t b,
                         void* devPtrORaggedOffset,
                         void* devPtrMNKOverride,
                         cudnnDataType_t tensorType) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // FP8 BERT Flash Attention only runs on cudnn v8.9 and above and only on Hopper
         if (check_device_arch_newer_than("hopper") == false) {
@@ -1918,8 +1916,6 @@ run_fp8_flash_mha_bprop(int64_t b,
         if (workspace_size > 0) {
             checkCudaErr(cudaFree(workspace_ptr));
         }
-
-        checkCudnnErr(cudnnDestroy(handle_));
 
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 

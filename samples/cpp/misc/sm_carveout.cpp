@@ -94,8 +94,10 @@ TEST_CASE("SGBN with SM carveout", "[batchnorm][graph][sm_carveout]") {
     if (check_device_arch_newer_than("ampere") == false) {
         SKIP("ConvBNFprop requires Ampere and up");
     }
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -139,6 +141,4 @@ TEST_CASE("SGBN with SM carveout", "[batchnorm][graph][sm_carveout]") {
         {peer_stats_0, Peer_stats_0_tensor.devPtr},
         {peer_stats_1, Peer_stats_1_tensor.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    cudnnDestroy(handle);
 }

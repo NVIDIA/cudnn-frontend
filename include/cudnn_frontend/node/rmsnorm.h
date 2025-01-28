@@ -27,35 +27,42 @@ class RMSNormNode : public NodeCRTP<RMSNormNode> {
 
         attributes.fill_from_context(context);
 
-        auto X                  = attributes.inputs[Rmsnorm_attributes::input_names::X];
-        auto const x_tensor_dim = X->get_dim();
-
-        auto Y            = attributes.outputs[Rmsnorm_attributes::output_names::Y];
-        auto y_tensor_dim = Y->get_dim();
+        auto X = attributes.inputs[Rmsnorm_attributes::input_names::X];
+        auto Y = attributes.outputs[Rmsnorm_attributes::output_names::Y];
 
         // Only infer dims and strides if user did not set them
-        if (y_tensor_dim.empty()) {
-            y_tensor_dim.resize(x_tensor_dim.size());
-            Y->set_dim(x_tensor_dim);
+        if (Y->get_dim().empty()) {
+            Y->set_dim(X->get_dim());
         }
         if (Y->get_stride().empty()) {
-            auto const& Y_dim = Y->get_dim();
-            // Default to NHWC
-            auto const& stride_order = detail::generate_NHWC_stride_order(Y_dim.size());
-            Y->set_stride(detail::generate_stride(Y_dim, stride_order));
+            Y->set_stride(X->get_stride());
         }
 
         if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
             auto inv_var = attributes.outputs[Rmsnorm_attributes::output_names::INV_VARIANCE];
-            if (auto inv_var_dim = inv_var->get_dim(); inv_var_dim.empty()) {
-                inv_var_dim.resize(x_tensor_dim.size(), 1);
-                inv_var_dim[0] = x_tensor_dim[0];
+            // Only infer dims and strides if user did not set them
+            if (inv_var->get_dim().empty()) {
+                auto inv_var_dim = X->get_dim();
+                auto scale       = attributes.inputs[Rmsnorm_attributes::input_names::SCALE];
+                if (scale->get_dim().empty()) {
+                    // mean inv_var dim is n,1,1,1
+                    for (size_t i = 1; i < inv_var_dim.size(); i++) {
+                        inv_var_dim[i] = 1;
+                    }
+                } else {
+                    for (size_t i = 0; i < inv_var_dim.size(); i++) {
+                        if (scale->get_dim()[i] != 1) {
+                            inv_var_dim[i] = 1;
+                        }
+                    }
+                }
                 inv_var->set_dim(inv_var_dim);
             }
             if (inv_var->get_stride().empty()) {
                 auto const& inv_var_dim = inv_var->get_dim();
-                // Default to NHWC
-                auto const& stride_order = detail::generate_NHWC_stride_order(inv_var_dim.size());
+                std::vector<int64_t> stride_order;
+                CHECK_CUDNN_FRONTEND_ERROR(
+                    detail::generate_stride_order_preserving_format(X->get_stride(), inv_var_dim.size(), stride_order));
                 inv_var->set_stride(detail::generate_stride(inv_var_dim, stride_order));
             }
         }

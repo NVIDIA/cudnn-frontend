@@ -86,8 +86,9 @@ TEST_CASE("Int8 Matmul", "[matmul][graph]") {
     C_after_add->set_output(true).set_data_type(cudnn_frontend::DataType_t::FLOAT);
     REQUIRE(graph.validate().is_good());
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
@@ -113,5 +114,4 @@ TEST_CASE("Int8 Matmul", "[matmul][graph]") {
 
     std::cout << graph.print() << std::endl;
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-    CUDNN_CHECK(cudnnDestroy(handle));
 }
