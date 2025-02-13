@@ -81,7 +81,7 @@ TEST_CASE("Slice gemm", "[slice][gemm][graph][fusion]") {
     Surface<half> C_gpu(B * M * N, false);
     std::unordered_map<int64_t, void *> variant_pack = {
         {a_uid, A_gpu.devPtr}, {b_uid, B_gpu.devPtr}, {c_uid, C_gpu.devPtr}};
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

@@ -147,7 +147,7 @@ TEST_CASE("Cached sdpa", "[graph][sdpa][flash]") {
                     {O_UID, o_tensor.devPtr},
                     {STATS_UID, stats_tensor.devPtr}};
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(fwd_graph2->get_workspace_size(workspace_size).is_good());
     Surface<int8_t> fwd_workspace(workspace_size, false);
 
