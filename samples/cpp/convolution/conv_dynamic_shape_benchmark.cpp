@@ -74,8 +74,8 @@ create_conv_relu_forward_graph(conv_shape_params conv_shape, const std::shared_p
 TEST_CASE("Benchmark conv graph API runtimes", "[conv][graph][benchmark]") {
     // SKIP("Very long test turned off by default.");
 
-    if (cudnnGetVersion() < 8903) {
-        SKIP("Test requires cudnn 8.9.3 or above");
+    if (cudnnGetVersion() < 90500) {
+        SKIP("Test requires cudnn 9.5.0 or above");
         return;
     }
 
@@ -194,12 +194,12 @@ TEST_CASE("Benchmark conv graph API runtimes", "[conv][graph][benchmark]") {
         REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
     };
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     for (int idx_shape = 0; idx_shape < conv_shapes_count; ++idx_shape) {
         auto [graph, X, W, Y] = build_new_graph(handle, idx_shape);
         execute_graph(handle, graph.get(), X.get(), W.get(), Y.get());
     }
-    cudnnDestroy(handle);
 }

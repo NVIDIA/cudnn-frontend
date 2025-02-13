@@ -48,8 +48,9 @@ TEST_CASE("Convolution Dgrad", "[dgrad][graph]") {
     auto DX            = graph.conv_dgrad(DY, W, dgrad_options);
     DX->set_dim({4, 32, 16, 16}).set_output(true);
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -73,7 +74,6 @@ TEST_CASE("Convolution Dgrad", "[dgrad][graph]") {
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {DY, dy_tensor.devPtr}, {W, w_tensor.devPtr}, {DX, dx_tensor.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("Dgrad Drelu Graph", "[dgrad][graph]") {
@@ -104,8 +104,9 @@ TEST_CASE("Dgrad Drelu Graph", "[dgrad][graph]") {
     auto DX            = graph.pointwise(dgrad_output, X, drelu_options);
     DX->set_output(true);
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -129,7 +130,6 @@ TEST_CASE("Dgrad Drelu Graph", "[dgrad][graph]") {
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {DY, dy_tensor.devPtr}, {W, w_tensor.devPtr}, {X, x_tensor.devPtr}, {DX, dx_tensor.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("Dgrad Drelu DBNweight Graph", "[dgrad][graph]") {
@@ -208,8 +208,9 @@ TEST_CASE("Dgrad Drelu DBNweight Graph", "[dgrad][graph]") {
         SKIP("DgradDreluBNBwdWeight requires ampere or hopper architecture.");
     }
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
     REQUIRE(graph.build_operation_graph(handle).is_good());
@@ -253,5 +254,4 @@ TEST_CASE("Dgrad Drelu DBNweight Graph", "[dgrad][graph]") {
         {eq_scale_x, eq_scale_x_tensor.devPtr},
         {drelu_output, drelu_output_tensor.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-    cudnnDestroy(handle);
 }

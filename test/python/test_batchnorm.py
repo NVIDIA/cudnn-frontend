@@ -366,7 +366,3 @@ def test_bn_infer_drelu_dbn(cudnn_handle):
 
     graph.execute(variant_pack, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
-
-
-if __name__ == "__main__":
-    pytest.main([__file__])

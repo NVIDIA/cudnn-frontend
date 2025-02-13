@@ -291,11 +291,12 @@ run_from_heuristics(int64_t* x_dim,
                     float* devPtrY,
                     cudnnBackendHeurMode_t heur_mode,
                     bool expect_in_cache) {
-    cudnnHandle_t handle_;
     (void)heur_mode;
     static cudnn_frontend::ExecutionPlanCache plan_cache("sample_cache");
     try {
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         common_conv_descriptors descriptors =
             create_common_descriptors(x_dim, padA, convstrideA, dilationA, w_dim, y_dim, dataType, mode);
 
@@ -370,8 +371,6 @@ run_from_heuristics(int64_t* x_dim,
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
         CHECK(false);
     }
-
-    if (handle_) cudnnDestroy(handle_);
     return;
 }
 
@@ -387,10 +386,10 @@ run_from_global_index(int64_t* x_dim,
                       float* devPtrX,
                       float* devPtrW,
                       float* devPtrY) {
-    cudnnHandle_t handle_;
-
     try {
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         common_conv_descriptors descriptors =
             create_common_descriptors(x_dim, padA, convstrideA, dilationA, w_dim, y_dim, dataType, mode);
 
@@ -441,8 +440,6 @@ run_from_global_index(int64_t* x_dim,
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
         CHECK(false);
     }
-
-    if (handle_) cudnnDestroy(handle_);
 }
 
 cudnnStatus_t
@@ -457,11 +454,11 @@ run_with_external_config(int64_t* x_dim,
                          float* devPtrX,
                          float* devPtrW,
                          float* devPtrY) {
-    cudnnHandle_t handle_;
-
     cudnnStatus_t status = CUDNN_STATUS_SUCCESS;
-    try {
-        checkCudnnErr(cudnnCreate(&handle_));
+    try {  // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
+
         common_conv_descriptors descriptors =
             create_common_descriptors(x_dim, padA, convstrideA, dilationA, w_dim, y_dim, dataType, mode);
 
@@ -534,8 +531,6 @@ run_with_external_config(int64_t* x_dim,
         CHECK(false);
     }
 
-    if (handle_) cudnnDestroy(handle_);
-
     return status;
 }
 
@@ -553,11 +548,11 @@ run_conv_add_bias_activation(int64_t* x_dim,
                              float* devPtrY,
                              float* devPtrZ,
                              float* devPtrB) {
-    cudnnHandle_t handle_;
     try {
         int convDim = 2;
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Creates the necessary tensor descriptors
         common_convbias_descriptors tensors = create_conv_add_bias_act_descriptors(
@@ -725,10 +720,10 @@ run_from_cudnn_find(int64_t* x_dim,
                     void* devPtrX,
                     void* devPtrW,
                     void* devPtrY) {
-    cudnnHandle_t handle_;
-
     try {
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         common_conv_descriptors descriptors =
             create_common_descriptors(x_dim, padA, convstrideA, dilationA, w_dim, y_dim, dataType, mode);
 
@@ -779,7 +774,6 @@ run_from_cudnn_find(int64_t* x_dim,
         CHECK(false);
     }
 
-    if (handle_) cudnnDestroy(handle_);
     return;
 }
 
@@ -796,11 +790,11 @@ run_conv_add_bias_activation_with_cudnn_find(int64_t* x_dim,
                                              float* devPtrY,
                                              float* devPtrZ,
                                              float* devPtrB) {
-    cudnnHandle_t handle_;
     try {
         int convDim = 2;
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Creates the necessary tensor descriptors
         common_convbias_descriptors tensors = create_conv_add_bias_act_descriptors(
@@ -950,10 +944,10 @@ run_from_cudnn_get(int64_t* x_dim,
                    float* devPtrX,
                    float* devPtrW,
                    float* devPtrY) {
-    cudnnHandle_t handle_;
-
     try {
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         common_conv_descriptors descriptors =
             create_common_descriptors(x_dim, padA, convstrideA, dilationA, w_dim, y_dim, dataType, mode);
 
@@ -1019,7 +1013,6 @@ run_from_cudnn_get(int64_t* x_dim,
         CHECK(false);
     }
 
-    if (handle_) cudnnDestroy(handle_);
     return;
 }
 
@@ -1035,10 +1028,10 @@ block_using_errata(int64_t* x_dim,
                    float* devPtrX,
                    float* devPtrW,
                    float* devPtrY) {
-    cudnnHandle_t handle_;
-
     try {
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         common_conv_descriptors descriptors =
             create_common_descriptors(x_dim, padA, convstrideA, dilationA, w_dim, y_dim, dataType, mode);
 
@@ -1161,8 +1154,6 @@ block_using_errata(int64_t* x_dim,
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
         CHECK(false);
     }
-
-    if (handle_) cudnnDestroy(handle_);
 }
 
 void
@@ -1178,10 +1169,10 @@ run_dp4a(int64_t* x_dim,
          void* devPtrY,
          int64_t vectorCount,
          int64_t vectorDimension) {
-    cudnnHandle_t handle_;
-
     try {
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr   = create_cudnn_handle();
+        auto handle_      = *handle_ptr;
         const int convDim = 2;
         (void)convDim;
 
@@ -1279,7 +1270,6 @@ run_dp4a(int64_t* x_dim,
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
         CHECK(false);
     }
-    if (handle_) cudnnDestroy(handle_);
 }
 
 void
@@ -1295,10 +1285,10 @@ run_imma(int64_t* x_dim_padded,
          void* devPtrY,
          int64_t vectorCount,
          int64_t vectorDimension) {
-    cudnnHandle_t handle_;
-
     try {
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr   = create_cudnn_handle();
+        auto handle_      = *handle_ptr;
         const int convDim = 2;
         (void)convDim;
 
@@ -1451,5 +1441,4 @@ run_imma(int64_t* x_dim_padded,
         std::cout << "[ERROR] Exception " << e.what() << std::endl;
         CHECK(false);
     }
-    if (handle_) cudnnDestroy(handle_);
 }

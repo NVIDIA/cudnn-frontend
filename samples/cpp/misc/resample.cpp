@@ -56,8 +56,9 @@ TEST_CASE("Resample Max Pooling NHWC Inference", "[resample][pooling][max][graph
     Y->set_output(true);
     assert(Index == nullptr);
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
     REQUIRE(graph.build_operation_graph(handle).is_good());
@@ -74,8 +75,6 @@ TEST_CASE("Resample Max Pooling NHWC Inference", "[resample][pooling][max][graph
     Surface<int8_t> workspace(workspace_size, false);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    CUDNN_CHECK(cudnnDestroy(handle));
 }
 
 TEST_CASE("Resample Max Pooling NHWC Training", "[resample][pooling][max][graph]") {
@@ -111,8 +110,9 @@ TEST_CASE("Resample Max Pooling NHWC Training", "[resample][pooling][max][graph]
     Y->set_output(true);
     Index->set_output(true).set_data_type(fe::DataType_t::INT8);
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
 
@@ -137,8 +137,6 @@ TEST_CASE("Resample Max Pooling NHWC Training", "[resample][pooling][max][graph]
     Surface<int8_t> workspace(workspace_size, false);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    CUDNN_CHECK(cudnnDestroy(handle));
 }
 
 TEST_CASE("Resample Avg Pooling", "[resample][pooling][average][graph]") {
@@ -173,8 +171,9 @@ TEST_CASE("Resample Avg Pooling", "[resample][pooling][average][graph]") {
     Y->set_output(true);
     assert(Index == nullptr);
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.validate().is_good());
     REQUIRE(graph.build_operation_graph(handle).is_good());
@@ -191,6 +190,4 @@ TEST_CASE("Resample Avg Pooling", "[resample][pooling][average][graph]") {
     Surface<int8_t> workspace(workspace_size, false);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    CUDNN_CHECK(cudnnDestroy(handle));
 }

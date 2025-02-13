@@ -227,7 +227,3 @@ def test_rmsnorm(param_extract, cudnn_handle):
     if has_bias:
         torch.testing.assert_close(bias_gpu.grad, Dbias_actual, atol=5e-4, rtol=5e-4)
     print("Success!!")
-
-
-if __name__ == "__main__":
-    test_rmsnorm((1600, torch.bfloat16, True))

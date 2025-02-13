@@ -25,10 +25,16 @@
 
 #include <cudnn_frontend.h>
 
-TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
+TEST_CASE("Matmul custom plan", "[matmul][graph][autotuning]") {
     if (is_arch_supported_by_cudnn() == false) {
         SKIP("Architecture is not supported by currend cudnn version");
     }
+
+    if (cudnnGetVersion() < 90300) {
+        SKIP("Test requires cudnn 9.3.0 or above");
+        return;
+    }
+
     namespace fe = cudnn_frontend;
 
     // matmul problem size
@@ -78,18 +84,36 @@ TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
 
         REQUIRE(graph.build_operation_graph(handle).is_good());
 
-        graph.deselect_workspace_greater_than(0);
-
-        REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
-
-        graph.deselect_workspace_greater_than(1024 * 1024);
-
-        REQUIRE(graph.check_support(handle).is_good());
-
         return graph;
     };
 
     auto graph = create_graph();
+
+    int64_t engine_count;
+    REQUIRE(graph.get_engine_count(engine_count).is_good());
+
+    for (int64_t id = 0; id < engine_count; id++) {
+        std::vector<fe::Knob> knobs;
+
+        // It might happen that an engine is not supported.
+        auto status = graph.get_knobs_for_engine(id, knobs);
+        if (status.get_code() != fe::error_code_t::OK) {
+            continue;
+        }
+
+        std::unordered_map<fe::KnobType_t, int64_t> knob_map;
+        for (auto &knob : knobs) {
+            knob_map[knob.type] = knob.minValue + knob.stride;
+        }
+
+        // It might happen that the knobs are not supported.
+        status = graph.create_execution_plan(id, knob_map);
+        if (status.get_code() != fe::error_code_t::OK) {
+            continue;
+        }
+    }
+
+    REQUIRE(graph.check_support(handle).is_good());
 
     auto plan_count = graph.get_execution_plan_count();
     std::cout << "Graph has " << plan_count << " plan candidates." << std::endl;
@@ -99,64 +123,9 @@ TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
     std::unordered_map<int64_t, void *> variant_pack = {
         {a_uid, A_gpu.devPtr}, {b_uid, B_gpu.devPtr}, {c_uid, C_gpu.devPtr}};
 
-    auto autotune = [&]() -> int64_t {
-        const int iter_count = 10;
-        cudaEvent_t start, stop;
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-        cudaDeviceSynchronize();
+    Surface<int8_t> workspace1(graph.get_workspace_size_plan_at_index(0), false);
+    REQUIRE(graph.execute_plan_at_index(handle, variant_pack, workspace1.devPtr, 0).is_good());
 
-        cudaStream_t stream = nullptr;
-        cudnnGetStream(handle, &stream);
-
-        std::vector<float> execution_times;
-        execution_times.resize(plan_count, 10.0f);  // Some arbitrary high time
-
-        int64_t workspace_size = 0;
-        for (auto i = 0; i < plan_count; i++) {
-            workspace_size = std::max(workspace_size, graph.get_workspace_size_plan_at_index(i));
-        }
-
-        Surface<int8_t> workspace(workspace_size, false);
-
-        for (auto i = 0; i < plan_count; i++) {
-            float time_ms = 0.0f;
-
-            auto warmup_status = graph.execute_plan_at_index(handle, variant_pack, workspace.devPtr, i);
-
-            if (warmup_status.is_bad()) {
-                std::cout << "Plan at index " << i << " failed execution " << warmup_status.get_message() << std::endl;
-                continue;
-            }
-            cudaDeviceSynchronize();
-
-            cudaEventRecord(start, stream);
-            for (int iter = 0; iter < iter_count; iter++) {
-                auto status = graph.execute_plan_at_index(handle, variant_pack, workspace.devPtr, i);
-                (void)status;
-            }
-            cudaEventRecord(stop, stream);
-            cudaEventSynchronize(stop);
-            cudaEventElapsedTime(&time_ms, start, stop);
-
-            std::cout << "Plan at index " << i << " took " << time_ms / iter_count << " ms." << std::endl;
-            execution_times[i] = time_ms / iter_count;
-        }
-
-        return std::distance(std::begin(execution_times),
-                             std::min_element(std::begin(execution_times), std::end(execution_times)));
-    };
-    // Run cudnn graph
-
-    auto candidate_index = autotune();
-
-    std::string name;
-    REQUIRE(graph.get_plan_name_at_index(candidate_index, name).is_good());
-    std::cout << "Successful candidate " << name << " is at index " << candidate_index << std::endl;
-
-    REQUIRE(graph.build_plan_at_index(handle, candidate_index).is_good());
-
-    Surface<int8_t> workspace(graph.get_workspace_size_plan_at_index(candidate_index), false);
-
-    REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
+    Surface<int8_t> workspace2(graph.get_workspace_size_plan_at_index(1), false);
+    REQUIRE(graph.execute_plan_at_index(handle, variant_pack, workspace2.devPtr, 1).is_good());
 }

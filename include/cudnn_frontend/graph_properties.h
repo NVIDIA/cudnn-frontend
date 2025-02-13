@@ -6,6 +6,7 @@
 #include <optional>
 #include <unordered_map>
 #include <vector>
+#include <limits.h>
 
 #include "context.h"
 
@@ -1414,15 +1415,25 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     using AttentionScoreModifier_t = std::function<Tensor_t(Graph_t, Tensor_t)>;
 
     std::optional<bool> is_inference;
-    bool alibi_mask               = false;
-    bool padding_mask             = false;
-    bool causal_mask              = false;
-    bool causal_mask_bottom_right = false;
-    std::optional<int> sliding_window_length;
+    bool alibi_mask   = false;
+    bool padding_mask = false;
+    std::optional<int64_t> left_bound;
+    std::optional<int64_t> right_bound;
+    DiagonalAlignment_t diagonal_alignment = DiagonalAlignment_t::TOP_LEFT;
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
     std::optional<int> max_seq_len_kv;
     AttentionScoreModifier_t attention_score_modifier = nullptr;
+
+    bool
+    has_causal_like_masking() const {
+        return right_bound.has_value();
+    }
+
+    bool
+    has_causal_mask_bottom_right() const {
+        return right_bound.has_value() && diagonal_alignment == DiagonalAlignment_t::BOTTOM_RIGHT;
+    }
 
    public:
     enum class input_names {
@@ -1450,11 +1461,12 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
                                    is_inference,
                                    alibi_mask,
                                    padding_mask,
-                                   causal_mask,
-                                   causal_mask_bottom_right,
                                    dropout_probability,
                                    attn_scale_value,
-                                   sliding_window_length)
+                                   max_seq_len_kv,
+                                   left_bound,
+                                   right_bound,
+                                   diagonal_alignment)
 
     SDPA_attributes&
     set_is_inference(bool const value) {
@@ -1505,14 +1517,37 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     }
 
     SDPA_attributes&
-    set_causal_mask(bool const value) {
-        causal_mask = value;
+    set_diagonal_alignment(DiagonalAlignment_t const alignment) {
+        diagonal_alignment = alignment;
         return *this;
     }
 
+    // Sets the diagonal position to top left and
+    // calls set_diagonal_band_right_bound(0) if no right_bound was specified
+    // TODO: Deprecate
+    SDPA_attributes&
+    set_causal_mask(bool const value) {
+        if (value) {
+            set_diagonal_alignment(DiagonalAlignment_t::TOP_LEFT);
+            if (!right_bound.has_value()) {
+                set_diagonal_band_right_bound(0);
+            }
+        }
+
+        return *this;
+    }
+
+    // Sets the diagonal position to the bottom right (on a per-sequence basis)
+    // and calls set_diagonal_band_right_bound(0) if no right_bound was specified
+    // TODO: Deprecate
     SDPA_attributes&
     set_causal_mask_bottom_right(bool const value) {
-        causal_mask_bottom_right = value;
+        if (value) {
+            set_diagonal_alignment(DiagonalAlignment_t::BOTTOM_RIGHT);
+            if (!right_bound.has_value()) {
+                set_diagonal_band_right_bound(0);
+            }
+        }
         return *this;
     }
 
@@ -1522,9 +1557,22 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         return *this;
     }
 
+    // calls set_diagonal_band_left_bound(value)
+    // TODO: Deprecate
     SDPA_attributes&
     set_sliding_window_length(int const value) {
-        sliding_window_length = value;
+        return set_diagonal_band_left_bound(value);
+    }
+
+    SDPA_attributes&
+    set_diagonal_band_left_bound(int const value) {
+        left_bound = value;
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_diagonal_band_right_bound(int const value) {
+        right_bound = value;
         return *this;
     }
 
@@ -1577,8 +1625,9 @@ class SDPA_fp8_attributes : public Attributes<SDPA_fp8_attributes> {
     friend class Graph;
 
     std::optional<bool> is_inference;
-    bool padding_mask = false;
-    bool causal_mask  = false;
+    bool padding_mask             = false;
+    bool causal_mask              = false;
+    bool causal_mask_bottom_right = false;
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
 
@@ -1615,6 +1664,7 @@ class SDPA_fp8_attributes : public Attributes<SDPA_fp8_attributes> {
                                    is_inference,
                                    padding_mask,
                                    causal_mask,
+                                   causal_mask_bottom_right,
                                    dropout_probability,
                                    attn_scale_value)
 
@@ -1682,6 +1732,12 @@ class SDPA_fp8_attributes : public Attributes<SDPA_fp8_attributes> {
         inputs[SDPA_fp8_attributes::input_names::Dropout_scale] = scale;
         return *this;
     }
+
+    SDPA_fp8_attributes&
+    set_causal_mask_bottom_right(bool const value) {
+        causal_mask_bottom_right = value;
+        return *this;
+    }
 };
 
 class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
@@ -1693,11 +1749,11 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
 
     using AttentionScoreModifier_t = std::function<Tensor_t(Graph_t, Tensor_t)>;
 
-    bool alibi_mask               = false;
-    bool padding_mask             = false;
-    bool causal_mask              = false;
-    bool causal_mask_bottom_right = false;
-    std::optional<int> sliding_window_length;
+    bool alibi_mask   = false;
+    bool padding_mask = false;
+    std::optional<int64_t> left_bound;
+    std::optional<int64_t> right_bound;
+    DiagonalAlignment_t diagonal_alignment = DiagonalAlignment_t::TOP_LEFT;
 
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
@@ -1708,6 +1764,16 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     bool is_deterministic_algorithm                         = false;
     AttentionScoreModifier_t attention_score_modifier       = nullptr;
     AttentionScoreModifier_t attention_score_modifier_bprop = nullptr;
+
+    bool
+    has_causal_like_masking() const {
+        return right_bound.has_value();
+    }
+
+    bool
+    has_causal_mask_bottom_right() const {
+        return right_bound.has_value() && diagonal_alignment == DiagonalAlignment_t::BOTTOM_RIGHT;
+    }
 
    public:
     enum class input_names {
@@ -1736,11 +1802,13 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
                                    outputs,
                                    alibi_mask,
                                    padding_mask,
-                                   causal_mask,
-                                   causal_mask_bottom_right,
                                    dropout_probability,
                                    attn_scale_value,
-                                   sliding_window_length,
+                                   left_bound,
+                                   right_bound,
+                                   diagonal_alignment,
+                                   max_total_seq_len_q,
+                                   max_total_seq_len_kv,
                                    is_deterministic_algorithm)
 
     SDPA_backward_attributes&
@@ -1816,20 +1884,55 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     }
 
     SDPA_backward_attributes&
-    set_causal_mask(bool const value) {
-        causal_mask = value;
+    set_diagonal_alignment(DiagonalAlignment_t const alignment) {
+        diagonal_alignment = alignment;
         return *this;
     }
 
+    // Sets the diagonal position to top left and
+    // calls set_diagonal_band_right_bound(0) if no right_bound was specified
+    // TODO: Deprecate
+    SDPA_backward_attributes&
+    set_causal_mask(bool const value) {
+        if (value) {
+            set_diagonal_alignment(DiagonalAlignment_t::TOP_LEFT);
+            if (!right_bound.has_value()) {
+                set_diagonal_band_right_bound(0);
+            }
+        }
+        return *this;
+    }
+
+    // Sets the diagonal position to the bottom right (on a per-sequence basis)
+    // and calls set_diagonal_band_right_bound(0) if no right_bound was specified
+    // TODO: Deprecate
     SDPA_backward_attributes&
     set_causal_mask_bottom_right(bool const value) {
-        causal_mask_bottom_right = value;
+        if (value) {
+            set_diagonal_alignment(DiagonalAlignment_t::BOTTOM_RIGHT);
+            if (!right_bound.has_value()) {
+                set_diagonal_band_right_bound(0);
+            }
+        }
+        return *this;
+    }
+
+    // calls set_diagonal_band_left_bound(value)
+    // TODO: Deprecate
+    SDPA_backward_attributes&
+    set_sliding_window_length(int const value) {
+        return set_diagonal_band_left_bound(value);
+    }
+
+    SDPA_backward_attributes&
+    set_diagonal_band_left_bound(int const value) {
+        left_bound = value;
         return *this;
     }
 
     SDPA_backward_attributes&
-    set_sliding_window_length(int const value) {
-        sliding_window_length = value;
+    set_diagonal_band_right_bound(int const value) {
+        right_bound = value;
         return *this;
     }
 
@@ -1872,8 +1975,9 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
     friend class SDPAFP8BackwardNode;
     friend class Graph;
 
-    bool padding_mask = false;
-    bool causal_mask  = false;
+    bool padding_mask             = false;
+    bool causal_mask              = false;
+    bool causal_mask_bottom_right = false;
 
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
@@ -1922,6 +2026,7 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
                                    padding_mask,
                                    causal_mask,
                                    dropout_probability,
+                                   causal_mask_bottom_right,
                                    attn_scale_value)
 
     SDPA_fp8_backward_attributes&
@@ -1963,6 +2068,12 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
     SDPA_fp8_backward_attributes&
     set_causal_mask(bool const value) {
         causal_mask = value;
+        return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_causal_mask_bottom_right(bool const value) {
+        causal_mask_bottom_right = value;
         return *this;
     }
 
@@ -2159,6 +2270,73 @@ class PagedCacheLoad_attributes : public Attributes<PagedCacheLoad_attributes> {
     enum class output_names { yOut };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(PagedCacheLoad_attributes, name, compute_data_type, inputs, outputs)
+};
+
+class Block_scale_quantize_attributes : public Attributes<Block_scale_quantize_attributes> {
+    friend class Attributes<Block_scale_quantize_attributes>;
+    friend class BlockScaleQuantizeNode;
+    friend class Graph;
+
+    std::optional<int32_t> block_size;
+    std::optional<int64_t> axis;
+    bool transpose = false;
+
+   public:
+    enum class input_names { X };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { Y, scale };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Block_scale_quantize_attributes,
+                                   name,
+                                   compute_data_type,
+                                   inputs,
+                                   outputs,
+                                   block_size,
+                                   axis)
+
+    Block_scale_quantize_attributes&
+    set_block_size(int32_t const value) {
+        block_size = value;
+        return *this;
+    }
+
+    Block_scale_quantize_attributes&
+    set_axis(int64_t const value) {
+        axis = value;
+        return *this;
+    }
+
+    Block_scale_quantize_attributes&
+    set_transpose(bool const value) {
+        transpose = value;
+        return *this;
+    }
+};
+
+class Block_scale_dequantize_attributes : public Attributes<Block_scale_dequantize_attributes> {
+    friend class Attributes<Block_scale_dequantize_attributes>;
+    friend class BlockScaleDequantizeNode;
+    friend class Graph;
+
+    std::optional<int32_t> block_size;
+
+   public:
+    enum class input_names { X, scale };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { Y };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Block_scale_dequantize_attributes,
+                                   name,
+                                   compute_data_type,
+                                   inputs,
+                                   outputs,
+                                   block_size)
+
+    Block_scale_dequantize_attributes&
+    set_block_size(int32_t const value) {
+        block_size = value;
+        return *this;
+    }
 };
 
 }  // namespace graph

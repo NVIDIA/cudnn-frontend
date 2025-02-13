@@ -101,10 +101,10 @@ run_conv_scale_bias_add_leaky_relu(int64_t* x_dim,
                                    void* devPtrS,
                                    void* devPtrB,
                                    void* devPtrA) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Creates the necessary tensor descriptors
         int64_t stride[4];
@@ -324,8 +324,6 @@ run_conv_scale_bias_add_leaky_relu(int64_t* x_dim,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnn_frontend::cudnnException& e) {
@@ -366,10 +364,10 @@ run_conv_bias_scale_relu(int64_t* x_dim,
                          void* devPtrY,
                          void* devPtrB,
                          void* devPtrS) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Creates the necessary tensor descriptors
         int64_t stride[4];
@@ -554,8 +552,6 @@ run_conv_bias_scale_relu(int64_t* x_dim,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnn_frontend::cudnnException& e) {
@@ -590,10 +586,10 @@ run_serialization_conv_bias_scale_relu(int64_t* x_dim,
                                        void* devPtrY,
                                        void* devPtrB,
                                        void* devPtrS) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Creates the necessary tensor descriptors
         int64_t stride[4];
@@ -790,8 +786,6 @@ run_serialization_conv_bias_scale_relu(int64_t* x_dim,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnn_frontend::cudnnException& e) {
@@ -830,8 +824,6 @@ run_conv_scale_bias_relu_gen_index_selection(int64_t* x_dim,
                                              void* devPtrB,
                                              void* devPtrTopThreshold,
                                              void* devPtrBottomThreshold) {
-    cudnnHandle_t handle_;
-    (void)handle_;
     (void)x_dim;
     (void)w_dim;
     (void)y_dim;
@@ -853,8 +845,9 @@ run_conv_scale_bias_relu_gen_index_selection(int64_t* x_dim,
     (void)devPtrBottomThreshold;
     try {
 #if (CUDNN_VERSION >= 8400)
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         if (check_device_arch_newer_than("turing") == false) {
             cudnn_frontend::set_error_and_throw_exception(
                 nullptr,
@@ -1204,8 +1197,6 @@ run_conv_scale_bias_relu_gen_index_selection(int64_t* x_dim,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 #endif
 
@@ -1233,10 +1224,10 @@ run_conv_scale_bias_relu_int8(int64_t* x_dim,
                               void* devPtrY,
                               void* devPtrS,
                               void* devPtrB) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         if (check_device_arch_newer_than("turing") == false) {
             cudnn_frontend::set_error_and_throw_exception(
@@ -1429,8 +1420,6 @@ run_conv_scale_bias_relu_int8(int64_t* x_dim,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnn_frontend::cudnnException& e) {
@@ -1475,7 +1464,6 @@ run_pool_scale_bias_relu_int8(int64_t* x_dim,
                               int64_t* prePaddingA,
                               int64_t* postPaddingA,
                               int64_t* strideA) {
-    cudnnHandle_t handle_;
     (void)nbSpatialDims;
     (void)alpha;
     (void)beta;
@@ -1484,8 +1472,9 @@ run_pool_scale_bias_relu_int8(int64_t* x_dim,
     (void)postPaddingA;
     (void)strideA;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Creates the necessary tensor descriptors
         int64_t strideTensor[4];
@@ -1666,7 +1655,6 @@ run_pool_scale_bias_relu_int8(int64_t* x_dim,
         if (workspace_size > 0) {
             checkCudaErr(cudaFree(workspace_ptr));
         }
-        checkCudnnErr(cudnnDestroy(handle_));
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
         std::cout << "EXECUTE SUCCESS" << std::endl;
 
@@ -1698,10 +1686,10 @@ run_matmul_bias_gelu(int64_t* a_dim,
                      void* devPtrC,
                      void* devPtrZ,
                      void* devPtrAfterZ) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         if (check_device_arch_newer_than("ampere") == false && dataType == CUDNN_DATA_FLOAT) {
             cudnn_frontend::set_error_and_throw_exception(
                 nullptr, CUDNN_STATUS_ARCH_MISMATCH, "run_matmul_bias_gelu: Sample requires Ampere or above GPU");
@@ -1847,8 +1835,6 @@ run_matmul_bias_gelu(int64_t* a_dim,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnn_frontend::cudnnException& e) {
@@ -1880,11 +1866,12 @@ run_conv_drelu(int64_t* x_dim,
                void* dev_ptr_w,
                void* dev_ptr_y,
                void* dev_ptr_bwd_act_x) {
-    cudnnHandle_t handle_;
     try {
         int convDim = 2;
 
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         if (check_device_arch_newer_than("ampere") == false) {
             cudnn_frontend::set_error_and_throw_exception(
                 nullptr, CUDNN_STATUS_ARCH_MISMATCH, "run_conv_drelu: Sample requires Ampere or above GPU");
@@ -2019,8 +2006,6 @@ run_conv_drelu(int64_t* x_dim,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnn_frontend::cudnnException& e) {
@@ -2045,14 +2030,15 @@ run_dgrad_drelu(int64_t* dx_dim,
                 void* dev_ptr_w,
                 void* dev_ptr_dy,
                 void* dev_ptr_bwd_act_x) {
-    cudnnHandle_t handle_;
     try {
         int convDim = 2;
         if (check_device_arch_newer_than("ampere") == false) {
             cudnn_frontend::set_error_and_throw_exception(
                 nullptr, CUDNN_STATUS_ARCH_MISMATCH, "run_dgrad_drelu: Sample requires Ampere or above GPU");
         }
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         int64_t dx_id        = 101;
         int64_t w_id         = 102;
@@ -2186,8 +2172,6 @@ run_dgrad_drelu(int64_t* dx_dim,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnn_frontend::cudnnException& e) {
@@ -2210,10 +2194,10 @@ run_matmul_dgelu_dbias(const int64_t* dy_dim,
                        void* dev_ptr_bwd_act_x,
                        void* dev_ptr_dx,
                        void* dev_ptr_dbias) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         if (check_device_arch_newer_than("ampere") == false) {
             cudnn_frontend::set_error_and_throw_exception(
                 nullptr, CUDNN_STATUS_ARCH_MISMATCH, "run_matmul_dgelu_dbias: Sample requires Ampere or above GPU");
@@ -2373,8 +2357,6 @@ run_matmul_dgelu_dbias(const int64_t* dy_dim,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnn_frontend::cudnnException& e) {
@@ -2404,10 +2386,10 @@ run_conv_reduction(int64_t* x_dim,
                    void* devPtrX,
                    void* devPtrW,
                    void* devPtrR) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         if (check_device_arch_newer_than("ampere") == false) {
             cudnn_frontend::set_error_and_throw_exception(
                 nullptr, CUDNN_STATUS_ARCH_MISMATCH, "run_conv_reduction: Sample requires Ampere or above GPU");
@@ -2529,8 +2511,6 @@ run_conv_reduction(int64_t* x_dim,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnn_frontend::cudnnException& e) {
@@ -2558,10 +2538,10 @@ run_bn_conv_gen_stat(int64_t* xTensorDim,
                      void* biasdevPtr,
                      void* sumdevPtr,
                      void* sqSumdevPtr) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Creates the necessary tensor descriptors
         int64_t stride[4];
@@ -2844,10 +2824,10 @@ run_bn_finalize(int64_t* perChannelSum,
                 double epsilon_val,
                 double exponential_decay_factor,
                 int64_t accumCnt_val) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Creates the necessary tensor descriptors
         int64_t stride[4];
@@ -3011,11 +2991,10 @@ run_dsbar(int64_t* Y_dim,
           void* DP_biasDevPtr,
           void* YdevPtr,
           cudnnDataType_t op_data_type) {
-    cudnnHandle_t handle_;
-
     try {
-        // Create a handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Create tensor descriptors
         int64_t stride[4];
@@ -3309,10 +3288,10 @@ run_conv_two_global_scales(int64_t* xTensorDim,
                            void* devPtrScale2,
                            void* devPtrOutput,
                            void* afterConv) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         if (check_device_arch_newer_than("ampere") == false) {
             cudnn_frontend::set_error_and_throw_exception(
                 nullptr, CUDNN_STATUS_ARCH_MISMATCH, "run_conv_two_global_scales: Sample requires Ampere or above GPU");
@@ -3518,10 +3497,10 @@ run_maxpool_with_idx(int64_t* x_dim,
                      int64_t* prePaddingA,
                      int64_t* postPaddingA,
                      int64_t* strideA) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Creates the necessary tensor descriptors
         int64_t strideTensor[4];
@@ -3628,7 +3607,6 @@ run_maxpool_with_idx(int64_t* x_dim,
         if (workspace_size > 0) {
             checkCudaErr(cudaFree(workspace_ptr));
         }
-        checkCudnnErr(cudnnDestroy(handle_));
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
         std::cout << "EXECUTE SUCCESS" << std::endl;
 
@@ -3663,10 +3641,10 @@ run_backward_avgpool(int64_t* dx_dim,
                      int64_t* prePaddingA,
                      int64_t* postPaddingA,
                      int64_t* strideA) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Creates the necessary tensor descriptors
         int64_t strideTensor[4];
@@ -3762,7 +3740,6 @@ run_backward_avgpool(int64_t* dx_dim,
         if (workspace_size > 0) {
             checkCudaErr(cudaFree(workspace_ptr));
         }
-        checkCudnnErr(cudnnDestroy(handle_));
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
         std::cout << "EXECUTE SUCCESS" << std::endl;
 
@@ -3799,10 +3776,10 @@ run_backward_maxpool(int64_t* dx_dim,
                      int64_t* prePaddingA,
                      int64_t* postPaddingA,
                      int64_t* strideA) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Creates the necessary tensor descriptors
         int64_t strideTensor[4];
@@ -3909,7 +3886,6 @@ run_backward_maxpool(int64_t* dx_dim,
         if (workspace_size > 0) {
             checkCudaErr(cudaFree(workspace_ptr));
         }
-        checkCudnnErr(cudnnDestroy(handle_));
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
         std::cout << "EXECUTE SUCCESS" << std::endl;
 
@@ -3948,10 +3924,10 @@ run_bn_bwd_weight(int64_t* xDim,
                   void* eqscale_dy,
                   void* eqscale_x,
                   void* eqbias) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // this example is only for Ampere and Hopper cards
         bool is_supported = (is_ampere_arch() || is_hopper_arch());
@@ -4130,7 +4106,6 @@ run_bn_bwd_weight(int64_t* xDim,
         }
 
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
-        checkCudnnErr(cudnnDestroy(handle_));
 
     } catch (cudnn_frontend::cudnnException& e) {
         struct cudaDeviceProp prop;

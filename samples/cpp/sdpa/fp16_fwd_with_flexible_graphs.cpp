@@ -159,8 +159,9 @@ TEST_CASE("Toy sdpa forward with flexible graph", "[graph][sdpa][flash][forward]
         return;
     }
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     auto graph =
         create_sdpa_forward_graph(b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v, attn_scale, is_inference, has_attn_bias);
@@ -193,6 +194,4 @@ TEST_CASE("Toy sdpa forward with flexible graph", "[graph][sdpa][flash][forward]
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    cudnnDestroy(handle);
 }

@@ -565,6 +565,7 @@ for causal, headdim, bs_seqlen, nheads in itertools.product(
             is_inference=is_infer,
             attn_scale=attn_scale,
             use_causal_mask=is_causal,
+            use_padding_mask=False,
         )
 
         o_fwd.set_output(True).set_dim(o_gpu.size()).set_stride(

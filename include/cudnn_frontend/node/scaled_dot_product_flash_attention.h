@@ -37,13 +37,13 @@ std::shared_ptr<Tensor_attributes> padding_mask(std::shared_ptr<Graph>,
 std::shared_ptr<Tensor_attributes>
 sliding_window_mask(std::shared_ptr<Graph> graph,
                     std::shared_ptr<Tensor_attributes> attention_score,
-                    bool has_causal_mask_bottom_right,
-                    int64_t left_window,
-                    int64_t right_window,
-                    int64_t s_kv,
+                    DiagonalAlignment_t diagonal_alignment,
+                    std::optional<int64_t> left_window,
+                    std::optional<int64_t> right_window,
                     int64_t s_q,
-                    std::shared_ptr<Tensor_attributes> s_kv_ptr,
-                    std::shared_ptr<Tensor_attributes> s_q_ptr);
+                    int64_t s_kv,
+                    std::shared_ptr<Tensor_attributes> s_q_ptr,
+                    std::shared_ptr<Tensor_attributes> s_kv_ptr);
 
 std::shared_ptr<Tensor_attributes>
 alibi_mask(std::shared_ptr<Graph>,
@@ -223,10 +223,14 @@ class SDPANode : public NodeCRTP<SDPANode> {
 
         // validation TODO:
         //    - validate stats has valid dims
+        cudaDeviceProp prop;
+        int device;
+        CHECK_CUDA_ERROR(detail::cuda_get_device(&device));
+        CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, device));
 
         RETURN_CUDNN_FRONTEND_ERROR_IF((attributes.attention_score_modifier != nullptr) &&
-                    (attributes.alibi_mask || attributes.causal_mask || attributes.padding_mask || attributes.causal_mask_bottom_right ||
-                     attributes.sliding_window_length.has_value()),error_code_t::GRAPH_NOT_SUPPORTED, "Attention score mod enabled and hence other subgraphs are disabled.");
+                    (attributes.alibi_mask || attributes.has_causal_like_masking() || attributes.padding_mask ||
+                     attributes.left_bound.has_value()),error_code_t::GRAPH_NOT_SUPPORTED, "Attention score mod enabled and hence other subgraphs are disabled.");
 
         // validate basic dimension requirements
         RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 256) || (d_qk % 8 != 0) || (d_v > 256) || (d_v % 8 != 0),
@@ -244,16 +248,31 @@ class SDPANode : public NodeCRTP<SDPANode> {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "attn_scale with tensor and value cannot be set at the same time.");
 
+        // validate alibi requirements
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.alibi_mask && !(attributes.right_bound.has_value() && attributes.right_bound.value() == 0),
+                        error_code_t::GRAPH_NOT_SUPPORTED,
+                        "When alibi mask is used, diagonal_band_right_bound needs to be set to 0.");
+
         // validate options for bias mask
         RETURN_CUDNN_FRONTEND_ERROR_IF(is_bias && (bias_mask->second->get_data_type() == DataType_t::BOOLEAN),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Bias mask data type cannot be boolean");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(is_bias && detail::get_backend_version() < 8906, error_code_t::GRAPH_NOT_SUPPORTED, "Bias mask is not  supported below cudnn version  8.9.6");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF((detail::get_backend_version() >= 8906 && detail::get_backend_version() < 90000) &&
+             (context.get_sm_version() > 0 && context.get_sm_version() < 90), error_code_t::GRAPH_NOT_SUPPORTED,
+            "Post scale Bias mask is not supported below Hopper for cudnn version" + std::to_string(detail::get_backend_version()));
 
         // validate options for padding mask
         auto const& seq_len_q     = attributes.inputs.find(input_names::SEQ_LEN_Q);
         bool const has_seq_len_q  = (seq_len_q != attributes.inputs.end()) && (seq_len_q->second != nullptr);
         auto const& seq_len_kv    = attributes.inputs.find(input_names::SEQ_LEN_KV);
         bool const has_seq_len_kv = (seq_len_kv != attributes.inputs.end()) && (seq_len_kv->second != nullptr);
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF((attributes.padding_mask || attributes.alibi_mask || attributes.has_causal_mask_bottom_right()) && (detail::get_backend_version() < 8906),
+                                         error_code_t::GRAPH_NOT_SUPPORTED,  "Only causal mask is supported in cudnn versions below 8.9.6 ");   
+
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.padding_mask && (!has_seq_len_q || !has_seq_len_kv),
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Padding mask requires seq_len_q and seq_len_kv to be set.");
@@ -262,34 +281,47 @@ class SDPANode : public NodeCRTP<SDPANode> {
                                        "seq_len_q and seq_len_kv needs to be set only if padding mask is enabled.");
 
         // validate options for bottom right causal mask
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask && attributes.causal_mask_bottom_right,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Bottom right causal mask and causal mask cannot be both enabled");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && s_q > s_kv,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (detail::get_backend_version() < 90300), error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Causal bottom right masking requires cudnn 9.3.0 and above");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && s_q > s_kv,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "Bottom right causal mask does not support s_q > s_kv. Please virtually slice the Q tensor and pass it as s_q == s_kv");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && (is_bias || attributes.alibi_mask || (is_ragged && !attributes.padding_mask) || is_dropout),
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (is_bias || attributes.alibi_mask || (is_ragged && !attributes.padding_mask) || is_dropout),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "Bottom right causal mask is only supported with is_bias=False, is_alibi=False, is_dropout=False. Further is_ragged==True is only allowed when padding_mask=True.");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && ((s_q % 64 != 0) || (s_kv % 64 != 0)),
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (detail::get_backend_version() < 90600) && ((s_q % 64 != 0) || (s_kv % 64 != 0)),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Bottom right causal mask is only supported with s_q multiple of 64, and s_kv multiple of 64");
+                                       "Bottom right causal mask is only supported with s_q multiple of 64, and s_kv multiple of 64, for cudnn version below 9.6.0");
+
+        //  NVTE_SBHD or NVTE_BSHD is only supported for bottom right causal mask and sliding window
+
+        // Combination of mask and bias
+        RETURN_CUDNN_FRONTEND_ERROR_IF((is_bias && (attributes.has_causal_like_masking() || attributes.padding_mask) && (detail::get_backend_version() < 8906)), error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Bias + padding or causal mask is only supported in 8.9.6 and above");
 
         // validate options for sliding window length
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && attributes.sliding_window_length.value() < 0,
+        RETURN_CUDNN_FRONTEND_ERROR_IF((attributes.left_bound.has_value() && detail::get_backend_version() < 90200), error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "sliding window is only supported 9.2.0 and above");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && attributes.left_bound.value() <= 0,
                                        error_code_t::INVALID_VALUE,
-                                       "Sliding window length should be greater than or equals to zero when set.");
+                                       "Left bound (Sliding window length) should be greater than zero when set.");
                                        
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && s_q > s_kv,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && s_q > s_kv,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "Sliding window attention is only supported with s_q <= s_kv.");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && (! (attributes.causal_mask || attributes.causal_mask_bottom_right) || is_dropout || is_bias || (is_ragged && !attributes.padding_mask)),
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && (! attributes.has_causal_like_masking() || is_dropout || is_bias || (is_ragged && !attributes.padding_mask)),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Sliding window attention is only supported with causal_mask=True, is_dropout=False, is_bias=False. Further is_ragged==True is only allowed when padding_mask=True.");
+                                       "Left and right bounds are only supported with is_dropout=False, is_bias=False. Further is_ragged==True is only allowed when padding_mask=True. Lastly the diagonal alignment must be set.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.right_bound.has_value() && attributes.right_bound.value() < 0,
+                                       error_code_t::INVALID_VALUE,
+                                       "Right bound needs to be larger than or equal to zero");
 
         // validate options for dropout mask
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.dropout_probability.has_value() && is_dropout_custom,
@@ -323,6 +355,17 @@ class SDPANode : public NodeCRTP<SDPANode> {
             error_code_t::GRAPH_NOT_SUPPORTED, "Value set through set_paged_attention_max_seq_len_kv is incompatible with the sequence length of the RNG_DUMP");
         }
 
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 8903, error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "SDPA OP requires cudnn version 8.9.3 and above");
+
+        // If user has set sm_version allow SM specific checks
+        if (context.get_sm_version() > 0) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(80 > context.get_sm_version(), error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "cudnn SDPA operation requires Ampere and above");
+        }
+ 
+        // (cudnn_runtime_version < 8907 && num_attn_heads == num_gqa_groups FIXME
+
         // version specific validation
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 8906 && ((s_kv % 64 != 0) || (d_qk % 64 != 0)),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -340,7 +383,12 @@ class SDPANode : public NodeCRTP<SDPANode> {
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "For cuDNN version below 9.0.0, hidden_dim shoud be less than 128 and hidden_dim should be multiple of 8");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90200 && attributes.sliding_window_length.has_value(),
+        // sm_arch_ >= 90 FIXME
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() >= 90000 && ((d_qk > 256) || (d_qk % 8 != 0) || (d_v > 256) || (d_v % 8 != 0)),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "For cuDNN version above 9.0.0, hidden_dim shoud be less than 256 and hidden_dim should be multiple of 8");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90200 && attributes.left_bound.has_value(),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "For cuDNN version below 9.2.0, sliding window attention is not supported");
         
@@ -348,6 +396,13 @@ class SDPANode : public NodeCRTP<SDPANode> {
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "For cuDNN version below 9.5.0, paged caches are not supported");
 
+        if (is_ragged) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF((context.get_sm_version() > 0  && context.get_sm_version() < 90), error_code_t::GRAPH_NOT_SUPPORTED, "THD (ragged offset) is only supported in Hopper and above");
+        }
+        // TODO add version check once fixed
+        RETURN_CUDNN_FRONTEND_ERROR_IF(prop.major == 10 && is_rng,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "dropout RNG dump is not supported for Blackwell architecture");
 
         // validate that datatype is set for the graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_intermediate_data_type() == DataType_t::NOT_SET,
@@ -532,28 +587,8 @@ class SDPANode : public NodeCRTP<SDPANode> {
             last_output = padding_mask_output;
         }
 
-        if (attributes.causal_mask || attributes.causal_mask_bottom_right) {
-            auto graph_                  = std::make_shared<Graph>();
-            std::shared_ptr<INode> node_ = std::static_pointer_cast<INode>(graph_);
-            node_->context               = context;
-            if (attributes.causal_mask_bottom_right) {
-                std::shared_ptr<Tensor_attributes> s_kv_tensor = attributes.inputs[input_names::SEQ_LEN_KV];
-                std::shared_ptr<Tensor_attributes> s_q_tensor  = attributes.inputs[input_names::SEQ_LEN_Q];
-                if (s_kv_tensor == nullptr) {
-                    s_kv_tensor = std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv));
-                }
-                if (s_q_tensor == nullptr) {
-                    s_q_tensor = std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q));
-                }
-                last_output =
-                    attn::score_modifiers::causal_mask_bottom_right(graph_, last_output, s_kv_tensor, s_q_tensor);
-            } else {
-                last_output = attn::score_modifiers::causal_mask(graph_, last_output);
-            }
-            sub_nodes.emplace_back(node_);
-        }
-
-        if (attributes.sliding_window_length.has_value()) {
+        // Apply (bottom-right) causal masking (with right bound) and/or set the left bound
+        if (attributes.left_bound.has_value() || attributes.right_bound.has_value()) {
             auto graph_                  = std::make_shared<Graph>();
             std::shared_ptr<INode> node_ = std::static_pointer_cast<INode>(graph_);
             node_->context               = context;
@@ -567,13 +602,13 @@ class SDPANode : public NodeCRTP<SDPANode> {
 
             last_output = attn::score_modifiers::sliding_window_mask(graph_,
                                                                      last_output,
-                                                                     attributes.causal_mask_bottom_right,
-                                                                     attributes.sliding_window_length.value(),
-                                                                     0,
-                                                                     s_kv,
+                                                                     attributes.diagonal_alignment,
+                                                                     attributes.left_bound,
+                                                                     attributes.right_bound,
                                                                      s_q,
-                                                                     s_kv_ptr,
-                                                                     s_q_ptr);
+                                                                     s_kv,
+                                                                     s_q_ptr,
+                                                                     s_kv_ptr);
             sub_nodes.emplace_back(node_);
         }
 
@@ -845,6 +880,9 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
         bool const is_dropout_custom = (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
         bool const is_dropout        = attributes.dropout_probability.has_value() || is_dropout_custom;
 
+        auto const& rng_tensor = attributes.outputs.find(output_names::RNG_DUMP);
+        bool const is_rng   = (rng_tensor != attributes.outputs.end() && rng_tensor->second != nullptr);
+
         // validation TODO:
         //    - validate stats has valid dims
         //    - validate Q and dQ have the same dims
@@ -867,8 +905,8 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
         }
 
         RETURN_CUDNN_FRONTEND_ERROR_IF((attributes.attention_score_modifier != nullptr) &&
-                    (attributes.alibi_mask || attributes.causal_mask || attributes.padding_mask || attributes.causal_mask_bottom_right ||
-                     attributes.sliding_window_length.has_value()), error_code_t::GRAPH_NOT_SUPPORTED,"Attention score mod enabled and hence other subgraphs are disabled.");
+                    (attributes.alibi_mask || attributes.padding_mask || attributes.has_causal_like_masking() ||
+                     attributes.left_bound.has_value()), error_code_t::GRAPH_NOT_SUPPORTED,"Attention score mod enabled and hence other subgraphs are disabled.");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF((h_q % h_k != 0) || (h_q % h_v != 0),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -880,6 +918,11 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(has_attn_scale && attributes.attn_scale_value.has_value(),
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "attn_scale with tensor and value cannot be set at the same time.");
+
+        // validate alibi requirements
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.alibi_mask && !(attributes.right_bound.has_value() && attributes.right_bound.value() == 0),
+                        error_code_t::GRAPH_NOT_SUPPORTED,
+                        "When alibi mask is used, diagonal_band_right_bound needs to be set to 0.");
 
         // validate options for bias mask
         RETURN_CUDNN_FRONTEND_ERROR_IF(is_bias && (bias_mask->second->get_data_type() == DataType_t::BOOLEAN),
@@ -904,34 +947,34 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                                        "max_total_seq_len_q is only supported with packed layout");
 
         // validate options for bottom right causal mask
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask && attributes.causal_mask_bottom_right,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Bottom right causal mask and causal mask cannot be both enabled");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && s_q > s_kv,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && s_q > s_kv,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "Bottom right causal mask does not support s_q > s_kv. Please virtually slice the Q tensor and pass it as s_q == s_kv");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && (is_bias || attributes.alibi_mask || (is_ragged && !attributes.padding_mask) || is_dropout),
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (is_bias || attributes.alibi_mask || (is_ragged && !attributes.padding_mask) || is_dropout),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "Bottom right causal mask is only supported with is_bias=False, is_alibi=False, is_dropout=False. Further is_ragged==True is only allowed when padding_mask=True.");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && ((s_q % 64 != 0) || (s_kv % 64 != 0)),
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (detail::get_backend_version() < 90600) && ((s_q % 64 != 0) || (s_kv % 64 != 0)),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Bottom right causal mask is only supported with s_q multiple of 64, and s_kv multiple of 64");
+                                       "Bottom right causal mask is only supported with s_q multiple of 64, and s_kv multiple of 64, for cudnn version below 9.6.0");
 
         // validate options for sliding window length
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && attributes.sliding_window_length.value() < 0,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && attributes.left_bound.value() <= 0,
                                        error_code_t::INVALID_VALUE,
-                                       "Sliding window length should be greater than or equals to zero when set.");
+                                       "Left bound (Sliding window length) should be greater than or equals to zero when set.");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && s_q > s_kv,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && s_q > s_kv,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "Sliding window attention is only supported with s_q <= s_kv.");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.sliding_window_length.has_value() && (! (attributes.causal_mask || attributes.causal_mask_bottom_right) || is_dropout || is_bias || (is_ragged && !attributes.padding_mask)),
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value()&& (! attributes.has_causal_like_masking() || is_dropout || is_bias || (is_ragged && !attributes.padding_mask)),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Sliding window attention is only supported with causal_mask=True, is_dropout=False, is_bias=False, is_ragged=False. Further is_ragged==True is only allowed when padding_mask=True.");
+                                       "Left and right bounds are only supported with is_dropout=False, is_bias=False. Further is_ragged==True is only allowed when padding_mask=True. Lastly the diagonal alignment must be set.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.right_bound.has_value() && attributes.right_bound.value() < 0,
+                                       error_code_t::INVALID_VALUE,
+                                       "Right bound needs to be larger than or equal to zero");
 
         // validate options for dropout mask
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.dropout_probability.has_value() && is_dropout_custom,
@@ -959,7 +1002,7 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                                        error_code_t::GRAPH_NOT_SUPPORTED,
             "                          Sequence length must be greater than or equal to 64 for cudnn version prior to v9.0.0");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90200 && attributes.sliding_window_length.has_value(),
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90200 && attributes.left_bound.has_value(),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "For cuDNN version below 9.2.0, sliding window attention is not supported");
 
@@ -974,6 +1017,16 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90600 && is_ragged && ((h_q != h_k) || (h_q != h_v)),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "For cuDNN version below 9.6.0, group-query attention with raggged offset is not supported");
+
+        // TODO add version check once fixed
+        RETURN_CUDNN_FRONTEND_ERROR_IF(prop.major == 10 && is_rng,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Dropout RNG dump is not supported for SM Major version 10");
+
+        // TODO add version check once fixed
+        RETURN_CUDNN_FRONTEND_ERROR_IF(prop.major == 10 && is_ragged && (is_dbias || attributes.is_deterministic_algorithm),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Deterministic kernel or dbias with ragged is not supported for SM Major version 10");
 
         // validate that datatype is set for the graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_intermediate_data_type() == DataType_t::NOT_SET,
@@ -1255,27 +1308,6 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
             sub_nodes.emplace_back(node_);
         }
 
-        if (attributes.causal_mask || attributes.causal_mask_bottom_right) {
-            auto graph_                  = std::make_shared<Graph>();
-            std::shared_ptr<INode> node_ = std::static_pointer_cast<INode>(graph_);
-            node_->context               = context;
-            if (attributes.causal_mask_bottom_right) {
-                std::shared_ptr<Tensor_attributes> s_kv_tensor = attributes.inputs[input_names::SEQ_LEN_KV];
-                std::shared_ptr<Tensor_attributes> s_q_tensor  = attributes.inputs[input_names::SEQ_LEN_Q];
-                if (s_kv_tensor == nullptr) {
-                    s_kv_tensor = std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv));
-                }
-                if (s_q_tensor == nullptr) {
-                    s_q_tensor = std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q));
-                }
-                last_output =
-                    attn::score_modifiers::causal_mask_bottom_right(graph_, last_output, s_kv_tensor, s_q_tensor);
-            } else {
-                last_output = attn::score_modifiers::causal_mask(graph_, last_output);
-            }
-            sub_nodes.emplace_back(node_);
-        }
-
         // last_output = last_output - stats
         last_output = pointwise(last_output,
                                 attributes.inputs[input_names::Stats],
@@ -1331,7 +1363,8 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                 Pointwise_attributes().set_name("select_2nd_padding").set_mode(PointwiseMode_t::BINARY_SELECT));
         }
 
-        if (attributes.sliding_window_length.has_value()) {
+        // Apply (bottom-right) causal masking (with right bound) and/or set the left bound
+        if (attributes.left_bound.has_value() || attributes.right_bound.has_value()) {
             auto graph_                  = std::make_shared<Graph>();
             std::shared_ptr<INode> node_ = std::static_pointer_cast<INode>(graph_);
             node_->context               = context;
@@ -1345,14 +1378,14 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
 
             last_output = attn::score_modifiers::sliding_window_mask(graph_,
                                                                      last_output,
-                                                                     attributes.causal_mask_bottom_right,
-                                                                     attributes.sliding_window_length.value(),
-                                                                     0,
-                                                                     s_kv,
+                                                                     attributes.diagonal_alignment,
+                                                                     attributes.left_bound,
+                                                                     attributes.right_bound,
                                                                      s_q,
-                                                                     s_kv_ptr,
-                                                                     s_q_ptr);
-            sub_nodes.emplace_back(node_);
+                                                                     s_kv,
+                                                                     s_q_ptr,
+                                                                     s_kv_ptr);
+            sub_nodes.emplace_back(std::move(node_));
         }
 
         // last_output = exp(last_output)

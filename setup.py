@@ -28,9 +28,16 @@ class CMakeBuild(build_ext):
         debug = int(os.environ.get("DEBUG", 0)) if self.debug is None else self.debug
         cfg = "Debug" if debug else "Release"
 
+        is_windows = os.name == "nt"
         # Set Python_EXECUTABLE instead if you use PYBIND11_FINDPYTHON
+        cmake_args = []
+
+        if is_windows == False:
+            cmake_args += [
+                f"-DPython_EXECUTABLE={sys.executable}",
+            ]
+
         cmake_args = [
-            f"-DPython_EXECUTABLE={sys.executable}",
             f"-DCMAKE_BUILD_TYPE={cfg}",  # not used on MSVC, but no harm
             f"-DCUDNN_FRONTEND_BUILD_PYTHON_BINDINGS=ON",
             # There's no need to build cpp samples and tests with python
@@ -39,9 +46,16 @@ class CMakeBuild(build_ext):
             # All these are handled by pip
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}{os.sep}",
             f"-DCUDNN_FRONTEND_KEEP_PYBINDS_IN_BINARY_DIR=OFF",
-            f"-DCUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE=OFF",
         ]
 
+        if is_windows:
+            cmake_args += [
+                f"-DCUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE=ON",
+            ]
+        else:
+            cmake_args += [
+                f"-DCUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE=OFF",
+            ]
         if "CUDA_PATH" in os.environ:
             cmake_args.append(f"-DCUDAToolkit_ROOT={os.environ['CUDA_PATH']}")
 
@@ -56,18 +70,21 @@ class CMakeBuild(build_ext):
         # exported for Ninja to pick it up, which is a little tricky to do.
         # Users can override the generator with CMAKE_GENERATOR in CMake
         # 3.15+.
-        try:
-            import ninja
+        if is_windows == False:
+            try:
+                import ninja
 
-            ninja_executable_path = Path(ninja.BIN_DIR) / "ninja"
-            cmake_args += [
-                "-GNinja",
-                f"-DCMAKE_MAKE_PROGRAM:FILEPATH={ninja_executable_path}",
-            ]
-        except ImportError:
-            pass
+                ninja_executable_path = Path(ninja.BIN_DIR) / "ninja"
+                cmake_args += [
+                    "-GNinja",
+                    f"-DCMAKE_MAKE_PROGRAM:FILEPATH={ninja_executable_path}",
+                ]
+            except ImportError:
+                pass
 
         build_args = []
+        if is_windows:
+            build_args += [f"--config Release"]
         # Set CMAKE_BUILD_PARALLEL_LEVEL to control the parallel build level
         # across all generators.
         if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ:
@@ -81,6 +98,7 @@ class CMakeBuild(build_ext):
         if not build_temp.exists():
             build_temp.mkdir(parents=True)
 
+        print(" ".join(cmake_args))
         subprocess.run(
             ["cmake", ext.sourcedir, *cmake_args], cwd=build_temp, check=True
         )

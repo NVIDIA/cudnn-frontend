@@ -223,8 +223,3 @@ def test_silu_and_mul_and_quantization(cudnn_handle):
 
     # Compare
     torch.cuda.synchronize()
-
-
-if __name__ == "__main__":
-    test_silu_and_mul_and_quantization()
-    test_gemm_silu_and_mul()

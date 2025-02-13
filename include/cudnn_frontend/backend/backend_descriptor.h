@@ -37,7 +37,8 @@ class backend_descriptor {
      * @param other The source `backend_descriptor` object.
      */
     backend_descriptor(backend_descriptor&& other) noexcept : desc(other.desc), status(other.status) {
-        other.desc = nullptr;
+        other.desc   = nullptr;
+        other.status = CUDNN_STATUS_NOT_INITIALIZED;
     }
 
     /**
@@ -122,17 +123,16 @@ class backend_descriptor {
         return status;
     }
 
-   protected:
     /**
      * @brief Constructs a default `backend_descriptor` object, but without initializing descriptor
      *
      * Used to return an error code to user for incorrect cuDNN version
      */
-    backend_descriptor() {}
+    backend_descriptor() = default;
 
    private:
-    cudnnBackendDescriptor_t desc = nullptr;               //!< Raw pointer to the backend descriptor.
-    cudnnStatus_t status          = CUDNN_STATUS_SUCCESS;  //!< Status of the descriptor creation operation.
+    cudnnBackendDescriptor_t desc = nullptr;                       //!< Raw pointer to the backend descriptor.
+    cudnnStatus_t status          = CUDNN_STATUS_NOT_INITIALIZED;  //!< Status of the descriptor creation operation.
 };
 
 }  // namespace cudnn_frontend::detail

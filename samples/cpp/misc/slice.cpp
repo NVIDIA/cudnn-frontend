@@ -67,8 +67,9 @@ TEST_CASE("Slice gemm", "[slice][gemm][graph][fusion]") {
         graph.pointwise(C0, fe::graph::Pointwise_attributes().set_name("relu").set_mode(fe::PointwiseMode_t::RELU_FWD));
     C->set_output(true).set_uid(c_uid);
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     REQUIRE(graph.build(handle, {fe::HeurMode_t::A}).is_good());
 
@@ -91,6 +92,4 @@ TEST_CASE("Slice gemm", "[slice][gemm][graph][fusion]") {
         std::cerr << result.get_message();
         REQUIRE(false);
     }
-
-    CUDNN_CHECK(cudnnDestroy(handle));
 }

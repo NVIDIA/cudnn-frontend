@@ -28,7 +28,7 @@
 
 namespace fe = cudnn_frontend;
 
-TEST_CASE("sdpa_fp8_bprop", "[graph][sdpa][fp8][backward]") {
+TEST_CASE("sdpa_fp8_bprop_brcm", "[graph][sdpa][fp8][backward][brcm]") {
     namespace fe = cudnn_frontend;
 
 #if CUDART_VERSION < 12000
@@ -100,7 +100,7 @@ TEST_CASE("sdpa_fp8_bprop", "[graph][sdpa][fp8][backward]") {
     // options/attributes
     auto sdpa_fp8_backwards_options = fe::graph::SDPA_fp8_backward_attributes()
                                           .set_name("sdpa_fp8_backward")
-                                          .set_causal_mask(true)
+                                          .set_causal_mask_bottom_right(true)
                                           .set_attn_scale(attn_scale);
 
     // output
@@ -135,8 +135,9 @@ TEST_CASE("sdpa_fp8_bprop", "[graph][sdpa][fp8][backward]") {
     // Create a unique_ptr for the cuDNN handle
     auto handle_ptr = create_cudnn_handle();
     auto handle     = *handle_ptr;
-    auto status     = mha_graph.validate();
-    if ((cudnnGetVersion() >= 90100) && check_device_arch_newer_than("hopper")) {
+
+    auto status = mha_graph.validate();
+    if ((cudnnGetVersion() >= 90700) && check_device_arch_newer_than("blackwell")) {
         REQUIRE(status.is_good());
     } else {
         REQUIRE(status.get_code() == fe::error_code_t::GRAPH_NOT_SUPPORTED);
@@ -213,175 +214,7 @@ TEST_CASE("sdpa_fp8_bprop", "[graph][sdpa][fp8][backward]") {
         {Amax_dV, AMax_dV_Tensor.devPtr},
         {Amax_dP, AMax_dP_Tensor.devPtr}};
 
-    int64_t workspace_size = 0;
-    REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
-
-    REQUIRE(mha_graph.execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-TEST_CASE("sdpa_fp8_gqa_bprop", "[graph][sdpa][fp8][backward]") {
-    namespace fe = cudnn_frontend;
-
-#if CUDART_VERSION < 12000
-    SKIP("Test requires cuda toolkit 12.0 or above");
-    return;
-#endif
-
-    int64_t b    = 2;    // batch size
-    int64_t h_qo = 12;   // query/output head dim
-    int64_t h_kv = 4;    // key/value head dim
-    int64_t s    = 512;  // q,k,v tensor is padded to this seq length
-    int64_t d    = 128;  // hidden dim
-
-    // construct graph
-    std::vector<int64_t> qo_dim    = {b, h_qo, s, d};
-    std::vector<int64_t> kv_dim    = {b, h_kv, s, d};
-    std::vector<int64_t> qo_stride = {s * h_qo * d, d, h_qo * d, 1};  // bshd
-    std::vector<int64_t> kv_stride = {s * h_kv * d, d, h_kv * d, 1};  // bshd
-
-    std::vector<int64_t> stats_dim    = {b, h_qo, s, 1};
-    std::vector<int64_t> stats_stride = {h_qo * s, s, 1, 1};
-
-    fe::graph::Graph mha_graph;
-    mha_graph.set_io_data_type(fe::DataType_t::FP8_E4M3)
-        .set_intermediate_data_type(fe::DataType_t::FLOAT)
-        .set_compute_data_type(fe::DataType_t::FLOAT);
-
-    auto q     = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("Q").set_dim(qo_dim).set_stride(qo_stride));
-    auto k     = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("K").set_dim(kv_dim).set_stride(kv_stride));
-    auto v     = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("V").set_dim(kv_dim).set_stride(kv_stride));
-    auto o     = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("O").set_dim(qo_dim).set_stride(qo_stride));
-    auto dO    = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("dO").set_dim(qo_dim).set_stride(qo_stride));
-    auto stats = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                      .set_name("Stats")
-                                      .set_dim(stats_dim)
-                                      .set_stride(stats_stride)
-                                      .set_data_type(fe::DataType_t::FLOAT));
-
-    float attn_scale = 0.125f;
-
-    auto descale_q  = mha_graph.tensor(fe::graph::Tensor_attributes()
-                                          .set_name("Descale_Q")
-                                          .set_dim({1, 1, 1, 1})
-                                          .set_stride({1, 1, 1, 1})
-                                          .set_data_type(fe::DataType_t::FLOAT));
-    auto descale_k  = mha_graph.tensor_like(descale_q, "Descale_K");
-    auto descale_v  = mha_graph.tensor_like(descale_q, "Descale_V");
-    auto descale_s  = mha_graph.tensor_like(descale_q, "Descale_S");
-    auto descale_o  = mha_graph.tensor_like(descale_q, "Descale_O");
-    auto descale_dO = mha_graph.tensor_like(descale_q, "Descale_dO");
-    auto descale_dP = mha_graph.tensor_like(descale_q, "Descale_dP");
-
-    auto scale_s  = mha_graph.tensor_like(descale_q, "Scale_S");
-    auto scale_dP = mha_graph.tensor_like(descale_q, "Scale_dP");
-    auto scale_dQ = mha_graph.tensor_like(descale_q, "Scale_dQ");
-    auto scale_dK = mha_graph.tensor_like(descale_q, "Scale_dK");
-    auto scale_dV = mha_graph.tensor_like(descale_q, "Scale_dV");
-
-    // clang-format off
-    auto [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP] = mha_graph.sdpa_fp8_backward(
-        q, k, v, o, dO, stats,
-        descale_q, descale_k, descale_v, descale_o, descale_dO, descale_s, descale_dP,
-        scale_s, scale_dQ, scale_dK, scale_dV, scale_dP,
-        fe::graph::SDPA_fp8_backward_attributes().set_name("sdpa_fp8_backward")
-                                                 .set_causal_mask(true)
-                                                 .set_attn_scale(attn_scale)
-    );
-    // clang-format on
-
-    dQ->set_output(true).set_dim(qo_dim).set_stride(qo_stride);
-    dK->set_output(true).set_dim(kv_dim).set_stride(kv_stride);
-    dV->set_output(true).set_dim(kv_dim).set_stride(kv_stride);
-    amax_dQ->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-    amax_dK->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-    amax_dV->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-    amax_dP->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-
-    // Create a unique_ptr for the cuDNN handle
-    auto handle_ptr = create_cudnn_handle();
-    auto handle     = *handle_ptr;
-    auto status     = mha_graph.validate();
-    if ((cudnnGetVersion() >= 90100) && check_device_arch_newer_than("hopper")) {
-        REQUIRE(status.is_good());
-    } else {
-        REQUIRE(status.get_code() == fe::error_code_t::GRAPH_NOT_SUPPORTED);
-        return;
-    }
-
-    REQUIRE(mha_graph.build_operation_graph(handle).is_good());
-    REQUIRE(mha_graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
-    REQUIRE(mha_graph.check_support(handle).is_good());
-    REQUIRE(mha_graph.build_plans(handle).is_good());
-
-    // Surfaces that alllocate GPU memory
-    Surface<int8_t> q_gpu(b * s * h_qo * d, false);
-    Surface<int8_t> k_gpu(b * s * h_kv * d, false);
-    Surface<int8_t> v_gpu(b * s * h_kv * d, false);
-    Surface<int8_t> o_gpu(b * s * h_qo * d, false);
-
-    Surface<float> stats_gpu(b * h_qo * s * 1, false);
-
-    Surface<int8_t> dQ_gpu(b * s * h_qo * d, false);
-    Surface<int8_t> dK_gpu(b * s * h_kv * d, false);
-    Surface<int8_t> dV_gpu(b * s * h_kv * d, false);
-    Surface<int8_t> dO_gpu(b * s * h_qo * d, false);
-
-    Surface<float> descale_q_gpu(1, false);
-    Surface<float> descale_k_gpu(1, false);
-    Surface<float> descale_v_gpu(1, false);
-    Surface<float> descale_o_gpu(1, false);
-    Surface<float> descale_s_gpu(1, false);
-    Surface<float> descale_dP_gpu(1, false);
-    Surface<float> descale_dO_gpu(1, false);
-
-    Surface<float> scale_s_gpu(1, false);
-    Surface<float> scale_dQ_gpu(1, false);
-    Surface<float> scale_dK_gpu(1, false);
-    Surface<float> scale_dV_gpu(1, false);
-    Surface<float> scale_dP_gpu(1, false);
-
-    Surface<float> amax_dQ_gpu(1, false);
-    Surface<float> amax_dK_gpu(1, false);
-    Surface<float> amax_dV_gpu(1, false);
-    Surface<float> amax_dP_gpu(1, false);
-
-    // Variant pack
-    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack{
-        {q, q_gpu.devPtr},
-        {k, k_gpu.devPtr},
-        {v, v_gpu.devPtr},
-        {o, o_gpu.devPtr},
-
-        {dQ, dQ_gpu.devPtr},
-        {dK, dK_gpu.devPtr},
-        {dV, dV_gpu.devPtr},
-        {dO, dO_gpu.devPtr},
-
-        {stats, stats_gpu.devPtr},
-
-        {descale_q, descale_q_gpu.devPtr},
-        {descale_k, descale_k_gpu.devPtr},
-        {descale_v, descale_v_gpu.devPtr},
-        {descale_o, descale_o_gpu.devPtr},
-        {descale_s, descale_s_gpu.devPtr},
-        {descale_dP, descale_dP_gpu.devPtr},
-        {descale_dO, descale_dO_gpu.devPtr},
-
-        {scale_s, scale_s_gpu.devPtr},
-        {scale_dQ, scale_dQ_gpu.devPtr},
-        {scale_dK, scale_dK_gpu.devPtr},
-        {scale_dV, scale_dV_gpu.devPtr},
-        {scale_dP, scale_dP_gpu.devPtr},
-
-        {amax_dQ, amax_dQ_gpu.devPtr},
-        {amax_dK, amax_dK_gpu.devPtr},
-        {amax_dV, amax_dV_gpu.devPtr},
-        {amax_dP, amax_dP_gpu.devPtr}};
-
-    int64_t workspace_size = 0;
+    int64_t workspace_size;
     REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

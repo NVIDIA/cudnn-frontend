@@ -31,7 +31,6 @@ else()
     find_package(pybind11 CONFIG REQUIRED)
 endif()
 
-add_compile_options(-fvisibility=hidden)
 
 # Add a library using FindPython's tooling (pybind11 also provides a helper like
 # this)
@@ -66,6 +65,16 @@ target_link_libraries(
     
     PRIVATE dlpack
 )
+
+if(MSVC)
+    target_compile_options(_compiled_module PRIVATE /wd4127)
+    target_compile_options(_compiled_module PRIVATE /wd4244)
+    target_compile_options(_compiled_module PRIVATE /wd4458)
+    target_compile_options(_compiled_module PRIVATE /wd4505)
+    target_compile_options(_compiled_module PRIVATE /bigobj)
+else()
+    add_compile_options(-fvisibility=hidden)
+endif()
 
 set_target_properties(
     _compiled_module

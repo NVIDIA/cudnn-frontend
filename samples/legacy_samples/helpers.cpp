@@ -59,6 +59,9 @@ bool
 check_device_arch_newer_than(std::string const& arch) {
     size_t arch_major = 6;
     size_t arch_minor = 0;
+    if (arch == "blackwell") {
+        arch_major = 10;
+    }
     if (arch == "hopper") {
         arch_major = 9;
     }

@@ -728,10 +728,10 @@ run_f16_flash_attention_fprop(int64_t b,
                               void* devPtrDropoutSeed,
                               void* devPtrDropoutOffset,
                               cudnnDataType_t tensorType) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         std::vector<cudnn_frontend::Operation const*> all_ops;
         std::vector<cudnn_frontend::Operation> ops;
@@ -824,8 +824,6 @@ run_f16_flash_attention_fprop(int64_t b,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnn_frontend::cudnnException& e) {
@@ -867,10 +865,10 @@ run_f16_flash_attention_bprop(int64_t b,
                               void* devPtrDropoutSeed,
                               void* devPtrDropoutOffset,
                               cudnnDataType_t tensorType) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         std::vector<cudnn_frontend::Operation const*> all_ops;
         std::vector<cudnn_frontend::Operation> ops;
@@ -1281,8 +1279,6 @@ run_f16_flash_attention_bprop(int64_t b,
         if (workspace_size > 0) {
             checkCudaErr(cudaFree(workspace_ptr));
         }
-
-        checkCudnnErr(cudnnDestroy(handle_));
 
         cudnn_frontend::throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 

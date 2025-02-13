@@ -40,10 +40,10 @@ run_fp8_conv_scale(int64_t* x_dim,
                    void* devPtrW,
                    void* devPtrY,
                    void* devPtrScale) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         if (check_device_arch_newer_than("hopper") == false) {
             cudnn_frontend::set_error_and_throw_exception(
                 nullptr, CUDNN_STATUS_ARCH_MISMATCH, "run_fp8_conv_scale: Sample requires Ampere or above GPU");
@@ -161,8 +161,6 @@ run_fp8_conv_scale(int64_t* x_dim,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnnException& e) {
@@ -198,10 +196,10 @@ run_fp8_conv_descale_descale_amax_scale(int64_t* x_dim,
                                         void* devPtrDescale1,
                                         void* devPtrDescale2,
                                         void* devPtrScale) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         if (check_device_arch_newer_than("hopper") == false) {
             cudnn_frontend::set_error_and_throw_exception(
                 nullptr,
@@ -369,8 +367,6 @@ run_fp8_conv_descale_descale_amax_scale(int64_t* x_dim,
             checkCudaErr(cudaFree(workspace_ptr));
         }
 
-        checkCudnnErr(cudnnDestroy(handle_));
-
         throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
     } catch (cudnnException& e) {
@@ -398,10 +394,10 @@ run_tranpose_scale_convert_fp16_fp8_amax(int64_t* x_dim,
                                          void* devPtrR,
                                          void* devPtrOutput,
                                          void* devPtrScale) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         if (check_device_arch_newer_than("hopper") == false) {
             cudnn_frontend::set_error_and_throw_exception(
                 nullptr,
@@ -531,7 +527,6 @@ run_tranpose_scale_convert_fp16_fp8_amax(int64_t* x_dim,
         }
 
         checkCudaErr(cudaDeviceSynchronize());
-        checkCudnnErr(cudnnDestroy(handle_));
 
         throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 
@@ -567,10 +562,10 @@ run_fp8_dgrad_descale_descale_amax_scale(int64_t* dx_dim,
                                          void* devPtrDescale1,
                                          void* devPtrDescale2,
                                          void* devPtrScale) {
-    cudnnHandle_t handle_;
     try {
-        // Create cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
         if (check_device_arch_newer_than("hopper") == false) {
             cudnn_frontend::set_error_and_throw_exception(
                 nullptr,
@@ -737,8 +732,6 @@ run_fp8_dgrad_descale_descale_amax_scale(int64_t* dx_dim,
         if (workspace_size > 0) {
             checkCudaErr(cudaFree(workspace_ptr));
         }
-
-        checkCudnnErr(cudnnDestroy(handle_));
 
         throw_if([status]() { return (status != CUDNN_STATUS_SUCCESS); }, "Plan execute error", status);
 

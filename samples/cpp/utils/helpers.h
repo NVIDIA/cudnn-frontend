@@ -30,10 +30,31 @@
         }                                                                                                       \
     }
 
+// Custom deleter for cudnnHandle_t
+struct CudnnHandleDeleter {
+    void
+    operator()(cudnnHandle_t* handle) const {
+        if (handle) {
+            CUDNN_CHECK(cudnnDestroy(*handle));
+            delete handle;
+        }
+    }
+};
+
+// Function to create a unique_ptr for cudnnHandle_t
+inline std::unique_ptr<cudnnHandle_t, CudnnHandleDeleter>
+create_cudnn_handle() {
+    auto handle = std::make_unique<cudnnHandle_t>();
+    CUDNN_CHECK(cudnnCreate(handle.get()));
+    return std::unique_ptr<cudnnHandle_t, CudnnHandleDeleter>(handle.release(), CudnnHandleDeleter());
+}
+
 inline size_t
 get_compute_capability() {
+    int current_device;
+    CUDA_CHECK(cudaGetDevice(&current_device));
     struct cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, current_device));
     return prop.major * 10 + prop.minor;
 }
 
@@ -52,7 +73,13 @@ is_ada_arch() {
 inline bool
 is_hopper_arch() {
     auto cc = get_compute_capability();
-    return (90 <= cc && cc < 100);
+    return (90 <= cc) && (cc < 100);
+}
+
+inline bool
+is_blackwell_arch() {
+    auto cc = get_compute_capability();
+    return (100 <= cc);
 }
 
 inline bool
@@ -67,6 +94,9 @@ inline bool
 check_device_arch_newer_than(std::string const& arch) {
     size_t arch_major = 6;
     size_t arch_minor = 0;
+    if (arch == "blackwell") {
+        arch_major = 10;
+    }
     if (arch == "hopper") {
         arch_major = 9;
     }
@@ -312,7 +342,7 @@ struct Surface {
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
-    Surface(const Surface& other) : n_elems(n_elems) {
+    Surface(const Surface& other) : n_elems(other.n_elems) {
         CUDA_CHECK(cudaMalloc((void**)&(devPtr), (size_t)((n_elems) * sizeof(devPtr[0]))));
         hostPtr = (T_ELEM*)calloc((size_t)n_elems, sizeof(hostPtr[0]));
         std::copy(other.hostPtr, other.hostPtr + n_elems, hostPtr);

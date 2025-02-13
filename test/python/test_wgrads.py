@@ -122,7 +122,3 @@ def test_scale_bias_relu_wgrad(cudnn_handle):
 
     except cudnn.cudnnGraphNotSupportedError as ex:
         print(ex)
-
-
-if __name__ == "__main__":
-    test_scale_bias_relu_wgrad()

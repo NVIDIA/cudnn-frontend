@@ -171,8 +171,7 @@ create_cudnn_execution_plan(std::shared_ptr<ExecutionPlan>& plan,
 namespace graph {
 class Execution_plan_list {
     std::string operation_tag;
-    std::vector<std::vector<cudnnBackendNumericalNote_t>> numeric_notes;
-    std::vector<std::vector<cudnnBackendNumericalNote_t>> behavior_notes;
+
     std::vector<bool> barred_indices;
     std::shared_ptr<KernelCache> kernel_cache;
 
@@ -222,6 +221,9 @@ class Execution_plan_list {
     }
 
    public:
+    std::vector<std::vector<NumericalNote_t>> numeric_notes;
+    std::vector<std::vector<BehaviorNote_t>> behavior_notes;
+
     std::vector<std::shared_ptr<ExecutionPlan>>
         execution_plans;  // a built plan corresponding to each engine config, irrespective of whether config is
                           // selected or deselected.
@@ -234,8 +236,8 @@ class Execution_plan_list {
         operation_tag = tag;
     }
     void
-    set_engine_configs(EngineConfigList list) {
-        engine_configs = list;
+    enqueue_engine_configs(EngineConfigList list) {
+        std::move(list.begin(), list.end(), back_inserter(engine_configs));
     }
     void
     set_kernel_cache(std::shared_ptr<KernelCache> kernel_cache_) {
@@ -257,8 +259,8 @@ class Execution_plan_list {
 
         for (auto& engine_config : engine_configs) {
             int64_t elem_count = 0;
-            std::vector<cudnnBackendNumericalNote_t> numerics;
-            std::vector<cudnnBackendNumericalNote_t> behavior;
+            std::vector<cudnnBackendNumericalNote_t> numeric;
+            std::vector<cudnnBackendBehaviorNote_t> behavior;
 
             ManagedOpaqueDescriptor extractedEngine   = make_shared_backend_pointer(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
             cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
@@ -282,13 +284,13 @@ class Execution_plan_list {
                                            error_code_t::HEURISTIC_QUERY_FAILED,
                                            "Heuristic query Numerical Note failed");
 
-            numerics.resize(static_cast<size_t>(elem_count));
+            numeric.resize(static_cast<size_t>(elem_count));
             status = detail::get_attribute(extractedEngine_,
                                            CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
                                            CUDNN_TYPE_NUMERICAL_NOTE,
                                            CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
                                            &elem_count,
-                                           numerics.data());
+                                           numeric.data());
             RETURN_CUDNN_FRONTEND_ERROR_IF((status != CUDNN_STATUS_SUCCESS),
                                            error_code_t::HEURISTIC_QUERY_FAILED,
                                            "Heuristic query Numerical Note failed");
@@ -312,8 +314,20 @@ class Execution_plan_list {
             RETURN_CUDNN_FRONTEND_ERROR_IF((status != CUDNN_STATUS_SUCCESS),
                                            error_code_t::HEURISTIC_QUERY_FAILED,
                                            "Heuristic query Behavior Note failed");
-            numeric_notes.emplace_back(numerics);
-            behavior_notes.emplace_back(behavior);
+
+            std::vector<NumericalNote_t> numerics;
+            numerics.resize(numeric.size());
+            for (auto& note : numeric) {
+                numerics.push_back(detail::convert_from_cudnn_type(note));
+            }
+            numeric_notes.emplace_back(std::move(numerics));
+
+            std::vector<BehaviorNote_t> behaviors;
+            behaviors.reserve(behaviors.size());
+            for (auto& note : behavior) {
+                behaviors.push_back(detail::convert_from_cudnn_type(note));
+            }
+            behavior_notes.emplace_back(std::move(behaviors));
         }
         return {error_code_t::OK, ""};
     }
@@ -321,15 +335,11 @@ class Execution_plan_list {
     error_t
     filter_numeric_notes(std::vector<NumericalNote_t> const& notes, bool const keep) {
         for (auto& note : notes) {
-            // Uses a dummy initializaiton to satisfy the compiler.
-            cudnnBackendNumericalNote_t backend_note = CUDNN_NUMERICAL_NOTE_TENSOR_CORE;
-
-            auto valid_note = (detail::convert_to_cudnn_type(note, backend_note) == CUDNN_STATUS_SUCCESS);
             for (auto i = 0u; i < engine_configs.size(); i++) {
                 bool has_barred_note =
-                    std::find(numeric_notes[i].begin(), numeric_notes[i].end(), backend_note) != numeric_notes[i].end();
+                    std::find(numeric_notes[i].begin(), numeric_notes[i].end(), note) != numeric_notes[i].end();
 
-                barred_indices[i] = barred_indices[i] || (has_barred_note && valid_note ? !keep : keep);
+                barred_indices[i] = barred_indices[i] || (has_barred_note ? !keep : keep);
             }
         }
         return {error_code_t::OK, ""};
@@ -338,16 +348,11 @@ class Execution_plan_list {
     error_t
     filter_behavior_notes(std::vector<BehaviorNote_t> const& notes, bool const keep) {
         for (auto& note : notes) {
-            // Uses a dummy initializaiton to satisfy the compiler.
-            cudnnBackendBehaviorNote_t backend_note = CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION;
-
-            auto valid_note = (detail::convert_to_cudnn_type(note, backend_note) == CUDNN_STATUS_SUCCESS);
-
             for (auto i = 0u; i < engine_configs.size(); i++) {
-                bool has_barred_note = std::find(behavior_notes[i].begin(), behavior_notes[i].end(), backend_note) !=
-                                       behavior_notes[i].end();
+                bool has_barred_note =
+                    std::find(behavior_notes[i].begin(), behavior_notes[i].end(), note) != behavior_notes[i].end();
 
-                barred_indices[i] = barred_indices[i] || (has_barred_note && valid_note ? !keep : keep);
+                barred_indices[i] = barred_indices[i] || (has_barred_note ? !keep : keep);
             }
         }
         return {error_code_t::OK, ""};
@@ -391,6 +396,10 @@ class Execution_plan_list {
     check_support_at_index(cudnnHandle_t handle, int64_t index) {
         // Ignore if the engine config was deselected.
         // This usually happens when user deselects by numerical and behavioural notes.
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF((index < 0) || (static_cast<int64_t>(barred_indices.size()) <= index),
+                                       error_code_t::GRAPH_EXECUTION_FAILED,
+                                       "Plan index " + std::to_string(index) + " is invalid.");
 
         if (barred_indices[index] == true) {
             CUDNN_FE_LOG_LABEL_ENDL("Deselecting execution plan at position " << index);
@@ -465,6 +474,17 @@ class Execution_plan_list {
         CUDNN_FE_LOG_LABEL_ENDL("ERROR: No valid engine configs returned from heuristics.\n" << err_msg);
         return {error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
                 "[cudnn_frontend] Error: No execution plans support the graph." + err_msg};
+    }
+
+    error_t
+    get_behavior_notes_at_index(int64_t const index, std::vector<BehaviorNote_t>& notes) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF((index < 0) || (static_cast<int64_t>(behavior_notes.size()) <= index),
+                                       error_code_t::GRAPH_EXECUTION_FAILED,
+                                       "Plan index " + std::to_string(index) + " is invalid.");
+
+        notes = behavior_notes[index];
+
+        return {error_code_t::OK, ""};
     }
 
     error_t

@@ -49,6 +49,7 @@ class PyGraph {
             cudnn_frontend::DataType_t compute_data_type,
             std::optional<std::intptr_t> handle_,
             py::object sm_count,
+            py::object sm_version,
             std::shared_ptr<KernelCache> kernel_cache) {
         graph.set_compute_data_type(compute_data_type)
             .set_intermediate_data_type(intermediate_data_type)
@@ -63,6 +64,10 @@ class PyGraph {
 
         if (sm_count.is(py::none()) == false) {
             graph.set_sm_count(sm_count.cast<int32_t>());
+        }
+
+        if (sm_version.is(py::none()) == false) {
+            graph.set_sm_version(sm_version.cast<int32_t>());
         }
 
         if (kernel_cache) {
@@ -289,6 +294,9 @@ class PyGraph {
          bool const use_causal_mask,
          bool const use_causal_mask_bottom_right,
          py::object const& sliding_window_length,
+         cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
+         py::object const& left_bound,
+         py::object const& right_bound,
          py::object const& dropout,
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_k_table,
@@ -317,6 +325,9 @@ class PyGraph {
                   bool const use_causal_mask,
                   bool const use_causal_mask_bottom_right,
                   py::object const& sliding_window_length,
+                  cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
+                  py::object const& left_bound,
+                  py::object const& right_bound,
                   py::object const& dropout,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
                   bool const use_deterministic_algorithm,
@@ -340,6 +351,7 @@ class PyGraph {
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
              bool const use_causal_mask,
+             bool const use_causal_mask_bottom_right,
              py::object const& dropout,
              cudnn_frontend::DataType_t const& compute_data_type,
              std::string const& name);
@@ -369,6 +381,7 @@ class PyGraph {
                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
                       bool const use_causal_mask,
+                      bool const use_causal_mask_bottom_right,
                       py::object const& dropout,
                       cudnn_frontend::DataType_t const& compute_data_type,
                       std::string const& name);
@@ -384,6 +397,15 @@ class PyGraph {
 
     void
     create_execution_plans(std::vector<cudnn_frontend::HeurMode_t> const&);
+
+    void
+    create_execution_plan(int64_t const engine_id, std::unordered_map<KnobType_t, int64_t> const& knobs);
+
+    int64_t
+    get_engine_count();
+
+    std::vector<Knob>
+    get_knobs_for_engine(int64_t const engine_id);
 
     void
     build_plans(BuildPlanPolicy_t const);
@@ -420,6 +442,12 @@ class PyGraph {
                           int64_t workspace,
                           int64_t index,
                           std::optional<std::intptr_t>);
+
+    std::vector<BehaviorNote_t>
+    get_behavior_notes();
+
+    std::vector<BehaviorNote_t>
+    get_behavior_notes_for_plan_at_index(int64_t const index);
 
     void
     select_numeric_notes(std::vector<NumericalNote_t> const& notes) {

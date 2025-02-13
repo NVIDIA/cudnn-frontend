@@ -118,8 +118,12 @@ create_sdpa_backward_graph(int64_t const b,
     auto sdpa_options = fe::graph::SDPA_backward_attributes()
                             .set_name("flash_attention_backward")
                             .set_alibi_mask(alibi_mask)
-                            .set_causal_mask(causal_mask)
                             .set_attn_scale(attn_scale);
+
+    if (causal_mask) {
+        sdpa_options.set_diagonal_alignment(cudnn_frontend::DiagonalAlignment_t::TOP_LEFT)
+            .set_diagonal_band_right_bound(0);
+    }
 
     // If attention bias is provided, set it
     if (has_attn_bias) {
@@ -192,13 +196,20 @@ TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
     bool alibi_mask    = (cudnnGetVersion() >= 8904);
     bool has_attn_bias = (cudnnGetVersion() >= 90500);
 
+    // switch off certain features on blackwell
+    if (is_blackwell_arch()) {
+        alibi_mask    = false;
+        has_attn_bias = false;
+    }
+
     if (cudnnGetVersion() < 8903) {
         SKIP("Test requires cudnn 8.9.3 or above");
         return;
     }
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     // Create the SDPA backward graph
     auto graph = create_sdpa_backward_graph(b,
@@ -282,6 +293,4 @@ TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    cudnnDestroy(handle);
 }

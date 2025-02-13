@@ -27,7 +27,12 @@ alibi_mask_options = [False, True]
 padding_mask_options = [False, True]
 causal_mask_options = [False, True]
 causal_mask_bottom_right_options = [False, True]
-sliding_window_mask_options = [False, True]
+diagonal_alignment_options = [
+    cudnn.diagonal_alignment.TOP_LEFT,
+    cudnn.diagonal_alignment.BOTTOM_RIGHT,
+]
+left_bound_options = [False, True]
+right_bound_options = [False, True]
 dropout_options = [False, True]
 ragged_options = [False, True]
 is_infer_options = [False, True]
@@ -57,9 +62,8 @@ def compute_ref(
     bias=None,
     is_alibi=False,
     padding=None,
-    is_causal=False,
-    is_causal_bottom_right=False,
-    sliding_window_length=None,
+    sliding_window=(None, None),
+    diagonal_alignment=cudnn.diagonal_alignment.TOP_LEFT,
     dropout_prob=0.0,
     dropout_mask=None,
     compute_stats=False,
@@ -77,6 +81,12 @@ def compute_ref(
     k = k.to(dtype=torch.float32, device=device)
     v = v.to(dtype=torch.float32, device=device)
 
+    assert isinstance(sliding_window, tuple) and len(sliding_window) == 2
+
+    # Set/override left and right bounds explicitly
+    left_bound = sliding_window[0]
+    right_bound = sliding_window[1]
+
     # expand tensors for GQA and MQA
     if h_q != h_k:
         assert h_q % h_k == 0
@@ -89,15 +99,9 @@ def compute_ref(
         v = v.expand(-1, -1, h_q // h_v, -1, -1)
         v = v.reshape(v.size(0), -1, v.size(3), v.size(4))
 
-    if is_causal_bottom_right:
-        causal_mask_bottom_right_zero = torch.ones(
-            1, 1, s_q, 1, dtype=torch.bool, device=device
-        )
-        causal_mask_bottom_right_zero[:, :, : s_q - s_kv, :] = False
-
-    if sliding_window_length is not None:
+    if left_bound is not None:
         swa_mask_zero = torch.ones(1, 1, s_q, 1, dtype=torch.bool, device=device)
-        swa_mask_zero[:, :, s_kv + sliding_window_length - 1 :, :] = False
+        swa_mask_zero[:, :, s_kv + left_bound - 1 :, :] = False
         q = q * swa_mask_zero
     # generate masks to compute reference values for padding mask
     # (also called variable sequence length)
@@ -156,11 +160,14 @@ def compute_ref(
         s = s + alibi_mask
     if padding is not None:
         s = s.masked_fill(s_mask, float("-inf"))
-    if is_causal:
+    if diagonal_alignment == diagonal_alignment.TOP_LEFT and right_bound is not None:
         causal_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=device)
-        causal_mask.triu_(diagonal=1)
+        causal_mask.triu_(diagonal=1 + right_bound)
         s = s.masked_fill(causal_mask, float("-inf"))
-    if is_causal_bottom_right:
+    elif (
+        diagonal_alignment == diagonal_alignment.BOTTOM_RIGHT
+        and right_bound is not None
+    ):
         causal_mask_bottom_right = None
         if padding:
             causal_mask_bottom_right = torch.ones(
@@ -169,40 +176,40 @@ def compute_ref(
             seq_len_q, seq_len_kv = padding
             for i in range(b):
                 causal_mask_bottom_right[i, :, :, :].triu_(
-                    diagonal=seq_len_kv[i] - seq_len_q[i] + 1
+                    diagonal=seq_len_kv[i] - seq_len_q[i] + 1 + right_bound
                 )
         else:
             causal_mask_bottom_right = torch.ones(
                 s_q, s_kv, dtype=torch.bool, device=device
             )
-            causal_mask_bottom_right.triu_(diagonal=s_kv - s_q + 1)
+            causal_mask_bottom_right.triu_(diagonal=s_kv - s_q + 1 + right_bound)
         s = s.masked_fill(causal_mask_bottom_right, float("-inf"))
-    if sliding_window_length is not None:
-        assert is_causal == True or is_causal_bottom_right == True
-        if is_causal:
+    if left_bound is not None:
+        assert diagonal_alignment is not None
+        if diagonal_alignment == diagonal_alignment.TOP_LEFT:
             swa_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=device)
-            swa_mask.tril_(diagonal=-1 * sliding_window_length)
+            swa_mask.tril_(diagonal=-1 * left_bound)
 
-        elif is_causal_bottom_right:
+        elif diagonal_alignment == diagonal_alignment.BOTTOM_RIGHT:
             # BRCM + SWA for variable sequence lengths
             if padding:
                 swa_mask = torch.ones(b, 1, s_q, s_kv, dtype=torch.bool, device=device)
                 seq_len_q, seq_len_kv = padding
                 for i in range(b):
                     swa_mask[i, :, :, :].tril_(
-                        diagonal=seq_len_kv[i] - seq_len_q[i] - sliding_window_length
+                        diagonal=seq_len_kv[i] - seq_len_q[i] - left_bound
                     )
             # BRCM + SWA for fixed sequence lengths
             else:
                 swa_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=device)
-                swa_mask.tril_(diagonal=-1 * sliding_window_length + (s_kv - s_q))
+                swa_mask.tril_(diagonal=-1 * left_bound + (s_kv - s_q))
 
         swa_mask &= swa_mask_zero.view(s_q, 1)
         s = s.masked_fill(swa_mask, float("-inf"))
 
     p = torch.softmax(s, dim=-1)
 
-    if sliding_window_length is not None:
+    if left_bound is not None:
         p = p * swa_mask_zero
     if padding is not None:
         p = p.masked_fill(p_mask, 0.0)
@@ -417,7 +424,7 @@ def generate_ragged_offset(
             k_ragged_offset = compute_exclusive_prefix_sum(seq_len_kv) * 2 * h_kv * d
             v_ragged_offset = compute_exclusive_prefix_sum(seq_len_kv) * 2 * h_kv * d
             o_ragged_offset = compute_exclusive_prefix_sum(seq_len_q) * h_q * d
-    else:
+    else:  # sbh3d
         raise ValueError()
 
     q_ragged_offset = q_ragged_offset.to(
@@ -497,9 +504,9 @@ def generate_actual_seq_lens(
 @pytest.mark.parametrize("is_infer", is_infer_options, ids=lambda p: f"infer{int(p)}")
 @pytest.mark.parametrize("is_ragged", ragged_options, ids=lambda p: f"ragged{int(p)}")
 @pytest.mark.parametrize("is_dropout", dropout_options, ids=lambda p: f"dropout{int(p)}")
-@pytest.mark.parametrize("is_sliding_window", sliding_window_mask_options, ids=lambda p: f"sliding_window{int(p)}")
-@pytest.mark.parametrize("is_causal_bottom_right", causal_mask_bottom_right_options, ids=lambda p: f"causal_bottom_right{int(p)}")
-@pytest.mark.parametrize("is_causal", causal_mask_options, ids=lambda p: f"causal{int(p)}")
+@pytest.mark.parametrize("is_right_bound", right_bound_options, ids=lambda p: f"right_bound{int(p)}")
+@pytest.mark.parametrize("is_left_bound", left_bound_options, ids=lambda p: f"left_bound{int(p)}")
+@pytest.mark.parametrize("diagonal_alignment", diagonal_alignment_options, ids=lambda p: f"diagonal_alignment_{p}".replace("diagonal_alignment.",""))
 @pytest.mark.parametrize("is_padding", padding_mask_options, ids=lambda p: f"padding{int(p)}")
 @pytest.mark.parametrize("is_alibi", alibi_mask_options, ids=lambda p: f"alibi{int(p)}")
 @pytest.mark.parametrize("is_bias", bias_options, ids=lambda p: f"bias{int(p)}")
@@ -517,9 +524,9 @@ def test_sdpa(
     is_bias,
     is_alibi,
     is_padding,
-    is_causal,
-    is_causal_bottom_right,
-    is_sliding_window,
+    diagonal_alignment,
+    is_left_bound,
+    is_right_bound,
     is_dropout,
     is_ragged,
     is_infer,
@@ -599,6 +606,14 @@ def test_sdpa(
     # block size for paged attention
     block_size = random.choice([32, 64, 128])
 
+    # Left/right bound should only be specified if we requested to set a left_bound/right_bound
+    assert (request.config.option.mha_left_bound is None) or is_left_bound
+    assert (request.config.option.mha_right_bound is None) or is_right_bound
+
+    # If bounds are requested: randomly pick between 0 and s_kv/4
+    left_bound = random.choice([1, s_kv//4]) if is_left_bound else None
+    right_bound = random.choice([0, s_kv//4]) if is_right_bound else None
+
     # -------------------------- override test parameters if args are provided ----------------
     b = int(request.config.option.mha_b) if request.config.option.mha_b != None else b
     s_q = int(request.config.option.mha_s_q) if request.config.option.mha_s_q != None else s_q
@@ -609,6 +624,8 @@ def test_sdpa(
     h_k = int(request.config.option.mha_h_k) if request.config.option.mha_h_k != None else h_k
     h_v = int(request.config.option.mha_h_v) if request.config.option.mha_h_v != None else h_v
     block_size = int(request.config.option.mha_block_size) if request.config.option.mha_block_size != None else block_size
+    left_bound = int(request.config.option.mha_left_bound) if request.config.option.mha_left_bound != None else left_bound
+    right_bound = int(request.config.option.mha_right_bound) if request.config.option.mha_right_bound != None else right_bound
 
     if d_qk != d_v and cudnn_version < "8.9.6":
         pytest.skip("d_qk != d_v is only supported on 8.9.6 onwards.")
@@ -616,13 +633,17 @@ def test_sdpa(
     if d_qk != d_v and is_ragged and cudnn_version < "9.1":
         pytest.skip("d_qk != d_v is not supported with ragged offset")
 
-    if s_q > s_kv and is_sliding_window:
+    if s_q > s_kv and is_left_bound:
         pytest.skip("s_q > s_kv is not supported with sliding window attention")
 
     print("\n=============== TEST CMD TO REPRODUCE ===============")
-    print(
-        f"pytest {request.node.nodeid} --mha_b={b} --mha_s_q={s_q} --mha_s_kv={s_kv} --mha_d_qk={d_qk} --mha_d_v={d_v} --mha_h_q={h_q} --mha_h_k={h_k} --mha_h_v={h_v} --mha_block_size={block_size}"
-    )
+    cmd = f"pytest {request.node.nodeid} --mha_b={b} --mha_s_q={s_q} --mha_s_kv={s_kv} --mha_d_qk={d_qk} --mha_d_v={d_v} --mha_h_q={h_q} --mha_h_k={h_k} --mha_h_v={h_v} --mha_block_size={block_size}"
+    if left_bound is not None:
+        cmd += f" --mha_left_bound={left_bound}"
+    if right_bound is not None:
+        cmd += f" --mha_right_bound={right_bound}"
+
+    print(cmd)
     print("=====================================================")
 
     attn_scale = 0.125
@@ -657,7 +678,7 @@ def test_sdpa(
         else None
     )
 
-    seq_len_q_gpu, seq_len_kv_gpu = generate_actual_seq_lens(b, s_q, s_kv, layout, head_group, is_padding, is_sliding_window or is_causal_bottom_right)
+    seq_len_q_gpu, seq_len_kv_gpu = generate_actual_seq_lens(b, s_q, s_kv, layout, head_group, is_padding, is_left_bound or (is_right_bound and diagonal_alignment == diagonal_alignment.BOTTOM_RIGHT))
 
     if is_dropout:
         seed_gpu = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
@@ -728,12 +749,14 @@ def test_sdpa(
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
+    sm_version = torch.cuda.get_device_capability()[0] * 10 + torch.cuda.get_device_capability()[1]
     # cuDNN graph
     graph = cudnn.pygraph(
         io_data_type=convert_to_cudnn_type(input_type),
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
         handle=cudnn_handle,
+        sm_version=sm_version
     )
 
     q = graph.tensor_like(q_gpu)
@@ -765,12 +788,7 @@ def test_sdpa(
         k.set_ragged_offset(k_ragged_offset)
         v.set_ragged_offset(v_ragged_offset)
 
-    sliding_window_length = None
-    if is_sliding_window:
-        sliding_window_length = s_kv // 4
-
-
-    
+   
     o, stats = graph.sdpa(
         name="sdpa",
         q=q,
@@ -783,9 +801,9 @@ def test_sdpa(
         use_padding_mask=is_padding,
         seq_len_q=seq_len_q,
         seq_len_kv=seq_len_kv,
-        use_causal_mask=is_causal,
-        use_causal_mask_bottom_right=is_causal_bottom_right,
-        sliding_window_length=sliding_window_length,
+        diagonal_band_left_bound=left_bound, 
+        diagonal_band_right_bound=right_bound,
+        diagonal_alignment=diagonal_alignment,
         dropout=dropout_tuple if is_dropout else None,
         rng_dump=rng_dump,
         paged_attention_k_table=page_table_k,
@@ -870,9 +888,8 @@ def test_sdpa(
         bias=bias_ref if is_bias else None,
         is_alibi=is_alibi,
         padding=(seq_len_q_ref, seq_len_kv_ref) if is_padding else None,
-        is_causal=is_causal,
-        is_causal_bottom_right=is_causal_bottom_right,
-        sliding_window_length=sliding_window_length,
+        sliding_window=(left_bound, right_bound),
+        diagonal_alignment=diagonal_alignment,
         compute_stats=(is_infer == False),
         dropout_prob=dropout_prob,
         dropout_mask=rng_dump_ref if is_dropout else None,
@@ -906,9 +923,9 @@ def test_sdpa(
 # fmt: off
 @pytest.mark.parametrize("is_ragged", ragged_options, ids=lambda p: f"ragged{int(p)}")
 @pytest.mark.parametrize("is_dropout", dropout_options, ids=lambda p: f"dropout{int(p)}")
-@pytest.mark.parametrize("is_sliding_window", sliding_window_mask_options, ids=lambda p: f"sliding_window{int(p)}")
-@pytest.mark.parametrize("is_causal_bottom_right", causal_mask_bottom_right_options, ids=lambda p: f"causal_bottom_right{int(p)}")
-@pytest.mark.parametrize("is_causal", causal_mask_options, ids=lambda p: f"causal{int(p)}")
+@pytest.mark.parametrize("is_right_bound", right_bound_options, ids=lambda p: f"right_bound{int(p)}")
+@pytest.mark.parametrize("is_left_bound", left_bound_options, ids=lambda p: f"left_bound{int(p)}")
+@pytest.mark.parametrize("diagonal_alignment", diagonal_alignment_options, ids=lambda p: f"diagonal_alignment_{p}".replace("diagonal_alignment.",""))
 @pytest.mark.parametrize("is_padding", padding_mask_options, ids=lambda p: f"padding{int(p)}")
 @pytest.mark.parametrize("is_alibi", alibi_mask_options, ids=lambda p: f"alibi{int(p)}")
 @pytest.mark.parametrize("is_bias", bias_options, ids=lambda p: f"bias{int(p)}")
@@ -924,9 +941,9 @@ def test_sdpa_backward(
     is_bias,
     is_alibi,
     is_padding,
-    is_causal,
-    is_causal_bottom_right,
-    is_sliding_window,
+    diagonal_alignment,
+    is_right_bound,
+    is_left_bound,
     is_dropout,
     is_ragged,
     request,
@@ -946,9 +963,6 @@ def test_sdpa_backward(
 
     if is_bias and cudnn_version < "9" and torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("dBias is only supported on hopper before v9.")
-
-    if is_alibi and not is_causal:
-        pytest.skip("ALiBi mask is only supported with causal mask")
 
     if is_alibi and cudnn_version < "8.9.4":
         pytest.skip("ALiBi mask is only supported 8.9.4 onwards.")
@@ -1012,6 +1026,15 @@ def test_sdpa_backward(
         os.environ["CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT"] = "0"
     is_deterministic = random.choice([True, False])
 
+    
+    # Left/right bound should only be specified if we requested to set a left_bound/right_bound
+    assert (request.config.option.mha_left_bound is None) or is_left_bound
+    assert (request.config.option.mha_right_bound is None) or is_right_bound
+
+    # If bounds are requested: randomly pick between 0 and s_kv/4
+    left_bound = random.choice([1, s_kv//4]) if is_left_bound else None
+    right_bound = random.choice([0, s_kv//4]) if is_right_bound else None
+
     # -------------------------- override test parameters if args are provided ----------------
     b = int(request.config.option.mha_b) if request.config.option.mha_b != None else b
     s_q = int(request.config.option.mha_s_q) if request.config.option.mha_s_q != None else s_q
@@ -1026,12 +1049,17 @@ def test_sdpa_backward(
         if request.config.option.mha_deterministic != None
         else is_deterministic
     )
+    left_bound = int(request.config.option.mha_left_bound) if request.config.option.mha_left_bound != None else left_bound
+    right_bound = int(request.config.option.mha_right_bound) if request.config.option.mha_right_bound != None else right_bound
 
     if d_qk != d_v and cudnn_version < "8.9.6":
         pytest.skip("d_qk != d_v is only supported on 8.9.6 onwards.")
 
     if d_qk != d_v and is_ragged and cudnn_version < "9.1":
         pytest.skip("d_qk != d_v is not supported with ragged offset")
+
+    if is_alibi and not (diagonal_alignment == diagonal_alignment.TOP_LEFT and (right_bound is not None and right_bound == 0)):
+        pytest.skip("ALiBi mask is only supported with causal mask")
 
     if (
         is_deterministic
@@ -1041,9 +1069,12 @@ def test_sdpa_backward(
         pytest.skip("Ampere deterministic implementation is not supported below 9.0.0")
 
     print("\n=============== TEST CMD TO REPRODUCE ===============")
-    print(
-        f"pytest {request.node.nodeid} --mha_b={b} --mha_s_q={s_q} --mha_s_kv={s_kv} --mha_d_qk={d_qk} --mha_d_v={d_v} --mha_h_q={h_q} --mha_h_k={h_k} --mha_h_v={h_v} --mha_deterministic={int(is_deterministic)}"
-    )
+    cmd = f"pytest {request.node.nodeid} --mha_b={b} --mha_s_q={s_q} --mha_s_kv={s_kv} --mha_d_qk={d_qk} --mha_d_v={d_v} --mha_h_q={h_q} --mha_h_k={h_k} --mha_h_v={h_v} --mha_deterministic={int(is_deterministic)}"
+    if left_bound is not None:
+        cmd += f" --mha_left_bound={left_bound}"
+    if right_bound is not None:
+        cmd += f" --mha_right_bound={right_bound}"
+    print(cmd)
     print("=====================================================")
 
     attn_scale = 0.125
@@ -1092,7 +1123,7 @@ def test_sdpa_backward(
         else None
     )
 
-    seq_len_q_gpu, seq_len_kv_gpu = generate_actual_seq_lens(b, s_q, s_kv, layout, head_group, is_padding, is_sliding_window or is_causal_bottom_right)
+    seq_len_q_gpu, seq_len_kv_gpu = generate_actual_seq_lens(b, s_q, s_kv, layout, head_group, is_padding, is_left_bound or (is_right_bound and diagonal_alignment == diagonal_alignment.BOTTOM_RIGHT))
 
     # maxT = next_multiple_of_64(sum(seq_len))
     max_t_q = ((torch.sum(seq_len_q_gpu).item() + 63) // 64) * 64 if is_ragged else None
@@ -1134,12 +1165,14 @@ def test_sdpa_backward(
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
+    sm_version = torch.cuda.get_device_capability()[0] * 10 + torch.cuda.get_device_capability()[1]
     # forward cuDNN graph
     graph = cudnn.pygraph(
         io_data_type=convert_to_cudnn_type(input_type),
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
         handle=cudnn_handle,
+        sm_version=sm_version
     )
 
     q = graph.tensor_like(q_gpu)
@@ -1168,10 +1201,6 @@ def test_sdpa_backward(
         k.set_ragged_offset(k_ragged_offset)
         v.set_ragged_offset(v_ragged_offset)
 
-    sliding_window_length = None
-    if is_sliding_window:
-        sliding_window_length = s_kv // 4
-
     o, stats = graph.sdpa(
         name="sdpa",
         q=q,
@@ -1184,9 +1213,9 @@ def test_sdpa_backward(
         use_padding_mask=is_padding,
         seq_len_q=seq_len_q,
         seq_len_kv=seq_len_kv,
-        use_causal_mask=is_causal,
-        use_causal_mask_bottom_right=is_causal_bottom_right,
-        sliding_window_length=sliding_window_length,
+        diagonal_band_left_bound=left_bound, 
+        diagonal_band_right_bound=right_bound,
+        diagonal_alignment=diagonal_alignment,
         dropout=dropout_tuple if is_dropout else None,
         rng_dump=rng_dump,
     )
@@ -1243,6 +1272,7 @@ def test_sdpa_backward(
 
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
+    sm_version = torch.cuda.get_device_capability()[0] * 10 + torch.cuda.get_device_capability()[1]
 
     # backward cuDNN graph
     graph = cudnn.pygraph(
@@ -1250,6 +1280,7 @@ def test_sdpa_backward(
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
         handle=cudnn_handle,
+        sm_version = sm_version
     )
 
     q = graph.tensor_like(q_gpu)
@@ -1303,9 +1334,9 @@ def test_sdpa_backward(
         seq_len_kv=seq_len_kv,
         max_total_seq_len_q=max_t_q,
         max_total_seq_len_kv=max_t_kv,
-        use_causal_mask=is_causal,
-        use_causal_mask_bottom_right=is_causal_bottom_right,
-        sliding_window_length=sliding_window_length,
+        diagonal_band_left_bound=left_bound, 
+        diagonal_band_right_bound=right_bound,
+        diagonal_alignment=diagonal_alignment,
         dropout=dropout_tuple if is_dropout else None,
         use_deterministic_algorithm=is_deterministic,
     )
@@ -1390,9 +1421,8 @@ def test_sdpa_backward(
         bias=bias_ref if is_bias else None,
         is_alibi=is_alibi,
         padding=(seq_len_q_ref, seq_len_kv_ref) if is_padding else None,
-        is_causal=is_causal,
-        is_causal_bottom_right=is_causal_bottom_right,
-        sliding_window_length=sliding_window_length,
+        sliding_window=(left_bound, right_bound),
+        diagonal_alignment=diagonal_alignment,
         dropout_prob=dropout_prob,
         dropout_mask=rng_dump_ref if is_dropout else None,
         compute_stats=False,
@@ -1447,40 +1477,3 @@ def test_sdpa_backward(
         torch.testing.assert_close(
             dBias_ref, dBias_gpu, check_dtype=False, atol=2e-2, rtol=2e-2
         )
-
-
-if __name__ == "__main__":
-    # example usage
-    # ================== forward ==================
-    """
-    pytest \
-      test/python/test_mhas.py::test_sdpa[torch.float16-bshd_bshd_bshd-group_query-paged0-bias0-alibi0-padding0-causal0-causal_bottom_right0-sliding_window0-dropout0-ragged0-infer0] \
-      -s \
-      --mha_b 3 \
-      --mha_s_q 256 \
-      --mha_s_kv 128 \
-      --mha_d_qk 48 \
-      --mha_d_v 32 \
-      --mha_h_q 12 \
-      --mha_h_k 3 \
-      --mha_h_v 4 \
-      --mha_block_size 32 \
-      --mha_deterministic 0
-    """
-    # ================== backward ==================
-    """
-    pytest \
-      test/python/test_mhas.py::test_sdpa_backward[torch.float16-bshd_bshd_bshd-group_query-bias0-alibi0-padding0-causal0-causal_bottom_right0-sliding_window0-dropout0-ragged0] \
-      -s \
-      --mha_b 3 \
-      --mha_s_q 256 \
-      --mha_s_kv 128 \
-      --mha_d_qk 48 \
-      --mha_d_v 32 \
-      --mha_h_q 12 \
-      --mha_h_k 3 \
-      --mha_h_v 4 \
-      --mha_deterministic 0
-    """
-
-    pytest.main([__file__])

@@ -227,7 +227,3 @@ def test_layernorm(param_extract, cudnn_handle):
     torch.testing.assert_close(x_gpu.grad, DX_actual, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(scale_gpu.grad, DScale_actual, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(bias_gpu.grad, Dbias_actual, atol=2e-4, rtol=2e-4)
-
-
-if __name__ == "__main__":
-    test_layernorm((1600, torch.bfloat16), cudnn_handle)

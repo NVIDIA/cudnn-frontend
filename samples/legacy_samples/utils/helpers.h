@@ -55,6 +55,36 @@ enum class MHA_Matrix {
 
 enum class MHA_Bias_Type { NO_BIAS = 0, PRE_SCALE_BIAS = 1, POST_SCALE_BIAS = 2 };
 
+#define CUDNN_CHECK(status)                                                                                     \
+    {                                                                                                           \
+        cudnnStatus_t err = status;                                                                             \
+        if (err != CUDNN_STATUS_SUCCESS) {                                                                      \
+            std::stringstream err_msg;                                                                          \
+            err_msg << "cuDNN Error: " << cudnnGetErrorString(err) << " (" << err << ") at " << __FILE__ << ":" \
+                    << __LINE__;                                                                                \
+            FAIL(err_msg.str());                                                                                \
+        }                                                                                                       \
+    }
+
+// Custom deleter for cudnnHandle_t
+struct CudnnHandleDeleter {
+    void
+    operator()(cudnnHandle_t* handle) const {
+        if (handle) {
+            CUDNN_CHECK(cudnnDestroy(*handle));
+            delete handle;
+        }
+    }
+};
+
+// Function to create a unique_ptr for cudnnHandle_t
+inline std::unique_ptr<cudnnHandle_t, CudnnHandleDeleter>
+create_cudnn_handle() {
+    auto handle = std::make_unique<cudnnHandle_t>();
+    CUDNN_CHECK(cudnnCreate(handle.get()));
+    return std::unique_ptr<cudnnHandle_t, CudnnHandleDeleter>(handle.release(), CudnnHandleDeleter());
+}
+
 bool
 is_ampere_arch();
 bool

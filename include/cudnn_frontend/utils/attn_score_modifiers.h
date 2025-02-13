@@ -6,92 +6,35 @@ namespace cudnn_frontend::graph::attn::score_modifiers {
 
 [[maybe_unused]] inline std::shared_ptr<Tensor_attributes>
 causal_mask(std::shared_ptr<Graph> graph, std::shared_ptr<Tensor_attributes> attention_score) {
-    auto row_index = graph->pointwise(attention_score,
-                                      Pointwise_attributes()
-                                          .set_name("gen_row_idx_causal")
-                                          .set_mode(PointwiseMode_t::GEN_INDEX)
-                                          .set_axis(2)
-                                          .set_compute_data_type(DataType_t::INT32));
-    row_index->set_data_type(DataType_t::INT32);
-
-    auto col_index = graph->pointwise(attention_score,
-                                      Pointwise_attributes()
-                                          .set_name("gen_col_idx_causal")
-                                          .set_mode(PointwiseMode_t::GEN_INDEX)
-                                          .set_axis(3)
-                                          .set_compute_data_type(DataType_t::INT32));
-    col_index->set_data_type(DataType_t::INT32);
-
-    auto bool_mask = graph->pointwise(row_index,
-                                      col_index,
-                                      Pointwise_attributes()
-                                          .set_name("row_greater_than_col")
-                                          .set_mode(PointwiseMode_t::CMP_GE)
-                                          .set_compute_data_type(DataType_t::BOOLEAN));
-    bool_mask->set_data_type(DataType_t::BOOLEAN);
-
-    auto after_causal_mask =
-        graph->pointwise(attention_score,
-                         std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest()),
-                         bool_mask,
-                         Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT));
-
-    return after_causal_mask;
+    return sliding_window_mask(graph,
+                               attention_score,
+                               DiagonalAlignment_t::TOP_LEFT,
+                               {},       // no left bound specified
+                               0,        // right bound = 0
+                               0,        // s_q does not matter for causal mask
+                               0,        // s_kv does not matter for causal mask
+                               nullptr,  // s_q does not matter for causal mask
+                               nullptr   // s_kv does not matter for causal mask
+    );
 }
 
 [[maybe_unused]] inline std::shared_ptr<Tensor_attributes>
 causal_mask_bottom_right(std::shared_ptr<Graph> graph,
                          std::shared_ptr<Tensor_attributes> attention_score,
-                         std::shared_ptr<Tensor_attributes> seq_len_kv,
-                         std::shared_ptr<Tensor_attributes> seq_len_q) {
-    auto row_index = graph->pointwise(attention_score,
-                                      Pointwise_attributes()
-                                          .set_name("gen_row_idx_causal")
-                                          .set_mode(PointwiseMode_t::GEN_INDEX)
-                                          .set_axis(2)
-                                          .set_compute_data_type(DataType_t::INT32));
-    row_index->set_data_type(DataType_t::INT32);
-
-    row_index = graph->pointwise(row_index,
-                                 seq_len_kv,
-                                 Pointwise_attributes()
-                                     .set_name("row_idx_add_skv")
-                                     .set_mode(PointwiseMode_t::ADD)
-                                     .set_compute_data_type(DataType_t::INT32));
-
-    row_index->set_data_type(DataType_t::INT32);
-
-    row_index = graph->pointwise(row_index,
-                                 seq_len_q,
-                                 Pointwise_attributes()
-                                     .set_name("row_idx_add_sq_sub_sq")
-                                     .set_mode(PointwiseMode_t::SUB)
-                                     .set_compute_data_type(DataType_t::INT32));
-    row_index->set_data_type(DataType_t::INT32);
-
-    auto col_index = graph->pointwise(attention_score,
-                                      Pointwise_attributes()
-                                          .set_name("gen_col_idx_causal")
-                                          .set_mode(PointwiseMode_t::GEN_INDEX)
-                                          .set_axis(3)
-                                          .set_compute_data_type(DataType_t::INT32));
-    col_index->set_data_type(DataType_t::INT32);
-
-    auto const& bool_mask = graph->pointwise(row_index,
-                                             col_index,
-                                             Pointwise_attributes()
-                                                 .set_name("row_greater_than_col")
-                                                 .set_mode(PointwiseMode_t::CMP_GE)
-                                                 .set_compute_data_type(DataType_t::BOOLEAN));
-    bool_mask->set_data_type(DataType_t::BOOLEAN);
-
-    auto return_mask =
-        graph->pointwise(attention_score,
-                         std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest()),
-                         bool_mask,
-                         Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT));
-
-    return return_mask;
+                         int64_t s_q,
+                         int64_t s_kv,
+                         std::shared_ptr<Tensor_attributes> seq_len_q,
+                         std::shared_ptr<Tensor_attributes> seq_len_kv) {
+    return sliding_window_mask(graph,
+                               attention_score,
+                               DiagonalAlignment_t::BOTTOM_RIGHT,
+                               {},                    // no left bound specified
+                               0,                     // right bound = 0
+                               s_q,                   // s_q dimension (max Q sequence length)
+                               s_kv,                  // s_kv dimension (max KV sequence length)
+                               std::move(seq_len_q),  // Actuall Q sequence lengths
+                               std::move(seq_len_kv)  // Actual KV sequence lengths
+    );
 }
 
 [[maybe_unused]] inline std::shared_ptr<Tensor_attributes>
@@ -209,30 +152,110 @@ bias(std::shared_ptr<Graph> graph,
 [[maybe_unused]] inline std::shared_ptr<Tensor_attributes>
 sliding_window_mask(std::shared_ptr<Graph> graph,
                     std::shared_ptr<Tensor_attributes> attention_score,
-                    bool has_causal_mask_bottom_right,
-                    int64_t left_window,
-                    int64_t right_window,
-                    int64_t s_kv,
+                    DiagonalAlignment_t diagonal_alignment,
+                    std::optional<int64_t> left_bound,
+                    std::optional<int64_t> right_bound,
                     int64_t s_q,
-                    std::shared_ptr<Tensor_attributes> s_kv_ptr,
-                    std::shared_ptr<Tensor_attributes> s_q_ptr) {
-    (void)right_window;
-    auto row_index_attributes =
-        Pointwise_attributes().set_name("gen_row_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(2);
-    std::shared_ptr<Tensor_attributes> row_index_output = graph->pointwise(attention_score, row_index_attributes);
+                    int64_t s_kv,
+                    std::shared_ptr<Tensor_attributes> s_q_ptr,
+                    std::shared_ptr<Tensor_attributes> s_kv_ptr) {
+    std::shared_ptr<Tensor_attributes> return_mask = attention_score;
 
-    auto col_index_attributes =
-        Pointwise_attributes().set_name("gen_col_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(3);
-    std::shared_ptr<Tensor_attributes> col_index_output = graph->pointwise(attention_score, col_index_attributes);
+    // Note: the right and left bound subtrees can be constructed in different ways as well that yield functionally
+    // correct results. However, for performance reasons in the cuDNN backend they are organized as they are. Be
+    // cautious of performance when editting.
 
-    // With bottom right causal masking, we need to shift the diagonal.
-    // Setup a graph so we can compare column + window_size - (s_kv - s_q) > row
+    // Set the right bound
+    if (right_bound.has_value()) {
+        auto row_index_attributes =
+            Pointwise_attributes().set_name("gen_row_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(2);
+        std::shared_ptr<Tensor_attributes> row_index = graph->pointwise(attention_score, row_index_attributes);
+        row_index->set_data_type(DataType_t::INT32);
 
-    if (has_causal_mask_bottom_right) {
+        auto col_index_attributes =
+            Pointwise_attributes().set_name("gen_col_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(3);
+        std::shared_ptr<Tensor_attributes> col_index = graph->pointwise(attention_score, col_index_attributes);
+        col_index->set_data_type(DataType_t::INT32);
+
+        if (diagonal_alignment == DiagonalAlignment_t::BOTTOM_RIGHT) {
+            row_index = graph->pointwise(
+                row_index,
+                // Use actual sequence lengths if they are provided
+                s_kv_ptr != nullptr ? s_kv_ptr : std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv)),
+                Pointwise_attributes()
+                    .set_name("row_idx_add_skv")
+                    .set_mode(PointwiseMode_t::ADD)
+                    .set_compute_data_type(DataType_t::INT32));
+
+            row_index->set_data_type(DataType_t::INT32);
+
+            row_index = graph->pointwise(
+                row_index,
+                // Use actual sequence lengths if they are provided
+                s_q_ptr != nullptr ? s_q_ptr : std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q)),
+                Pointwise_attributes()
+                    .set_name("row_idx_add_skv_sub_sq")
+                    .set_mode(PointwiseMode_t::SUB)
+                    .set_compute_data_type(DataType_t::INT32));
+            row_index->set_data_type(DataType_t::INT32);
+        }
+
+        // Shift the diagonal in case there is a non-zero right bound
+        if (right_bound.value() != 0) {
+            row_index = graph->pointwise(row_index,
+                                         std::make_shared<Tensor_attributes>(static_cast<int32_t>(right_bound.value())),
+                                         Pointwise_attributes()
+                                             .set_name("row_idx_add_skv_sub_sq_add_right_bound")
+                                             .set_mode(PointwiseMode_t::ADD)
+                                             .set_compute_data_type(DataType_t::INT32));
+            row_index->set_data_type(DataType_t::INT32);
+        }
+
+        auto const& bool_mask = graph->pointwise(row_index,
+                                                 col_index,
+                                                 Pointwise_attributes()
+                                                     .set_name("row_greater_than_col")
+                                                     .set_mode(PointwiseMode_t::CMP_GE)
+                                                     .set_compute_data_type(DataType_t::BOOLEAN));
+        bool_mask->set_data_type(DataType_t::BOOLEAN);
+
+        return_mask =
+            graph->pointwise(attention_score,
+                             std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest()),
+                             bool_mask,
+                             Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT));
+    }
+
+    // Set the left bound
+    if (left_bound.has_value()) {
+        auto row_index_attributes =
+            Pointwise_attributes().set_name("gen_row_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(2);
+        std::shared_ptr<Tensor_attributes> row_index_output = graph->pointwise(return_mask, row_index_attributes);
+
+        auto col_index_attributes =
+            Pointwise_attributes().set_name("gen_col_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(3);
+        std::shared_ptr<Tensor_attributes> col_index_output = graph->pointwise(return_mask, col_index_attributes);
+        // When the diagonal is top left aligned: setup a graph so we can compare column + window_size > row
+        // All elements for which column + window_size > row, will be retained, all others will be masked out
+        // Note that here and following sections, row refers to the s_q index and column refers to the s_kv index in
+        // the s_q x s_kv masking matrix
+        if (diagonal_alignment == DiagonalAlignment_t::TOP_LEFT) {
+            // sliding window length parameter should be of float type
+            auto sliding_window_length = std::make_shared<Tensor_attributes>((float)left_bound.value());
+            auto add_col_attributes    = Pointwise_attributes()
+                                          .set_name("col+window")
+                                          .set_mode(PointwiseMode_t::ADD)
+                                          .set_compute_data_type(DataType_t::FLOAT)
+                                          .set_axis(3);
+
+            col_index_output = graph->pointwise(col_index_output, sliding_window_length, add_col_attributes);
+        }
+        // With bottom right diagonal alignment, we need to shift the diagonal.
+        // Setup a graph so we can compare column + window_size - (s_kv - s_q) > row
         // Optimization with fixed sequence lengths: single pointwise addition for the left-hand of the comparison
         // Again, all elements satisfying the comparison will be retained.
-        if (s_kv_ptr == nullptr && s_q_ptr == nullptr) {
-            auto sliding_window_length = std::make_shared<Tensor_attributes>((float)(left_window - s_kv + s_q));
+        else if (s_kv_ptr == nullptr && s_q_ptr == nullptr) {
+            auto sliding_window_length = std::make_shared<Tensor_attributes>((float)(left_bound.value() - s_kv + s_q));
             auto add_col_attributes    = Pointwise_attributes()
                                           .set_name("col+window-skv+sq")
                                           .set_mode(PointwiseMode_t::ADD)
@@ -241,7 +264,7 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
 
             col_index_output = graph->pointwise(col_index_output, sliding_window_length, add_col_attributes);
         }
-        // With bottom right causal masking: general case when at least one of Q and KV have variable sequence
+        // With bottom right diagonal alignment: general case when at least one of Q and KV have variable sequence
         // lengths.
         // Setup a graph so we can compare column + window_size - (s_k[i] - s_q[i]) > row  for each batch i
         // Also here, all elements satisfying the comparison will be retained.
@@ -249,7 +272,7 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
             col_index_output->set_data_type(DataType_t::INT32);
             row_index_output->set_data_type(DataType_t::INT32);
 
-            auto sliding_window_length = std::make_shared<Tensor_attributes>((int32_t)left_window);
+            auto sliding_window_length = std::make_shared<Tensor_attributes>((int32_t)left_bound.value());
             auto add_col_attributes    = Pointwise_attributes()
                                           .set_name("col+window")
                                           .set_mode(PointwiseMode_t::ADD)
@@ -294,46 +317,27 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
             col_index_output->set_data_type(DataType_t::INT32);
         }
 
+        auto greater_than_attributes =
+            Pointwise_attributes().set_mode(PointwiseMode_t::CMP_GT).set_compute_data_type(DataType_t::BOOLEAN);
+
+        if (diagonal_alignment == DiagonalAlignment_t::TOP_LEFT) {
+            greater_than_attributes.set_name("col+ws>row");
+        } else {
+            greater_than_attributes.set_name("col+window-skv+sq>row");
+        }
+
+        auto swa_comparison_output = graph->pointwise(col_index_output, row_index_output, greater_than_attributes);
+        swa_comparison_output->set_data_type(DataType_t::BOOLEAN);
+
+        // Lower attributes to binary select attributes
+        auto negative_inf_swa = std::make_shared<Tensor_attributes>(-1024.0f * 1024.0f * 1024.0f);
+
+        auto binary_select_attributes =
+            Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT);
+
+        return_mask = graph->pointwise(return_mask, negative_inf_swa, swa_comparison_output, binary_select_attributes);
     }
-
-    // Without bottom right causal masking: setup a graph so we can compare column + window_size > row
-    // All elements for which column + window_size > row, will be retained, all others will be masked out
-    // Note that here and following sections, row refers to the s_q index and column refers to the s_kv index in
-    // the s_q x s_kv masking matrix
-    else {  // No Bottom right causal mask
-            // sliding window length parameter should be of float type
-        auto sliding_window_length = std::make_shared<Tensor_attributes>((float)left_window);
-        auto add_col_attributes    = Pointwise_attributes()
-                                      .set_name("col+window")
-                                      .set_mode(PointwiseMode_t::ADD)
-                                      .set_compute_data_type(DataType_t::FLOAT)
-                                      .set_axis(3);
-
-        col_index_output = graph->pointwise(col_index_output, sliding_window_length, add_col_attributes);
-    }
-
-    auto greater_than_attributes =
-        Pointwise_attributes().set_mode(PointwiseMode_t::CMP_GT).set_compute_data_type(DataType_t::BOOLEAN);
-
-    if (has_causal_mask_bottom_right) {
-        greater_than_attributes.set_name("col+window-skv+sq>row");
-    } else {
-        greater_than_attributes.set_name("col+ws>row");
-    }
-
-    auto swa_comparison_output = graph->pointwise(col_index_output, row_index_output, greater_than_attributes);
-    swa_comparison_output->set_data_type(DataType_t::BOOLEAN);
-
-    // Lower attributes to binary select attributes
-    auto negative_inf_swa = std::make_shared<Tensor_attributes>(-1024.0f * 1024.0f * 1024.0f);
-
-    auto binary_select_attributes =
-        Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT);
-
-    auto swa_mask_output =
-        graph->pointwise(attention_score, negative_inf_swa, swa_comparison_output, binary_select_attributes);
-
-    return swa_mask_output;
+    return return_mask;
 }
 
 class Softcap {

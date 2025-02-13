@@ -11,7 +11,11 @@ using namespace pybind11::literals;
 
 namespace cudnn_frontend {
 
+#ifdef _WIN32
+HMODULE cudnn_dlhandle = nullptr;
+#else
 void *cudnn_dlhandle = nullptr;
+#endif
 
 namespace python_bindings {
 
@@ -69,7 +73,11 @@ init_properties(py::module_ &);
 
 void
 set_dlhandle_cudnn(std::intptr_t dlhandle) {
+#ifdef _WIN32
+    cudnn_dlhandle = reinterpret_cast<HMODULE>(dlhandle);
+#else
     cudnn_dlhandle = reinterpret_cast<void *>(dlhandle);
+#endif
 }
 
 PYBIND11_MODULE(_compiled_module, m) {

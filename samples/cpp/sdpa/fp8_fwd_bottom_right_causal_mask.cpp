@@ -28,7 +28,7 @@
 
 namespace fe = cudnn_frontend;
 
-TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
+TEST_CASE("sdpa_fp8_fprop_brcm", "[graph][sdpa][fp8][forward][brcm]") {
     namespace fe = cudnn_frontend;
 
 #if CUDART_VERSION < 12000
@@ -36,10 +36,11 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
     return;
 #endif
 
-    int64_t b = 2;    // batch size
-    int64_t h = 2;    // head dim
-    int64_t s = 512;  // q,k,v tensor is padded to this seq length
-    int64_t d = 128;  // hidden dim
+    int64_t b    = 2;  // batch size
+    int64_t h    = 2;  // head dim
+    int64_t s_q  = 512;
+    int64_t s_kv = 1024;
+    int64_t d    = 128;  // hidden dim
 
     bool is_inference = true;
 
@@ -48,14 +49,15 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT);
 
-    auto QKVO_dims = std::vector<int64_t>({b, h, s, d});
+    auto QO_dims = std::vector<int64_t>({b, h, s_q, d});
+    auto KV_dims = std::vector<int64_t>({b, h, s_kv, d});
 
-    auto QKV_strides = std::vector<int64_t>({s * 3 * h * d, d, 3 * h * d, 1});  // bs3hd
-    auto O_strides   = std::vector<int64_t>({s * h * d, d, h * d, 1});          // bhsd
+    auto QO_strides = std::vector<int64_t>({s_q * h * d, d, h * d, 1});   // bhsd
+    auto KV_strides = std::vector<int64_t>({s_kv * h * d, d, h * d, 1});  // bhsd
 
-    auto Q = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("Q").set_dim(QKVO_dims).set_stride(QKV_strides));
-    auto K = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("K").set_dim(QKVO_dims).set_stride(QKV_strides));
-    auto V = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("V").set_dim(QKVO_dims).set_stride(QKV_strides));
+    auto Q = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("Q").set_dim(QO_dims).set_stride(QO_strides));
+    auto K = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("K").set_dim(KV_dims).set_stride(KV_strides));
+    auto V = mha_graph.tensor(fe::graph::Tensor_attributes().set_name("V").set_dim(KV_dims).set_stride(KV_strides));
 
     float attn_scale = 0.123f;
 
@@ -73,13 +75,13 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
     auto sdpa_fp8_options = fe::graph::SDPA_fp8_attributes()
                                 .set_name("sdpa_fp8")
                                 .set_is_inference(is_inference)
-                                .set_causal_mask(true)
+                                .set_causal_mask_bottom_right(true)
                                 .set_attn_scale(attn_scale);
 
     auto [O, Stats, Amax_S, Amax_O] =
         mha_graph.sdpa_fp8(Q, K, V, descale_q, descale_k, descale_v, descale_s, scale_s, scale_o, sdpa_fp8_options);
 
-    O->set_output(true).set_dim(QKVO_dims).set_stride(O_strides);
+    O->set_output(true).set_dim(QO_dims).set_stride(QO_strides);
     Amax_O->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
     Amax_S->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
 
@@ -95,7 +97,7 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
     auto handle     = *handle_ptr;
 
     auto status = mha_graph.validate();
-    if ((cudnnGetVersion() >= 90100) && check_device_arch_newer_than("hopper")) {
+    if ((cudnnGetVersion() >= 90700) && check_device_arch_newer_than("blackwell")) {
         REQUIRE(status.is_good());
     } else {
         REQUIRE(status.get_code() == fe::error_code_t::GRAPH_NOT_SUPPORTED);
@@ -108,11 +110,13 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
     REQUIRE(mha_graph.build_plans(handle).is_good());
 
     //// Build variant pack
-    Surface<int8_t> qkvTensor(b * s * 3 * h * d, false);
-    Surface<int8_t> oTensor(b * s * h * d, false);
-    void* devPtrQ = qkvTensor.devPtr;
-    void* devPtrK = (qkvTensor.devPtr + h * d);
-    void* devPtrV = (qkvTensor.devPtr + 2 * h * d);
+    Surface<int8_t> qTensor(b * s_q * h * d, false);
+    Surface<int8_t> kTensor(b * s_kv * h * d, false);
+    Surface<int8_t> vTensor(b * s_kv * h * d, false);
+    Surface<int8_t> oTensor(b * s_q * h * d, false);
+    void* devPtrQ = qTensor.devPtr;
+    void* devPtrK = kTensor.devPtr;
+    void* devPtrV = vTensor.devPtr;
     void* devPtrO = oTensor.devPtr;
 
     Surface<float> descale_Q_Tensor(1, false);
@@ -138,12 +142,12 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
         {Amax_S, Amax_S_Tensor.devPtr},
         {Amax_O, Amax_O_Tensor.devPtr}};
 
-    Surface<float> stats_tensor(b * h * s * 1, false);
+    Surface<float> stats_tensor(b * h * s_q * 1, false);
     if (is_inference == false) {
         variant_pack[Stats] = stats_tensor.devPtr;
     }
 
-    int64_t workspace_size = 0;
+    int64_t workspace_size;
     REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

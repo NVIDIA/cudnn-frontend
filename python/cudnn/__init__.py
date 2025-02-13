@@ -1,32 +1,49 @@
 import ctypes
 import glob
 import os
+import sys
 import sysconfig
+import importlib
 
-from ._compiled_module import (
-    backend_version,
-    backend_version_string,
-    get_last_error_string,
-    destroy_handle,
-    norm_forward_phase,
-    reduction_mode,
-    behavior_note,
-    create_handle,
-    create_kernel_cache,
-    get_stream,
-    numerical_note,
-    set_stream,
-    build_plan_policy,
-    data_type,
-    heur_mode,
-    pygraph,
-    tensor,
-    cudnnGraphNotSupportedError,
-)
+
+def is_windows():
+    return sys.platform.startswith("win")
+
+
+module_name = ".Release._compiled_module" if is_windows() else "._compiled_module"
+
+_pybind_module = importlib.import_module(module_name, package=__name__)
+
+symbols_to_import = [
+    "backend_version",
+    "backend_version_string",
+    "get_last_error_string",
+    "destroy_handle",
+    "norm_forward_phase",
+    "reduction_mode",
+    "behavior_note",
+    "knob_type",
+    "create_handle",
+    "create_kernel_cache",
+    "get_stream",
+    "numerical_note",
+    "set_stream",
+    "build_plan_policy",
+    "data_type",
+    "heur_mode",
+    "pygraph",
+    "tensor",
+    "knob",
+    "cudnnGraphNotSupportedError",
+    "diagonal_alignment",
+]
+
+for symbol_name in symbols_to_import:
+    globals()[symbol_name] = getattr(_pybind_module, symbol_name)
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 
 def _tensor(
@@ -72,7 +89,7 @@ def _set_data_type(
     return self._set_data_type(_library_type(data_type))
 
 
-_compiled_module.tensor.set_data_type = _set_data_type
+_pybind_module.tensor.set_data_type = _set_data_type
 pygraph.tensor = _tensor
 
 
@@ -85,7 +102,7 @@ def _library_device_pointer(input_tensor):
         return input_tensor.data_ptr()
     # fall back to dlpack support by library
     else:
-        return _compiled_module._get_data_ptr(input_tensor)
+        return _pybind_module._get_data_ptr(input_tensor)
 
 
 def _execute(self, tensor_to_device_buffer, workspace, handle=None):
@@ -137,6 +154,24 @@ pygraph.execute = _execute
 pygraph.execute_plan_at_index = _execute_plan_at_index
 
 
+def load_cudnn():
+    # First look at python site packages
+    lib_path = glob.glob(
+        os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/bin/cudnn64_9.dll")
+    )
+
+    if lib_path:
+        assert (
+            len(lib_path) == 1
+        ), f"Found {len(lib_path)} libcudnn.dll.x in nvidia-cudnn-cuXX."
+        lib = ctypes.windll.LoadLibrary(lib_path[0])
+    else:  # Fallback
+        lib = ctypes.windll.LoadLibrary("cudnn64_9.dll")
+
+    handle = ctypes.cast(lib._handle, ctypes.c_void_p).value
+    _pybind_module._set_dlhandle_cudnn(handle)
+
+
 def _dlopen_cudnn():
     # First look at python site packages
     lib_path = glob.glob(
@@ -154,7 +189,10 @@ def _dlopen_cudnn():
         lib = ctypes.CDLL("libcudnn.so")
 
     handle = ctypes.cast(lib._handle, ctypes.c_void_p).value
-    _compiled_module._set_dlhandle_cudnn(handle)
+    _pybind_module._set_dlhandle_cudnn(handle)
 
 
-_dlopen_cudnn()
+if is_windows():
+    load_cudnn()
+else:
+    _dlopen_cudnn()

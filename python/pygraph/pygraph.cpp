@@ -306,8 +306,8 @@ std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input, std::string const& name) {
     auto attributes = cudnn_frontend::graph::Reshape_attributes().set_name(name);
 
-    auto OUT = graph.reshape(input, attributes);
-    return OUT;
+    auto OUT_0 = graph.reshape(input, attributes);
+    return OUT_0;
 }
 
 void
@@ -327,10 +327,48 @@ PyGraph::build_operation_graph() {
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
+std::vector<BehaviorNote_t>
+PyGraph::get_behavior_notes() {
+    std::vector<BehaviorNote_t> notes;
+    auto status = graph.get_behavior_notes(notes);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+    return notes;
+}
+
+std::vector<BehaviorNote_t>
+PyGraph::get_behavior_notes_for_plan_at_index(int64_t const index) {
+    std::vector<BehaviorNote_t> notes;
+    auto status = graph.get_behavior_notes_for_plan_at_index(index, notes);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+    return notes;
+}
+
 void
 PyGraph::create_execution_plans(std::vector<cudnn_frontend::HeurMode_t> const& modes) {
     auto status = graph.create_execution_plans(modes);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+void
+PyGraph::create_execution_plan(int64_t const engine_id, std::unordered_map<KnobType_t, int64_t> const& knobs) {
+    auto status = graph.create_execution_plan(engine_id, knobs);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+int64_t
+PyGraph::get_engine_count() {
+    int64_t engine_count = 0;
+    auto status          = graph.get_engine_count(engine_count);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+    return engine_count;
+}
+
+std::vector<Knob>
+PyGraph::get_knobs_for_engine(int64_t const engine_id) {
+    std::vector<Knob> knobs;
+    auto status = graph.get_knobs_for_engine(engine_id, knobs);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+    return knobs;
 }
 
 void
@@ -518,6 +556,7 @@ init_pygraph_submodule(py::module_& m) {
                       cudnn_frontend::DataType_t,
                       std::optional<std::intptr_t>,
                       py::object,
+                      py::object,
                       std::shared_ptr<KernelCache>>(),
              py::arg_v("name", "test_graph"),
              py::arg_v("io_data_type", cudnn_frontend::DataType_t::NOT_SET),
@@ -525,6 +564,7 @@ init_pygraph_submodule(py::module_& m) {
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("handle", std::nullopt),
              py::arg_v("sm_count", py::none()),
+             py::arg_v("sm_version", py::none()),
              py::arg_v("kernel_cache", nullptr))
         .def("tensor_like",
              py::overload_cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const&, std::string const&>(
@@ -767,6 +807,8 @@ init_pygraph_submodule(py::module_& m) {
                 Returns:
                     cudnn_tensor: The result of reshape operation. Please set the dims for the output tensor.
             )pbdoc")
+        .def("get_behavior_notes", &PyGraph::get_behavior_notes)
+        .def("get_behavior_notes_for_plan_at_index", &PyGraph::get_behavior_notes_for_plan_at_index)
         .def("deselect_engines", &PyGraph::deselect_engines)
         .def("deselect_numeric_notes", &PyGraph::deselect_numeric_notes)
         .def("deselect_behavior_notes", &PyGraph::deselect_behavior_notes)
@@ -777,6 +819,22 @@ init_pygraph_submodule(py::module_& m) {
         .def("key", &PyGraph::key)
         .def("build_operation_graph", &PyGraph::build_operation_graph)
         .def("create_execution_plans", &PyGraph::create_execution_plans)
+        .def("create_execution_plan",
+             &PyGraph::create_execution_plan,
+             R"pbdoc(
+                Gets the knob configurations available for the given engine.
+                Args:
+                    engine_id (int): The ID of the engine to create the execution plan on.
+                    knobs (dict[Knob, int]): The map of knobs to knob values.
+            )pbdoc")
+        .def("get_engine_count", &PyGraph::get_engine_count)
+        .def("get_knobs_for_engine",
+             &PyGraph::get_knobs_for_engine,
+             R"pbdoc(
+                Gets the knob configurations available for the given engine.
+                Args:
+                    engine_id (int): The ID of the engine to query knob configurations for.
+            )pbdoc")
         .def("check_support", &PyGraph::check_support)
         .def("build_plans",
              &PyGraph::build_plans,

@@ -73,7 +73,9 @@ TEST_CASE("Conv with Int8 datatypes", "[conv][graph][caching]") {
         return std::make_tuple(graph, X, W, Y);
     };
 
-    cudnnHandle_t handle;
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
 #if (CUDNN_VERSION < 8600)
     SKIP("Conv Int8 requires cudnn 8.6 and up");
@@ -82,8 +84,6 @@ TEST_CASE("Conv with Int8 datatypes", "[conv][graph][caching]") {
     if (check_device_arch_newer_than("ampere") == false) {
         SKIP("Int8 datatype convolutions require Ampere and later architectures");
     }
-
-    CUDNN_CHECK(cudnnCreate(&handle));
 
     auto [graph, X, W, Y] = build_new_graph(handle);
 
@@ -99,5 +99,4 @@ TEST_CASE("Conv with Int8 datatypes", "[conv][graph][caching]") {
     Surface<int8_t> workspace(workspace_size, false);
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
-    cudnnDestroy(handle);
 }

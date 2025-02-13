@@ -1,4 +1,16 @@
-from ._compiled_module import data_type as cudnn_data_type
+import sys
+import importlib
+
+
+def is_windows():
+    return sys.platform.startswith("win")
+
+
+module_name = ".Release._compiled_module" if is_windows() else "._compiled_module"
+
+_pybind_module = importlib.import_module(module_name, package="cudnn")
+
+globals()["cudnn_data_type"] = getattr(_pybind_module, "data_type")
 
 torch_available = None
 _torch_to_cudnn_data_type_dict = None

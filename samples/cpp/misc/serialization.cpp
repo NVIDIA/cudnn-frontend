@@ -40,9 +40,9 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
 
     int64_t n = 8, c = 32, h = 16, w = 16, k = 64, r = 3, s = 3;
 
-    cudnnHandle_t handle;  // Handle to use during deserialize and execute
-
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     auto build_and_validate_graph_helper =
         [](int64_t n, int64_t c, int64_t h, int64_t w, int64_t k, int64_t r, int64_t s)
@@ -103,9 +103,9 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
 
     auto check_support = [build_and_validate_graph_helper](
                              int64_t n, int64_t c, int64_t h, int64_t w, int64_t k, int64_t r, int64_t s) -> bool {
-        cudnnHandle_t handle;
-
-        CUDNN_CHECK(cudnnCreate(&handle));
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle     = *handle_ptr;
 
         auto graph = build_and_validate_graph_helper(n, c, h, w, k, r, s);
 
@@ -115,8 +115,6 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
 
         REQUIRE(graph->check_support(handle).is_good());
 
-        cudnnDestroy(handle);
-
         return true;
     };
 
@@ -125,11 +123,10 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
     auto serialize =
         [build_and_validate_graph_helper](
             int64_t n, int64_t c, int64_t h, int64_t w, int64_t k, int64_t r, int64_t s) -> std::vector<uint8_t> {
-        cudnnHandle_t handle;
-
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle     = *handle_ptr;
         std::vector<uint8_t> serialized_data;
-
-        CUDNN_CHECK(cudnnCreate(&handle));
 
         auto graph = build_and_validate_graph_helper(n, c, h, w, k, r, s);
 
@@ -144,8 +141,6 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
         // Insert auto-tuning logic here
 
         REQUIRE(graph->serialize(serialized_data).is_good());
-
-        cudnnDestroy(handle);
 
         return serialized_data;
     };
@@ -189,8 +184,6 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
                                                        {y_tensor, y_device_memory.devPtr}};
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    cudnnDestroy(handle);
 }
 
 TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
@@ -207,6 +200,9 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
     // Mode of sdpa operation
     bool is_inference = true;
 
+    bool use_causal_mask = true;
+    bool use_alibi_mask  = true;
+
     // attention scale
     bool is_attn_scale   = true;
     float attn_scale_cpu = 0.5f;
@@ -214,6 +210,12 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
     // Dropout configutation
     bool use_dropout_with_rng = true;
     float dropout_probability = 0.1f;
+
+    // switch off certain features on blackwell
+    if (is_blackwell_arch()) {
+        use_dropout_with_rng = false;
+        use_alibi_mask       = false;
+    }
 
     enum UIDs { uid_Q, uid_K, uid_V, uid_ATTN_SCALE, uid_SEED, uid_OFFSET, uid_O, uid_STATS };
 
@@ -225,6 +227,8 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
            int64_t d,
            bool is_attn_scale,
            bool is_inference,
+           bool use_causal_mask,
+           bool use_alibi_mask,
            bool use_dropout_with_rng,
            float dropout_probability) -> std::shared_ptr<cudnn_frontend::graph::Graph> {
         namespace fe = cudnn_frontend;
@@ -262,8 +266,12 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
 
         auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention").set_is_inference(is_inference);
 
-        sdpa_options.set_causal_mask(true);
-        sdpa_options.set_alibi_mask(true);
+        if (use_causal_mask) {
+            sdpa_options.set_diagonal_alignment(cudnn_frontend::DiagonalAlignment_t::TOP_LEFT)
+                .set_diagonal_band_right_bound(0);
+        }
+
+        sdpa_options.set_alibi_mask(use_alibi_mask);
 
         if (is_attn_scale) {
             sdpa_options.set_attn_scale(attn_scale);
@@ -312,22 +320,31 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
                                                            int64_t d,
                                                            bool is_attn_scale,
                                                            bool is_inference,
+                                                           bool use_causal_mask,
+                                                           bool use_alibi_mask,
                                                            bool use_dropout_with_rng,
                                                            float dropout_probability) -> bool {
-        cudnnHandle_t handle;
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle     = *handle_ptr;
 
-        CUDNN_CHECK(cudnnCreate(&handle));
-
-        auto graph = build_and_validate_graph_helper(
-            b, h, s_q, s_kv, d, is_attn_scale, is_inference, use_dropout_with_rng, dropout_probability);
+        auto graph = build_and_validate_graph_helper(b,
+                                                     h,
+                                                     s_q,
+                                                     s_kv,
+                                                     d,
+                                                     is_attn_scale,
+                                                     is_inference,
+                                                     use_causal_mask,
+                                                     use_alibi_mask,
+                                                     use_dropout_with_rng,
+                                                     dropout_probability);
 
         REQUIRE(graph->build_operation_graph(handle).is_good());
 
         REQUIRE(graph->create_execution_plans({cudnn_frontend::HeurMode_t::A}).is_good());
 
         REQUIRE(graph->check_support(handle).is_good());
-
-        cudnnDestroy(handle);
 
         return true;
     };
@@ -339,16 +356,26 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
                                                        int64_t d,
                                                        bool is_attn_scale,
                                                        bool is_inference,
+                                                       bool use_causal_mask,
+                                                       bool use_alibi_mask,
                                                        bool use_dropout_with_rng,
                                                        float dropout_probability) -> std::vector<uint8_t> {
-        cudnnHandle_t handle;
-
+        // Create a unique_ptr for the cuDNN handle
+        auto handle_ptr = create_cudnn_handle();
+        auto handle     = *handle_ptr;
         std::vector<uint8_t> serialized_data;
 
-        CUDNN_CHECK(cudnnCreate(&handle));
-
-        auto graph = build_and_validate_graph_helper(
-            b, h, s_q, s_kv, d, is_attn_scale, is_inference, use_dropout_with_rng, dropout_probability);
+        auto graph = build_and_validate_graph_helper(b,
+                                                     h,
+                                                     s_q,
+                                                     s_kv,
+                                                     d,
+                                                     is_attn_scale,
+                                                     is_inference,
+                                                     use_causal_mask,
+                                                     use_alibi_mask,
+                                                     use_dropout_with_rng,
+                                                     dropout_probability);
 
         REQUIRE(graph->build_operation_graph(handle).is_good());
 
@@ -361,8 +388,6 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
         // Insert auto-tuning logic here
 
         REQUIRE(graph->serialize(serialized_data).is_good());
-
-        cudnnDestroy(handle);
 
         return serialized_data;
     };
@@ -377,14 +402,34 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
     };
 
     // Check support
-    REQUIRE(check_support(b, h, s_q, s_kv, d, is_attn_scale, is_inference, use_dropout_with_rng, dropout_probability));
+    REQUIRE(check_support(b,
+                          h,
+                          s_q,
+                          s_kv,
+                          d,
+                          is_attn_scale,
+                          is_inference,
+                          use_causal_mask,
+                          use_alibi_mask,
+                          use_dropout_with_rng,
+                          dropout_probability));
 
     // Serialize the graph.
-    auto serialize_data =
-        serialize(b, h, s_q, s_kv, d, is_attn_scale, is_inference, use_dropout_with_rng, dropout_probability);
+    auto serialize_data = serialize(b,
+                                    h,
+                                    s_q,
+                                    s_kv,
+                                    d,
+                                    is_attn_scale,
+                                    is_inference,
+                                    use_causal_mask,
+                                    use_alibi_mask,
+                                    use_dropout_with_rng,
+                                    dropout_probability);
 
-    cudnnHandle_t handle;
-    CUDNN_CHECK(cudnnCreate(&handle));
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
 
     auto graph = deserialize(handle, serialize_data);
 
@@ -416,6 +461,4 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
                                                        {uid_O, devPtrO}};
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
-
-    CUDNN_CHECK(cudnnDestroy(handle));
 }

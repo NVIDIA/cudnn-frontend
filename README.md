@@ -1,7 +1,7 @@
 # cuDNN FrontEnd(FE) API
 
 ## Introduction
-The cuDNN FrontEnd(FE) API is a C++ header-only library that wraps the [cuDNN C backend API](https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnn-backend-api). Both the FE and backend APIs are entry points to the same set of functionality that is commonly referred to as the "[graph API](https://docs.nvidia.com/deeplearning/cudnn/latest/developer/graph-api.html#graph-api)".
+The cuDNN FrontEnd(FE) API is a C++ header-only library and python frontend to the [cuDNN C backend API](https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnn-backend-api). Both the FE and backend APIs are entry points to the same set of functionality that is commonly referred to as the "[graph API](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/overview.html)".
 
 While there are two entry points to the graph API (i.e. backend and frontend), it is expected that most users will use the FE API. Reasons being:
 
@@ -10,7 +10,7 @@ While there are two entry points to the graph API (i.e. backend and frontend), i
 
 Also, for those using backend API, FE API source and samples can serve as reference implementation.
 
-In FE v1.0 API, users can describe multiple operations that form subgraph through a persistent `cudnn_frontend::graph::Graph` object. Unlike the FE v0.x API, users don't need to worry about specifying shapes and sizes of the intermediate virtual tensors. FE v1.0 API extends the groundwork of earlier versions and introduces a new set of APIs to further simplify the workflow.  For detailed information of FE v1.0 API, see [README.FE.1.0.md](README.FE.1.0.md).
+In FE v1.0 API, users can describe multiple operations that form subgraph through a persistent `cudnn_frontend::graph::Graph` object. FE v1.0 API extends the groundwork of earlier versions and introduces a new set of APIs to further simplify the workflow.  For detailed information of FE v1.0 API, please refer to the [documentation](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/).
 
 Additionally, FE v1.0 API provides python bindings to all API through pybind11. It is recommended that new users of cuDNN start with the frontend v1.0 API. See `samples/cpp` and `samples/python` for more details on its usage.
 
@@ -21,6 +21,8 @@ For Python users, run `import cudnn`
 
 ## Build:
 
+Please refer to the [frontend installation guide](https://docs.nvidia.com/deeplearning/cudnn/installation/latest/frontend.html)
+
 ### Dependencies
 With the release of v1.0, we are bumping up the minimum supported cudnn version to 8.5.0
 
@@ -30,7 +32,7 @@ cudnn can be installed from
     - [nvidia dev-zone](https://developer.nvidia.com/cudnn)
     - [pypi wheels](https://pypi.org/project/nvidia-cudnn-cu12/)
 
-Minimum python version needed 3.6
+Minimum python version needed 3.8
 The python binding compilation requires development package which can be installed by running `apt-get install python-dev`.
 
 To run the Python samples, you will need the dependencies mentioned in `requirements.txt`. This can be be installed by running:
@@ -117,8 +119,7 @@ Calling `cudnn_frontend::getStream() = stream_name` can be used to assign the ou
 For further debugging, please turn on the cudnn backend logs described here https://docs.nvidia.com/deeplearning/cudnn/latest/reference/troubleshooting.html#error-reporting-and-api-logging
 
 ## Documentation
-- See [README.FE.1.0.md](README.FE.1.0.md) for v1.0 API documentation.
-- See [README.FE.0.x.md](README.FE.0.x.md) for v0.x API documentation.
+The developer guide and API reference can be found [https://docs.nvidia.com/deeplearning/cudnn/frontend/v1.9.0/developer/overview.html](https://docs.nvidia.com/deeplearning/cudnn/latest/index.html).
 
 ## Contributing:
 Please refer to our [contribution guide](CONTRIBUTING.md)
