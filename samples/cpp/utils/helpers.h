@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cudnn_ops_infer.h>
 
 #include <catch2/catch_test_macros.hpp>
 
