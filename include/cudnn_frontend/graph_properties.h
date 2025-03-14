@@ -265,6 +265,7 @@ class Tensor_attributes {
 
 class Batchnorm_attributes;
 class Batchnorm_backward_attributes;
+class Concatenate_attributes;
 
 template <typename DerivedT>
 class Attributes {
@@ -282,15 +283,27 @@ class Attributes {
     get_non_virtual_uids() const {
         std::vector<int64_t> non_virtual_uids;
         auto derived = static_cast<DerivedT const*>(this);
-        for (auto& [name, tensor] : derived->inputs) {
-            (void)name;
-            if (tensor && tensor->get_is_virtual() == false) {
-                non_virtual_uids.push_back(tensor->get_uid());
-                if (auto ragged_offset = tensor->get_ragged_offset()) {
-                    non_virtual_uids.push_back(ragged_offset->get_uid());
+        if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
+            for (auto tensor : derived->inputs) {
+                if (tensor && tensor->get_is_virtual() == false) {
+                    non_virtual_uids.push_back(tensor->get_uid());
+                    if (auto ragged_offset = tensor->get_ragged_offset()) {
+                        non_virtual_uids.push_back(ragged_offset->get_uid());
+                    }
+                }
+            }
+        } else {
+            for (auto& [name, tensor] : derived->inputs) {
+                (void)name;
+                if (tensor && tensor->get_is_virtual() == false) {
+                    non_virtual_uids.push_back(tensor->get_uid());
+                    if (auto ragged_offset = tensor->get_ragged_offset()) {
+                        non_virtual_uids.push_back(ragged_offset->get_uid());
+                    }
                 }
             }
         }
+
         for (auto& [name, tensor] : derived->outputs) {
             (void)name;
             if (tensor && tensor->get_is_virtual() == false) {
@@ -322,10 +335,18 @@ class Attributes {
     fill_pass_by_value(std::unordered_map<Tensor_attributes::uid_t, Tensor_attributes::pass_by_values_t>&
                            tensor_to_pass_by_value) const {
         auto derived = static_cast<DerivedT const*>(this);
-        for (auto& [name, tensor] : derived->inputs) {
-            (void)name;
-            if (tensor && tensor->get_pass_by_value().has_value()) {
-                tensor_to_pass_by_value.emplace(tensor->get_uid(), tensor->get_pass_by_value().value());
+        if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
+            for (auto& tensor : derived->inputs) {
+                if (tensor && tensor->get_pass_by_value().has_value()) {
+                    tensor_to_pass_by_value.emplace(tensor->get_uid(), tensor->get_pass_by_value().value());
+                }
+            }
+        } else {
+            for (auto& [name, tensor] : derived->inputs) {
+                (void)name;
+                if (tensor && tensor->get_pass_by_value().has_value()) {
+                    tensor_to_pass_by_value.emplace(tensor->get_uid(), tensor->get_pass_by_value().value());
+                }
             }
         }
 
@@ -335,10 +356,19 @@ class Attributes {
     void
     fill_from_context(detail::Context const& context) {
         auto derived = static_cast<DerivedT const*>(this);
-        for (auto& [name, tensor] : derived->inputs) {
-            (void)name;
-            if (tensor) {
-                tensor->fill_from_context(context);
+
+        if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
+            for (auto& tensor : derived->inputs) {
+                if (tensor) {
+                    tensor->fill_from_context(context);
+                }
+            }
+        } else {
+            for (auto& [name, tensor] : derived->inputs) {
+                (void)name;
+                if (tensor) {
+                    tensor->fill_from_context(context);
+                }
             }
         }
         for (auto& [name, tensor] : derived->outputs) {
@@ -365,11 +395,20 @@ class Attributes {
         // Pick number of dimensions from anyone of non-fused-scalar input/output tensors
         // In case, all tensors are fused scalars, just keep them 1D.
         int64_t number_of_dims = 1;
-        for (auto [name, tensor] : derived->inputs) {
-            (void)name;
-            if (tensor && (tensor->get_pass_by_value().has_value() == false)) {
-                number_of_dims = tensor->get_dim().size();
-                break;
+        if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
+            for (auto tensor : derived->inputs) {
+                if (tensor && (tensor->get_pass_by_value().has_value() == false)) {
+                    number_of_dims = tensor->get_dim().size();
+                    break;
+                }
+            }
+        } else {
+            for (auto [name, tensor] : derived->inputs) {
+                (void)name;
+                if (tensor && (tensor->get_pass_by_value().has_value() == false)) {
+                    number_of_dims = tensor->get_dim().size();
+                    break;
+                }
             }
         }
 
@@ -384,11 +423,20 @@ class Attributes {
             }
         }
 
-        for (auto [name, tensor] : derived->inputs) {
-            (void)name;
-            if (tensor && tensor->get_pass_by_value().has_value()) {
-                tensor->set_dim(std::vector<int64_t>(number_of_dims, 1));
-                tensor->set_stride(std::vector<int64_t>(number_of_dims, 1));
+        if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
+            for (auto tensor : derived->inputs) {
+                if (tensor && tensor->get_pass_by_value().has_value()) {
+                    tensor->set_dim(std::vector<int64_t>(number_of_dims, 1));
+                    tensor->set_stride(std::vector<int64_t>(number_of_dims, 1));
+                }
+            }
+        } else {
+            for (auto [name, tensor] : derived->inputs) {
+                (void)name;
+                if (tensor && tensor->get_pass_by_value().has_value()) {
+                    tensor->set_dim(std::vector<int64_t>(number_of_dims, 1));
+                    tensor->set_stride(std::vector<int64_t>(number_of_dims, 1));
+                }
             }
         }
     }
@@ -1412,7 +1460,8 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     using Tensor_t = std::shared_ptr<Tensor_attributes>;
     using Graph_t  = std::shared_ptr<Graph>;
 
-    using AttentionScoreModifier_t = std::function<Tensor_t(Graph_t, Tensor_t)>;
+    using AttentionScoreModifier_t =
+        std::function<Tensor_t(std::shared_ptr<Graph>, std::shared_ptr<Tensor_attributes>)>;
 
     std::optional<bool> is_inference;
     bool alibi_mask   = false;
@@ -1747,7 +1796,8 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     using Tensor_t = std::shared_ptr<Tensor_attributes>;
     using Graph_t  = std::shared_ptr<Graph>;
 
-    using AttentionScoreModifier_t = std::function<Tensor_t(Graph_t, Tensor_t)>;
+    using AttentionScoreModifier_t =
+        std::function<Tensor_t(std::shared_ptr<Graph>, std::shared_ptr<Tensor_attributes>)>;
 
     bool alibi_mask   = false;
     bool padding_mask = false;
@@ -2335,6 +2385,44 @@ class Block_scale_dequantize_attributes : public Attributes<Block_scale_dequanti
     Block_scale_dequantize_attributes&
     set_block_size(int32_t const value) {
         block_size = value;
+        return *this;
+    }
+};
+
+#if 0
+class Concatenate_string {
+    friend class Attributes<Concatenate_attributes>;
+    friend class ConcatenateNode;
+    friend class Graph;
+public:
+std::string str;
+NLOHMANN_DEFINE_TYPE_INTRUSIVE(Concatenate_string, str)
+};
+#endif
+
+class Concatenate_attributes : public Attributes<Concatenate_attributes> {
+    friend class Attributes<Concatenate_attributes>;
+    friend class ConcatenateNode;
+    friend class Graph;
+
+    std::optional<int64_t> axis;
+    std::optional<int64_t> in_place_index;
+
+   public:
+    std::vector<std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { Y };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Concatenate_attributes, name, inputs, outputs, axis, in_place_index)
+
+    Concatenate_attributes&
+    set_axis(int64_t const value) {
+        axis = value;
+        return *this;
+    }
+
+    Concatenate_attributes&
+    set_in_place_index(int64_t const value) {
+        in_place_index = value;
         return *this;
     }
 };

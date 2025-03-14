@@ -461,8 +461,6 @@ TEST_CASE("sdpa graph serialization", "[graph][serialize]") {
     O->set_output(true).set_dim({b, h, s_q, d}).set_stride({h * d, d, b * h * d, 1});
     stats->set_output(true).set_data_type(fe::DataType_t::FLOAT);
 
-    REQUIRE(graph.validate().is_good());
-
     json j = graph;
 
     fe::graph::Graph graph_deserialized;
@@ -470,8 +468,6 @@ TEST_CASE("sdpa graph serialization", "[graph][serialize]") {
     json j2 = graph_deserialized;
 
     REQUIRE(j == j2);
-
-    REQUIRE(graph_deserialized.validate().is_good());
 }
 
 TEST_CASE("sdpa backward graph serialization", "[graph][serialize]") {

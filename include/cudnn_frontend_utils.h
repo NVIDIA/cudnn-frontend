@@ -455,7 +455,8 @@ enum class DescriptorType_t {
     OPERATION_RNG_DESCRIPTOR,
     OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR,
     OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR,
-    OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR
+    OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR,
+    OPERATION_CONCATENATE_DESCRIPTOR
 };
 
 enum class NormMode_t {
@@ -915,6 +916,9 @@ operator<<(std::ostream& os, const DescriptorType_t& mode) {
             break;
         case DescriptorType_t::OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR:
             os << "OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR";
+            break;
+        case DescriptorType_t::OPERATION_CONCATENATE_DESCRIPTOR:
+            os << "OPERATION_CONCATENATE_DESCRIPTOR";
             break;
         case DescriptorType_t::NOT_SET:
             os << "NOT_SET";
@@ -1567,6 +1571,14 @@ convert_to_cudnn_type(cudnn_frontend::DescriptorType_t const mode, cudnnBackendD
 #if (CUDNN_VERSION >= 90700)  // TODO: v9.99 is new feature branch; switch to release branch when ready
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90700, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
             cudnn_mode = CUDNN_BACKEND_OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
+        case DescriptorType_t::OPERATION_CONCATENATE_DESCRIPTOR:
+#if (CUDNN_VERSION >= 90700)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90700, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_BACKEND_OPERATION_CONCAT_DESCRIPTOR;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
 #else
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;

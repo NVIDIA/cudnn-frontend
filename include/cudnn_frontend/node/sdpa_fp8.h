@@ -110,13 +110,15 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
 
         // validate basic dimension requirements
         if (prop.major >= 10) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 16 != 0) || (d_v > 128) || (d_v % 16 != 0),
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "hidden_dim shoud be less than 128 and hidden_dim should be multiple of 16");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                (d_qk > 128) || (d_qk % 16 != 0) || (d_v > 128) || (d_v % 16 != 0),
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "hidden_dim shoud be less than or equal to 128 and hidden_dim should be multiple of 16");
         } else {
-            RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 256) || (d_qk % 16 != 0) || (d_v > 256) || (d_v % 16 != 0),
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "hidden_dim shoud be less than 256 and hidden_dim should be multiple of 16");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                (d_qk > 256) || (d_qk % 16 != 0) || (d_v > 256) || (d_v % 16 != 0),
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "hidden_dim shoud be less than or equal to 256 and hidden_dim should be multiple of 16");
         }
         RETURN_CUDNN_FRONTEND_ERROR_IF((h_q % h_k != 0) || (h_q % h_v != 0),
                                        error_code_t::GRAPH_NOT_SUPPORTED,

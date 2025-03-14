@@ -470,6 +470,11 @@ NLOHMANN_JSON_SERIALIZE_ENUM(Block_scale_dequantize_attributes::output_names,
                                  {Block_scale_dequantize_attributes::output_names::Y, "Y"},
                              })
 
+NLOHMANN_JSON_SERIALIZE_ENUM(Concatenate_attributes::output_names,
+                             {
+                                 {Concatenate_attributes::output_names::Y, "Y"},
+                             })
+
 inline void
 to_json(nlohmann::json& j, const Tensor_attributes& ta) {
     j = nlohmann::json{{"name", ta.name},

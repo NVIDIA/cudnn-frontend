@@ -233,9 +233,9 @@ class SDPANode : public NodeCRTP<SDPANode> {
                      attributes.left_bound.has_value()),error_code_t::GRAPH_NOT_SUPPORTED, "Attention score mod enabled and hence other subgraphs are disabled.");
 
         // validate basic dimension requirements
-        RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 256) || (d_qk % 8 != 0) || (d_v > 256) || (d_v % 8 != 0),
+        RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk % 8 != 0) || (d_v % 8 != 0),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "hidden_dim shoud be less than 256 and hidden_dim should be multiple of 8");
+                                        "hidden_dim should be multiple of 8");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF((h_q % h_k != 0) || (h_q % h_v != 0),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -261,8 +261,8 @@ class SDPANode : public NodeCRTP<SDPANode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(is_bias && detail::get_backend_version() < 8906, error_code_t::GRAPH_NOT_SUPPORTED, "Bias mask is not  supported below cudnn version  8.9.6");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF((detail::get_backend_version() >= 8906 && detail::get_backend_version() < 90000) &&
-             (context.get_sm_version() > 0 && context.get_sm_version() < 90), error_code_t::GRAPH_NOT_SUPPORTED,
-            "Post scale Bias mask is not supported below Hopper for cudnn version" + std::to_string(detail::get_backend_version()));
+                                       (context.get_sm_version() > 0 && context.get_sm_version() < 90), error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Post scale Bias mask is not supported below Hopper for cudnn version" + std::to_string(detail::get_backend_version()));
 
         // validate options for padding mask
         auto const& seq_len_q     = attributes.inputs.find(input_names::SEQ_LEN_Q);
@@ -276,7 +276,7 @@ class SDPANode : public NodeCRTP<SDPANode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.padding_mask && (!has_seq_len_q || !has_seq_len_kv),
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Padding mask requires seq_len_q and seq_len_kv to be set.");
-        RETURN_CUDNN_FRONTEND_ERROR_IF((!attributes.padding_mask) && (has_seq_len_q || has_seq_len_kv),
+        RETURN_CUDNN_FRONTEND_ERROR_IF((!attributes.padding_mask && !attributes.attention_score_modifier) && (has_seq_len_q || has_seq_len_kv),
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "seq_len_q and seq_len_kv needs to be set only if padding mask is enabled.");
 
@@ -285,9 +285,9 @@ class SDPANode : public NodeCRTP<SDPANode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (detail::get_backend_version() < 90300), error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Causal bottom right masking requires cudnn 9.3.0 and above");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && s_q > s_kv,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (!attributes.padding_mask) && s_q > s_kv,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Bottom right causal mask does not support s_q > s_kv. Please virtually slice the Q tensor and pass it as s_q == s_kv");
+                                       "Bottom right causal mask does not support max_s_q > max_s_kv. Please virtually slice the Q tensor and pass it as max_s_q == max_s_kv");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (is_bias || attributes.alibi_mask || (is_ragged && !attributes.padding_mask) || is_dropout),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -311,9 +311,9 @@ class SDPANode : public NodeCRTP<SDPANode> {
                                        error_code_t::INVALID_VALUE,
                                        "Left bound (Sliding window length) should be greater than zero when set.");
                                        
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && s_q > s_kv,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && (!attributes.padding_mask) && s_q > s_kv,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Sliding window attention is only supported with s_q <= s_kv.");
+                                       "Sliding window attention is only supported with max_s_q <= max_s_kv.");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && (! attributes.has_causal_like_masking() || is_dropout || is_bias || (is_ragged && !attributes.padding_mask)),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -333,11 +333,11 @@ class SDPANode : public NodeCRTP<SDPANode> {
                                        "Dropout probability cannot be 1 as corresponding scale wont be well formed.");
 
         // validate options for paged attention
-        RETURN_CUDNN_FRONTEND_ERROR_IF(is_paged && is_ragged,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(is_paged && is_ragged && detail::get_backend_version() < 90700,
             error_code_t::GRAPH_NOT_SUPPORTED,
             "Paged caches are not supported in combination with ragged offsets.");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(is_paged && (!has_seq_len_q || !has_seq_len_kv || !attributes.padding_mask),
+        RETURN_CUDNN_FRONTEND_ERROR_IF(is_paged && (!has_seq_len_q || !has_seq_len_kv),
             error_code_t::GRAPH_NOT_SUPPORTED,
             "Paged caches can only be used in combination with padding mask and variable sequence lengths for both Q and KV.");
 
@@ -367,6 +367,18 @@ class SDPANode : public NodeCRTP<SDPANode> {
         // (cudnn_runtime_version < 8907 && num_attn_heads == num_gqa_groups FIXME
 
         // version specific validation
+        if(prop.major < 10) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 256) || (d_v > 256),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "hidden_dim should be less than or equal to 256");
+        }
+        if((detail::get_backend_version() < 90900) && (prop.major == 10)) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_v > 128),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "hidden_dim should be less than or equal to 128");
+        }
+
+
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 8906 && ((s_kv % 64 != 0) || (d_qk % 64 != 0)),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "For cuDNN version below 8.9.6, s_kv not a multiple of 64 or d not a multiple of 64 is not supported");
@@ -381,12 +393,12 @@ class SDPANode : public NodeCRTP<SDPANode> {
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90000 && ((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0)),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "For cuDNN version below 9.0.0, hidden_dim shoud be less than 128 and hidden_dim should be multiple of 8");
+                                       "For cuDNN version below 9.0.0, hidden_dim shoud be less than or equal to 128 and hidden_dim should be multiple of 8");
 
         // sm_arch_ >= 90 FIXME
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() >= 90000 && ((d_qk > 256) || (d_qk % 8 != 0) || (d_v > 256) || (d_v % 8 != 0)),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "For cuDNN version above 9.0.0, hidden_dim shoud be less than 256 and hidden_dim should be multiple of 8");
+                                       "For cuDNN version above 9.0.0, hidden_dim shoud be less than or equal to 256 and hidden_dim should be multiple of 8");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90200 && attributes.left_bound.has_value(),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -552,7 +564,7 @@ class SDPANode : public NodeCRTP<SDPANode> {
         }
 
         // There are two cases of applying padding mask
-        // 1. when actual seq_len is less than max_seq_len
+        // 1. when actual seq_len is less than or equal to max_seq_len
         if (attributes.padding_mask) {
             auto graph_                  = std::make_shared<Graph>();
             std::shared_ptr<INode> node_ = std::static_pointer_cast<INode>(graph_);
@@ -896,12 +908,12 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
             // validate basic dimension requirements
             RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 256) || (d_qk % 8 != 0) || (d_v > 256) || (d_v % 8 != 0),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Num hidden_dim shoud be less than 256 and hidden_dim should be multiple of 8");
+                                        "Num hidden_dim shoud be less than or equal to 256 and hidden_dim should be multiple of 8");
         } else {
             // validate basic dimension requirements
             RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Num hidden_dim shoud be less than 128 and hidden_dim should be multiple of 8");
+                                        "Num hidden_dim shoud be less than or equal to 128 and hidden_dim should be multiple of 8");
         }
 
         RETURN_CUDNN_FRONTEND_ERROR_IF((attributes.attention_score_modifier != nullptr) &&
@@ -937,7 +949,7 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.padding_mask && (!has_seq_len_q || !has_seq_len_kv),
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Padding mask requires seq_len_q and seq_len_kv to be set.");
-        RETURN_CUDNN_FRONTEND_ERROR_IF((!attributes.padding_mask) && (has_seq_len_q || has_seq_len_kv),
+        RETURN_CUDNN_FRONTEND_ERROR_IF((!attributes.padding_mask && !attributes.attention_score_modifier) && (has_seq_len_q || has_seq_len_kv),
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "seq_len_q and seq_len_kv needs to be set only if padding mask is enabled.");
 
@@ -947,9 +959,9 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                                        "max_total_seq_len_q is only supported with packed layout");
 
         // validate options for bottom right causal mask
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && s_q > s_kv,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (!attributes.padding_mask) && s_q > s_kv,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Bottom right causal mask does not support s_q > s_kv. Please virtually slice the Q tensor and pass it as s_q == s_kv");
+                                       "Bottom right causal mask does not support max_s_q > max_s_kv. Please virtually slice the Q tensor and pass it as max_s_q == max_s_kv");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (is_bias || attributes.alibi_mask || (is_ragged && !attributes.padding_mask) || is_dropout),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -964,9 +976,9 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                                        error_code_t::INVALID_VALUE,
                                        "Left bound (Sliding window length) should be greater than or equals to zero when set.");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && s_q > s_kv,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && (!attributes.padding_mask) && s_q > s_kv,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Sliding window attention is only supported with s_q <= s_kv.");
+                                       "Sliding window attention is only supported with max_s_q <= max_s_kv.");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value()&& (! attributes.has_causal_like_masking() || is_dropout || is_bias || (is_ragged && !attributes.padding_mask)),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -1472,9 +1484,11 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
         last_output->set_dim({b, h_q, s_q, s_kv}).set_stride({h_q * s_q * s_kv, s_q * s_kv, s_kv, 1});
 
         // last_output = last_output(dP) * mask
-        last_output = pointwise(last_output,
-                                (is_dropout_prob || is_dropout_mask) ? rng_output : one_tensor,
-                                Pointwise_attributes().set_name("dP_dropout_mask").set_mode(PointwiseMode_t::MUL));
+        if (is_dropout_prob || is_dropout_mask) {
+            last_output = pointwise(last_output,
+                                    rng_output,
+                                    Pointwise_attributes().set_name("dP_dropout_mask").set_mode(PointwiseMode_t::MUL));
+        }
 
         // last_output = last_output - softmax_sum
         last_output = pointwise(last_output,

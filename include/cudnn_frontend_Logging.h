@@ -40,8 +40,12 @@ get_environment(const char *name) {
 
 inline bool &
 isLoggingEnabled() {
+#ifdef NV_CUDNN_FRONTEND_DISABLE_LOGGING
+    static bool log_enabled = false;
+#else
     static bool log_enabled =
         get_environment("CUDNN_FRONTEND_LOG_INFO") && std::strncmp(get_environment("CUDNN_FRONTEND_LOG_INFO"), "0", 1);
+#endif
     return log_enabled;
 }
 

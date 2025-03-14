@@ -94,12 +94,12 @@ PyGraph::tensor(std::vector<int64_t> const& dim,
                      .set_ragged_offset(ragged_offset)
                      .set_name(name);
 
-    return graph.tensor(props);
+    return graph->tensor(props);
 }
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::tensor_like(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& tensor, std::string const& name) {
-    return graph.tensor_like(tensor, name);
+    return graph->tensor_like(tensor, name);
 }
 
 static std::intptr_t
@@ -167,7 +167,7 @@ PyGraph::tensor_like(py::object const& pyobj) {
         props.set_stride(stride);
     }
 
-    return graph.tensor(props);
+    return graph->tensor(props);
 }
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
@@ -191,7 +191,7 @@ PyGraph::slice(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
 
-    auto output = graph.slice(input, attributes);
+    auto output = graph->slice(input, attributes);
     return output;
 }
 
@@ -214,7 +214,7 @@ PyGraph::conv_fprop(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& i
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
 
-    auto Y = graph.conv_fprop(image, weight, attributes);
+    auto Y = graph->conv_fprop(image, weight, attributes);
     return Y;
 }
 
@@ -236,7 +236,7 @@ PyGraph::conv_dgrad(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& l
                           .set_convolution_mode(conv_mode)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
-    auto DX = graph.conv_dgrad(loss, filter, attributes);
+    auto DX = graph->conv_dgrad(loss, filter, attributes);
     return DX;
 }
 
@@ -258,7 +258,7 @@ PyGraph::conv_wgrad(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& i
                           .set_convolution_mode(conv_mode)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
-    auto DW = graph.conv_wgrad(loss, image, attributes);
+    auto DW = graph->conv_wgrad(loss, image, attributes);
     return DW;
 }
 
@@ -273,7 +273,7 @@ PyGraph::matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& A,
                           .set_name(name)
                           .set_padding(padding);
 
-    auto C = graph.matmul(A, B, attributes);
+    auto C = graph->matmul(A, B, attributes);
     return C;
 }
 
@@ -284,7 +284,7 @@ PyGraph::genstats(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& inp
     auto attributes =
         cudnn_frontend::graph::Genstats_attributes().set_compute_data_type(compute_data_type).set_name(name);
 
-    auto [SUM, SQ_SUM] = graph.genstats(input, attributes);
+    auto [SUM, SQ_SUM] = graph->genstats(input, attributes);
     return {SUM, SQ_SUM};
 }
 
@@ -298,7 +298,7 @@ PyGraph::reduction(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& in
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
 
-    auto OUT_0 = graph.reduction(input, attributes);
+    auto OUT_0 = graph->reduction(input, attributes);
     return OUT_0;
 }
 
@@ -306,31 +306,31 @@ std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input, std::string const& name) {
     auto attributes = cudnn_frontend::graph::Reshape_attributes().set_name(name);
 
-    auto OUT_0 = graph.reshape(input, attributes);
+    auto OUT_0 = graph->reshape(input, attributes);
     return OUT_0;
 }
 
 void
 PyGraph::validate() {
-    auto status = graph.validate();
+    auto status = graph->validate();
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
 size_t
 PyGraph::key() {
-    return graph.key();
+    return graph->key();
 }
 
 void
 PyGraph::build_operation_graph() {
-    auto status = graph.build_operation_graph(handle);
+    auto status = graph->build_operation_graph(handle);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
 std::vector<BehaviorNote_t>
 PyGraph::get_behavior_notes() {
     std::vector<BehaviorNote_t> notes;
-    auto status = graph.get_behavior_notes(notes);
+    auto status = graph->get_behavior_notes(notes);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
     return notes;
 }
@@ -338,27 +338,27 @@ PyGraph::get_behavior_notes() {
 std::vector<BehaviorNote_t>
 PyGraph::get_behavior_notes_for_plan_at_index(int64_t const index) {
     std::vector<BehaviorNote_t> notes;
-    auto status = graph.get_behavior_notes_for_plan_at_index(index, notes);
+    auto status = graph->get_behavior_notes_for_plan_at_index(index, notes);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
     return notes;
 }
 
 void
 PyGraph::create_execution_plans(std::vector<cudnn_frontend::HeurMode_t> const& modes) {
-    auto status = graph.create_execution_plans(modes);
+    auto status = graph->create_execution_plans(modes);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
 void
 PyGraph::create_execution_plan(int64_t const engine_id, std::unordered_map<KnobType_t, int64_t> const& knobs) {
-    auto status = graph.create_execution_plan(engine_id, knobs);
+    auto status = graph->create_execution_plan(engine_id, knobs);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
 int64_t
 PyGraph::get_engine_count() {
     int64_t engine_count = 0;
-    auto status          = graph.get_engine_count(engine_count);
+    auto status          = graph->get_engine_count(engine_count);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
     return engine_count;
 }
@@ -366,7 +366,7 @@ PyGraph::get_engine_count() {
 std::vector<Knob>
 PyGraph::get_knobs_for_engine(int64_t const engine_id) {
     std::vector<Knob> knobs;
-    auto status = graph.get_knobs_for_engine(engine_id, knobs);
+    auto status = graph->get_knobs_for_engine(engine_id, knobs);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
     return knobs;
 }
@@ -374,13 +374,13 @@ PyGraph::get_knobs_for_engine(int64_t const engine_id) {
 void
 PyGraph::build_plans(BuildPlanPolicy_t const policy) {
     // TODO: Add multithreaded support in python
-    auto status = graph.build_plans(handle, policy, false);
+    auto status = graph->build_plans(handle, policy, false);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
 void
 PyGraph::build_plan_at_index(int64_t const index) {
-    auto status = graph.build_plan_at_index(handle, index);
+    auto status = graph->build_plan_at_index(handle, index);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
@@ -394,8 +394,14 @@ PyGraph::build(std::vector<cudnn_frontend::HeurMode_t> const& modes) {
 }
 
 void
+PyGraph::build() {
+    validate();
+    build_operation_graph();
+}
+
+void
 PyGraph::check_support() {
-    auto status = graph.check_support(handle);
+    auto status = graph->check_support(handle);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
@@ -403,7 +409,7 @@ int64_t
 PyGraph::get_workspace_size() {
     int64_t workspace = 0;
 
-    auto status = graph.get_workspace_size(workspace);
+    auto status = graph->get_workspace_size(workspace);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     return workspace;
@@ -413,7 +419,7 @@ int64_t
 PyGraph::get_workspace_size_plan_at_index(int64_t index) {
     int64_t workspace;
 
-    auto status = graph.get_workspace_size_plan_at_index(index, workspace);
+    auto status = graph->get_workspace_size_plan_at_index(index, workspace);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     return workspace;
@@ -422,7 +428,7 @@ PyGraph::get_workspace_size_plan_at_index(int64_t index) {
 std::vector<uint8_t>
 PyGraph::serialize() const {
     std::vector<uint8_t> data;
-    auto status = graph.serialize(data);
+    auto status = graph->serialize(data);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
     return data;
 }
@@ -432,13 +438,13 @@ PyGraph::deserialize(py::object const& pyobj) {
     if (py::isinstance<py::str>(pyobj)) {
         json j = json::parse(pyobj.cast<std::string>());
 
-        auto status = graph.deserialize(j);
+        auto status = graph->deserialize(j);
 
         throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     } else {
         std::vector<uint8_t> data = pyobj.cast<std::vector<uint8_t>>();
-        auto status               = graph.deserialize(handle, data);
+        auto status               = graph->deserialize(handle, data);
 
         throw_if(status.is_bad(), status.get_code(), status.get_message());
     }
@@ -455,10 +461,10 @@ PyGraph::update_cuda_graph(std::intptr_t handle,
         var_pack_.emplace(uid, (void*)device_pointer);
     }
 
-    auto status = graph.update_cuda_graph(reinterpret_cast<cudnnHandle_t>(handle),
-                                          var_pack_,
-                                          reinterpret_cast<void*>(workspace),
-                                          reinterpret_cast<cudaGraph_t>(cuda_graph));
+    auto status = graph->update_cuda_graph(reinterpret_cast<cudnnHandle_t>(handle),
+                                           var_pack_,
+                                           reinterpret_cast<void*>(workspace),
+                                           reinterpret_cast<cudaGraph_t>(cuda_graph));
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     return;
@@ -476,10 +482,10 @@ PyGraph::populate_cuda_graph(
         var_pack_.emplace(uid, (void*)device_pointer);
     }
 
-    auto status = graph.populate_cuda_graph(reinterpret_cast<cudnnHandle_t>(handle),
-                                            var_pack_,
-                                            reinterpret_cast<void*>(workspace),
-                                            reinterpret_cast<cudaGraph_t>(cuda_graph));
+    auto status = graph->populate_cuda_graph(reinterpret_cast<cudnnHandle_t>(handle),
+                                             var_pack_,
+                                             reinterpret_cast<void*>(workspace),
+                                             reinterpret_cast<cudaGraph_t>(cuda_graph));
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     return;
@@ -499,7 +505,7 @@ PyGraph::execute(std::unordered_map<int64_t, std::intptr_t> var_pack,
 
     cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
 
-    auto status = graph.execute(handle_, var_pack_, workspace_ptr);
+    auto status = graph->execute(handle_, var_pack_, workspace_ptr);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     return;
@@ -519,7 +525,7 @@ PyGraph::execute_plan_at_index(std::unordered_map<int64_t, std::intptr_t> var_pa
 
     cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
 
-    auto status = graph.execute_plan_at_index(handle_, var_pack_, workspace_ptr, index);
+    auto status = graph->execute_plan_at_index(handle_, var_pack_, workspace_ptr, index);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     return;
@@ -528,7 +534,7 @@ PyGraph::execute_plan_at_index(std::unordered_map<int64_t, std::intptr_t> var_pa
 std::shared_ptr<graph::Tensor_attributes>
 PyGraph::query_tensor_attributes_of_uid(int64_t const uid) const {
     graph::Tensor_attributes tensor;
-    auto status = graph.query_tensor_attributes_of_uid(uid, tensor);
+    auto status = graph->query_tensor_attributes_of_uid(uid, tensor);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
     return std::make_shared<graph::Tensor_attributes>(tensor);
 }
@@ -536,7 +542,7 @@ PyGraph::query_tensor_attributes_of_uid(int64_t const uid) const {
 std::string
 PyGraph::get_plan_name_at_index(int64_t index) {
     std::string plan_name;
-    auto status = graph.get_plan_name_at_index(index, plan_name);
+    auto status = graph->get_plan_name_at_index(index, plan_name);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
     return plan_name;
 }
@@ -598,7 +604,7 @@ init_pygraph_submodule(py::module_& m) {
                 Args:
                     input (cudnn_tensor): The input tensor to be sliced.
                     slices (List[slice]): A list of Python slice objects, one for each dimension.
-                    compute_data_type (Optional[cudnn.data_type]): The data type for computation. 
+                    compute_data_type (Optional[cudnn.data_type]): The data type for computation.
                         Default is NOT_SET.
                     name (Optional[str]): A name for the slice operation.
 
@@ -847,7 +853,8 @@ init_pygraph_submodule(py::module_& m) {
                 Args:
                     index (int): The index of the plan to build.
             )pbdoc")
-        .def("build", &PyGraph::build)
+        .def("build", (void(PyGraph::*)(std::vector<cudnn_frontend::HeurMode_t> const&)) & PyGraph::build)
+        .def("build", (void(PyGraph::*)()) & PyGraph::build)
         .def("get_execution_plan_count",
              &PyGraph::get_execution_plan_count,
              R"pbdoc(

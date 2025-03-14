@@ -23,7 +23,7 @@ PyGraph::pointwise_ternary(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
                           .set_mode(MODE)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
-    return graph.pointwise(a, b, c, attributes);
+    return graph->pointwise(a, b, c, attributes);
 }
 
 template <cudnn_frontend::PointwiseMode_t MODE>
@@ -36,7 +36,7 @@ PyGraph::pointwise_binary(std::shared_ptr<cudnn_frontend::graph::Tensor_attribut
                           .set_mode(MODE)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
-    return graph.pointwise(a, b, attributes);
+    return graph->pointwise(a, b, attributes);
 }
 
 template <cudnn_frontend::PointwiseMode_t MODE>
@@ -48,7 +48,7 @@ PyGraph::pointwise_unary(std::shared_ptr<cudnn_frontend::graph::Tensor_attribute
                           .set_mode(MODE)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
-    return graph.pointwise(a, attributes);
+    return graph->pointwise(a, attributes);
 }
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
@@ -75,7 +75,7 @@ PyGraph::relu(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
         attributes.set_relu_upper_clip(upper_clip.value());
     }
 
-    auto OUT_0 = graph.pointwise(input, attributes);
+    auto OUT_0 = graph->pointwise(input, attributes);
     return OUT_0;
 }
 
@@ -90,7 +90,7 @@ PyGraph::gen_index(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& in
                           .set_axis(axis)
                           .set_name(name);
 
-    auto OUT_0 = graph.pointwise(input, attributes);
+    auto OUT_0 = graph->pointwise(input, attributes);
     return OUT_0;
 }
 
@@ -119,7 +119,7 @@ PyGraph::relu_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
         attributes.set_relu_upper_clip(upper_clip.value());
     }
 
-    auto OUT_0 = graph.pointwise(loss, input, attributes);
+    auto OUT_0 = graph->pointwise(loss, input, attributes);
     return OUT_0;
 }
 

@@ -4004,12 +4004,12 @@ run_bn_bwd_weight(int64_t* xDim,
         // Define the pointwise descriptor
         auto scaleDesc   = pointwise_create(CUDNN_POINTWISE_MUL);
         auto biasDesc    = pointwise_create(CUDNN_POINTWISE_ADD);
-        auto addDesc     = pointwise_create(CUDNN_POINTWISE_ADD);
+        auto subDesc     = pointwise_create(CUDNN_POINTWISE_SUB);
         auto mulDesc     = pointwise_create(CUDNN_POINTWISE_MUL);
         auto bwdReluDesc = pointwise_create(CUDNN_POINTWISE_RELU_BWD);
 
         // Create Pointwise Operations
-        auto addOpDesc     = pointwise_op_create(x_tensor_bn_fwd, meanTensor, after_meanTensor, addDesc);
+        auto subOpDesc     = pointwise_op_create(x_tensor_bn_fwd, meanTensor, after_meanTensor, subDesc);
         auto mulOpDesc     = pointwise_op_create(after_meanTensor, invVarTensor, after_invVarTensor, mulDesc);
         auto scaleOpDesc   = pointwise_op_create(after_invVarTensor, scaleTensor, after_scaleTensor, scaleDesc);
         auto biasOpDesc    = pointwise_op_create(after_scaleTensor, biasTensor, after_biasTensor, biasDesc);
@@ -4057,7 +4057,7 @@ run_bn_bwd_weight(int64_t* xDim,
 
         // Create an Operation Graph. In this case it is convolution scale bias add activation
         std::array<cudnn_frontend::Operation const*, 7> ops = {
-            &conv_op, &addOpDesc, &mulOpDesc, &scaleOpDesc, &biasOpDesc, &bwdReluOpDesc, &bn_bwd_op};
+            &conv_op, &subOpDesc, &mulOpDesc, &scaleOpDesc, &biasOpDesc, &bwdReluOpDesc, &bn_bwd_op};
 
         auto opGraph = cudnn_frontend::OperationGraphBuilder()
                            .setHandle(handle_)

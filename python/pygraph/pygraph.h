@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "pybind11/pybind11.h"
+#include "pybind11/functional.h"
 #include "pybind11/cast.h"
 #include "pybind11/stl.h"
 
@@ -16,6 +17,10 @@ namespace cudnn_frontend::python_bindings {
 // This class is only meant direct pythonic API calls to c++ Graph class.
 class PyGraph {
    public:
+    using Tensor_t   = std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>;
+    using Graph_t    = std::shared_ptr<cudnn_frontend::graph::Graph>;
+    using PyCallback = std::function<Tensor_t(PyGraph&, Tensor_t)>;
+
     template <cudnn_frontend::PointwiseMode_t MODE>
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     pointwise_ternary(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& a,
@@ -39,9 +44,13 @@ class PyGraph {
 
     // This Graph class is the sole structure which implicitly makes PyGraph own all tensors, nodes, and cudnn
     // descriptors.
-    cudnn_frontend::graph::Graph graph;
+    Graph_t graph;
     cudnnHandle_t handle;
     bool is_handle_owner = false;
+
+    std::optional<PyCallback> callback_fn;
+
+    PyGraph(Graph_t graph_) : graph(graph_) {};
 
     PyGraph(std::string const&,
             cudnn_frontend::DataType_t io_data_type,
@@ -50,8 +59,9 @@ class PyGraph {
             std::optional<std::intptr_t> handle_,
             py::object sm_count,
             py::object sm_version,
-            std::shared_ptr<KernelCache> kernel_cache) {
-        graph.set_compute_data_type(compute_data_type)
+            std::shared_ptr<KernelCache> kernel_cache)
+        : graph(std::make_shared<cudnn_frontend::graph::Graph>()) {
+        graph->set_compute_data_type(compute_data_type)
             .set_intermediate_data_type(intermediate_data_type)
             .set_io_data_type(io_data_type);
 
@@ -63,16 +73,16 @@ class PyGraph {
         }
 
         if (sm_count.is(py::none()) == false) {
-            graph.set_sm_count(sm_count.cast<int32_t>());
+            graph->set_sm_count(sm_count.cast<int32_t>());
         }
 
         if (sm_version.is(py::none()) == false) {
-            graph.set_sm_version(sm_version.cast<int32_t>());
+            graph->set_sm_version(sm_version.cast<int32_t>());
         }
 
         if (kernel_cache) {
-            graph.set_kernel_cache(kernel_cache);
-            graph.set_dynamic_shape_enabled(true);
+            graph->set_kernel_cache(kernel_cache);
+            graph->set_dynamic_shape_enabled(true);
         }
     }
 
@@ -81,6 +91,16 @@ class PyGraph {
             detail::destroy_handle(handle);
         }
     }
+
+    std::function<Tensor_t(Graph_t, Tensor_t)> wrapper_function = [this](Graph_t graph, Tensor_t q_kt) {
+        auto py_graph = std::make_shared<PyGraph>(graph);
+
+        if (callback_fn.has_value()) {
+            q_kt = this->callback_fn.value()(*py_graph, q_kt);
+        }
+
+        return q_kt;
+    };
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     tensor(std::vector<int64_t> const& dim,
@@ -303,7 +323,8 @@ class PyGraph {
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_v_table,
          py::object const& paged_attention_max_seq_len_kv,
          cudnn_frontend::DataType_t const& compute_data_type,
-         std::string const& name);
+         std::string const& name,
+         std::optional<PyCallback> fn);
 
     // return [dQ, dK, dV]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 3>
@@ -419,6 +440,9 @@ class PyGraph {
     void
     build(std::vector<cudnn_frontend::HeurMode_t> const&);
 
+    void
+    build();
+
     int64_t
     get_workspace_size();
 
@@ -451,37 +475,37 @@ class PyGraph {
 
     void
     select_numeric_notes(std::vector<NumericalNote_t> const& notes) {
-        graph.select_numeric_notes(notes);
+        graph->select_numeric_notes(notes);
         return;
     }
 
     void
     select_behavior_notes(std::vector<BehaviorNote_t> const& notes) {
-        graph.select_behavior_notes(notes);
+        graph->select_behavior_notes(notes);
         return;
     }
 
     void
     deselect_engines(std::vector<std::string> const& engine_names) {
-        graph.deselect_engines(engine_names);
+        graph->deselect_engines(engine_names);
         return;
     }
 
     void
     deselect_numeric_notes(std::vector<NumericalNote_t> const& notes) {
-        graph.deselect_numeric_notes(notes);
+        graph->deselect_numeric_notes(notes);
         return;
     }
 
     void
     deselect_behavior_notes(std::vector<BehaviorNote_t> const& notes) {
-        graph.deselect_behavior_notes(notes);
+        graph->deselect_behavior_notes(notes);
         return;
     }
 
     void
     deselect_workspace_greater_than(int64_t const workspace) {
-        graph.deselect_workspace_greater_than(workspace);
+        graph->deselect_workspace_greater_than(workspace);
         return;
     }
 
@@ -493,7 +517,7 @@ class PyGraph {
 
     int64_t
     get_execution_plan_count() const {
-        return graph.get_execution_plan_count();
+        return graph->get_execution_plan_count();
     }
 
     int64_t

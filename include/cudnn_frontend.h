@@ -29,7 +29,7 @@
  * The cuDNN Frontend API is a C++ header-only library that demonstrates how to use the cuDNN C backend API. The cuDNN C
  * backend API is documented in the cuDNN developer guide.
  *
- * \section Need Why use Frontend API
+ * \section Why use Frontend API
  *
  * Consider the following code snippet which showcases cudnnBackendTensor creation using the backend API and its
  * equivalent front-end API code. Many among the backend constructs follow similar pattern.
