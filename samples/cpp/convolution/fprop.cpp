@@ -736,3 +736,95 @@ TEST_CASE("Convolution fprop large", "[conv][graph][caching]") {
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 }
+
+TEST_CASE("Convolution fprop concatenate", "[conv][graph][caching]") {
+    namespace fe = cudnn_frontend;
+
+    if (is_arch_supported_by_cudnn() == false) {
+        SKIP("Architecture is not supported by currend cudnn version");
+    }
+#if (CUDNN_VERSION < 90800)
+    SKIP("fprop concatenate fusion requires cudnn 9.8.0 and up.");
+#endif
+
+    int64_t n = 16, c = 128, h = 64, w = 64, k = 256, r = 1, s = 1;
+
+    auto axis = 1;
+
+    auto in_place_index = 1;
+
+    auto build_new_graph = [=](cudnnHandle_t handle) {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::HALF).set_compute_data_type(fe::DataType_t::FLOAT);
+
+        auto X = graph->tensor(fe::graph::Tensor_attributes()
+                                   .set_name("image")
+                                   .set_dim({n, c, h, w})
+                                   .set_stride({c * h * w, 1, c * w, c}));
+
+        auto W = graph->tensor(fe::graph::Tensor_attributes()
+                                   .set_name("filter")
+                                   .set_dim({k, c, r, s})
+                                   .set_stride({c * r * s, 1, c * s, c}));
+
+        auto conv_options =
+            fe::graph::Conv_fprop_attributes().set_padding({0, 0}).set_stride({1, 1}).set_dilation({1, 1});
+        auto Y = graph->conv_fprop(X, W, conv_options);
+
+        Y->set_data_type(fe::DataType_t::HALF);
+
+        auto Y0 = graph->tensor(fe::graph::Tensor_attributes()
+                                    .set_name("concatenate input")
+                                    .set_dim({n, k, h, w})
+                                    .set_stride({k * h * w, 1, k * w, k}));
+
+        std::vector<std::shared_ptr<fe::graph::Tensor_attributes>> inputs;
+        inputs.push_back(Y);
+        inputs.push_back(Y0);
+
+        auto concatenate_options =
+            fe::graph::Concatenate_attributes().set_axis(axis).set_in_place_index(in_place_index);
+
+        auto Y1 = graph->concatenate(inputs, concatenate_options);
+
+        Y1->set_output(true);
+
+        REQUIRE(graph->validate().is_good());
+
+        REQUIRE(graph->build_operation_graph(handle).is_good());
+
+        REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
+
+        REQUIRE(graph->check_support(handle).is_good());
+
+        REQUIRE(graph->build_plans(handle).is_good());
+
+        return std::make_tuple(graph, X, W, Y, Y0, Y1);
+    };
+
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+
+    auto [graph, X, W, Y, Y0, Y1] = build_new_graph(handle);
+
+    Surface<half> x_tensor(n * c * h * w, false);
+    Surface<half> w_tensor(k * c * r * s, false);
+    Surface<half> y_tensor(n * k * h * w, false);       // Should be p, q.
+    Surface<half> y0_tensor(n * k * h * w, false);      // Should be p, q.
+    Surface<half> y1_tensor(n * 2 * k * h * w, false);  // Should be p, q.
+
+    std::unordered_map<int64_t, void *> variant_pack = {{X->get_uid(), x_tensor.devPtr},
+                                                        {W->get_uid(), w_tensor.devPtr},
+                                                        {Y->get_uid(), y_tensor.devPtr},
+                                                        {Y0->get_uid(), y0_tensor.devPtr},
+                                                        {Y1->get_uid(), y1_tensor.devPtr}};
+
+    int64_t workspace_size;
+    REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
+    std::cout << *graph << std::endl;
+
+    REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+}

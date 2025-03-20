@@ -37,9 +37,9 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
 #endif
 
     int64_t b = 2;    // batch size
-    int64_t h = 2;    // head dim
+    int64_t h = 2;    // number of heads
     int64_t s = 512;  // q,k,v tensor is padded to this seq length
-    int64_t d = 128;  // hidden dim
+    int64_t d = 128;  // hidden head dim
 
     bool is_inference = true;
 

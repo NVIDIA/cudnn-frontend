@@ -26,6 +26,7 @@ namespace graph {
 
 class BatchNormNode;
 class DBNNode;
+class ConcatenateNode;
 class MatmulNode;
 class MatmulFP8Node;
 class PointwiseNode;
@@ -133,7 +134,8 @@ class INode {
         WGRAD,
         PAGED_CACHE_LOAD,
         BLOCK_SCALE_QUANTIZE,
-        BLOCK_SCALE_DEQUANTIZE
+        BLOCK_SCALE_DEQUANTIZE,
+        CONCATENATE
     };
     Type tag;
 
@@ -206,6 +208,11 @@ class INode {
                            std::shared_ptr<Tensor_attributes> scale,
                            Block_scale_dequantize_attributes attributes,
                            std::shared_ptr<Tensor_attributes> y);
+
+    void
+    concatenate(std::vector<std::shared_ptr<Tensor_attributes>> x,
+                Concatenate_attributes attributes,
+                std::shared_ptr<Tensor_attributes> y);
 
     error_t
     validate_subtree() {
@@ -389,12 +396,22 @@ class NodeCRTP : public INode {
                               int64_t& potential_uid,
                               std::unordered_set<int64_t> const& used_uids) const override {
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Creating cudnn tensors for node named '" << self().attributes.name << "':");
-        for (auto const& [name, tensor] : self().attributes.inputs) {
-            (void)name;
-            if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
+
+        if constexpr (std::is_same_v<DerivedT, ConcatenateNode>) {
+            for (auto const& tensor : self().attributes.inputs) {
+                if (tensor) {
+                    CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
+                }
+            }
+        } else {
+            for (auto const& [name, tensor] : self().attributes.inputs) {
+                (void)name;
+                if (tensor) {
+                    CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
+                }
             }
         }
+
         for (auto const& [name, tensor] : self().attributes.outputs) {
             (void)name;
             if (tensor) {

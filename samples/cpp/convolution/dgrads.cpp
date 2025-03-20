@@ -161,7 +161,7 @@ TEST_CASE("Dgrad Drelu DBNweight Graph", "[dgrad][graph]") {
                               .set_dim({1, 32, 1, 1})
                               .set_stride({32, 1, 32, 32})
                               .set_data_type(fe::DataType_t::FLOAT));
-    auto mean_options = fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::ADD);
+    auto mean_options = fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::SUB);
     auto M_output     = graph.pointwise(X, M, mean_options);
 
     auto V               = graph.tensor(fe::graph::Tensor_attributes()
@@ -201,8 +201,8 @@ TEST_CASE("Dgrad Drelu DBNweight Graph", "[dgrad][graph]") {
     eq_scale_x->set_output(true);
     eq_bias->set_output(true);
 
-#if (CUDNN_VERSION < 8900)
-    SKIP("DgradDreluBNBwdWeight requires cudnn 8.9 and up");
+#if (CUDNN_VERSION < 90800)
+    SKIP("DgradDreluBNBwdWeight requires cudnn 9.8.0 and up");
 #endif
     if (!is_ampere_arch() && !is_hopper_arch()) {
         SKIP("DgradDreluBNBwdWeight requires ampere or hopper architecture.");

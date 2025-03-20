@@ -8,7 +8,6 @@
 #include "../node_interface.h"
 
 namespace cudnn_frontend::graph {
-
 class ConvolutionNode : public NodeCRTP<ConvolutionNode> {
    public:
     Conv_fprop_attributes attributes;

@@ -33,7 +33,7 @@ PyGraph::batchnorm(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& x,
                           .set_peer_stats(peer_stats)
                           .set_name(name);
 
-    auto [Y, mean, inv_var, next_running_mean, next_running_var] = graph.batchnorm(x, scale, bias, attributes);
+    auto [Y, mean, inv_var, next_running_mean, next_running_var] = graph->batchnorm(x, scale, bias, attributes);
     return {Y, mean, inv_var, next_running_mean, next_running_var};
 }
 
@@ -51,7 +51,7 @@ PyGraph::layernorm(cudnn_frontend::NormFwdPhase_t const forward_phase,
                           .set_epsilon(epsilon)
                           .set_name(name);
 
-    auto [Y, mean, inv_var] = graph.layernorm(x, scale, bias, attributes);
+    auto [Y, mean, inv_var] = graph->layernorm(x, scale, bias, attributes);
     return {Y, mean, inv_var};
 }
 
@@ -66,7 +66,7 @@ PyGraph::batchnorm_inference(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
     auto attributes =
         cudnn_frontend::graph::Batchnorm_inference_attributes().set_compute_data_type(compute_data_type).set_name(name);
 
-    return graph.batchnorm_inference(x, mean, inv_variance, scale, bias, attributes);
+    return graph->batchnorm_inference(x, mean, inv_variance, scale, bias, attributes);
 }
 
 std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>
@@ -82,7 +82,7 @@ PyGraph::layernorm_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attrib
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
 
-    auto [DX, DScale, DBias] = graph.layernorm_backward(dy, x, scale, attributes);
+    auto [DX, DScale, DBias] = graph->layernorm_backward(dy, x, scale, attributes);
     return {DX, DScale, DBias};
 }
 
@@ -101,7 +101,7 @@ PyGraph::batchnorm_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attrib
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
 
-    auto [DX, DScale, DBias] = graph.batchnorm_backward(dy, x, scale, attributes);
+    auto [DX, DScale, DBias] = graph->batchnorm_backward(dy, x, scale, attributes);
     return {DX, DScale, DBias};
 }
 
@@ -120,7 +120,7 @@ PyGraph::rmsnorm(cudnn_frontend::NormFwdPhase_t const forward_phase,
                           .set_epsilon(epsilon)
                           .set_name(name);
 
-    auto [Y, inv_var] = graph.rmsnorm(x, scale, attributes);
+    auto [Y, inv_var] = graph->rmsnorm(x, scale, attributes);
     return {Y, inv_var};
 }
 
@@ -137,7 +137,7 @@ PyGraph::rmsnorm_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribut
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
 
-    auto [DX, DScale, DBias] = graph.rmsnorm_backward(dy, x, scale, inv_variance, attributes);
+    auto [DX, DScale, DBias] = graph->rmsnorm_backward(dy, x, scale, inv_variance, attributes);
     return {DX, DScale, DBias};
 }
 
@@ -155,7 +155,7 @@ PyGraph::instancenorm(cudnn_frontend::NormFwdPhase_t const forward_phase,
                           .set_epsilon(epsilon)
                           .set_name(name);
 
-    auto [Y, mean, inv_var] = graph.instancenorm(x, scale, bias, attributes);
+    auto [Y, mean, inv_var] = graph->instancenorm(x, scale, bias, attributes);
     return {Y, mean, inv_var};
 }
 
@@ -172,7 +172,7 @@ PyGraph::instancenorm_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_att
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
 
-    auto [DX, DScale, DBias] = graph.instancenorm_backward(dy, x, scale, attributes);
+    auto [DX, DScale, DBias] = graph->instancenorm_backward(dy, x, scale, attributes);
     return {DX, DScale, DBias};
 }
 

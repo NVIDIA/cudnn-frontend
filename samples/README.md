@@ -69,7 +69,7 @@ Demonstrates the building and execution of a CUDA graph representing the SDPA op
 
 - [Fprop](cpp/convolution/fprop.cpp)
 
-Show cases a simple fprop, fprop with pointwise fusion of scale bias and relu, fprop with bias and relu for channels first layout and fusions before convolution in the form of scale bias relu conv and stats.
+Showcases a simple fprop, fprop with pointwise fusion of scale bias and relu, fprop with bias and relu for channels first layout and fusions before convolution in the form of scale bias relu conv and stats.  Also epilogue fusion of concatenate.
 
 - [Fp8 fprop](cpp/convolution/fp8_fprop.cpp)
 

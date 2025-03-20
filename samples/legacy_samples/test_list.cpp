@@ -2667,7 +2667,7 @@ TEST_CASE("Dgrad Descale Descale Amax Scale sample", "[frontend][fusion][ConvSca
 }
 #endif
 
-#if (CUDNN_VERSION >= 8400)
+#if (CUDNN_VERSION >= 90800)
 TEST_CASE("BN BWD Weights sample", "[frontend][fusion][BnBwdWeight]") {
     std::cout << "TEST_CASE :: BN BWD Weights sample" << std::endl;
     INFO("TEST_CASE :: Sample BN BWD Weights sample");
