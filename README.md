@@ -35,7 +35,7 @@ cudnn can be installed from
 Minimum python version needed 3.8
 The python binding compilation requires development package which can be installed by running `apt-get install python-dev`.
 
-To run the Python samples, you will need the dependencies mentioned in `requirements.txt`. This can be be installed by running:
+To run the Python samples, you will need the dependencies mentioned in `requirements.txt`. This can be installed by running:
 `pip install -r requirements.txt`
 
 ### Python API
