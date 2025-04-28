@@ -63,6 +63,61 @@ get_symbol(const char *function_name) {
 
 enum class CudaLibrary { CUDART, CUDA };
 
+inline HMODULE
+load_cuda_so() {
+    // Clear any existing error
+    dlerror();
+
+    // Attempt to open the cuda library
+    HMODULE handle = dlopen("libcuda.so", RTLD_NOW);
+    const char *error = reinterpret_cast<const char *>(dlerror());
+    if (!handle || error) {
+        // If opening the library fails, throw an exception with the error message
+        throw std::runtime_error("Unable to dlopen libcuda.so : " +
+                                    std::string(error ? error : "Unknown error"));
+    }
+
+    return handle;
+}
+
+
+inline HMODULE
+load_cudart_so() {
+    // Clear any existing error
+    dlerror();
+
+    // Potential list of libraries
+    const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
+
+    // Initialize handle
+    HMODULE lib_handle = nullptr;
+    size_t lib_index = -1;
+
+    // Check all libraries. Ensure that exactly 1 is found.
+    for (auto i = 0; i < sizeof(libs) / sizeof(libs[0]); ++i) {
+        HMODULE handle = dlopen(libs[i], RTLD_NOW);
+        const char *error = reinterpret_cast<const char *>(dlerror());
+
+        if (handle && !error && lib_index > -1) {
+            // Loaded multiple libraries, fail with a message
+            throw std::runtime_error("Found multiple libraries: " + std::string(libs[lib_index]) + " and " + std::string(libs[i]));
+        } else if (handle && !error) {
+            // Library loaded
+            lib_index = i;
+            lib_handle = handle;
+        }
+
+    }
+
+    if (lib_index == -1) {
+        // If opening the library fails, throw an exception with the error message
+        throw std::runtime_error("Unable to dlopen libcudart.so.*");
+    }
+
+    return lib_handle;
+}
+
+
 inline void *
 get_cuda_symbol(CudaLibrary library, const char *function_name) {
     // Static mutex to ensure thread-safety
@@ -71,28 +126,12 @@ get_cuda_symbol(CudaLibrary library, const char *function_name) {
     // Static map to store handles for different libraries
     static std::unordered_map<CudaLibrary, HMODULE> dl_handles;
 
-    // Determine the library name based on the provided library parameter
-    const char *library_name = (library == CudaLibrary::CUDART) ? "libcudart.so" : "libcuda.so";
-    (void)library_name;
-
     // Lock the mutex to ensure thread-safe access
     std::lock_guard<std::mutex> lock(cuda_lib_mutex);
 
-    // If the library hasn't been opened yet, open it
+    // If the library hasn't been opened yet, open it and store the handle to future use
     if (dl_handles.find(library) == dl_handles.end()) {
-        // Clear any existing error
-        dlerror();
-
-        // Attempt to open the specified CUDA library
-        HMODULE handle    = dlopen(library_name, RTLD_NOW);
-        const char *error = reinterpret_cast<const char *>(dlerror());
-        if (!handle || error) {
-            // If opening the library fails, throw an exception with the error message
-            throw std::runtime_error("Unable to dlopen " + std::string(library_name) + ": " +
-                                     std::string(error ? error : "Unknown error"));
-        }
-        // Store the handle for future use
-        dl_handles[library] = handle;
+        dl_handles[library] = (library == CudaLibrary::CUDART) ? load_cudart_so() : load_cuda_so();
     }
 
     // Clear any existing error before calling dlsym
