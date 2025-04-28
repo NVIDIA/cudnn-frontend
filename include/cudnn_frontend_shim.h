@@ -86,32 +86,33 @@ load_cudart_so() {
     // Clear any existing error
     dlerror();
 
-    // Potential list of libraries
-    const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
+    // List of potential libcudart libraries
+    constexpr const char* libs[] = {"libcudart.so.12", "libcudart.so.13"};
+    constexpr size_t num_libs = sizeof(libs) / sizeof(libs[0]);
 
-    // Initialize handle
     HMODULE lib_handle = nullptr;
-    size_t lib_index = -1;
+    int loaded_index = -1;
 
-    // Check all libraries. Ensure that exactly 1 is found.
-    for (auto i = 0; i < sizeof(libs) / sizeof(libs[0]); ++i) {
+    for (size_t i = 0; i < num_libs; ++i) {
         HMODULE handle = dlopen(libs[i], RTLD_NOW);
         const char *error = reinterpret_cast<const char *>(dlerror());
 
-        if (handle && !error && lib_index > -1) {
-            // Loaded multiple libraries, fail with a message
-            throw std::runtime_error("Found multiple libraries: " + std::string(libs[lib_index]) + " and " + std::string(libs[i]));
-        } else if (handle && !error) {
-            // Library loaded
-            lib_index = i;
+        if (handle && !error) {
+            if (lib_handle) {
+                // Already loaded one -> multiple found
+                dlclose(handle);
+                throw std::runtime_error("Multiple libcudart libraries found: " +
+                                         std::string(libs[loaded_index]) + " and " +
+                                         std::string(libs[i]));
+            }
             lib_handle = handle;
+            loaded_index = static_cast<int>(i);
         }
-
     }
 
-    if (lib_index == -1) {
-        // If opening the library fails, throw an exception with the error message
-        throw std::runtime_error("Unable to dlopen libcudart.so.*");
+    // If opening the library fails, throw an exception with the error message
+    if (!lib_handle) {
+        throw std::runtime_error("Unable to load any libcudart.so.* library.");
     }
 
     return lib_handle;
