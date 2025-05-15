@@ -25,6 +25,7 @@ def convert_to_cudnn_type(torch_type):
     LooseVersion(cudnn.backend_version_string()) < "8.8",
     reason="BN with mask output not supported below cudnn 8.8",
 )
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_bn_relu_with_mask(cudnn_handle):
     n, c, h, w = 4, 16, 56, 56
@@ -166,6 +167,7 @@ def test_bn_relu_with_mask(cudnn_handle):
     LooseVersion(cudnn.backend_version_string()) < "8.9",
     reason="DBN fusions not supported below cudnn 8.9",
 )
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_drelu_dadd_dbn(dump_dX_dRelu, cudnn_handle):
     n, c, h, w = 4, 16, 56, 56
@@ -257,6 +259,7 @@ def test_drelu_dadd_dbn(dump_dX_dRelu, cudnn_handle):
     LooseVersion(cudnn.backend_version_string()) < "8.9.4",
     reason="BN_infer-Drelu-DBN not supported below cudnn 8.9.4",
 )
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_bn_infer_drelu_dbn(cudnn_handle):
     n, c, h, w = 4, 16, 56, 56

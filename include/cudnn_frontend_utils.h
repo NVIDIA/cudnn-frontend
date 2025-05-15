@@ -467,6 +467,7 @@ enum class NormMode_t {
     BATCH_NORM,
     GROUP_NORM,
     RMS_NORM,
+    ADA_LAYER_NORM,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(NormMode_t,
@@ -477,6 +478,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(NormMode_t,
                                  {NormMode_t::BATCH_NORM, "BATCH_NORM"},
                                  {NormMode_t::GROUP_NORM, "GROUP_NORM"},
                                  {NormMode_t::RMS_NORM, "RMS_NORM"},
+                                 {NormMode_t::ADA_LAYER_NORM, "ADA_LAYER_NORM"},
                              })
 
 enum class PointwiseMode_t {
@@ -1666,7 +1668,12 @@ convert_to_cudnn_type(cudnn_frontend::NormMode_t const mode, cudnnBackendNormMod
             cudnn_mode = CUDNN_RMS_NORM;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
 #endif
-
+#if (CUDNN_VERSION >= 90900)
+        case NormMode_t::ADA_LAYER_NORM:
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90900, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_ADA_LAYER_NORM;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#endif
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;

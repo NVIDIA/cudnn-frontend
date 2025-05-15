@@ -1,8 +1,18 @@
 #pragma once
 
 #include "../graph_interface.h"
+#include "../../cudnn_frontend_shim.h"
 
 namespace cudnn_frontend::graph::attn::score_modifiers {
+
+[[maybe_unused]] inline float
+get_negative_inf_value() {
+    // older cuDNN version prefers lowest for softmax mask
+    if (detail::get_backend_version() < 91000) {
+        return std::numeric_limits<float>::lowest();
+    }
+    return -std::numeric_limits<float>::infinity();
+}
 
 [[maybe_unused]] inline std::shared_ptr<Tensor_attributes>
 causal_mask(std::shared_ptr<Graph> graph, std::shared_ptr<Tensor_attributes> attention_score) {
@@ -81,7 +91,7 @@ padding_mask(std::shared_ptr<Graph> graph,
                                                     .set_mode(PointwiseMode_t::LOGICAL_AND)
                                                     .set_compute_data_type(DataType_t::BOOLEAN));
     padding_mask_output->set_data_type(DataType_t::BOOLEAN);
-    auto negative_inf_padding = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
+    auto negative_inf_padding = std::make_shared<Tensor_attributes>(get_negative_inf_value());
 
     auto after_padding_mask =
         graph->pointwise(attention_score,
@@ -221,7 +231,7 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
 
         return_mask =
             graph->pointwise(attention_score,
-                             std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest()),
+                             std::make_shared<Tensor_attributes>(get_negative_inf_value()),
                              bool_mask,
                              Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT));
     }

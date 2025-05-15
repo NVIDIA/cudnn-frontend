@@ -1288,6 +1288,7 @@ TEST_CASE("ConvDrelu sample", "[frontend][convDrelu][drelu]") {
 TEST_CASE("DgradDrelu sample", "[frontend][dgradDrelu][drelu]") {
     std::cout << "TEST_CASE :: Sample dgrad drelu" << std::endl;
     INFO("TEST_CASE :: Sample dgrad drelu");
+
     int64_t xTensorDim[] = {4, 32, 32, 32};
     int64_t wTensorDim[] = {32, 32, 3, 3};
     int64_t yTensorDim[] = {0, 0, 0, 0};  // Computed Below

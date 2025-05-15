@@ -132,18 +132,20 @@ showDevices(void) {
     for (int i = 0; i < totalDevices; i++) {
         struct cudaDeviceProp prop;
         checkCudaErrors(cudaGetDeviceProperties(&prop, i));
-        printf(
-            "device %d : sms %2d  Capabilities %d.%d, SmClock %.1f Mhz, MemSize (Mb) %d, MemClock %.1f Mhz, Ecc=%d, "
-            "boardGroupID=%d\n",
-            i,
-            prop.multiProcessorCount,
-            prop.major,
-            prop.minor,
-            (float)prop.clockRate * 1e-3,
-            (int)(prop.totalGlobalMem / (1024 * 1024)),
-            (float)prop.memoryClockRate * 1e-3,
-            prop.ECCEnabled,
-            prop.multiGpuBoardGroupID);
+        printf("device %d : sms %2d  Capabilities %d.%d, MemSize (Mb) %d, Ecc=%d, boardGroupID=%d",
+               i,
+               prop.multiProcessorCount,
+               prop.major,
+               prop.minor,
+               (int)(prop.totalGlobalMem / (1024 * 1024)),
+               prop.ECCEnabled,
+               prop.multiGpuBoardGroupID);
+#if (CUDART_VERSION < 13000)
+        printf(", SmClock %.1f Mhz, MemClock %.1f Mhz",  // Removed in CUDA 13.0
+               (float)prop.clockRate * 1e-3,
+               (float)prop.memoryClockRate * 1e-3);
+#endif
+        printf("\n");
     }
 }
 

@@ -30,6 +30,7 @@ dilation = [1, 1]
     LooseVersion(cudnn.backend_version_string()) < "8.8",
     reason="requires cudnn 8.8 or higher",
 )
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_scale_bias_relu_wgrad(cudnn_handle):
 

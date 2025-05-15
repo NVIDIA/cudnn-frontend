@@ -212,6 +212,7 @@ def arrow_mask(
     return out
 
 
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_sdpa_with_flexible_graph(cudnn_handle):
 
@@ -389,6 +390,7 @@ def document_mask(sdpa_graph, q_kt_tensor, document_tensor, document_tensor_t, n
     return out
 
 
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_sdpa_with_arrow_mask(cudnn_handle):
 
@@ -513,6 +515,7 @@ def test_sdpa_with_arrow_mask(cudnn_handle):
     torch.cuda.synchronize()
 
 
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_sdpa_with_document_mask(cudnn_handle):
 

@@ -135,7 +135,9 @@ class INode {
         PAGED_CACHE_LOAD,
         BLOCK_SCALE_QUANTIZE,
         BLOCK_SCALE_DEQUANTIZE,
-        CONCATENATE
+        CONCATENATE,
+        ADALAYERNORM,
+        DADALAYERNORM
     };
     Type tag;
 

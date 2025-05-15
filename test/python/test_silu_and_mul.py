@@ -14,6 +14,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
     hasattr(torch, "float8_e4m3fn") is False,
     reason="torch does not have fp8 data types",
 )
+@pytest.mark.L0
 def test_gemm_silu_and_mul(cudnn_handle):
 
     # setup
@@ -138,6 +139,7 @@ def test_gemm_silu_and_mul(cudnn_handle):
     hasattr(torch, "float8_e4m3fn") is False,
     reason="torch does not have fp8 data types",
 )
+@pytest.mark.L0
 def test_silu_and_mul_and_quantization(cudnn_handle):
 
     # setup
