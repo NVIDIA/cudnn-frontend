@@ -10,6 +10,7 @@ from test_utils import torch_fork_set_rng
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch"
 )
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_int8_bf16_matmul_slice(cudnn_handle):
 

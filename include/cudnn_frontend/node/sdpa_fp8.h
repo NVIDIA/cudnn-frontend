@@ -39,6 +39,11 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
                                        "sdpa fp8 forward operation is only supported starting cudnn 9.1.0. Please "
                                        "consider upgrading your current version.");
 
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() == 91000,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "sdpa fp8 forward operation is not supported on cudnn 9.10.0. Please "
+                                       "consider upgrading your current version.");
+
         cudaDeviceProp prop;
         int device;
         CHECK_CUDA_ERROR(detail::cuda_get_device(&device));
@@ -342,8 +347,8 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
             // Lower attributes to binary select attributes
             // Use a smaller value of neg infinity so that the softmax stats for rows that are fully padded dont
             // go towards NaNs/Infs when multipled by the numerous scale/descale
-            // auto negative_inf_padding = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
-            auto negative_inf_padding = std::make_shared<Tensor_attributes>(-1024.f * 1024.f * 1024.f);
+            auto negative_inf_padding =
+                std::make_shared<Tensor_attributes>(attn::score_modifiers::get_negative_inf_value());
 
             auto binary_select_attributes =
                 Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT);
@@ -409,7 +414,8 @@ class SDPAFP8Node : public NodeCRTP<SDPAFP8Node> {
             row_greater_than_col_output->set_data_type(DataType_t::BOOLEAN);
 
             // Lower attributes to binary select attributes
-            auto negative_inf_causal = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
+            auto negative_inf_causal =
+                std::make_shared<Tensor_attributes>(attn::score_modifiers::get_negative_inf_value());
 
             auto binary_select_attributes =
                 Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT);

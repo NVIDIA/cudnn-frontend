@@ -1,7 +1,7 @@
 """
 This test harness allows for testing the various options of the attention operator. See example usage under "main" below.
 
-The full documentation on the attention operator can be found in: https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Attention.md#scaled-dot-product-attention
+The full documentation on the attention operator can be found in: https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html
 
 Notebooks that demonstrate the attention operator can be found here:
 - Introductory example: https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/50_scaled_dot_product_attention.ipynb
@@ -36,7 +36,7 @@ right_bound_options = [False, True]
 dropout_options = [False, True]
 ragged_options = [False, True]
 is_infer_options = [False, True]
-page_table_options = [False, True]
+page_table_options = [0, 1, "_packed"]
 
 
 def convert_to_cudnn_type(torch_type):
@@ -443,6 +443,44 @@ def generate_ragged_offset(
     return q_ragged_offset, k_ragged_offset, v_ragged_offset, o_ragged_offset
 
 
+# @brief Convert a padded page table into a packed page table
+# @return packed_page_table: packed page table
+# @return ragged_offset: offset into the packed page table
+def convert_uniform_to_ragged_page_tables(
+    uniform_tensor, seq_len, block_size, cudnn_version
+):
+    [B, H, S, D] = uniform_tensor.size()
+    ragged_offset = torch.zeros(
+        B + 1, 1, 1, 1, dtype=torch.int32, device=uniform_tensor.device
+    )  # Initialize with first offset as 0
+    for i in range(1, B + 1):
+        prev_seq_len = seq_len[i - 1]
+        num_pages_prev_batch = (prev_seq_len + block_size - 1) // block_size
+        next_batch_offset = ragged_offset[i - 1] + num_pages_prev_batch
+        ragged_offset[i, 0, 0, 0] = next_batch_offset
+
+    ragged_offset.to(dtype=torch.int64 if cudnn_version >= "9.6.0" else torch.int32)
+    # ragged_offset.to(dtype=torch.int32)
+
+    packed_page_table = torch.zeros(B * S, H, D).to(
+        dtype=uniform_tensor.dtype, device=uniform_tensor.device
+    )
+
+    uniform_tensor_thd = torch.einsum("bhsd->bshd", uniform_tensor).reshape(B * S, H, D)
+
+    t_0 = 0
+    for b, t_1 in enumerate(ragged_offset.flatten()[1:]):
+        packed_page_table[t_0:t_1, :, :] = uniform_tensor_thd[
+            b * S : b * S + (t_1 - t_0), :, :
+        ]
+        t_0 = t_1
+
+    packed_page_table = packed_page_table.reshape(B, S, H, D)
+    packed_page_table = torch.einsum("bshd->bhsd", packed_page_table)
+
+    return packed_page_table, ragged_offset
+
+
 def convert_ragged_to_uniform(ragged_tensor, seq_len):
     # limitations:
     # 1. tensor is bhsd dim order and bshd stride order (may be interleaved)
@@ -510,17 +548,18 @@ def generate_actual_seq_lens(
 @pytest.mark.parametrize("is_padding", padding_mask_options, ids=lambda p: f"padding{int(p)}")
 @pytest.mark.parametrize("is_alibi", alibi_mask_options, ids=lambda p: f"alibi{int(p)}")
 @pytest.mark.parametrize("is_bias", bias_options, ids=lambda p: f"bias{int(p)}")
-@pytest.mark.parametrize("is_paged_attention", page_table_options, ids=lambda p: f"paged{int(p)}")
+@pytest.mark.parametrize("paged_attention", page_table_options, ids=lambda p: f"paged{p}")
 @pytest.mark.parametrize("head_group", head_group_options)
 @pytest.mark.parametrize("layout", layout_options)
 @pytest.mark.parametrize("input_type", input_type_options, ids=lambda p: str(p))
+@pytest.mark.L0
 # fmt: on
 @torch_fork_set_rng(seed=0)
 def test_sdpa(
     input_type,
     layout,
     head_group,
-    is_paged_attention,
+    paged_attention,
     is_bias,
     is_alibi,
     is_padding,
@@ -533,7 +572,9 @@ def test_sdpa(
     request,
     cudnn_handle
 ):
-    
+    is_paged_attention = (paged_attention == "_packed" or paged_attention == 1)
+    is_packed_paged_attention = (paged_attention == "_packed")
+
     cudnn_version = LooseVersion(cudnn.backend_version_string())
 
     if cudnn_version < "8.9.3":
@@ -569,15 +610,20 @@ def test_sdpa(
     if is_paged_attention and (not is_padding or cudnn_version < "9.5" or not layout == "bshd_bshd_bshd" or is_ragged):
         pytest.skip("Paged attention is only tested with packed variable length tensors, bshd_bshd_bshd, no ragged offsets, and only on cuDNNv9.5 or greater")
 
+    if is_packed_paged_attention and cudnn_version < "9.10.2":
+        pytest.skip("Packed paged attention is only supported on cuDNNv9.10.2 or greater")
 
     # -------------------------- default randomized parameter testing ------------------------
     # batch size
     b = 2
     # query sequence length
-    if cudnn_version >= "9.7.0":
-        s_q = random.choice([24, 256, 512, 1024, 2048]) # Need to add s_q = 1 to the harness
-    else:
-        s_q = random.choice([24, 256, 512, 1024, 2048])
+
+    s_q_choices = [ 24, 256, 512, 1024, 2048]
+
+    if cudnn_version >= "9.7.0" and layout == "bshd_bshd_bshd":
+        s_q_choices.extend([1])
+
+    s_q = random.choice(s_q_choices)
 
     if s_q == 1:
         is_left_bound = False
@@ -586,20 +632,25 @@ def test_sdpa(
     # key+value sequence length
     s_kv = (
         random.choice([24, 32, 256, 512, 1024, 2048])
-        if layout == "bshd_bshd_bshd" or s_q == 1
+        if layout == "bshd_bshd_bshd"
         else s_q
     )
 
     d_choices = [32, 56, 64, 128]
-    # if cudnn_version >= "9.9.0":
-    #     d_choices.extend([192, 256, 512])
+
+    # for hopper always extend d_choices to 256
+    if cudnn_version >= "9.5":
+        d_choices.extend([192, 256])
+
+    if cudnn_version >= "9.9.0":
+        d_choices.extend([200, 264, 520])
 
     # query+key embedding dimension per head
     d_qk = random.choice(d_choices)
     # value embedding dimension per head
     d_v = (
         random.choice(d_choices)
-        if (layout == "bshd_bshd_bshd" and not is_ragged)
+        if (layout == "bshd_bshd_bshd")
         else d_qk
     )
     # number of heads
@@ -649,9 +700,6 @@ def test_sdpa(
 
     if d_qk != d_v and is_ragged and cudnn_version < "9.1":
         pytest.skip("d_qk != d_v is not supported with ragged offset")
-
-    if s_q > s_kv and is_left_bound:
-        pytest.skip("s_q > s_kv is not supported with sliding window attention")
 
     print("\n=============== TEST CMD TO REPRODUCE ===============")
     cmd = f"pytest {request.node.nodeid} --mha_b={b} --mha_s_q={s_q} --mha_s_kv={s_kv} --mha_d_qk={d_qk} --mha_d_v={d_v} --mha_h_q={h_q} --mha_h_k={h_k} --mha_h_v={h_v} --mha_block_size={block_size}"
@@ -766,9 +814,14 @@ def test_sdpa(
     container_v_gpu = None
     page_table_k_gpu = None
     page_table_v_gpu = None
+
     if is_paged_attention:
         container_k_gpu, page_table_k_gpu = create_container_and_page_table(k_gpu, block_size)
         container_v_gpu, page_table_v_gpu = create_container_and_page_table(v_gpu, block_size)
+
+    if is_packed_paged_attention:
+        page_table_k_gpu, page_table_k_ragged_offset_gpu = convert_uniform_to_ragged_page_tables(page_table_k_gpu, seq_len_kv_gpu, block_size, cudnn_version)
+        page_table_v_gpu, page_table_v_ragged_offset_gpu = convert_uniform_to_ragged_page_tables(page_table_v_gpu, seq_len_kv_gpu, block_size, cudnn_version)
 
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
@@ -807,11 +860,17 @@ def test_sdpa(
     v_ragged_offset = graph.tensor_like(v_ragged_offset_gpu) if is_ragged else None
     o_ragged_offset = graph.tensor_like(o_ragged_offset_gpu) if is_ragged else None
 
+    page_table_k_ragged_offset = graph.tensor_like(page_table_k_ragged_offset_gpu) if is_packed_paged_attention else None
+    page_table_v_ragged_offset = graph.tensor_like(page_table_v_ragged_offset_gpu) if is_packed_paged_attention else None
+
     if is_ragged:
         q.set_ragged_offset(q_ragged_offset)
         k.set_ragged_offset(k_ragged_offset)
         v.set_ragged_offset(v_ragged_offset)
 
+    if is_packed_paged_attention:
+        page_table_k.set_ragged_offset(page_table_k_ragged_offset)
+        page_table_v.set_ragged_offset(page_table_v_ragged_offset)
    
     o, stats = graph.sdpa(
         name="sdpa",
@@ -871,7 +930,9 @@ def test_sdpa(
         stats: stats_gpu,
         rng_dump: rng_dump_gpu,
         page_table_k: page_table_k_gpu,
-        page_table_v: page_table_v_gpu
+        page_table_v: page_table_v_gpu,
+        page_table_k_ragged_offset: page_table_k_ragged_offset_gpu if is_packed_paged_attention else None,
+        page_table_v_ragged_offset: page_table_v_ragged_offset_gpu if is_packed_paged_attention else None
     }
 
     if is_dropout:
@@ -956,6 +1017,7 @@ def test_sdpa(
 @pytest.mark.parametrize("head_group", head_group_options)
 @pytest.mark.parametrize("layout", layout_options)
 @pytest.mark.parametrize("input_type", input_type_options, ids=lambda p: str(p))
+@pytest.mark.L0
 # fmt: on
 @torch_fork_set_rng(seed=0)
 def test_sdpa_backward(
@@ -1028,7 +1090,7 @@ def test_sdpa_backward(
     # value embedding dimension per head
     d_v = (
         random.choice([64, 96, 128])
-        if (layout == "bshd_bshd_bshd" and not is_ragged)
+        if (layout == "bshd_bshd_bshd")
         else d_qk
     )
     # number of heads
