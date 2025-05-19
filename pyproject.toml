@@ -1,29 +1,26 @@
 [build-system]
-requires = ["setuptools>=64", "cmake>=3.17", "ninja==1.11.1.1", "pybind11[global]"]
-build-backend = "setuptools.build_meta"
+build-backend = 'mesonpy'
+
+requires = [
+    'meson_python>=0.17.1',
+    'meson>=1.8.0',
+    'pybind11[global]>=0.1.35'
+]
+
 
 [project]
-name = "nvidia-cudnn-frontend"
+name = "cuda-cudnn-frontend"
 dynamic = ["version"]
 description = "CUDNN FrontEnd python library"
 readme = "README.md"
-requires-python = ">=3.7"
-license = {text = "NVIDIA Proprietary Software"}
-classifiers = [
-    "Programming Language :: Python :: 3",
+authors = [
+    {name = "Eugo, Inc."},
+    {name = "NVIDIA, Ltd."}
 ]
+requires-python = ">=3.12"
+license = {text = "NVIDIA Proprietary Software"}
 
-[tool.setuptools]
-packages = ["cudnn", "include"]
-package-dir = {"" = "python", "include" = "include"}
-include-package-data = true
 
 [project.urls]
-"Homepage" = "https://github.com/nvidia/cudnn-frontend"
-"Bug Tracker" = "https://github.com/nvidia/cudnn-frontend/issues"
-
-[tool.setuptools.dynamic]
-version = {attr = "cudnn.__version__"}
-
-[tool.setuptools.package-data]
-include = ["**/*"]
+"Homepage" = "https://github.com/eugo-inc/cudnn-frontend-meson-python"
+"Bug Tracker" = "https://github.com/eugo-inc/cudnn-frontend-meson-python/issues"
