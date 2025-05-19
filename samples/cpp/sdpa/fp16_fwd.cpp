@@ -154,12 +154,6 @@ TEST_CASE("Toy sdpa forward", "[graph][sdpa][flash][forward]") {
         return;
     }
 
-    // switch off certain features on blackwell
-    if (is_blackwell_arch()) {
-        alibi_mask    = false;
-        has_attn_bias = false;
-    }
-
     // Create a unique_ptr for the cuDNN handle
     auto handle_ptr = create_cudnn_handle();
     auto handle     = *handle_ptr;

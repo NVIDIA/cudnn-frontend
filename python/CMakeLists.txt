@@ -4,7 +4,9 @@ Include(FetchContent)
 
 # Fetch and build dlpack
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.18)
 set(BUILD_MOCK OFF)
+
 option(CUDNN_FRONTEND_USE_SYSTEM_DLPACK "Whether dlpack should use the system version or fetched." OFF)
 
 IF(CUDNN_FRONTEND_USE_SYSTEM_DLPACK)
@@ -18,7 +20,7 @@ else()
   FetchContent_Declare(
     dlpack
     GIT_REPOSITORY https://github.com/dmlc/dlpack
-    GIT_TAG        v0.8
+    GIT_TAG        v1.1
   )
   FetchContent_MakeAvailable(dlpack)
 endif()
@@ -36,7 +38,7 @@ if(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE)
     FetchContent_Declare(
         pybind11
         GIT_REPOSITORY https://github.com/pybind/pybind11
-        GIT_TAG        v2.11.1
+        GIT_TAG        v2.13.6
     )
     FetchContent_MakeAvailable(pybind11)
 else()

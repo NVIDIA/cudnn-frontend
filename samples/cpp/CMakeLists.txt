@@ -33,6 +33,8 @@ add_executable(
 
     norm/batchnorm.cpp
     norm/layernorm.cpp
+    norm/adaptive_layernorm.cpp
+    norm/norm_zero_centered_gamma.cpp
     norm/rmsnorm.cpp
     norm/norm_block_scale.cpp
 

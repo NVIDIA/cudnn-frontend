@@ -343,6 +343,7 @@ get_heuristics_list_impl(cudnnBackendHeurMode_t heur_mode,
     CUDNN_FE_LOG_LABEL_ENDL("Heuristic query for mode " << heur_mode << " has " << num_config << " configurations.");
     auto &engine_config = heuristics.getEngineConfig(num_config);
     NV_CUDNN_RETURN_IF_ERROR(heuristics);
+    CUDNN_FE_LOG_LABEL_ENDL("Backend heuristics recommendation count: " << engine_config.size());
     cudnn_frontend::filter(engine_config, filtered_configs, filter_fn);
     return CUDNN_STATUS_SUCCESS;
 }

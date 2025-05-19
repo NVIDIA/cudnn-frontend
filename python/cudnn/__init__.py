@@ -43,7 +43,7 @@ for symbol_name in symbols_to_import:
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 
 
 def _tensor(
@@ -180,6 +180,13 @@ def _dlopen_cudnn():
         )
     )
 
+    if not lib_path:
+        lib_path = glob.glob(
+            os.path.join(
+                sysconfig.get_path("purelib"), "nvidia/cudnn_jit/lib/libcudnn.so.*[0-9]"
+            )
+        )
+
     if lib_path:
         assert (
             len(lib_path) == 1
@@ -196,3 +203,5 @@ if is_windows():
     load_cudnn()
 else:
     _dlopen_cudnn()
+
+from .graph import graph, jit, graph_cache

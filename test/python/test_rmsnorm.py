@@ -55,6 +55,7 @@ def param_extract(request):
     LooseVersion(cudnn.backend_version_string()) < "8.9.6",
     reason="RmsNorm not supported below cudnn 8.9.6",
 )
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_rmsnorm(param_extract, cudnn_handle):
 

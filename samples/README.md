@@ -115,6 +115,10 @@ Mixed precision multiplication between int8 and bf16 data-type with int8 operand
 
 Eg for layernorm training, inference and back propagation
 
+- [AdaLayerNorm](cpp/norm/adalayernorm.cpp)
+
+Eg for adaptive layernorm training, inference and back propagation
+
 - [RMSNorm](cpp/norm/layernorm.cpp)
 
 Eg for rmsnorm training, inference and back propagation
@@ -126,6 +130,10 @@ Shows different fusions in batch norm fprop and bprop. And split batch norm fusi
 - [Block scale quantize](cpp/norm/norm_block_scale.cpp)
 
 Showcases normalization with block scale quantize epilogue fusion.
+
+- [Norm zero centered gamma](cpp/norm/norm_zero_centered_gamma.cpp)
+
+Showcases layer normalization with zero centered gamma usage.
 
 ### Miscellaneous examples
 

@@ -36,6 +36,7 @@ def get_cc():
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch"
 )
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_int8_bf16_matmul(cudnn_handle):
 
@@ -107,6 +108,7 @@ MMA_data_type_options = [torch.bfloat16, torch.float16, torch.float32]
 @pytest.mark.parametrize("A_data_type", A_data_type_options)
 @pytest.mark.parametrize("B_data_type", B_data_type_options)
 @pytest.mark.parametrize("MMA_data_type", MMA_data_type_options)
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type, cudnn_handle):
 
@@ -215,6 +217,7 @@ def param_extract(request):
     return request.param
 
 
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_matmul_bias_relu(param_extract, cudnn_handle):
 

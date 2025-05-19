@@ -197,15 +197,15 @@ test_case(phase_t phase) {
     bool has_attn_bias      = false;
 
     bool is_ragged = (phase == phase_t::prefill);
-    if (cudnnGetVersion() < 90500) {
-        SKIP("Test requires cudnn 9.5.0 or above");
+    if (cudnnGetVersion() < 90800 && is_ragged) {
+        SKIP("Test requires cudnn 9.8.0 or above");
         return;
     }
 
-    // switch off certain features on blackwell
-    // if (is_blackwell_arch()) {
-    //     SKIP("Providing paged caches for attention is not supported on Blackwell");
-    // }
+    else if (cudnnGetVersion() < 90500) {
+        SKIP("Test requires cudnn 9.5.0 or above");
+        return;
+    }
 
     // Create a unique_ptr for the cuDNN handle
     auto handle_ptr = create_cudnn_handle();

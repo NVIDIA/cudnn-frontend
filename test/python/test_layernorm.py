@@ -23,6 +23,7 @@ def param_extract(request):
     LooseVersion(cudnn.backend_version_string()) < "8.9.5",
     reason="LN not supported below cudnn 8.9.5",
 )
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_layernorm(param_extract, cudnn_handle):
 
