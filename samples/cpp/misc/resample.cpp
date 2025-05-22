@@ -70,7 +70,7 @@ TEST_CASE("Resample Max Pooling NHWC Inference", "[resample][pooling][max][graph
     Surface<half> Y_gpu(N * H * W * C, false);
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {{X, X_gpu.devPtr},
                                                                                              {Y, Y_gpu.devPtr}};
-    int64_t workspace_size = 0;
+    int64_t workspace_size                                                                = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
@@ -185,7 +185,7 @@ TEST_CASE("Resample Avg Pooling", "[resample][pooling][average][graph]") {
     Surface<half> Y_gpu(N * H * W * C, false);
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {{X, X_gpu.devPtr},
                                                                                              {Y, Y_gpu.devPtr}};
-    int64_t workspace_size = 0;
+    int64_t workspace_size                                                                = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

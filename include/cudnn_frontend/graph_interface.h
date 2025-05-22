@@ -1729,7 +1729,7 @@ Graph::adalayernorm(std::shared_ptr<Tensor_attributes> x,
 
     sub_nodes.emplace_back(std::make_unique<AdaLayerNormNode>(std::move(attributes), context));
 
-    return {Y, MEAN, INV_VARIANCE};
+    return {std::move(Y), std::move(MEAN), std::move(INV_VARIANCE)};
 }
 
 inline std::array<std::shared_ptr<Tensor_attributes>, 3>
@@ -1900,7 +1900,7 @@ Graph::adalayernorm_backward(std::shared_ptr<Tensor_attributes> dy,
 
     sub_nodes.emplace_back(std::make_unique<DAdaLayerNormNode>(std::move(attributes), context));
 
-    return {DX, DSCALE, DBIAS};
+    return {std::move(DX), std::move(DSCALE), std::move(DBIAS)};
 }
 
 inline std::shared_ptr<Tensor_attributes>
