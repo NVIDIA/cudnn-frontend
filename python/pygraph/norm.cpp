@@ -120,7 +120,7 @@ PyGraph::adalayernorm(cudnn_frontend::NormFwdPhase_t const forward_phase,
                           .set_name(name);
 
     auto [Y, mean, inv_var] = graph->adalayernorm(x, scale, bias, attributes);
-    return {Y, mean, inv_var};
+    return {std::move(Y), std::move(mean), std::move(inv_var)};
 }
 
 std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>
@@ -137,7 +137,7 @@ PyGraph::adalayernorm_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_att
                           .set_name(name);
 
     auto [DX, DScale, DBias] = graph->adalayernorm_backward(dy, x, scale, attributes);
-    return {DX, DScale, DBias};
+    return {std::move(DX), std::move(DScale), std::move(DBias)};
 }
 
 std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>

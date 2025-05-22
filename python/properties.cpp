@@ -60,7 +60,7 @@ create_kernel_cache_helper() {
 }
 
 std::string
-kernel_cache_to_json_helper(std::shared_ptr<cudnn_frontend::KernelCache> kernel_cache) {
+kernel_cache_to_json_helper(std::shared_ptr<cudnn_frontend::KernelCache> const& kernel_cache) {
     std::string str_json;
     auto err = kernel_cache->to_json(str_json);
     throw_if(err.is_bad(), err.code, err.get_message());

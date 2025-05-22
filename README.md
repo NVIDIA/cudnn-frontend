@@ -19,6 +19,11 @@ For c++ users, in order to include the entire library, include the cudnn_fronten
 
 For Python users, run `import cudnn`
 
+
+## Performance
+
+Benchmarking test suites for cuDNN, covering various models and computational subgraphs, are available in the [benchmark directory](benchmark/). This section provides instructions for utilizing cuDNN as the primary backend across different environments.
+
 ## Build:
 
 Please refer to the [frontend installation guide](https://docs.nvidia.com/deeplearning/cudnn/installation/latest/frontend.html)

@@ -964,8 +964,8 @@ class AdaLayernorm_attributes : public Attributes<AdaLayernorm_attributes> {
     }
 
     AdaLayernorm_attributes&
-    set_epsilon(std::shared_ptr<Tensor_attributes>& value) {
-        inputs[AdaLayernorm_attributes::input_names::EPSILON] = value;
+    set_epsilon(std::shared_ptr<Tensor_attributes> value) {
+        inputs[AdaLayernorm_attributes::input_names::EPSILON] = std::move(value);
         return *this;
     }
 };

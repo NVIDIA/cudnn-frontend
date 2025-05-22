@@ -92,7 +92,7 @@ class KernelCache : public detail::backend_descriptor {
                                                 &serializationSize,
                                                 serialization_buf.data()));
         std::string json_string(serialization_buf.begin(), serialization_buf.end());
-        str_json = json_string;
+        str_json = std::move(json_string);
         return {};
 #else
         (void)str_json;
