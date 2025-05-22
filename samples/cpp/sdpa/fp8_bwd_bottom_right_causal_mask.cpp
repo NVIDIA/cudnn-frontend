@@ -214,7 +214,7 @@ TEST_CASE("sdpa_fp8_bprop_brcm", "[graph][sdpa][fp8][backward][brcm]") {
         {Amax_dV, AMax_dV_Tensor.devPtr},
         {Amax_dP, AMax_dP_Tensor.devPtr}};
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

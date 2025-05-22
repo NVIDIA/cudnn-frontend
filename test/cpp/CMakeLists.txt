@@ -55,7 +55,9 @@ target_link_libraries(
 
     CUDNN::cudnn
 
+    CUDA::cublasLt
     CUDA::cudart
+    CUDA::nvrtc
 )
 
 # cuDNN dlopen's its libraries

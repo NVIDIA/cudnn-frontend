@@ -143,7 +143,7 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
         variant_pack[Stats] = stats_tensor.devPtr;
     }
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

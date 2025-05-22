@@ -79,8 +79,10 @@ target_link_libraries(
     _cudnn_frontend_pch
     CUDNN::cudnn
 
+    CUDA::cublasLt
     CUDA::cudart
     CUDA::cuda_driver # Needed as calls all CUDA calls will eventually move to driver
+    CUDA::nvrtc
 )
 
 # target cmake properties

@@ -6,12 +6,24 @@ Include(FetchContent)
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.18)
 set(BUILD_MOCK OFF)
-FetchContent_Declare(
-  dlpack
-  GIT_REPOSITORY https://github.com/dmlc/dlpack
-  GIT_TAG        v1.1
-)
-FetchContent_MakeAvailable(dlpack)
+
+option(CUDNN_FRONTEND_USE_SYSTEM_DLPACK "Whether dlpack should use the system version or fetched." OFF)
+
+IF(CUDNN_FRONTEND_USE_SYSTEM_DLPACK)
+  find_package(dlpack REQUIRED)
+  if(dlpack_FOUND)
+    message(STATUS "Found system dlpack")
+  else()
+    message(FATAL_ERROR "dlpack not found")
+  endif()
+else()
+  FetchContent_Declare(
+    dlpack
+    GIT_REPOSITORY https://github.com/dmlc/dlpack
+    GIT_TAG        v1.1
+  )
+  FetchContent_MakeAvailable(dlpack)
+endif()
 
 # Find python
 find_package(Python 3.8 COMPONENTS Interpreter Development.Module REQUIRED)
@@ -20,6 +32,7 @@ find_package(Python 3.8 COMPONENTS Interpreter Development.Module REQUIRED)
 include(${PROJECT_SOURCE_DIR}/cmake/cuDNN.cmake)
 
 option(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE "Whether cmake build system should fetch pybinds." ON)
+
 
 if(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE)
     FetchContent_Declare(
@@ -61,11 +74,19 @@ target_include_directories(
 
 target_compile_definitions(_compiled_module PRIVATE NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)
 
-target_link_libraries(
-    _compiled_module
-    
-    PRIVATE dlpack
-)
+if(CUDNN_FRONTEND_USE_SYSTEM_DLPACK)
+    target_link_libraries(
+        _compiled_module
+
+        PRIVATE dlpack::dlpack
+    )
+else()
+    target_link_libraries(
+        _compiled_module
+
+        PRIVATE dlpack
+    )
+endif()
 
 if(MSVC)
     target_compile_options(_compiled_module PRIVATE /wd4127)

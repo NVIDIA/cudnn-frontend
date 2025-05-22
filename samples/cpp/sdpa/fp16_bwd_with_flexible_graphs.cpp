@@ -196,7 +196,7 @@ TEST_CASE("Toy sdpa backward with flexible graph", "[graph][sdpa][flash][backwar
                                                                                    {DV_UID, dV_tensor.devPtr}};
 
     // Allocate workspace
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

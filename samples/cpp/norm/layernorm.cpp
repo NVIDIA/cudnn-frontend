@@ -134,7 +134,7 @@ layernorm_fwd_dynamic_shapes(bool train = true) {
         Surface<float> Mean_tensor(max_stats_volume, false);
         Surface<float> Var_tensor(max_stats_volume, false);
 
-        int64_t workspace_size;
+        int64_t workspace_size = 0;
         REQUIRE(graph.get_workspace_size(workspace_size).is_good());
         Surface<int8_t> workspace(workspace_size, false);
 
@@ -232,7 +232,7 @@ TEST_CASE("LayerNorm Training", "[layernorm][graph]") {
     Surface<float> Bias_tensor(hidden_size, false);
     Surface<half> Y_tensor(batch_size * seq_length * hidden_size, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
@@ -309,7 +309,7 @@ TEST_CASE("LayerNorm Inference", "[layernorm][graph]") {
     Surface<float> Bias_tensor(hidden_size, false);
     Surface<half> Y_tensor(batch_size * seq_length * hidden_size, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
@@ -390,7 +390,7 @@ TEST_CASE("LayerNorm Backward", "[layernorm][graph]") {
     Surface<float> Dbias_tensor(hidden_size, false);
     Surface<half> DX_tensor(batch_size * seq_length * hidden_size, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

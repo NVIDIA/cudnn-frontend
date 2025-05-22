@@ -215,7 +215,7 @@ TEST_CASE("Toy sdpa forward", "[graph][sdpa][flash][forward]") {
         variant_pack[STATS_UID] = statsTensor.devPtr;
     }
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
