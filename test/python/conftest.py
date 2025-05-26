@@ -32,12 +32,6 @@ def pytest_configure(config):
     print(f"PyTorch CUDA Version: {torch.version.cuda}")
     print(f"PyTorch cuDNN Version: {torch.backends.cudnn.version()}")
 
-    config.addinivalue_line("markers", "L0: specifies L0 level (use -m L0)")
-    config.addinivalue_line("markers", "L1: specifies L0 level (use -m L1)")
-    config.addinivalue_line("markers", "L2: specifies L0 level (use -m L2)")
-    config.addinivalue_line("markers", "L3: specifies L0 level (use -m L3)")
-    config.addinivalue_line("markers", "L4: specifies L0 level (use -m L4)")
-
 
 def pytest_addoption(parser):
     # Generic options that may be used by all scripts.

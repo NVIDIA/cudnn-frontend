@@ -96,7 +96,7 @@ class SdpaBwdTestData {
           dk_tensor(b * h_k * d_qk * s_kv, false),
           dv_tensor(b * h_v * d_v * s_kv, false),
           do_tensor(b * s_q * h_q * d_qk, false, cpu_float2half_rn(qkv_fill_value)),
-          dbias_tensor(b * 1 * s_q * s_kv, false),
+          dbias_tensor(1 * h_q * s_q * s_kv, false),
           devActualSeqlenQ(b, false, /*fillValue=*/20),
           devActualSeqlenKV(b, false, /*fillValue=*/20),
           statsTensor(b * h_q * s_q * 1, false),
@@ -228,7 +228,7 @@ TEST_CASE("Toy sdpa backward as CUDA graph", "[graph][sdpa][flash][backward][cud
     bool causal_mask   = true;
     bool padding_mask  = (cudnnGetVersion() >= 8903);
     bool alibi_mask    = false;  // TODO: (cudnnGetVersion() >= 8904)
-    bool has_attn_bias = false;  // TODO: (cudnnGetVersion() >= 8903);
+    bool has_attn_bias = (cudnnGetVersion() >= 90500);
 
     // Create a unique_ptr for the cuDNN handle
     auto handle_ptr = create_cudnn_handle();
@@ -260,7 +260,7 @@ TEST_CASE("Toy sdpa backward as CUDA graph", "[graph][sdpa][flash][backward][cud
     REQUIRE(graph->check_support(handle).is_good());
     REQUIRE(graph->build_plans(handle).is_good());
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
 
     //// Create a CUDA graph.

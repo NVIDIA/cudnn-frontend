@@ -173,7 +173,7 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
     Surface<half> b_device_memory(k, false);
     Surface<half> y_device_memory(n * k * h * w, false);  // Should be p, q.
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
@@ -446,7 +446,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
     Surface<int32_t> dropoutSeed(scaleSize, false, seed_value);
     Surface<int32_t> dropoutOffset(scaleSize, false, (int32_t)1);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

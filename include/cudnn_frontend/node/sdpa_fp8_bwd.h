@@ -370,8 +370,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
             // Use a smaller value of neg infinity so that the softmax stats for rows that are fully padded dont
             // go towards NaNs/Infs when multipled by the numerous scale/descale
-            // auto negative_inf_padding = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
-            auto negative_inf_padding = std::make_shared<Tensor_attributes>(-1024.f*1024.f*1024.f);
+            auto negative_inf_padding = std::make_shared<Tensor_attributes>(attn::score_modifiers::get_negative_inf_value());
 
             last_dV =
                 pointwise(last_dV,
@@ -437,7 +436,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             row_greater_than_col_output->set_data_type(DataType_t::BOOLEAN);
 
             // Lower attributes to binary select attributes
-            auto negative_inf_causal = std::make_shared<Tensor_attributes>(std::numeric_limits<float>::lowest());
+            auto negative_inf_causal = std::make_shared<Tensor_attributes>(attn::score_modifiers::get_negative_inf_value());
 
             auto binary_select_attributes =
                 Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT);

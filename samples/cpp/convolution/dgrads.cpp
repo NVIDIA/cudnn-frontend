@@ -66,7 +66,7 @@ TEST_CASE("Convolution Dgrad", "[dgrad][graph]") {
     Surface<half> w_tensor(64 * 32 * 3 * 3, false);
     Surface<half> dx_tensor(4 * 32 * 16 * 16, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
 
     Surface<int8_t> workspace(workspace_size, false);
@@ -123,7 +123,7 @@ TEST_CASE("Dgrad Drelu Graph", "[dgrad][graph]") {
     Surface<half> x_tensor(4 * 32 * 16 * 16, false);
     Surface<half> dx_tensor(4 * 32 * 16 * 16, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 
@@ -235,7 +235,7 @@ TEST_CASE("Dgrad Drelu DBNweight Graph", "[dgrad][graph]") {
     Surface<float> eq_scale_x_tensor(1 * 32 * 1 * 1, false);
     Surface<float> eq_bias_tensor(1 * 32 * 1 * 1, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

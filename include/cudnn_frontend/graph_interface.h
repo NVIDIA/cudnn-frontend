@@ -15,6 +15,7 @@
 #include "node/dbn_weight.h"
 #include "node/genstats.h"
 #include "node/layernorm.h"
+#include "node/adaptive_layernorm.h"
 #include "node/instancenorm.h"
 #include "node/rmsnorm.h"
 #include "node/resample.h"
@@ -557,7 +558,6 @@ class Graph : public ICudnn, public INode {
 
         // Validate the nodes, which in turn also infers missing tensor attributes.
         CHECK_CUDNN_FRONTEND_ERROR(validate_subtree());
-
         // Validate all outputs, which should now have everything set to be lowered to backend.
         for (auto const &output : full_graph_outputs) {
             CHECK_CUDNN_FRONTEND_ERROR(output->validate());
@@ -914,6 +914,11 @@ class Graph : public ICudnn, public INode {
                                                                 std::shared_ptr<Tensor_attributes>,
                                                                 Layernorm_attributes);
 
+    std::array<std::shared_ptr<Tensor_attributes>, 3> adalayernorm(std::shared_ptr<Tensor_attributes>,
+                                                                   std::shared_ptr<Tensor_attributes>,
+                                                                   std::shared_ptr<Tensor_attributes>,
+                                                                   AdaLayernorm_attributes);
+
     std::array<std::shared_ptr<Tensor_attributes>, 3> instancenorm(std::shared_ptr<Tensor_attributes>,
                                                                    std::shared_ptr<Tensor_attributes>,
                                                                    std::shared_ptr<Tensor_attributes>,
@@ -967,6 +972,11 @@ class Graph : public ICudnn, public INode {
                                                                          std::shared_ptr<Tensor_attributes>,
                                                                          std::shared_ptr<Tensor_attributes>,
                                                                          Layernorm_backward_attributes);
+
+    std::array<std::shared_ptr<Tensor_attributes>, 3> adalayernorm_backward(std::shared_ptr<Tensor_attributes>,
+                                                                            std::shared_ptr<Tensor_attributes>,
+                                                                            std::shared_ptr<Tensor_attributes>,
+                                                                            AdaLayernorm_backward_attributes);
 
     std::array<std::shared_ptr<Tensor_attributes>, 3> instancenorm_backward(std::shared_ptr<Tensor_attributes>,
                                                                             std::shared_ptr<Tensor_attributes>,
@@ -1182,7 +1192,6 @@ class Graph : public ICudnn, public INode {
         j["nodes"];
         j["tensors"];
         std::unordered_set<std::string> tensors;
-
         for (const auto &sub_node : full_json["nodes"]) {
             // Create a short version of the node
             auto short_node       = sub_node;
@@ -1212,7 +1221,6 @@ class Graph : public ICudnn, public INode {
                 }
 
                 std::string tensor_name = tensor_info["name"].get<std::string>();
-
                 // Update short_node inputs
                 short_node["inputs"][port_name] = tensor_name;
 
@@ -1700,6 +1708,31 @@ Graph::layernorm(std::shared_ptr<Tensor_attributes> x,
 }
 
 inline std::array<std::shared_ptr<Tensor_attributes>, 3>
+Graph::adalayernorm(std::shared_ptr<Tensor_attributes> x,
+                    std::shared_ptr<Tensor_attributes> scale,
+                    std::shared_ptr<Tensor_attributes> bias,
+                    AdaLayernorm_attributes attributes) {
+    // Set outputs
+    auto Y = attributes.outputs[AdaLayernorm_attributes::output_names::Y] = output_tensor(attributes.name + "::Y");
+    std::shared_ptr<Tensor_attributes> MEAN                               = nullptr;
+    std::shared_ptr<Tensor_attributes> INV_VARIANCE                       = nullptr;
+    if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
+        MEAN = attributes.outputs[AdaLayernorm_attributes::output_names::MEAN] =
+            output_tensor(attributes.name + "::MEAN");
+        INV_VARIANCE = attributes.outputs[AdaLayernorm_attributes::output_names::INV_VARIANCE] =
+            output_tensor(attributes.name + "::INV_VARIANCE");
+    }
+    // Set inputs
+    attributes.inputs[AdaLayernorm_attributes::input_names::X]     = x;
+    attributes.inputs[AdaLayernorm_attributes::input_names::SCALE] = scale;
+    attributes.inputs[AdaLayernorm_attributes::input_names::BIAS]  = bias;
+
+    sub_nodes.emplace_back(std::make_unique<AdaLayerNormNode>(std::move(attributes), context));
+
+    return {std::move(Y), std::move(MEAN), std::move(INV_VARIANCE)};
+}
+
+inline std::array<std::shared_ptr<Tensor_attributes>, 3>
 Graph::instancenorm(std::shared_ptr<Tensor_attributes> x,
                     std::shared_ptr<Tensor_attributes> scale,
                     std::shared_ptr<Tensor_attributes> bias,
@@ -1846,6 +1879,28 @@ Graph::layernorm_backward(std::shared_ptr<Tensor_attributes> dy,
     sub_nodes.emplace_back(std::make_unique<DLNNode>(std::move(attributes), context));
 
     return {DX, DSCALE, DBIAS};
+}
+
+inline std::array<std::shared_ptr<Tensor_attributes>, 3>
+Graph::adalayernorm_backward(std::shared_ptr<Tensor_attributes> dy,
+                             std::shared_ptr<Tensor_attributes> x,
+                             std::shared_ptr<Tensor_attributes> scale,
+                             AdaLayernorm_backward_attributes attributes) {
+    // Set outputs
+    auto DX = attributes.outputs[AdaLayernorm_backward_attributes::output_names::DX] =
+        output_tensor(attributes.name + "::DX");
+    auto DSCALE = attributes.outputs[AdaLayernorm_backward_attributes::output_names::DSCALE] =
+        output_tensor(attributes.name + "::DSCALE");
+    auto DBIAS = attributes.outputs[AdaLayernorm_backward_attributes::output_names::DBIAS] =
+        output_tensor(attributes.name + "::DBIAS");
+    // Set inputs
+    attributes.inputs[AdaLayernorm_backward_attributes::input_names::DY]    = dy;
+    attributes.inputs[AdaLayernorm_backward_attributes::input_names::X]     = x;
+    attributes.inputs[AdaLayernorm_backward_attributes::input_names::SCALE] = scale;
+
+    sub_nodes.emplace_back(std::make_unique<DAdaLayerNormNode>(std::move(attributes), context));
+
+    return {std::move(DX), std::move(DSCALE), std::move(DBIAS)};
 }
 
 inline std::shared_ptr<Tensor_attributes>

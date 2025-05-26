@@ -27,6 +27,7 @@ def param_extract(request):
     LooseVersion(cudnn.backend_version_string()) < "8.9.5",
     reason="IN not supported below cudnn 8.9.5",
 )
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_in(param_extract, cudnn_handle):
 

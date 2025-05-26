@@ -196,12 +196,6 @@ TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
     bool alibi_mask    = (cudnnGetVersion() >= 8904);
     bool has_attn_bias = (cudnnGetVersion() >= 90500);
 
-    // switch off certain features on blackwell
-    if (is_blackwell_arch()) {
-        alibi_mask    = false;
-        has_attn_bias = false;
-    }
-
     if (cudnnGetVersion() < 8903) {
         SKIP("Test requires cudnn 8.9.3 or above");
         return;
@@ -286,7 +280,7 @@ TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
     }
 
     // Allocate workspace
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

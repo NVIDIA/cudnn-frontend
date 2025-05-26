@@ -33,6 +33,8 @@ add_executable(
 
     norm/batchnorm.cpp
     norm/layernorm.cpp
+    norm/adaptive_layernorm.cpp
+    norm/norm_zero_centered_gamma.cpp
     norm/rmsnorm.cpp
     norm/norm_block_scale.cpp
 
@@ -77,8 +79,10 @@ target_link_libraries(
     _cudnn_frontend_pch
     CUDNN::cudnn
 
+    CUDA::cublasLt
     CUDA::cudart
     CUDA::cuda_driver # Needed as calls all CUDA calls will eventually move to driver
+    CUDA::nvrtc
 )
 
 # target cmake properties

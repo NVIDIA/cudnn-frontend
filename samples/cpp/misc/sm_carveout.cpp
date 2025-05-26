@@ -123,7 +123,7 @@ TEST_CASE("SGBN with SM carveout", "[batchnorm][graph][sm_carveout]") {
     Surface<float> Peer_stats_0_tensor(2 * 4 * c, false, true);
     Surface<float> Peer_stats_1_tensor(2 * 4 * c, false);
 
-    int64_t workspace_size;
+    int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size, false);
 

@@ -48,26 +48,46 @@ def apply_rope_ref(
     return torch.cat((q_roped, q[..., rope_n_elem:]), dim=-1)
 
 
-@pytest.mark.skip(
-    reason="Switched off as need to debug some layout issue between pyt and cudnn graphs."
-)
-@torch_fork_set_rng(seed=0)
-def _test_apply_rope(cudnn_handle):
+@cudnn.jit(heur_modes=[cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+def create_rope_graph(handle, x1_gpu, x2_gpu, cos1_gpu, cos2_gpu, sin1_gpu, sin2_gpu):
+    with cudnn.graph(
+        handle,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    ) as (g, _):
+        x1 = g.tensor_like(x1_gpu)
+        x2 = g.tensor_like(x2_gpu)
+        cos1 = g.tensor_like(cos1_gpu)
+        cos2 = g.tensor_like(cos2_gpu)
+        sin1 = g.tensor_like(sin1_gpu)
+        sin2 = g.tensor_like(sin2_gpu)
 
+        x1_cos1 = g.mul(a=x1, b=cos1)
+        x2_cos2 = g.mul(a=x2, b=cos2)
+        x2_sin1 = g.mul(a=x2, b=sin1)
+        x1_sin2 = g.mul(a=x1, b=sin2)
+
+        Y1 = g.sub(a=x1_cos1, b=x2_sin1)
+        Y1.set_output(True).set_data_type(torch.float16)
+
+        Y2 = g.add(a=x2_cos2, b=x1_sin2)
+        Y2.set_output(True).set_data_type(torch.float16)
+
+        return g, [x1, x2, sin1, sin2, cos1, cos2, Y1, Y2]
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_apply_rope(cudnn_handle):
     B, nh, T, hs = 8, 32, 4096, 128
     rope_n_elem = int(0.25 * hs)
 
     # Reference
     x_gpu = torch.randn(B, nh, T, hs, dtype=torch.float16, device="cuda")
-
-    cos_gpu, sin_gpu = build_rope_cache(
-        seq_len=T,
-        n_elem=rope_n_elem,
-    )
-
+    cos_gpu, sin_gpu = build_rope_cache(seq_len=T, n_elem=rope_n_elem)
     Y_expected = apply_rope_ref(x_gpu, cos_gpu, sin_gpu)
 
-    # Cudnn code
+    # Prepare inputs
     x_gpu_3d = x_gpu.reshape(-1, T, hs)
     x1_gpu = x_gpu_3d[..., : rope_n_elem // 2]
     x2_gpu = x_gpu_3d[..., rope_n_elem // 2 : rope_n_elem]
@@ -83,55 +103,27 @@ def _test_apply_rope(cudnn_handle):
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
-    graph = cudnn.pygraph(
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
-        handle=cudnn_handle,
+    g, uids = create_rope_graph(
+        cudnn_handle, x1_gpu, x2_gpu, cos1_gpu, cos2_gpu, sin1_gpu, sin2_gpu
     )
-    x1 = graph.tensor_like(x1_gpu)
-    x2 = graph.tensor_like(x2_gpu)
-    cos1 = graph.tensor_like(cos1_gpu)
-    cos2 = graph.tensor_like(cos2_gpu)
-    sin1 = graph.tensor_like(sin1_gpu)
-    sin2 = graph.tensor_like(sin2_gpu)
+    x1_uid, x2_uid, sin1_uid, sin2_uid, cos1_uid, cos2_uid, Y1_uid, Y2_uid = uids
 
-    x1_cos1 = graph.mul(a=x1, b=cos1)
-    x2_cos2 = graph.mul(a=x2, b=cos2)
+    workspace = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
-    x2_sin1 = graph.mul(a=x2, b=sin1)
-    x1_sin2 = graph.mul(a=x1, b=sin2)
-
-    Y1 = graph.sub(a=x1_cos1, b=x2_sin1)
-    Y1.set_output(True).set_data_type(torch.float16)
-
-    Y2 = graph.add(a=x2_cos2, b=x1_sin2)
-    Y2.set_output(True).set_data_type(torch.float16)
-
-    graph.validate()
-    graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    graph.check_support()
-    graph.build_plans()
-
-    workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
-
-    graph.execute(
+    g.execute(
         {
-            x1: x1_gpu,
-            x2: x2_gpu,
-            sin1: sin1_gpu,
-            sin2: sin2_gpu,
-            cos1: cos1_gpu,
-            cos2: cos2_gpu,
-            Y1: x1_gpu,
-            Y2: x2_gpu,
+            x1_uid: x1_gpu,
+            x2_uid: x2_gpu,
+            sin1_uid: sin1_gpu,
+            sin2_uid: sin2_gpu,
+            cos1_uid: cos1_gpu,
+            cos2_uid: cos2_gpu,
+            Y1_uid: x1_gpu,
+            Y2_uid: x2_gpu,
         },
         workspace,
         handle=cudnn_handle,
     )
 
     torch.cuda.synchronize()
-    # Compare
     torch.testing.assert_close(Y_expected, x_gpu, atol=1e-2, rtol=1e-2)

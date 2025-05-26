@@ -943,6 +943,54 @@ class Layernorm_attributes : public Attributes<Layernorm_attributes> {
     }
 };
 
+class AdaLayernorm_attributes : public Attributes<AdaLayernorm_attributes> {
+    friend class Attributes<AdaLayernorm_attributes>;
+    friend class AdaLayerNormNode;
+    friend class Graph;
+
+    NormFwdPhase_t forward_phase = NormFwdPhase_t::NOT_SET;
+
+   public:
+    enum class input_names { X, SCALE, BIAS, EPSILON };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { Y, MEAN, INV_VARIANCE };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(AdaLayernorm_attributes, name, compute_data_type, inputs, outputs, forward_phase)
+
+    AdaLayernorm_attributes&
+    set_forward_phase(NormFwdPhase_t const value) {
+        forward_phase = value;
+        return *this;
+    }
+
+    AdaLayernorm_attributes&
+    set_epsilon(std::shared_ptr<Tensor_attributes> value) {
+        inputs[AdaLayernorm_attributes::input_names::EPSILON] = std::move(value);
+        return *this;
+    }
+};
+
+class AdaLayernorm_backward_attributes : public Attributes<AdaLayernorm_backward_attributes> {
+    friend class Attributes<AdaLayernorm_backward_attributes>;
+    friend class DAdaLayerNormNode;
+    friend class Graph;
+
+   public:
+    enum class input_names { DY, X, SCALE, MEAN, INV_VARIANCE, EPSILON };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { DX, DSCALE, DBIAS };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(AdaLayernorm_backward_attributes, name, compute_data_type, inputs, outputs)
+
+    AdaLayernorm_backward_attributes&
+    set_saved_mean_and_inv_variance(std::shared_ptr<Tensor_attributes> mean,
+                                    std::shared_ptr<Tensor_attributes> inv_variance) {
+        inputs[AdaLayernorm_backward_attributes::input_names::MEAN]         = mean;
+        inputs[AdaLayernorm_backward_attributes::input_names::INV_VARIANCE] = inv_variance;
+        return *this;
+    }
+};
+
 class Instancenorm_attributes : public Attributes<Instancenorm_attributes> {
     friend class Attributes<Instancenorm_attributes>;
     friend class InstanceNormNode;

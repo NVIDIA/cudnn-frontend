@@ -4,9 +4,9 @@ build-backend = 'mesonpy'
 requires = [
     'meson_python>=0.17.1',
     'meson>=1.8.0',
+    'cmake>=3.18',
     'pybind11[global]>=0.1.35'
 ]
-
 
 [project]
 name = "cuda-cudnn-frontend"

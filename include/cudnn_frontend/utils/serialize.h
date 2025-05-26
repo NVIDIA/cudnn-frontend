@@ -200,6 +200,37 @@ NLOHMANN_JSON_SERIALIZE_ENUM(Layernorm_backward_attributes::output_names,
                                  {Layernorm_backward_attributes::output_names::DBIAS, "DBIAS"},
                              })
 
+NLOHMANN_JSON_SERIALIZE_ENUM(AdaLayernorm_attributes::input_names,
+                             {
+                                 {AdaLayernorm_attributes::input_names::X, "X"},
+                                 {AdaLayernorm_attributes::input_names::SCALE, "SCALE"},
+                                 {AdaLayernorm_attributes::input_names::BIAS, "BIAS"},
+                                 {AdaLayernorm_attributes::input_names::EPSILON, "EPSILON"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(AdaLayernorm_attributes::output_names,
+                             {
+                                 {AdaLayernorm_attributes::output_names::Y, "Y"},
+                                 {AdaLayernorm_attributes::output_names::MEAN, "MEAN"},
+                                 {AdaLayernorm_attributes::output_names::INV_VARIANCE, "INV_VARIANCE"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(AdaLayernorm_backward_attributes::input_names,
+                             {
+                                 {AdaLayernorm_backward_attributes::input_names::DY, "DY"},
+                                 {AdaLayernorm_backward_attributes::input_names::X, "X"},
+                                 {AdaLayernorm_backward_attributes::input_names::SCALE, "SCALE"},
+                                 {AdaLayernorm_backward_attributes::input_names::MEAN, "MEAN"},
+                                 {AdaLayernorm_backward_attributes::input_names::INV_VARIANCE, "INV_VARIANCE"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(AdaLayernorm_backward_attributes::output_names,
+                             {
+                                 {AdaLayernorm_backward_attributes::output_names::DX, "DX"},
+                                 {AdaLayernorm_backward_attributes::output_names::DSCALE, "DSCALE"},
+                                 {AdaLayernorm_backward_attributes::output_names::DBIAS, "DBIAS"},
+                             })
+
 NLOHMANN_JSON_SERIALIZE_ENUM(Matmul_attributes::input_names,
                              {
                                  {Matmul_attributes::input_names::A, "A"},

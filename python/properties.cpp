@@ -59,6 +59,20 @@ create_kernel_cache_helper() {
     return kernel_cache;
 }
 
+std::string
+kernel_cache_to_json_helper(std::shared_ptr<cudnn_frontend::KernelCache> const& kernel_cache) {
+    std::string str_json;
+    auto err = kernel_cache->to_json(str_json);
+    throw_if(err.is_bad(), err.code, err.get_message());
+    return str_json;
+}
+
+void
+kernel_cache_from_json_helper(std::shared_ptr<cudnn_frontend::KernelCache> kernel_cache, std::string const& str_json) {
+    auto err = kernel_cache->from_json(str_json);
+    throw_if(err.is_bad(), err.code, err.get_message());
+}
+
 static std::string
 get_last_error_string() {
     return detail::get_last_error_string_();
@@ -172,7 +186,9 @@ init_properties(py::module_& m) {
 
     m.def("get_last_error_string", &get_last_error_string);
 
-    py::class_<cudnn_frontend::KernelCache, std::shared_ptr<cudnn_frontend::KernelCache>>(m, "kernel_cache");
+    py::class_<cudnn_frontend::KernelCache, std::shared_ptr<cudnn_frontend::KernelCache>>(m, "kernel_cache")
+        .def("serialize", &kernel_cache_to_json_helper)
+        .def("deserialize", &kernel_cache_from_json_helper);
     m.def("create_kernel_cache", &create_kernel_cache_helper);
 
     m.def("create_handle", &HandleManagement::create_handle);
