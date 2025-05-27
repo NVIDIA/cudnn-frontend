@@ -935,7 +935,7 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
         CHECK_CUDA_ERROR(detail::cuda_get_device(&device));
         CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, device));
 
-        if (prop.major != 9) { 
+        if (prop.major == 9) { 
             // validate basic dimension hquirements
             RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 256) || (d_qk % 8 != 0) || (d_v > 256) || (d_v % 8 != 0),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
