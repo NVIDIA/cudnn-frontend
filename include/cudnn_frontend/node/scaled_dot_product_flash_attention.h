@@ -939,17 +939,17 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
             // validate basic dimension hquirements
             RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 256) || (d_qk % 8 != 0) || (d_v > 256) || (d_v % 8 != 0),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Num hidden_dim shoud be less than or equal to 256 and hidden_dim should be multiple of 8");
+                                        "Num hidden_dim should be less than or equal to 256 and hidden_dim should be multiple of 8");
         } else if (prop.major == 10 && detail::get_backend_version() >= 91100) {
             // validate basic dimension requirements
             RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk % 8 != 0) || (d_v % 8 != 0),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Num hidden_dim shoud be should be multiple of 8");
+                                        "Num hidden_dim should be multiple of 8");
         } else {
             // validate basic dimension requirements
             RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Num hidden_dim shoud be less than or equal to 128 and hidden_dim should be multiple of 8");
+                                        "Num hidden_dim should be less than or equal to 128 and hidden_dim should be multiple of 8");
         }
 
         RETURN_CUDNN_FRONTEND_ERROR_IF((attributes.attention_score_modifier != nullptr) &&
