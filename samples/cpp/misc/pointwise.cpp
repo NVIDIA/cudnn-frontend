@@ -50,7 +50,7 @@ TEST_CASE("Reduction", "[reduction]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
-    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
     Surface<float> C_gpu(n * n * n * n, false);
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {{A, A_gpu.devPtr},
                                                                                              {C, C_gpu.devPtr}};
@@ -84,7 +84,7 @@ TEST_CASE("Fused scalar", "[scalar][graph]") {
     auto handle     = *handle_ptr;
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
-    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     Surface<half> C_gpu(n * n * n, false);
     Surface<half> A_gpu(n * n * n, false);
@@ -141,7 +141,7 @@ TEST_CASE("Fused Amax Reduction and type conversion", "[reduction]") {
     auto handle     = *handle_ptr;
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
-    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     Surface<float> A_gpu(n * n * n * n, false);
     Surface<float> scale_gpu(1, false);

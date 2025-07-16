@@ -94,12 +94,12 @@ TEST_CASE("Int8 Matmul", "[matmul][graph]") {
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
 
     if (check_device_arch_newer_than("ampere") && cudnnGetVersion() >= 8906) {
-        REQUIRE(graph.check_support(handle).is_good());
+        REQUIRE(graph.check_support().is_good());
     } else {
         SKIP("int8 gemm not supported pre-Ampere or pre-cudnn-8.9.6");
     }
 
-    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     // Run cudnn graph
     // note this is a bf16 tensor, but half is used just for memory allocation

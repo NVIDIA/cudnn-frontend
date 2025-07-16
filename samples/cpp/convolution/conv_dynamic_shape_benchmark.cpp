@@ -145,7 +145,7 @@ TEST_CASE("Benchmark conv graph API runtimes", "[conv][graph][benchmark]") {
                     status                = graph->build_operation_graph(handle);
                     status                = graph->create_execution_plans({fe::HeurMode_t::A});
                 }
-                meter.measure([&](int i) { return g[i]->check_support(handle); });
+                meter.measure([&](int i) { return g[i]->check_support(); });
             };
 
             BENCHMARK_ADVANCED("Build execution plan")(Catch::Benchmark::Chronometer meter) {
@@ -156,9 +156,9 @@ TEST_CASE("Benchmark conv graph API runtimes", "[conv][graph][benchmark]") {
                     auto status           = graph->validate();
                     status                = graph->build_operation_graph(handle);
                     status                = graph->create_execution_plans({fe::HeurMode_t::A});
-                    status                = graph->check_support(handle);
+                    status                = graph->check_support();
                 }
-                meter.measure([&](int i) { return g[i]->build_plans(handle); });
+                meter.measure([&](int i) { return g[i]->build_plans(); });
             };
         }
 
@@ -170,9 +170,9 @@ TEST_CASE("Benchmark conv graph API runtimes", "[conv][graph][benchmark]") {
 
         REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
-        REQUIRE(graph->build_plans(handle).is_good());
+        REQUIRE(graph->build_plans().is_good());
 
         return std::make_tuple(graph, X, W, Y);
     };

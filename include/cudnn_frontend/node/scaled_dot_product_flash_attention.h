@@ -1,4 +1,4 @@
-    #pragma once
+#pragma once
 
 #include <cstdlib>
 
@@ -171,25 +171,20 @@ class SDPANode : public NodeCRTP<SDPANode> {
 
         // check that Q, K, V, O tensors has been assigned
         // check that dim and strides has been assigned and last stride is 1
-#define CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(port, port_map)                                                        \
-    {                                                                                                            \
-        std::shared_ptr<Tensor_attributes> tensor_ptr = port_map.at(port);                                       \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_dim().size() != 4,                                        \
-                                       error_code_t::ATTRIBUTE_NOT_SET,                                          \
-                                       "The dim for " + std::string(#port) + " is invalid");                     \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_stride().size() != 4,                                     \
-                                       error_code_t::ATTRIBUTE_NOT_SET,                                          \
-                                       "The stride for " + std::string(#port) + " is invalid");                  \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                          \
-            tensor_ptr->get_stride()[3] != 1,                                                                    \
-            error_code_t::GRAPH_NOT_SUPPORTED,                                                                   \
-            "The stride for the last dimension corresponding to the embedding size per head should be 1 for " +  \
-                std::string(#port));                                                                             \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                          \
-            tensor_ptr->get_stride()[2] == 0,                                                                    \
-            error_code_t::GRAPH_NOT_SUPPORTED,                                                                   \
-            "The stride for the dimension corresponding to the sequence lengths per head should not be 0 for " + \
-                std::string(#port));                                                                             \
+#define CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(port, port_map)                                                       \
+    {                                                                                                           \
+        std::shared_ptr<Tensor_attributes> tensor_ptr = port_map.at(port);                                      \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_dim().size() != 4,                                       \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
+                                       "The dim for " + std::string(#port) + " is invalid");                    \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_stride().size() != 4,                                    \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
+                                       "The stride for " + std::string(#port) + " is invalid");                 \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                         \
+            tensor_ptr->get_stride()[3] != 1,                                                                   \
+            error_code_t::GRAPH_NOT_SUPPORTED,                                                                  \
+            "The stride for the last dimension corresponding to the embedding size per head should be 1 for " + \
+                std::string(#port));                                                                            \
     }
 
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Q, attributes.inputs);
@@ -197,12 +192,12 @@ class SDPANode : public NodeCRTP<SDPANode> {
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::V, attributes.inputs);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::O, attributes.outputs);
 
-        // validate options for is_inference and stats tensor
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.is_inference.has_value() == false,
+        // validate options for generate_stats and stats tensor
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.generate_stats.has_value() == false,
                                        error_code_t::ATTRIBUTE_NOT_SET,
-                                       "is_inference attribute not set");
+                                       "generate_stats attribute not set");
 
-        if (attributes.is_inference.value() == false) {
+        if (attributes.generate_stats.value() == true) {
             CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::Stats);
         }
 
@@ -335,9 +330,15 @@ class SDPANode : public NodeCRTP<SDPANode> {
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "On Hopper architecture, this specific combination of s_q, s_kv, and left_bound + right_bound + bottom right diagonal alignment is not supported for backend version 9.9 or below");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value()&& (!attributes.has_causal_like_masking() || is_dropout || is_bias || (is_ragged && !attributes.padding_mask)),
-                                    error_code_t::GRAPH_NOT_SUPPORTED,
-                                    "Left and right bounds are only supported with is_dropout=False, is_bias=False. Further is_ragged==True is only allowed when padding_mask=True. Lastly the diagonal alignment must be set.");
+        if ((detail::get_backend_version() >= 91002)) {
+             RETURN_CUDNN_FRONTEND_ERROR_IF((attributes.left_bound.has_value() || attributes.right_bound.has_value()) && ((is_ragged && !attributes.padding_mask)),
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Left and right bounds with is_ragged==True is only allowed when padding_mask=True. And the diagonal alignment must be set.");
+        } else {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value()&& (!attributes.has_causal_like_masking() || is_dropout || is_bias || (is_ragged && !attributes.padding_mask)),
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Left and right bounds are only supported with is_dropout=False, is_bias=False. Further is_ragged==True is only allowed when padding_mask=True. Lastly the diagonal alignment must be set.");
+        }
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.right_bound.has_value() && attributes.right_bound.value() < 0,
                                        error_code_t::INVALID_VALUE,
@@ -456,7 +457,7 @@ class SDPANode : public NodeCRTP<SDPANode> {
 
     error_t
     infer_properties_node() override final {
-        if (attributes.is_inference.value() == false) {
+        if (attributes.generate_stats.value() == true) {
             auto stats     = attributes.outputs.at(output_names::Stats);
             auto stats_dim = stats->get_dim();
 
@@ -661,7 +662,7 @@ class SDPANode : public NodeCRTP<SDPANode> {
 
         // Create a virtual output for stats if inference step otherwise output.Stats is already set
         auto softmax_stats = attributes.outputs[output_names::Stats];
-        if (attributes.is_inference.value() == true) {
+        if (attributes.generate_stats.value() == false) {
             softmax_stats = std::make_shared<Tensor_attributes>();
             softmax_stats->set_is_virtual(true);
         }
@@ -866,25 +867,20 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
 
         // check that Q, K, V, O, stats, dO, dQ, dK, dV tensors has been assigned
         // check that dim and strides has been assigned and last stride is 1
-#define CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(port, port_map)                                                        \
-    {                                                                                                            \
-        std::shared_ptr<Tensor_attributes> tensor_ptr = port_map.at(port);                                       \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_dim().size() != 4,                                        \
-                                       error_code_t::ATTRIBUTE_NOT_SET,                                          \
-                                       "The dim for " + std::string(#port) + " is invalid");                     \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_stride().size() != 4,                                     \
-                                       error_code_t::ATTRIBUTE_NOT_SET,                                          \
-                                       "The stride for " + std::string(#port) + " is invalid");                  \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                          \
-            tensor_ptr->get_stride()[3] != 1,                                                                    \
-            error_code_t::GRAPH_NOT_SUPPORTED,                                                                   \
-            "The stride for the last dimension corresponding to the embedding size per head should be 1 for " +  \
-                std::string(#port));                                                                             \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                          \
-            tensor_ptr->get_stride()[2] == 0,                                                                    \
-            error_code_t::GRAPH_NOT_SUPPORTED,                                                                   \
-            "The stride for the dimension corresponding to the sequence lengths per head should not be 0 for " + \
-                std::string(#port));                                                                             \
+#define CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(port, port_map)                                                       \
+    {                                                                                                           \
+        std::shared_ptr<Tensor_attributes> tensor_ptr = port_map.at(port);                                      \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_dim().size() != 4,                                       \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
+                                       "The dim for " + std::string(#port) + " is invalid");                    \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_stride().size() != 4,                                    \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
+                                       "The stride for " + std::string(#port) + " is invalid");                 \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                         \
+            tensor_ptr->get_stride()[3] != 1,                                                                   \
+            error_code_t::GRAPH_NOT_SUPPORTED,                                                                  \
+            "The stride for the last dimension corresponding to the embedding size per head should be 1 for " + \
+                std::string(#port));                                                                            \
     }
 
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Q, attributes.inputs);
@@ -937,14 +933,33 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
 
         if (prop.major == 9) { 
             // validate basic dimension hquirements
-            RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 256) || (d_qk % 8 != 0) || (d_v > 256) || (d_v % 8 != 0),
-                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Num hidden_dim should be less than or equal to 256 and hidden_dim should be multiple of 8");
+            if (d_qk == d_v) {
+                RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 256) || (d_qk % 8 != 0) || (d_v > 256) || (d_v % 8 != 0),
+                                            error_code_t::GRAPH_NOT_SUPPORTED,
+                                            "Num hidden_dim should be less than or equal to 256 and hidden_dim should be multiple of 8");
+            } else {
+                if (d_qk == 192) { // special case for 192 hidden dim
+                    RETURN_CUDNN_FRONTEND_ERROR_IF( (d_v != 128),
+                                            error_code_t::GRAPH_NOT_SUPPORTED,
+                                            "Num hidden_dim d_v should be equal to 128 if d_qk is 192");
+                } else {
+                    RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
+                            error_code_t::GRAPH_NOT_SUPPORTED,
+                            "Num hidden_dim should be less than or equal to 128 and hidden_dim should be multiple of 8 when d_qk != d_v");
+                }
+            }
+
         } else if (prop.major == 10 && detail::get_backend_version() >= 91100) {
             // validate basic dimension requirements
-            RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk % 8 != 0) || (d_v % 8 != 0),
+            if (d_qk == 192) { // special case for 192 hidden dim
+                RETURN_CUDNN_FRONTEND_ERROR_IF( (d_v != 128),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Num hidden_dim should be multiple of 8");
+                                        "Num hidden_dim d_v should be equal to 128 if d_qk is 192");
+            } else {
+                RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
+                                            error_code_t::GRAPH_NOT_SUPPORTED,
+                                            "Num hidden_dim should be less than or equal to 128 and hidden_dim should be multiple of 8 when d_qk != d_v");
+            }
         } else {
             // validate basic dimension requirements
             RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
@@ -1020,10 +1035,16 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "Sliding window attention is only supported with max_s_q <= max_s_kv.");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && (! attributes.has_causal_like_masking() || is_dropout || is_bias || (is_ragged && !attributes.padding_mask)),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Left and right bounds are only supported with is_dropout=False, is_bias=False. Further is_ragged==True is only allowed when padding_mask=True. Lastly the diagonal alignment must be set.");
-
+        if ((detail::get_backend_version() >= 91002)) {
+             RETURN_CUDNN_FRONTEND_ERROR_IF((attributes.left_bound.has_value() || attributes.right_bound.has_value()) && ((is_ragged && !attributes.padding_mask)),
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Left and right bounds with is_ragged==True is only allowed when padding_mask=True. And the diagonal alignment must be set.");
+        } else {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && (! attributes.has_causal_like_masking() || is_dropout || is_bias || (is_ragged && !attributes.padding_mask)),
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Left and right bounds are only supported with is_dropout=False, is_bias=False. Further is_ragged==True is only allowed when padding_mask=True. Lastly the diagonal alignment must be set.");
+        }
+        
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.right_bound.has_value() && attributes.right_bound.value() < 0,
                                        error_code_t::INVALID_VALUE,
                                        "Right bound needs to be larger than or equal to zero");

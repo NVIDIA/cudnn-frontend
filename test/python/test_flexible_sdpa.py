@@ -302,7 +302,7 @@ def test_sdpa_with_flexible_graph(cudnn_handle):
         v=container_v,
         seq_len_q=seq_len_q,
         seq_len_kv=seq_len_kv,
-        is_inference=True,
+        generate_stats=False,
         attn_scale=attn_scale,
         use_causal_mask=False,
         paged_attention_k_table=page_table_k,  # Page Table K: Tensor containing offsets to the container with K blocks
@@ -480,7 +480,7 @@ def test_sdpa_with_arrow_mask(cudnn_handle):
         q=q,
         k=k,
         v=v,
-        is_inference=True,
+        generate_stats=False,
         attn_scale=attn_scale,
         score_mod=partial(
             arrow_mask,
@@ -583,7 +583,7 @@ def test_sdpa_with_document_mask(cudnn_handle):
         q=q,
         k=k,
         v=v,
-        is_inference=True,
+        generate_stats=False,
         attn_scale=attn_scale,
         score_mod=partial(
             document_mask,

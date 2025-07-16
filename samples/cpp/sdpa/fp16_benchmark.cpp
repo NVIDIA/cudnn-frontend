@@ -46,12 +46,12 @@ create_sdpa_forward_graph(int64_t const b,
                           int64_t const s_kv,
                           int64_t const d_qk,
                           int64_t const d_v,
-                          float const attn_scale  = 1.0f,
-                          bool const is_inference = false,
-                          bool const causal_mask  = false,
-                          bool const alibi_mask   = false,
-                          bool const padding_mask = false,
-                          bool has_attn_bias      = false);
+                          float const attn_scale    = 1.0f,
+                          bool const generate_stats = true,
+                          bool const causal_mask    = false,
+                          bool const alibi_mask     = false,
+                          bool const padding_mask   = false,
+                          bool has_attn_bias        = false);
 
 // Directly use the backward graph builder from the toy example
 std::shared_ptr<fe::graph::Graph>
@@ -63,12 +63,12 @@ create_sdpa_backward_graph(int64_t const b,
                            int64_t const s_kv,
                            int64_t const d_qk,
                            int64_t const d_v,
-                           float const attn_scale  = 1.0f,
-                           bool const is_inference = false,
-                           bool const causal_mask  = false,
-                           bool const alibi_mask   = false,
-                           bool const padding_mask = false,
-                           bool has_attn_bias      = false);
+                           float const attn_scale    = 1.0f,
+                           bool const generate_stats = true,
+                           bool const causal_mask    = false,
+                           bool const alibi_mask     = false,
+                           bool const padding_mask   = false,
+                           bool has_attn_bias        = false);
 
 #define Q_UID 1
 #define K_UID 2
@@ -136,7 +136,7 @@ TEST_CASE("Benchmark sdpa graph API runtimes", "[graph][sdpa][flash]") {
         status      = g->build_operation_graph(handle);
         status      = g->create_execution_plans({fe::HeurMode_t::A});
 
-        meter.measure([&] { return g->check_support(handle); });
+        meter.measure([&] { return g->check_support(); });
     };
 
     BENCHMARK_ADVANCED("Cached Build plan")(Catch::Benchmark::Chronometer meter) {
@@ -144,10 +144,10 @@ TEST_CASE("Benchmark sdpa graph API runtimes", "[graph][sdpa][flash]") {
         auto status = g->validate();
         status      = g->build_operation_graph(handle);
         status      = g->create_execution_plans({fe::HeurMode_t::A});
-        status      = g->check_support(handle);
-        status      = g->build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE, false);
+        status      = g->check_support();
+        status      = g->build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE, false);
 
-        meter.measure([&] { return g->build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE, false); });
+        meter.measure([&] { return g->build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE, false); });
     };
 
     BENCHMARK_ADVANCED("Workspace query")(Catch::Benchmark::Chronometer meter) {
@@ -155,8 +155,8 @@ TEST_CASE("Benchmark sdpa graph API runtimes", "[graph][sdpa][flash]") {
         auto status = g->validate();
         status      = g->build_operation_graph(handle);
         status      = g->create_execution_plans({fe::HeurMode_t::A});
-        status      = g->check_support(handle);
-        status      = g->build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE, false);
+        status      = g->check_support();
+        status      = g->build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE, false);
 
         meter.measure([&] { return g->get_workspace_size(); });
     };

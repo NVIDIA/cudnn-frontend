@@ -67,11 +67,11 @@ create_sdpa_forward_graph_with_paged_caches(int64_t const b,
                                             int64_t const num_blocks_v,
                                             int64_t const table_size,
                                             bool is_ragged,
-                                            float const attn_scale  = 1.0f,
-                                            bool const is_inference = false,
-                                            bool const causal_mask  = false,
-                                            bool const alibi_mask   = false,
-                                            bool has_attn_bias      = false) {
+                                            float const attn_scale    = 1.0f,
+                                            bool const generate_stats = true,
+                                            bool const causal_mask    = false,
+                                            bool const alibi_mask     = false,
+                                            bool has_attn_bias        = false) {
     // Create a graph and set common global properties.
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(fe::DataType_t::BFLOAT16)
@@ -112,7 +112,7 @@ create_sdpa_forward_graph_with_paged_caches(int64_t const b,
 
     auto sdpa_options = fe::graph::SDPA_attributes()
                             .set_name("flash_attention")
-                            .set_is_inference(is_inference)
+                            .set_generate_stats(generate_stats)
                             .set_alibi_mask(alibi_mask)
                             .set_attn_scale(attn_scale);
 
@@ -166,10 +166,10 @@ create_sdpa_forward_graph_with_paged_caches(int64_t const b,
 
     O->set_output(true).set_dim({b, h_q, s_q, d_v}).set_stride({h_q * d_v, d_v, b * h_q * d_v, 1}).set_uid(O_UID);
 
-    if (is_inference) {
-        assert(Stats == nullptr);
-    } else {
+    if (generate_stats) {
         Stats->set_output(true).set_data_type(fe::DataType_t::FLOAT).set_uid(STATS_UID);
+    } else {
+        assert(Stats == nullptr);
     }
 
     return graph;
@@ -190,7 +190,7 @@ test_case(phase_t phase) {
     int64_t num_blocks_k    = ((s_kv + block_size - 1) / block_size) * b;  // Number of blocks in container_k
     int64_t num_blocks_v    = ((s_kv + block_size - 1) / block_size) * b;  // Number of blocks in container_v
     int64_t page_table_size = (s_kv + block_size - 1) / block_size;        // per-batch size of the page tables
-    bool is_inference       = false;
+    bool generate_stats     = true;
     float attn_scale        = 0.123f;
     bool causal_mask        = true;
     bool alibi_mask         = false;
@@ -225,7 +225,7 @@ test_case(phase_t phase) {
                                                              page_table_size,
                                                              is_ragged,
                                                              attn_scale,
-                                                             is_inference,
+                                                             generate_stats,
                                                              causal_mask,
                                                              alibi_mask,
                                                              has_attn_bias);
@@ -314,7 +314,7 @@ test_case(phase_t phase) {
     variant_pack[SEQ_LEN_KV_UID] = devActualSeqlenKV.devPtr;
 
     Surface<float> statsTensor(b * h_q * s_q * 1, false);
-    if (is_inference == false) {
+    if (generate_stats == true) {
         variant_pack[STATS_UID] = statsTensor.devPtr;
     }
 

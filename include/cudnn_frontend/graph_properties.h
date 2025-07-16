@@ -1074,13 +1074,20 @@ class Reduction_attributes : public Attributes<Reduction_attributes> {
     friend class INode;
 
     std::optional<ReductionMode_t> mode;
+    bool is_deterministic = false;
 
    public:
     enum class input_names { X };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Reduction_attributes, name, compute_data_type, inputs, outputs, mode)
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Reduction_attributes,
+                                   name,
+                                   compute_data_type,
+                                   inputs,
+                                   outputs,
+                                   mode,
+                                   is_deterministic)
 
     std::optional<ReductionMode_t>
     get_mode() const {
@@ -1090,6 +1097,17 @@ class Reduction_attributes : public Attributes<Reduction_attributes> {
     Reduction_attributes&
     set_mode(ReductionMode_t value) {
         mode = value;
+        return *this;
+    }
+
+    bool
+    get_is_deterministic() const {
+        return is_deterministic;
+    }
+
+    Reduction_attributes&
+    set_is_deterministic(bool value) {
+        is_deterministic = value;
         return *this;
     }
 };
@@ -1181,7 +1199,7 @@ class Resample_attributes : public Attributes<Resample_attributes> {
     friend class ResampleNode;
     friend class INode;
 
-    std::optional<bool> is_inference;
+    std::optional<bool> generate_index;
     ResampleMode_t resample_mode;
     PaddingMode_t padding_mode;
     std::vector<cudnnFraction_t> pre_padding;
@@ -1200,7 +1218,7 @@ class Resample_attributes : public Attributes<Resample_attributes> {
                                    name,
                                    inputs,
                                    outputs,
-                                   is_inference,
+                                   generate_index,
                                    resample_mode,
                                    padding_mode,
                                    pre_padding,
@@ -1285,9 +1303,15 @@ class Resample_attributes : public Attributes<Resample_attributes> {
     }
 
     auto
-    set_is_inference(bool const value) -> Resample_attributes& {
-        is_inference = value;
+    set_generate_index(bool const value) -> Resample_attributes& {
+        generate_index = value;
         return *this;
+    }
+
+    [[deprecated]]
+    auto
+    set_is_inference(bool const value) -> Resample_attributes& {
+        return set_generate_index(!value);
     }
 };
 
@@ -1511,7 +1535,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     using AttentionScoreModifier_t =
         std::function<Tensor_t(std::shared_ptr<Graph>, std::shared_ptr<Tensor_attributes>)>;
 
-    std::optional<bool> is_inference;
+    std::optional<bool> generate_stats;
     bool alibi_mask   = false;
     bool padding_mask = false;
     std::optional<int64_t> left_bound;
@@ -1555,7 +1579,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
                                    name,
                                    inputs,
                                    outputs,
-                                   is_inference,
+                                   generate_stats,
                                    alibi_mask,
                                    padding_mask,
                                    dropout_probability,
@@ -1566,9 +1590,15 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
                                    diagonal_alignment)
 
     SDPA_attributes&
-    set_is_inference(bool const value) {
-        is_inference = value;
+    set_generate_stats(bool const value) {
+        generate_stats = value;
         return *this;
+    }
+
+    [[deprecated]]
+    SDPA_attributes&
+    set_is_inference(bool const value) {
+        return set_generate_stats(!value);
     }
 
     SDPA_attributes&
@@ -1721,7 +1751,7 @@ class SDPA_fp8_attributes : public Attributes<SDPA_fp8_attributes> {
     friend class SDPAFP8Node;
     friend class Graph;
 
-    std::optional<bool> is_inference;
+    std::optional<bool> generate_stats;
     bool padding_mask             = false;
     bool causal_mask              = false;
     bool causal_mask_bottom_right = false;
@@ -1758,7 +1788,7 @@ class SDPA_fp8_attributes : public Attributes<SDPA_fp8_attributes> {
                                    name,
                                    inputs,
                                    outputs,
-                                   is_inference,
+                                   generate_stats,
                                    padding_mask,
                                    causal_mask,
                                    causal_mask_bottom_right,
@@ -1766,9 +1796,15 @@ class SDPA_fp8_attributes : public Attributes<SDPA_fp8_attributes> {
                                    attn_scale_value)
 
     SDPA_fp8_attributes&
-    set_is_inference(bool const value) {
-        is_inference = value;
+    set_generate_stats(bool const value) {
+        generate_stats = value;
         return *this;
+    }
+
+    [[deprecated]]
+    SDPA_fp8_attributes&
+    set_is_inference(bool const value) {
+        return set_generate_stats(!value);
     }
 
     SDPA_fp8_attributes&
@@ -2416,7 +2452,7 @@ class Block_scale_dequantize_attributes : public Attributes<Block_scale_dequanti
     friend class BlockScaleDequantizeNode;
     friend class Graph;
 
-    std::optional<int32_t> block_size;
+    std::vector<int32_t> block_size;
 
    public:
     enum class input_names { X, scale };
@@ -2431,8 +2467,32 @@ class Block_scale_dequantize_attributes : public Attributes<Block_scale_dequanti
                                    block_size)
 
     Block_scale_dequantize_attributes&
-    set_block_size(int32_t const value) {
-        block_size = value;
+    set_block_size(int32_t const value, int32_t idx = 0) {
+        if (idx < 0) {
+            return *this;
+        }
+        if (static_cast<int32_t>(block_size.size()) < idx + 1) {
+            block_size.resize(idx + 1, 1);
+        }
+        block_size[idx] = value;
+        return *this;
+    }
+
+    Block_scale_dequantize_attributes&
+    set_block_size(const int32_t* values, int32_t len = 1) {
+        if (len < 1) {
+            return *this;
+        }
+        if (static_cast<int32_t>(block_size.size()) < len) {
+            block_size.resize(len);
+        }
+        std::copy(values, values + len, block_size.begin());
+        return *this;
+    }
+
+    Block_scale_dequantize_attributes&
+    set_block_size(const std::vector<int32_t>& values) {
+        block_size = values;
         return *this;
     }
 };

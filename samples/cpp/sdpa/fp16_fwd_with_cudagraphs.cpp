@@ -59,12 +59,12 @@ create_sdpa_forward_graph(int64_t const b,
                           int64_t const s_kv,
                           int64_t const d_qk,
                           int64_t const d_v,
-                          float const attn_scale  = 1.0f,
-                          bool const is_inference = false,
-                          bool const causal_mask  = false,
-                          bool const alibi_mask   = false,
-                          bool const padding_mask = false,
-                          bool has_attn_bias      = false);
+                          float const attn_scale    = 1.0f,
+                          bool const generate_stats = true,
+                          bool const causal_mask    = false,
+                          bool const alibi_mask     = false,
+                          bool const padding_mask   = false,
+                          bool has_attn_bias        = false);
 
 // Convenience class to encapsulate SDPA test data for this example
 class SdpaTestData {
@@ -78,7 +78,7 @@ class SdpaTestData {
                  int64_t const d_qk,
                  int64_t const d_v,
                  int64_t const workspace_size,
-                 bool const is_inference,
+                 bool const generate_stats,
                  bool const padding_mask,
                  bool const has_attn_bias,
                  float const qkv_fill_value)
@@ -91,7 +91,7 @@ class SdpaTestData {
           devActualSeqlenKV(b, false, /*fillValue=*/20),
           statsTensor(b * h_q * s_q * 1, false),
           workspace(workspace_size, false),
-          is_inference_(is_inference),
+          generate_stats_(generate_stats),
           padding_mask_(padding_mask),
           has_attn_bias_(has_attn_bias) {}
 
@@ -109,7 +109,7 @@ class SdpaTestData {
             variant_pack[SEQ_LEN_Q_UID]  = devActualSeqlenQ.devPtr;
             variant_pack[SEQ_LEN_KV_UID] = devActualSeqlenKV.devPtr;
         }
-        if (is_inference_ == false) {
+        if (generate_stats_ == true) {
             variant_pack[STATS_UID] = statsTensor.devPtr;
         }
         return variant_pack;
@@ -125,7 +125,7 @@ class SdpaTestData {
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(
             o_tensor.hostPtr, o_tensor.devPtr, sizeof(o_tensor.hostPtr[0]) * o_tensor.n_elems, cudaMemcpyDeviceToHost));
-        if (is_inference_ == false) {
+        if (generate_stats_ == true) {
             CUDA_CHECK(cudaMemcpy(statsTensor.hostPtr,
                                   statsTensor.devPtr,
                                   sizeof(statsTensor.hostPtr[0]) * statsTensor.n_elems,
@@ -148,11 +148,11 @@ class SdpaTestData {
 
     bool
     equal_outputs(SdpaTestData &other) {
-        REQUIRE(is_inference_ == other.is_inference_);
+        REQUIRE(generate_stats_ == other.generate_stats_);
         sync_outputs();
         other.sync_outputs();
         if (!equal_tensors(o_tensor, other.o_tensor)) return false;
-        if (!is_inference_ && !equal_tensors(statsTensor, other.statsTensor)) return false;
+        if (generate_stats_ && !equal_tensors(statsTensor, other.statsTensor)) return false;
         return true;
     }
 
@@ -166,7 +166,7 @@ class SdpaTestData {
     Surface<int32_t> devActualSeqlenKV;
     Surface<float> statsTensor;
     Surface<int8_t> workspace;
-    bool is_inference_;
+    bool generate_stats_;
     bool padding_mask_;
     bool has_attn_bias_;
 };
@@ -190,20 +190,20 @@ TEST_CASE("Toy sdpa forward as CUDA graph", "[graph][sdpa][flash][forward][cudag
         return;
     }
 
-    int64_t b          = 3;     // batch size
-    int64_t h_q        = 4;     // head dim
-    int64_t h_k        = 4;     // head dim
-    int64_t h_v        = 4;     // head dim
-    int64_t s_q        = 1024;  // q tensor is padded to this seq length
-    int64_t s_kv       = 1024;  // k and v tensor is padded to this seq length
-    int64_t d_qk       = 128;   // hidden dim
-    int64_t d_v        = 128;   // hidden dim
-    bool is_inference  = false;
-    float attn_scale   = 0.123f;
-    bool causal_mask   = true;
-    bool padding_mask  = (cudnnGetVersion() >= 8903);
-    bool alibi_mask    = false;  // TODO: (cudnnGetVersion() >= 8904)
-    bool has_attn_bias = (cudnnGetVersion() >= 8903);
+    int64_t b           = 3;     // batch size
+    int64_t h_q         = 4;     // head dim
+    int64_t h_k         = 4;     // head dim
+    int64_t h_v         = 4;     // head dim
+    int64_t s_q         = 1024;  // q tensor is padded to this seq length
+    int64_t s_kv        = 1024;  // k and v tensor is padded to this seq length
+    int64_t d_qk        = 128;   // hidden dim
+    int64_t d_v         = 128;   // hidden dim
+    bool generate_stats = true;
+    float attn_scale    = 0.123f;
+    bool causal_mask    = true;
+    bool padding_mask   = (cudnnGetVersion() >= 8903);
+    bool alibi_mask     = false;  // TODO: (cudnnGetVersion() >= 8904)
+    bool has_attn_bias  = (cudnnGetVersion() >= 8903);
 
     // Create a unique_ptr for the cuDNN handle
     auto handle_ptr = create_cudnn_handle();
@@ -218,7 +218,7 @@ TEST_CASE("Toy sdpa forward as CUDA graph", "[graph][sdpa][flash][forward][cudag
                                            d_qk,
                                            d_v,
                                            attn_scale,
-                                           is_inference,
+                                           generate_stats,
                                            causal_mask,
                                            alibi_mask,
                                            padding_mask,
@@ -231,8 +231,8 @@ TEST_CASE("Toy sdpa forward as CUDA graph", "[graph][sdpa][flash][forward][cudag
 
     // Make sure the selected execution plan supports cuda graph
     graph->select_behavior_notes({cudnn_frontend::BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API});
-    REQUIRE(graph->check_support(handle).is_good());
-    REQUIRE(graph->build_plans(handle).is_good());
+    REQUIRE(graph->check_support().is_good());
+    REQUIRE(graph->build_plans().is_good());
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
@@ -252,7 +252,7 @@ TEST_CASE("Toy sdpa forward as CUDA graph", "[graph][sdpa][flash][forward][cudag
                              d_qk,
                              d_v,
                              workspace_size,
-                             is_inference,
+                             generate_stats,
                              padding_mask,
                              has_attn_bias,
                              /*fillValue_qkv=*/1.1f);
@@ -282,7 +282,7 @@ TEST_CASE("Toy sdpa forward as CUDA graph", "[graph][sdpa][flash][forward][cudag
                              d_qk,
                              d_v,
                              workspace_size,
-                             is_inference,
+                             generate_stats,
                              padding_mask,
                              has_attn_bias,
                              /*fillValue_qkv=*/1.3f);

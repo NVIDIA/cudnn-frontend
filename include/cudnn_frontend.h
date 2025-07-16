@@ -124,6 +124,7 @@
 #include "cudnn_frontend/utils/serialize.h"
 #include "cudnn_frontend/backend/kernel_cache.h"
 #include "cudnn_frontend/utils/attn_score_modifiers.h"
+#include "cudnn_frontend/backend/device_properties.h"
 
 #include "cudnn_frontend_version.h"
 

@@ -206,6 +206,8 @@ class OperationGraphBuilder_v8 {
                 "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: Check and set CUDNN_ATTR_OPERATIONGRAPH_OPS field");
             return std::move(m_operationGraph);
         }
+// handle is not a must-have after cudnn 9.8.0
+#if (CUDNN_VERSION < 90800)
         if (m_operationGraph.handle == nullptr) {
             set_error_and_throw_exception(
                 &m_operationGraph,
@@ -213,6 +215,7 @@ class OperationGraphBuilder_v8 {
                 "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: Check and Set CUDNN_ATTR_OPERATIONGRAPH_HANDLE");
             return std::move(m_operationGraph);
         }
+#endif
 
         // Create a descriptor. Memory allocation happens here.
         auto status = m_operationGraph.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR);
@@ -239,18 +242,22 @@ class OperationGraphBuilder_v8 {
                 "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: SetAttribute CUDNN_ATTR_OPERATIONGRAPH_OPS Failed");
             return std::move(m_operationGraph);
         }
-        status = detail::set_attribute(m_operationGraph.pointer->get_backend_descriptor(),
-                                       CUDNN_ATTR_OPERATIONGRAPH_HANDLE,
-                                       CUDNN_TYPE_HANDLE,
-                                       1,
-                                       &m_operationGraph.handle);
-        if (status != CUDNN_STATUS_SUCCESS) {
-            set_error_and_throw_exception(
-                &m_operationGraph,
-                status,
-                "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: SetAttribute CUDNN_ATTR_OPERATIONGRAPH_HANDLE Failed");
-            return std::move(m_operationGraph);
+
+        if (m_operationGraph.handle != nullptr) {
+            status = detail::set_attribute(m_operationGraph.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATIONGRAPH_HANDLE,
+                                           CUDNN_TYPE_HANDLE,
+                                           1,
+                                           &m_operationGraph.handle);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_operationGraph,
+                    status,
+                    "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: SetAttribute CUDNN_ATTR_OPERATIONGRAPH_HANDLE Failed");
+                return std::move(m_operationGraph);
+            }
         }
+
 #if (CUDNN_VERSION >= 90400)
         if (m_operationGraph.is_dynamic_shape_enabled) {
             status = detail::set_attribute(m_operationGraph.pointer->get_backend_descriptor(),

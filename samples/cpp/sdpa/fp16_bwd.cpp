@@ -61,12 +61,12 @@ create_sdpa_backward_graph(int64_t const b,
                            int64_t const s_kv,
                            int64_t const d_qk,
                            int64_t const d_v,
-                           float const attn_scale                   = 1.0f,
-                           [[maybe_unused]] bool const is_inference = false,
-                           bool const causal_mask                   = false,
-                           bool const alibi_mask                    = false,
-                           bool const padding_mask                  = false,
-                           bool has_attn_bias                       = false) {
+                           float const attn_scale                     = 1.0f,
+                           [[maybe_unused]] bool const generate_stats = true,
+                           bool const causal_mask                     = false,
+                           bool const alibi_mask                      = false,
+                           bool const padding_mask                    = false,
+                           bool has_attn_bias                         = false) {
     // Create a graph and set common global properties
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(fe::DataType_t::BFLOAT16)
@@ -181,20 +181,20 @@ create_sdpa_backward_graph(int64_t const b,
 
 // Test case for the SDPA backward graph
 TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
-    int64_t b          = 3;     // batch size
-    int64_t h_q        = 4;     // head dim
-    int64_t h_k        = 4;     // head dim
-    int64_t h_v        = 4;     // head dim
-    int64_t s_q        = 1024;  // q tensor is padded to this seq length
-    int64_t s_kv       = 1024;  // k and v tensor is padded to this seq length
-    int64_t d_qk       = 128;   // hidden dim
-    int64_t d_v        = 128;   // hidden dim
-    bool is_inference  = false;
-    float attn_scale   = 0.123f;
-    bool causal_mask   = true;
-    bool padding_mask  = (cudnnGetVersion() >= 8903);
-    bool alibi_mask    = (cudnnGetVersion() >= 8904);
-    bool has_attn_bias = (cudnnGetVersion() >= 90500);
+    int64_t b           = 3;     // batch size
+    int64_t h_q         = 4;     // head dim
+    int64_t h_k         = 4;     // head dim
+    int64_t h_v         = 4;     // head dim
+    int64_t s_q         = 1024;  // q tensor is padded to this seq length
+    int64_t s_kv        = 1024;  // k and v tensor is padded to this seq length
+    int64_t d_qk        = 128;   // hidden dim
+    int64_t d_v         = 128;   // hidden dim
+    bool generate_stats = true;
+    float attn_scale    = 0.123f;
+    bool causal_mask    = true;
+    bool padding_mask   = (cudnnGetVersion() >= 8903);
+    bool alibi_mask     = (cudnnGetVersion() >= 8904);
+    bool has_attn_bias  = (cudnnGetVersion() >= 90500);
 
     if (cudnnGetVersion() < 8903) {
         SKIP("Test requires cudnn 8.9.3 or above");
@@ -215,7 +215,7 @@ TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
                                             d_qk,
                                             d_v,
                                             attn_scale,
-                                            is_inference,
+                                            generate_stats,
                                             causal_mask,
                                             alibi_mask,
                                             padding_mask,

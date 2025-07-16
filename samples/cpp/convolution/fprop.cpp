@@ -60,9 +60,9 @@ TEST_CASE("Convolution fprop", "[conv][graph][caching]") {
 
         REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
-        REQUIRE(graph->build_plans(handle).is_good());
+        REQUIRE(graph->build_plans().is_good());
 
         return std::make_tuple(graph, X, W, Y);
     };
@@ -175,9 +175,9 @@ TEST_CASE("Convolution fprop dynamic shape", "[conv][graph][dynamic_shape]") {
 
         REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
-        REQUIRE(graph->build_plans(handle).is_good());
+        REQUIRE(graph->build_plans().is_good());
 
         return std::make_tuple(graph, X, W, Y);
     };
@@ -279,9 +279,9 @@ TEST_CASE("CSBR Graph", "[conv][graph][caching]") {
 
         REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
-        REQUIRE(graph->build_plans(handle).is_good());
+        REQUIRE(graph->build_plans().is_good());
 
         user_maintained_cache.insert({key, std::make_tuple(graph, X, W, S, B, Y)});
 
@@ -422,9 +422,9 @@ TEST_CASE("CSBR Graph dynamic shape", "[conv][graph][dynamic_shape]") {
 
         REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
-        REQUIRE(graph->build_plans(handle).is_good());
+        REQUIRE(graph->build_plans().is_good());
 
         return std::make_tuple(graph, X, W, S, B, Y);
     };
@@ -509,9 +509,9 @@ TEST_CASE("SBRCS", "[conv][genstats][graph]") {
 
         REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
-        REQUIRE(graph->build_plans(handle).is_good());
+        REQUIRE(graph->build_plans().is_good());
 
         return std::make_tuple(graph, X, W, S, B, Y, SUM, SQ_SUM);
     };
@@ -624,9 +624,9 @@ TEST_CASE("CBR Graph NCHW", "[conv][graph][caching]") {
 
         REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
-        REQUIRE(graph->build_plans(handle).is_good());
+        REQUIRE(graph->build_plans().is_good());
 
         user_maintained_cache.insert({key, std::make_tuple(graph, X, W, Z, B, Y)});
 
@@ -708,9 +708,9 @@ TEST_CASE("Convolution fprop large", "[conv][graph][caching]") {
 
         REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
-        REQUIRE(graph->build_plans(handle).is_good());
+        REQUIRE(graph->build_plans().is_good());
 
         return std::make_tuple(graph, X, W, Y);
     };
@@ -795,9 +795,9 @@ TEST_CASE("Convolution fprop concatenate", "[conv][graph][caching]") {
 
         REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
-        REQUIRE(graph->build_plans(handle).is_good());
+        REQUIRE(graph->build_plans().is_good());
 
         return std::make_tuple(graph, X, W, Y, Y0, Y1);
     };

@@ -45,7 +45,7 @@ TEST_CASE("Resample Max Pooling NHWC Inference", "[resample][pooling][max][graph
 
     auto [Y, Index] = graph.resample(X,
                                      fe::graph::Resample_attributes()
-                                         .set_is_inference(true)
+                                         .set_generate_index(false)
                                          .set_resampling_mode(fe::ResampleMode_t::MAXPOOL)
                                          .set_padding_mode(fe::PaddingMode_t::NEG_INF_PAD)
                                          .set_window({2, 3})
@@ -63,8 +63,8 @@ TEST_CASE("Resample Max Pooling NHWC Inference", "[resample][pooling][max][graph
     REQUIRE(graph.validate().is_good());
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
-    REQUIRE(graph.check_support(handle).is_good());
-    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+    REQUIRE(graph.check_support().is_good());
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     Surface<half> X_gpu(N * H * W * C, false);
     Surface<half> Y_gpu(N * H * W * C, false);
@@ -99,7 +99,7 @@ TEST_CASE("Resample Max Pooling NHWC Training", "[resample][pooling][max][graph]
 
     auto [Y, Index] = graph.resample(X,
                                      fe::graph::Resample_attributes()
-                                         .set_is_inference(false)
+                                         .set_generate_index(true)
                                          .set_resampling_mode(fe::ResampleMode_t::MAXPOOL)
                                          .set_padding_mode(fe::PaddingMode_t::NEG_INF_PAD)
                                          .set_window({2, 3})
@@ -124,8 +124,8 @@ TEST_CASE("Resample Max Pooling NHWC Training", "[resample][pooling][max][graph]
         SKIP("Using index tensor is not supported pre 8.6.");
     }
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
-    REQUIRE(graph.check_support(handle).is_good());
-    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+    REQUIRE(graph.check_support().is_good());
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     Surface<half> X_gpu(N * H * W * C, false);
     Surface<half> Y_gpu(N * H * W * C, false);
@@ -160,7 +160,7 @@ TEST_CASE("Resample Avg Pooling", "[resample][pooling][average][graph]") {
 
     auto [Y, Index] = graph.resample(X,
                                      fe::graph::Resample_attributes()
-                                         .set_is_inference(false)
+                                         .set_generate_index(true)
                                          .set_resampling_mode(fe::ResampleMode_t::AVGPOOL_INCLUDE_PADDING)
                                          .set_padding_mode(fe::PaddingMode_t::ZERO_PAD)
                                          .set_window({2, 3})
@@ -178,8 +178,8 @@ TEST_CASE("Resample Avg Pooling", "[resample][pooling][average][graph]") {
     REQUIRE(graph.validate().is_good());
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
-    REQUIRE(graph.check_support(handle).is_good());
-    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+    REQUIRE(graph.check_support().is_good());
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     Surface<half> X_gpu(N * H * W * C, false);
     Surface<half> Y_gpu(N * H * W * C, false);

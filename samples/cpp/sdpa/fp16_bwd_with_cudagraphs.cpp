@@ -65,12 +65,12 @@ create_sdpa_backward_graph(int64_t const b,
                            int64_t const s_kv,
                            int64_t const d_qk,
                            int64_t const d_v,
-                           float const attn_scale                   = 1.0f,
-                           [[maybe_unused]] bool const is_inference = false,
-                           bool const causal_mask                   = false,
-                           bool const alibi_mask                    = false,
-                           bool const padding_mask                  = false,
-                           bool has_attn_bias                       = false);
+                           float const attn_scale                     = 1.0f,
+                           [[maybe_unused]] bool const generate_stats = true,
+                           bool const causal_mask                     = false,
+                           bool const alibi_mask                      = false,
+                           bool const padding_mask                    = false,
+                           bool has_attn_bias                         = false);
 
 // Convenience class to encapsulate SDPA test data for this example
 class SdpaBwdTestData {
@@ -257,8 +257,8 @@ TEST_CASE("Toy sdpa backward as CUDA graph", "[graph][sdpa][flash][backward][cud
 
     // Make sure the selected execution plan supports cuda graph
     graph->select_behavior_notes({cudnn_frontend::BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API});
-    REQUIRE(graph->check_support(handle).is_good());
-    REQUIRE(graph->build_plans(handle).is_good());
+    REQUIRE(graph->check_support().is_good());
+    REQUIRE(graph->build_plans().is_good());
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());

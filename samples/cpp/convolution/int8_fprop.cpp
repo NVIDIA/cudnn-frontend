@@ -66,9 +66,9 @@ TEST_CASE("Conv with Int8 datatypes", "[conv][graph][caching]") {
 
         REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
-        REQUIRE(graph->build_plans(handle).is_good());
+        REQUIRE(graph->build_plans().is_good());
 
         return std::make_tuple(graph, X, W, Y);
     };

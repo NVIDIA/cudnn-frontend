@@ -62,11 +62,11 @@ create_sdpa_forward_graph_with_paged_caches(int64_t const b,
                                             int64_t const num_blocks_k,
                                             int64_t const num_blocks_v,
                                             int64_t const table_size,
-                                            float const attn_scale  = 1.0f,
-                                            bool const is_inference = false,
-                                            bool const causal_mask  = false,
-                                            bool const alibi_mask   = false,
-                                            bool has_attn_bias      = false) {
+                                            float const attn_scale    = 1.0f,
+                                            bool const generate_stats = true,
+                                            bool const causal_mask    = false,
+                                            bool const alibi_mask     = false,
+                                            bool has_attn_bias        = false) {
     // Create a graph and set common global properties.
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(fe::DataType_t::BFLOAT16)
@@ -93,7 +93,7 @@ create_sdpa_forward_graph_with_paged_caches(int64_t const b,
 
     auto sdpa_options = fe::graph::SDPA_attributes()
                             .set_name("flash_attention")
-                            .set_is_inference(is_inference)
+                            .set_generate_stats(generate_stats)
                             .set_alibi_mask(alibi_mask)
                             .set_causal_mask(causal_mask)
                             .set_attn_scale(attn_scale);
@@ -144,10 +144,10 @@ create_sdpa_forward_graph_with_paged_caches(int64_t const b,
     O->set_output(true).set_dim({b, h_q, s_q, d_v}).set_stride({h_q * s_q * d_v, s_q * d_v, d_v, 1}).set_uid(O_UID);
     // O->set_output(true).set_dim({b, h_q, s_q, d_v}).set_stride({h_q * d_v, d_v, b * h_q * d_v, 1}).set_uid(O_UID);
 
-    if (is_inference) {
-        assert(Stats == nullptr);
-    } else {
+    if (generate_stats) {
         Stats->set_output(true).set_data_type(fe::DataType_t::FLOAT).set_uid(STATS_UID);
+    } else {
+        assert(Stats == nullptr);
     }
 
     return graph;
@@ -164,11 +164,11 @@ TEST_CASE("Toy sdpa forward with paged caches", "[graph][sdpa][flash][paged][for
     int64_t d_v               = 128;                                                             // hidden dim
     int64_t block_size        = 1;  // block size for paged attention (i.e page size)
 
-    bool is_inference  = false;
-    float attn_scale   = 0.123f;
-    bool causal_mask   = false;
-    bool alibi_mask    = false;
-    bool has_attn_bias = false;
+    bool generate_stats = true;
+    float attn_scale    = 0.123f;
+    bool causal_mask    = false;
+    bool alibi_mask     = false;
+    bool has_attn_bias  = false;
 
     if (cudnnGetVersion() < 90500) {
         SKIP("Test requires cudnn 9.5.0 or above");
@@ -197,7 +197,7 @@ TEST_CASE("Toy sdpa forward with paged caches", "[graph][sdpa][flash][paged][for
                                                                      num_blocks_v,
                                                                      page_table_size,
                                                                      attn_scale,
-                                                                     is_inference,
+                                                                     generate_stats,
                                                                      causal_mask,
                                                                      alibi_mask,
                                                                      has_attn_bias);
@@ -252,7 +252,7 @@ TEST_CASE("Toy sdpa forward with paged caches", "[graph][sdpa][flash][paged][for
             }
 
             Surface<float> statsTensor(b[i] * h_q * s_q * 1, false);
-            if (is_inference == false) {
+            if (generate_stats == true) {
                 variant_pack[STATS_UID] = statsTensor.devPtr;
             }
 

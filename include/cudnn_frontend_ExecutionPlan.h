@@ -34,6 +34,7 @@
 #include "cudnn_frontend_Engine.h"
 #include "cudnn_frontend_utils.h"
 #include "cudnn_frontend/backend/kernel_cache.h"
+#include "cudnn_frontend/backend/device_properties.h"
 
 namespace cudnn_frontend {
 ///
@@ -376,13 +377,8 @@ class ExecutionPlanBuilder_v8 {
     //! Throws the appropriate error message
     ExecutionPlan_v8 &&
     build() {
-        if (m_execution_plan.handle == nullptr || !m_execution_plan.handle) {
-            set_error_and_throw_exception(
-                &m_execution_plan,
-                CUDNN_STATUS_BAD_PARAM,
-                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: Check and Set the CUDNN_ATTR_EXECUTION_PLAN_HANDLE");
-            return std::move(m_execution_plan);
-        };
+        // NOTE: skipping the handle and device properties here which are required for plan deserialization only
+
         if (m_execution_plan.engine_config == nullptr) {
             set_error_and_throw_exception(
                 &m_execution_plan,
@@ -411,18 +407,7 @@ class ExecutionPlanBuilder_v8 {
                 "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG Failed");
             return std::move(m_execution_plan);
         }
-        status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
-                                       CUDNN_ATTR_EXECUTION_PLAN_HANDLE,
-                                       CUDNN_TYPE_HANDLE,
-                                       1,
-                                       &m_execution_plan.handle);
-        if (status != CUDNN_STATUS_SUCCESS) {
-            set_error_and_throw_exception(
-                &m_execution_plan,
-                status,
-                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute CUDNN_ATTR_EXECUTION_PLAN_HANDLE Failed");
-            return std::move(m_execution_plan);
-        }
+
 #if (CUDNN_VERSION >= 90400)
         if (m_execution_plan.kernel_cache) {
             status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),

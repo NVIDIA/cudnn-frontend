@@ -146,8 +146,8 @@ TEST_CASE("sdpa_fp8_bprop_brcm", "[graph][sdpa][fp8][backward][brcm]") {
 
     REQUIRE(mha_graph.build_operation_graph(handle).is_good());
     REQUIRE(mha_graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
-    REQUIRE(mha_graph.check_support(handle).is_good());
-    REQUIRE(mha_graph.build_plans(handle).is_good());
+    REQUIRE(mha_graph.check_support().is_good());
+    REQUIRE(mha_graph.build_plans().is_good());
 
     // Surfaces
     auto Q_K_V_dQ_dK_dV_bulk_dims{b * s * 3 * h * d};

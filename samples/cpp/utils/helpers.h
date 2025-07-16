@@ -8,6 +8,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+static int64_t
+div_up(int64_t x, int64_t y) {
+    return (x + y - 1) / y;
+}
+
 #define CUDA_CHECK(status)                                                                                    \
     {                                                                                                         \
         cudaError_t err = status;                                                                             \

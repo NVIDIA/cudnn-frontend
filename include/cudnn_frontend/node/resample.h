@@ -24,11 +24,11 @@ class ResampleNode : public NodeCRTP<ResampleNode> {
     pre_validate_node() const override final {
         CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Validating ResampleNode " << attributes.name << "...");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.is_inference.has_value() == false,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.generate_index.has_value() == false,
                                        error_code_t::ATTRIBUTE_NOT_SET,
-                                       "is_inference attribute not set");
+                                       "generate_index attribute not set");
 
-        if (attributes.is_inference.value() == false && attributes.resample_mode == ResampleMode_t::MAXPOOL) {
+        if (attributes.generate_index.value() == true && attributes.resample_mode == ResampleMode_t::MAXPOOL) {
             CUDNN_FE_VALIDATE_OUTPUT_TENSOR(Resample_attributes::output_names::Index);
         }
 
@@ -175,7 +175,7 @@ INode::resample(std::shared_ptr<Tensor_attributes> input, Resample_attributes at
     attributes.inputs[Resample_attributes::input_names::X] = input;
     auto Y = attributes.outputs[Resample_attributes::output_names::Y] = output_tensor(attributes.name + "::Y");
     std::shared_ptr<Tensor_attributes> Index                          = nullptr;
-    if (attributes.is_inference.has_value() && attributes.is_inference.value() == false &&
+    if (attributes.generate_index.has_value() && attributes.generate_index.value() == true &&
         attributes.resample_mode == ResampleMode_t::MAXPOOL) {
         Index = attributes.outputs[Resample_attributes::output_names::Index] =
             output_tensor(attributes.name + "::Index");

@@ -76,9 +76,9 @@ create_sdpa_forward_graph(int64_t const b,
                           int64_t const s_kv,
                           int64_t const d_qk,
                           int64_t const d_v,
-                          float const attn_scale  = 1.0f,
-                          bool const is_inference = false,
-                          bool has_attn_bias      = false) {
+                          float const attn_scale    = 1.0f,
+                          bool const generate_stats = true,
+                          bool has_attn_bias        = false) {
     // Create a graph and set common global properties.
     auto graph = std::make_shared<fe::graph::Graph>();
 
@@ -117,7 +117,7 @@ create_sdpa_forward_graph(int64_t const b,
 
     auto sdpa_options = fe::graph::SDPA_attributes()
                             .set_name("flash_attention")
-                            .set_is_inference(is_inference)
+                            .set_generate_stats(generate_stats)
                             .set_attn_scale(attn_scale);
     if (has_attn_bias) {
         sdpa_options.set_score_mod(
@@ -131,26 +131,26 @@ create_sdpa_forward_graph(int64_t const b,
 
     O->set_output(true).set_dim({b, h_q, s_q, d_v}).set_stride({h_q * d_v, d_v, b * h_q * d_v, 1}).set_uid(O_UID);
 
-    if (is_inference) {
-        assert(Stats == nullptr);
-    } else {
+    if (generate_stats) {
         Stats->set_output(true).set_data_type(fe::DataType_t::FLOAT).set_uid(STATS_UID);
+    } else {
+        assert(Stats == nullptr);
     }
 
     return graph;
 }
 
 TEST_CASE("Toy sdpa forward with flexible graph", "[graph][sdpa][flash][forward][flex_attention]") {
-    int64_t b         = 16;    // batch size
-    int64_t h_q       = 32;    // head dim
-    int64_t h_k       = 32;    // head dim
-    int64_t h_v       = 32;    // head dim
-    int64_t s_q       = 2048;  // q tensor is padded to this seq length
-    int64_t s_kv      = 2048;  // k and v tensor is padded to this seq length
-    int64_t d_qk      = 128;   // hidden dim
-    int64_t d_v       = 128;   // hidden dim
-    bool is_inference = false;
-    float attn_scale  = 0.123f;
+    int64_t b           = 16;    // batch size
+    int64_t h_q         = 32;    // head dim
+    int64_t h_k         = 32;    // head dim
+    int64_t h_v         = 32;    // head dim
+    int64_t s_q         = 2048;  // q tensor is padded to this seq length
+    int64_t s_kv        = 2048;  // k and v tensor is padded to this seq length
+    int64_t d_qk        = 128;   // hidden dim
+    int64_t d_v         = 128;   // hidden dim
+    bool generate_stats = true;
+    float attn_scale    = 0.123f;
 
     bool has_attn_bias = true;
 
@@ -164,7 +164,7 @@ TEST_CASE("Toy sdpa forward with flexible graph", "[graph][sdpa][flash][forward]
     auto handle     = *handle_ptr;
 
     auto graph =
-        create_sdpa_forward_graph(b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v, attn_scale, is_inference, has_attn_bias);
+        create_sdpa_forward_graph(b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v, attn_scale, generate_stats, has_attn_bias);
 
     REQUIRE(graph->build(handle, {fe::HeurMode_t::A}).is_good());
 
@@ -183,7 +183,7 @@ TEST_CASE("Toy sdpa forward with flexible graph", "[graph][sdpa][flash][forward]
     }
 
     Surface<float> statsTensor(b * h_q * s_q * 1, false);
-    if (is_inference == false) {
+    if (generate_stats == true) {
         variant_pack[STATS_UID] = statsTensor.devPtr;
     }
 

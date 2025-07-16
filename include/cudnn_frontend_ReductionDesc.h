@@ -38,6 +38,7 @@ namespace cudnn_frontend {
 /// Properties:
 ///    - compute_type
 ///    - reduction_mode
+///    - is_deterministic
 ///
 /// Use ReductionDesc_v8 to build this class.
 /// Describe returns a string describing the Reduction operation
@@ -49,11 +50,13 @@ class ReductionDesc_v8 : public BackendDescriptor {
     describe() const override {
         std::stringstream ss;
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
-        ss << "CUDNN_BACKEND_REDUCTION_DESCRIPTOR :" << " Math precision " << json{compute_type} << " Reduction mode "
-           << json{reduction_mode};
+        ss << "CUDNN_BACKEND_REDUCTION_DESCRIPTOR :"
+           << " Math precision " << json{compute_type} << " Reduction mode " << json{reduction_mode}
+           << " Is deterministic " << json(is_deterministic);
 #else
-        ss << "CUDNN_BACKEND_REDUCTION_DESCRIPTOR :" << " Math precision " << (int)compute_type << " Reduction mode "
-           << int(reduction_mode);
+        ss << "CUDNN_BACKEND_REDUCTION_DESCRIPTOR :"
+           << " Math precision " << (int)compute_type << " Reduction mode " << int(reduction_mode)
+           << " Is deterministic " << int(is_deterministic);
 #endif
         return ss.str();
     }
@@ -72,6 +75,7 @@ class ReductionDesc_v8 : public BackendDescriptor {
 
     DataType_t compute_type        = DataType_t::NOT_SET;
     ReductionMode_t reduction_mode = ReductionMode_t::NOT_SET;
+    bool is_deterministic          = false;
 };
 
 ////
@@ -111,6 +115,11 @@ class ReductionDescBuilder_v8 {
     auto
     setMathPrecision(cudnnDataType_t data_type_) -> ReductionDescBuilder_v8 & {
         return setComputeType(data_type_);
+    }
+    auto
+    setIsDeterministic(bool is_deterministic_) -> ReductionDescBuilder_v8 & {
+        m_reductionDesc.is_deterministic = is_deterministic_;
+        return *this;
     }
 
     //! constructs the ReductionDesc_v8 by calling the cudnn API
@@ -169,6 +178,36 @@ class ReductionDescBuilder_v8 {
                 "CUDNN_BACKEND_REDUCTION_DESCRIPTOR: SetAttribute CUDNN_ATTR_REDUCTION_OPERATOR Failed");
             return std::move(m_reductionDesc);
         }
+
+#if (CUDNN_VERSION >= 91100)
+        // If backend version is less then 9.11.0, then determinisitc mode is not even supported.
+        // But in the default case which exists in current implementations, is_deterministic is false, and should be
+        // ignored.
+        if (detail::get_backend_version() < 91100) {
+            if (m_reductionDesc.is_deterministic) {
+                set_error_and_throw_exception(&m_reductionDesc,
+                                              CUDNN_STATUS_NOT_SUPPORTED,
+                                              "CUDNN_BACKEND_REDUCTION_DESCRIPTOR: DETERMINISTIC mode is not supported "
+                                              "in cudnn version < 9.11.0");
+                return std::move(m_reductionDesc);
+            } else {
+                // Do nothing.
+            }
+        } else {
+            status = detail::set_attribute(m_reductionDesc.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_REDUCTION_IS_DETERMINISTIC,
+                                           CUDNN_TYPE_BOOLEAN,
+                                           1,
+                                           &m_reductionDesc.is_deterministic);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_reductionDesc,
+                    status,
+                    "CUDNN_BACKEND_REDUCTION_DESCRIPTOR: SetAttribute CUDNN_ATTR_REDUCTION_IS_DETERMINISTIC Failed");
+                return std::move(m_reductionDesc);
+            }
+        }
+#endif
 
         // Finalizing the descriptor
         status = detail::finalize(m_reductionDesc.pointer->get_backend_descriptor());

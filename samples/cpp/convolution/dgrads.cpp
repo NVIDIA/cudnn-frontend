@@ -58,9 +58,9 @@ TEST_CASE("Convolution Dgrad", "[dgrad][graph]") {
 
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-    REQUIRE(graph.check_support(handle).is_good());
+    REQUIRE(graph.check_support().is_good());
 
-    REQUIRE(graph.build_plans(handle).is_good());
+    REQUIRE(graph.build_plans().is_good());
 
     Surface<half> dy_tensor(4 * 64 * 16 * 16, false);
     Surface<half> w_tensor(64 * 32 * 3 * 3, false);
@@ -114,9 +114,9 @@ TEST_CASE("Dgrad Drelu Graph", "[dgrad][graph]") {
 
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-    REQUIRE(graph.check_support(handle).is_good());
+    REQUIRE(graph.check_support().is_good());
 
-    REQUIRE(graph.build_plans(handle).is_good());
+    REQUIRE(graph.build_plans().is_good());
 
     Surface<half> dy_tensor(4 * 64 * 16 * 16, false);
     Surface<half> w_tensor(64 * 32 * 3 * 3, false);
@@ -217,9 +217,9 @@ TEST_CASE("Dgrad Drelu DBNweight Graph", "[dgrad][graph]") {
 
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-    REQUIRE(graph.check_support(handle).is_good());
+    REQUIRE(graph.check_support().is_good());
 
-    REQUIRE(graph.build_plans(handle).is_good());
+    REQUIRE(graph.build_plans().is_good());
 
     Surface<half> dy_tensor(4 * 64 * 16 * 16, false);
     Surface<half> w_tensor(64 * 32 * 3 * 3, false);

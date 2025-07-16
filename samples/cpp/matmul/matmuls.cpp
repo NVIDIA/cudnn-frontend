@@ -143,9 +143,9 @@ matmul_dynamic_shapes(bool use_abs = false, bool use_bias = false) {
 
         REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph.check_support(handle).is_good());
+        REQUIRE(graph.check_support().is_good());
 
-        REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::ALL).is_good());
+        REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
 
         return std::make_tuple(graph, A, B, C, Bias);
     };
@@ -243,9 +243,9 @@ TEST_CASE("Matmul", "[matmul][graph]") {
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
 
     graph.deselect_engines({"eng4_"});
-    REQUIRE(graph.check_support(handle).is_good());
+    REQUIRE(graph.check_support().is_good());
 
-    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::ALL).is_good());
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
 
     // Run cudnn graph
     Surface<float> C_gpu(b * m * n, false);
@@ -312,9 +312,9 @@ TEST_CASE("Abs + Matmul", "[matmul][graph]") {
 
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-    REQUIRE(graph.check_support(handle).is_good());
+    REQUIRE(graph.check_support().is_good());
 
-    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     // Run cudnn graph
     Surface<float> C_gpu(b * m * n, false);
@@ -401,7 +401,7 @@ TEST_CASE("Bias + Matmul", "[matmul][graph]") {
     std::vector<int64_t> successful_plans;
     std::vector<int64_t> unsuccessful_plans;
     for (int64_t plan_index = 0; plan_index < plan_count; plan_index++) {
-        bool did_build_successfully = graph.build_plan_at_index(handle, plan_index).is_good();
+        bool did_build_successfully = graph.build_plan_at_index(plan_index).is_good();
         if (did_build_successfully) {
             successful_plans.push_back(plan_index);
         } else {
@@ -508,9 +508,9 @@ TEST_CASE("Matmul SBR Graph", "[matmul][graph]") {
 
             REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
 
-            REQUIRE(graph->check_support(handle).is_good());
+            REQUIRE(graph->check_support().is_good());
 
-            REQUIRE(graph->build_plans(handle, fe::BuildPlanPolicy_t::ALL).is_good());
+            REQUIRE(graph->build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
 
             Surface<int8_t> autotune_workspace(graph->get_autotune_workspace_size(), false);
 
@@ -599,9 +599,9 @@ TEST_CASE("Matmul with restricted shared memory", "[matmul][graph]") {
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
 
     graph.deselect_shared_mem_greater_than(256 * 1024);
-    REQUIRE(graph.check_support(handle).is_good());
+    REQUIRE(graph.check_support().is_good());
 
-    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     // Run cudnn graph
     Surface<float> C_gpu(b * m * n, false);

@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/pytorch:25.05-py3
+FROM nvcr.io/nvidia/pytorch:25.06-py3
 
 RUN pip install --upgrade pip && \
     pip install seaborn
@@ -11,7 +11,9 @@ RUN apt-get update && \
 
 RUN pip uninstall -y cudnn
 
-COPY benchmark_sdpa.py .
+COPY benchmark_bf16_sdpa.py .
+
+COPY benchmark_fp8_sdpa.py .
 
 COPY benchmark_single_sdpa.py .
 

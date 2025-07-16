@@ -1,0 +1,39 @@
+[INFO] cuDNN Backend Version: cudnn.backend_version() = 91002
+[INFO] cuDNN Frontend Version: cudnn.__version__ = '1.12.0'
+[INFO] torch.__version__ = '2.8.0a0+5228986c39.nv25.06'
+[INFO] torch.version.cuda = '12.9'
+[INFO] torch.cuda.is_available() = True
+[INFO] torch.cuda.device_count() = 1
+[INFO] torch.cuda.current_device() = 0
+[INFO] torch.cuda.get_device_name(torch.cuda.current_device()) = 'NVIDIA B200'
+[INFO] Begin benchmark for layers (batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim)
+[INFO] sdpa_configs = [(1, 512, 512, 128, 8, 128), (1, 1024, 1024, 128, 8, 128), (1, 2048, 2048, 128, 8, 128), (1, 4096, 4096, 128, 8, 128), (1, 8192, 8192, 128, 8, 128), (1, 16384, 16384, 128, 8, 128), (1, 32768, 32768, 128, 8, 128), (1, 65536, 65536, 128, 8, 128), (1, 131072, 131072, 128, 8, 128)]
+[INFO] Running layer (1, 512, 512, 128, 8, 128)
+[INFO]   Benchmarking backend fp8
+[INFO]   Benchmarking backend bf16
+[INFO] Running layer (1, 1024, 1024, 128, 8, 128)
+[INFO]   Benchmarking backend fp8
+[INFO]   Benchmarking backend bf16
+[INFO] Running layer (1, 2048, 2048, 128, 8, 128)
+[INFO]   Benchmarking backend fp8
+[INFO]   Benchmarking backend bf16
+[INFO] Running layer (1, 4096, 4096, 128, 8, 128)
+[INFO]   Benchmarking backend fp8
+[INFO]   Benchmarking backend bf16
+[INFO] Running layer (1, 8192, 8192, 128, 8, 128)
+[INFO]   Benchmarking backend fp8
+[INFO]   Benchmarking backend bf16
+[INFO] Running layer (1, 16384, 16384, 128, 8, 128)
+[INFO]   Benchmarking backend fp8
+[INFO]   Benchmarking backend bf16
+[INFO] Running layer (1, 32768, 32768, 128, 8, 128)
+[INFO]   Benchmarking backend fp8
+[INFO]   Benchmarking backend bf16
+[INFO] Running layer (1, 65536, 65536, 128, 8, 128)
+[INFO]   Benchmarking backend fp8
+[INFO]   Benchmarking backend bf16
+[INFO] Running layer (1, 131072, 131072, 128, 8, 128)
+[INFO]   Benchmarking backend fp8
+[INFO]   Benchmarking backend bf16
+[INFO] Saving results to ./artifacts/sdpa_fp8_benchmark_results_NVIDIA_B200.csv
+[INFO] Saving plot to ./artifacts/sdpa_fp8_benchmark_results_NVIDIA_B200.png

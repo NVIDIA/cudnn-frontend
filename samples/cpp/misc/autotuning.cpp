@@ -84,7 +84,7 @@ TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
 
         graph.deselect_workspace_greater_than(1024 * 1024);
 
-        REQUIRE(graph.check_support(handle).is_good());
+        REQUIRE(graph.check_support().is_good());
 
         return graph;
     };
@@ -94,7 +94,7 @@ TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
     auto plan_count = graph.get_execution_plan_count();
     std::cout << "Graph has " << plan_count << " plan candidates." << std::endl;
 
-    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::ALL).is_good());
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
 
     std::unordered_map<int64_t, void *> variant_pack = {
         {a_uid, A_gpu.devPtr}, {b_uid, B_gpu.devPtr}, {c_uid, C_gpu.devPtr}};
@@ -154,7 +154,7 @@ TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
     REQUIRE(graph.get_plan_name_at_index(candidate_index, name).is_good());
     std::cout << "Successful candidate " << name << " is at index " << candidate_index << std::endl;
 
-    REQUIRE(graph.build_plan_at_index(handle, candidate_index).is_good());
+    REQUIRE(graph.build_plan_at_index(candidate_index).is_good());
 
     Surface<int8_t> workspace(graph.get_workspace_size_plan_at_index(candidate_index), false);
 

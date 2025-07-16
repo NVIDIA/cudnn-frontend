@@ -93,9 +93,9 @@ TEST_CASE("LayerNorm Zero Centered Gamma Training", "[layernorm][graph][zero_cen
 
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
 
-    REQUIRE(graph.check_support(handle).is_good());
+    REQUIRE(graph.check_support().is_good());
 
-    REQUIRE(graph.build_plans(handle).is_good());
+    REQUIRE(graph.build_plans().is_good());
 
     Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
     Surface<float> Mean_tensor(batch_size * seq_length, false);
@@ -186,9 +186,9 @@ TEST_CASE("LayerNorm Zero Centered Gamma Inference", "[layernorm][graph][zero_ce
 
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
 
-    REQUIRE(graph.check_support(handle).is_good());
+    REQUIRE(graph.check_support().is_good());
 
-    REQUIRE(graph.build_plans(handle).is_good());
+    REQUIRE(graph.build_plans().is_good());
 
     Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
     Surface<float> Scale_tensor(hidden_size, false);
@@ -276,9 +276,9 @@ TEST_CASE("LayerNorm Zero Centered Gamma Backward", "[layernorm][graph][zero_cen
 
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
 
-    REQUIRE(graph.check_support(handle).is_good());
+    REQUIRE(graph.check_support().is_good());
 
-    REQUIRE(graph.build_plans(handle).is_good());
+    REQUIRE(graph.build_plans().is_good());
 
     Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
     Surface<half> DY_tensor(batch_size * seq_length * hidden_size, false);
