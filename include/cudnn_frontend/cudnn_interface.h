@@ -118,6 +118,8 @@ class ICudnn {
     bool is_dynamic_shape_enabled             = false;
     std::shared_ptr<KernelCache> kernel_cache = nullptr;
 
+    std::shared_ptr<const DeviceProperties> device_properties = nullptr;
+
     error_t
     create_cudnn_operation_graph(cudnnHandle_t handle) {
         std::vector<Operation const*> cudnn_operations;

@@ -84,6 +84,7 @@ PyGraph::tensor(std::vector<int64_t> const& dim,
                 bool const& is_virtual,
                 bool const& is_pass_by_value,
                 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& ragged_offset,
+                cudnn_frontend::TensorReordering_t const reordering_type,
                 std::string const& name) {
     auto props = cudnn_frontend::graph::Tensor_attributes()
                      .set_data_type(data_type)
@@ -92,6 +93,7 @@ PyGraph::tensor(std::vector<int64_t> const& dim,
                      .set_dim(dim)
                      .set_stride(stride)
                      .set_ragged_offset(ragged_offset)
+                     .set_reordering_type(reordering_type)
                      .set_name(name);
 
     return graph->tensor(props);
@@ -263,6 +265,23 @@ PyGraph::conv_wgrad(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& i
 }
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::block_scale_dequantize(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale,
+                                std::vector<int32_t> const& block_size,
+                                cudnn_frontend::DataType_t const& compute_data_type,
+                                std::string const& name) {
+    auto attributes = cudnn_frontend::graph::Block_scale_dequantize_attributes()
+                          .set_block_size(block_size)
+                          .set_compute_data_type(compute_data_type)
+                          .set_name(name);
+    if (compute_data_type != cudnn_frontend::DataType_t::NOT_SET) {
+        attributes.set_compute_data_type(compute_data_type);
+    }
+    auto output = graph->block_scale_dequantize(input, descale, attributes);
+    return output;
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& A,
                 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& B,
                 cudnn_frontend::DataType_t const& compute_data_type,
@@ -374,13 +393,13 @@ PyGraph::get_knobs_for_engine(int64_t const engine_id) {
 void
 PyGraph::build_plans(BuildPlanPolicy_t const policy) {
     // TODO: Add multithreaded support in python
-    auto status = graph->build_plans(handle, policy, false);
+    auto status = graph->build_plans(policy, false);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
 void
 PyGraph::build_plan_at_index(int64_t const index) {
-    auto status = graph->build_plan_at_index(handle, index);
+    auto status = graph->build_plan_at_index(index);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
@@ -401,7 +420,7 @@ PyGraph::build() {
 
 void
 PyGraph::check_support() {
-    auto status = graph->check_support(handle);
+    auto status = graph->check_support();
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
@@ -586,6 +605,7 @@ init_pygraph_submodule(py::module_& m) {
              py::arg_v{"is_virtual", false},
              py::arg_v{"is_pass_by_value", false},
              py::arg_v{"ragged_offset", nullptr},
+             py::arg_v{"reordering_type", cudnn_frontend::TensorReordering_t::NONE},
              py::arg_v("name", ""))
         .def("genstats",
              &PyGraph::genstats,
@@ -797,6 +817,16 @@ init_pygraph_submodule(py::module_& m) {
 
                 Returns:
                     cudnn_tensor: The result of reduction operation.
+            )pbdoc")
+        .def("block_scale_dequantize",
+             &PyGraph::block_scale_dequantize,
+             py::arg("input"),
+             py::arg("descale"),
+             py::arg("block_size"),
+             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+             py::arg_v("name", ""),
+             R"pbdoc(
+                Dequantize an input tensor to other dimensions without changing the actual memory layout.
             )pbdoc")
         .def("reshape",
              &PyGraph::reshape,

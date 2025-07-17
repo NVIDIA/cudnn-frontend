@@ -113,9 +113,9 @@ adalayernorm_fwd_dynamic_shapes(bool train = true) {
 
         REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK, fe::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph.check_support(handle).is_good());
+        REQUIRE(graph.check_support().is_good());
 
-        REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::ALL).is_good());
+        REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
 
         return std::make_tuple(graph, X, scale, bias, Y, mean, inv_variance);
     };
@@ -234,9 +234,9 @@ TEST_CASE("AdaLayerNorm Backward", "[adalayernorm][graph]") {
 
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
 
-    REQUIRE(graph.check_support(handle).is_good());
+    REQUIRE(graph.check_support().is_good());
 
-    REQUIRE(graph.build_plans(handle).is_good());
+    REQUIRE(graph.build_plans().is_good());
 
     Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
     Surface<half> DY_tensor(batch_size * seq_length * hidden_size, false);

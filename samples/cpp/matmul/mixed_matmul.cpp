@@ -87,12 +87,12 @@ TEST_CASE("Mixed Precision Matmul", "[matmul][graph]") {
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
 
     if ((is_hopper_arch() || is_blackwell_arch()) && cudnnGetVersion() >= 8906) {
-        REQUIRE(graph.check_support(handle).is_good());
+        REQUIRE(graph.check_support().is_good());
     } else {
         SKIP("int8_bf16 mixed precision gemm not supported pre-Hopper or pre-cudnn-8.9.6");
     }
 
-    REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     //// Run cudnn graph
     // note this is a bf16 tensor, but half is used just for memory allocation

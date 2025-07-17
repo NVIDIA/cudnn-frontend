@@ -36,7 +36,7 @@ def pytest_configure(config):
 def pytest_addoption(parser):
     # Generic options that may be used by all scripts.
     parser.addoption(
-        "--dryrun", action="store", nargs="?", const=1, type=int, default=0, help="show repro commands when 1 or 2 (use with '-s')",
+        "--dryrun", action="store", nargs="?", const=1, type=int, default=0, help="show repro commands when 1, 2, or 3 (use with '-s')",
     )
     parser.addoption(
         "--diffs", action="store", type=int, default=10, help="set number of numerical mismatches to display",
@@ -56,48 +56,45 @@ def pytest_addoption(parser):
 
     # MHA command line options to overwrite specific test dimensions in test_mhas.py and test_mhas_v2.py.
     parser.addoption(
-        "--mha_b", default=None, help="[test_mhas.py] batch dimension"
+        "--mha_b", default=None, type=int, help="[test_mhas.py] batch dimension"
     )
     parser.addoption(
-        "--mha_s_q", default=None, help="[test_mhas.py] query sequence length"
+        "--mha_s_q", default=None, type=int, help="[test_mhas.py] query sequence length"
     )
     parser.addoption(
-        "--mha_s_kv", default=None, help="[test_mhas.py] key/value sequence length"
+        "--mha_s_kv", default=None, type=int, help="[test_mhas.py] key/value sequence length"
     )
     parser.addoption(
-        "--mha_d_qk", default=None, help="[test_mhas.py] query/key embedding dimension per head",
+        "--mha_d_qk", default=None, type=int, help="[test_mhas.py] query/key embedding dimension per head",
     )
     parser.addoption(
-        "--mha_d_v", default=None, help="[test_mhas.py] value embedding dimension per head",
+        "--mha_d_v", default=None, type=int, help="[test_mhas.py] value embedding dimension per head",
     )
     parser.addoption(
-        "--mha_h_q", default=None, help="[test_mhas.py] query number of heads"
+        "--mha_h_q", default=None, type=int, help="[test_mhas.py] query number of heads"
     )
     parser.addoption(
-        "--mha_h_k", default=None, help="[test_mhas.py] key number of heads"
+        "--mha_h_k", default=None, type=int, help="[test_mhas.py] key number of heads"
     )
     parser.addoption(
-        "--mha_h_v", default=None, help="[test_mhas.py] value number of heads"
+        "--mha_h_v", default=None, type=int, help="[test_mhas.py] value number of heads"
     )
     parser.addoption(
-        "--mha_deterministic", default=None, help="[test_mhas.py] force deterministic algorithm",
+        "--mha_deterministic", default=None, type=int, choices=[0, 1], help="[test_mhas.py] force deterministic algorithm",
     )
     parser.addoption(
-        "--mha_block_size", default=None, help="[test_mhas.py] block size for paged attention",
+        "--mha_block_size", default=None, type=int, help="[test_mhas.py] block size for paged attention",
     )
     parser.addoption(
-        "--mha_left_bound", default=None, help="[test_mhas.py] size of the window to the left of the diagonal",
+        "--mha_left_bound", default=None, type=int, help="[test_mhas.py] size of the window to the left of the diagonal",
     )
     parser.addoption(
-        "--mha_right_bound", default=None, help="[test_mhas.py] size of the window to the right of the diagonal",
+        "--mha_right_bound", default=None, type=int, help="[test_mhas.py] size of the window to the right of the diagonal",
     )
 
     # MHA command line options to overwrite boolean 'is*' variables in test_mhas_v2.py.
     parser.addoption(
         "--mha_is_infer", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_infer",
-    )
-    parser.addoption(
-        "--mha_is_causal", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_causal",
     )
     parser.addoption(
         "--mha_is_alibi", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_alibi",
@@ -115,19 +112,16 @@ def pytest_addoption(parser):
         "--mha_is_ragged", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_ragged",
     )
     parser.addoption(
-        "--mha_is_causal_br", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_causal_br",
-    )
-    parser.addoption(
-        "--mha_is_sliding_w", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_sliding_w",
-    )
-    parser.addoption(
         "--mha_is_dropout", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_dropout",
     )
     parser.addoption(
         "--mha_is_determin", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_determin",
     )
+    parser.addoption(
+        "--mha_diag_align", default=None, type=int, choices=[0, 1], help="[test_mhas_v2.py] diagonal alignment: 0-TOP_LEFT, 1-BOTTOM_RIGHT",
+    )
 
     # Refined command line option in test_mhas_v2.py to supersede --mha_b (the 'b' variable is too short).
     parser.addoption(
-        "--mha_batches", default=None, help="[test_mhas_v2.py] update batch dimension"
+        "--mha_batches", default=None, type=int, help="[test_mhas_v2.py] update batch dimension"
     )

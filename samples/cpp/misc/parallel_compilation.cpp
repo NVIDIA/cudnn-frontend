@@ -94,30 +94,28 @@ TEST_CASE("Parallel build", "[matmul][graph][parallel]") {
 
         graph.select_behavior_notes({fe::BehaviorNote_t::RUNTIME_COMPILATION});
 
-        REQUIRE(graph.check_support(handle).is_good());
+        REQUIRE(graph.check_support().is_good());
 
         return graph;
     };
 
-    auto build = [](fe::graph::Graph &graph, cudnnHandle_t handle, int index) {
-        auto status = graph.build_plan_at_index(handle, index);
-    };
+    auto build = [](fe::graph::Graph &graph, int index) { auto status = graph.build_plan_at_index(index); };
 
     BENCHMARK("BuildPlanPolicy_t::HEURISTICS_CHOICE") {
         fe::graph::Graph graph = create_graph();
-        return graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good();
+        return graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good();
     };
 
     BENCHMARK("BuildPlanPolicy_t::ALL") {
         fe::graph::Graph graph = create_graph();
-        return graph.build_plans(handle, fe::BuildPlanPolicy_t::ALL).is_good();
+        return graph.build_plans(fe::BuildPlanPolicy_t::ALL).is_good();
     };
 
     BENCHMARK("build_plan_at_index::ALL::serial") {
         fe::graph::Graph graph = create_graph();
         auto plan_count        = graph.get_execution_plan_count();
         for (auto i = 0; i < plan_count; i++) {
-            build(graph, handle, i);
+            build(graph, i);
         }
     };
 
@@ -126,7 +124,7 @@ TEST_CASE("Parallel build", "[matmul][graph][parallel]") {
         auto plan_count        = graph.get_execution_plan_count();
         std::vector<std::thread> builders;
         for (auto i = 0; i < plan_count; i++) {
-            builders.emplace_back(std::thread{build, std::reference_wrapper<fe::graph::Graph>(graph), handle, i});
+            builders.emplace_back(std::thread{build, std::reference_wrapper<fe::graph::Graph>(graph), i});
         }
         for (auto &builder : builders) {
             builder.join();
@@ -141,7 +139,7 @@ TEST_CASE("Parallel build", "[matmul][graph][parallel]") {
             auto plan_count = input < graph.get_execution_plan_count() ? input : graph.get_execution_plan_count();
             std::vector<std::thread> builders;
             for (auto i = 0; i < plan_count; i++) {
-                builders.emplace_back(std::thread{build, std::reference_wrapper<fe::graph::Graph>(graph), handle, i});
+                builders.emplace_back(std::thread{build, std::reference_wrapper<fe::graph::Graph>(graph), i});
             }
             for (auto &builder : builders) {
                 builder.join();

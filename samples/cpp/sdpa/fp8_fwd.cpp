@@ -41,7 +41,7 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
     int64_t s = 512;  // q,k,v tensor is padded to this seq length
     int64_t d = 128;  // hidden head dim
 
-    bool is_inference = true;
+    bool generate_stats = false;
 
     fe::graph::Graph mha_graph;
     mha_graph.set_io_data_type(fe::DataType_t::FP8_E4M3)
@@ -72,7 +72,7 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
 
     auto sdpa_fp8_options = fe::graph::SDPA_fp8_attributes()
                                 .set_name("sdpa_fp8")
-                                .set_is_inference(is_inference)
+                                .set_generate_stats(generate_stats)
                                 .set_causal_mask(true)
                                 .set_attn_scale(attn_scale);
 
@@ -84,10 +84,10 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
     Amax_S->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
 
     // Check that Stats tensor is real, which is only when its training step
-    if (is_inference) {
-        REQUIRE(Stats == nullptr);
-    } else {
+    if (generate_stats) {
         Stats->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+    } else {
+        REQUIRE(Stats == nullptr);
     }
 
     // Create a unique_ptr for the cuDNN handle
@@ -139,7 +139,7 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
         {Amax_O, Amax_O_Tensor.devPtr}};
 
     Surface<float> stats_tensor(b * h * s * 1, false);
-    if (is_inference == false) {
+    if (generate_stats == true) {
         variant_pack[Stats] = stats_tensor.devPtr;
     }
 

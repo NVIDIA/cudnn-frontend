@@ -572,6 +572,15 @@ class Graph : public ICudnn, public INode {
         return {error_code_t::OK, ""};
     }
 
+    // overload for deviceless AoT compilation
+    error_t
+    build_operation_graph() {
+        if (device_properties == nullptr) {
+            return {error_code_t::ATTRIBUTE_NOT_SET, "Device properties are not set."};
+        }
+        return build_operation_graph(nullptr);
+    }
+
     error_t
     build_operation_graph(cudnnHandle_t handle) {
         // expand composite nodes
@@ -893,6 +902,8 @@ class Graph : public ICudnn, public INode {
     set_sm_version(int32_t version);
     Graph &
     set_kernel_cache(std::shared_ptr<KernelCache> cache);
+    Graph &
+    set_device_properties(std::shared_ptr<const DeviceProperties> device_prop);
 
     Graph &
     set_name(std::string const &name) {
@@ -1085,23 +1096,58 @@ class Graph : public ICudnn, public INode {
 
     error_t
     check_support(cudnnHandle_t h) {
-        CHECK_CUDNN_FRONTEND_ERROR(plans.check_support(h));
+        // handle not required anymore
+        // TODO: remove this function in next release
+        (void)h;
+        return check_support();
+    }
+
+    // overload for deviceless AoT compilation
+    error_t
+    check_support() {
+        CHECK_CUDNN_FRONTEND_ERROR(plans.check_support());
         return {error_code_t::OK, ""};
     }
 
+    // TODO: remove this function in next release
     error_t
     build(cudnnHandle_t const &handle,
           std::vector<HeurMode_t> const &mode,
           BuildPlanPolicy_t const policy     = BuildPlanPolicy_t::HEURISTICS_CHOICE,
           bool const do_multithreaded_builds = false);
 
+    // overload for deviceless AoT compilation
+    error_t
+    build(std::vector<HeurMode_t> const &mode,
+          BuildPlanPolicy_t const policy     = BuildPlanPolicy_t::HEURISTICS_CHOICE,
+          bool const do_multithreaded_builds = false);
+
     error_t
     build_plans(cudnnHandle_t const &handle,
                 BuildPlanPolicy_t const policy     = BuildPlanPolicy_t::HEURISTICS_CHOICE,
+                bool const do_multithreaded_builds = false) {
+        // handle not required anymore
+        // TODO: remove this function in next release
+        (void)handle;
+        return build_plans(policy, do_multithreaded_builds);
+    }
+
+    // overload for deviceless AoT compilation
+    error_t
+    build_plans(BuildPlanPolicy_t const policy     = BuildPlanPolicy_t::HEURISTICS_CHOICE,
                 bool const do_multithreaded_builds = false);
 
     error_t
-    build_plan_at_index(cudnnHandle_t const &handle, int64_t index);
+    build_plan_at_index(cudnnHandle_t const &handle, int64_t index) {
+        // handle not required anymore
+        // TODO: remove this function in next release
+        (void)handle;
+        return build_plan_at_index(index);
+    }
+
+    // overload for deviceless AoT compilation
+    error_t
+    build_plan_at_index(int64_t index);
 
     Graph &
     deselect_workspace_greater_than(int64_t const workspace) {
@@ -1485,8 +1531,8 @@ Graph::get_knobs_for_engine(int64_t const engine, std::vector<Knob> &knobs) {
 inline error_t
 Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
     EngineConfigList op_graph_to_configs;
-    CHECK_CUDNN_FRONTEND_ERROR(
-        detail::query_cudnn_heuristics_impl(operation_graph, op_graph_to_configs, mode, context.get_target_sm_count()));
+    CHECK_CUDNN_FRONTEND_ERROR(detail::query_cudnn_heuristics_impl(
+        operation_graph, op_graph_to_configs, mode, context.get_target_sm_count(), device_properties));
 
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Extracting engine configs.");
 
@@ -1508,7 +1554,8 @@ Graph::create_execution_plan(int64_t const engine_id, std::unordered_map<KnobTyp
     RETURN_CUDNN_FRONTEND_ERROR_IF(engine.get_status() != CUDNN_STATUS_SUCCESS,
                                    error_code_t::CUDNN_BACKEND_API_FAILED,
                                    "Failed to create engine's backend descriptor.");
-    CHECK_CUDNN_FRONTEND_ERROR(detail::create_engine(engine, engine_id, operation_graph->get_raw_desc()));
+    CHECK_CUDNN_FRONTEND_ERROR(
+        detail::create_engine(engine, engine_id, operation_graph->get_raw_desc(), device_properties));
 
     // Create an array of knob choices
     std::vector<detail::backend_descriptor> knob_choices;
@@ -1523,14 +1570,14 @@ Graph::create_execution_plan(int64_t const engine_id, std::unordered_map<KnobTyp
 }
 
 inline error_t
-Graph::build_plan_at_index(cudnnHandle_t const &handle, int64_t plan_index) {
-    CHECK_CUDNN_FRONTEND_ERROR(plans.build_plan_at_index(handle, plan_index));
+Graph::build_plan_at_index(int64_t plan_index) {
+    CHECK_CUDNN_FRONTEND_ERROR(plans.build_plan_at_index(plan_index));
     return {error_code_t::OK, ""};
 }
 
 inline error_t
-Graph::build_plans(cudnnHandle_t const &handle, BuildPlanPolicy_t const policy, bool const do_multithreaded_builds) {
-    CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, policy, do_multithreaded_builds));
+Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_builds) {
+    CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(policy, do_multithreaded_builds));
     return {error_code_t::OK, ""};
 }
 
@@ -1542,8 +1589,18 @@ Graph::build(cudnnHandle_t const &handle,
     CHECK_CUDNN_FRONTEND_ERROR(this->validate());
     CHECK_CUDNN_FRONTEND_ERROR(this->build_operation_graph(handle));
     CHECK_CUDNN_FRONTEND_ERROR(this->create_execution_plans(modes));
-    CHECK_CUDNN_FRONTEND_ERROR(this->check_support(handle));
-    CHECK_CUDNN_FRONTEND_ERROR(this->build_plans(handle, policy, do_multithreaded_builds));
+    CHECK_CUDNN_FRONTEND_ERROR(this->check_support());
+    CHECK_CUDNN_FRONTEND_ERROR(this->build_plans(policy, do_multithreaded_builds));
+    return {error_code_t::OK, ""};
+}
+
+inline error_t
+Graph::build(std::vector<HeurMode_t> const &modes, BuildPlanPolicy_t const policy, bool const do_multithreaded_builds) {
+    CHECK_CUDNN_FRONTEND_ERROR(this->validate());
+    CHECK_CUDNN_FRONTEND_ERROR(this->build_operation_graph());
+    CHECK_CUDNN_FRONTEND_ERROR(this->create_execution_plans(modes));
+    CHECK_CUDNN_FRONTEND_ERROR(this->check_support());
+    CHECK_CUDNN_FRONTEND_ERROR(this->build_plans(policy, do_multithreaded_builds));
     return {error_code_t::OK, ""};
 }
 
@@ -1574,6 +1631,12 @@ Graph::set_dynamic_shape_enabled(bool is_enabled) {
 inline Graph &
 Graph::set_kernel_cache(std::shared_ptr<KernelCache> cache) {
     kernel_cache = cache;
+    return *this;
+}
+
+inline Graph &
+Graph::set_device_properties(std::shared_ptr<const DeviceProperties> device_prop) {
+    device_properties = device_prop;
     return *this;
 }
 
@@ -2062,7 +2125,7 @@ Graph::sdpa(std::shared_ptr<Tensor_attributes> q,
     auto O = attributes.outputs[SDPA_attributes::output_names::O] = output_tensor(attributes.name + "::O");
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> Stats = nullptr;
-    if (attributes.is_inference == false) {
+    if (attributes.generate_stats == true) {
         Stats = attributes.outputs[SDPA_attributes::output_names::Stats] = output_tensor(attributes.name + "::Stats");
     }
 
@@ -2091,7 +2154,7 @@ Graph::sdpa_fp8(std::shared_ptr<Tensor_attributes> q,
     auto O = attributes.outputs[SDPA_fp8_attributes::output_names::O] = output_tensor(attributes.name + "::O");
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> Stats = nullptr;
-    if (attributes.is_inference == false) {
+    if (attributes.generate_stats == true) {
         Stats = attributes.outputs[SDPA_fp8_attributes::output_names::Stats] =
             output_tensor(attributes.name + "::Stats");
     }

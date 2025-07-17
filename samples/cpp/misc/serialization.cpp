@@ -113,7 +113,7 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
 
         REQUIRE(graph->create_execution_plans({cudnn_frontend::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
         return true;
     };
@@ -134,9 +134,9 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
 
         REQUIRE(graph->create_execution_plans({cudnn_frontend::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
-        REQUIRE(graph->build_plans(handle).is_good());
+        REQUIRE(graph->build_plans().is_good());
 
         // Insert auto-tuning logic here
 
@@ -198,7 +198,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
 #endif
 
     // Mode of sdpa operation
-    bool is_inference = true;
+    bool generate_stats = false;
 
     bool use_causal_mask = true;
     bool use_alibi_mask  = true;
@@ -226,7 +226,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
            int64_t s_kv,
            int64_t d,
            bool is_attn_scale,
-           bool is_inference,
+           bool generate_stats,
            bool use_causal_mask,
            bool use_alibi_mask,
            bool use_dropout_with_rng,
@@ -264,7 +264,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
                                                             .set_data_type(fe::DataType_t::FLOAT))
                                         : nullptr;
 
-        auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention").set_is_inference(is_inference);
+        auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention").set_generate_stats(generate_stats);
 
         if (use_causal_mask) {
             sdpa_options.set_diagonal_alignment(cudnn_frontend::DiagonalAlignment_t::TOP_LEFT)
@@ -302,10 +302,10 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
         O->set_output(true).set_dim({b, h, s_q, d}).set_uid(uid_O).set_stride({h * d, d, b * h * d, 1});
 
         // Check that Stats tensor is real, which is only when its training step
-        if (is_inference) {
-            REQUIRE(stats == nullptr);
-        } else {
+        if (generate_stats) {
             stats->set_output(true).set_uid(uid_STATS).set_data_type(fe::DataType_t::FLOAT);
+        } else {
+            REQUIRE(stats == nullptr);
         }
 
         REQUIRE(graph->validate().is_good());
@@ -319,7 +319,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
                                                            int64_t s_kv,
                                                            int64_t d,
                                                            bool is_attn_scale,
-                                                           bool is_inference,
+                                                           bool generate_stats,
                                                            bool use_causal_mask,
                                                            bool use_alibi_mask,
                                                            bool use_dropout_with_rng,
@@ -334,7 +334,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
                                                      s_kv,
                                                      d,
                                                      is_attn_scale,
-                                                     is_inference,
+                                                     generate_stats,
                                                      use_causal_mask,
                                                      use_alibi_mask,
                                                      use_dropout_with_rng,
@@ -344,7 +344,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
 
         REQUIRE(graph->create_execution_plans({cudnn_frontend::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
         return true;
     };
@@ -355,7 +355,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
                                                        int64_t s_kv,
                                                        int64_t d,
                                                        bool is_attn_scale,
-                                                       bool is_inference,
+                                                       bool generate_stats,
                                                        bool use_causal_mask,
                                                        bool use_alibi_mask,
                                                        bool use_dropout_with_rng,
@@ -371,7 +371,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
                                                      s_kv,
                                                      d,
                                                      is_attn_scale,
-                                                     is_inference,
+                                                     generate_stats,
                                                      use_causal_mask,
                                                      use_alibi_mask,
                                                      use_dropout_with_rng,
@@ -381,9 +381,9 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
 
         REQUIRE(graph->create_execution_plans({cudnn_frontend::HeurMode_t::A}).is_good());
 
-        REQUIRE(graph->check_support(handle).is_good());
+        REQUIRE(graph->check_support().is_good());
 
-        REQUIRE(graph->build_plans(handle).is_good());
+        REQUIRE(graph->build_plans().is_good());
 
         // Insert auto-tuning logic here
 
@@ -408,7 +408,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
                           s_kv,
                           d,
                           is_attn_scale,
-                          is_inference,
+                          generate_stats,
                           use_causal_mask,
                           use_alibi_mask,
                           use_dropout_with_rng,
@@ -421,7 +421,7 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
                                     s_kv,
                                     d,
                                     is_attn_scale,
-                                    is_inference,
+                                    generate_stats,
                                     use_causal_mask,
                                     use_alibi_mask,
                                     use_dropout_with_rng,

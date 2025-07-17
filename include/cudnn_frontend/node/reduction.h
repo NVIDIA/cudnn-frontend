@@ -21,6 +21,16 @@ class ReductionNode : public NodeCRTP<ReductionNode> {
     }
 
     error_t
+    pre_validate_node() const override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating ReductionNode " << attributes.name << "...");
+
+        if (attributes.get_is_deterministic() && detail::get_backend_version() < 91100) {
+            return {error_code_t::GRAPH_NOT_SUPPORTED, "DETERMINISTIC mode is not supported in cudnn version < 9.11.0"};
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
     infer_properties_node() override final {
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for reduction node " << attributes.name << "...");
 
@@ -58,6 +68,7 @@ class ReductionNode : public NodeCRTP<ReductionNode> {
         auto reduction_descriptor = cudnn_frontend::ReductionDescBuilder()
                                         .setComputeType(attributes.compute_data_type)
                                         .setReductionOp(attributes.get_mode().value())
+                                        .setIsDeterministic(attributes.get_is_deterministic())
                                         .build();
 
         auto&& reduction_operation_builder =

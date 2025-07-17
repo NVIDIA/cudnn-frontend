@@ -66,7 +66,7 @@ def compute_ref(
     diagonal_alignment=cudnn.diagonal_alignment.TOP_LEFT,
     dropout_prob=0.0,
     dropout_mask=None,
-    compute_stats=False,
+    generate_stats=False,
     device="cuda",
 ):
     b, h_q, s_q, d_qk = q.shape
@@ -224,7 +224,7 @@ def compute_ref(
     o = torch.einsum("bhqk,bhkd->bhqd", p, v)
 
     # softmax stats is used for backwards computation
-    if compute_stats:
+    if generate_stats:
         # amax (NOT absolute max) is used here to evenly distribute gradient
         row_max = torch.amax(s, -1, True)
         row_exp = torch.exp(s - row_max)
@@ -877,7 +877,7 @@ def test_sdpa(
         q=q,
         k=k,
         v=v,
-        is_inference=is_infer,
+        generate_stats=not is_infer,
         attn_scale=attn_scale,
         bias=bias,
         use_alibi_mask=is_alibi,
@@ -975,7 +975,7 @@ def test_sdpa(
         padding=(seq_len_q_ref, seq_len_kv_ref) if is_padding else None,
         sliding_window=(left_bound, right_bound),
         diagonal_alignment=diagonal_alignment,
-        compute_stats=(is_infer == False),
+        generate_stats=(is_infer == False),
         dropout_prob=dropout_prob,
         dropout_mask=rng_dump_ref if is_dropout else None,
     )
@@ -1292,7 +1292,7 @@ def test_sdpa_backward(
         q=q,
         k=k,
         v=v,
-        is_inference=False,
+        generate_stats=True,
         attn_scale=attn_scale,
         bias=bias,
         use_alibi_mask=is_alibi,
@@ -1511,7 +1511,7 @@ def test_sdpa_backward(
         diagonal_alignment=diagonal_alignment,
         dropout_prob=dropout_prob,
         dropout_mask=rng_dump_ref if is_dropout else None,
-        compute_stats=False,
+        generate_stats=False,
     )
 
     outputs_ref = [o_ref]

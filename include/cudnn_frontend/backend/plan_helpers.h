@@ -59,7 +59,10 @@ get_shared_memory_size(ManagedOpaqueDescriptor& engine_config, int32_t& shared_m
 }
 
 inline error_t
-create_engine(backend_descriptor& engine, int64_t const engine_id, cudnnBackendDescriptor_t op_graph) {
+create_engine(backend_descriptor& engine,
+              int64_t const engine_id,
+              cudnnBackendDescriptor_t op_graph,
+              std::shared_ptr<const DeviceProperties> device_properties = nullptr) {
     CHECK_CUDNN_ERROR(detail::set_attribute(
         engine.get_ptr(), CUDNN_ATTR_ENGINE_OPERATION_GRAPH, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &op_graph));
 
@@ -72,6 +75,16 @@ create_engine(backend_descriptor& engine, int64_t const engine_id, cudnnBackendD
 
     CHECK_CUDNN_ERROR(
         detail::set_attribute(engine.get_ptr(), CUDNN_ATTR_ENGINE_GLOBAL_INDEX, CUDNN_TYPE_INT64, 1, &engine_id));
+
+    if (device_properties != nullptr) {
+#if (CUDNN_VERSION >= 90800)
+        CHECK_CUDNN_ERROR(detail::set_attribute(engine.get_ptr(),
+                                                CUDNN_ATTR_ENGINE_DEVICEPROP,
+                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                1,
+                                                &device_properties->get_ptr()));
+#endif
+    }
 
     CHECK_CUDNN_ERROR(detail::finalize(engine.get_ptr()));
 

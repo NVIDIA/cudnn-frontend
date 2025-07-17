@@ -339,13 +339,11 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
         auto swa_comparison_output = graph->pointwise(col_index_output, row_index_output, greater_than_attributes);
         swa_comparison_output->set_data_type(DataType_t::BOOLEAN);
 
-        // Lower attributes to binary select attributes
-        auto negative_inf_swa = std::make_shared<Tensor_attributes>(-1024.0f * 1024.0f * 1024.0f);
-
-        auto binary_select_attributes =
-            Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT);
-
-        return_mask = graph->pointwise(return_mask, negative_inf_swa, swa_comparison_output, binary_select_attributes);
+        return_mask =
+            graph->pointwise(return_mask,
+                             std::make_shared<Tensor_attributes>(get_negative_inf_value()),
+                             swa_comparison_output,
+                             Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT));
     }
     return return_mask;
 }

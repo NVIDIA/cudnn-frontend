@@ -29,7 +29,8 @@ add_executable(
     matmul/fp8_matmul.cpp
     matmul/int8_matmul.cpp
     matmul/mixed_matmul.cpp
-    matmul/nvfp4_mxfp8_matmul.cpp
+    matmul/blackwell_nvfp4_mxfp8_block_scale_matmul.cpp
+    matmul/general_block_scale_matmul.cpp
 
     norm/batchnorm.cpp
     norm/layernorm.cpp
@@ -37,6 +38,7 @@ add_executable(
     norm/norm_zero_centered_gamma.cpp
     norm/rmsnorm.cpp
     norm/norm_block_scale.cpp
+    norm/layernorm_bitmask_relu.cpp
 
     misc/serialization.cpp
     misc/autotuning.cpp
@@ -47,6 +49,7 @@ add_executable(
     misc/slice.cpp
     misc/sm_carveout.cpp
     misc/cudagraphs.cpp
+    misc/deviceless_aot_compilation.cpp
 )
 
 # target flags

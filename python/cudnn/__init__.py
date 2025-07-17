@@ -30,6 +30,7 @@ symbols_to_import = [
     "set_stream",
     "build_plan_policy",
     "data_type",
+    "tensor_reordering",
     "heur_mode",
     "pygraph",
     "tensor",
@@ -43,7 +44,7 @@ for symbol_name in symbols_to_import:
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.12.0"
+__version__ = "1.13.0"
 
 
 def _tensor(
@@ -54,6 +55,7 @@ def _tensor(
     is_virtual=False,
     is_pass_by_value=False,
     ragged_offset=None,
+    reordering_type=tensor_reordering.NONE,
     name="",
 ):
     """
@@ -66,6 +68,7 @@ def _tensor(
         is_virtual (bool): Flag indicating if the tensor is virtual.
         is_pass_by_value (bool): Flag indicating if the tensor is passed by value.
         ragged_offset (cudnn_tensor): The ragged offset tensor.
+        reordering_type (cudnn.tensor_reordering): The reordering type of the tensor.
         name (str): The name of the tensor.
 
     Returns:
@@ -78,6 +81,7 @@ def _tensor(
         is_virtual=is_virtual,
         is_pass_by_value=is_pass_by_value,
         ragged_offset=ragged_offset,
+        reordering_type=reordering_type,
         name=name,
     )
 

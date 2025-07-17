@@ -16,7 +16,7 @@ std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 2>
 PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
-              bool const is_inference,
+              py::object const& is_inference,
               py::object const& attn_scale,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
               bool const use_alibi_mask,
@@ -36,10 +36,10 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               py::object const& paged_attention_max_seq_len_kv,
               cudnn_frontend::DataType_t const& compute_data_type,
               std::string const& name,
-              std::optional<PyCallback> fn) {
+              std::optional<PyCallback> fn,
+              py::object const& generate_stats) {
     auto attributes =
         cudnn_frontend::graph::SDPA_attributes()
-            .set_is_inference(is_inference)
             .set_bias(bias)
             .set_alibi_mask(use_alibi_mask)
             .set_padding_mask(use_padding_mask)
@@ -51,6 +51,26 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
             .set_causal_mask_bottom_right(use_causal_mask_bottom_right)
             .set_compute_data_type(compute_data_type)
             .set_name(name);
+
+    if (generate_stats.is_none() == is_inference.is_none()) {
+        throw std::runtime_error("Exactly one of {generate_stats, is_inference} must be set (prefer generate_stats).");
+    }
+
+    if (!is_inference.is_none()) {
+        if (py::isinstance<py::bool_>(is_inference)) {
+            attributes.set_generate_stats(!is_inference.cast<bool>());
+        } else {
+            throw std::runtime_error("is_inference must be a bool.");
+        }
+    }
+
+    if (!generate_stats.is_none()) {
+        if (py::isinstance<py::bool_>(generate_stats)) {
+            attributes.set_generate_stats(generate_stats.cast<bool>());
+        } else {
+            throw std::runtime_error("generate_stats must be a bool.");
+        }
+    }
 
     if (paged_attention_k_table) {
         attributes.set_paged_attention_k_table(paged_attention_k_table);
@@ -296,7 +316,7 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_s,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& scale_s,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& scale_o,
-                  bool const is_inference,
+                  py::object const& is_inference,
                   py::object const& attn_scale,
                   bool const use_padding_mask,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
@@ -305,9 +325,9 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                   bool const use_causal_mask_bottom_right,
                   py::object const& dropout,
                   cudnn_frontend::DataType_t const& compute_data_type,
-                  std::string const& name) {
+                  std::string const& name,
+                  py::object const& generate_stats) {
     auto attributes = cudnn_frontend::graph::SDPA_fp8_attributes()
-                          .set_is_inference(is_inference)
                           .set_padding_mask(use_padding_mask)
                           .set_seq_len_q(seq_len_q)
                           .set_seq_len_kv(seq_len_kv)
@@ -315,6 +335,26 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                           .set_causal_mask_bottom_right(use_causal_mask_bottom_right)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
+
+    if (generate_stats.is_none() == is_inference.is_none()) {
+        throw std::runtime_error("Exactly one of {generate_stats, is_inference} must be set (prefer generate_stats).");
+    }
+
+    if (!is_inference.is_none()) {
+        if (py::isinstance<py::bool_>(is_inference)) {
+            attributes.set_generate_stats(!is_inference.cast<bool>());
+        } else {
+            throw std::runtime_error("is_inference must be a bool.");
+        }
+    }
+
+    if (!generate_stats.is_none()) {
+        if (py::isinstance<py::bool_>(generate_stats)) {
+            attributes.set_generate_stats(generate_stats.cast<bool>());
+        } else {
+            throw std::runtime_error("generate_stats must be a bool.");
+        }
+    }
 
     if (!attn_scale.is_none()) {
         if (py::isinstance<py::float_>(attn_scale)) {
@@ -483,7 +523,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg("q"),
           py::arg("k"),
           py::arg("v"),
-          py::arg("is_inference"),
+          py::arg_v("is_inference", py::none()),
           py::arg_v("attn_scale", py::none()),
           py::arg_v("bias", nullptr),
           py::arg_v("use_alibi_mask", false),
@@ -504,6 +544,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
           py::arg_v("name", ""),
           py::arg_v("score_mod", std::nullopt),
+          py::arg_v("generate_stats", py::none()),
           R"pbdoc(
                 Perform scaled dot product attention.
 
@@ -511,7 +552,6 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     q (cudnn_tensor): The query data.
                     k (cudnn_tensor): The key data. When page_table_k is provided, 'k' is a container of non-contiguous key data.
                     v (cudnn_tensor): The value data. When page_table_v is provided, 'v' is a container of non-contiguous value data.
-                    is_inference (bool): Whether it is an inference step or training step.
                     attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
                     bias (Optional[cudnn_tensor]): The bias data for attention. Default is None.
                     use_alibi_mask (Optional[bool]): Whether to use alibi mask. Default is False.
@@ -525,14 +565,17 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     paged_attention_max_seq_len_kv (Optional[integer]): The maximum sequence length for k/v caches when paged attention is active.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                     name (Optional[str]): The name of the operation.
+                    generate_stats (Optional[bool]): If true, compute and output softmax stats (useful at training time). Default is None, but one of {generate_stats, is_inference} must be set.
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and diagonal_band_right_bound=0. Default is TOP_LEFT.
-                    left_bround (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
+                    diagonal_band_left_bound (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
                     diagonal_band_right_bound (Optional[int]): An integer >= 0 specifying the offset to the right of the main diagonal to attend to. Default is None, implying +Inf.
                 Deprecated masking Args (can cause undetermined behavior when combined with the Preferred masking args):
                     sliding_window_length (Optional[int]): A positive int specifying the left bound sliding window length
                     use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
                     use_causal_mask_bottom_right (Optional[bool]): Whether to use bottom right aligned causal mask. Default is False.
+                Other deprecated Args:
+                    is_inference (Optional[bool]): If false, compute and output softmax stats. Prefer generate_stats instead (NOTE: generate_stats takes the negation of the argument to is_inference).
 
                 Returns:
                     o (cudnn_tensor): The output data.
@@ -615,7 +658,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg("descale_s"),
           py::arg("scale_s"),
           py::arg("scale_o"),
-          py::arg("is_inference"),
+          py::arg_v("is_inference", py::none()),
           py::arg_v("attn_scale", py::none()),
           py::arg_v("use_padding_mask", false),
           py::arg_v("seq_len_q", nullptr),
@@ -625,6 +668,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("dropout", py::none()),
           py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
           py::arg_v("name", ""),
+          py::arg_v("generate_stats", py::none()),
           R"pbdoc(
                 Perform scaled dot product attention with fp8 datatype inputs and outputs.
 
@@ -638,7 +682,6 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     descale_s (cudnn_tensor): Descale factor for S tensor.
                     scale_s (cudnn_tensor): Scale factor for S tensor.
                     scale_o (cudnn_tensor): Scale factor for output.
-                    is_inference (bool): Whether it is an inference step or training step.
                     attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
                     use_padding_mask (bool): Whether it is an inference step or training step.
                     seq_len_q (Optional[cudnn_tensor]): The sequence length of the query.
@@ -647,6 +690,9 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                     name (Optional[str]): The name of the operation.
+                    generate_stats (Optional[bool]): If true, compute and output softmax stats (useful at training time). Default is None, but one of {generate_stats, is_inference} must be set.
+                Deprecated Args:
+                    is_inference (Optional[bool]): If false, compute and output softmax stats. Prefer generate_stats instead (NOTE: generate_stats takes the negation of the argument to is_inference).
 
                 Returns:
                     o (cudnn_tensor): The output data.

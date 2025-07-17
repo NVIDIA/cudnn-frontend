@@ -48,6 +48,9 @@ def is_torch_available():
             possibly_add_type("float8_e4m3fn", cudnn_data_type.FP8_E4M3)
             possibly_add_type("float8_e5m2", cudnn_data_type.FP8_E5M2)
 
+            possibly_add_type("float8_e8m0fnu", cudnn_data_type.FP8_E8M0)
+            possibly_add_type("float4_e2m1fn_x2", cudnn_data_type.FP4_E2M1)
+
         except ImportError:
             torch_available = False
             _torch_to_cudnn_data_type_dict = {}

@@ -45,12 +45,12 @@ create_sdpa_forward_graph(int64_t const b,
                           int64_t const s_kv,
                           int64_t const d_qk,
                           int64_t const d_v,
-                          float const attn_scale  = 1.0f,
-                          bool const is_inference = false,
-                          bool const causal_mask  = false,
-                          bool const alibi_mask   = false,
-                          bool const padding_mask = false,
-                          bool has_attn_bias      = false);
+                          float const attn_scale    = 1.0f,
+                          bool const generate_stats = true,
+                          bool const causal_mask    = false,
+                          bool const alibi_mask     = false,
+                          bool const padding_mask   = false,
+                          bool has_attn_bias        = false);
 
 // Directly use the backward graph builder from the toy example
 std::shared_ptr<fe::graph::Graph>
@@ -62,12 +62,12 @@ create_sdpa_backward_graph(int64_t const b,
                            int64_t const s_kv,
                            int64_t const d_qk,
                            int64_t const d_v,
-                           float const attn_scale  = 1.0f,
-                           bool const is_inference = false,
-                           bool const causal_mask  = false,
-                           bool const alibi_mask   = false,
-                           bool const padding_mask = false,
-                           bool has_attn_bias      = false);
+                           float const attn_scale    = 1.0f,
+                           bool const generate_stats = true,
+                           bool const causal_mask    = false,
+                           bool const alibi_mask     = false,
+                           bool const padding_mask   = false,
+                           bool has_attn_bias        = false);
 
 #define Q_UID 1
 #define K_UID 2

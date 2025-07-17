@@ -29,6 +29,7 @@
 #include "cudnn_frontend_EngineConfig.h"
 #include "cudnn_frontend_utils.h"
 #include "cudnn_frontend_Filters.h"
+#include "cudnn_frontend/backend/device_properties.h"
 
 #if defined(_MSC_VER)
 #pragma warning(push)
@@ -129,8 +130,9 @@ class EngineHeuristics_v8 : public BackendDescriptor {
     EngineHeuristics_v8 &
     operator=(EngineHeuristics_v8 const &) = delete;
 
-    cudnnBackendHeurMode_t mode     = CUDNN_HEUR_MODE_INSTANT;
-    ManagedOpaqueDescriptor opGraph = nullptr;
+    cudnnBackendHeurMode_t mode                               = CUDNN_HEUR_MODE_INSTANT;
+    ManagedOpaqueDescriptor opGraph                           = nullptr;
+    std::shared_ptr<const DeviceProperties> device_properties = nullptr;
     std::vector<ManagedOpaqueDescriptor> m_heuristic_results;  //! storage of heuristic results
     std::string opGraphTag;
     int32_t target_sm_count = -1;
@@ -164,7 +166,13 @@ class EngineHeuristicsBuilder_v8 {
         m_heuristics.opGraphTag = tag;
         return *this;
     }
-    //! Set cudnnHandle for the operations
+
+    auto
+    setDeviceProperties(std::shared_ptr<const DeviceProperties> device_properties) -> EngineHeuristicsBuilder_v8 & {
+        m_heuristics.device_properties = device_properties;
+        return *this;
+    }
+
     auto
     setHeurMode(cudnnBackendHeurMode_t mode_) -> EngineHeuristicsBuilder_v8 & {
         m_heuristics.mode = mode_;
@@ -210,6 +218,7 @@ class EngineHeuristicsBuilder_v8 {
                 "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: SetAttribute  CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH Failed");
             return std::move(m_heuristics);
         };
+
         status = detail::set_attribute(m_heuristics.pointer->get_backend_descriptor(),
                                        CUDNN_ATTR_ENGINEHEUR_MODE,
                                        CUDNN_TYPE_HEUR_MODE,
@@ -222,6 +231,24 @@ class EngineHeuristicsBuilder_v8 {
                 "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: SetAttribute CUDNN_ATTR_ENGINEHEUR_MODE Failed");
             return std::move(m_heuristics);
         };
+
+        if (m_heuristics.device_properties != nullptr) {
+#if (CUDNN_VERSION >= 90800)
+            status = detail::set_attribute(m_heuristics.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_ENGINEHEUR_DEVICEPROP,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &m_heuristics.device_properties->get_ptr());
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(&m_heuristics,
+                                              status,
+                                              "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: SetAttribute "
+                                              "CUDNN_ATTR_ENGINEHEUR_DEVICEPROP Failed");
+                return std::move(m_heuristics);
+            }
+#endif
+        }
+
 #if (CUDNN_VERSION >= 8905)
         if (m_heuristics.target_sm_count >= 0) {
             NV_CUDNN_FE_DYNAMIC_CHECK_BACKEND_DESCRIPTOR(8905,
@@ -334,9 +361,14 @@ get_heuristics_list_impl(cudnnBackendHeurMode_t heur_mode,
                          OperationGraph_v8 &opGraph,
                          std::function<bool(cudnnBackendDescriptor_t)> filter_fn,
                          int32_t sm_count,
-                         EngineConfigList &filtered_configs) {
-    auto heuristics =
-        EngineHeuristicsBuilder_v8().setOperationGraph(opGraph).setHeurMode(heur_mode).setSMCount(sm_count).build();
+                         EngineConfigList &filtered_configs,
+                         std::shared_ptr<const DeviceProperties> device_properties = nullptr) {
+    auto heuristics = EngineHeuristicsBuilder_v8()
+                          .setDeviceProperties(device_properties)
+                          .setOperationGraph(opGraph)
+                          .setHeurMode(heur_mode)
+                          .setSMCount(sm_count)
+                          .build();
     NV_CUDNN_RETURN_IF_ERROR(heuristics);
     auto num_config = heuristics.getEngineConfigCount();
     NV_CUDNN_RETURN_IF_ERROR(heuristics);
@@ -353,8 +385,9 @@ get_heuristics_list(std::vector<std::string> const &modes,
                     OperationGraph_v8 &opGraph,
                     std::function<bool(cudnnBackendDescriptor_t)> filter_fn,
                     EngineConfigList &filtered_configs,
-                    bool evaluate_all = false,
-                    int32_t sm_count  = -1) {
+                    bool evaluate_all                                         = false,
+                    int32_t sm_count                                          = -1,
+                    std::shared_ptr<const DeviceProperties> device_properties = nullptr) {
     std::vector<cudnnStatus_t> statuses;
 
     // Try building the heuristics for each mode
@@ -364,28 +397,30 @@ get_heuristics_list(std::vector<std::string> const &modes,
             mode.find("heuristics_mode_a") != std::string::npos) {
             auto heur_mode = CUDNN_HEUR_MODE_A;
             NV_CUDNN_FE_TRY();
-            auto status_l = get_heuristics_list_impl(heur_mode, opGraph, filter_fn, sm_count, filtered_configs);
+            auto status_l =
+                get_heuristics_list_impl(heur_mode, opGraph, filter_fn, sm_count, filtered_configs, device_properties);
             NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status_l, true);
             NV_CUDNN_FE_CATCH(NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(e.getCudnnStatus(), true));
 
         } else if (mode.find("heuristics_fallback") != std::string::npos) {
             NV_CUDNN_FE_TRY();
-            auto status_l =
-                get_heuristics_list_impl(CUDNN_HEUR_MODE_FALLBACK, opGraph, filter_fn, sm_count, filtered_configs);
+            auto status_l = get_heuristics_list_impl(
+                CUDNN_HEUR_MODE_FALLBACK, opGraph, filter_fn, sm_count, filtered_configs, device_properties);
             NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status_l, true);
             NV_CUDNN_FE_CATCH(NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(e.getCudnnStatus(), true));
         } else if (mode.find("heuristics_mode_b") != std::string::npos) {
             auto heur_mode = CUDNN_HEUR_MODE_B;
             NV_CUDNN_FE_TRY();
-            auto status_l = get_heuristics_list_impl(heur_mode, opGraph, filter_fn, sm_count, filtered_configs);
+            auto status_l =
+                get_heuristics_list_impl(heur_mode, opGraph, filter_fn, sm_count, filtered_configs, device_properties);
 
             // Between cudnn version 8.3 and 8.6, when heur_mode_b heuristics did not succeed,
             // there was no fallback to the instant mode. We are here manually adding instant mode
             // to the heur_mode_b to alleviate this issue.
 #if (CUDNN_VERSION >= 8300) && (CUDNN_VERSION < 8600)
             if (status_l != CUDNN_STATUS_SUCCESS) {
-                status_l =
-                    get_heuristics_list_impl(CUDNN_HEUR_MODE_INSTANT, opGraph, filter_fn, sm_count, filtered_configs);
+                status_l = get_heuristics_list_impl(
+                    CUDNN_HEUR_MODE_INSTANT, opGraph, filter_fn, sm_count, filtered_configs, device_properties);
             }
 #endif
             NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status_l, true);
@@ -394,7 +429,8 @@ get_heuristics_list(std::vector<std::string> const &modes,
         }
         catch (cudnn_frontend::cudnnException &) {
             NV_CUDNN_FE_TRY();
-            auto status_ = get_heuristics_list_impl(heur_mode, opGraph, filter_fn, sm_count, filtered_configs);
+            auto status_ =
+                get_heuristics_list_impl(heur_mode, opGraph, filter_fn, sm_count, filtered_configs, device_properties);
             statuses.push_back(status_);
             NV_CUDNN_FE_CATCH(NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(e.getCudnnStatus(), true));
         }
@@ -412,8 +448,9 @@ get_heuristics_list(std::vector<cudnn_frontend::HeurMode_t> const &modes,
                     OperationGraph_v8 &opGraph,
                     std::function<bool(cudnnBackendDescriptor_t)> filter_fn,
                     EngineConfigList &filtered_configs,
-                    bool evaluate_all = false,
-                    int32_t sm_count  = -1) {
+                    bool evaluate_all                                         = false,
+                    int32_t sm_count                                          = -1,
+                    std::shared_ptr<const DeviceProperties> device_properties = nullptr) {
     std::unordered_map<HeurMode_t, std::string> mode_to_string = {
         {HeurMode_t::A, "heuristics_mode_a"},
         {HeurMode_t::B, "heuristics_mode_b"},
@@ -425,7 +462,8 @@ get_heuristics_list(std::vector<cudnn_frontend::HeurMode_t> const &modes,
         return mode_to_string.at(mode);
     });
 
-    return get_heuristics_list(string_modes, opGraph, filter_fn, filtered_configs, evaluate_all, sm_count);
+    return get_heuristics_list(
+        string_modes, opGraph, filter_fn, filtered_configs, evaluate_all, sm_count, device_properties);
 }
 
 template <std::size_t SIZE>

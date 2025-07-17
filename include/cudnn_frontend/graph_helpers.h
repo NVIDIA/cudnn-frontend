@@ -29,6 +29,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <string>
+#include <numeric>
 
 namespace cudnn_frontend {
 

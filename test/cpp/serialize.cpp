@@ -135,10 +135,10 @@ TEST_CASE("Graph key", "[graph][key]") {
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
     REQUIRE(key == graph.key());
 
-    REQUIRE(graph.check_support(handle).is_good());
+    REQUIRE(graph.check_support().is_good());
     REQUIRE(key == graph.key());
 
-    REQUIRE(graph.build_plans(handle).is_good());
+    REQUIRE(graph.build_plans().is_good());
     REQUIRE(key == graph.key());
 
     cudnnDestroy(handle);
@@ -215,10 +215,10 @@ TEST_CASE("Graph key dynamic shape", "[graph][key][dynamic_shape]") {
         REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
         REQUIRE(key == graph.key());
 
-        REQUIRE(graph.check_support(handle).is_good());
+        REQUIRE(graph.check_support().is_good());
         REQUIRE(key == graph.key());
 
-        REQUIRE(graph.build_plans(handle).is_good());
+        REQUIRE(graph.build_plans().is_good());
         REQUIRE(key == graph.key());
 
         cudnnDestroy(handle);
@@ -446,7 +446,7 @@ TEST_CASE("sdpa graph serialization", "[graph][serialize]") {
 
     auto sdpa_options = fe::graph::SDPA_attributes()
                             .set_name("flash_attention")
-                            .set_is_inference(false)
+                            .set_generate_stats(true)
                             .set_attn_scale(attn_scale)
                             .set_alibi_mask(true)
                             .set_diagonal_band_right_bound(0)

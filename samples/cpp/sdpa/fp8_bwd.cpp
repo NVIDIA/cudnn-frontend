@@ -145,8 +145,8 @@ TEST_CASE("sdpa_fp8_bprop", "[graph][sdpa][fp8][backward]") {
 
     REQUIRE(mha_graph.build_operation_graph(handle).is_good());
     REQUIRE(mha_graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
-    REQUIRE(mha_graph.check_support(handle).is_good());
-    REQUIRE(mha_graph.build_plans(handle).is_good());
+    REQUIRE(mha_graph.check_support().is_good());
+    REQUIRE(mha_graph.build_plans().is_good());
 
     // Surfaces
     auto Q_K_V_dQ_dK_dV_bulk_dims{b * s * 3 * h * d};
@@ -313,8 +313,8 @@ TEST_CASE("sdpa_fp8_gqa_bprop", "[graph][sdpa][fp8][backward]") {
 
     REQUIRE(mha_graph.build_operation_graph(handle).is_good());
     REQUIRE(mha_graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
-    REQUIRE(mha_graph.check_support(handle).is_good());
-    REQUIRE(mha_graph.build_plans(handle).is_good());
+    REQUIRE(mha_graph.check_support().is_good());
+    REQUIRE(mha_graph.build_plans().is_good());
 
     // Surfaces that alllocate GPU memory
     Surface<int8_t> q_gpu(b * s * h_qo * d, false);

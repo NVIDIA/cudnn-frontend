@@ -98,7 +98,14 @@ init_properties(py::module_& m) {
         .value("FAST_FLOAT_FOR_FP8", cudnn_frontend::DataType_t::FAST_FLOAT_FOR_FP8)
         .value("FP8_E8M0", cudnn_frontend::DataType_t::FP8_E8M0)
         .value("FP4_E2M1", cudnn_frontend::DataType_t::FP4_E2M1)
+        .value("INT4", cudnn_frontend::DataType_t::INT4)
         .value("NOT_SET", cudnn_frontend::DataType_t::NOT_SET);
+
+    py::enum_<cudnn_frontend::TensorReordering_t>(m, "tensor_reordering")
+        .value("NONE", cudnn_frontend::TensorReordering_t::NONE)
+        .value("INT8x32", cudnn_frontend::TensorReordering_t::INT8x32)
+        .value("F16x16", cudnn_frontend::TensorReordering_t::F16x16)
+        .value("F8_128x4", cudnn_frontend::TensorReordering_t::F8_128x4);
 
     py::class_<cudnn_frontend::graph::Tensor_attributes, std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(
         m, "tensor")

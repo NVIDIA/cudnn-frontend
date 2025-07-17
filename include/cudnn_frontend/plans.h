@@ -42,7 +42,8 @@ inline error_t
 query_cudnn_heuristics_impl(std::shared_ptr<OperationGraph_v8> const& operation_graph,
                             cudnn_frontend::EngineConfigList& configs,
                             std::vector<HeurMode_t> const& modes,
-                            int32_t sm_count) {
+                            int32_t sm_count,
+                            std::shared_ptr<const DeviceProperties> device_properties = nullptr) {
     RETURN_CUDNN_FRONTEND_ERROR_IF(
         operation_graph == nullptr,
         error_code_t::HEURISTIC_QUERY_FAILED,
@@ -55,13 +56,14 @@ query_cudnn_heuristics_impl(std::shared_ptr<OperationGraph_v8> const& operation_
 #ifdef NV_CUDNN_DISABLE_EXCEPTION
     // disable exception macro is defined. Calling build will not throw.
     // Check status of desc and return error.
-    statuses = cudnn_frontend::get_heuristics_list(modes, *operation_graph, allowAllConfig, configs, true, sm_count);
+    statuses = cudnn_frontend::get_heuristics_list(
+        modes, *operation_graph, allowAllConfig, configs, true, sm_count, device_properties);
 #else
     // build() can throw
     // wrap in try catch
     try {
-        statuses =
-            cudnn_frontend::get_heuristics_list(modes, *operation_graph, allowAllConfig, configs, true, sm_count);
+        statuses = cudnn_frontend::get_heuristics_list(
+            modes, *operation_graph, allowAllConfig, configs, true, sm_count, device_properties);
     } catch (cudnn_frontend::cudnnException& e) {
         // Silly MSVC error that thinks below condition is constexpr
         // RETURN_CUDNN_FRONTEND_ERROR_IF(
@@ -131,11 +133,10 @@ inline error_t
 create_cudnn_execution_plan(std::shared_ptr<ExecutionPlan>& plan,
                             ManagedOpaqueDescriptor const& config,
                             std::string const& operation_graph_tag,
-                            std::shared_ptr<KernelCache> kernel_cache,
-                            cudnnHandle_t handle) {
+                            std::shared_ptr<KernelCache> kernel_cache) {
     auto&& plan_builder = cudnn_frontend::ExecutionPlanBuilder();
 
-    plan_builder.setHandle(handle).setEngineConfig(config, operation_graph_tag).setKernelCache(kernel_cache);
+    plan_builder.setEngineConfig(config, operation_graph_tag).setKernelCache(kernel_cache);
 
 #ifdef NV_CUDNN_DISABLE_EXCEPTION
     // disable exception macro is defined. Calling build will not throw.
@@ -173,7 +174,7 @@ class Execution_plan_list {
     std::string operation_tag;
 
     std::vector<bool> barred_indices;
-    std::shared_ptr<KernelCache> kernel_cache;
+    std::shared_ptr<KernelCache> kernel_cache = nullptr;
 
     int64_t max_workspace_allowed  = std::numeric_limits<int64_t>::max();
     int64_t max_shared_mem_allowed = 1024 * 1024 * 1024;  // Crazy high number (2GB) which will never be hit
@@ -182,10 +183,10 @@ class Execution_plan_list {
     EngineConfigList engine_configs;
 
     error_t
-    _build_plan_at_index_impl(cudnnHandle_t handle, int64_t index) {
+    _build_plan_at_index_impl(int64_t index) {
         if (execution_plans[index] == nullptr) {
             CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_execution_plan(
-                execution_plans[index], engine_configs[index], operation_tag, kernel_cache, handle));
+                execution_plans[index], engine_configs[index], operation_tag, kernel_cache));
         }
 
         auto is_blocked = [](std::string const& full_name, std::vector<std::string> const& blocked_names) -> bool {
@@ -393,7 +394,7 @@ class Execution_plan_list {
     }
 
     error_t
-    check_support_at_index(cudnnHandle_t handle, int64_t index) {
+    check_support_at_index(int64_t index) {
         // Ignore if the engine config was deselected.
         // This usually happens when user deselects by numerical and behavioural notes.
 
@@ -452,7 +453,7 @@ class Execution_plan_list {
         }
         // Else we need to build the config. A successful execution plan build means that check_support succeeded.
         else {
-            CHECK_CUDNN_FRONTEND_ERROR(_build_plan_at_index_impl(handle, index));
+            CHECK_CUDNN_FRONTEND_ERROR(_build_plan_at_index_impl(index));
         }
 
         CUDNN_FE_LOG_LABEL_ENDL("Check support for index " << index << " passed with cfg " << cfg_tag);
@@ -461,10 +462,10 @@ class Execution_plan_list {
     }
 
     error_t
-    check_support(cudnnHandle_t handle) {
+    check_support() {
         // Go over each engine config and return true when you find the first one that is supported.
         for (auto i = 0u; i < engine_configs.size(); i++) {
-            auto status = check_support_at_index(handle, i);
+            auto status = check_support_at_index(i);
             if (status.is_good()) {
                 return {error_code_t::OK, ""};
             }
@@ -500,15 +501,15 @@ class Execution_plan_list {
     }
 
     error_t
-    build_plan_at_index(cudnnHandle_t handle, int64_t index) {
-        CHECK_CUDNN_FRONTEND_ERROR(check_support_at_index(handle, index));
-        CHECK_CUDNN_FRONTEND_ERROR(_build_plan_at_index_impl(handle, index));
+    build_plan_at_index(int64_t index) {
+        CHECK_CUDNN_FRONTEND_ERROR(check_support_at_index(index));
+        CHECK_CUDNN_FRONTEND_ERROR(_build_plan_at_index_impl(index));
 
         return {error_code_t::OK, ""};
     }
 
     error_t
-    build_plans(cudnnHandle_t handle, BuildPlanPolicy_t const policy, bool const do_multithreaded_builds) {
+    build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_builds) {
         RETURN_CUDNN_FRONTEND_ERROR_IF(do_multithreaded_builds,
                                        error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
                                        "Doing multithreaded builds is not yet supported.");
@@ -520,7 +521,7 @@ class Execution_plan_list {
         }
 
         for (auto i = 0u; i < engine_configs.size(); i++) {
-            auto status = build_plan_at_index(handle, i);
+            auto status = build_plan_at_index(i);
             if (status.is_bad()) {
                 CUDNN_FE_LOG_LABEL_ENDL("WARN: Failed to build plan at " << i);
                 continue;

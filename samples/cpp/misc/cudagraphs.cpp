@@ -113,7 +113,7 @@ TEST_CASE("Cuda graphs with matmul add", "[cudagraph][graph]") {
 
     // Make sure the selected execution plan supports cuda graph
     graph->select_behavior_notes({cudnn_frontend::BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API});
-    auto status = graph->check_support(handle);
+    auto status = graph->check_support();
     if (cudnn_frontend::detail::get_backend_version() >= 90500) {
         REQUIRE(status.is_good());
     } else {
@@ -144,7 +144,7 @@ TEST_CASE("Cuda graphs with matmul add", "[cudagraph][graph]") {
     REQUIRE(supports_cuda_graph_native_api);
     // END
 
-    REQUIRE(graph->build_plans(handle).is_good());
+    REQUIRE(graph->build_plans().is_good());
 
     //// Test code
     // Does not necessarily need to be included in user code, in case you are

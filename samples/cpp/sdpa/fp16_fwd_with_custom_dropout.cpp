@@ -53,10 +53,10 @@ std::shared_ptr<fe::graph::Graph> static create_sdpa_forward_graph_with_custom_d
                                                                                        int64_t const s_kv,
                                                                                        int64_t const d_qk,
                                                                                        int64_t const d_v,
-                                                                                       float const attn_scale  = 1.0f,
-                                                                                       bool const is_inference = false,
-                                                                                       bool const causal_mask  = false,
-                                                                                       bool has_attn_bias = false) {
+                                                                                       float const attn_scale    = 1.0f,
+                                                                                       bool const generate_stats = true,
+                                                                                       bool const causal_mask = false,
+                                                                                       bool has_attn_bias     = false) {
     // Create a graph and set common global properties.
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(fe::DataType_t::BFLOAT16)
@@ -83,7 +83,7 @@ std::shared_ptr<fe::graph::Graph> static create_sdpa_forward_graph_with_custom_d
 
     auto sdpa_options = fe::graph::SDPA_attributes()
                             .set_name("flash_attention")
-                            .set_is_inference(is_inference)
+                            .set_generate_stats(generate_stats)
                             .set_attn_scale(attn_scale);
 
     if (causal_mask) {
@@ -121,28 +121,28 @@ std::shared_ptr<fe::graph::Graph> static create_sdpa_forward_graph_with_custom_d
 
     O->set_output(true).set_dim({b, h_q, s_q, d_v}).set_stride({h_q * d_v, d_v, b * h_q * d_v, 1}).set_uid(O_UID);
 
-    if (is_inference) {
-        assert(Stats == nullptr);
-    } else {
+    if (generate_stats) {
         Stats->set_output(true).set_data_type(fe::DataType_t::FLOAT).set_uid(STATS_UID);
+    } else {
+        assert(Stats == nullptr);
     }
 
     return graph;
 }
 
 TEST_CASE("Toy sdpa forward with dropout", "[graph][sdpa][flash][forward]") {
-    int64_t b          = 3;     // batch size
-    int64_t h_q        = 4;     // head dim
-    int64_t h_k        = 4;     // head dim
-    int64_t h_v        = 4;     // head dim
-    int64_t s_q        = 1024;  // q tensor is padded to this seq length
-    int64_t s_kv       = 1024;  // k and v tensor is padded to this seq length
-    int64_t d_qk       = 128;   // hidden dim
-    int64_t d_v        = 128;   // hidden dim
-    bool is_inference  = false;
-    float attn_scale   = 0.123f;
-    bool causal_mask   = true;
-    bool has_attn_bias = (cudnnGetVersion() >= 8903);
+    int64_t b           = 3;     // batch size
+    int64_t h_q         = 4;     // head dim
+    int64_t h_k         = 4;     // head dim
+    int64_t h_v         = 4;     // head dim
+    int64_t s_q         = 1024;  // q tensor is padded to this seq length
+    int64_t s_kv        = 1024;  // k and v tensor is padded to this seq length
+    int64_t d_qk        = 128;   // hidden dim
+    int64_t d_v         = 128;   // hidden dim
+    bool generate_stats = true;
+    float attn_scale    = 0.123f;
+    bool causal_mask    = true;
+    bool has_attn_bias  = (cudnnGetVersion() >= 8903);
 
     if (cudnnGetVersion() < 8903) {
         SKIP("Test requires cudnn 8.9.3 or above");
@@ -159,7 +159,7 @@ TEST_CASE("Toy sdpa forward with dropout", "[graph][sdpa][flash][forward]") {
     auto handle     = *handle_ptr;
 
     auto graph = create_sdpa_forward_graph_with_custom_dropout(
-        b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v, attn_scale, is_inference, causal_mask, has_attn_bias);
+        b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v, attn_scale, generate_stats, causal_mask, has_attn_bias);
 
     REQUIRE(graph->build(handle, {fe::HeurMode_t::A}).is_good());
 
@@ -184,7 +184,7 @@ TEST_CASE("Toy sdpa forward with dropout", "[graph][sdpa][flash][forward]") {
     variant_pack[DROPOUT_SCALE_UID] = &dropout_scale;
 
     Surface<float> statsTensor(b * h_q * s_q * 1, false);
-    if (is_inference == false) {
+    if (generate_stats == true) {
         variant_pack[STATS_UID] = statsTensor.devPtr;
     }
 
