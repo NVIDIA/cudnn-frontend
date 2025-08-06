@@ -29,6 +29,7 @@
 #include <iomanip>
 #include <sstream>
 #include <cmath>
+#include <cstdint>
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
