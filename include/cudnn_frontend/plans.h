@@ -31,7 +31,7 @@ execute(cudnnHandle_t handle,
                                    "Failed to create variant pack's backend descriptor.");
 
     CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, workspace_ptr));
-    CHECK_CUDNN_ERROR(execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()));
+    _CUDNN_CHECK_CUDNN_ERROR(execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()));
 
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Executed " << plan->getTag() << ".");
 

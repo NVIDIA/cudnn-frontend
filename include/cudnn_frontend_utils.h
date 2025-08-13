@@ -931,6 +931,14 @@ NLOHMANN_JSON_SERIALIZE_ENUM(DiagonalAlignment_t,
                                  {DiagonalAlignment_t::BOTTOM_RIGHT, "BOTTOM_RIGHT"},
                              })
 
+enum class AttentionImplementation_t { AUTO, COMPOSITE, UNIFIED };
+NLOHMANN_JSON_SERIALIZE_ENUM(AttentionImplementation_t,
+                             {
+                                 {AttentionImplementation_t::AUTO, "AUTO"},
+                                 {AttentionImplementation_t::COMPOSITE, "COMPOSITE"},
+                                 {AttentionImplementation_t::UNIFIED, "UNIFIED"},
+                             })
+
 namespace detail {
 
 inline size_t
@@ -967,7 +975,7 @@ get_data_type_size(DataType_t const data_type) {
 }
 
 inline std::vector<float>
-get_abili_slope(int64_t const n_heads) {
+get_alibi_slope(int64_t const n_heads) {
     std::vector<float> slope;
 #ifdef _MSC_VER
 #pragma warning(push)

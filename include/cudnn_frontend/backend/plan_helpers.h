@@ -25,12 +25,12 @@ namespace cudnn_frontend::detail {
 inline error_t
 get_workspace_size(ManagedOpaqueDescriptor& engine_config, int64_t& workspace) {
 #if CUDNN_VERSION >= 90200
-    CHECK_CUDNN_ERROR(detail::get_attribute(engine_config->get_backend_descriptor(),
-                                            CUDNN_ATTR_ENGINECFG_WORKSPACE_SIZE,
-                                            CUDNN_TYPE_INT64,
-                                            1,
-                                            nullptr,
-                                            &workspace));
+    _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(engine_config->get_backend_descriptor(),
+                                                   CUDNN_ATTR_ENGINECFG_WORKSPACE_SIZE,
+                                                   CUDNN_TYPE_INT64,
+                                                   1,
+                                                   nullptr,
+                                                   &workspace));
     return {error_code_t::OK, ""};
 #else
     (void)engine_config;
@@ -43,12 +43,12 @@ get_workspace_size(ManagedOpaqueDescriptor& engine_config, int64_t& workspace) {
 inline error_t
 get_shared_memory_size(ManagedOpaqueDescriptor& engine_config, int32_t& shared_memory_size) {
 #if CUDNN_VERSION >= 90200
-    CHECK_CUDNN_ERROR(detail::get_attribute(engine_config->get_backend_descriptor(),
-                                            CUDNN_ATTR_ENGINECFG_SHARED_MEMORY_USED,
-                                            CUDNN_TYPE_INT32,
-                                            1,
-                                            nullptr,
-                                            &shared_memory_size));
+    _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(engine_config->get_backend_descriptor(),
+                                                   CUDNN_ATTR_ENGINECFG_SHARED_MEMORY_USED,
+                                                   CUDNN_TYPE_INT32,
+                                                   1,
+                                                   nullptr,
+                                                   &shared_memory_size));
     return {error_code_t::OK, ""};
 #else
     (void)engine_config;
@@ -63,30 +63,30 @@ create_engine(backend_descriptor& engine,
               int64_t const engine_id,
               cudnnBackendDescriptor_t op_graph,
               std::shared_ptr<const DeviceProperties> device_properties = nullptr) {
-    CHECK_CUDNN_ERROR(detail::set_attribute(
+    _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
         engine.get_ptr(), CUDNN_ATTR_ENGINE_OPERATION_GRAPH, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &op_graph));
 
     // Validate before setting
     int64_t count;
-    CHECK_CUDNN_ERROR(detail::get_attribute(
+    _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
         op_graph, CUDNN_ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT, CUDNN_TYPE_INT64, 1, nullptr, &count));
     RETURN_CUDNN_FRONTEND_ERROR_IF(
         engine_id >= count || engine_id < 0, error_code_t::INVALID_VALUE, "Invalid engine id.");
 
-    CHECK_CUDNN_ERROR(
+    _CUDNN_CHECK_CUDNN_ERROR(
         detail::set_attribute(engine.get_ptr(), CUDNN_ATTR_ENGINE_GLOBAL_INDEX, CUDNN_TYPE_INT64, 1, &engine_id));
 
     if (device_properties != nullptr) {
 #if (CUDNN_VERSION >= 90800)
-        CHECK_CUDNN_ERROR(detail::set_attribute(engine.get_ptr(),
-                                                CUDNN_ATTR_ENGINE_DEVICEPROP,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &device_properties->get_ptr()));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(engine.get_ptr(),
+                                                       CUDNN_ATTR_ENGINE_DEVICEPROP,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &device_properties->get_ptr()));
 #endif
     }
 
-    CHECK_CUDNN_ERROR(detail::finalize(engine.get_ptr()));
+    _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(engine.get_ptr()));
 
     return {error_code_t::OK, ""};
 }
@@ -119,37 +119,37 @@ query_knobs(int64_t const engine_id, cudnnBackendDescriptor_t op_graph, std::vec
 
     // This is the actual number of knobs that is supported by the engine
     int64_t knobs_size;
-    CHECK_CUDNN_ERROR(detail::get_attribute(engine.get_ptr(),
-                                            CUDNN_ATTR_ENGINE_KNOB_INFO,
-                                            CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                            CUDNN_KNOB_TYPE_COUNTS,
-                                            &knobs_size,
-                                            backend_knobs.data()));
+    _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(engine.get_ptr(),
+                                                   CUDNN_ATTR_ENGINE_KNOB_INFO,
+                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                   CUDNN_KNOB_TYPE_COUNTS,
+                                                   &knobs_size,
+                                                   backend_knobs.data()));
 
     for (int64_t i = 0; i < knobs_size; i++) {
         cudnnBackendKnobType_t type;
         int64_t elemCount;
-        CHECK_CUDNN_ERROR(detail::get_attribute(
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
             frontend_knobs[i].get_ptr(), CUDNN_ATTR_KNOB_INFO_TYPE, CUDNN_TYPE_KNOB_TYPE, 1, &elemCount, &type));
 
         int64_t maxValue;
-        CHECK_CUDNN_ERROR(detail::get_attribute(frontend_knobs[i].get_ptr(),
-                                                CUDNN_ATTR_KNOB_INFO_MAXIMUM_VALUE,
-                                                CUDNN_TYPE_INT64,
-                                                1,
-                                                &elemCount,
-                                                &maxValue));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(frontend_knobs[i].get_ptr(),
+                                                       CUDNN_ATTR_KNOB_INFO_MAXIMUM_VALUE,
+                                                       CUDNN_TYPE_INT64,
+                                                       1,
+                                                       &elemCount,
+                                                       &maxValue));
 
         int64_t minValue;
-        CHECK_CUDNN_ERROR(detail::get_attribute(frontend_knobs[i].get_ptr(),
-                                                CUDNN_ATTR_KNOB_INFO_MINIMUM_VALUE,
-                                                CUDNN_TYPE_INT64,
-                                                1,
-                                                &elemCount,
-                                                &minValue));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(frontend_knobs[i].get_ptr(),
+                                                       CUDNN_ATTR_KNOB_INFO_MINIMUM_VALUE,
+                                                       CUDNN_TYPE_INT64,
+                                                       1,
+                                                       &elemCount,
+                                                       &minValue));
 
         int64_t stride;
-        CHECK_CUDNN_ERROR(detail::get_attribute(
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
             frontend_knobs[i].get_ptr(), CUDNN_ATTR_KNOB_INFO_STRIDE, CUDNN_TYPE_INT64, 1, &elemCount, &stride));
 
         auto frontend_knob_type = convert_from_backend_knob_type(type);
@@ -169,13 +169,13 @@ set_knob_choices(std::unordered_map<KnobType_t, int64_t> const& user_choices,
                                        "Failed to create knob_choice's backend descriptor.");
 
         cudnnBackendKnobType_t backend_type;
-        CHECK_CUDNN_ERROR(convert_to_backend_knob_type(type, backend_type));
-        CHECK_CUDNN_ERROR(detail::set_attribute(
+        _CUDNN_CHECK_CUDNN_ERROR(convert_to_backend_knob_type(type, backend_type));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
             knob_choice.get_ptr(), CUDNN_ATTR_KNOB_CHOICE_KNOB_TYPE, CUDNN_TYPE_KNOB_TYPE, 1, &backend_type));
-        CHECK_CUDNN_ERROR(detail::set_attribute(
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
             knob_choice.get_ptr(), CUDNN_ATTR_KNOB_CHOICE_KNOB_VALUE, CUDNN_TYPE_INT64, 1, &choice));
 
-        CHECK_CUDNN_ERROR(detail::finalize(knob_choice.get_ptr()));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(knob_choice.get_ptr()));
 
         knob_choices.push_back(std::move(knob_choice));
     }
@@ -187,24 +187,24 @@ inline error_t
 create_engine_config(ManagedOpaqueDescriptor& engine_config,
                      backend_descriptor& engine,
                      std::vector<detail::backend_descriptor>& knob_choices) {
-    CHECK_CUDNN_ERROR(detail::set_attribute(engine_config->get_backend_descriptor(),
-                                            CUDNN_ATTR_ENGINECFG_ENGINE,
-                                            CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                            1,
-                                            &(engine.get_ptr())));
+    _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(engine_config->get_backend_descriptor(),
+                                                   CUDNN_ATTR_ENGINECFG_ENGINE,
+                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                   1,
+                                                   &(engine.get_ptr())));
 
     std::vector<cudnnBackendDescriptor_t> backend_knob_choices(CUDNN_KNOB_TYPE_COUNTS);
     for (size_t i = 0; i < knob_choices.size(); i++) {
         backend_knob_choices[i] = knob_choices[i].get_ptr();
     }
-    CHECK_CUDNN_ERROR(detail::set_attribute(engine_config->get_backend_descriptor(),
-                                            CUDNN_ATTR_ENGINECFG_KNOB_CHOICES,
-                                            CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                            knob_choices.size(),
-                                            backend_knob_choices.data()));
+    _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(engine_config->get_backend_descriptor(),
+                                                   CUDNN_ATTR_ENGINECFG_KNOB_CHOICES,
+                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                   knob_choices.size(),
+                                                   backend_knob_choices.data()));
 
     // Finalizing the descriptor
-    CHECK_CUDNN_ERROR(detail::finalize(engine_config->get_backend_descriptor()));
+    _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(engine_config->get_backend_descriptor()));
 
     return {error_code_t::OK, ""};
 }

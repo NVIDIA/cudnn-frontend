@@ -120,7 +120,7 @@ typedef struct [[nodiscard]] error_object {
     }                                                                                                              \
     CUDNN_FRONTEND_WHILE_FALSE
 
-#define CHECK_CUDNN_ERROR(x)                                                                                \
+#define _CUDNN_CHECK_CUDNN_ERROR(x)                                                                         \
     do {                                                                                                    \
         if (auto cudnn_retval = x; cudnn_retval != CUDNN_STATUS_SUCCESS) {                                  \
             std::stringstream error_msg;                                                                    \
@@ -132,7 +132,7 @@ typedef struct [[nodiscard]] error_object {
     }                                                                                                       \
     CUDNN_FRONTEND_WHILE_FALSE
 
-#define CHECK_CUDA_ERROR(x)                                                                                 \
+#define _CUDNN_CHECK_CUDA_ERROR(x)                                                                          \
     do {                                                                                                    \
         if (auto cuda_retval = x; cuda_retval != cudaSuccess) {                                             \
             std::stringstream error_msg;                                                                    \

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.23)
 
-project(cudnn_frontend VERSION 1.13.0)
+project(cudnn_frontend VERSION 1.14.0)
 
 option(CUDNN_FRONTEND_SKIP_JSON_LIB "Defines whether FE should not include nlohmann/json.hpp." OFF)
 option(CUDNN_FRONTEND_BUILD_SAMPLES "Defines if samples are built or not." ON)

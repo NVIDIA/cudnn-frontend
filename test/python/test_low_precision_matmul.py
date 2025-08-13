@@ -286,10 +286,10 @@ def create_matmul_dequantize_graph(
     with cudnn.graph(cudnn_handle) as (g, _):
 
         batch_size, M, N, K = (
-            A.shape[0],
-            A.shape[1],
-            B.shape[1],
-            A.shape[2],
+            A_descale.shape[0],
+            A_descale.shape[1],
+            B_descale.shape[1],
+            A_descale.shape[2],
         )
 
         A_cudnn_tensor = g.tensor(

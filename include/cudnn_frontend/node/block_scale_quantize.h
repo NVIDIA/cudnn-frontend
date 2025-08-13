@@ -127,44 +127,44 @@ class BlockScaleQuantizeNode : public NodeCRTP<BlockScaleQuantizeNode> {
 
         auto X         = attributes.inputs.find(Block_scale_quantize_attributes::input_names::X)->second;
         auto backend_x = tensors[X->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(block_scale_quantize_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_BLOCK_SCALE_QUANTIZE_XDESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_x));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(block_scale_quantize_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_BLOCK_SCALE_QUANTIZE_XDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_x));
 
         auto Y         = attributes.outputs.find(Block_scale_quantize_attributes::output_names::Y)->second;
         auto backend_y = tensors[Y->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(block_scale_quantize_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_BLOCK_SCALE_QUANTIZE_YDESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_y));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(block_scale_quantize_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_BLOCK_SCALE_QUANTIZE_YDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_y));
 
         auto scale         = attributes.outputs.find(Block_scale_quantize_attributes::output_names::scale)->second;
         auto backend_scale = tensors[scale->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(block_scale_quantize_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_BLOCK_SCALE_QUANTIZE_SCALE_DESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_scale));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(block_scale_quantize_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_BLOCK_SCALE_QUANTIZE_SCALE_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_scale));
 
         cudnnDataType_t cudnn_data_type;
-        CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.compute_data_type, cudnn_data_type));
-        CHECK_CUDNN_ERROR(detail::set_attribute(block_scale_quantize_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_BLOCK_SCALE_QUANTIZE_MATH_PREC,
-                                                CUDNN_TYPE_DATA_TYPE,
-                                                1,
-                                                &cudnn_data_type));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.compute_data_type, cudnn_data_type));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(block_scale_quantize_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_BLOCK_SCALE_QUANTIZE_MATH_PREC,
+                                                       CUDNN_TYPE_DATA_TYPE,
+                                                       1,
+                                                       &cudnn_data_type));
 
         int32_t block_size = attributes.block_size.value();
-        CHECK_CUDNN_ERROR(detail::set_attribute(block_scale_quantize_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_BLOCK_SCALE_QUANTIZE_BLOCK_SIZE,
-                                                CUDNN_TYPE_INT32,
-                                                1,
-                                                &block_size));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(block_scale_quantize_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_BLOCK_SCALE_QUANTIZE_BLOCK_SIZE,
+                                                       CUDNN_TYPE_INT32,
+                                                       1,
+                                                       &block_size));
 
-        CHECK_CUDNN_ERROR(detail::finalize(block_scale_quantize_operation->get_backend_descriptor()));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(block_scale_quantize_operation->get_backend_descriptor()));
 
         raw_operations.push_back(block_scale_quantize_operation);
 

@@ -81,16 +81,16 @@ class KernelCache : public detail::backend_descriptor {
 
         int64_t serializationSize;
         std::vector<char> serialization_buf;
-        CHECK_CUDNN_ERROR(detail::get_attribute(
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
             get_ptr(), CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION, CUDNN_TYPE_CHAR, 0, &serializationSize, nullptr));
         serialization_buf.resize(static_cast<size_t>(serializationSize));
 
-        CHECK_CUDNN_ERROR(detail::get_attribute(get_ptr(),
-                                                CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION,
-                                                CUDNN_TYPE_CHAR,
-                                                serializationSize,
-                                                &serializationSize,
-                                                serialization_buf.data()));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(get_ptr(),
+                                                       CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION,
+                                                       CUDNN_TYPE_CHAR,
+                                                       serializationSize,
+                                                       &serializationSize,
+                                                       serialization_buf.data()));
         std::string json_string(serialization_buf.begin(), serialization_buf.end());
         str_json = std::move(json_string);
         return {};
@@ -117,11 +117,11 @@ class KernelCache : public detail::backend_descriptor {
 
         std::vector<char> serialization_buf;
         serialization_buf.assign(json_cache.begin(), json_cache.end());
-        CHECK_CUDNN_ERROR(detail::set_attribute(get_ptr(),
-                                                CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION,
-                                                CUDNN_TYPE_CHAR,
-                                                serialization_buf.size(),
-                                                serialization_buf.data()));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(get_ptr(),
+                                                       CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION,
+                                                       CUDNN_TYPE_CHAR,
+                                                       serialization_buf.size(),
+                                                       serialization_buf.data()));
         return {};
 #else
         (void)json_cache;
@@ -146,7 +146,7 @@ class KernelCache : public detail::backend_descriptor {
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "CUDNN_ATTR_KERNEL_CACHE_OPERATION_GRAPH is only available starting 9.5.");
         if (op_graph) {
-            CHECK_CUDNN_ERROR(detail::set_attribute(
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
                 get_ptr(), CUDNN_ATTR_KERNEL_CACHE_OPERATION_GRAPH, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &op_graph));
         }
 #else

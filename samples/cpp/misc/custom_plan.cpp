@@ -126,6 +126,8 @@ TEST_CASE("Matmul custom plan", "[matmul][graph][autotuning]") {
     Surface<int8_t> workspace1(graph.get_workspace_size_plan_at_index(0), false);
     REQUIRE(graph.execute_plan_at_index(handle, variant_pack, workspace1.devPtr, 0).is_good());
 
-    Surface<int8_t> workspace2(graph.get_workspace_size_plan_at_index(1), false);
-    REQUIRE(graph.execute_plan_at_index(handle, variant_pack, workspace2.devPtr, 1).is_good());
+    if (plan_count > 1) {
+        Surface<int8_t> workspace2(graph.get_workspace_size_plan_at_index(1), false);
+        REQUIRE(graph.execute_plan_at_index(handle, variant_pack, workspace2.devPtr, 1).is_good());
+    }
 }

@@ -96,35 +96,35 @@ class ConcatenateNode : public NodeCRTP<ConcatenateNode> {
             backend_x[index] = tensors[input->get_uid()]->get_desc()->get_backend_descriptor();
             index++;
         }
-        CHECK_CUDNN_ERROR(detail::set_attribute(concatenate_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_CONCAT_INPUT_DESCS,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                attributes.inputs.size(),
-                                                backend_x.data()));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(concatenate_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_CONCAT_INPUT_DESCS,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       attributes.inputs.size(),
+                                                       backend_x.data()));
 
         auto Y         = attributes.outputs.find(Concatenate_attributes::output_names::Y)->second;
         auto backend_y = tensors[Y->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(concatenate_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_CONCAT_OUTPUT_DESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_y));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(concatenate_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_CONCAT_OUTPUT_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_y));
 
         int64_t axis = attributes.axis.value();
-        CHECK_CUDNN_ERROR(detail::set_attribute(concatenate_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_CONCAT_AXIS,
-                                                CUDNN_TYPE_INT64,
-                                                1,
-                                                &axis));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(concatenate_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_CONCAT_AXIS,
+                                                       CUDNN_TYPE_INT64,
+                                                       1,
+                                                       &axis));
 
         int64_t in_place_index = attributes.in_place_index.value();
-        CHECK_CUDNN_ERROR(detail::set_attribute(concatenate_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_CONCAT_INPLACE_INDEX,
-                                                CUDNN_TYPE_INT64,
-                                                1,
-                                                &in_place_index));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(concatenate_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_CONCAT_INPLACE_INDEX,
+                                                       CUDNN_TYPE_INT64,
+                                                       1,
+                                                       &in_place_index));
 
-        CHECK_CUDNN_ERROR(detail::finalize(concatenate_operation->get_backend_descriptor()));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(concatenate_operation->get_backend_descriptor()));
 
         raw_operations.push_back(concatenate_operation);
 

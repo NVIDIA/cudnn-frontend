@@ -535,8 +535,7 @@ TEST_CASE("sdpa backward graph serialization", "[graph][serialize]") {
                                      .set_diagonal_band_right_bound(0)
                                      .set_attn_scale(attn_scale)
                                      .set_bias(bias)
-                                     .set_dropout(0.1f, dropout_seed, dropout_offset)
-                                     .set_deterministic_algorithm(true);
+                                     .set_dropout(0.1f, dropout_seed, dropout_offset);
 
     auto [dQ, dK, dV] = graph.sdpa_backward(q, k, v, o, dO, stats, sdpa_backward_options);
 

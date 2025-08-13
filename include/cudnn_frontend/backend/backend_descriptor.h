@@ -89,7 +89,7 @@ class backend_descriptor {
      */
     error_t
     initialize(cudnnBackendDescriptorType_t type) {
-        CHECK_CUDNN_ERROR(detail::create_descriptor(type, &desc));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::create_descriptor(type, &desc));
         return {error_code_t::OK, ""};
     }
 
@@ -99,7 +99,7 @@ class backend_descriptor {
      */
     error_t
     finalize() {
-        CHECK_CUDNN_ERROR(detail::finalize(desc));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(desc));
         return {error_code_t::OK, ""};
     }
 

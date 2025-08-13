@@ -413,4 +413,4 @@ TEST_CASE("Blackwell Block Scale Matmul", "[matmul][graph][FP4]") {
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 }
 
-};  // namespace BlackwellNVFP4MXFP8BlockScaleMatmul
+}  // namespace BlackwellNVFP4MXFP8BlockScaleMatmul

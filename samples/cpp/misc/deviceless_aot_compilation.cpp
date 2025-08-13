@@ -26,8 +26,8 @@
 #include <cudnn_frontend.h>
 
 TEST_CASE("Deviceless compilation", "[conv][graph][serialization]") {
-#if (CUDNN_VERSION < 90800)
-    SKIP("Device property serialization requires cudnn 9.8.0 and up.");
+#if (CUDNN_VERSION < 91100)
+    SKIP("Device property serialization requires cudnn 9.11.0 and up.");
 #endif
 
     if (!is_arch_supported_by_cudnn()) {
@@ -59,16 +59,16 @@ TEST_CASE("Deviceless compilation", "[conv][graph][serialization]") {
         .set_io_data_type(fe::DataType_t::HALF)
         .set_compute_data_type(fe::DataType_t::FLOAT);
 
-    int64_t n = 16, c = 128, h = 64, w = 64, k = 256, r = 1, s = 1;
+    int64_t n = 16, c = 128, h = 64, w = 64, k = 256, r = 3, s = 3;
     auto X = graph->tensor(
         fe::graph::Tensor_attributes().set_name("image").set_dim({n, c, h, w}).set_stride({c * h * w, 1, c * w, c}));
     auto W = graph->tensor(
         fe::graph::Tensor_attributes().set_name("filter").set_dim({k, c, r, s}).set_stride({c * r * s, 1, c * s, c}));
-    auto conv_options = fe::graph::Conv_fprop_attributes().set_padding({0, 0}).set_stride({1, 1}).set_dilation({1, 1});
+    auto conv_options = fe::graph::Conv_fprop_attributes().set_padding({1, 1}).set_stride({1, 1}).set_dilation({1, 1});
     auto Y            = graph->conv_fprop(X, W, conv_options);
     Y->set_output(true);
 
-    REQUIRE(graph->build({fe::HeurMode_t::A}).is_good());
+    REQUIRE(graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
 
     std::vector<uint8_t> data_graph;
     REQUIRE(graph->serialize(data_graph).is_good());
