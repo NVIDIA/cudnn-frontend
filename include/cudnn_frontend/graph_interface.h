@@ -1,6 +1,7 @@
 #pragma once
 
 #include <unordered_map>
+#include <stdexcept>
 #include <string>
 
 #include "../cudnn_frontend_version.h"
@@ -23,7 +24,6 @@
 #include "node/slice.h"
 // #include "node/scaled_dot_product_attention.h"
 #include "node/scaled_dot_product_flash_attention.h"
-#include "node/sdpa_fp8.h"
 #include "node/sdpa_fp8_bwd.h"
 #include "node/block_scale_quantize.h"
 #include "node/block_scale_dequantize.h"
@@ -200,21 +200,22 @@ class Graph : public ICudnn, public INode {
         void *fe_workspace,
         std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> &workspace_modifications) const {
         cudaStream_t stream;
-        CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
         char *workspace = static_cast<char *>(fe_workspace);
 
         for (auto [uid, data] : workspace_modifications) {
             (void)uid;
             if (std::get<0>(data) == 0) {
                 auto &vec_data = std::get<2>(data);
-                CHECK_CUDA_ERROR(detail::cuda_mem_cpy_async(workspace + std::get<1>(data),
-                                                            vec_data.data(),
-                                                            vec_data.size() * sizeof(float),
-                                                            cudaMemcpyHostToDevice,
-                                                            stream));
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_mem_cpy_async(workspace + std::get<1>(data),
+                                                                   vec_data.data(),
+                                                                   vec_data.size() * sizeof(float),
+                                                                   cudaMemcpyHostToDevice,
+                                                                   stream));
             } else if (std::get<0>(data) == 1) {
                 int64_t memset_size = (int64_t)std::get<2>(data)[0];
-                CHECK_CUDA_ERROR(detail::cuda_mem_set_async(workspace + std::get<1>(data), 0, memset_size, stream));
+                _CUDNN_CHECK_CUDA_ERROR(
+                    detail::cuda_mem_set_async(workspace + std::get<1>(data), 0, memset_size, stream));
             }
         }
         return {error_code_t::OK, ""};
@@ -236,6 +237,66 @@ class Graph : public ICudnn, public INode {
         CUDNN_FRONTEND_UNUSED(remove_shape);
         return 1;
 #endif
+    }
+
+    // Private unified sdpa method - internal implementation for both FP16 and FP8 modes
+    inline SDPA_attributes::SDPA_outputs
+    sdpa_internal(std::shared_ptr<Tensor_attributes> q,
+                  std::shared_ptr<Tensor_attributes> k,
+                  std::shared_ptr<Tensor_attributes> v,
+                  SDPA_attributes &&attributes) {
+        // Set inputs
+        attributes.inputs[SDPA_attributes::input_names::Q] = q;
+        attributes.inputs[SDPA_attributes::input_names::K] = k;
+        attributes.inputs[SDPA_attributes::input_names::V] = v;
+
+        // Make required output tensors
+        SDPA_attributes::SDPA_outputs sdpa_outputs;
+
+        sdpa_outputs.O = attributes.outputs[SDPA_attributes::output_names::O] = output_tensor(attributes.name + "::O");
+
+        if (attributes.generate_stats == true) {
+            sdpa_outputs.Stats = attributes.outputs[SDPA_attributes::output_names::Stats] =
+                output_tensor(attributes.name + "::Stats");
+        }
+
+        // Dropout mask dump (created conditionally based on dropout parameters)
+        if (attributes.outputs.find(SDPA_attributes::output_names::RNG_DUMP) != attributes.outputs.end() &&
+            attributes.outputs.at(SDPA_attributes::output_names::RNG_DUMP) != nullptr) {
+            sdpa_outputs.RNG_DUMP = attributes.outputs[SDPA_attributes::output_names::RNG_DUMP];
+        }
+
+        // FP8-specific outputs (created conditionally based on FP8 scaling parameters)
+        if (attributes.inputs.find(SDPA_attributes::input_names::Descale_S) != attributes.inputs.end() &&
+            attributes.inputs.at(SDPA_attributes::input_names::Descale_S) != nullptr) {
+            sdpa_outputs.Amax_S = attributes.outputs[SDPA_attributes::output_names::Amax_S] =
+                output_tensor(attributes.name + "::Amax_S");
+        }
+        if (attributes.inputs.find(SDPA_attributes::input_names::Scale_O) != attributes.inputs.end() &&
+            attributes.inputs.at(SDPA_attributes::input_names::Scale_O) != nullptr) {
+            sdpa_outputs.Amax_O = attributes.outputs[SDPA_attributes::output_names::Amax_O] =
+                output_tensor(attributes.name + "::Amax_O");
+        }
+
+        if (attributes.implementation == AttentionImplementation_t::AUTO) {
+            // Sets attributes.implementation to a supporting implementation,
+            // or leaves as AUTO if none found
+            attributes._auto_select_implementation(context);
+        }
+
+        switch (attributes.implementation) {
+            case AttentionImplementation_t::AUTO:
+                throw std::runtime_error("No suitable implementation for given SDPA_attributes");
+                break;
+            case AttentionImplementation_t::COMPOSITE:
+                sub_nodes.emplace_back(std::make_unique<CompositeSDPANode>(std::move(attributes), context));
+                break;
+            case AttentionImplementation_t::UNIFIED:
+                sub_nodes.emplace_back(std::make_unique<UnifiedSDPANode>(std::move(attributes), context));
+                break;
+        }
+
+        return sdpa_outputs;
     }
 
    public:
@@ -266,12 +327,12 @@ class Graph : public ICudnn, public INode {
             cudnn_cuda_graph == nullptr, error_code_t::INVALID_VALUE, "cudnn_cuda_graph should not be a nullptr");
 
         size_t num_root_nodes;
-        CHECK_CUDA_ERROR(detail::cuda_graph_get_root_nodes(cudnn_cuda_graph, nullptr, &num_root_nodes));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_get_root_nodes(cudnn_cuda_graph, nullptr, &num_root_nodes));
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             num_root_nodes != 1, error_code_t::INVALID_VALUE, "cudnn_cuda_graph should have exactly 1 root node.");
 
         cudaGraphNode_t current_node = nullptr;
-        CHECK_CUDA_ERROR(detail::cuda_graph_get_root_nodes(cudnn_cuda_graph, &current_node, &num_root_nodes));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_get_root_nodes(cudnn_cuda_graph, &current_node, &num_root_nodes));
 
         ///////////////////////////////////////
         //// PASS BY VALUE TENSOR HANDLING ////
@@ -301,7 +362,7 @@ class Graph : public ICudnn, public INode {
 
             // 0 means memcpy
             if (operation_type == 0) {
-                CHECK_CUDA_ERROR(
+                _CUDNN_CHECK_CUDA_ERROR(
                     detail::cuda_graph_add_memcpy_node_set_params_1D(current_node,
                                                                      static_cast<char *>(workspace) + offset,
                                                                      vec_data.data(),
@@ -322,7 +383,7 @@ class Graph : public ICudnn, public INode {
                 params.height      = 1;  // 1D memset currently
                 params.pitch       = 0;  // unused
 
-                CHECK_CUDA_ERROR(detail::cuda_graph_add_memset_node_set_params(current_node, &params));
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_add_memset_node_set_params(current_node, &params));
             }
             // Other values do not correspond to CUDA graph nodes
             else {
@@ -330,12 +391,13 @@ class Graph : public ICudnn, public INode {
             }
 
             size_t num_dependent_nodes;
-            CHECK_CUDA_ERROR(detail::cuda_graph_node_get_dependent_nodes(current_node, nullptr, &num_dependent_nodes));
+            _CUDNN_CHECK_CUDA_ERROR(
+                detail::cuda_graph_node_get_dependent_nodes(current_node, nullptr, &num_dependent_nodes));
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 num_dependent_nodes != 1,
                 error_code_t::INVALID_VALUE,
                 "Each node of cudnn_cuda_graph before the backend graph node should have exactly 1 dependent node.");
-            CHECK_CUDA_ERROR(
+            _CUDNN_CHECK_CUDA_ERROR(
                 detail::cuda_graph_node_get_dependent_nodes(current_node, &current_node, &num_dependent_nodes));
         }
 
@@ -359,7 +421,7 @@ class Graph : public ICudnn, public INode {
         //// BE GRAPH ////
         ///////////////////
         cudaGraph_t backend_cuda_graph;
-        CHECK_CUDA_ERROR(detail::cuda_graph_child_graph_node_get_graph(current_node, &backend_cuda_graph));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_child_graph_node_get_graph(current_node, &backend_cuda_graph));
 
         detail::backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
         RETURN_CUDNN_FRONTEND_ERROR_IF(variant_pack_descriptor.get_status() != CUDNN_STATUS_SUCCESS,
@@ -373,14 +435,15 @@ class Graph : public ICudnn, public INode {
 
         int64_t candidate = plans.candidate;
         CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(candidate));
-        CHECK_CUDNN_ERROR(detail::update_cuda_graph(handle,
-                                                    plans.execution_plans[candidate]->get_raw_desc(),
-                                                    variant_pack_descriptor.get_ptr(),
-                                                    backend_cuda_graph));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::update_cuda_graph(handle,
+                                                           plans.execution_plans[candidate]->get_raw_desc(),
+                                                           variant_pack_descriptor.get_ptr(),
+                                                           backend_cuda_graph));
 
         // There should be nothing after the backend graph
         size_t num_dependent_nodes;
-        CHECK_CUDA_ERROR(detail::cuda_graph_node_get_dependent_nodes(current_node, nullptr, &num_dependent_nodes));
+        _CUDNN_CHECK_CUDA_ERROR(
+            detail::cuda_graph_node_get_dependent_nodes(current_node, nullptr, &num_dependent_nodes));
         RETURN_CUDNN_FRONTEND_ERROR_IF(num_dependent_nodes != 0,
                                        error_code_t::INVALID_VALUE,
                                        "cudnn_cuda_graph should have no graph nodes after the backend graph node.");
@@ -451,14 +514,14 @@ class Graph : public ICudnn, public INode {
 
             // 0 means memcpy
             if (operation_type == 0) {
-                CHECK_CUDA_ERROR(detail::cuda_graph_add_memcpy_node_1D(&node,
-                                                                       cudnn_cuda_graph,
-                                                                       &last_node,
-                                                                       last_node != nullptr,
-                                                                       static_cast<char *>(workspace) + offset,
-                                                                       vec_data.data(),
-                                                                       vec_data.size() * sizeof(float),
-                                                                       cudaMemcpyHostToDevice));
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_add_memcpy_node_1D(&node,
+                                                                              cudnn_cuda_graph,
+                                                                              &last_node,
+                                                                              last_node != nullptr,
+                                                                              static_cast<char *>(workspace) + offset,
+                                                                              vec_data.data(),
+                                                                              vec_data.size() * sizeof(float),
+                                                                              cudaMemcpyHostToDevice));
             }
             // 1 means memset
             else if (operation_type == 1) {
@@ -474,7 +537,7 @@ class Graph : public ICudnn, public INode {
                 params.height      = 1;  // 1D memset currently
                 params.pitch       = 0;  // unused
 
-                CHECK_CUDA_ERROR(detail::cuda_graph_add_memset_node(
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_add_memset_node(
                     &node, cudnn_cuda_graph, &last_node, last_node != nullptr, &params));
             }
             // Other values do not correspond to CUDA graph nodes
@@ -527,10 +590,10 @@ class Graph : public ICudnn, public INode {
         // The responsibility to destroy is on the user.
         detail::cu_graph_create(&backend_cuda_graph, 0);  // 0 is just what the API says to pass
 
-        CHECK_CUDNN_ERROR(detail::populate_cuda_graph(handle,
-                                                      plans.execution_plans[candidate]->get_raw_desc(),
-                                                      variant_pack_descriptor.get_ptr(),
-                                                      backend_cuda_graph));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::populate_cuda_graph(handle,
+                                                             plans.execution_plans[candidate]->get_raw_desc(),
+                                                             variant_pack_descriptor.get_ptr(),
+                                                             backend_cuda_graph));
 
         // Clone BE graph into a graph_node
         // This same call also places the newly created into FE's graph
@@ -541,7 +604,7 @@ class Graph : public ICudnn, public INode {
 
         // Destroy the BE graph as it now has been cloned into a node
         // It was initialized by internals of backend, but the responsibility to destroy it is on FE.
-        CHECK_CUDA_ERROR(detail::cuda_graph_destroy(backend_cuda_graph));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_destroy(backend_cuda_graph));
 
         return {error_code_t::OK, ""};
     }
@@ -1424,13 +1487,24 @@ class Graph : public ICudnn, public INode {
                         auto sdpa_attributes = j_sub_node.get<SDPA_attributes>();
                         CHECK_TENSORS(sdpa_attributes);
                         FILL_GLOBAL_IO_TENSOR_MAP(sdpa_attributes);
-                        sub_nodes.emplace_back(std::make_unique<SDPANode>(std::move(sdpa_attributes), context));
+                        switch (sdpa_attributes.implementation) {
+                            case AttentionImplementation_t::AUTO:
+                                return {error_code_t::INVALID_VALUE,
+                                        "Implementation cannot be AUTO in serialized form"};
+                            case AttentionImplementation_t::COMPOSITE:
+                                sub_nodes.emplace_back(
+                                    std::make_unique<CompositeSDPANode>(std::move(sdpa_attributes), context));
+                                break;
+                            case AttentionImplementation_t::UNIFIED:
+                                sub_nodes.emplace_back(
+                                    std::make_unique<UnifiedSDPANode>(std::move(sdpa_attributes), context));
+                        }
                     } else if (tag == "SDPA_BWD") {
                         auto sdpa_bwd_attributes = j_sub_node.get<SDPA_backward_attributes>();
                         CHECK_TENSORS(sdpa_bwd_attributes);
                         FILL_GLOBAL_IO_TENSOR_MAP(sdpa_bwd_attributes);
                         sub_nodes.emplace_back(
-                            std::make_unique<SDPABackwardNode>(std::move(sdpa_bwd_attributes), context));
+                            std::make_unique<CompositeSDPABackwardNode>(std::move(sdpa_bwd_attributes), context));
                     } else if (tag == "MATMUL") {
                         auto matmul_attributes = j_sub_node.get<Matmul_attributes>();
                         CHECK_TENSORS(matmul_attributes);
@@ -1441,11 +1515,6 @@ class Graph : public ICudnn, public INode {
                         CHECK_TENSORS(slice_attributes);
                         FILL_GLOBAL_IO_TENSOR_MAP(slice_attributes);
                         sub_nodes.emplace_back(std::make_unique<SliceNode>(std::move(slice_attributes), context));
-                    } else if (tag == "SDPA_FP8_FWD") {
-                        auto sdpa_fp8_attributes = j_sub_node.get<SDPA_fp8_attributes>();
-                        CHECK_TENSORS(sdpa_fp8_attributes);
-                        FILL_GLOBAL_IO_TENSOR_MAP(sdpa_fp8_attributes);
-                        sub_nodes.emplace_back(std::make_unique<SDPAFP8Node>(std::move(sdpa_fp8_attributes), context));
                     } else if (tag == "RESAMPLE") {
                         auto resample_attributes = j_sub_node.get<Resample_attributes>();
                         CHECK_TENSORS(resample_attributes);
@@ -1511,12 +1580,12 @@ Graph::get_execution_plan_count() const {
 
 inline error_t
 Graph::get_engine_count(int64_t &count) {
-    CHECK_CUDNN_ERROR(detail::get_attribute(operation_graph->get_raw_desc(),
-                                            CUDNN_ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT,
-                                            CUDNN_TYPE_INT64,
-                                            1,
-                                            nullptr,
-                                            &count));
+    _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(operation_graph->get_raw_desc(),
+                                                   CUDNN_ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT,
+                                                   CUDNN_TYPE_INT64,
+                                                   1,
+                                                   nullptr,
+                                                   &count));
 
     return {error_code_t::OK, ""};
 }
@@ -2121,22 +2190,13 @@ Graph::sdpa(std::shared_ptr<Tensor_attributes> q,
             std::shared_ptr<Tensor_attributes> k,
             std::shared_ptr<Tensor_attributes> v,
             SDPA_attributes attributes) {
-    // Make required output tensors
-    auto O = attributes.outputs[SDPA_attributes::output_names::O] = output_tensor(attributes.name + "::O");
-
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> Stats = nullptr;
-    if (attributes.generate_stats == true) {
-        Stats = attributes.outputs[SDPA_attributes::output_names::Stats] = output_tensor(attributes.name + "::Stats");
+    if (attributes.mma_core_mode == DataType_t::NOT_SET) {
+        attributes._set_mma_core_mode(DataType_t::HALF);
     }
 
-    // Set inputs
-    attributes.inputs[SDPA_attributes::input_names::Q] = q;
-    attributes.inputs[SDPA_attributes::input_names::K] = k;
-    attributes.inputs[SDPA_attributes::input_names::V] = v;
-
-    sub_nodes.emplace_back(std::make_unique<SDPANode>(std::move(attributes), context));
-
-    return {O, Stats};
+    // Call internal implementation and return only the O and Stats outputs for backward compatibility
+    auto internal_result = sdpa_internal(q, k, v, std::move(attributes));
+    return {internal_result.O, internal_result.Stats};
 }
 
 inline std::array<std::shared_ptr<Tensor_attributes>, 4>
@@ -2150,25 +2210,11 @@ Graph::sdpa_fp8(std::shared_ptr<Tensor_attributes> q,
                 std::shared_ptr<Tensor_attributes> scale_s,
                 std::shared_ptr<Tensor_attributes> scale_o,
                 SDPA_fp8_attributes attributes) {
-    // Make required output tensors
-    auto O = attributes.outputs[SDPA_fp8_attributes::output_names::O] = output_tensor(attributes.name + "::O");
-
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> Stats = nullptr;
-    if (attributes.generate_stats == true) {
-        Stats = attributes.outputs[SDPA_fp8_attributes::output_names::Stats] =
-            output_tensor(attributes.name + "::Stats");
+    if (attributes.mma_core_mode == DataType_t::NOT_SET) {
+        attributes._set_mma_core_mode(DataType_t::FP8_E4M3);
     }
 
-    auto Amax_S = attributes.outputs[SDPA_fp8_attributes::output_names::Amax_S] =
-        output_tensor(attributes.name + "::Amax_S");
-    auto Amax_O = attributes.outputs[SDPA_fp8_attributes::output_names::Amax_O] =
-        output_tensor(attributes.name + "::Amax_O");
-
-    // Set inputs
-    attributes.inputs[SDPA_fp8_attributes::input_names::Q] = q;
-    attributes.inputs[SDPA_fp8_attributes::input_names::K] = k;
-    attributes.inputs[SDPA_fp8_attributes::input_names::V] = v;
-
+    // Set FP8 scaling inputs
     attributes.inputs[SDPA_fp8_attributes::input_names::Descale_Q] = descale_q;
     attributes.inputs[SDPA_fp8_attributes::input_names::Descale_K] = descale_k;
     attributes.inputs[SDPA_fp8_attributes::input_names::Descale_V] = descale_v;
@@ -2176,9 +2222,9 @@ Graph::sdpa_fp8(std::shared_ptr<Tensor_attributes> q,
     attributes.inputs[SDPA_fp8_attributes::input_names::Scale_S]   = scale_s;
     attributes.inputs[SDPA_fp8_attributes::input_names::Scale_O]   = scale_o;
 
-    sub_nodes.emplace_back(std::make_unique<SDPAFP8Node>(std::move(attributes), context));
-
-    return {O, Stats, Amax_S, Amax_O};
+    // Call internal implementation and return {Output, Stats, Amax_S, Amax_O} as array for backward compatibility
+    auto internal_result = sdpa_internal(q, k, v, std::move(attributes));
+    return {internal_result.O, internal_result.Stats, internal_result.Amax_S, internal_result.Amax_O};
 }
 
 inline std::array<std::shared_ptr<Tensor_attributes>, 7>
@@ -2265,7 +2311,7 @@ Graph::sdpa_backward(std::shared_ptr<Tensor_attributes> q,
     auto dK = attributes.outputs[SDPA_backward_attributes::output_names::dK] = output_tensor(attributes.name + "::dK");
     auto dV = attributes.outputs[SDPA_backward_attributes::output_names::dV] = output_tensor(attributes.name + "::dV");
 
-    sub_nodes.emplace_back(std::make_unique<SDPABackwardNode>(std::move(attributes), context));
+    sub_nodes.emplace_back(std::make_unique<CompositeSDPABackwardNode>(std::move(attributes), context));
 
     return {dQ, dK, dV};
 }

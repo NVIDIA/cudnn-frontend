@@ -362,42 +362,21 @@ NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_attributes::input_names,
                                  {SDPA_attributes::input_names::Dropout_scale, "Dropout_scale"},
                                  {SDPA_attributes::input_names::Page_table_K, "Page_table_K"},
                                  {SDPA_attributes::input_names::Page_table_V, "Page_table_V"},
+                                 // FP8-specific inputs
+                                 {SDPA_attributes::input_names::Descale_Q, "Descale_Q"},
+                                 {SDPA_attributes::input_names::Descale_K, "Descale_K"},
+                                 {SDPA_attributes::input_names::Descale_V, "Descale_V"},
+                                 {SDPA_attributes::input_names::Descale_S, "Descale_S"},
+                                 {SDPA_attributes::input_names::Scale_S, "Scale_S"},
+                                 {SDPA_attributes::input_names::Scale_O, "Scale_O"},
                              })
 
 NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_attributes::output_names,
                              {{SDPA_attributes::output_names::O, "O"},
                               {SDPA_attributes::output_names::Stats, "Stats"},
-                              {SDPA_attributes::output_names::RNG_DUMP, "RNG_DUMP"}})
-
-NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_fp8_attributes::input_names,
-                             {
-                                 {SDPA_fp8_attributes::input_names::Q, "Q"},
-                                 {SDPA_fp8_attributes::input_names::K, "K"},
-                                 {SDPA_fp8_attributes::input_names::V, "V"},
-                                 {SDPA_fp8_attributes::input_names::Attn_scale, "Attn_scale"},
-                                 {SDPA_fp8_attributes::input_names::Bias, "Bias"},
-                                 {SDPA_fp8_attributes::input_names::SEQ_LEN_Q, "SEQ_LEN_Q"},
-                                 {SDPA_fp8_attributes::input_names::SEQ_LEN_KV, "SEQ_LEN_KV"},
-                                 {SDPA_fp8_attributes::input_names::Seed, "Seed"},
-                                 {SDPA_fp8_attributes::input_names::Offset, "Offset"},
-                                 {SDPA_fp8_attributes::input_names::Dropout_mask, "Dropout_mask"},
-                                 {SDPA_fp8_attributes::input_names::Dropout_scale, "Dropout_scale"},
-
-                                 {SDPA_fp8_attributes::input_names::Descale_Q, "Descale_Q"},
-                                 {SDPA_fp8_attributes::input_names::Descale_K, "Descale_K"},
-                                 {SDPA_fp8_attributes::input_names::Descale_V, "Descale_V"},
-                                 {SDPA_fp8_attributes::input_names::Descale_S, "Descale_S"},
-                                 {SDPA_fp8_attributes::input_names::Scale_S, "Scale_S"},
-                                 {SDPA_fp8_attributes::input_names::Scale_O, "Scale_O"},
-                             })
-
-NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_fp8_attributes::output_names,
-                             {
-                                 {SDPA_fp8_attributes::output_names::O, "O"},
-                                 {SDPA_fp8_attributes::output_names::Stats, "Stats"},
-                                 {SDPA_fp8_attributes::output_names::Amax_O, "Amax_O"},
-                                 {SDPA_fp8_attributes::output_names::Amax_S, "Amax_S"},
-                             })
+                              {SDPA_attributes::output_names::RNG_DUMP, "RNG_DUMP"},
+                              {SDPA_attributes::output_names::Amax_S, "Amax_S"},
+                              {SDPA_attributes::output_names::Amax_O, "Amax_O"}})
 
 NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_backward_attributes::input_names,
                              {

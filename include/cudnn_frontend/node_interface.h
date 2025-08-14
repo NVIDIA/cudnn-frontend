@@ -129,7 +129,6 @@ class INode {
         RESHAPE,
         RMSNORM,
         RNG,
-        SCALED_DOT_PRODUCT_ATTENTION,
         SLICE,
         WGRAD,
         PAGED_CACHE_LOAD,
@@ -137,7 +136,8 @@ class INode {
         BLOCK_SCALE_DEQUANTIZE,
         CONCATENATE,
         ADALAYERNORM,
-        DADALAYERNORM
+        DADALAYERNORM,
+        UNIFIED_SDPA,
     };
     Type tag;
 

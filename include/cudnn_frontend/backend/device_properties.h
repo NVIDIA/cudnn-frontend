@@ -82,16 +82,16 @@ class DeviceProperties : public detail::backend_descriptor {
                                        "CUDNN_ATTR_DEVICEPROP_JSON_REPRESENTATION is only available starting 9.8.");
 
         int64_t serializationSize;
-        CHECK_CUDNN_ERROR(detail::get_attribute(
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
             get_ptr(), CUDNN_ATTR_DEVICEPROP_JSON_REPRESENTATION, CUDNN_TYPE_CHAR, 0, &serializationSize, nullptr));
         serialization_buf.resize(static_cast<size_t>(serializationSize));
 
-        CHECK_CUDNN_ERROR(detail::get_attribute(get_ptr(),
-                                                CUDNN_ATTR_DEVICEPROP_JSON_REPRESENTATION,
-                                                CUDNN_TYPE_CHAR,
-                                                serializationSize,
-                                                &serializationSize,
-                                                serialization_buf.data()));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(get_ptr(),
+                                                       CUDNN_ATTR_DEVICEPROP_JSON_REPRESENTATION,
+                                                       CUDNN_TYPE_CHAR,
+                                                       serializationSize,
+                                                       &serializationSize,
+                                                       serialization_buf.data()));
         return {};
 #else
         (void)serialization_buf;
@@ -107,18 +107,18 @@ class DeviceProperties : public detail::backend_descriptor {
                                        error_code_t::CUDNN_BACKEND_API_FAILED,
                                        "CUDNN_ATTR_DEVICEPROP_JSON_REPRESENTATION is only available starting 9.8.");
 
-        // Check if the kernel cache is already initialized
+        // Check if the device properties is already initialized
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             get_ptr() != nullptr, error_code_t::CUDNN_BACKEND_API_FAILED, "Device properties is already initialized.");
 
-        // // Initialize the device properties descriptor
+        // Initialize the device properties descriptor
         CHECK_CUDNN_FRONTEND_ERROR(initialize(CUDNN_BACKEND_DEVICEPROP_DESCRIPTOR));
 
-        CHECK_CUDNN_ERROR(detail::set_attribute(get_ptr(),
-                                                CUDNN_ATTR_DEVICEPROP_JSON_REPRESENTATION,
-                                                CUDNN_TYPE_CHAR,
-                                                serialized_buf.size(),
-                                                serialized_buf.data()));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(get_ptr(),
+                                                       CUDNN_ATTR_DEVICEPROP_JSON_REPRESENTATION,
+                                                       CUDNN_TYPE_CHAR,
+                                                       serialized_buf.size(),
+                                                       serialized_buf.data()));
 
         CHECK_CUDNN_FRONTEND_ERROR(finalize());
         return {};
@@ -141,12 +141,12 @@ class DeviceProperties : public detail::backend_descriptor {
         }
 
         if (handle != nullptr) {
-            CHECK_CUDNN_ERROR(
+            _CUDNN_CHECK_CUDNN_ERROR(
                 detail::set_attribute(get_ptr(), CUDNN_ATTR_DEVICEPROP_HANDLE, CUDNN_TYPE_HANDLE, 1, &handle));
         }
 
         if (device_id >= 0) {
-            CHECK_CUDNN_ERROR(
+            _CUDNN_CHECK_CUDNN_ERROR(
                 detail::set_attribute(get_ptr(), CUDNN_ATTR_DEVICEPROP_DEVICE_ID, CUDNN_TYPE_INT32, 1, &device_id));
         }
 

@@ -34,8 +34,12 @@ class MatmulFP8Node : public NodeCRTP<MatmulFP8Node> {
         std::shared_ptr<Tensor_attributes> last_output;
 
         // Matmul
-        auto matmul_attributes = Matmul_attributes().set_name("matmul");
-        last_output            = matmul(attributes.inputs.at(Matmul_fp8_attributes::input_names::A),
+
+        auto matmul_attributes = Matmul_attributes();
+        matmul_attributes.clone_fp8_attributes(attributes);
+        matmul_attributes.set_name("matmul");
+
+        last_output = matmul(attributes.inputs.at(Matmul_fp8_attributes::input_names::A),
                              attributes.inputs.at(Matmul_fp8_attributes::input_names::B),
                              matmul_attributes);
 

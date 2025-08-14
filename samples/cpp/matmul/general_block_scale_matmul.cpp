@@ -289,4 +289,4 @@ TEST_CASE("General Block Scale Matmul", "[matmul][graph]") {
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 }
 
-};  // namespace GeneralBlockScaleMatmul
+}  // namespace GeneralBlockScaleMatmul

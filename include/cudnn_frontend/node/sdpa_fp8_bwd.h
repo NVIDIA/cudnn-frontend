@@ -39,8 +39,8 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
         cudaDeviceProp prop;
         int device;
-        CHECK_CUDA_ERROR(detail::cuda_get_device(&device));
-        CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, device));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_get_device(&device));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, device));
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             prop.major < 9,
             error_code_t::GRAPH_NOT_SUPPORTED,
@@ -86,6 +86,13 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         int64_t h_v  = attributes.inputs.at(input_names::V)->get_dim()[1];
         int64_t d_qk = attributes.inputs.at(input_names::Q)->get_dim()[3];
         int64_t d_v  = attributes.inputs.at(input_names::V)->get_dim()[3];
+
+        auto const& dq_tensor = attributes.outputs.at(output_names::dQ);
+        auto const& dq_data_type = dq_tensor->get_data_type();
+        auto const& dk_tensor = attributes.outputs.at(output_names::dK);
+        auto const& dk_data_type = dk_tensor->get_data_type();
+        auto const& dv_tensor = attributes.outputs.at(output_names::dV);
+        auto const& dv_data_type = dv_tensor->get_data_type();
 
         auto const& bias_mask = attributes.inputs.find(input_names::Bias);
         bool const is_bias    = (bias_mask != attributes.inputs.end() && bias_mask->second != nullptr);
@@ -178,6 +185,16 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_intermediate_data_type() == DataType_t::NOT_SET,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Intermediate tensor data type needs to be set as internal tensors require it.");
+
+        // if output data type is half or bfloat16 for any of dq, dk, dv, and version is below 9.13 or is not blackwell, return NOT_SUPPORTED
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            (dq_data_type == DataType_t::HALF || dq_data_type == DataType_t::BFLOAT16 ||
+             dk_data_type == DataType_t::HALF || dk_data_type == DataType_t::BFLOAT16 ||
+             dv_data_type == DataType_t::HALF || dv_data_type == DataType_t::BFLOAT16) &&
+                (detail::get_backend_version() < 91300 || prop.major < 10),
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "sdpa fp8 forward operation is only supported on cuDNN version 9.13.0 and newer. Please "
+            "consider upgrading your current version.");
         return {error_code_t::OK, ""};
     }
 

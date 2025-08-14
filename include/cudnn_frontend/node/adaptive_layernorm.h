@@ -147,83 +147,83 @@ class AdaLayerNormNode : public NodeCRTP<AdaLayerNormNode> {
             make_shared_backend_pointer((cudnnBackendDescriptorType_t)CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR);
 
         cudnnBackendNormMode_t cudnn_norm_mode;
-        CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(NormMode_t::ADA_LAYER_NORM, cudnn_norm_mode));
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_FWD_MODE,
-                                                CUDNN_TYPE_NORM_MODE,
-                                                1,
-                                                &cudnn_norm_mode));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(NormMode_t::ADA_LAYER_NORM, cudnn_norm_mode));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_MODE,
+                                                       CUDNN_TYPE_NORM_MODE,
+                                                       1,
+                                                       &cudnn_norm_mode));
 
         cudnnBackendNormFwdPhase_t cudnn_norm_fwd_phase;
-        CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.forward_phase, cudnn_norm_fwd_phase));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.forward_phase, cudnn_norm_fwd_phase));
 
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_FWD_PHASE,
-                                                CUDNN_TYPE_NORM_FWD_PHASE,
-                                                1,
-                                                &cudnn_norm_fwd_phase));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_PHASE,
+                                                       CUDNN_TYPE_NORM_FWD_PHASE,
+                                                       1,
+                                                       &cudnn_norm_fwd_phase));
 
         auto X         = attributes.inputs.find(AdaLayernorm_attributes::input_names::X)->second;
         auto backend_x = tensors[X->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_FWD_XDESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_x));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_XDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_x));
 
         auto Scale         = attributes.inputs.find(AdaLayernorm_attributes::input_names::SCALE)->second;
         auto backend_scale = tensors[Scale->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_scale));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_scale));
 
         auto Bias_iter = attributes.inputs.find(AdaLayernorm_attributes::input_names::BIAS);
         if (Bias_iter != attributes.inputs.end() && Bias_iter->second->get_is_virtual() == false) {
             auto backend_bias = tensors[Bias_iter->second->get_uid()]->get_desc()->get_backend_descriptor();
-            CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                    CUDNN_ATTR_OPERATION_NORM_FWD_BIAS_DESC,
-                                                    CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                    1,
-                                                    &backend_bias));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_BIAS_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &backend_bias));
         }
 
         auto Epsilon         = attributes.inputs.find(AdaLayernorm_attributes::input_names::EPSILON)->second;
         auto backend_epsilon = tensors[Epsilon->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_FWD_EPSILON_DESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_epsilon));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_EPSILON_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_epsilon));
 
         auto Y         = attributes.outputs.find(AdaLayernorm_attributes::output_names::Y)->second;
         auto backend_y = tensors[Y->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_FWD_YDESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_y));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_YDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_y));
 
         if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
             auto Mean         = attributes.outputs.find(AdaLayernorm_attributes::output_names::MEAN)->second;
             auto backend_mean = tensors[Mean->get_uid()]->get_desc()->get_backend_descriptor();
-            CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                    CUDNN_ATTR_OPERATION_NORM_FWD_MEAN_DESC,
-                                                    CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                    1,
-                                                    &backend_mean));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_MEAN_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &backend_mean));
 
             auto Inv_variance = attributes.outputs.find(AdaLayernorm_attributes::output_names::INV_VARIANCE)->second;
             auto backend_inv_variance = tensors[Inv_variance->get_uid()]->get_desc()->get_backend_descriptor();
-            CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                    CUDNN_ATTR_OPERATION_NORM_FWD_INV_VARIANCE_DESC,
-                                                    CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                    1,
-                                                    &backend_inv_variance));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_INV_VARIANCE_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &backend_inv_variance));
         }
 
-        CHECK_CUDNN_ERROR(detail::finalize(adalayernorm_operation->get_backend_descriptor()));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(adalayernorm_operation->get_backend_descriptor()));
 
         raw_operations.push_back(adalayernorm_operation);
 
@@ -351,80 +351,80 @@ class DAdaLayerNormNode : public NodeCRTP<DAdaLayerNormNode> {
             make_shared_backend_pointer((cudnnBackendDescriptorType_t)CUDNN_BACKEND_OPERATION_NORM_BACKWARD_DESCRIPTOR);
 
         cudnnBackendNormMode_t cudnn_norm_mode;
-        CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(NormMode_t::ADA_LAYER_NORM, cudnn_norm_mode));
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_BWD_MODE,
-                                                CUDNN_TYPE_NORM_MODE,
-                                                1,
-                                                &cudnn_norm_mode));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(NormMode_t::ADA_LAYER_NORM, cudnn_norm_mode));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_BWD_MODE,
+                                                       CUDNN_TYPE_NORM_MODE,
+                                                       1,
+                                                       &cudnn_norm_mode));
 
         auto X         = attributes.inputs.find(AdaLayernorm_backward_attributes::input_names::X)->second;
         auto backend_x = tensors[X->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_BWD_XDESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_x));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_BWD_XDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_x));
 
         auto Mean         = attributes.inputs.find(AdaLayernorm_backward_attributes::input_names::MEAN)->second;
         auto backend_mean = tensors[Mean->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_BWD_MEAN_DESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_mean));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_BWD_MEAN_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_mean));
 
         auto Inv_variance = attributes.inputs.find(AdaLayernorm_backward_attributes::input_names::INV_VARIANCE)->second;
         auto backend_inv_variance = tensors[Inv_variance->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_BWD_INV_VARIANCE_DESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_inv_variance));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_BWD_INV_VARIANCE_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_inv_variance));
 
         auto Dy         = attributes.inputs.find(AdaLayernorm_backward_attributes::input_names::DY)->second;
         auto backend_dy = tensors[Dy->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_BWD_DYDESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_dy));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_BWD_DYDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_dy));
 
         auto Scale         = attributes.inputs.find(AdaLayernorm_backward_attributes::input_names::SCALE)->second;
         auto backend_scale = tensors[Scale->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_BWD_SCALE_DESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_scale));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_BWD_SCALE_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_scale));
 
         auto Dx         = attributes.outputs.find(AdaLayernorm_backward_attributes::output_names::DX)->second;
         auto backend_dx = tensors[Dx->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_BWD_DXDESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_dx));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_BWD_DXDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_dx));
 
         auto Dscale         = attributes.outputs.find(AdaLayernorm_backward_attributes::output_names::DSCALE)->second;
         auto backend_dscale = tensors[Dscale->get_uid()]->get_desc()->get_backend_descriptor();
-        CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                CUDNN_ATTR_OPERATION_NORM_BWD_DSCALE_DESC,
-                                                CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                1,
-                                                &backend_dscale));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                       CUDNN_ATTR_OPERATION_NORM_BWD_DSCALE_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &backend_dscale));
 
         auto Dbias_iter = attributes.outputs.find(AdaLayernorm_backward_attributes::output_names::DBIAS);
         if (Dbias_iter != attributes.outputs.end() && Dbias_iter->second->get_is_virtual() == false) {
             auto backend_dbias = tensors[Dbias_iter->second->get_uid()]->get_desc()->get_backend_descriptor();
-            CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
-                                                    CUDNN_ATTR_OPERATION_NORM_BWD_DBIAS_DESC,
-                                                    CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                    1,
-                                                    &backend_dbias));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_NORM_BWD_DBIAS_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &backend_dbias));
         }
 
-        CHECK_CUDNN_ERROR(detail::finalize(adalayernorm_operation->get_backend_descriptor()));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(adalayernorm_operation->get_backend_descriptor()));
 
         raw_operations.push_back(adalayernorm_operation);
 

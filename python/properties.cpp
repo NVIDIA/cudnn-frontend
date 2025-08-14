@@ -73,6 +73,37 @@ kernel_cache_from_json_helper(std::shared_ptr<cudnn_frontend::KernelCache> kerne
     throw_if(err.is_bad(), err.code, err.get_message());
 }
 
+std::shared_ptr<cudnn_frontend::DeviceProperties>
+create_device_properties_helper(int32_t device_id) {
+    auto device_properties = std::make_shared<cudnn_frontend::DeviceProperties>();
+    throw_if(
+        device_properties == nullptr, cudnn_frontend::error_code_t::INVALID_VALUE, "device properties creation failed");
+    if (device_id >= 0) {
+        auto err = device_properties->set_device_id(device_id).build();
+        throw_if(!err.is_good(), err.code, err.get_message());
+    }
+    return device_properties;
+}
+
+std::shared_ptr<cudnn_frontend::DeviceProperties>
+create_device_properties_helper(std::string const& json_str) {
+    auto device_properties = std::make_shared<cudnn_frontend::DeviceProperties>();
+    throw_if(
+        device_properties == nullptr, cudnn_frontend::error_code_t::INVALID_VALUE, "device properties creation failed");
+    std::vector<uint8_t> serialization_buf(json_str.begin(), json_str.end());
+    auto err = device_properties->deserialize(serialization_buf);
+    throw_if(err.is_bad(), err.code, err.get_message());
+    return device_properties;
+}
+
+std::string
+serialize_device_properties_helper(std::shared_ptr<cudnn_frontend::DeviceProperties> const& device_properties) {
+    std::vector<uint8_t> serialization_buf;
+    auto err = device_properties->serialize(serialization_buf);
+    throw_if(err.is_bad(), err.code, err.get_message());
+    return std::string(serialization_buf.begin(), serialization_buf.end());
+}
+
 static std::string
 get_last_error_string() {
     return detail::get_last_error_string_();
@@ -198,6 +229,16 @@ init_properties(py::module_& m) {
         .def("deserialize", &kernel_cache_from_json_helper);
     m.def("create_kernel_cache", &create_kernel_cache_helper);
 
+    py::class_<cudnn_frontend::DeviceProperties, std::shared_ptr<cudnn_frontend::DeviceProperties>>(m,
+                                                                                                    "device_properties")
+        .def("serialize", &serialize_device_properties_helper);
+    m.def(
+        "create_device_properties",
+        static_cast<std::shared_ptr<cudnn_frontend::DeviceProperties> (*)(int32_t)>(&create_device_properties_helper));
+    m.def("create_device_properties",
+          static_cast<std::shared_ptr<cudnn_frontend::DeviceProperties> (*)(std::string const&)>(
+              &create_device_properties_helper));
+
     m.def("create_handle", &HandleManagement::create_handle);
     m.def("destroy_handle", &HandleManagement::destroy_handle);
     m.def("get_stream", &HandleManagement::get_stream);
@@ -254,6 +295,11 @@ init_properties(py::module_& m) {
     py::enum_<cudnn_frontend::DiagonalAlignment_t>(m, "diagonal_alignment")
         .value("TOP_LEFT", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT)
         .value("BOTTOM_RIGHT", cudnn_frontend::DiagonalAlignment_t::BOTTOM_RIGHT);
+
+    py::enum_<cudnn_frontend::AttentionImplementation_t>(m, "attention_implementation")
+        .value("AUTO", cudnn_frontend::AttentionImplementation_t::AUTO)
+        .value("COMPOSITE", cudnn_frontend::AttentionImplementation_t::COMPOSITE)
+        .value("UNIFIED", cudnn_frontend::AttentionImplementation_t::UNIFIED);
 }
 
 }  // namespace python_bindings

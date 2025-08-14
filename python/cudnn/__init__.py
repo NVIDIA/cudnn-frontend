@@ -25,6 +25,7 @@ symbols_to_import = [
     "knob_type",
     "create_handle",
     "create_kernel_cache",
+    "create_device_properties",
     "get_stream",
     "numerical_note",
     "set_stream",
@@ -37,6 +38,7 @@ symbols_to_import = [
     "knob",
     "cudnnGraphNotSupportedError",
     "diagonal_alignment",
+    "attention_implementation",
 ]
 
 for symbol_name in symbols_to_import:
@@ -44,7 +46,7 @@ for symbol_name in symbols_to_import:
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.13.0"
+__version__ = "1.14.0"
 
 
 def _tensor(
@@ -57,6 +59,7 @@ def _tensor(
     ragged_offset=None,
     reordering_type=tensor_reordering.NONE,
     name="",
+    uid=-1,
 ):
     """
     Create a tensor.
@@ -83,6 +86,7 @@ def _tensor(
         ragged_offset=ragged_offset,
         reordering_type=reordering_type,
         name=name,
+        uid=uid,
     )
 
 
@@ -197,7 +201,10 @@ def _dlopen_cudnn():
         ), f"Found {len(lib_path)} libcudnn.so.x in nvidia-cudnn-cuXX."
         lib = ctypes.CDLL(lib_path[0])
     else:  # Fallback
-        lib = ctypes.CDLL("libcudnn.so")
+        try:
+            lib = ctypes.CDLL("libcudnn.so.9")
+        except Exception:
+            lib = ctypes.CDLL("libcudnn.so")
 
     handle = ctypes.cast(lib._handle, ctypes.c_void_p).value
     _pybind_module._set_dlhandle_cudnn(handle)
