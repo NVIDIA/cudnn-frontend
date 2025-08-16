@@ -755,7 +755,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
 
                 // DeepSeek case, 9.11 only supports 192 hidden dim
                 if (detail::get_backend_version() >= 91100) {
-                    RETURN_CUDNN_FRONTEND_ERROR_IF( (d_v != 128) && (d_qk != 192),
+                    RETURN_CUDNN_FRONTEND_ERROR_IF( ((d_v == 128) && (d_qk == 192)) == false,
                                             error_code_t::GRAPH_NOT_SUPPORTED,
                                             "Num hidden_dim d_v should be equal to 128 if d_qk is 192");
                 }
