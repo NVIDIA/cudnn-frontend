@@ -65,6 +65,9 @@ class CMakeBuild(build_ext):
         if "CUDNN_PATH" in os.environ:
             cmake_args.append(f"-DCUDNN_PATH={os.environ['CUDNN_PATH']}")
 
+        if "FETCHCONTENT_SOURCE_DIR_DLPACK" in os.environ:
+            cmake_args.append(f"-DFETCHCONTENT_SOURCE_DIR_DLPACK={os.environ['FETCHCONTENT_SOURCE_DIR_DLPACK']}")
+
         # Using Ninja-build since it a) is available as a wheel and b)
         # multithreads automatically. MSVC would require all variables be
         # exported for Ninja to pick it up, which is a little tricky to do.
