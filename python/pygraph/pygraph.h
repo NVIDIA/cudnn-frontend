@@ -245,6 +245,19 @@ class PyGraph {
          std::string const& name);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    swish(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+          cudnn_frontend::DataType_t const& compute_data_type,
+          std::optional<float> const& swish_beta,
+          std::string const& name);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    swish_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& loss,
+                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+                   cudnn_frontend::DataType_t const& compute_data_type,
+                   std::optional<float> const& swish_beta,
+                   std::string const& name);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     block_scale_dequantize(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale,
                            std::vector<int32_t> const& block_size,

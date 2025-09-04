@@ -219,7 +219,7 @@ def param_extract(request):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-def test_matmul_bias_relu(param_extract, cudnn_handle):
+def test_matmul_bias(param_extract, cudnn_handle):
 
     problem_size_options, input_type = param_extract
     b, s, e = problem_size_options

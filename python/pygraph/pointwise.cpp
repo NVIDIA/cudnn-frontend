@@ -80,6 +80,43 @@ PyGraph::relu(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
 }
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::swish(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+               cudnn_frontend::DataType_t const& compute_data_type,
+               std::optional<float> const& swish_beta,
+               std::string const& name) {
+    auto attributes = cudnn_frontend::graph::Pointwise_attributes()
+                          .set_compute_data_type(compute_data_type)
+                          .set_mode(cudnn_frontend::PointwiseMode_t::SWISH_FWD)
+                          .set_name(name);
+
+    if (swish_beta.has_value()) {
+        attributes.set_swish_beta(swish_beta.value());
+    }
+
+    auto OUT_0 = graph->pointwise(input, attributes);
+    return OUT_0;
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::swish_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& loss,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+                        cudnn_frontend::DataType_t const& compute_data_type,
+                        std::optional<float> const& swish_beta,
+                        std::string const& name) {
+    auto attributes = cudnn_frontend::graph::Pointwise_attributes()
+                          .set_compute_data_type(compute_data_type)
+                          .set_mode(cudnn_frontend::PointwiseMode_t::SWISH_BWD)
+                          .set_name(name);
+
+    if (swish_beta.has_value()) {
+        attributes.set_swish_beta(swish_beta.value());
+    }
+
+    auto OUT_0 = graph->pointwise(loss, input, attributes);
+    return OUT_0;
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::gen_index(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
                    int64_t const axis,
                    cudnn_frontend::DataType_t const& compute_data_type,
@@ -394,9 +431,10 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
                 cudnn_tensor: The result of the sigmoid activation.
         )pbdoc");
     m.def("swish",
-          &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::SWISH_FWD>,
+          &PyGraph::swish,
           py::arg("input"),
           py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+          py::arg_v("swish_beta", py::none()),
           py::arg_v("name", ""),
           R"pbdoc(
             Apply the Swish activation function to the input.
@@ -579,10 +617,11 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
                 cudnn_tensor: The result of backpropagation of softplus activation.
         )pbdoc");
     m.def("swish_backward",
-          &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::SWISH_BWD>,
+          &PyGraph::swish_backward,
           py::arg("loss"),
           py::arg("input"),
           py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+          py::arg_v("swish_beta", py::none()),
           py::arg_v("name", ""),
           R"pbdoc(
             Apply backpropagation on swish activation function.

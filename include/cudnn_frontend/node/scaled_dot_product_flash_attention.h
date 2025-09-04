@@ -208,6 +208,12 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
             return validation_result;
         }
 
+        // return NOT_SET if sink_token present with 9.12 and below
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 91300 &&
+                                           attributes.inputs.find(input_names::SINK_TOKEN) != attributes.inputs.end(),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "SDPA with sink_token is not supported before 9.13.");
+
         return {error_code_t::OK, ""};
     }
 
@@ -508,6 +514,10 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
 
         auto softmax_attributes =
             Softmax_attributes().set_name("softmax").has_stats(true).has_M_Zinv(false);  // As this is flash attention
+        // Set sink for softmax if user has provided a sink tensor
+        if (attributes.inputs.find(input_names::SINK_TOKEN) != attributes.inputs.end()) {
+            softmax_attributes.set_sink(attributes.inputs[input_names::SINK_TOKEN]);
+        }
         // Special non-functional-style call. Needed because output already created and provided to user.
         softmax(last_output, softmax_attributes, softmax_output, softmax_stats);
         last_output = softmax_output;
@@ -751,13 +761,14 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         if (prop.major == 9) { 
             // validate basic dimension requirements
 
-            if ((128 < d_qk) && (d_qk <= 192) && (64 < d_v) && (d_v <= 128)) {
+            if ((detail::get_backend_version() >= 91100) && (detail::get_backend_version() < 91300)) {
+                
+                if ((128 < d_qk) && (d_qk <= 192) && (64 < d_v) && (d_v <= 128)) {
 
-                // DeepSeek case, 9.11 only supports 192 hidden dim
-                if (detail::get_backend_version() >= 91100) {
-                    RETURN_CUDNN_FRONTEND_ERROR_IF( ((d_v == 128) && (d_qk == 192)) == false,
-                                            error_code_t::GRAPH_NOT_SUPPORTED,
-                                            "Num hidden_dim d_v should be equal to 128 if d_qk is 192");
+                    // DeepSeek case, 9.11 only supports 192 hidden dim
+                        RETURN_CUDNN_FRONTEND_ERROR_IF( (d_v != 128) && (d_qk != 192),
+                                                error_code_t::GRAPH_NOT_SUPPORTED,
+                                                "Num hidden_dim d_v should be equal to 128 if d_qk is 192");
                 }
             }
 
@@ -926,6 +937,10 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(this->context.get_intermediate_data_type() == DataType_t::NOT_SET,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Intermediate tensor data type needs to be set as internal tensors require it.");
+        // If dsink is set, sink also needs to be set
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.outputs.find(output_names::DSINK_TOKEN) != attributes.outputs.end() && attributes.inputs.find(input_names::SINK_TOKEN) == attributes.inputs.end(),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "If dsink is set, sink also needs to be set.");
         // clang-format on
 
         return {error_code_t::OK, ""};
@@ -1119,6 +1134,28 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         last_output =
             reduction(last_output, Reduction_attributes().set_name("reduce_dO_o").set_mode(ReductionMode_t::ADD));
         last_output->set_dim({b, h_q, s_q, 1}).set_stride({h_q * s_q, s_q, 1, 1});
+
+        if (attributes.outputs.find(output_names::DSINK_TOKEN) != attributes.outputs.end()) {
+            // sub_sink = sink - stats
+            auto sub_sink = pointwise(attributes.inputs[input_names::SINK_TOKEN],
+                                      attributes.inputs[input_names::Stats],
+                                      Pointwise_attributes().set_name("sub_sink").set_mode(PointwiseMode_t::SUB));
+
+            // exp_sink = exp(sub_sink)
+            auto exp_sink =
+                pointwise(sub_sink, Pointwise_attributes().set_name("exp_sink").set_mode(PointwiseMode_t::EXP));
+
+            // per_token_grad = exp_sink * last_output
+            auto per_token_grad =
+                pointwise(exp_sink,
+                          last_output,
+                          Pointwise_attributes().set_name("mul_exp_sink_last_output").set_mode(PointwiseMode_t::MUL));
+
+            // dSink = redduce(per_token_grad)
+            reduction(per_token_grad,
+                      Reduction_attributes().set_name("reduce_per_token_grad").set_mode(ReductionMode_t::ADD),
+                      attributes.outputs[output_names::DSINK_TOKEN]);
+        }
 
         // softmax_sum = last_output * dropout_scale
         last_output = pointwise(last_output,

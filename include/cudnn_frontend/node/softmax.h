@@ -64,8 +64,18 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
         max_output->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
 
         auto max_attributes = Reduction_attributes().set_name("M").set_mode(ReductionMode_t::MAX);
-        // Special non-functional-style call. Needed because output already created and provided to user.
-        reduction(attributes.inputs[Softmax_attributes::input_names::P], max_attributes, max_output);
+        // If sink tensor is present, we also need to take a pointwise max with sink
+        if (attributes.inputs.find(Softmax_attributes::input_names::SINK) != attributes.inputs.end()) {
+            auto s_max = reduction(attributes.inputs[Softmax_attributes::input_names::P], max_attributes);
+            s_max->set_name("s_max");
+
+            auto sink_tensor     = attributes.inputs[Softmax_attributes::input_names::SINK];
+            auto sink_attributes = Pointwise_attributes().set_name("max_sink").set_mode(PointwiseMode_t::MAX);
+            pointwise(s_max, sink_tensor, sink_attributes, max_output);
+        } else {
+            // Special non-functional-style call. Needed because output already created and provided to user.
+            reduction(attributes.inputs[Softmax_attributes::input_names::P], max_attributes, max_output);
+        }
 
         auto sub_attributes = Pointwise_attributes().set_name("sub").set_mode(PointwiseMode_t::SUB);
         auto const& sub_output =
@@ -76,8 +86,26 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
         auto const& exp_output = pointwise(sub_output, exp_attributes);
         exp_output->set_name("exp_sub_M");
 
-        auto sum_attributes    = Reduction_attributes().set_name("sum").set_mode(ReductionMode_t::ADD);
-        auto const& sum_output = reduction(exp_output, sum_attributes);
+        auto const& sum_output = [&]() {
+            auto sum_attributes = Reduction_attributes().set_name("sum").set_mode(ReductionMode_t::ADD);
+            // If sink tensor is present, also subtract it and take its exp
+            if (attributes.inputs.find(Softmax_attributes::input_names::SINK) != attributes.inputs.end()) {
+                auto sink_tensor = attributes.inputs[Softmax_attributes::input_names::SINK];
+                auto sub_sink    = pointwise(sink_tensor, max_output, sub_attributes);
+                sub_sink->set_name("sub_sink");
+
+                auto exp_sink = pointwise(sub_sink, exp_attributes);
+                exp_sink->set_name("exp_sink");
+
+                auto temp_sum = reduction(exp_output, sum_attributes);
+                temp_sum->set_name("SumExp").set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+
+                auto add_attributes = Pointwise_attributes().set_name("add_sink").set_mode(PointwiseMode_t::ADD);
+                return pointwise(temp_sum, exp_sink, add_attributes);
+            } else {
+                return reduction(exp_output, sum_attributes);
+            }
+        }();
         sum_output->set_name("Z").set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
 
         // Another path to add when in flash attention mode.

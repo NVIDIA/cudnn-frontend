@@ -99,6 +99,18 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
             pointwise_descriptor_builder.setReluUpperClip(attributes.relu_upper_clip.value());
         }
 
+        if (attributes.swish_beta.has_value()) {
+            pointwise_descriptor_builder.setSwishBeta(attributes.swish_beta.value());
+        }
+
+        if (attributes.elu_alpha.has_value()) {
+            pointwise_descriptor_builder.setEluAlpha(attributes.elu_alpha.value());
+        }
+
+        if (attributes.softplus_beta.has_value()) {
+            pointwise_descriptor_builder.setSoftplusBeta(attributes.softplus_beta.value());
+        }
+
         pointwise_descriptor_builder.setComputeType(attributes.compute_data_type);
         pointwise_descriptor_builder.setMode(attributes.mode);
         auto pointwise_descriptor = pointwise_descriptor_builder.build();
