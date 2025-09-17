@@ -279,9 +279,11 @@ class Graph : public ICudnn, public INode {
         }
 
         if (attributes.implementation == AttentionImplementation_t::AUTO) {
+            // Temporary WAR to not choose UNIFIED for now.
+            attributes.implementation = AttentionImplementation_t::COMPOSITE;
             // Sets attributes.implementation to a supporting implementation,
             // or leaves as AUTO if none found
-            attributes._auto_select_implementation(context);
+            // attributes._auto_select_implementation(context);
         }
 
         switch (attributes.implementation) {
