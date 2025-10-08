@@ -35,6 +35,8 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        std::string const& name,
                        std::optional<PyCallback> fn,
                        py::object const& generate_stats,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
                        cudnn_frontend::DataType_t const& mma_core_mode,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_q,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_k,
@@ -53,7 +55,9 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                           .set_compute_data_type(compute_data_type)
                           ._set_mma_core_mode(mma_core_mode)
                           .set_name(name)
-                          .set_implementation(implementation);
+                          .set_implementation(implementation)
+                          .set_logit_max(score_max)
+                          .set_score_sum_exp(score_sum_exp);
 
     // Set generate_stats
     if (!generate_stats.is_none()) {
@@ -225,7 +229,9 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               std::string const& name,
               std::optional<PyCallback> fn,
               py::object const& generate_stats,
-              cudnn_frontend::AttentionImplementation_t const& implementation) {
+              cudnn_frontend::AttentionImplementation_t const& implementation,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp) {
     cudnn_frontend::DataType_t mma_core_mode                            = cudnn_frontend::DataType_t::HALF;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_q = nullptr;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_k = nullptr;
@@ -304,6 +310,8 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          name,
                                          fn,
                                          actual_generate_stats,
+                                         score_max,
+                                         score_sum_exp,
                                          mma_core_mode,
                                          descale_q,
                                          descale_k,
@@ -482,7 +490,9 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                   cudnn_frontend::DataType_t const& compute_data_type,
                   std::string const& name,
                   std::optional<PyCallback> fn,
-                  py::object const& generate_stats) {
+                  py::object const& generate_stats,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp) {
     cudnn_frontend::DataType_t mma_core_mode = cudnn_frontend::DataType_t::FP8_E4M3;
 
     // Handle sliding_window to left_bound mapping for backward compatibility
@@ -555,6 +565,8 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          name,
                                          fn,
                                          actual_generate_stats,
+                                         score_max,
+                                         score_sum_exp,
                                          mma_core_mode,
                                          descale_q,
                                          descale_k,
@@ -704,6 +716,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("score_mod", std::nullopt),
           py::arg_v("generate_stats", py::none()),
           py::arg_v("implementation", cudnn_frontend::AttentionImplementation_t::AUTO),
+          py::arg_v("score_max", nullptr),
+          py::arg_v("score_sum_exp", nullptr),
           R"pbdoc(
                 Perform scaled dot product attention.
 
@@ -724,8 +738,10 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     paged_attention_max_seq_len_kv (Optional[integer]): The maximum sequence length for k/v caches when paged attention is active.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                     name (Optional[str]): The name of the operation.
-                    generate_stats (Optional[bool]): If true, compute and output softmax stats (useful at training time). Default is None, but one of {generate_stats, is_inference} must be set.
+                    generate_stats (Optional[bool]): If true, compute and output softmax stats (useful at training time). Default is None, but one of {generate_stats, is_inference} must be set.   
                     implementation (Optional[cudnn.attention_implementation]): Which underlying implementation to use in the cuDNN backend. Default is AUTO (recommended).              
+                    score_max (Optional[cudnn_tensor]): The max of attention score.
+                    score_sum_exp (Optional[cudnn_tensor]): The numerically stable sum of exponents using normalized values wrt max score.
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and diagonal_band_right_bound=0. Default is TOP_LEFT.
                     diagonal_band_left_bound (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
@@ -842,6 +858,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("name", ""),
           py::arg_v("fn", std::nullopt),
           py::arg_v("generate_stats", py::none()),
+          py::arg_v("score_max", nullptr),
+          py::arg_v("score_sum_exp", nullptr),
           R"pbdoc(
                 Perform scaled dot product attention with fp8 datatype inputs and outputs.
 
@@ -870,6 +888,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     name (Optional[str]): The name of the operation.
                     fn (Optional[callable]): An optional callback function for attention score modification. Default is None.
                     generate_stats (Optional[bool]): If true, compute and output softmax stats (useful at training time). Default is None, but one of {generate_stats, is_inference} must be set.
+                    score_max (Optional[cudnn_tensor]): The max of attention score.
+                    score_sum_exp (Optional[cudnn_tensor]): The numerically stable sum of exponents using normalized values wrt max score.
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and right_bound=0. Default is TOP_LEFT.
                     left_bound (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.

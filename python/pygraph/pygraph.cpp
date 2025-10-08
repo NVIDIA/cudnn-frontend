@@ -273,10 +273,12 @@ std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::block_scale_dequantize(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
                                 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale,
                                 std::vector<int32_t> const& block_size,
+                                bool const is_negative_scale,
                                 cudnn_frontend::DataType_t const& compute_data_type,
                                 std::string const& name) {
     auto attributes = cudnn_frontend::graph::Block_scale_dequantize_attributes()
                           .set_block_size(block_size)
+                          .set_is_negative_scale(is_negative_scale)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
     if (compute_data_type != cudnn_frontend::DataType_t::NOT_SET) {
@@ -841,10 +843,22 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("input"),
              py::arg("descale"),
              py::arg("block_size"),
+             py::arg_v("is_negative_scale", false),
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("name", ""),
              R"pbdoc(
                 Dequantize an input tensor to other dimensions without changing the actual memory layout.
+                
+                Args:
+                    input (cudnn_tensor): The input tensor to dequantize.
+                    descale (cudnn_tensor): The scale tensor for dequantization.
+                    block_size (List[int]): The block size for dequantization.
+                    is_negative_scale (Optional[bool]): Whether the scale values can be negative. Default is False.
+                    compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
+                    name (Optional[str]): A name for the operation.
+                
+                Returns:
+                    cudnn_tensor: The dequantized output tensor.
             )pbdoc")
         .def("reshape",
              &PyGraph::reshape,

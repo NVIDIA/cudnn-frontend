@@ -30,7 +30,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
     error_t
     pre_validate_node() const override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating SDPAFP8BackwardNode " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating SDPAFP8BackwardNode " << attributes.name);
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90100,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -205,8 +205,8 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
     error_t
     expand_node() override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for Scaled_dot_product_flash_attention node  "
-                                << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO:     Inferrencing properties for Scaled_dot_product_flash_attention node  "
+                                << attributes.name);
 
         attributes.fill_from_context(context);
 

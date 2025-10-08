@@ -70,7 +70,7 @@ class GenstatsNode : public NodeCRTP<GenstatsNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Building GenstatsNode operations " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL("INFO: " << "Building GenstatsNode operations " << attributes.name << " ");
 
         auto&& genstats_operation_builder =
             cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_GEN_STATS_DESCRIPTOR);

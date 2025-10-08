@@ -566,11 +566,11 @@ run_fp8_dgrad_descale_descale_amax_scale(int64_t* dx_dim,
         // Create a unique_ptr for the cuDNN handle
         auto handle_ptr = create_cudnn_handle();
         auto handle_    = *handle_ptr;
-        if (check_device_arch_newer_than("hopper") == false) {
+        if (!is_hopper_arch() && !is_blackwell_computing_arch()) {
             cudnn_frontend::set_error_and_throw_exception(
                 nullptr,
                 CUDNN_STATUS_ARCH_MISMATCH,
-                "run_fp8_dgrad_descale_descale_amax_scale: Sample requires Ampere or above GPU");
+                "run_fp8_dgrad_descale_descale_amax_scale: Sample requires Hopper or Blackwell Computing GPU");
         }
         // Creates the necessary tensor descriptors
         int64_t stride[4];

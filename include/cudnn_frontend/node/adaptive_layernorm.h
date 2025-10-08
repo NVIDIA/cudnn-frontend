@@ -23,7 +23,7 @@ class AdaLayerNormNode : public NodeCRTP<AdaLayerNormNode> {
 
     error_t
     infer_properties_node() override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferencing properties for adalayernorm node " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferencing properties for adalayernorm node " << attributes.name);
 
         attributes.fill_from_context(context);
 
@@ -122,7 +122,7 @@ class AdaLayerNormNode : public NodeCRTP<AdaLayerNormNode> {
 
     error_t
     pre_validate_node() const override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Validating AdaLayerNormNode " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Validating AdaLayerNormNode " << attributes.name);
         // Norm forward phase should be set
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.forward_phase == NormFwdPhase_t::NOT_SET,
                                        error_code_t::ATTRIBUTE_NOT_SET,
@@ -137,8 +137,8 @@ class AdaLayerNormNode : public NodeCRTP<AdaLayerNormNode> {
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Building AdaLayernorm operations " << attributes.name << "..."
-                    << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Building AdaLayernorm operations " << attributes.name << std::endl;
+
         auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED, "AdaLN fwd requires cuDNN v9.9.0"};
 #if (CUDNN_VERSION >= 90900)
         NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90900, cudnn_ver_error);
@@ -248,7 +248,7 @@ class AdaLayerNormNode : public NodeCRTP<AdaLayerNormNode> {
 #endif
 };
 
-/************************************************************************/
+/*******/
 
 class DAdaLayerNormNode : public NodeCRTP<DAdaLayerNormNode> {
    public:
@@ -264,7 +264,7 @@ class DAdaLayerNormNode : public NodeCRTP<DAdaLayerNormNode> {
 
     error_t
     infer_properties_node() override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferencing properties for DAdaLayerNorm node " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferencing properties for DAdaLayerNorm node " << attributes.name);
 
         attributes.fill_from_context(context);
 
@@ -330,7 +330,7 @@ class DAdaLayerNormNode : public NodeCRTP<DAdaLayerNormNode> {
 
     error_t
     pre_validate_node() const override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating DAdaLayerNormNode node " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating DAdaLayerNormNode node " << attributes.name);
 
         return {error_code_t::OK, ""};
     }
@@ -341,7 +341,7 @@ class DAdaLayerNormNode : public NodeCRTP<DAdaLayerNormNode> {
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Building DAdaLayerNormNode operations " << attributes.name << "..."
+        getLogger() << "[cudnn_frontend] INFO: " << "Building DAdaLayerNormNode operations " << attributes.name
                     << std::endl;
         auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED, "AdaLN bwd requires cuDNN v9.9.0"};
 #if (CUDNN_VERSION >= 90900)

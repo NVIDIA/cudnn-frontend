@@ -25,14 +25,7 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
 
     error_t
     pre_validate_node() const override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating SoftmaxNode " << attributes.name << "...");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            attributes.use_stats.has_value() == false, error_code_t::ATTRIBUTE_NOT_SET, "use_stats attribute not set.");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.use_M_Zinv.has_value() == false,
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "use_M_Zinv attribute not set.");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating SoftmaxNode " << attributes.name);
 
         return {error_code_t::OK, ""};
     }
@@ -44,7 +37,7 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
 
     error_t
     expand_node() override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for Softmax node " << attributes.name << ".");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO:     Inferrencing properties for Softmax node " << attributes.name);
 
         attributes.fill_from_context(context);
 
@@ -54,16 +47,16 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
         auto h           = p_dim[1];
         auto s_q         = p_dim[2];
 
-        auto max_output = attributes.outputs[Softmax_attributes::output_names::M];
-        if (!attributes.use_M_Zinv.value()) {
+        auto max_output = attributes.outputs[Softmax_attributes::output_names::Max];
+        if (max_output == nullptr) {
             max_output = std::make_shared<Tensor_attributes>();
-            max_output->set_name("M").set_is_virtual(true);
+            max_output->set_is_virtual(true);
         }
         //////////////// TODO //////////////////////////
         // Check Stride (Before setting dimension?)
         max_output->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
 
-        auto max_attributes = Reduction_attributes().set_name("M").set_mode(ReductionMode_t::MAX);
+        auto max_attributes = Reduction_attributes().set_name("Max").set_mode(ReductionMode_t::MAX);
         // If sink tensor is present, we also need to take a pointwise max with sink
         if (attributes.inputs.find(Softmax_attributes::input_names::SINK) != attributes.inputs.end()) {
             auto s_max = reduction(attributes.inputs[Softmax_attributes::input_names::P], max_attributes);
@@ -86,30 +79,44 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
         auto const& exp_output = pointwise(sub_output, exp_attributes);
         exp_output->set_name("exp_sub_M");
 
-        auto const& sum_output = [&]() {
-            auto sum_attributes = Reduction_attributes().set_name("sum").set_mode(ReductionMode_t::ADD);
-            // If sink tensor is present, also subtract it and take its exp
-            if (attributes.inputs.find(Softmax_attributes::input_names::SINK) != attributes.inputs.end()) {
-                auto sink_tensor = attributes.inputs[Softmax_attributes::input_names::SINK];
-                auto sub_sink    = pointwise(sink_tensor, max_output, sub_attributes);
-                sub_sink->set_name("sub_sink");
+        auto sum_output = attributes.outputs[Softmax_attributes::output_names::Sum_exp];
+        if (sum_output == nullptr) {
+            sum_output = std::make_shared<Tensor_attributes>();
+            sum_output->set_is_virtual(true);
+        }
+        sum_output->set_name("SumExp").set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+        auto sum_attributes = Reduction_attributes().set_name("sum").set_mode(ReductionMode_t::ADD);
+        // If sink tensor is present, also subtract it and take its exp
+        if (attributes.inputs.find(Softmax_attributes::input_names::SINK) != attributes.inputs.end()) {
+            auto sink_tensor = attributes.inputs[Softmax_attributes::input_names::SINK];
+            auto sub_sink    = pointwise(sink_tensor, max_output, sub_attributes);
+            sub_sink->set_name("sub_sink");
 
-                auto exp_sink = pointwise(sub_sink, exp_attributes);
-                exp_sink->set_name("exp_sink");
+            auto exp_sink = pointwise(sub_sink, exp_attributes);
+            exp_sink->set_name("exp_sink");
 
-                auto temp_sum = reduction(exp_output, sum_attributes);
-                temp_sum->set_name("SumExp").set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+            auto temp_sum = reduction(exp_output, sum_attributes);
+            temp_sum->set_name("SumExp_elements").set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
 
-                auto add_attributes = Pointwise_attributes().set_name("add_sink").set_mode(PointwiseMode_t::ADD);
-                return pointwise(temp_sum, exp_sink, add_attributes);
-            } else {
-                return reduction(exp_output, sum_attributes);
-            }
-        }();
-        sum_output->set_name("Z").set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+            auto add_attributes = Pointwise_attributes().set_name("add_sink").set_mode(PointwiseMode_t::ADD);
+            pointwise(temp_sum, exp_sink, add_attributes, sum_output);
+        } else {
+            reduction(exp_output, sum_attributes, sum_output);
+        }
 
-        // Another path to add when in flash attention mode.
-        if (attributes.use_stats.value()) {
+        // WAR when:
+        // - softmax stats in not requested
+        // - max and sum_exp are not requested
+        if (attributes.outputs[Softmax_attributes::output_names::Stats] == nullptr &&
+            attributes.outputs[Softmax_attributes::output_names::Max] == nullptr &&
+            attributes.outputs[Softmax_attributes::output_names::Sum_exp] == nullptr) {
+            auto softmax_stats = std::make_shared<Tensor_attributes>();
+            softmax_stats->set_is_virtual(true);
+            attributes.outputs[Softmax_attributes::output_names::Stats] = softmax_stats;
+        }
+
+        if (attributes.outputs.find(Softmax_attributes::output_names::Stats) != attributes.outputs.end() &&
+            attributes.outputs[Softmax_attributes::output_names::Stats] != nullptr) {
             auto log_attributes    = Pointwise_attributes().set_name("log").set_mode(PointwiseMode_t::LOG);
             auto const& log_output = pointwise(sum_output, log_attributes);
             log_output->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
@@ -120,25 +127,9 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
                 max_output, log_output, add_attributes, attributes.outputs[Softmax_attributes::output_names::Stats]);
         }
 
-        if (attributes.use_M_Zinv.value()) {
-            auto reciprocal_attributes =
-                Pointwise_attributes().set_name("reciprocal").set_mode(PointwiseMode_t::RECIPROCAL);
-            // Special non-functional-style call. Needed because output already created and provided to user.
-            pointwise(sum_output, reciprocal_attributes, attributes.outputs[Softmax_attributes::output_names::Zinv]);
-        }
-
-        if (!attributes.use_M_Zinv.value()) {
-            auto div_attributes = Pointwise_attributes().set_name("div").set_mode(PointwiseMode_t::DIV);
-            // Special non-functional-style call. Needed because output already created and provided to user.
-            pointwise(exp_output, sum_output, div_attributes, attributes.outputs[Softmax_attributes::output_names::S]);
-        } else {
-            auto mul_attributes = Pointwise_attributes().set_name("mul").set_mode(PointwiseMode_t::MUL);
-            // Special non-functional-style call. Needed because output already created and provided to user.
-            pointwise(exp_output,
-                      attributes.outputs[Softmax_attributes::output_names::Zinv],
-                      mul_attributes,
-                      attributes.outputs[Softmax_attributes::output_names::S]);
-        }
+        auto div_attributes = Pointwise_attributes().set_name("div").set_mode(PointwiseMode_t::DIV);
+        // Special non-functional-style call. Needed because output already created and provided to user.
+        pointwise(exp_output, sum_output, div_attributes, attributes.outputs[Softmax_attributes::output_names::S]);
 
         return {error_code_t::OK, ""};
     }
@@ -155,23 +146,15 @@ inline void
 INode::softmax(std::shared_ptr<Tensor_attributes> p,
                Softmax_attributes attributes,
                std::shared_ptr<Tensor_attributes> s,
-               std::shared_ptr<Tensor_attributes> stats) {
-    attributes.inputs[Softmax_attributes::input_names::P]       = p;
-    attributes.outputs[Softmax_attributes::output_names::S]     = s;
-    attributes.outputs[Softmax_attributes::output_names::Stats] = stats;
+               std::shared_ptr<Tensor_attributes> stats,
+               std::shared_ptr<Tensor_attributes> max,
+               std::shared_ptr<Tensor_attributes> sum_exp) {
+    attributes.inputs[Softmax_attributes::input_names::P]         = p;
+    attributes.outputs[Softmax_attributes::output_names::S]       = s;
+    attributes.outputs[Softmax_attributes::output_names::Stats]   = stats;
+    attributes.outputs[Softmax_attributes::output_names::Max]     = max;
+    attributes.outputs[Softmax_attributes::output_names::Sum_exp] = sum_exp;
     sub_nodes.emplace_back(std::make_unique<SoftmaxNode>(std::move(attributes), context));
 }
 
-inline void
-INode::softmax(std::shared_ptr<Tensor_attributes> p,
-               Softmax_attributes attributes,
-               std::shared_ptr<Tensor_attributes> s,
-               std::shared_ptr<Tensor_attributes> m,
-               std::shared_ptr<Tensor_attributes> zinv) {
-    attributes.inputs[Softmax_attributes::input_names::P]      = p;
-    attributes.outputs[Softmax_attributes::output_names::S]    = s;
-    attributes.outputs[Softmax_attributes::output_names::M]    = m;
-    attributes.outputs[Softmax_attributes::output_names::Zinv] = zinv;
-    sub_nodes.emplace_back(std::make_unique<SoftmaxNode>(std::move(attributes), context));
-}
 }  // namespace cudnn_frontend::graph

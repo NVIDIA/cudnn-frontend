@@ -10,22 +10,22 @@ The provided benchmark targets training use cases--causal masking is enabled for
 - `Dockerfile` to create a Docker container for the dependencies and run the benchmark.
 - `benchmark_bf16_sdpa.py` which runs cudnn, pytorch, and other backends up to 128k sequence length.
 - `benchmark_fp8_sdpa.py` which runs cudnn on fp8 along with bf16 up to 128k sequence length.
-- Sample benchmark output and results on B200 in the `artifacts` directory.
+- Sample benchmark output and results on B200 and GB300 in the `artifacts` directory.
 - Useful Python scripts for running single attention layers: 
   - `benchmark_single_sdpa.py` for benchmarking a single flash attention instance from various backends.
   - See below for usage example.
 
 ## Software versions
 
-This benchmark code should run on any decently modern Python environment with CUDA-enabled GPU. The results in `artifacts` were collected using the PyTorch docker image [from the NVIDIA GPU CLOUD (NGC) catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch), `nvcr.io/nvidia/pytorch:25.06-py3`, where cuDNN 9.10.2 was used. We provide a `Dockerfile` to reproduce the environment with the following library versions
+This benchmark code should run on any decently modern Python environment with CUDA-enabled GPU. The results in `artifacts` were collected using the PyTorch docker image [from the NVIDIA GPU CLOUD (NGC) catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch), `nvcr.io/nvidia/pytorch:25.09-py3`, where cuDNN 9.13.1 was used. We provide a `Dockerfile` to reproduce the environment with the following library versions
 
 
 | Software       | Version |
 |----------------|---------|
-| Python         | 3.12.9  |
-| CUDA           | 12.9.0  |
-| cuDNN          | 9.10.2  |
-| PyTorch        | 2.8.0   |
+| Python         | 3.12.3  |
+| CUDA           | 13.0.0  |
+| cuDNN          | 9.13.1  |
+| PyTorch        | 2.9.0   |
 | FlashAttention | 2.7.4   |
 
 
@@ -60,13 +60,13 @@ Please note that FlashAttention-3 is currently not supported on NVIDIA's Blackwe
 Sample outputs:
 ```
 $ python3 benchmark_bf16_sdpa.py
-[INFO] torch.__version__ = '2.8.0a0+5228986c39.nv25.06'
-[INFO] torch.version.cuda = '12.9'
+[INFO] torch.__version__ = '2.9.0a0+50eac811a6.nv25.09'
+[INFO] torch.version.cuda = '13.0'
 [INFO] torch.cuda.is_available() = True
-[INFO] torch.cuda.device_count() = 1
+[INFO] torch.cuda.device_count() = 8
 [INFO] torch.cuda.current_device() = 0
 [INFO] torch.cuda.get_device_name(torch.cuda.current_device()) = 'NVIDIA B200'
-[INFO] torch.backends.cudnn.version() = 91002
+[INFO] torch.backends.cudnn.version() = 91300
 [INFO] torch.backends.cudnn.enabled = True
 [INFO] flash_attn.__version__ = '2.7.4.post1'
 [INFO] Begin benchmark for layers (batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim)
@@ -79,12 +79,12 @@ $ python3 benchmark_bf16_sdpa.py
 
 ```
 $ python3 benchmark_sdpa_fp8.py
-[INFO] cuDNN Backend Version: cudnn.backend_version() = 91002
-[INFO] cuDNN Frontend Version: cudnn.__version__ = '1.12.0'
-[INFO] torch.__version__ = '2.8.0a0+5228986c39.nv25.06'
-[INFO] torch.version.cuda = '12.9'
+[INFO] cuDNN Backend Version: cudnn.backend_version() = 91301
+[INFO] cuDNN Frontend Version: cudnn.__version__ = '1.14.1'
+[INFO] torch.__version__ = '2.9.0a0+50eac811a6.nv25.09'
+[INFO] torch.version.cuda = '13.0'
 [INFO] torch.cuda.is_available() = True
-[INFO] torch.cuda.device_count() = 1
+[INFO] torch.cuda.device_count() = 8
 [INFO] torch.cuda.current_device() = 0
 [INFO] torch.cuda.get_device_name(torch.cuda.current_device()) = 'NVIDIA B200'
 [INFO] Begin benchmark for layers (batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim)
@@ -100,13 +100,13 @@ $ python3 benchmark_sdpa_fp8.py
 Benchmarked performance numbers are stored in the [artifacts](artifacts) directory as csv and png files.
 
 ## Results
-Below are the result of the benchmark running on a single B200 GPU.
+Below are the result of the benchmark running on a single B200 GPU and a single GB300 GPU.
 
 For both runs, the following software versions are used:
 
-- CUDA: 12.9 (from NGC container)
-- PyTorch: 2.8.0 (from NGC container)
-- cuDNN: 9.10.2 (Installed via `apt-get`; see `Dockerfile`)
+- CUDA: 13.0 (from NGC container)
+- PyTorch: 2.9.0 (from NGC container)
+- cuDNN: 9.13.1 (Installed via `apt-get`; see `Dockerfile`)
 
 
 ### B200 - BF16 Performance Comparison between Backends
@@ -120,6 +120,18 @@ For both runs, the following software versions are used:
 - SDPA parameters were used `batch=1; num_q_heads=128; num_kv_heads=8; head_dim=128; is_causal=True; dtype=bfloat16`. 
 - Sequence lengths are shown in the x-axis. 
 - Results were obtained on an NVIDIA B200 GPU with free clock.
+
+### GB300 - BF16 Performance Comparison between Backends
+![Comparison of pytorch and cudnn](artifacts/sdpa_bf16_benchmark_results_NVIDIA_GB300.png)
+- SDPA parameters were used `batch=1; num_q_heads=128; num_kv_heads=8; head_dim=128; is_causal=True; dtype=bfloat16`. 
+- Sequence lengths are shown in the x-axis. 
+- Results were obtained on an NVIDIA GB300 GPU with free clock.
+
+### GB300 - cuDNN's FP8 Performance Relative to BF16
+![Comparison of pytorch and cudnn](artifacts/sdpa_fp8_benchmark_results_NVIDIA_GB300.png)
+- SDPA parameters were used `batch=1; num_q_heads=128; num_kv_heads=8; head_dim=128; is_causal=True; dtype=bfloat16`. 
+- Sequence lengths are shown in the x-axis. 
+- Results were obtained on an NVIDIA GB300 GPU with free clock.
 
 ## Pytorch adoption
 As demonstrated can be seen from the results, cuDNN v9 can achieve over 2x the performance of the comparable PyTorch eager implementation. Refer to [PyTorch's scaled_dot_product_attention()](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html) and [sdpa_kernel](https://docs.pytorch.org/docs/stable/generated/torch.nn.attention.sdpa_kernel.html#torch.nn.attention.sdpa_kernel) context manager documentations for enabling the cuDNN backend for scaled dot product attention.

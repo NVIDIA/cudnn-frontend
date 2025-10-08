@@ -65,6 +65,22 @@ def _torch_to_cudnn_data_type(torch_data_type) -> cudnn_data_type:
         return None
 
 
+def _cudnn_to_torch_data_type(cudnn_data_type):
+    """Convert a cuDNN data type to a PyTorch data type.
+
+    Args:
+        cudnn_data_type: The cuDNN data type to convert.
+
+    Returns:
+        The PyTorch data type, or None if the conversion is not available.
+    """
+    if is_torch_available():
+        for torch_type, cudnn_type in _torch_to_cudnn_data_type_dict.items():
+            if cudnn_type == cudnn_data_type:
+                return torch_type
+    return None
+
+
 def _library_type(input_type):
     if type(input_type) is cudnn_data_type:
         return input_type

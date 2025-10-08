@@ -17,10 +17,11 @@ IF(CUDNN_FRONTEND_USE_SYSTEM_DLPACK)
     message(FATAL_ERROR "dlpack not found")
   endif()
 else()
+
   # Read dlpack version from dlpack_version.txt
   file(READ ${PROJECT_SOURCE_DIR}/dlpack_version.txt DLPACK_VERSION)
   string(STRIP "${DLPACK_VERSION}" DLPACK_VERSION)
-  
+
   FetchContent_Declare(
     dlpack
     GIT_REPOSITORY https://github.com/dmlc/dlpack

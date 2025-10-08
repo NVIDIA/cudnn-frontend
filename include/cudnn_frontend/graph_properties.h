@@ -1645,12 +1645,14 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         SINK_TOKEN,
     };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
-    enum class output_names { O, Stats, RNG_DUMP, Amax_S, Amax_O };
+    enum class output_names { O, Stats, Max, Sum_exp, RNG_DUMP, Amax_S, Amax_O };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
     // Convenience struct for named access to SDPA outputs
     struct SDPA_outputs {
         std::shared_ptr<Tensor_attributes> O;         ///< Main attention output tensor
         std::shared_ptr<Tensor_attributes> Stats;     ///< Statistics/softmax output (when generate_stats=true)
+        std::shared_ptr<Tensor_attributes> Max;       ///< Max output tensor
+        std::shared_ptr<Tensor_attributes> Sum_exp;   ///< Sum_exp output tensor
         std::shared_ptr<Tensor_attributes> RNG_DUMP;  ///< Random number generator dump for dropout
                                                       ///< check why we don't return RNG_DUMP this way
         std::shared_ptr<Tensor_attributes> Amax_S;    ///< FP8 absolute maximum for attention scores
@@ -1678,6 +1680,18 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     SDPA_attributes&
     set_generate_stats(bool const value) {
         generate_stats = value;
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_logit_max(std::shared_ptr<Tensor_attributes> value) {
+        outputs[SDPA_attributes::output_names::Max] = std::move(value);
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_score_sum_exp(std::shared_ptr<Tensor_attributes> value) {
+        outputs[SDPA_attributes::output_names::Sum_exp] = std::move(value);
         return *this;
     }
 
@@ -1858,10 +1872,10 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     // Internal function - do not use directly in application code
     void
     _auto_select_implementation(const detail::Context& context) {
-        if (validate_sdpa_support_surface_for_implementation(context, AttentionImplementation_t::UNIFIED).is_good()) {
+        if (verify_sdpa_support_surface_for_implementation(context, AttentionImplementation_t::UNIFIED).is_good()) {
             implementation = AttentionImplementation_t::UNIFIED;
             CUDNN_FE_LOG_LABEL_ENDL("INFO: Auto-selected SDPA implementation UNIFIED");
-        } else if (validate_sdpa_support_surface_for_implementation(context, AttentionImplementation_t::COMPOSITE)
+        } else if (verify_sdpa_support_surface_for_implementation(context, AttentionImplementation_t::COMPOSITE)
                        .is_good()) {
             implementation = AttentionImplementation_t::COMPOSITE;
             CUDNN_FE_LOG_LABEL_ENDL("INFO: Auto-selected SDPA implementation COMPOSITE");
@@ -1875,8 +1889,8 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     // Check whether implementation `impl` supports the requested features. `impl` must not be AUTO.
     // (The `implementation` member variable is ignored.)
     error_t
-    validate_sdpa_support_surface_for_implementation(const detail::Context& context,
-                                                     AttentionImplementation_t impl) const;
+    verify_sdpa_support_surface_for_implementation(const detail::Context& context,
+                                                   AttentionImplementation_t impl) const;
 };
 
 // Type alias for backward compatibility - SDPA_fp8_attributes is now an alias to SDPA_attributes
@@ -2263,27 +2277,12 @@ class Softmax_attributes : public Attributes<Softmax_attributes> {
     friend class SoftmaxNode;
     friend class INode;
 
-    std::optional<bool> use_stats;
-    std::optional<bool> use_M_Zinv;
-
    public:
     enum class input_names { P, SINK };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
-    enum class output_names { S, Stats, M, Zinv };
+    enum class output_names { S, Stats, Max, Sum_exp };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Softmax_attributes, name, compute_data_type, inputs, outputs, use_stats, use_M_Zinv)
-
-    Softmax_attributes&
-    has_stats(bool const value) {
-        use_stats = value;
-        return *this;
-    }
-
-    Softmax_attributes&
-    has_M_Zinv(bool const value) {
-        use_M_Zinv = value;
-        return *this;
-    }
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Softmax_attributes, name, compute_data_type, inputs, outputs)
 
     Softmax_attributes&
     set_sink(std::shared_ptr<Tensor_attributes> value) {
@@ -2482,6 +2481,7 @@ class Block_scale_dequantize_attributes : public Attributes<Block_scale_dequanti
     friend class Graph;
 
     std::vector<int32_t> block_size;
+    bool is_negative_scale;
 
    public:
     enum class input_names { X, scale };
@@ -2493,7 +2493,8 @@ class Block_scale_dequantize_attributes : public Attributes<Block_scale_dequanti
                                    compute_data_type,
                                    inputs,
                                    outputs,
-                                   block_size)
+                                   block_size,
+                                   is_negative_scale)
 
     Block_scale_dequantize_attributes&
     set_block_size(int32_t const value, int32_t idx = 0) {
@@ -2522,6 +2523,17 @@ class Block_scale_dequantize_attributes : public Attributes<Block_scale_dequanti
     Block_scale_dequantize_attributes&
     set_block_size(const std::vector<int32_t>& values) {
         block_size = values;
+        return *this;
+    }
+
+    bool
+    get_is_negative_scale() const {
+        return is_negative_scale;
+    }
+
+    Block_scale_dequantize_attributes&
+    set_is_negative_scale(bool value) {
+        is_negative_scale = value;
         return *this;
     }
 };

@@ -1,10 +1,10 @@
-[INFO] torch.__version__ = '2.8.0a0+5228986c39.nv25.06'
-[INFO] torch.version.cuda = '12.9'
+[INFO] torch.__version__ = '2.9.0a0+50eac811a6.nv25.09'
+[INFO] torch.version.cuda = '13.0'
 [INFO] torch.cuda.is_available() = True
-[INFO] torch.cuda.device_count() = 1
+[INFO] torch.cuda.device_count() = 8
 [INFO] torch.cuda.current_device() = 0
 [INFO] torch.cuda.get_device_name(torch.cuda.current_device()) = 'NVIDIA B200'
-[INFO] torch.backends.cudnn.version() = 91002
+[INFO] torch.backends.cudnn.version() = 91300
 [INFO] torch.backends.cudnn.enabled = True
 [INFO] flash_attn.__version__ = '2.7.4.post1'
 [INFO] Begin benchmark for layers (batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim)

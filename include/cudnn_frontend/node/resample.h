@@ -22,7 +22,7 @@ class ResampleNode : public NodeCRTP<ResampleNode> {
 
     error_t
     pre_validate_node() const override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Validating ResampleNode " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Validating ResampleNode " << attributes.name);
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.generate_index.has_value() == false,
                                        error_code_t::ATTRIBUTE_NOT_SET,
@@ -44,7 +44,7 @@ class ResampleNode : public NodeCRTP<ResampleNode> {
 
     error_t
     infer_properties_node() override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for resample node " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO:     Inferrencing properties for resample node " << attributes.name);
 
         auto y_tensor = attributes.outputs[Resample_attributes::output_names::Y];
         auto x_tensor = attributes.inputs[Resample_attributes::input_names::X];
@@ -101,7 +101,7 @@ class ResampleNode : public NodeCRTP<ResampleNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Building ResampleNode operations " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL("INFO: " << "Building ResampleNode operations " << attributes.name << " ");
 
         auto number_of_spatial_dim = static_cast<int64_t>(attributes.window.size());
 

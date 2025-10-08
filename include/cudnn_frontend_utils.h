@@ -674,22 +674,35 @@ enum class DataType_t {
     FP8_E8M0,
     FP4_E2M1,
     INT4,
+    COMPLEX_FP32,
+    COMPLEX_FP64,
 };
 
-NLOHMANN_JSON_SERIALIZE_ENUM(
-    DataType_t,
-    {
-        {DataType_t::NOT_SET, nullptr},     {DataType_t::FLOAT, "FLOAT"},
-        {DataType_t::DOUBLE, "DOUBLE"},     {DataType_t::HALF, "HALF"},
-        {DataType_t::INT8, "INT8"},         {DataType_t::INT32, "INT32"},
-        {DataType_t::INT8x4, "INT8x4"},     {DataType_t::UINT8, "UINT8"},
-        {DataType_t::UINT8x4, "UINT8x4"},   {DataType_t::INT8x32, "INT8x32"},
-        {DataType_t::BFLOAT16, "BFLOAT16"}, {DataType_t::INT64, "INT64"},
-        {DataType_t::BOOLEAN, "BOOLEAN"},   {DataType_t::FP8_E4M3, "FP8_E4M3"},
-        {DataType_t::FP8_E5M2, "FP8_E5M2"}, {DataType_t::FAST_FLOAT_FOR_FP8, "FAST_FLOAT_FOR_FP8"},
-        {DataType_t::FP8_E8M0, "FP8_E8M0"}, {DataType_t::FP4_E2M1, "FP4_E2M1"},
-        {DataType_t::INT4, "INT4"},
-    })
+NLOHMANN_JSON_SERIALIZE_ENUM(DataType_t,
+                             {
+                                 {DataType_t::NOT_SET, nullptr},
+                                 {DataType_t::FLOAT, "FLOAT"},
+                                 {DataType_t::DOUBLE, "DOUBLE"},
+                                 {DataType_t::HALF, "HALF"},
+                                 {DataType_t::INT8, "INT8"},
+                                 {DataType_t::INT32, "INT32"},
+                                 {DataType_t::INT8x4, "INT8x4"},
+                                 {DataType_t::UINT8, "UINT8"},
+                                 {DataType_t::UINT8x4, "UINT8x4"},
+                                 {DataType_t::INT8x32, "INT8x32"},
+                                 {DataType_t::BFLOAT16, "BFLOAT16"},
+                                 {DataType_t::INT64, "INT64"},
+                                 {DataType_t::BOOLEAN, "BOOLEAN"},
+                                 {DataType_t::FP8_E4M3, "FP8_E4M3"},
+                                 {DataType_t::FP8_E5M2, "FP8_E5M2"},
+                                 {DataType_t::FAST_FLOAT_FOR_FP8, "FAST_FLOAT_FOR_FP8"},
+                                 {DataType_t::FP8_E8M0, "FP8_E8M0"},
+                                 {DataType_t::FP4_E2M1, "FP4_E2M1"},
+                                 {DataType_t::INT4, "INT4"},
+                                 {DataType_t::COMPLEX_FP32, "COMPLEX_FP32"},
+                                 {DataType_t::COMPLEX_FP64, "COMPLEX_FP64"},
+
+                             })
 
 enum class ReductionMode_t {
     NOT_SET,
@@ -1066,7 +1079,7 @@ convert_to_cudnn_type(cudnn_frontend::DataType_t const mode, cudnnDataType_t& cu
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
         case DataType_t::FP8_E8M0:
-#if (CUDNN_VERSION >= 90700)  // TODO: v9.99 is new feature branch; switch to release branch when ready
+#if (CUDNN_VERSION >= 90700)
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90700, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
             cudnn_mode = CUDNN_DATA_FP8_E8M0;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
@@ -1074,7 +1087,7 @@ convert_to_cudnn_type(cudnn_frontend::DataType_t const mode, cudnnDataType_t& cu
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
         case DataType_t::FP4_E2M1:
-#if (CUDNN_VERSION >= 90700)  // TODO: v9.99 is new feature branch; switch to release branch when ready
+#if (CUDNN_VERSION >= 90700)
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(90700, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
             cudnn_mode = CUDNN_DATA_FP4_E2M1;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
@@ -1089,7 +1102,22 @@ convert_to_cudnn_type(cudnn_frontend::DataType_t const mode, cudnnDataType_t& cu
 #else
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
-
+        case DataType_t::COMPLEX_FP32:
+#if (CUDNN_VERSION >= 91400)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91400, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_DATA_COMPLEX_FP32;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
+        case DataType_t::COMPLEX_FP64:
+#if (CUDNN_VERSION >= 91400)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91400, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_DATA_COMPLEX_FP64;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
@@ -2160,17 +2188,23 @@ convert_from_cudnn_type(cudnnDataType_t const cudnn_mode) {
         case CUDNN_DATA_FAST_FLOAT_FOR_FP8:
             return DataType_t::FAST_FLOAT_FOR_FP8;
 #endif
-#if (CUDNN_VERSION >= 90700)  // TODO: v9.99 is new feature branch; switch to release branch when ready
+#if (CUDNN_VERSION >= 90700)
         case CUDNN_DATA_FP8_E8M0:
             return DataType_t::FP8_E8M0;
 #endif
-#if (CUDNN_VERSION >= 90700)  // TODO: v9.99 is new feature branch; switch to release branch when ready
+#if (CUDNN_VERSION >= 90700)
         case CUDNN_DATA_FP4_E2M1:
             return DataType_t::FP4_E2M1;
 #endif
 #if (CUDNN_VERSION >= 91100)
         case CUDNN_DATA_INT4:
             return DataType_t::INT4;
+#endif
+#if (CUDNN_VERSION >= 91400)
+        case CUDNN_DATA_COMPLEX_FP32:
+            return DataType_t::COMPLEX_FP32;
+        case CUDNN_DATA_COMPLEX_FP64:
+            return DataType_t::COMPLEX_FP64;
 #endif
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
@@ -2186,8 +2220,16 @@ get_element_size_in_bits(cudnn_frontend::DataType_t datatype) {
         case DataType_t::INT8x32:
             return 256;
             break;
+#if (CUDNN_VERSION >= 91400)
+        case DataType_t::COMPLEX_FP64:
+            return 128;
+            break;
+#endif
         case DataType_t::DOUBLE:
         case DataType_t::INT64:
+#if (CUDNN_VERSION >= 91400)
+        case DataType_t::COMPLEX_FP32:
+#endif
             return 64;
             break;
         case DataType_t::FLOAT:

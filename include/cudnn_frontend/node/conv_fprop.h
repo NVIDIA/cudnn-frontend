@@ -22,7 +22,7 @@ class ConvolutionNode : public NodeCRTP<ConvolutionNode> {
 
     error_t
     pre_validate_node() const override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating Node Type::CONVOLUTION " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating Node Type::CONVOLUTION " << attributes.name);
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             attributes.get_pre_padding().empty(), error_code_t::ATTRIBUTE_NOT_SET, "Pre padding not set.");
@@ -38,7 +38,7 @@ class ConvolutionNode : public NodeCRTP<ConvolutionNode> {
 
     error_t
     infer_properties_node() override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for conv node " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO:     Inferrencing properties for conv node " << attributes.name);
 
         attributes.fill_from_context(context);
 
@@ -87,7 +87,7 @@ class ConvolutionNode : public NodeCRTP<ConvolutionNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Building ConvolutionNode operations " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL("INFO: Building ConvolutionNode operations " << attributes.name << " ");
 
         // convolution descriptor
         int64_t const spatial_dim_count = attributes.get_pre_padding().size();

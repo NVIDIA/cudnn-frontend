@@ -91,7 +91,7 @@ TEST_CASE("LayerNorm Zero Centered Gamma Training", "[layernorm][graph][zero_cen
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
 
     REQUIRE(graph.check_support().is_good());
 
@@ -184,7 +184,7 @@ TEST_CASE("LayerNorm Zero Centered Gamma Inference", "[layernorm][graph][zero_ce
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
 
     REQUIRE(graph.check_support().is_good());
 
@@ -274,7 +274,7 @@ TEST_CASE("LayerNorm Zero Centered Gamma Backward", "[layernorm][graph][zero_cen
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
 
     REQUIRE(graph.check_support().is_good());
 

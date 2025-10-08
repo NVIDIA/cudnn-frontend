@@ -19,6 +19,7 @@ add_executable(
     sdpa/fp8_bwd_bottom_right_causal_mask.cpp
     sdpa/fp16_fwd_with_sink_token.cpp
     sdpa/fp16_bwd_with_sink_token.cpp
+    sdpa/fp16_fwd_with_max_and_sum_exp.cpp
 
     convolution/fprop.cpp
     convolution/fp8_fprop.cpp
@@ -33,6 +34,7 @@ add_executable(
     matmul/mixed_matmul.cpp
     matmul/blackwell_nvfp4_mxfp8_block_scale_matmul.cpp
     matmul/general_block_scale_matmul.cpp
+    matmul/complex_fp32_matmul.cpp
 
     norm/batchnorm.cpp
     norm/layernorm.cpp

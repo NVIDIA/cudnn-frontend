@@ -627,7 +627,7 @@ def test_sdpa(
 
     if s_q == 1:
         is_left_bound = False
-        request.config.option.mha_left_bound = None
+        request.config.option.left_bound = None
         
     # key+value sequence length
     s_kv = (
@@ -671,29 +671,29 @@ def test_sdpa(
     block_size = random.choice([32, 64, 128])
 
     # Left/right bound should only be specified if we requested to set a left_bound/right_bound
-    assert (request.config.option.mha_left_bound is None) or is_left_bound
-    assert (request.config.option.mha_right_bound is None) or is_right_bound
+    assert (request.config.option.left_bound is None) or is_left_bound
+    assert (request.config.option.right_bound is None) or is_right_bound
 
     # If bounds are requested: randomly pick between 1/0 and s_kv/4
     left_bound = max(1, random.choice([1, s_kv//4])) if is_left_bound else None
     right_bound = random.choice([0, s_kv//4]) if is_right_bound else None
 
     # -------------------------- override test parameters if args are provided ----------------
-    b = int(request.config.option.mha_b) if request.config.option.mha_b != None else b
-    s_q = int(request.config.option.mha_s_q) if request.config.option.mha_s_q != None else s_q
-    s_kv = int(request.config.option.mha_s_kv) if request.config.option.mha_s_kv != None else s_kv
-    d_qk = int(request.config.option.mha_d_qk) if request.config.option.mha_d_qk != None else d_qk
-    d_v = int(request.config.option.mha_d_v) if request.config.option.mha_d_v != None else d_v
-    h_q = int(request.config.option.mha_h_q) if request.config.option.mha_h_q != None else h_q
-    h_k = int(request.config.option.mha_h_k) if request.config.option.mha_h_k != None else h_k
-    h_v = int(request.config.option.mha_h_v) if request.config.option.mha_h_v != None else h_v
-    block_size = int(request.config.option.mha_block_size) if request.config.option.mha_block_size != None else block_size
-    left_bound = int(request.config.option.mha_left_bound) if request.config.option.mha_left_bound != None else left_bound
-    right_bound = int(request.config.option.mha_right_bound) if request.config.option.mha_right_bound != None else right_bound
+    b = int(request.config.option.b) if request.config.option.b != None else b
+    s_q = int(request.config.option.s_q) if request.config.option.s_q != None else s_q
+    s_kv = int(request.config.option.s_kv) if request.config.option.s_kv != None else s_kv
+    d_qk = int(request.config.option.d_qk) if request.config.option.d_qk != None else d_qk
+    d_v = int(request.config.option.d_v) if request.config.option.d_v != None else d_v
+    h_q = int(request.config.option.h_q) if request.config.option.h_q != None else h_q
+    h_k = int(request.config.option.h_k) if request.config.option.h_k != None else h_k
+    h_v = int(request.config.option.h_v) if request.config.option.h_v != None else h_v
+    block_size = int(request.config.option.block_size) if request.config.option.block_size != None else block_size
+    left_bound = int(request.config.option.left_bound) if request.config.option.left_bound != None else left_bound
+    right_bound = int(request.config.option.right_bound) if request.config.option.right_bound != None else right_bound
 
     if s_q == 1:
         is_dropout = False
-        request.config.option.mha_dropout = None
+        request.config.option.dropout = None
 
     if d_qk != d_v and cudnn_version < "8.9.6":
         pytest.skip("d_qk != d_v is only supported on 8.9.6 onwards.")
@@ -702,11 +702,11 @@ def test_sdpa(
         pytest.skip("d_qk != d_v is not supported with ragged offset")
 
     print("\n=============== TEST CMD TO REPRODUCE ===============")
-    cmd = f"pytest {request.node.nodeid} --mha_b={b} --mha_s_q={s_q} --mha_s_kv={s_kv} --mha_d_qk={d_qk} --mha_d_v={d_v} --mha_h_q={h_q} --mha_h_k={h_k} --mha_h_v={h_v} --mha_block_size={block_size}"
+    cmd = f"pytest {request.node.nodeid} --b={b} --s_q={s_q} --s_kv={s_kv} --d_qk={d_qk} --d_v={d_v} --h_q={h_q} --h_k={h_k} --h_v={h_v} --block_size={block_size}"
     if left_bound is not None:
-        cmd += f" --mha_left_bound={left_bound}"
+        cmd += f" --left_bound={left_bound}"
     if right_bound is not None:
-        cmd += f" --mha_right_bound={right_bound}"
+        cmd += f" --right_bound={right_bound}"
 
     print(cmd)
     print("=====================================================")
@@ -1114,29 +1114,29 @@ def test_sdpa_backward(
 
     
     # Left/right bound should only be specified if we requested to set a left_bound/right_bound
-    assert (request.config.option.mha_left_bound is None) or is_left_bound
-    assert (request.config.option.mha_right_bound is None) or is_right_bound
+    assert (request.config.option.left_bound is None) or is_left_bound
+    assert (request.config.option.right_bound is None) or is_right_bound
 
     # If bounds are requested: randomly pick between 1/0 and s_kv/4
     left_bound = max(1, random.choice([1, s_kv//4])) if is_left_bound else None
     right_bound = random.choice([0, s_kv//4]) if is_right_bound else None
 
     # -------------------------- override test parameters if args are provided ----------------
-    b = int(request.config.option.mha_b) if request.config.option.mha_b != None else b
-    s_q = int(request.config.option.mha_s_q) if request.config.option.mha_s_q != None else s_q
-    s_kv = int(request.config.option.mha_s_kv) if request.config.option.mha_s_kv != None else s_kv
-    d_qk = int(request.config.option.mha_d_qk) if request.config.option.mha_d_qk != None else d_qk
-    d_v = int(request.config.option.mha_d_v) if request.config.option.mha_d_v != None else d_v
-    h_q = int(request.config.option.mha_h_q) if request.config.option.mha_h_q != None else h_q
-    h_k = int(request.config.option.mha_h_k) if request.config.option.mha_h_k != None else h_k
-    h_v = int(request.config.option.mha_h_v) if request.config.option.mha_h_v != None else h_v
+    b = int(request.config.option.b) if request.config.option.b != None else b
+    s_q = int(request.config.option.s_q) if request.config.option.s_q != None else s_q
+    s_kv = int(request.config.option.s_kv) if request.config.option.s_kv != None else s_kv
+    d_qk = int(request.config.option.d_qk) if request.config.option.d_qk != None else d_qk
+    d_v = int(request.config.option.d_v) if request.config.option.d_v != None else d_v
+    h_q = int(request.config.option.h_q) if request.config.option.h_q != None else h_q
+    h_k = int(request.config.option.h_k) if request.config.option.h_k != None else h_k
+    h_v = int(request.config.option.h_v) if request.config.option.h_v != None else h_v
     is_deterministic = (
-        bool(int(request.config.option.mha_deterministic))
-        if request.config.option.mha_deterministic != None
+        bool(int(request.config.option.deterministic))
+        if request.config.option.deterministic != None
         else is_deterministic
     )
-    left_bound = int(request.config.option.mha_left_bound) if request.config.option.mha_left_bound != None else left_bound
-    right_bound = int(request.config.option.mha_right_bound) if request.config.option.mha_right_bound != None else right_bound
+    left_bound = int(request.config.option.left_bound) if request.config.option.left_bound != None else left_bound
+    right_bound = int(request.config.option.right_bound) if request.config.option.right_bound != None else right_bound
 
     if d_qk != d_v and cudnn_version < "8.9.6":
         pytest.skip("d_qk != d_v is only supported on 8.9.6 onwards.")
@@ -1155,11 +1155,11 @@ def test_sdpa_backward(
         pytest.skip("Ampere deterministic implementation is not supported below 9.0.0")
 
     print("\n=============== TEST CMD TO REPRODUCE ===============")
-    cmd = f"pytest {request.node.nodeid} --mha_b={b} --mha_s_q={s_q} --mha_s_kv={s_kv} --mha_d_qk={d_qk} --mha_d_v={d_v} --mha_h_q={h_q} --mha_h_k={h_k} --mha_h_v={h_v} --mha_deterministic={int(is_deterministic)}"
+    cmd = f"pytest {request.node.nodeid} --b={b} --s_q={s_q} --s_kv={s_kv} --d_qk={d_qk} --d_v={d_v} --h_q={h_q} --h_k={h_k} --h_v={h_v} --deterministic={int(is_deterministic)}"
     if left_bound is not None:
-        cmd += f" --mha_left_bound={left_bound}"
+        cmd += f" --left_bound={left_bound}"
     if right_bound is not None:
-        cmd += f" --mha_right_bound={right_bound}"
+        cmd += f" --right_bound={right_bound}"
     print(cmd)
     print("=====================================================")
 

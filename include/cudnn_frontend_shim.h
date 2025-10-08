@@ -313,6 +313,31 @@ cuda_graph_add_memset_node_set_params(cudaGraphNode_t node, const cudaMemsetPara
 }
 
 inline cudaError_t
+cuda_graph_begin_capture(cudaStream_t stream, cudaStreamCaptureMode mode) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_begin_capture, cudaStreamBeginCapture, stream, mode);
+}
+
+inline cudaError_t
+cuda_stream_is_capturing(cudaStream_t stream, cudaStreamCaptureStatus *capture_status) {
+    NV_FE_CALL_TO_CUDA(cuda_stream_is_capturing, cudaStreamIsCapturing, stream, capture_status);
+}
+
+inline cudaError_t
+cuda_stream_create(cudaStream_t *stream) {
+    NV_FE_CALL_TO_CUDA(cuda_stream_create, cudaStreamCreate, stream);
+}
+
+inline cudaError_t
+cuda_stream_destroy(cudaStream_t stream) {
+    NV_FE_CALL_TO_CUDA(cuda_stream_destroy, cudaStreamDestroy, stream);
+}
+
+inline cudaError_t
+cuda_graph_end_capture(cudaStream_t stream, cudaGraph_t *graph) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_end_capture, cudaStreamEndCapture, stream, graph);
+}
+
+inline cudaError_t
 cuda_graph_destroy(cudaGraph_t graph) {
     NV_FE_CALL_TO_CUDA(cuda_graph_destroy, cudaGraphDestroy, graph);
 }
@@ -375,6 +400,16 @@ cu_get_error_string(CUresult error, const char **pStr) {
 inline cudaError_t
 cuda_device_synchronize() {
     NV_FE_CALL_TO_CUDA(cuda_device_synchronize, cudaDeviceSynchronize);
+}
+
+inline cudaError_t
+cuda_malloc(void **ptr, size_t sz) {
+    NV_FE_CALL_TO_CUDA(cuda_malloc, cudaMalloc, ptr, sz);
+}
+
+inline cudaError_t
+cuda_free(void *ptr) {
+    NV_FE_CALL_TO_CUDA(cuda_free, cudaFree, ptr);
 }
 
 inline cudnnStatus_t

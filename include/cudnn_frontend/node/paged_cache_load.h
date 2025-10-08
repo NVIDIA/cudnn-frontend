@@ -74,7 +74,7 @@ class PagedCacheLoadNode : public NodeCRTP<PagedCacheLoadNode> {
 
     error_t
     pre_validate_node() const override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating PagedCacheLoadNode " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating PagedCacheLoadNode " << attributes.name);
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90500 || detail::get_compiled_version() < 90500,
                                        error_code_t::CUDNN_BACKEND_API_FAILED,

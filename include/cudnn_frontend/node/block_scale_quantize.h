@@ -24,7 +24,7 @@ class BlockScaleQuantizeNode : public NodeCRTP<BlockScaleQuantizeNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating BlockScaleQuantizeNode " << attributes.name << "..."
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating BlockScaleQuantizeNode " << attributes.name
                     << std::endl;
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
@@ -36,7 +36,7 @@ class BlockScaleQuantizeNode : public NodeCRTP<BlockScaleQuantizeNode> {
     error_t
     infer_properties_node() override final {
         getLogger() << "[cudnn_frontend] INFO: Inferencing properties for BlockScaleQuantizeNode " << attributes.name
-                    << "..." << std::endl;
+                    << std::endl;
 
         attributes.fill_from_context(context);
 
@@ -116,7 +116,7 @@ class BlockScaleQuantizeNode : public NodeCRTP<BlockScaleQuantizeNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         getLogger() << "[cudnn_frontend] INFO: " << "Building BlockScaleQuantizeNode operations " << attributes.name
-                    << "..." << std::endl;
+                    << std::endl;
         auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Block scale quantize requires cuDNN v9.7.0"};
 
 #if (CUDNN_VERSION >= 90700)  // TODO: v9.99 is new feature branch; switch to release branch when ready
