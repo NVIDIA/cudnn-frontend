@@ -161,7 +161,9 @@ class INode {
     softmax(std::shared_ptr<Tensor_attributes> p,
             Softmax_attributes attributes,
             std::shared_ptr<Tensor_attributes> s,
-            std::shared_ptr<Tensor_attributes> stats);
+            std::shared_ptr<Tensor_attributes> stats,
+            std::shared_ptr<Tensor_attributes> max,
+            std::shared_ptr<Tensor_attributes> sum_exp);
 
     void
     softmax(std::shared_ptr<Tensor_attributes> p,

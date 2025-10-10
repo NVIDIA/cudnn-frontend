@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/pytorch:25.06-py3
+FROM nvcr.io/nvidia/pytorch:25.09-py3
 
 RUN pip install --upgrade pip && \
     pip install seaborn

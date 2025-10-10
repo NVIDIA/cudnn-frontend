@@ -27,8 +27,8 @@
 
 TEST_CASE("Forward Training LayerNorm and Bitmask Clamped ReLU", "[layernorm][graph][clamped_relu_bitmask]") {
     // Compatibility checks
-    if constexpr (CUDNN_VERSION < 91100) {
-        SKIP("LayerNorm with relu using bitmask is not supported in cudnn versions prior to 9.11.0");
+    if constexpr (CUDNN_VERSION < 91300) {
+        SKIP("LayerNorm with relu using bitmask is not supported in cudnn versions prior to 9.13.0");
     }
     if (check_device_arch_newer_than("ampere") == false) {
         SKIP("LayerNorm requires Ampere and up");
@@ -154,8 +154,8 @@ TEST_CASE("Forward Training LayerNorm and Bitmask Clamped ReLU", "[layernorm][gr
 
 TEST_CASE("Clamped DReLU using Bitmask and Backward LayerNorm", "[layernorm][graph][DRelu_bitmask_DLN]") {
     // Compatibility checks
-    if constexpr (CUDNN_VERSION < 91100) {
-        SKIP("LayerNorm with relu using bitmask is not supported in cudnn versions prior to 9.11.0");
+    if constexpr (CUDNN_VERSION < 91300) {
+        SKIP("LayerNorm with relu using bitmask is not supported in cudnn versions prior to 9.13.0");
     }
     if (check_device_arch_newer_than("ampere") == false) {
         SKIP("LayerNorm requires Ampere and up");

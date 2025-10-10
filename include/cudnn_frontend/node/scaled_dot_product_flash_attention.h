@@ -165,7 +165,7 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
 
     error_t
     pre_validate_node() const override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating SDPANode " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating SDPANode " << attributes.name);
 
         // check that Q, K, V, O tensors has been assigned
         // check that dim and strides has been assigned and last stride is 1
@@ -190,13 +190,20 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::V, attributes.inputs);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::O, attributes.outputs);
 
-        // validate options for generate_stats and stats tensor
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.generate_stats.has_value() == false,
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "generate_stats attribute not set");
-
-        if (attributes.generate_stats.value() == true) {
+        if (attributes.generate_stats.value_or(false) == true) {
             CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::Stats);
+        }
+
+        // If max is requested, validate that the output tensor is present
+        if (attributes.outputs.find(output_names::Max) != attributes.outputs.end() &&
+            attributes.outputs.at(output_names::Max) != nullptr) {
+            CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::Max);
+        }
+
+        // If sum_exp is requested, validate that the output tensor is present
+        if (attributes.outputs.find(output_names::Sum_exp) != attributes.outputs.end() &&
+            attributes.outputs.at(output_names::Sum_exp) != nullptr) {
+            CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::Sum_exp);
         }
 
 #undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
@@ -219,7 +226,7 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
 
     error_t
     infer_properties_node() override final {
-        if (attributes.generate_stats.value() == true) {
+        if (attributes.generate_stats.value_or(false)) {
             auto stats     = attributes.outputs.at(output_names::Stats);
             auto stats_dim = stats->get_dim();
 
@@ -230,6 +237,32 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                 auto h            = p_dim[1];
                 auto s_q          = p_dim[2];
                 stats->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+            }
+        }
+
+        if (attributes.outputs[output_names::Max] != nullptr) {
+            auto max = attributes.outputs.at(output_names::Max);
+
+            if (max->get_dim().empty()) {
+                // Fill properties of virtual tensors
+                auto const& p_dim = attributes.inputs[input_names::Q]->get_dim();
+                auto b            = p_dim[0];
+                auto h            = p_dim[1];
+                auto s_q          = p_dim[2];
+                max->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+            }
+        }
+
+        if (attributes.outputs[output_names::Sum_exp] != nullptr) {
+            auto sum_exp = attributes.outputs.at(output_names::Sum_exp);
+
+            if (sum_exp->get_dim().empty()) {
+                // Fill properties of virtual tensors
+                auto const& p_dim = attributes.inputs[input_names::Q]->get_dim();
+                auto b            = p_dim[0];
+                auto h            = p_dim[1];
+                auto s_q          = p_dim[2];
+                sum_exp->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
             }
         }
         return {error_code_t::OK, ""};
@@ -301,8 +334,7 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
 
     error_t
     expand_node() override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for CompositeSDPANode node  " << attributes.name
-                                                                                             << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO:     Inferrencing properties for CompositeSDPANode node " << attributes.name);
 
         // DO NOT REMOVE
         // input data type is needed for:
@@ -505,21 +537,18 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
         auto softmax_output = std::make_shared<Tensor_attributes>();
         softmax_output->set_is_virtual(true);
 
-        // Create a virtual output for stats if inference step otherwise output.Stats is already set
-        auto softmax_stats = attributes.outputs[output_names::Stats];
-        if (attributes.generate_stats.value() == false) {
-            softmax_stats = std::make_shared<Tensor_attributes>();
-            softmax_stats->set_is_virtual(true);
-        }
-
-        auto softmax_attributes =
-            Softmax_attributes().set_name("softmax").has_stats(true).has_M_Zinv(false);  // As this is flash attention
+        auto softmax_attributes = Softmax_attributes().set_name("softmax");
         // Set sink for softmax if user has provided a sink tensor
         if (attributes.inputs.find(input_names::SINK_TOKEN) != attributes.inputs.end()) {
             softmax_attributes.set_sink(attributes.inputs[input_names::SINK_TOKEN]);
         }
         // Special non-functional-style call. Needed because output already created and provided to user.
-        softmax(last_output, softmax_attributes, softmax_output, softmax_stats);
+        softmax(last_output,
+                softmax_attributes,
+                softmax_output,
+                attributes.outputs[output_names::Stats],
+                attributes.outputs[output_names::Max],
+                attributes.outputs[output_names::Sum_exp]);
         last_output = softmax_output;
 
         // Two cases for training: dropout present or not
@@ -677,8 +706,17 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     std::shared_ptr<Tensor_attributes> alibi_slopes;
     int64_t alibi_slopes_size = 0;
 
+    mutable bool has_workaround_padding_mask         = false;  // Will be edited in pre_validate_node()
+    mutable int32_t s_q_for_workaround_padding_mask  = 0;      // Will be edited in pre_validate_node()
+    mutable int32_t s_kv_for_workaround_padding_mask = 0;      // Will be edited in pre_validate_node()
+    mutable std::shared_ptr<Tensor_attributes>
+        workaround_padding_mask_seq_len_q;  // Will be edited in pre_validate_node()
+    mutable std::shared_ptr<Tensor_attributes>
+        workaround_padding_mask_seq_len_kv;                      // Will be edited in pre_validate_node()
+    mutable int64_t batch_size_for_workaround_padding_mask = 0;  // Will be edited in pre_validate_node()
+
    public:
-    SDPA_backward_attributes attributes;
+    mutable SDPA_backward_attributes attributes;  // Will be edited in pre_validate_node() for workaround padding mask
 
     CompositeSDPABackwardNode(SDPA_backward_attributes&& attributes_, detail::Context const& context)
         : NodeCRTP(context), attributes(std::move(attributes_)) {}
@@ -690,7 +728,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
 
     error_t
     pre_validate_node() const override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating CompositeSDPABackwardNode" << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating CompositeSDPABackwardNode" << attributes.name);
 
         // check that Q, K, V, O, stats, dO, dQ, dK, dV tensors has been assigned
         // check that dim and strides has been assigned and last stride is 1
@@ -752,6 +790,11 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         // validation TODO:
         //    - validate stats has valid dims
         //    - validate Q and dQ have the same dims
+
+        // Stop s_q = S_kv = 1 from running
+        RETURN_CUDNN_FRONTEND_ERROR_IF(s_q == 1 && s_kv == 1,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "s_q = s_kv = 1 is not supported.");
 
         cudaDeviceProp prop;
         int device;
@@ -818,6 +861,20 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(is_bias && (bias_mask->second->get_data_type() == DataType_t::BOOLEAN),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Bias mask data type cannot be boolean");
+
+        if (s_q % 128 != 0 && attributes.padding_mask == false && is_ragged == false) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Workaround padding mask is enabled for s_q % 128 != 0 and use_padding_mask == false and is_ragged == false");
+            has_workaround_padding_mask = true;
+            batch_size_for_workaround_padding_mask = attributes.inputs.at(input_names::Q)->get_dim()[0];
+            s_q_for_workaround_padding_mask = s_q;
+            s_kv_for_workaround_padding_mask = s_kv;
+            workaround_padding_mask_seq_len_q = std::make_shared<Tensor_attributes>();
+            workaround_padding_mask_seq_len_q->set_name("workaround_padding_mask_seq_len_q").set_dim({batch_size_for_workaround_padding_mask,1,1,1}).set_stride({1,1,1,1}).set_data_type(DataType_t::INT32);
+            workaround_padding_mask_seq_len_kv = std::make_shared<Tensor_attributes>();
+            workaround_padding_mask_seq_len_kv->set_name("workaround_padding_mask_seq_len_kv").set_dim({batch_size_for_workaround_padding_mask,1,1,1}).set_stride({1,1,1,1}).set_data_type(DataType_t::INT32);
+            attributes.set_padding_mask(true);
+            attributes.set_seq_len_q(workaround_padding_mask_seq_len_q).set_seq_len_kv(workaround_padding_mask_seq_len_kv);
+        }
 
         // validate options for padding mask
         auto const& seq_len_q     = attributes.inputs.find(input_names::SEQ_LEN_Q);
@@ -970,7 +1027,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
 
     error_t
     expand_node() override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for CompositeSDPABackwardNode " << attributes.name);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO:     Inferrencing properties for CompositeSDPABackwardNode " << attributes.name);
 
         attributes.fill_from_context(context);
 
@@ -1573,6 +1630,10 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         size += dV_fullhead_size;
         size += softmax_sum_size;
 
+        if (has_workaround_padding_mask) {
+            size += batch_size_for_workaround_padding_mask * sizeof(int32_t) * 2;
+        }
+
         return size;
     }
 
@@ -1616,6 +1677,34 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             offset = offset + softmax_sum_size;
         }
 
+        if (has_workaround_padding_mask) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Collecting workaround padding mask tensors with batch size "
+                                    << batch_size_for_workaround_padding_mask << " with UIDs "
+                                    << workaround_padding_mask_seq_len_q->get_uid() << " and "
+                                    << workaround_padding_mask_seq_len_kv->get_uid());
+            std::vector<int32_t> workaround_padding_mask_seq_len_q_vec(batch_size_for_workaround_padding_mask,
+                                                                       s_q_for_workaround_padding_mask);
+            std::vector<int32_t> workaround_padding_mask_seq_len_kv_vec(batch_size_for_workaround_padding_mask,
+                                                                        s_kv_for_workaround_padding_mask);
+
+            // reinterpret_cast the int32_t vector data to float vector for workspace_modifications
+            std::vector<float> workaround_padding_mask_seq_len_q_vec_float(
+                reinterpret_cast<float*>(workaround_padding_mask_seq_len_q_vec.data()),
+                reinterpret_cast<float*>(workaround_padding_mask_seq_len_q_vec.data()) +
+                    batch_size_for_workaround_padding_mask);
+            std::vector<float> workaround_padding_mask_seq_len_kv_vec_float(
+                reinterpret_cast<float*>(workaround_padding_mask_seq_len_kv_vec.data()),
+                reinterpret_cast<float*>(workaround_padding_mask_seq_len_kv_vec.data()) +
+                    batch_size_for_workaround_padding_mask);
+
+            workspace_modifications.emplace(workaround_padding_mask_seq_len_q->get_uid(),
+                                            std::make_tuple(0, offset, workaround_padding_mask_seq_len_q_vec_float));
+            offset = offset + batch_size_for_workaround_padding_mask * sizeof(float);
+            workspace_modifications.emplace(workaround_padding_mask_seq_len_kv->get_uid(),
+                                            std::make_tuple(0, offset, workaround_padding_mask_seq_len_kv_vec_float));
+            offset = offset + batch_size_for_workaround_padding_mask * sizeof(float);
+        }
+
         return {error_code_t::OK, ""};
     }
 
@@ -1640,7 +1729,7 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
 
     error_t
     expand_node() override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for UnifiedSDPANode node  " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO:     Inferrencing properties for UnifiedSDPANode node  " << attributes.name);
 
         // DO NOT REMOVE
         // input data type is needed for:
@@ -1665,11 +1754,11 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Building UnifiedSDPANode operations " << attributes.name << "...");
-        auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node requires cuDNN 9.13.0"};
+        CUDNN_FE_LOG_LABEL("INFO: " << "Building UnifiedSDPANode operations " << attributes.name << " ");
+        auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node requires cuDNN 9.13.1"};
 
-#if (CUDNN_VERSION >= 91300)
-        NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91300, cudnn_ver_error);
+#if (CUDNN_VERSION >= 91301)
+        NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91301, cudnn_ver_error);
         CUDNN_FRONTEND_UNUSED(operations);
         auto unified_sdpa_operation =
             make_shared_backend_pointer((cudnnBackendDescriptorType_t)CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR);

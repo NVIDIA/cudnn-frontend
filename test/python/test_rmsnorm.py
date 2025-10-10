@@ -26,8 +26,8 @@ class RMSNorm(torch.nn.Module):
     ) -> torch.Tensor:
         # NOTE: the original RMSNorm paper implementation is not equivalent
         norm_x = torch.mean(x * x, dim=self.dim, keepdim=True)
-        inv_var = torch.rsqrt(norm_x + self.eps)
-        x_normed = x * inv_var
+        inv_var = torch.rsqrt(norm_x.float() + self.eps)
+        x_normed = x * inv_var.to(x.dtype)
         x_scaled = weight * x_normed
         if bias is not None:
             x_scaled += bias

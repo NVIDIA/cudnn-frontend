@@ -115,6 +115,26 @@ getLogger() {
         }                                                         \
     } while (0);
 
+#define CUDNN_FE_LOG_BANNER(X)                                                         \
+    do {                                                                               \
+        if (isLoggingEnabled()) {                                                      \
+            {                                                                          \
+                constexpr int total_width = 128;                                       \
+                std::ostringstream oss;                                                \
+                oss << "[cudnn_frontend] ||| === " << X << " === |||";                 \
+                std::string banner_line = oss.str();                                   \
+                int banner_len          = static_cast<int>(banner_line.size());        \
+                int pad                 = total_width - banner_len;                    \
+                if (pad > 0) {                                                         \
+                    banner_line.insert(banner_line.size() - 5, std::string(pad, ' ')); \
+                }                                                                      \
+                getLogger() << std::string(total_width, '=') << std::endl;             \
+                getLogger() << banner_line << std::endl;                               \
+                getLogger() << std::string(total_width, '=') << std::endl;             \
+            }                                                                          \
+        }                                                                              \
+    } while (0);
+
 static std::ostream &
 operator<<(std::ostream &os, const BackendDescriptor &desc) {
     if (isLoggingEnabled()) {

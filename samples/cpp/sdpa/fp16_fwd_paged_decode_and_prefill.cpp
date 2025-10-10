@@ -32,7 +32,7 @@ namespace fe = cudnn_frontend;
 
 /*
 Run this example by using command:
-bin/samples "Toy sdpa forward with paged caches"
+bin/samples "Toy sdpa forward paged caches decode and prefill"
 
 This example shows how to construct a sdpa forward graph with paged caches.
 */

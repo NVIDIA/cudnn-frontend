@@ -30,9 +30,9 @@ namespace fe = cudnn_frontend;
 
 /*
 Run this example by using command:
-bin/samples "Toy sdpa forward with unrolled stats"
+bin/samples "Toy sdpa forward with sink"
 
-This example shows how to construct a sdpa forward graph.
+This example shows how to construct a sdpa forward graph with sink token.
 */
 
 // Tensors in forward pass

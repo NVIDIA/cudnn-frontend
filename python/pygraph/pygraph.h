@@ -261,6 +261,7 @@ class PyGraph {
     block_scale_dequantize(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale,
                            std::vector<int32_t> const& block_size,
+                           bool const is_negative_scale,
                            cudnn_frontend::DataType_t const& compute_data_type,
                            std::string const& name);
 
@@ -370,7 +371,9 @@ class PyGraph {
          std::string const& name,
          std::optional<PyCallback> fn,
          py::object const& generate_stats,
-         cudnn_frontend::AttentionImplementation_t const& implementation);
+         cudnn_frontend::AttentionImplementation_t const& implementation,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp);
 
     // return [dQ, dK, dV]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 3>
@@ -433,7 +436,9 @@ class PyGraph {
              cudnn_frontend::DataType_t const& compute_data_type,
              std::string const& name,
              std::optional<PyCallback> fn,
-             py::object const& generate_stats);
+             py::object const& generate_stats,
+             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
+             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp);
 
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 7>
@@ -615,6 +620,8 @@ class PyGraph {
                   std::string const& name,
                   std::optional<PyCallback> fn,
                   py::object const& generate_stats,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
                   cudnn_frontend::DataType_t const& mma_core_mode = cudnn_frontend::DataType_t::HALF,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_q = nullptr,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_k = nullptr,

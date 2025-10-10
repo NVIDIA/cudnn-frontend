@@ -48,6 +48,18 @@ is_hopper_arch() {
 }
 
 bool
+is_blackwell_computing_arch() {
+    auto cc = get_compute_capability();
+    return (100 <= cc && cc < 110);
+}
+
+bool
+is_blackwell_gaming_arch() {
+    auto cc = get_compute_capability();
+    return (120 <= cc && cc < 130);
+}
+
+bool
 is_arch_supported_by_cudnn() {
     if (cudnnGetVersion() < 8600 && (is_hopper_arch() || is_ada_arch())) {
         return false;

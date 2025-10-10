@@ -30,9 +30,9 @@ namespace fe = cudnn_frontend;
 
 /*
 Run this example by using command:
-bin/samples "Toy sdpa backward"
+bin/samples "Toy sdpa backward with sink"
 
-This example shows how to construct a sdpa backward graph->
+This example shows how to construct a sdpa backward graph with sink token.
 */
 
 // Tensors in backward pass

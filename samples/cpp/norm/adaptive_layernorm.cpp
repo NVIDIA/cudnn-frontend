@@ -111,7 +111,7 @@ adalayernorm_fwd_dynamic_shapes(bool train = true) {
         status = graph.build_operation_graph(handle);
         REQUIRE(status.is_good());
 
-        REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK, fe::HeurMode_t::A}).is_good());
+        REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
 
         REQUIRE(graph.check_support().is_good());
 
@@ -232,7 +232,7 @@ TEST_CASE("AdaLayerNorm Backward", "[adalayernorm][graph]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
 
     REQUIRE(graph.check_support().is_good());
 

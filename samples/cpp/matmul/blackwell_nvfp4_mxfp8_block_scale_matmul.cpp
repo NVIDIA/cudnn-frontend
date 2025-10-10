@@ -31,6 +31,8 @@
 
 namespace BlackwellNVFP4MXFP8BlockScaleMatmul {
 
+namespace fe = cudnn_frontend;
+
 struct TestParams {
     int64_t b = -1;
     int64_t m = -1;
@@ -70,8 +72,6 @@ struct TestParams {
 };
 
 TEST_CASE("Blackwell Block Scale Matmul", "[matmul][graph][FP4]") {
-    namespace fe = cudnn_frontend;
-
 #if (CUDNN_VERSION < 90700)
     SKIP("Matmul with block scaling is not supported in cudnn versions prior to 9.7.0");
 #endif
@@ -321,7 +321,8 @@ TEST_CASE("Blackwell Block Scale Matmul", "[matmul][graph][FP4]") {
 
     int64_t block_scale_dim_m = div_up(m, indestructible_128x4_block_m_n) * indestructible_128x4_block_m_n;
     int64_t block_scale_dim_n = div_up(n, indestructible_128x4_block_m_n) * indestructible_128x4_block_m_n;
-    int64_t block_scale_dim_k = div_up(k, indestructible_128x4_block_k) * indestructible_128x4_block_k;
+    int64_t block_scale_dim_k =
+        div_up(div_up(k, block_size), indestructible_128x4_block_k) * indestructible_128x4_block_k;
 
     Surface<int8_t> block_descale_a_gpu(
         div_up(b * block_scale_dim_m * block_scale_dim_k *
@@ -408,6 +409,338 @@ TEST_CASE("Blackwell Block Scale Matmul", "[matmul][graph][FP4]") {
         {tensor_b, tensor_b_gpu.devPtr},
         {block_descale_a, block_descale_a_gpu.devPtr},
         {block_descale_b, block_descale_b_gpu.devPtr},
+        {tensor_d, tensor_d_gpu.devPtr}};
+
+    REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
+}
+
+TEST_CASE("Blackwell Block Scale Matmul Quantize", "[matmul][graph][FP4]") {
+#if (CUDNN_VERSION < 91400)
+    SKIP("Matmul with block scaling quantize is not supported in cudnn versions prior to 9.14.0");
+#endif
+    if (get_compute_capability() < 100 || get_compute_capability() >= 110) {
+        SKIP("Matmul with block scaling quantize is only supported on compute capability 100-109");
+    }
+
+    auto test_params = GENERATE(TestParams(1,
+                                           256,
+                                           256,
+                                           256,
+                                           16,
+                                           cudnn_frontend::DataType_t::FP4_E2M1,
+                                           cudnn_frontend::DataType_t::FP4_E2M1,
+                                           cudnn_frontend::DataType_t::FP8_E4M3,
+                                           cudnn_frontend::DataType_t::FP4_E2M1));
+
+    int64_t const b = test_params.b;
+    int64_t const m = test_params.m;
+    int64_t const n = test_params.n;
+    int64_t const k = test_params.k;
+
+    auto datatype_a = test_params.datatype_a;
+    auto datatype_b = test_params.datatype_b;
+
+    auto datatype_block_scale = test_params.datatype_block_scale;
+
+    auto block_size = test_params.block_size;
+
+    auto datatype_d = test_params.datatype_d;
+
+    Surface<int8_t> tensor_a_gpu(div_up(b * m * k * cudnn_frontend::detail::get_element_size_in_bits(datatype_a), 8),
+                                 false);
+    Surface<int8_t> tensor_b_gpu(div_up(b * k * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_b), 8),
+                                 false);
+
+    static constexpr int indestructible_128x4_block_m_n = 128;
+    static constexpr int indestructible_128x4_block_k   = 4;
+
+    int64_t block_scale_dim_m = div_up(m, indestructible_128x4_block_m_n) * indestructible_128x4_block_m_n;
+    int64_t block_scale_dim_n = div_up(n, indestructible_128x4_block_m_n) * indestructible_128x4_block_m_n;
+    int64_t block_scale_dim_k =
+        div_up(div_up(k, block_size), indestructible_128x4_block_k) * indestructible_128x4_block_k;
+    int64_t block_scale_dim_out_m = block_scale_dim_m;
+    int64_t block_scale_dim_out_n =
+        div_up(div_up(n, block_size), indestructible_128x4_block_k) * indestructible_128x4_block_k;
+
+    Surface<int8_t> block_descale_a_gpu(
+        div_up(b * block_scale_dim_m * block_scale_dim_k *
+                   cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
+               8),
+        false);
+    Surface<int8_t> block_descale_b_gpu(
+        div_up(b * block_scale_dim_n * block_scale_dim_k *
+                   cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
+               8),
+        false);
+
+    Surface<int8_t> tensor_d_gpu(div_up(b * m * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_d), 8),
+                                 false);
+
+    Surface<int8_t> block_scale_gpu(div_up(b * block_scale_dim_out_m * block_scale_dim_out_n *
+                                               cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
+                                           8),
+                                    false);
+
+    fe::graph::Graph graph{};
+
+    graph.set_intermediate_data_type(fe::DataType_t::FLOAT);
+    graph.set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto tensor_a = graph.tensor(fe::graph::Tensor_attributes()
+                                     .set_name("tensor_a")
+                                     .set_data_type(datatype_a)
+                                     .set_dim({b, m, k})
+                                     .set_stride({m * k, k, 1}));
+
+    auto tensor_b = graph.tensor(fe::graph::Tensor_attributes()
+                                     .set_name("tensor_b")
+                                     .set_data_type(datatype_b)
+                                     .set_dim({b, k, n})
+                                     .set_stride({k * n, 1, k}));
+
+    auto block_descale_a = graph.tensor(fe::graph::Tensor_attributes()
+                                            .set_name("block_descale_a")
+                                            .set_data_type(datatype_block_scale)
+                                            .set_dim({b, block_scale_dim_m, block_scale_dim_k})
+                                            .set_stride({block_scale_dim_m * block_scale_dim_k, block_scale_dim_k, 1})
+                                            .set_reordering_type(cudnn_frontend::TensorReordering_t::F8_128x4));
+
+    auto block_descale_b = graph.tensor(fe::graph::Tensor_attributes()
+                                            .set_name("block_descale_b")
+                                            .set_data_type(datatype_block_scale)
+                                            .set_dim({b, block_scale_dim_k, block_scale_dim_n})
+                                            .set_stride({block_scale_dim_m * block_scale_dim_k, 1, block_scale_dim_k})
+                                            .set_reordering_type(cudnn_frontend::TensorReordering_t::F8_128x4));
+
+    auto dequantize_attr_a = fe::graph::Block_scale_dequantize_attributes().set_block_size({1, block_size});
+
+    auto dequan_tensor_a = graph.block_scale_dequantize(tensor_a, block_descale_a, dequantize_attr_a);
+
+    auto dequantize_attr_b = fe::graph::Block_scale_dequantize_attributes().set_block_size({block_size, 1});
+
+    auto dequan_tensor_b = graph.block_scale_dequantize(tensor_b, block_descale_b, dequantize_attr_b);
+
+    auto matmul_attributes =
+        fe::graph::Matmul_attributes().set_name("GEMM").set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto tensor_c = graph.matmul(dequan_tensor_a, dequan_tensor_b, matmul_attributes);
+
+    auto quantize_attr =
+        fe::graph::Block_scale_quantize_attributes().set_block_size(block_size).set_axis(2).set_transpose(false);
+
+    auto [tensor_d, block_scale] = graph.block_scale_quantize(tensor_c, quantize_attr);
+
+    tensor_d->set_output(true).set_data_type(datatype_d);
+    block_scale->set_output(true)
+        .set_data_type(datatype_block_scale)
+        .set_reordering_type(cudnn_frontend::TensorReordering_t::F8_128x4);
+
+    std::cout << graph << std::endl;
+
+    REQUIRE(graph.validate().is_good());
+
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+
+    REQUIRE(graph.build_operation_graph(handle).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
+
+    REQUIRE(graph.check_support().is_good());
+
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+
+    int64_t workspace_size = 0;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
+        {tensor_a, tensor_a_gpu.devPtr},
+        {tensor_b, tensor_b_gpu.devPtr},
+        {block_descale_a, block_descale_a_gpu.devPtr},
+        {block_descale_b, block_descale_b_gpu.devPtr},
+        {tensor_d, tensor_d_gpu.devPtr},
+        {block_scale, block_scale_gpu.devPtr}};
+
+    REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
+}
+
+TEST_CASE("Block Scale Matmul Swiglu", "[matmul][graph][FP4]") {
+#if (CUDNN_VERSION < 91500)
+    SKIP("Block Scale Matmul with Swiglu epilogue fusion is not supported in cudnn versions prior to 9.15.0");
+#endif
+
+    if (check_device_arch_newer_than("blackwell") == false) {
+        SKIP("Hardware accelerated NVFP4/MXFP8 block scale matmul requires Blackwell and up");
+    }
+
+    auto test_params = GENERATE(TestParams(1,
+                                           256,
+                                           256,
+                                           256,
+                                           16,
+                                           cudnn_frontend::DataType_t::FP4_E2M1,
+                                           cudnn_frontend::DataType_t::FP4_E2M1,
+                                           cudnn_frontend::DataType_t::FP8_E4M3,
+                                           cudnn_frontend::DataType_t::FP4_E2M1));
+
+    int64_t const b = test_params.b;
+    int64_t const m = test_params.m;
+    int64_t const n = test_params.n;
+    int64_t const k = test_params.k;
+
+    auto datatype_a = test_params.datatype_a;
+    auto datatype_b = test_params.datatype_b;
+
+    auto datatype_block_scale = test_params.datatype_block_scale;
+
+    auto block_size = test_params.block_size;
+
+    auto datatype_d = test_params.datatype_d;
+
+    Surface<int8_t> tensor_a_gpu(div_up(b * m * k * cudnn_frontend::detail::get_element_size_in_bits(datatype_a), 8),
+                                 false);
+    Surface<int8_t> tensor_b0_gpu(div_up(b * k * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_b), 8),
+                                  false);
+    Surface<int8_t> tensor_b1_gpu(div_up(b * k * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_b), 8),
+                                  false);
+
+    static constexpr int indestructible_128x4_block_m_n = 128;
+    static constexpr int indestructible_128x4_block_k   = 4;
+
+    int64_t block_scale_dim_m = div_up(m, indestructible_128x4_block_m_n) * indestructible_128x4_block_m_n;
+    int64_t block_scale_dim_n = div_up(n, indestructible_128x4_block_m_n) * indestructible_128x4_block_m_n;
+    int64_t block_scale_dim_k =
+        div_up(div_up(k, block_size), indestructible_128x4_block_k) * indestructible_128x4_block_k;
+
+    Surface<int8_t> block_descale_a_gpu(
+        div_up(b * block_scale_dim_m * block_scale_dim_k *
+                   cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
+               8),
+        false);
+    Surface<int8_t> block_descale_b0_gpu(
+        div_up(b * block_scale_dim_n * block_scale_dim_k *
+                   cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
+               8),
+        false);
+    Surface<int8_t> block_descale_b1_gpu(
+        div_up(b * block_scale_dim_n * block_scale_dim_k *
+                   cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
+               8),
+        false);
+
+    Surface<int8_t> tensor_d_gpu(div_up(b * m * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_d), 8),
+                                 false);
+
+    fe::graph::Graph graph{};
+
+    graph.set_intermediate_data_type(fe::DataType_t::FLOAT);
+    graph.set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto tensor_a = graph.tensor(fe::graph::Tensor_attributes()
+                                     .set_name("tensor_a")
+                                     .set_data_type(datatype_a)
+                                     .set_dim({b, m, k})
+                                     .set_stride({m * k, k, 1}));
+
+    auto tensor_b0 = graph.tensor(fe::graph::Tensor_attributes()
+                                      .set_name("tensor_b")
+                                      .set_data_type(datatype_b)
+                                      .set_dim({b, k, n})
+                                      .set_stride({k * n, 1, k}));
+
+    auto tensor_b1 = graph.tensor(fe::graph::Tensor_attributes()
+                                      .set_name("tensor_b")
+                                      .set_data_type(datatype_b)
+                                      .set_dim({b, k, n})
+                                      .set_stride({k * n, 1, k}));
+
+    auto block_descale_a = graph.tensor(fe::graph::Tensor_attributes()
+                                            .set_name("block_descale_a")
+                                            .set_data_type(datatype_block_scale)
+                                            .set_dim({b, block_scale_dim_m, block_scale_dim_k})
+                                            .set_stride({block_scale_dim_m * block_scale_dim_k, block_scale_dim_k, 1})
+                                            .set_reordering_type(cudnn_frontend::TensorReordering_t::F8_128x4));
+
+    auto block_descale_b0 = graph.tensor(fe::graph::Tensor_attributes()
+                                             .set_name("block_descale_b")
+                                             .set_data_type(datatype_block_scale)
+                                             .set_dim({b, block_scale_dim_k, block_scale_dim_n})
+                                             .set_stride({block_scale_dim_m * block_scale_dim_k, 1, block_scale_dim_k})
+                                             .set_reordering_type(cudnn_frontend::TensorReordering_t::F8_128x4));
+
+    auto block_descale_b1 = graph.tensor(fe::graph::Tensor_attributes()
+                                             .set_name("block_descale_b")
+                                             .set_data_type(datatype_block_scale)
+                                             .set_dim({b, block_scale_dim_k, block_scale_dim_n})
+                                             .set_stride({block_scale_dim_m * block_scale_dim_k, 1, block_scale_dim_k})
+                                             .set_reordering_type(cudnn_frontend::TensorReordering_t::F8_128x4));
+
+    auto dequantize_attr_a = fe::graph::Block_scale_dequantize_attributes().set_block_size({1, block_size});
+
+    auto dequan_tensor_a = graph.block_scale_dequantize(tensor_a, block_descale_a, dequantize_attr_a);
+
+    auto dequantize_attr_b0 = fe::graph::Block_scale_dequantize_attributes().set_block_size({block_size, 1});
+
+    auto dequan_tensor_b0 = graph.block_scale_dequantize(tensor_b0, block_descale_b0, dequantize_attr_b0);
+
+    auto dequantize_attr_b1 = fe::graph::Block_scale_dequantize_attributes().set_block_size({block_size, 1});
+
+    auto dequan_tensor_b1 = graph.block_scale_dequantize(tensor_b1, block_descale_b1, dequantize_attr_b1);
+
+    auto matmul0_attributes =
+        fe::graph::Matmul_attributes().set_name("GEMM").set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto matmul1_attributes =
+        fe::graph::Matmul_attributes().set_name("GEMM").set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto tensor_c0 = graph.matmul(dequan_tensor_a, dequan_tensor_b0, matmul0_attributes);
+
+    auto tensor_c1 = graph.matmul(dequan_tensor_a, dequan_tensor_b1, matmul1_attributes);
+
+    auto swish_attributes = fe::graph::Pointwise_attributes()
+                                .set_name("swish")
+                                .set_mode(fe::PointwiseMode_t::SWISH_FWD)
+                                .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto tensor_after_swish = graph.pointwise(tensor_c0, swish_attributes);
+
+    auto mul_attributes = fe::graph::Pointwise_attributes()
+                              .set_name("mul")
+                              .set_mode(fe::PointwiseMode_t::MUL)
+                              .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto tensor_d = graph.pointwise(tensor_after_swish, tensor_c1, mul_attributes);
+
+    tensor_d->set_output(true).set_data_type(datatype_d);
+
+    std::cout << graph << std::endl;
+
+    REQUIRE(graph.validate().is_good());
+
+    // Create a unique_ptr for the cuDNN handle
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+
+    REQUIRE(graph.build_operation_graph(handle).is_good());
+
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
+
+    REQUIRE(graph.check_support().is_good());
+
+    REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+
+    int64_t workspace_size = 0;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size, false);
+
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
+        {tensor_a, tensor_a_gpu.devPtr},
+        {tensor_b0, tensor_b0_gpu.devPtr},
+        {tensor_b1, tensor_b1_gpu.devPtr},
+        {block_descale_a, block_descale_a_gpu.devPtr},
+        {block_descale_b0, block_descale_b0_gpu.devPtr},
+        {block_descale_b1, block_descale_b1_gpu.devPtr},
         {tensor_d, tensor_d_gpu.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());

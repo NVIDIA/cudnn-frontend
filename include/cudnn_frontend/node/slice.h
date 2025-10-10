@@ -16,7 +16,7 @@ class SliceNode : public NodeCRTP<SliceNode> {
 
     error_t
     infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferrencing properties for slice node " << attributes.name << "..."
+        getLogger() << "[cudnn_frontend] INFO:     Inferrencing properties for slice node " << attributes.name
                     << std::endl;
 
         attributes.fill_from_context(context);

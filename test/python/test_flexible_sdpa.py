@@ -117,7 +117,7 @@ def decode_mask(
     return out
 
 
-def causal_mask(sdpa_graph, q_kt_tensor):
+def causal_mask(sdpa_graph, q_kt_tensor, neg_inf):
 
     row_index = sdpa_graph.gen_index(input=q_kt_tensor, axis=2)
     row_index.set_data_type(cudnn.data_type.INT32)
@@ -130,7 +130,7 @@ def causal_mask(sdpa_graph, q_kt_tensor):
     )
     mask.set_data_type(cudnn.data_type.BOOLEAN)
 
-    out = sdpa_graph.binary_select(input0=q_kt_tensor, input1=q_kt_tensor, mask=mask)
+    out = sdpa_graph.binary_select(input0=q_kt_tensor, input1=neg_inf, mask=mask)
 
     return out
 

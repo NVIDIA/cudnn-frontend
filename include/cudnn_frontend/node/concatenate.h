@@ -25,8 +25,7 @@ class ConcatenateNode : public NodeCRTP<ConcatenateNode> {
 
     error_t
     pre_validate_node() const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Validating ConcatenateNode " << attributes.name << "..."
-                    << std::endl;
+        getLogger() << "[cudnn_frontend] INFO: " << "Validating ConcatenateNode " << attributes.name << std::endl;
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(!attributes.axis.has_value(), error_code_t::ATTRIBUTE_NOT_SET, "Axis not set\n");
 
@@ -43,7 +42,7 @@ class ConcatenateNode : public NodeCRTP<ConcatenateNode> {
 
     error_t
     infer_properties_node() override final {
-        getLogger() << "[cudnn_frontend] INFO: Inferring properties for ConcatenateNode " << attributes.name << "..."
+        getLogger() << "[cudnn_frontend] INFO: Inferring properties for ConcatenateNode " << attributes.name
                     << std::endl;
 
         attributes.fill_from_context(context);
@@ -81,7 +80,7 @@ class ConcatenateNode : public NodeCRTP<ConcatenateNode> {
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        getLogger() << "[cudnn_frontend] INFO: " << "Building ConcatenateNode operations " << attributes.name << "..."
+        getLogger() << "[cudnn_frontend] INFO: " << "Building ConcatenateNode operations " << attributes.name
                     << std::endl;
         auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Concatenate requires cuDNN v9.7.0"};
 

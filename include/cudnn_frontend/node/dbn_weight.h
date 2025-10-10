@@ -78,7 +78,7 @@ class DBNWeightNode : public NodeCRTP<DBNWeightNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
-        CUDNN_FE_LOG_LABEL_ENDL("INFO:Building DBNWeightNode operations " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL("INFO:Building DBNWeightNode operations " << attributes.name << " ");
 
         // Create the batchnorm operation.
         auto&& batchnorm_operation_builder =

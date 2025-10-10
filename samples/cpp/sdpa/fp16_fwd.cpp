@@ -99,6 +99,7 @@ create_sdpa_forward_graph(int64_t const b,
         auto bias = graph->tensor(fe::graph::Tensor_attributes()
                                       .set_name("bias")
                                       .set_uid(BIAS_UID)
+                                      .set_data_type(fe::DataType_t::HALF)
                                       .set_dim({b, 1, s_q, s_kv})
                                       .set_stride({s_q * s_kv, s_q * s_kv, s_kv, 1}));
         sdpa_options.set_bias(bias);

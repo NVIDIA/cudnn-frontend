@@ -46,12 +46,12 @@ create_cudnn_tensor(
     // Check whether backend tensor already created
     auto tensor_uid = props->get_uid();
     if (tensors.find(tensor_uid) != tensors.end()) {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Backend Tensor named '" << props->get_name() << "' with UID " << tensor_uid
-                                                               << " already created.");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO:      Backend Tensor named '" << props->get_name() << "' with UID " << tensor_uid
+                                                                    << " already created.");
         return {error_code_t::OK, ""};
     }
-    CUDNN_FE_LOG_LABEL_ENDL("INFO: Creating Backend Tensor named '" << props->get_name() << "' with UID "
-                                                                    << tensor_uid);
+    CUDNN_FE_LOG_LABEL_ENDL("INFO:      Backend Tensor named '" << props->get_name() << "' with UID " << tensor_uid
+                                                                << " being created.");
 
     auto&& tensor_builder = cudnn_frontend::TensorBuilder();
 
@@ -154,7 +154,7 @@ class ICudnn {
                 e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
         }
 #endif
-        return {error_code_t::OK, "Successfully built Operation Graphs."};
+        return {error_code_t::OK, "Successfully built Operation Graph."};
     }
 
    public:

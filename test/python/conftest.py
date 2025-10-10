@@ -1,13 +1,17 @@
 import pytest
 import cudnn
 import torch
+import argparse
 
 # fmt: off
 
 # =================== Fixtures =====================
 @pytest.fixture(scope="session", autouse=True)
 def cudnn_handle():
+    # Create CUDA stream and graph objects
+    stream = torch.cuda.Stream()
     cudnn_handle = cudnn.create_handle()
+    cudnn.set_stream(handle=cudnn_handle, stream=stream.cuda_stream)
     yield cudnn_handle
     cudnn.destroy_handle(cudnn_handle)
 
@@ -44,84 +48,46 @@ def pytest_addoption(parser):
     parser.addoption(
         "--repro", action="store", type=str, default=None, help="specify config string to run repro function",
     )
-    parser.addoption(
-        "--unlock", action="store_true", default=False, help="run 'flaky' tests, normally skipped"
-    )
-    parser.addoption(
-        "--geom_seed", type=int, default=None, help="update seed of RNG generating task dimensions (geometries)",
-    )
-    parser.addoption(
-        "--data_seed", type=int, default=None, help="update seed of RNG initializing task input data",
-    )
+
 
     # MHA command line options to overwrite specific test dimensions in test_mhas.py and test_mhas_v2.py.
     parser.addoption(
-        "--mha_b", default=None, type=int, help="[test_mhas.py] batch dimension"
+        "--b", default=None, type=int, help="[test_mhas.py] batch dimension"
     )
     parser.addoption(
-        "--mha_s_q", default=None, type=int, help="[test_mhas.py] query sequence length"
+        "--s_q", default=None, type=int, help="[test_mhas.py] query sequence length"
     )
     parser.addoption(
-        "--mha_s_kv", default=None, type=int, help="[test_mhas.py] key/value sequence length"
+        "--s_kv", default=None, type=int, help="[test_mhas.py] key/value sequence length"
     )
     parser.addoption(
-        "--mha_d_qk", default=None, type=int, help="[test_mhas.py] query/key embedding dimension per head",
+        "--d_qk", default=None, type=int, help="[test_mhas.py] query/key embedding dimension per head",
     )
     parser.addoption(
-        "--mha_d_v", default=None, type=int, help="[test_mhas.py] value embedding dimension per head",
+        "--d_v", default=None, type=int, help="[test_mhas.py] value embedding dimension per head",
     )
     parser.addoption(
-        "--mha_h_q", default=None, type=int, help="[test_mhas.py] query number of heads"
+        "--h_q", default=None, type=int, help="[test_mhas.py] query number of heads"
     )
     parser.addoption(
-        "--mha_h_k", default=None, type=int, help="[test_mhas.py] key number of heads"
+        "--h_k", default=None, type=int, help="[test_mhas.py] key number of heads"
     )
     parser.addoption(
-        "--mha_h_v", default=None, type=int, help="[test_mhas.py] value number of heads"
+        "--h_v", default=None, type=int, help="[test_mhas.py] value number of heads"
     )
     parser.addoption(
-        "--mha_deterministic", default=None, type=int, choices=[0, 1], help="[test_mhas.py] force deterministic algorithm",
+        "--deterministic", default=None, type=int, choices=[0, 1], help="[test_mhas.py] force deterministic algorithm",
     )
     parser.addoption(
-        "--mha_block_size", default=None, type=int, help="[test_mhas.py] block size for paged attention",
+        "--block_size", default=None, type=int, help="[test_mhas.py] block size for paged attention",
     )
     parser.addoption(
-        "--mha_left_bound", default=None, type=int, help="[test_mhas.py] size of the window to the left of the diagonal",
+        "--left_bound", default=None, type=int, help="[test_mhas.py] size of the window to the left of the diagonal",
     )
     parser.addoption(
-        "--mha_right_bound", default=None, type=int, help="[test_mhas.py] size of the window to the right of the diagonal",
-    )
-
-    # MHA command line options to overwrite boolean 'is*' variables in test_mhas_v2.py.
-    parser.addoption(
-        "--mha_is_infer", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_infer",
-    )
-    parser.addoption(
-        "--mha_is_alibi", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_alibi",
-    )
-    parser.addoption(
-        "--mha_is_paged", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_paged",
-    )
-    parser.addoption(
-        "--mha_is_bias", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_bias",
-    )
-    parser.addoption(
-        "--mha_is_padding", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_padding",
-    )
-    parser.addoption(
-        "--mha_is_ragged", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_ragged",
-    )
-    parser.addoption(
-        "--mha_is_dropout", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_dropout",
-    )
-    parser.addoption(
-        "--mha_is_determin", action="store", default=None, type=str, choices=["True", "False"], help="[test_mhas_v2.py], overwrites is_determin",
-    )
-    parser.addoption(
-        "--mha_diag_align", default=None, type=int, choices=[0, 1], help="[test_mhas_v2.py] diagonal alignment: 0-TOP_LEFT, 1-BOTTOM_RIGHT",
+        "--right_bound", default=None, type=int, help="[test_mhas.py] size of the window to the right of the diagonal",
     )
 
-    # Refined command line option in test_mhas_v2.py to supersede --mha_b (the 'b' variable is too short).
     parser.addoption(
-        "--mha_batches", default=None, type=int, help="[test_mhas_v2.py] update batch dimension"
+        "--implementation", action="store", default=None, type=str, choices=["AUTO", "COMPOSITE", "UNIFIED"], help="[test_mhas_v2.py], overwrites implementation",
     )

@@ -92,7 +92,7 @@ TEST_CASE("LayerNorm Training MXFP8 with reshape", "[layernorm][graph][block_sca
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
 
     REQUIRE(graph.check_support().is_good());
 
@@ -180,7 +180,7 @@ TEST_CASE("LayerNorm Inference MXFP8", "[layernorm][graph][block_scale]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
 
     REQUIRE(graph.check_support().is_good());
 
@@ -260,7 +260,7 @@ TEST_CASE("RmsNorm Training MXFP8", "[rmsnorm][graph][block_scale]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
 
     REQUIRE(graph.check_support().is_good());
 
@@ -345,7 +345,7 @@ TEST_CASE("RmsNorm Inference NVFP4", "[rmsnorm][graph][block_scale]") {
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
 
-    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::FALLBACK}).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
 
     REQUIRE(graph.check_support().is_good());
 

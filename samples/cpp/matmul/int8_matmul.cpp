@@ -59,7 +59,7 @@ TEST_CASE("Int8 Matmul", "[matmul][graph]") {
     auto B_attributes = fe::graph::Tensor_attributes()
                             .set_name("B")
                             .set_dim({b, k, n})
-                            .set_stride({k * n, 1, n})
+                            .set_stride({k * n, 1, k})
                             .set_data_type(fe::DataType_t::INT8);
     auto B = graph.tensor(B_attributes);
 

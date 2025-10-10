@@ -279,11 +279,9 @@ class Graph : public ICudnn, public INode {
         }
 
         if (attributes.implementation == AttentionImplementation_t::AUTO) {
-            // Temporary WAR to not choose UNIFIED for now.
-            attributes.implementation = AttentionImplementation_t::COMPOSITE;
             // Sets attributes.implementation to a supporting implementation,
             // or leaves as AUTO if none found
-            // attributes._auto_select_implementation(context);
+            attributes._auto_select_implementation(context);
         }
 
         switch (attributes.implementation) {
@@ -613,7 +611,7 @@ class Graph : public ICudnn, public INode {
 
     error_t
     validate() {
-        CUDNN_FE_LOG_LABEL_ENDL("");
+        CUDNN_FE_LOG_BANNER("  VALIDATING GRAPH  ");
         CUDNN_FE_LOG(*this << std::endl;);
 
         // First validate all inputs that the user set.
@@ -630,9 +628,10 @@ class Graph : public ICudnn, public INode {
 
         // Get all the pre assigned uids
         CHECK_CUDNN_FRONTEND_ERROR(get_pre_assigned_uids(used_uids));
-
         // Clear state
         used_uids.clear();
+
+        CUDNN_FE_LOG_BANNER("  VALIDATED ALL OK  ");
 
         return {error_code_t::OK, ""};
     }
@@ -640,23 +639,33 @@ class Graph : public ICudnn, public INode {
     // overload for deviceless AoT compilation
     error_t
     build_operation_graph() {
+        CUDNN_FE_LOG_BANNER("  BUILD OP GRAPH WITHOUT HANDLE  ");
+
         if (device_properties == nullptr) {
             return {error_code_t::ATTRIBUTE_NOT_SET, "Device properties are not set."};
         }
+        CUDNN_FE_LOG_BANNER("  BUILT OP GRAPH WITHOUT HANDLE  ");
         return build_operation_graph(nullptr);
     }
 
     error_t
     build_operation_graph(cudnnHandle_t handle) {
+        CUDNN_FE_LOG_BANNER("  BUILD OP GRAPH  ");
+
+        CUDNN_FE_LOG_BANNER("  1/4 INFER PROPERTIES OF NODES  ");
+
         // expand composite nodes
         CHECK_CUDNN_FRONTEND_ERROR(expand_subtree());
 
         // Get all the pre assigned uids
         CHECK_CUDNN_FRONTEND_ERROR(get_pre_assigned_uids(used_uids));
 
+        CUDNN_FE_LOG_BANNER("  2/4 CREATE TENSORS  ");
+
         Tensor_attributes::uid_t start_uid = 1;
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensors_subtree(uid_to_tensors, start_uid, used_uids));
 
+        CUDNN_FE_LOG_BANNER("  3/4 CREATE OPERATIONS  ");
         // INode keeps track of all uids that an operation graph uses.
         // This helps to return errors to user during execution, without relying on backend to do so.
         // Also, as uid in a variant pack have to be unique, keep a set of them.
@@ -669,12 +678,17 @@ class Graph : public ICudnn, public INode {
 
         fe_workspace_size = get_fe_workspace_size_subtree();
 
+        CUDNN_FE_LOG_BANNER("  4/4 LOWERING TO BACKEND OPERATION GRAPH  ");
+
         // The method here fuses all operations. There will be 1 operation graph in total.
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_operation_graph(handle));
 
         if (is_dynamic_shape_enabled && kernel_cache && !kernel_cache->is_finalized()) {
+            CUDNN_FE_LOG_BANNER("  BUILD KERNEL CACHE  ");
             CHECK_CUDNN_FRONTEND_ERROR(kernel_cache->build(operation_graph->get_raw_desc()));
         }
+
+        CUDNN_FE_LOG_BANNER("  BUILD OP GRAPH ALL OK === ");
 
         return {error_code_t::OK, ""};
     }
@@ -784,6 +798,7 @@ class Graph : public ICudnn, public INode {
                           std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
                           void *workspace,
                           int64_t plan_index) const {
+        CUDNN_FE_LOG_BANNER(" EXECUTE PLAN AT INDEX  for plan index (with Tensor keys) " << plan_index << "  ");
         // First get all the uids from the map
         std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
         for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
@@ -797,6 +812,8 @@ class Graph : public ICudnn, public INode {
     execute(cudnnHandle_t handle,
             std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
             void *workspace) const {
+        CUDNN_FE_LOG_BANNER(" EXECUTE PLAN (with Tensor keys) ");
+
         // First get all the uids from the map
         std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
         for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
@@ -814,6 +831,7 @@ class Graph : public ICudnn, public INode {
         // Add pass_by_value data pointers to uid_to_pointer map
         // object lifetime is controlled by tensor_to_pass_by_value which means the pointer should stay valid during
         // execute.
+        CUDNN_FE_LOG_BANNER("  EXECUTE PLAN AT INDEX  for plan index " << plan_index << "  ");
         std::unordered_map<uid_t, pass_by_values_t> tensor_to_pass_by_value;
         CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
 
@@ -838,6 +856,7 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(
             execute_cudnn_plan_with_uid(handle, tensor_uid_to_pointer_map, cudnn_workspace, plan_index));
 
+        CUDNN_FE_LOG_BANNER("  EXECUTE PLAN AT INDEX  ALL OK for plan index " << plan_index << "  ");
         return {error_code_t::OK, ""};
     }
 
@@ -848,6 +867,7 @@ class Graph : public ICudnn, public INode {
         // Add pass_by_value data pointers to uid_to_pointer map
         // object lifetime is controlled by tensor_to_pass_by_value which means the pointer should stay valid during
         // execute.
+        CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ");
         std::unordered_map<uid_t, pass_by_values_t> tensor_to_pass_by_value;
         CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
 
@@ -871,11 +891,99 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(
             execute_cudnn_plan_with_uid(handle, tensor_uid_to_pointer_map, cudnn_workspace, plans.candidate));
 
+        CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK ");
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    warmup(cudnnHandle_t handle) {
+        cudaStream_t fake_stream;
+
+        cudaStream_t original_stream;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &original_stream));
+
+        CUDNN_FE_LOG_BANNER("WARMUP (BEGIN FAKE GRAPH CAPTURE) ");
+
+        if (original_stream == nullptr) {
+            _CUDNN_CHECK_CUDA_ERROR(detail::cuda_stream_create(&fake_stream));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_stream(handle, fake_stream));
+        } else {
+            fake_stream = original_stream;
+        }
+
+        cudaGraph_t graph_obj;
+
+        cudaStreamCaptureStatus capture_status;
+
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_stream_is_capturing(fake_stream, &capture_status));
+
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: capture_status "
+                                << capture_status << " original_stream "
+                                << ((original_stream == nullptr) ? "DEFAULT (NULL) Stream" : "NON-DEFAULT Stream"));
+
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_begin_capture(fake_stream, cudaStreamCaptureModeRelaxed));
+
+        std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
+
+        void *tmp_pointer = reinterpret_cast<void *>(0x7f0000000000llu);
+
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_malloc((void **)&tmp_pointer, 1024 * 1024));
+
+        float tmp_double  = 1.0f;
+        void *cpu_pointer = reinterpret_cast<void *>(&tmp_double);
+
+        for (auto const &tensor : deserialized_tensor_properties) {
+            if (tensor->get_is_virtual() == false) {
+                if (tensor->get_is_pass_by_value() == false) {
+                    tensor_uid_to_pointer_map.emplace(tensor->get_uid(), tmp_pointer);
+                } else {
+                    tensor_uid_to_pointer_map.emplace(tensor->get_uid(), cpu_pointer);
+                }
+            }
+        }
+
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: full_graph_inputs: " << full_graph_inputs.size() << " elements");
+        for (auto const &tensor : full_graph_inputs) {
+            CUDNN_FE_LOG_LABEL_ENDL("\tuid: " << tensor->get_uid()
+                                              << ", is_pass_by_value = " << tensor->get_is_pass_by_value());
+            if (tensor->get_is_pass_by_value() == false) {
+                tensor_uid_to_pointer_map.emplace(tensor->get_uid(), tmp_pointer);
+            } else {
+                tensor_uid_to_pointer_map.emplace(tensor->get_uid(), cpu_pointer);
+            }
+        }
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: full_graph_outputs: " << full_graph_outputs.size() << " elements");
+        for (auto const &tensor : full_graph_outputs) {
+            CUDNN_FE_LOG_LABEL_ENDL("\tuid: " << tensor->get_uid());
+            tensor_uid_to_pointer_map.emplace(tensor->get_uid(), tmp_pointer);
+        }
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, deserialized_pass_by_value));
+
+        CHECK_CUDNN_FRONTEND_ERROR(execute(handle, tensor_uid_to_pointer_map, tmp_pointer));
+
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_end_capture(fake_stream, &graph_obj));
+
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_destroy(graph_obj));
+
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_free(tmp_pointer));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_stream(handle, original_stream));
+
+        if (original_stream == nullptr) {
+            _CUDNN_CHECK_CUDA_ERROR(detail::cuda_stream_destroy(fake_stream));
+        }
+
+        CUDNN_FE_LOG_BANNER("WARMUP (END FAKE GRAPH CAPTURE) ");
+
         return {error_code_t::OK, ""};
     }
 
     error_t
     serialize(std::vector<uint8_t> &data) const {
+        CUDNN_FE_LOG_BANNER(" SERIALIZE PLAN  ");
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j;
         serialize(j);
@@ -904,6 +1012,7 @@ class Graph : public ICudnn, public INode {
         j["fe_workspace_size"] = fe_workspace_size;
 
         data = json::to_ubjson(j);
+        CUDNN_FE_LOG_BANNER(" SERIALIZE PLAN (ALL OK) ");
         return {error_code_t::OK, ""};
 #else
         CUDNN_FRONTEND_UNUSED(data);
@@ -913,6 +1022,8 @@ class Graph : public ICudnn, public INode {
 
     error_t
     deserialize(cudnnHandle_t handle, std::vector<uint8_t> const &data) {
+        CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE  ");
+
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j = json::from_ubjson(data);
 
@@ -926,6 +1037,7 @@ class Graph : public ICudnn, public INode {
         }
 
         auto serialized_plan = j["cudnn_backend_data"];
+
         CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, serialized_plan));
 
         plans.behavior_notes = j["behavior_notes"].get<std::vector<std::vector<BehaviorNote_t>>>();
@@ -939,6 +1051,10 @@ class Graph : public ICudnn, public INode {
         variant_pack_replacements = j["variant_pack_replacements"];
 
         fe_workspace_size = j["fe_workspace_size"];
+
+        CHECK_CUDNN_FRONTEND_ERROR(warmup(handle));
+
+        CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE (ALL OK) ");
 
         return {error_code_t::OK, ""};
 #else
@@ -1601,6 +1717,7 @@ Graph::get_knobs_for_engine(int64_t const engine, std::vector<Knob> &knobs) {
 
 inline error_t
 Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
+    CUDNN_FE_LOG_BANNER("  CREATE EXECUTION PLANS  (HEURISTICS QUERY)  ");
     EngineConfigList op_graph_to_configs;
     CHECK_CUDNN_FRONTEND_ERROR(detail::query_cudnn_heuristics_impl(
         operation_graph, op_graph_to_configs, mode, context.get_target_sm_count(), device_properties));
@@ -1614,6 +1731,7 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Querying engine config properties.");
     CHECK_CUDNN_FRONTEND_ERROR(plans.query_properties());
 
+    CUDNN_FE_LOG_BANNER("  HEURISTICS QUERY ALL OK  ");
     return {error_code_t::OK, ""};
 }
 
@@ -1621,6 +1739,7 @@ inline error_t
 Graph::create_execution_plan(int64_t const engine_id, std::unordered_map<KnobType_t, int64_t> const &user_knobs) {
     // first create the engine
     // this just uses the global engine id and operation graph
+    CUDNN_FE_LOG_BANNER("  CREATE EXECUTION PLAN  for engine id " << engine_id << "  ");
     detail::backend_descriptor engine(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
     RETURN_CUDNN_FRONTEND_ERROR_IF(engine.get_status() != CUDNN_STATUS_SUCCESS,
                                    error_code_t::CUDNN_BACKEND_API_FAILED,
@@ -1637,6 +1756,8 @@ Graph::create_execution_plan(int64_t const engine_id, std::unordered_map<KnobTyp
     plans.enqueue_engine_configs({engine_config});
     CHECK_CUDNN_FRONTEND_ERROR(plans.query_properties());
 
+    CUDNN_FE_LOG_BANNER("  CREATE EXECUTION PLAN ALL OK  ");
+
     return {error_code_t::OK, ""};
 }
 
@@ -1648,7 +1769,13 @@ Graph::build_plan_at_index(int64_t plan_index) {
 
 inline error_t
 Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_builds) {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+    CUDNN_FE_LOG_BANNER("  BUILD PLANS  for policy " << nlohmann::json(policy).dump() << "  ");
+#else
+    CUDNN_FE_LOG_BANNER("  BUILD PLANS  for policy " << static_cast<int>(policy) << "  ");
+#endif
     CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(policy, do_multithreaded_builds));
+    CUDNN_FE_LOG_BANNER("  BUILD PLANS ALL OK  ");
     return {error_code_t::OK, ""};
 }
 
@@ -1657,21 +1784,33 @@ Graph::build(cudnnHandle_t const &handle,
              std::vector<HeurMode_t> const &modes,
              BuildPlanPolicy_t const policy,
              bool const do_multithreaded_builds) {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+    CUDNN_FE_LOG_BANNER(" BUILD with handle " << nlohmann::json(policy).dump());
+#else
+    CUDNN_FE_LOG_BANNER(" BUILD with handle " << static_cast<int>(policy) << "  ");
+#endif
     CHECK_CUDNN_FRONTEND_ERROR(this->validate());
     CHECK_CUDNN_FRONTEND_ERROR(this->build_operation_graph(handle));
     CHECK_CUDNN_FRONTEND_ERROR(this->create_execution_plans(modes));
     CHECK_CUDNN_FRONTEND_ERROR(this->check_support());
     CHECK_CUDNN_FRONTEND_ERROR(this->build_plans(policy, do_multithreaded_builds));
+    CUDNN_FE_LOG_BANNER("  BUILD ALL OK (with handle) ");
     return {error_code_t::OK, ""};
 }
 
 inline error_t
 Graph::build(std::vector<HeurMode_t> const &modes, BuildPlanPolicy_t const policy, bool const do_multithreaded_builds) {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+    CUDNN_FE_LOG_BANNER("  BUILD PLANS  without handle " << nlohmann::json(policy).dump() << "  ");
+#else
+    CUDNN_FE_LOG_BANNER("  BUILD PLANS  without handle " << static_cast<int>(policy) << "  ");
+#endif
     CHECK_CUDNN_FRONTEND_ERROR(this->validate());
     CHECK_CUDNN_FRONTEND_ERROR(this->build_operation_graph());
     CHECK_CUDNN_FRONTEND_ERROR(this->create_execution_plans(modes));
     CHECK_CUDNN_FRONTEND_ERROR(this->check_support());
     CHECK_CUDNN_FRONTEND_ERROR(this->build_plans(policy, do_multithreaded_builds));
+    CUDNN_FE_LOG_BANNER("  BUILD PLANS ALL OK (no handle) ");
     return {error_code_t::OK, ""};
 }
 

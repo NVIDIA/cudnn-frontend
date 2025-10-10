@@ -23,7 +23,7 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
 
     error_t
     infer_properties_node() override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferrencing properties for pointwise node " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO:     Inferrencing properties for pointwise node " << attributes.name);
 
         attributes.fill_from_context(context);
 
@@ -50,8 +50,8 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
                     continue;
                 }
                 if (input_tensor->get_dim() == out_0_tensor->get_dim()) {
-                    CUDNN_FE_LOG_LABEL_ENDL("INFO:" << out_0_tensor->get_name() << " stride computed from "
-                                                    << input_tensor->get_name());
+                    CUDNN_FE_LOG_LABEL_ENDL("INFO:" << "        " << out_0_tensor->get_name()
+                                                    << " stride computed from " << input_tensor->get_name());
                     out_0_tensor->set_stride(input_tensor->get_stride());
                     break;
                 }
@@ -79,7 +79,7 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Building PointwiseNode operations " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL("INFO: " << "Building PointwiseNode operations " << attributes.name << " ");
 
         auto&& pointwise_descriptor_builder = cudnn_frontend::PointwiseDescBuilder();
 

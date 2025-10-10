@@ -31,7 +31,7 @@ namespace fe = cudnn_frontend;
 
 /*
 Run this example by using command:
-bin/samples "Cached sdpa"
+bin/samples "Benchmark sdpa graph API runtimes"
 
 This example is supposed to be used when executing full models and/or doing multiple iterations.
 */

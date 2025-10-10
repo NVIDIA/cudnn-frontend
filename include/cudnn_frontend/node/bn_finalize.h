@@ -24,8 +24,7 @@ class BatchNormFinalizeNode : public NodeCRTP<BatchNormFinalizeNode> {
 
     error_t
     infer_properties_node() override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO:Inferencing properties for batchnorm finalize node  " << attributes.name
-                                                                                            << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO:Inferencing properties for batchnorm finalize node " << attributes.name);
 
         attributes.fill_from_context(context);
 
@@ -64,7 +63,7 @@ class BatchNormFinalizeNode : public NodeCRTP<BatchNormFinalizeNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
-        CUDNN_FE_LOG_LABEL_ENDL("INFO:Building BatchNormFinalizeNode operations " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL("INFO:Building BatchNormFinalizeNode operations " << attributes.name << " ");
 
         // Create the batchnorm operation.
         auto&& batchnorm_operation_builder =

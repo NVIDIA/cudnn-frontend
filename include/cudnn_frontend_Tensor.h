@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -56,20 +56,23 @@ class Tensor_v8 : public BackendDescriptor {
     std::string
     describe() const override {
         std::stringstream ss;
+        ss << "               CUDNN_BACKEND_TENSOR_DESCRIPTOR :\n"
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
-        ss << "CUDNN_BACKEND_TENSOR_DESCRIPTOR :" << " Datatype: " << json{data_type} << " Id: " << std::to_string(id)
+           << "                                   Datatype: " << json{data_type}
 #else
-        ss << "CUDNN_BACKEND_TENSOR_DESCRIPTOR :" << " Datatype: " << int(data_type) << " Id: " << std::to_string(id)
+           << "                                   Datatype: " << int(data_type)
 #endif
-           << " nDims " << nDims << " VectorCount: " << vectorCount << " vectorDimension " << vectorDimension;
-        ss << " Dim [ ";
+           << "\n                                   Id: " << id << "\n                                   Dims " << nDims
+           << "\n                                   VectorCount: " << vectorCount
+           << "\n                                   vectorDimension " << vectorDimension;
+        ss << "\n                                   Dim [ ";
         for (auto i = 0; i < nDims; i++) {
             if (i != 0) {
                 ss << ',';
             }
             ss << btensor_dimA[i];
         }
-        ss << " ] Str [ ";
+        ss << " ]\n                                   Str [ ";
         for (auto i = 0; i < nDims; i++) {
             if (i != 0) {
                 ss << ',';
@@ -77,12 +80,17 @@ class Tensor_v8 : public BackendDescriptor {
             ss << btensor_strA[i];
         }
         ss << " ]";
-        ss << " isVirtual: " << isVirtual << " isByValue: " << isByValue << " Alignment: " << alignment;
+        ss << "\n                                   isVirtual: " << isVirtual
+           << "\n                                   isByValue: " << isByValue
+           << "\n                                   Alignment: " << alignment;
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
-        ss << " reorder_type: " << json{reorder_type};
+        ss << "\n                                   reorder_type: " << json{reorder_type};
 #else
-        ss << " reorder_type: " << int(reorder_type);
+        ss << "\n                                   reorder_type: " << int(reorder_type);
 #endif
+        if (raggedOffset != nullptr) {
+            ss << "\n                                   raggedOffset: Enabled UID: " << raggedOffset->getId();
+        }
         return ss.str();
     }
 

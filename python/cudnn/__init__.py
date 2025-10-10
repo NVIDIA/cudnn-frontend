@@ -46,7 +46,7 @@ for symbol_name in symbols_to_import:
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.14.1"
+__version__ = "1.15.0"
 
 
 def _tensor(
@@ -204,10 +204,14 @@ def _dlopen_cudnn():
         try:
             lib = ctypes.CDLL("libcudnn.so.9")
         except Exception:
-            lib = ctypes.CDLL("libcudnn.so")
+            try:
+                lib = ctypes.CDLL("libcudnn.so")
+            except Exception:
+                lib = None
 
-    handle = ctypes.cast(lib._handle, ctypes.c_void_p).value
-    _pybind_module._set_dlhandle_cudnn(handle)
+    if lib is not None:
+        handle = ctypes.cast(lib._handle, ctypes.c_void_p).value
+        _pybind_module._set_dlhandle_cudnn(handle)
 
 
 if is_windows():
@@ -216,3 +220,4 @@ else:
     _dlopen_cudnn()
 
 from .graph import graph, jit, graph_cache
+from .wrapper import Graph

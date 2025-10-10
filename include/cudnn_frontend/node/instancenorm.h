@@ -72,7 +72,7 @@ class InstanceNormNode : public NodeCRTP<InstanceNormNode> {
 
     error_t
     pre_validate_node() const override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating InstanceNormNode " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating InstanceNormNode " << attributes.name);
 
         // Norm forward phase should be set
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.forward_phase == NormFwdPhase_t::NOT_SET,
@@ -89,7 +89,7 @@ class InstanceNormNode : public NodeCRTP<InstanceNormNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Building InstanceNormNode operations " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL("INFO: Building InstanceNormNode operations " << attributes.name << " ");
 
         auto&& op_builder = cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_FORWARD_DESCRIPTOR);
 
@@ -166,7 +166,7 @@ class DINNode : public NodeCRTP<DINNode> {
 
     error_t
     infer_properties_node() override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferencing properties for DIN node " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferencing properties for DIN node " << attributes.name);
 
         attributes.fill_from_context(context);
 
@@ -240,7 +240,7 @@ class DINNode : public NodeCRTP<DINNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Building DINode operations " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL("INFO: Building DINode operations " << attributes.name << " ");
 
         // Create the DIN operation.
         auto&& DIN_operation_builder =

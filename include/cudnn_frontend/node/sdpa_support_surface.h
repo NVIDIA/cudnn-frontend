@@ -96,7 +96,7 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
                                    error_code_t::ATTRIBUTE_NOT_SET,
                                    "seq_len_q and seq_len_kv needs to be set only if padding mask is enabled.");
 
-    RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (padding_mask == false),
+    RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && ((padding_mask == false) && (attention_score_modifier == nullptr)),
                                    error_code_t::GRAPH_NOT_SUPPORTED,
                                    "Ragged offsets are only supported with padding mask.");
 
@@ -375,85 +375,90 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
     }
 
     // Check whether the selected implementation supports the requested features.
-    CHECK_CUDNN_FRONTEND_ERROR(validate_sdpa_support_surface_for_implementation(context, implementation));
+    CHECK_CUDNN_FRONTEND_ERROR(verify_sdpa_support_surface_for_implementation(context, implementation));
 
     return {error_code_t::OK, ""};
 }
 
+// Verify that the underlying implementation supports all the features in these attributes.
+// Unlike `validate_sdpa_support_surface()`, this may be called before validation, so:
+//   * don't assume any particular keys already exist in `inputs` or `outputs`
+//   * don't assume any tensor dims or strides are already set
+// We return error codes directly instead of using `RETURN_CUDNN_FRONTEND_ERROR_IF`
+// to avoid unneeded logging when this function is being called in a non-error-generating
+// situation (e.g. during auto-select of SDPA implementation).
 inline error_t
-SDPA_attributes::validate_sdpa_support_surface_for_implementation(const detail::Context& context,
-                                                                  AttentionImplementation_t impl) const {
+SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Context& context,
+                                                                AttentionImplementation_t impl) const {
     switch (impl) {
         case AttentionImplementation_t::AUTO:
             // This function should not be called with AUTO.
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                true,
-                error_code_t::INVALID_VALUE,
-                "Can't call validate_sdpa_support_surface_for_implementation with impl=AUTO");
-            break;
+            return {error_code_t::INVALID_VALUE,
+                    "Can't call verify_sdpa_support_surface_for_implementation with impl=AUTO"};
         case AttentionImplementation_t::COMPOSITE:
             // Composite implementation already supports all of the features.
             break;
         case AttentionImplementation_t::UNIFIED: {
             auto cudnn_ver_error =
-                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node requires cuDNN 9.13.0"};
-#if (CUDNN_VERSION >= 91300)
-            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91300, cudnn_ver_error);
+                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node requires cuDNN 9.13.1"};
+#if (CUDNN_VERSION >= 91301)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91301, cudnn_ver_error);
 
             for (const auto& [key, value] : inputs) {
-                RETURN_CUDNN_FRONTEND_ERROR_IF(
-                    key != input_names::Q && key != input_names::K && key != input_names::V &&
-                        key != input_names::Attn_scale && value != nullptr,
-                    error_code_t::GRAPH_NOT_SUPPORTED,
-                    "Unified SDPA node doesn't yet support inputs other than Q, K, V and Attn_scale");
+                if (key != input_names::Q && key != input_names::K && key != input_names::V &&
+                    key != input_names::Attn_scale && value != nullptr) {
+                    return {error_code_t::GRAPH_NOT_SUPPORTED,
+                            "Unified SDPA node doesn't yet support inputs other than Q, K, V and Attn_scale"};
+                }
             }
 
             for (const auto& [key, value] : outputs) {
-                RETURN_CUDNN_FRONTEND_ERROR_IF(key != output_names::O && key != output_names::Stats && value != nullptr,
-                                               error_code_t::GRAPH_NOT_SUPPORTED,
-                                               "Unified SDPA node doesn't yet support outputs other than O and Stats");
+                if (key != output_names::O && key != output_names::Stats && value != nullptr) {
+                    return {error_code_t::GRAPH_NOT_SUPPORTED,
+                            "Unified SDPA node doesn't yet support outputs other than O and Stats"};
+                }
             }
 
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                alibi_mask, error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support alibi mask");
+            if (alibi_mask) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support alibi mask"};
+            }
 
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                padding_mask, error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support padding mask");
+            if (padding_mask) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support padding mask"};
+            }
 
-            RETURN_CUDNN_FRONTEND_ERROR_IF(left_bound.has_value() || right_bound.has_value(),
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Unified SDPA node doesn't yet support left bound or right bound");
+            if (left_bound.has_value() || right_bound.has_value()) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Unified SDPA node doesn't yet support left bound or right bound"};
+            }
 
-            RETURN_CUDNN_FRONTEND_ERROR_IF(diagonal_alignment != DiagonalAlignment_t::TOP_LEFT,
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Unified SDPA node doesn't yet support diagonal alignment");
+            if (diagonal_alignment != DiagonalAlignment_t::TOP_LEFT) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support diagonal alignment"};
+            }
 
-            RETURN_CUDNN_FRONTEND_ERROR_IF(dropout_probability.has_value(),
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Unified SDPA node doesn't yet support dropout");
+            if (dropout_probability.has_value()) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support dropout"};
+            }
 
-            RETURN_CUDNN_FRONTEND_ERROR_IF(max_seq_len_kv.has_value(),
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Unified SDPA node doesn't yet support max sequence length");
+            if (max_seq_len_kv.has_value()) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support max sequence length"};
+            }
 
-            RETURN_CUDNN_FRONTEND_ERROR_IF(attention_score_modifier != nullptr,
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Unified SDPA node doesn't yet support attention score modifier");
+            if (attention_score_modifier != nullptr) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Unified SDPA node doesn't yet support attention score modifier"};
+            }
 
-            RETURN_CUDNN_FRONTEND_ERROR_IF(mma_core_mode != DataType_t::HALF,
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Unified SDPA node doesn't yet support a data type other than fp16");
+            if (mma_core_mode != DataType_t::HALF) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Unified SDPA node doesn't yet support a data type other than fp16"};
+            }
 
-            int64_t s_q = inputs.at(SDPA_attributes::input_names::Q)->get_dim()[2];
-            RETURN_CUDNN_FRONTEND_ERROR_IF(s_q == 1,
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Unified SDPA node doesn't yet support decode only mode, i.e. s_q == 1");
-
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                (compute_data_type != DataType_t::NOT_SET && compute_data_type != DataType_t::FLOAT) ||
-                    context.get_compute_data_type() != DataType_t::FLOAT,
-                error_code_t::GRAPH_NOT_SUPPORTED,
-                "Unified SDPA node doesn't yet support compute data type other than float");
+            if ((compute_data_type != DataType_t::NOT_SET && compute_data_type != DataType_t::FLOAT) ||
+                context.get_compute_data_type() != DataType_t::FLOAT) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Unified SDPA node doesn't yet support compute data type other than float"};
+            }
 #else
             CUDNN_FRONTEND_UNUSED(context);
             return cudnn_ver_error;

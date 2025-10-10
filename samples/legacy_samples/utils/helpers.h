@@ -92,6 +92,10 @@ is_ada_arch();
 bool
 is_hopper_arch();
 bool
+is_blackwell_computing_arch();
+bool
+is_blackwell_gaming_arch();
+bool
 check_device_arch_newer_than(std::string const& arch);
 bool
 is_arch_supported_by_cudnn();

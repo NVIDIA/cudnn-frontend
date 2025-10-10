@@ -23,7 +23,7 @@ class DLNNode : public NodeCRTP<DLNNode> {
     }
     error_t
     infer_properties_node() override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferencing properties for DLN node " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferencing properties for DLN node " << attributes.name);
 
         // WAR as epsilon was required in previous versions
         if (detail::get_backend_version() < 8906) {
@@ -97,7 +97,7 @@ class DLNNode : public NodeCRTP<DLNNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: " << "Building DLNNode operations " << attributes.name << "...");
+        CUDNN_FE_LOG_LABEL("INFO: " << "Building DLNNode operations " << attributes.name << " ");
 
         // Create the DLN operation.
         auto&& DLN_op_builder = cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_BACKWARD_DESCRIPTOR);
