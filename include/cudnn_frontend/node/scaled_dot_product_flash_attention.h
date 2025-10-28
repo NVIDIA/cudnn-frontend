@@ -849,8 +849,18 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
     std::shared_ptr<Tensor_attributes> alibi_slopes;
     int64_t alibi_slopes_size = 0;
 
+    mutable bool has_workaround_padding_mask         = false;  // Will be edited in pre_validate_node()
+    mutable int32_t s_q_for_workaround_padding_mask  = 0;      // Will be edited in pre_validate_node()
+    mutable int32_t s_kv_for_workaround_padding_mask = 0;      // Will be edited in pre_validate_node()
+    mutable std::shared_ptr<Tensor_attributes>
+        workaround_padding_mask_seq_len_q;  // Will be edited in pre_validate_node()
+    mutable std::shared_ptr<Tensor_attributes>
+        workaround_padding_mask_seq_len_kv;                      // Will be edited in pre_validate_node()
+    mutable int64_t batch_size_for_workaround_padding_mask = 0;  // Will be edited in pre_validate_node()
+
+
    public:
-    SDPA_backward_attributes attributes;
+    mutable SDPA_backward_attributes attributes;  // Will be edited in pre_validate_node() for workaround padding mask
 
     SDPABackwardNode(SDPA_backward_attributes&& attributes_, detail::Context const& context)
         : NodeCRTP(context), attributes(std::move(attributes_)) {}
@@ -976,6 +986,20 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(is_bias && (bias_mask->second->get_data_type() == DataType_t::BOOLEAN),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Bias mask data type cannot be boolean");
+
+        if (s_q % 128 != 0 && attributes.padding_mask == false && is_ragged == false) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Workaround padding mask is enabled for s_q % 128 != 0 and use_padding_mask == false and is_ragged == false");
+            has_workaround_padding_mask = true;
+            batch_size_for_workaround_padding_mask = attributes.inputs.at(input_names::Q)->get_dim()[0];
+            s_q_for_workaround_padding_mask = s_q;
+            s_kv_for_workaround_padding_mask = s_kv;
+            workaround_padding_mask_seq_len_q = std::make_shared<Tensor_attributes>();
+            workaround_padding_mask_seq_len_q->set_name("workaround_padding_mask_seq_len_q").set_dim({batch_size_for_workaround_padding_mask,1,1,1}).set_stride({1,1,1,1}).set_data_type(DataType_t::INT32);
+            workaround_padding_mask_seq_len_kv = std::make_shared<Tensor_attributes>();
+            workaround_padding_mask_seq_len_kv->set_name("workaround_padding_mask_seq_len_kv").set_dim({batch_size_for_workaround_padding_mask,1,1,1}).set_stride({1,1,1,1}).set_data_type(DataType_t::INT32);
+            attributes.set_padding_mask(true);
+            attributes.set_seq_len_q(workaround_padding_mask_seq_len_q).set_seq_len_kv(workaround_padding_mask_seq_len_kv);
+        }
 
         // validate options for padding mask
         auto const& seq_len_q     = attributes.inputs.find(input_names::SEQ_LEN_Q);
@@ -1694,6 +1718,10 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
         size += dV_fullhead_size;
         size += softmax_sum_size;
 
+        if (has_workaround_padding_mask) {
+            size += batch_size_for_workaround_padding_mask * sizeof(int32_t) * 2;
+        }
+
         return size;
     }
 
@@ -1735,6 +1763,34 @@ class SDPABackwardNode : public NodeCRTP<SDPABackwardNode> {
         if (softmax_sum && !softmax_sum->get_is_virtual()) {
             workspace_modifications.emplace(softmax_sum->get_uid(), std::make_tuple(2, offset, std::vector<float>()));
             offset = offset + softmax_sum_size;
+        }
+
+        if (has_workaround_padding_mask) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Collecting workaround padding mask tensors with batch size "
+                                    << batch_size_for_workaround_padding_mask << " with UIDs "
+                                    << workaround_padding_mask_seq_len_q->get_uid() << " and "
+                                    << workaround_padding_mask_seq_len_kv->get_uid());
+            std::vector<int32_t> workaround_padding_mask_seq_len_q_vec(batch_size_for_workaround_padding_mask,
+                                                                       s_q_for_workaround_padding_mask);
+            std::vector<int32_t> workaround_padding_mask_seq_len_kv_vec(batch_size_for_workaround_padding_mask,
+                                                                        s_kv_for_workaround_padding_mask);
+
+            // reinterpret_cast the int32_t vector data to float vector for workspace_modifications
+            std::vector<float> workaround_padding_mask_seq_len_q_vec_float(
+                reinterpret_cast<float*>(workaround_padding_mask_seq_len_q_vec.data()),
+                reinterpret_cast<float*>(workaround_padding_mask_seq_len_q_vec.data()) +
+                    batch_size_for_workaround_padding_mask);
+            std::vector<float> workaround_padding_mask_seq_len_kv_vec_float(
+                reinterpret_cast<float*>(workaround_padding_mask_seq_len_kv_vec.data()),
+                reinterpret_cast<float*>(workaround_padding_mask_seq_len_kv_vec.data()) +
+                    batch_size_for_workaround_padding_mask);
+
+            workspace_modifications.emplace(workaround_padding_mask_seq_len_q->get_uid(),
+                                            std::make_tuple(0, offset, workaround_padding_mask_seq_len_q_vec_float));
+            offset = offset + batch_size_for_workaround_padding_mask * sizeof(float);
+            workspace_modifications.emplace(workaround_padding_mask_seq_len_kv->get_uid(),
+                                            std::make_tuple(0, offset, workaround_padding_mask_seq_len_kv_vec_float));
+            offset = offset + batch_size_for_workaround_padding_mask * sizeof(float);
         }
 
         return {error_code_t::OK, ""};
