@@ -70,9 +70,9 @@ class EngineConfigGenerator {
 
     /// Returns the concatenated plan in the order of heuristic results.
     auto
-    cudnnGetPlan(cudnnHandle_t handle, cudnn_frontend::OperationGraph &opGraph, Predicate pred) -> executionPlans_t;
+    cudnnGetPlan(cudnnHandle_t handle, cudnn_frontend::OperationGraph &opGraph, Predicate pred, size_t max_plans=10000) -> executionPlans_t;
     auto
-    cudnnGetPlan(cudnnHandle_t handle, cudnn_frontend::OperationGraph &opGraph) -> executionPlans_t;
+    cudnnGetPlan(cudnnHandle_t handle, cudnn_frontend::OperationGraph &opGraph, size_t max_plans=10000) -> executionPlans_t;
 
     /// Reruns the concatenated plans and measures the execution time following which
     /// a sorted order of executionPlans are return to the user.
