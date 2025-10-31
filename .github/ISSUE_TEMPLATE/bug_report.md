@@ -26,7 +26,7 @@ A clear and concise description of what you expected to happen.
 Please attach API logs for both cudnn_frontend and cudnn_backend.
 ```
 // For cudnn_frontend
-export CUDNN_FRONTEND_LOG_FLIE=fe.log
+export CUDNN_FRONTEND_LOG_FILE=fe.log
 export CUDNN_FRONTEND_LOG_INFO=1
 
 // For cudnn_backend
