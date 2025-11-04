@@ -862,7 +862,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Bias mask data type cannot be boolean");
 
-        if (s_q % 128 != 0 && attributes.padding_mask == false && is_ragged == false) {
+        if (s_q % 128 != 0 && attributes.padding_mask == false && is_ragged == false && detail::get_backend_version() <= 91500) {
             CUDNN_FE_LOG_LABEL_ENDL("INFO: Workaround padding mask is enabled for s_q % 128 != 0 and use_padding_mask == false and is_ragged == false");
             has_workaround_padding_mask = true;
             batch_size_for_workaround_padding_mask = attributes.inputs.at(input_names::Q)->get_dim()[0];
