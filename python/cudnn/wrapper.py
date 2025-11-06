@@ -30,6 +30,7 @@ Example:
 """
 
 from collections import OrderedDict
+import atexit
 import itertools
 import inspect
 import logging
@@ -37,19 +38,23 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cudnn
 import cudnn.datatypes
-import torch
 from cudnn import data_type, heur_mode
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 __all__ = ["Graph", "data_type", "heur_mode", "cudnn"]
 
 # typedefs for readability
 CudnnHandle = int
+_default_cudnn_handle = None
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-
-def _graph_tensor(graph: cudnn.pygraph, tensor: torch.Tensor) -> cudnn.tensor:
+def _graph_tensor(graph: cudnn.pygraph, tensor: "torch.Tensor") -> cudnn.tensor:
     """Create a tensor in the graph object.
 
     Args:
@@ -71,7 +76,7 @@ def _graph_tensor(graph: cudnn.pygraph, tensor: torch.Tensor) -> cudnn.tensor:
 
 
 def _find_tensor(
-    tensor: Union[str, cudnn.tensor, torch.Tensor],
+    tensor: Union[str, cudnn.tensor, "torch.Tensor"],
     tensor_map: Dict[str, cudnn.tensor],
     dlpack_map: Dict[int, cudnn.tensor],
 ) -> str:
@@ -124,7 +129,7 @@ def _find_tensor(
 
 def _extract_tensor(
     name: str, tensor: cudnn.tensor, arg_dict: dict
-) -> Optional[torch.Tensor]:
+) -> Optional["torch.Tensor"]:
     """Extract a dlpack tensor from the arg_dict that matches the provided name or cudnn tensor
 
     Args:
@@ -149,7 +154,7 @@ def _extract_tensor(
         return None  # not found
 
 
-def _tensor_like(cudnn_tensor: cudnn.tensor, tensor_type: str = "pyt") -> torch.Tensor:
+def _tensor_like(cudnn_tensor: cudnn.tensor, tensor_type: str = "pyt") -> "torch.Tensor":
     """Create a tensor like the provided cudnn tensor
 
     Args:
@@ -171,6 +176,27 @@ def _tensor_like(cudnn_tensor: cudnn.tensor, tensor_type: str = "pyt") -> torch.
     tensor = torch.empty(cudnn_tensor.get_dim(), device="cuda", dtype=dtype)
     tensor = torch.as_strided(tensor, cudnn_tensor.get_dim(), cudnn_tensor.get_stride())
     return tensor
+
+
+def get_default_handle(stream: Optional["torch.cuda.Stream"] = None) -> CudnnHandle:
+    """Get the default cuDNN handle and set to torch's current stream"""
+    global _default_cudnn_handle
+    if torch is None:
+        raise RuntimeError("PyTorch is not available")
+    if _default_cudnn_handle is None:
+        _default_cudnn_handle = cudnn.create_handle()
+    if stream is None:
+        stream = torch.cuda.current_stream().cuda_stream
+    cudnn.set_stream(handle=_default_cudnn_handle, stream=stream)
+    return _default_cudnn_handle
+
+
+def destroy_default_handle():
+    if _default_cudnn_handle is not None:
+        cudnn.destroy_handle(_default_cudnn_handle)
+
+
+atexit.register(destroy_default_handle)
 
 
 class Graph:
@@ -198,12 +224,14 @@ class Graph:
         self,
         *,
         handle: Optional[CudnnHandle] = None,
-        inputs: Optional[List[Union[str, torch.Tensor, cudnn.tensor]]] = None,
-        outputs: Optional[List[Union[str, torch.Tensor, cudnn.tensor]]] = None,
+        inputs: Optional[List[Union[str, "torch.Tensor", cudnn.tensor]]] = None,
+        outputs: Optional[List[Union[str, "torch.Tensor", cudnn.tensor]]] = None,
         heuristics: Optional[List[heur_mode]] = None,
         workspace_alloc: bool = True,
         **kwargs,
     ) -> None:
+        if torch is None:
+            raise RuntimeError("PyTorch is not available")
         if inputs and not isinstance(inputs, (list, tuple)):
             raise ValueError("inputs must be a list or tuple")
         if outputs and not isinstance(outputs, (list, tuple)):
@@ -255,7 +283,9 @@ class Graph:
             raise RuntimeError("Graph already created")
         self.__graph = cudnn.pygraph(
             # Pass handle only if self.__handle is not None
-            **({"handle": self.__handle} if self.__handle is not None else {}),
+            **(
+                {"handle": self.__handle} if self.__handle not in ["auto", None] else {}
+            ),
             **self.__kwargs,
         )
         return self
@@ -435,7 +465,7 @@ class Graph:
 
     def __call_with_positional_args(
         self, *args, **kwargs
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+    ) -> Union["torch.Tensor", Tuple["torch.Tensor", ...]]:
         """Execute the graph with positional arguments.
 
         Args:
@@ -464,7 +494,9 @@ class Graph:
         kwargs = dict(kwargs)  # shallow copy
 
         if "handle" not in kwargs:
-            if self.__handle is not None:
+            if self.__handle == "auto":
+                kwargs["handle"] = get_default_handle()
+            elif self.__handle is not None:
                 kwargs["handle"] = self.__handle
             else:
                 raise RuntimeError("Need to specify cudnn handle to execute graph")
@@ -474,7 +506,6 @@ class Graph:
             else:
                 kwargs["workspace"] = self.__workspace
         self.__graph.execute(variant_pack, **kwargs)
-        torch.cuda.synchronize()
         # return the output as a single tensor or a tuple
         if len(output_tuple) == 1:
             return output_tuple[0]
@@ -483,9 +514,9 @@ class Graph:
 
     def __call_with_tensor_dict(
         self,
-        tensor_dict: Dict[str, torch.Tensor],
+        tensor_dict: Dict[str, "torch.Tensor"],
         **kwargs,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, "torch.Tensor"]:
         """Execute the graph with a dictionary of tensors.
 
         Args:
@@ -545,7 +576,9 @@ class Graph:
         # execute the graph
         kwargs = dict(kwargs)  # shallow copy
         if "handle" not in kwargs:
-            if self.__handle is not None:
+            if self.__handle == "auto":
+                kwargs["handle"] = get_default_handle()
+            elif self.__handle is not None:
                 kwargs["handle"] = self.__handle
             else:
                 raise RuntimeError("Need to specify cudnn handle to execute graph")
@@ -555,13 +588,12 @@ class Graph:
             else:
                 kwargs["workspace"] = self.__workspace
         self.__graph.execute(variant_pack, **kwargs)
-        torch.cuda.synchronize()
         return tensor_dict  # by this time, the output tensors are updated
 
     def set_io_tuples(
         self,
-        inputs: List[Union[str, torch.Tensor, cudnn.tensor]],
-        outputs: List[Union[str, torch.Tensor, cudnn.tensor]],
+        inputs: List[Union[str, "torch.Tensor", cudnn.tensor]],
+        outputs: List[Union[str, "torch.Tensor", cudnn.tensor]],
     ) -> None:
         """Set order of input and output tensors to allow graph to be executed with positional arguments.
 

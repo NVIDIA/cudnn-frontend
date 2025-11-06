@@ -14,12 +14,15 @@ add_executable(
     sdpa/fp16_fwd_with_cudagraphs.cpp
     sdpa/fp16_bwd_with_cudagraphs.cpp
     sdpa/fp8_fwd.cpp
+    sdpa/fp8_fwd_current_scaling.cpp
+    sdpa/fp8_bwd_with_current_scaling.cpp
     sdpa/fp8_bwd.cpp
     sdpa/fp8_fwd_bottom_right_causal_mask.cpp
     sdpa/fp8_bwd_bottom_right_causal_mask.cpp
     sdpa/fp16_fwd_with_sink_token.cpp
     sdpa/fp16_bwd_with_sink_token.cpp
     sdpa/fp16_fwd_with_max_and_sum_exp.cpp
+    sdpa/fp16_fwd_with_block_mask.cpp
 
     convolution/fprop.cpp
     convolution/fp8_fprop.cpp

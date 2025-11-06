@@ -678,6 +678,8 @@ def test_sdpa(
     left_bound = max(1, random.choice([1, s_kv//4])) if is_left_bound else None
     right_bound = random.choice([0, s_kv//4]) if is_right_bound else None
 
+    implementation = cudnn.attention_implementation.AUTO
+
     # -------------------------- override test parameters if args are provided ----------------
     b = int(request.config.option.b) if request.config.option.b != None else b
     s_q = int(request.config.option.s_q) if request.config.option.s_q != None else s_q
@@ -690,6 +692,7 @@ def test_sdpa(
     block_size = int(request.config.option.block_size) if request.config.option.block_size != None else block_size
     left_bound = int(request.config.option.left_bound) if request.config.option.left_bound != None else left_bound
     right_bound = int(request.config.option.right_bound) if request.config.option.right_bound != None else right_bound
+    implementation = getattr(cudnn.attention_implementation, request.config.option.implementation) if request.config.option.implementation != None else implementation
 
     if s_q == 1:
         is_dropout = False
@@ -702,7 +705,7 @@ def test_sdpa(
         pytest.skip("d_qk != d_v is not supported with ragged offset")
 
     print("\n=============== TEST CMD TO REPRODUCE ===============")
-    cmd = f"pytest {request.node.nodeid} --b={b} --s_q={s_q} --s_kv={s_kv} --d_qk={d_qk} --d_v={d_v} --h_q={h_q} --h_k={h_k} --h_v={h_v} --block_size={block_size}"
+    cmd = f"pytest {request.node.nodeid} --b={b} --s_q={s_q} --s_kv={s_kv} --d_qk={d_qk} --d_v={d_v} --h_q={h_q} --h_k={h_k} --h_v={h_v} --block_size={block_size} --implementation={implementation.name}"
     if left_bound is not None:
         cmd += f" --left_bound={left_bound}"
     if right_bound is not None:
@@ -891,7 +894,8 @@ def test_sdpa(
         rng_dump=rng_dump,
         paged_attention_k_table=page_table_k,
         paged_attention_v_table=page_table_v,
-        paged_attention_max_seq_len_kv=s_kv if is_paged_attention else None
+        paged_attention_max_seq_len_kv=s_kv if is_paged_attention else None,
+        implementation=implementation
     )
 
     o.set_output(True).set_dim(shape_o).set_stride(stride_o)
@@ -905,7 +909,7 @@ def test_sdpa(
         graph.validate()
     except cudnn.cudnnGraphNotSupportedError as e:
         print("Graph not supported")
-        pytest.xfail(repr(e))
+        pytest.skip(repr(e))
     except Exception as e:
         pytest.fail(repr(e))
 
@@ -1315,13 +1319,19 @@ def test_sdpa_backward(
     try:
         graph.validate()
     except cudnn.cudnnGraphNotSupportedError as e:
-        pytest.xfail(repr(e))
+        pytest.skip(repr(e))
     except Exception as e:
         pytest.fail(repr(e))
 
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    graph.check_support()
+    
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+    except cudnn.cudnnGraphNotSupportedError as e:
+        print(f"TEST WAIVED: unsupported graph. {e}")
+        pytest.skip("TEST WAIVED: unsupported graph.")
+    
     graph.build_plans()
 
     variant_pack = {
@@ -1438,13 +1448,19 @@ def test_sdpa_backward(
     try:
         graph.validate()
     except cudnn.cudnnGraphNotSupportedError as e:
-        pytest.xfail(repr(e))
+        pytest.skip(repr(e))
     except Exception as e:
         pytest.fail(repr(e))
 
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    graph.check_support()
+    
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+    except cudnn.cudnnGraphNotSupportedError as e:
+        print(f"TEST WAIVED: unsupported graph. {e}")
+        pytest.skip("TEST WAIVED: unsupported graph.")
+    
     graph.build_plans()
 
     variant_pack = {

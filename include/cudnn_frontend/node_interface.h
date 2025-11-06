@@ -35,6 +35,7 @@ class ResampleNode;
 class ReshapeNode;
 class RngNode;
 class SoftmaxNode;
+class MoeGroupedMatmulNode;
 
 // Interface for all nodes to follow.
 class INode {
@@ -138,6 +139,7 @@ class INode {
         ADALAYERNORM,
         DADALAYERNORM,
         UNIFIED_SDPA,
+        MOE_GROUPED_MATMUL,
     };
     Type tag;
 
@@ -217,6 +219,15 @@ class INode {
     concatenate(std::vector<std::shared_ptr<Tensor_attributes>> x,
                 Concatenate_attributes attributes,
                 std::shared_ptr<Tensor_attributes> y);
+
+    void
+    moe_grouped_matmul(std::shared_ptr<Tensor_attributes> token,
+                       std::shared_ptr<Tensor_attributes> weight,
+                       std::shared_ptr<Tensor_attributes> first_token_offset,
+                       std::shared_ptr<Tensor_attributes> token_index,
+                       std::shared_ptr<Tensor_attributes> token_ks,
+                       Moe_grouped_matmul_attributes attributes,
+                       std::shared_ptr<Tensor_attributes> output);
 
     error_t
     validate_subtree() {

@@ -28,6 +28,7 @@
 #include "node/block_scale_quantize.h"
 #include "node/block_scale_dequantize.h"
 #include "node/concatenate.h"
+#include "node/moe_grouped_matmul.h"
 
 #include "backend/backend_descriptor.h"
 #include "plans.h"
@@ -1242,6 +1243,13 @@ class Graph : public ICudnn, public INode {
     std::shared_ptr<Tensor_attributes> concatenate(std::vector<std::shared_ptr<Tensor_attributes>>,
                                                    Concatenate_attributes);
 
+    std::shared_ptr<Tensor_attributes> moe_grouped_matmul(std::shared_ptr<Tensor_attributes>,
+                                                          std::shared_ptr<Tensor_attributes>,
+                                                          std::shared_ptr<Tensor_attributes>,
+                                                          std::shared_ptr<Tensor_attributes>,
+                                                          std::shared_ptr<Tensor_attributes>,
+                                                          Moe_grouped_matmul_attributes);
+
     [[deprecated]] std::array<std::shared_ptr<Tensor_attributes>, 2>
     scaled_dot_product_flash_attention(std::shared_ptr<Tensor_attributes> q,
                                        std::shared_ptr<Tensor_attributes> k,
@@ -1648,6 +1656,12 @@ class Graph : public ICudnn, public INode {
                         CHECK_TENSORS(wgrad_attributes);
                         FILL_GLOBAL_IO_TENSOR_MAP(wgrad_attributes);
                         sub_nodes.emplace_back(std::make_unique<WgradNode>(std::move(wgrad_attributes), context));
+                    } else if (tag == "MOE_GROUPED_MATMUL") {
+                        auto moe_grouped_matmul_attributes = j_sub_node.get<Moe_grouped_matmul_attributes>();
+                        CHECK_TENSORS(moe_grouped_matmul_attributes);
+                        FILL_GLOBAL_IO_TENSOR_MAP(moe_grouped_matmul_attributes);
+                        sub_nodes.emplace_back(
+                            std::make_unique<MoeGroupedMatmulNode>(std::move(moe_grouped_matmul_attributes), context));
                     }
                 }
 #undef CHECK_TENSORS
@@ -2516,6 +2530,31 @@ Graph::concatenate(std::vector<std::shared_ptr<Tensor_attributes>> x, Concatenat
     sub_nodes.emplace_back(std::make_unique<ConcatenateNode>(std::move(attributes), context));
 
     return Y;
+}
+
+inline std::shared_ptr<Tensor_attributes>
+Graph::moe_grouped_matmul(std::shared_ptr<Tensor_attributes> token,
+                          std::shared_ptr<Tensor_attributes> weight,
+                          std::shared_ptr<Tensor_attributes> first_token_offset,
+                          std::shared_ptr<Tensor_attributes> token_index,
+                          std::shared_ptr<Tensor_attributes> token_ks,
+                          Moe_grouped_matmul_attributes attributes) {
+    if (attributes.name.empty()) {
+        attributes.name += std::to_string(sub_nodes.size());
+    }
+
+    auto output = attributes.outputs[Moe_grouped_matmul_attributes::output_names::Output] =
+        output_tensor(attributes.name + "::Output");
+
+    attributes.inputs[Moe_grouped_matmul_attributes::input_names::Token]            = token;
+    attributes.inputs[Moe_grouped_matmul_attributes::input_names::Weight]           = weight;
+    attributes.inputs[Moe_grouped_matmul_attributes::input_names::FirstTokenOffset] = first_token_offset;
+    attributes.inputs[Moe_grouped_matmul_attributes::input_names::TokenIndex]       = token_index;
+    attributes.inputs[Moe_grouped_matmul_attributes::input_names::TokenKs]          = token_ks;
+
+    sub_nodes.emplace_back(std::make_unique<MoeGroupedMatmulNode>(std::move(attributes), context));
+
+    return output;
 }
 
 static inline std::ostream &

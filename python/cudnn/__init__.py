@@ -46,7 +46,7 @@ for symbol_name in symbols_to_import:
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.15.0"
+__version__ = "1.16.0"
 
 
 def _tensor(
@@ -221,3 +221,53 @@ else:
 
 from .graph import graph, jit, graph_cache
 from .wrapper import Graph
+
+from typing import Any
+
+
+def __getattr__(name: str) -> Any:
+    if name == "GemmSwigluSm100":
+        try:
+            from .gemm_swiglu import GemmSwigluSm100 as _GemmSwigluSm100
+
+            return _GemmSwigluSm100
+        except Exception as e:
+            raise ImportError(
+                f"GemmSwigluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
+    elif name == "gemm_swiglu_wrapper_sm100":
+        try:
+            from .gemm_swiglu import (
+                gemm_swiglu_wrapper_sm100 as _gemm_swiglu_wrapper_sm100,
+            )
+
+            return _gemm_swiglu_wrapper_sm100
+        except Exception as e:
+            raise ImportError(
+                f"gemm_swiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
+    elif name == "GemmAmaxSm100":
+        try:
+            from .gemm_amax import GemmAmaxSm100 as _GemmAmaxSm100
+
+            return _GemmAmaxSm100
+        except Exception as e:
+            raise ImportError(
+                f"GemmAmaxSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
+    elif name == "gemm_amax_wrapper_sm100":
+        try:
+            from .gemm_amax import (
+                gemm_amax_wrapper_sm100 as _gemm_amax_wrapper_sm100,
+            )
+
+            return _gemm_amax_wrapper_sm100
+        except Exception as e:
+            raise ImportError(
+                f"gemm_amax_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+    else:
+        raise AttributeError(name)

@@ -88,6 +88,12 @@ is_blackwell_arch() {
 }
 
 inline bool
+is_blackwell_computing_arch() {
+    auto cc = get_compute_capability();
+    return (100 <= cc && cc < 110);
+}
+
+inline bool
 is_arch_supported_by_cudnn() {
     if (cudnnGetVersion() < 8600 && (is_hopper_arch() || is_ada_arch())) {
         return false;

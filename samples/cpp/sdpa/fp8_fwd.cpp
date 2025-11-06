@@ -36,6 +36,11 @@ TEST_CASE("sdpa_fp8_fprop", "[graph][sdpa][fp8][forward]") {
     return;
 #endif
 
+    if (!is_hopper_arch() && !is_blackwell_computing_arch()) {
+        SKIP("sdpa fp8: Sample requires Hopper or Blackwell Computing GPU");
+        return;
+    }
+
     int64_t b = 2;    // batch size
     int64_t h = 2;    // number of heads
     int64_t s = 512;  // q,k,v tensor is padded to this seq length

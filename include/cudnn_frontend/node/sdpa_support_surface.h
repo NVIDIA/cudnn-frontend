@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <unordered_set>
 
 #include "../../cudnn_frontend_Heuristics.h"
 #include "../../cudnn_frontend_Logging.h"
@@ -396,19 +397,40 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
             return {error_code_t::INVALID_VALUE,
                     "Can't call verify_sdpa_support_surface_for_implementation with impl=AUTO"};
         case AttentionImplementation_t::COMPOSITE:
-            // Composite implementation already supports all of the features.
+            for (const auto& [key, value] : inputs) {
+                RETURN_CUDNN_FRONTEND_ERROR_IF(key == input_names::Block_mask && value != nullptr,
+                                               error_code_t::GRAPH_NOT_SUPPORTED,
+                                               "Composite SDPA node doesn't support Block_mask input");
+            }
             break;
         case AttentionImplementation_t::UNIFIED: {
-            auto cudnn_ver_error =
-                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node requires cuDNN 9.13.1"};
-#if (CUDNN_VERSION >= 91301)
-            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91301, cudnn_ver_error);
+            auto effective_cudnn_ver = std::min(detail::get_backend_version(), detail::get_compiled_version());
+            RETURN_CUDNN_FRONTEND_ERROR_IF(effective_cudnn_ver < 91301,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Unified SDPA node requires cuDNN 9.13.1");
+
+            // TODO: Provide smarter error messages that provide the required cuDNN version for each input.
+            std::unordered_set<SDPA_attributes::input_names> allowed_input_names{
+                input_names::Q, input_names::K, input_names::V, input_names::Attn_scale};
+            std::string allowed_input_msg =
+                "Unified SDPA node doesn't yet support inputs other than Q, K, V, Attn_scale";
+
+            if (effective_cudnn_ver >= 91400) {
+                allowed_input_names.insert({input_names::Block_mask});
+                allowed_input_msg += ", Block_mask";
+            }
+
+            if (effective_cudnn_ver >= 91500) {
+                allowed_input_names.insert({input_names::Page_table_K,
+                                            input_names::Page_table_V,
+                                            input_names::SEQ_LEN_Q,
+                                            input_names::SEQ_LEN_KV});
+                allowed_input_msg += ", Page_table_K, Page_table_V, SEQ_LEN_Q, SEQ_LEN_KV";
+            }
 
             for (const auto& [key, value] : inputs) {
-                if (key != input_names::Q && key != input_names::K && key != input_names::V &&
-                    key != input_names::Attn_scale && value != nullptr) {
-                    return {error_code_t::GRAPH_NOT_SUPPORTED,
-                            "Unified SDPA node doesn't yet support inputs other than Q, K, V and Attn_scale"};
+                if (allowed_input_names.find(key) == allowed_input_names.end() && value != nullptr) {
+                    return {error_code_t::GRAPH_NOT_SUPPORTED, allowed_input_msg};
                 }
             }
 
@@ -423,8 +445,8 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support alibi mask"};
             }
 
-            if (padding_mask) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support padding mask"};
+            if (padding_mask && effective_cudnn_ver < 91500) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED, "Padding mask for unified SDPA node requires cuDNN 9.15.0"};
             }
 
             if (left_bound.has_value() || right_bound.has_value()) {
@@ -440,8 +462,11 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support dropout"};
             }
 
-            if (max_seq_len_kv.has_value()) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support max sequence length"};
+            // Unified engine in cuDNN < 9.15 can't meaningfully support max sequence length,
+            // while versions >= 9.15 "support" it by ignoring it (unified engine doesn't need it).
+            if (max_seq_len_kv.has_value() && effective_cudnn_ver < 91500) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Max sequence length for unified SDPA node cannot be set in cuDNN < 9.15.0"};
             }
 
             if (attention_score_modifier != nullptr) {
@@ -459,10 +484,6 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
                         "Unified SDPA node doesn't yet support compute data type other than float"};
             }
-#else
-            CUDNN_FRONTEND_UNUSED(context);
-            return cudnn_ver_error;
-#endif
         } break;
     }
 

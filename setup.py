@@ -113,6 +113,6 @@ class CMakeBuild(build_ext):
 
 
 setup(
-    ext_modules=[CMakeExtension("cudnn/_compiled_module")],
+    ext_modules=[CMakeExtension("cudnn._compiled_module")],
     cmdclass={"build_ext": CMakeBuild},
 )

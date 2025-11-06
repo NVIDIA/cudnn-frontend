@@ -265,6 +265,14 @@ class PyGraph {
                            cudnn_frontend::DataType_t const& compute_data_type,
                            std::string const& name);
 
+    std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 2>
+    block_scale_quantize(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+                         int32_t block_size,
+                         std::optional<int64_t> axis,
+                         bool transpose,
+                         cudnn_frontend::DataType_t const& compute_data_type,
+                         std::string const& name);
+
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     gen_index(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
               int64_t const axis,
@@ -352,6 +360,7 @@ class PyGraph {
          py::object const& is_inference,
          py::object const& attn_scale,
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& block_mask,
          bool const use_alibi_mask,
          bool const use_padding_mask,
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
@@ -469,6 +478,17 @@ class PyGraph {
                       py::object const& dropout,
                       cudnn_frontend::DataType_t const& compute_data_type,
                       std::string const& name);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    moe_grouped_matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& weight,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& first_token_offset,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token_index,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token_ks,
+                       cudnn_frontend::MoeGroupedMatmulMode_t const& mode,
+                       cudnn_frontend::DataType_t const& compute_data_type,
+                       int32_t const& top_k,
+                       std::string const& name);
 
     void
     validate();
@@ -604,6 +624,7 @@ class PyGraph {
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
                   py::object const& attn_scale,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& block_mask,
                   bool const use_alibi_mask,
                   bool const use_padding_mask,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,

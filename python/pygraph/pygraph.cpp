@@ -288,6 +288,27 @@ PyGraph::block_scale_dequantize(std::shared_ptr<cudnn_frontend::graph::Tensor_at
     return output;
 }
 
+std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 2>
+PyGraph::block_scale_quantize(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+                              int32_t block_size,
+                              std::optional<int64_t> axis,
+                              bool transpose,
+                              cudnn_frontend::DataType_t const& compute_data_type,
+                              std::string const& name) {
+    auto attributes = cudnn_frontend::graph::Block_scale_quantize_attributes()
+                          .set_block_size(block_size)
+                          .set_transpose(transpose)
+                          .set_name(name);
+    if (axis.has_value()) {
+        attributes.set_axis(axis.value());
+    }
+    if (compute_data_type != cudnn_frontend::DataType_t::NOT_SET) {
+        attributes.set_compute_data_type(compute_data_type);
+    }
+    auto outputs = graph->block_scale_quantize(input, attributes);
+    return outputs;
+}
+
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& A,
                 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& B,
@@ -334,6 +355,26 @@ PyGraph::reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& inpu
 
     auto OUT_0 = graph->reshape(input, attributes);
     return OUT_0;
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::moe_grouped_matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token,
+                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& weight,
+                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& first_token_offset,
+                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token_index,
+                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token_ks,
+                            cudnn_frontend::MoeGroupedMatmulMode_t const& mode,
+                            cudnn_frontend::DataType_t const& compute_data_type,
+                            int32_t const& top_k,
+                            std::string const& name) {
+    auto attributes = cudnn_frontend::graph::Moe_grouped_matmul_attributes()
+                          .set_name(name)
+                          .set_mode(mode)
+                          .set_compute_data_type(compute_data_type)
+                          .set_top_k(top_k);
+
+    auto output = graph->moe_grouped_matmul(token, weight, first_token_offset, token_index, token_ks, attributes);
+    return output;
 }
 
 void
@@ -860,6 +901,28 @@ init_pygraph_submodule(py::module_& m) {
                 Returns:
                     cudnn_tensor: The dequantized output tensor.
             )pbdoc")
+        .def("block_scale_quantize",
+             &PyGraph::block_scale_quantize,
+             py::arg("input"),
+             py::arg("block_size"),
+             py::arg_v("axis", std::nullopt),
+             py::arg_v("transpose", false),
+             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+             py::arg_v("name", ""),
+             R"pbdoc(
+                Quantize an input tensor with block scaling to produce quantized output and scale tensors.
+                
+                Args:
+                    input (cudnn_tensor): The input tensor to quantize.
+                    block_size (int): The block size for quantization.
+                    axis (Optional[int]): The axis along which to quantize. Default is None.
+                    transpose (Optional[bool]): Whether to transpose during quantization. Default is False.
+                    compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
+                    name (Optional[str]): A name for the operation.
+                
+                Returns:
+                    Tuple[cudnn_tensor, cudnn_tensor]: A tuple of (quantized_output, scale) tensors.
+            )pbdoc")
         .def("reshape",
              &PyGraph::reshape,
              py::arg("input"),
@@ -874,6 +937,31 @@ init_pygraph_submodule(py::module_& m) {
 
                 Returns:
                     cudnn_tensor: The result of reshape operation. Please set the dims for the output tensor.
+            )pbdoc")
+        .def("moe_grouped_matmul",
+             &PyGraph::moe_grouped_matmul,
+             py::arg("token"),
+             py::arg("weight"),
+             py::arg("first_token_offset"),
+             py::arg_v("token_index", nullptr),
+             py::arg_v("token_ks", nullptr),
+             py::arg_v("mode", cudnn_frontend::MoeGroupedMatmulMode_t::NONE),
+             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::FLOAT),
+             py::arg_v("top_k", 0),
+             py::arg_v("name", ""),
+             R"pbdoc(
+                Perform MoE Grouped Matmul operation.
+
+                Args:
+                    token (cudnn_tensor): The token tensor.
+                    weight (cudnn_tensor): The weight tensor.
+                    first_token_offset (cudnn_tensor): The first token offset tensor.
+                    token_index (cudnn_tensor): The token index tensor or nullptr.
+                    token_ks (cudnn_tensor): The token ks tensor or nullptr.
+                    mode (cudnn.moe_grouped_matmul_mode): The mode of the operation.
+                    compute_data_type (cudnn.data_type): The data type for computation.
+                    top_k (int): The top k value.
+                    name (str): The name of the operation.
             )pbdoc")
         .def("get_behavior_notes", &PyGraph::get_behavior_notes)
         .def("get_behavior_notes_for_plan_at_index", &PyGraph::get_behavior_notes_for_plan_at_index)

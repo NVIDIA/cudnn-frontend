@@ -160,6 +160,12 @@ TEST_CASE("Toy sdpa backward with flexible graph", "[graph][sdpa][flash][backwar
         SKIP("Test requires Hopper or above");
         return;
     }
+
+    if (get_compute_capability() == 120) {
+        SKIP("Backward pass with flexible graphs is not supported on SM version 120 yet");
+        return;
+    }
+
     // Create a unique_ptr for the cuDNN handle
     auto handle_ptr = create_cudnn_handle();
     auto handle     = *handle_ptr;

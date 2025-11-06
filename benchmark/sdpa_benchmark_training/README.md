@@ -142,22 +142,22 @@ As demonstrated can be seen from the results, cuDNN v9 can achieve over 2x the p
 Example commands and outputs:
 ```
 ## For running various PyTorch backends (FlashAttention, cuDNN, ...) or FlashAttention-2:
-$ python benchmark_single_sdpa.py --batch_size 1 --q_seqlen 32768 --kv_seqlen 32768 --num_q_heads 128 --num_kv_heads 8 --head_dim 128 --is_causal --data_type bfloat16 --num_iterations 10 --sdpa_backend pyt_cudnn --data_type bfloat16 --fwd_bwd
+$ python benchmark_single_sdpa.py --batch_size 1 --q_seqlen 32768 --kv_seqlen 32768 --num_q_heads 128 --num_kv_heads 8 --head_dim 128 --attn_mask top_left --data_type bfloat16 --num_iterations 10 --sdpa_backend pyt_cudnn --data_type bfloat16 --fwd_bwd
 pyt_cudnn:: Median (fwd, bwd) Execution Times: 24.645 ms (1428 TFLOPS), 78.674 ms (1118 TFLOPS) (max difference vs. pyt_reference: 0.000000 from 10 iterations)
 
 ## For directly running cuDNN via cuDNN Frontend
-$ python benchmark_single_sdpa.py --batch_size 1 --q_seqlen 32768 --kv_seqlen 32768 --num_q_heads 128 --num_kv_heads 8 --head_dim 128 --is_causal --data_type bfloat16 --num_iterations 10 --sdpa_backend cudnn_fe --data_type bfloat16 --fwd_bwd
+$ python benchmark_single_sdpa.py --batch_size 1 --q_seqlen 32768 --kv_seqlen 32768 --num_q_heads 128 --num_kv_heads 8 --head_dim 128 --attn_mask top_left --data_type bfloat16 --num_iterations 10 --sdpa_backend cudnn_fe --data_type bfloat16 --fwd_bwd
 cudnn_fe:: Median (fwd, bwd) Execution Times: 24.543 ms (1434 TFLOPS), 73.210 ms (1201 TFLOPS) (max difference vs. pyt_reference: 0.000000 from 10 iterations)
 
 ## For running cuDNN FP8
-$ python benchmark_single_sdpa.py --batch_size 1 --q_seqlen 32768 --kv_seqlen 32768 --num_q_heads 128 --num_kv_heads 8 --head_dim 128 --is_causal --data_type bfloat16 --num_iterations 10 --sdpa_backend cudnn_fe --data_type fp8 --fwd_bwd
+$ python benchmark_single_sdpa.py --batch_size 1 --q_seqlen 32768 --kv_seqlen 32768 --num_q_heads 128 --num_kv_heads 8 --head_dim 128 --attn_mask top_left --data_type bfloat16 --num_iterations 10 --sdpa_backend cudnn_fe --data_type fp8 --fwd_bwd
 cudnn_fe:: Median (fwd, bwd) Execution Times: 21.334 ms (1649 TFLOPS), 56.373 ms (1560 TFLOPS) (max difference vs. pyt_reference: 0.000000 from 10 iterations)
 ```
 
 The cuDNN version used in the benchmark can be replaced by setting the `LD_LIBRARY_PATH` environment variable.
 ```
 $ export LD_LIBRARY_PATH=<my_path_to_cuDNN_9.10.2>
-$ python benchmark_single_sdpa.py --batch_size 1 --q_seqlen 16384 --kv_seqlen 16384 --num_q_heads 128 --num_kv_heads 8 --head_dim 128 --is_causal --data_type bfloat16 --num_iterations 10 --sdpa_backend cudnn_fe --fwd_bwd --data_type fp8 --verbose
+$ python benchmark_single_sdpa.py --batch_size 1 --q_seqlen 16384 --kv_seqlen 16384 --num_q_heads 128 --num_kv_heads 8 --head_dim 128 --attn_mask top_left --data_type bfloat16 --num_iterations 10 --sdpa_backend cudnn_fe --fwd_bwd --data_type fp8 --verbose
 [INFO] cuDNN Backend Version: cudnn.backend_version() = 91002
 [INFO] cuDNN Frontend Version: cudnn.__version__ = '1.12.0'
 [INFO] torch.__version__ = '2.8.0a0+5228986c39.nv25.06'

@@ -106,7 +106,7 @@ def _sdpa_key_fn(handle, batch_size):
     return batch_size
 
 
-@cudnn.jit(heur_modes=[cudnn.heur_mode.A])
+@cudnn.jit(heur_modes=[cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
 @cudnn.graph_cache(key_fn=_sdpa_key_fn)
 def lookup_or_create_sdpa_graph(handle, batch_size):
     with cudnn.graph(handle) as (g, _):
