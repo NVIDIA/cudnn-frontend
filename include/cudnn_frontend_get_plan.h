@@ -26,7 +26,8 @@
 
 namespace cudnn_frontend {
 
-auto inline EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph& opGraph) -> executionPlans_t {
+auto inline EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph& opGraph, size_t max_plans)
+    -> executionPlans_t {
     // Creating a set of execution plans that are supported.
     executionPlans_t plans;
     for (auto& engine_config : generate_engine_config(opGraph)) {
@@ -43,14 +44,19 @@ auto inline EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationG
             continue;
         }
 #endif
+        if (plans.size() >= max_plans) {
+            break;
+        }
     }
     return plans;
 }
 
-auto inline EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle, OperationGraph& opGraph, Predicate pred)
-    -> executionPlans_t {
+auto inline EngineConfigGenerator::cudnnGetPlan(cudnnHandle_t handle,
+                                                OperationGraph& opGraph,
+                                                Predicate pred,
+                                                size_t max_plans) -> executionPlans_t {
     // Creating a set of execution plans that are supported.
-    executionPlans_t plans = cudnnGetPlan(handle, opGraph);
+    executionPlans_t plans = cudnnGetPlan(handle, opGraph, max_plans);
     return filter(pred, plans);
 }
 }  // namespace cudnn_frontend

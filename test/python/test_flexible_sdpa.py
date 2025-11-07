@@ -319,7 +319,17 @@ def test_sdpa_with_flexible_graph(cudnn_handle):
 
     o.set_output(True).set_dim(q_dims).set_stride(q_strides)
 
-    graph.build([cudnn.heur_mode.A])
+    graph.validate()
+    graph.build_operation_graph()
+
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+    except cudnn.cudnnGraphNotSupportedError as e:
+        print(f"TEST WAIVED: unsupported graph. {e}")
+        pytest.skip("TEST WAIVED: unsupported graph.")
+
+    graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
 
     variant_pack = {
         q: q_gpu,
@@ -494,7 +504,17 @@ def test_sdpa_with_arrow_mask(cudnn_handle):
 
     o.set_output(True).set_dim(q_dims).set_stride(q_strides)
 
-    graph.build([cudnn.heur_mode.A])
+    graph.validate()
+    graph.build_operation_graph()
+
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+    except cudnn.cudnnGraphNotSupportedError as e:
+        print(f"TEST WAIVED: unsupported graph. {e}")
+        pytest.skip("TEST WAIVED: unsupported graph.")
+
+    graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
 
     variant_pack = {
         q: q_gpu,
@@ -595,7 +615,17 @@ def test_sdpa_with_document_mask(cudnn_handle):
 
     o.set_output(True).set_dim(q_dims).set_stride(q_strides)
 
-    graph.build([cudnn.heur_mode.A])
+    graph.validate()
+    graph.build_operation_graph()
+
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+    except cudnn.cudnnGraphNotSupportedError as e:
+        print(f"TEST WAIVED: unsupported graph. {e}")
+        pytest.skip("TEST WAIVED: unsupported graph.")
+
+    graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
 
     variant_pack = {
         q: q_gpu,

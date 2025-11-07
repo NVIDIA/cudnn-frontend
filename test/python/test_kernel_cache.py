@@ -56,7 +56,17 @@ def build_cudnn_graph(handle, cache, shape):
     A.set_uid(0)
     B.set_uid(1)
 
-    graph.build([cudnn.heur_mode.A])
+    graph.validate()
+    graph.build_operation_graph()
+
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+    except cudnn.cudnnGraphNotSupportedError as e:
+        print(f"TEST WAIVED: unsupported graph. {e}")
+        pytest.skip("TEST WAIVED: unsupported graph.")
+
+    graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
 
     return graph
 

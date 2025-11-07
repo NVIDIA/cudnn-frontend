@@ -36,6 +36,11 @@ TEST_CASE("sdpa_fp8_bprop", "[graph][sdpa][fp8][backward]") {
     return;
 #endif
 
+    if (!is_hopper_arch() && !is_blackwell_computing_arch()) {
+        SKIP("sdpa fp8: Sample requires Hopper or Blackwell Computing GPU");
+        return;
+    }
+
     int64_t b = 2;    // batch size
     int64_t h = 2;    // head dim
     int64_t s = 512;  // q,k,v tensor is padded to this seq length
@@ -229,6 +234,11 @@ TEST_CASE("sdpa_fp8_gqa_bprop", "[graph][sdpa][fp8][backward]") {
     SKIP("Test requires cuda toolkit 12.0 or above");
     return;
 #endif
+
+    if (!is_hopper_arch() && !is_blackwell_computing_arch()) {
+        SKIP("sdpa fp8: Sample requires Hopper or Blackwell Computing GPU");
+        return;
+    }
 
     int64_t b    = 2;    // batch size
     int64_t h_qo = 12;   // query/output head dim

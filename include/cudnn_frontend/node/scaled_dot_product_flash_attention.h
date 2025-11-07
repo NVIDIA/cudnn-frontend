@@ -98,6 +98,18 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
         return ((page_table_k_it) != attributes.inputs.end() && page_table_k_it->second != nullptr);
     }
 
+    bool
+    has_seq_len_q() const {
+        auto seq_len_Q_it = attributes.inputs.find(SDPA_attributes::input_names::SEQ_LEN_Q);
+        return ((seq_len_Q_it) != attributes.inputs.end() && seq_len_Q_it->second != nullptr);
+    }
+
+    bool
+    has_seq_len_kv() const {
+        auto seq_len_KV_it = attributes.inputs.find(SDPA_attributes::input_names::SEQ_LEN_KV);
+        return ((seq_len_KV_it) != attributes.inputs.end() && seq_len_KV_it->second != nullptr);
+    }
+
     // Helper function to infer KV sequence length
     // Note that it cannot be run as part of infer_properties_node as
     // this is being used in pre_validate_node
@@ -862,7 +874,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Bias mask data type cannot be boolean");
 
-        if (s_q % 128 != 0 && attributes.padding_mask == false && is_ragged == false) {
+        if (s_kv % 128 != 0 && attributes.padding_mask == false && is_ragged == false && detail::get_backend_version() <= 91500) {
             CUDNN_FE_LOG_LABEL_ENDL("INFO: Workaround padding mask is enabled for s_q % 128 != 0 and use_padding_mask == false and is_ragged == false");
             has_workaround_padding_mask = true;
             batch_size_for_workaround_padding_mask = attributes.inputs.at(input_names::Q)->get_dim()[0];
@@ -1753,13 +1765,12 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
         std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
-        CUDNN_FRONTEND_UNUSED(raw_operations);
+        CUDNN_FRONTEND_UNUSED(operations);
         CUDNN_FE_LOG_LABEL("INFO: " << "Building UnifiedSDPANode operations " << attributes.name << " ");
         auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node requires cuDNN 9.13.1"};
 
 #if (CUDNN_VERSION >= 91301)
         NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91301, cudnn_ver_error);
-        CUDNN_FRONTEND_UNUSED(operations);
         auto unified_sdpa_operation =
             make_shared_backend_pointer((cudnnBackendDescriptorType_t)CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR);
 
@@ -1815,6 +1826,81 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
                                                            &backend_scale));
         }
 
+        auto block_mask_it = attributes.inputs.find(SDPA_attributes::input_names::Block_mask);
+        if (block_mask_it != attributes.inputs.end() && block_mask_it->second != nullptr) {
+            auto block_mask_cudnn_ver_error =
+                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Block mask in unified SDPA node requires cuDNN 9.14.0"};
+#if CUDNN_VERSION >= 91400
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91400, block_mask_cudnn_ver_error);
+            auto backend_block_mask = tensors[block_mask_it->second->get_uid()]->get_desc()->get_backend_descriptor();
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_BLOCK_MASK_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &backend_block_mask));
+#else
+            return block_mask_cudnn_ver_error;
+#endif
+        }
+
+        // Paged attention attributes
+        if (is_paged_k() || is_paged_v() || has_seq_len_q() || has_seq_len_kv()) {
+            auto paged_cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                                                 "Paged attention in unified SDPA node requires cuDNN 9.15.0"};
+#if (CUDNN_VERSION >= 91500)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91500, paged_cudnn_ver_error);
+
+            if (is_paged_k()) {
+                auto page_table_K         = attributes.inputs.find(SDPA_attributes::input_names::Page_table_K)->second;
+                auto backend_page_table_K = tensors[page_table_K->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_FWD_PAGE_TABLE_KDESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_page_table_K));
+            }
+
+            if (is_paged_v()) {
+                auto page_table_V         = attributes.inputs.find(SDPA_attributes::input_names::Page_table_V)->second;
+                auto backend_page_table_V = tensors[page_table_V->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_FWD_PAGE_TABLE_VDESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_page_table_V));
+            }
+
+            if (has_seq_len_q()) {
+                auto seq_len_Q         = attributes.inputs.find(SDPA_attributes::input_names::SEQ_LEN_Q)->second;
+                auto backend_seq_len_Q = tensors[seq_len_Q->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_QDESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_seq_len_Q));
+            }
+
+            if (has_seq_len_kv()) {
+                auto seq_len_KV         = attributes.inputs.find(SDPA_attributes::input_names::SEQ_LEN_KV)->second;
+                auto backend_seq_len_KV = tensors[seq_len_KV->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_KVDESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_seq_len_KV));
+            }
+
+            // Ignore attributes.max_seq_len_kv, because unified engine doesn't need it (it's harmless if set).
+
+            // Ignore attributes.padding_mask, because unified engine already applies an implicit padding mask
+            // if seq_len_Q and seq_len_KV are both provided. We already checked in
+            // `SDPA_attributes::validate_sdpa_support_surface()` that padding_mask must be true if and
+            // only if seq_len_Q and seq_len_KV are both set, so we don't need to check it here.
+#else
+            return paged_cudnn_ver_error;
+#endif
+        }
+
         _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(unified_sdpa_operation->get_backend_descriptor()));
 
         raw_operations.push_back(unified_sdpa_operation);
@@ -1824,11 +1910,10 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
         return {error_code_t::OK, ""};
 #else
         CUDNN_FRONTEND_UNUSED(uids_involved_in_operations);
-        CUDNN_FRONTEND_UNUSED(operations);
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FRONTEND_UNUSED(tensors);
         return cudnn_ver_error;
-#endif
+#endif  // CUDNN_VERSION >= 91301
     }
 };
 

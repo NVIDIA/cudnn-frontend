@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include <iostream>
@@ -72,6 +73,7 @@ class Tensor_attributes {
     bool uid_assigned                  = false;
 
     std::shared_ptr<Tensor_attributes> ragged_offset;
+    int64_t alignment = 16;  // Default to 16 bytes
 
     auto
     fill_from_context(detail::Context const& context) -> Tensor_attributes& {
@@ -229,6 +231,17 @@ class Tensor_attributes {
     auto
     set_reordering_type(TensorReordering_t const value) -> Tensor_attributes& {
         reordering_type = value;
+        return *this;
+    }
+
+    int64_t
+    get_alignment() const {
+        return alignment;
+    }
+
+    auto
+    set_alignment(int64_t const value) -> Tensor_attributes& {
+        alignment = value;
         return *this;
     }
 
@@ -1358,8 +1371,7 @@ class Resample_attributes : public Attributes<Resample_attributes> {
         return *this;
     }
 
-    [[deprecated]]
-    auto
+    [[deprecated]] auto
     set_is_inference(bool const value) -> Resample_attributes& {
         return set_generate_index(!value);
     }
@@ -1635,6 +1647,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         Dropout_scale,
         Page_table_K,
         Page_table_V,
+        Block_mask,
         // FP8-specific scaling inputs
         Descale_Q,
         Descale_K,
@@ -1695,8 +1708,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         return *this;
     }
 
-    [[deprecated]]
-    SDPA_attributes&
+    [[deprecated]] SDPA_attributes&
     set_is_inference(bool const value) {
         return set_generate_stats(!value);
     }
@@ -1716,6 +1728,12 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     SDPA_attributes&
     set_bias(std::shared_ptr<Tensor_attributes> value) {
         inputs[SDPA_attributes::input_names::Bias] = std::move(value);
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_block_mask(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_attributes::input_names::Block_mask] = std::move(value);
         return *this;
     }
 
@@ -2572,6 +2590,35 @@ class Concatenate_attributes : public Attributes<Concatenate_attributes> {
     Concatenate_attributes&
     set_in_place_index(int64_t const value) {
         in_place_index = value;
+        return *this;
+    }
+};
+
+class Moe_grouped_matmul_attributes : public Attributes<Moe_grouped_matmul_attributes> {
+    friend class Attributes<Moe_grouped_matmul_attributes>;
+    friend class MoeGroupedMatmulNode;
+    friend class Graph;
+
+    MoeGroupedMatmulMode_t mode = MoeGroupedMatmulMode_t::NONE;
+
+    int32_t top_k = 0;
+
+   public:
+    enum class input_names { Token, Weight, FirstTokenOffset, TokenIndex, TokenKs };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { Output };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Moe_grouped_matmul_attributes, name, inputs, outputs, mode, top_k)
+
+    Moe_grouped_matmul_attributes&
+    set_mode(MoeGroupedMatmulMode_t mode) {
+        this->mode = mode;
+        return *this;
+    }
+
+    Moe_grouped_matmul_attributes&
+    set_top_k(int32_t top_k) {
+        this->top_k = top_k;
         return *this;
     }
 };

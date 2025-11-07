@@ -95,8 +95,14 @@ def test_in(param_extract, cudnn_handle):
 
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    graph.check_support()
+
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+    except cudnn.cudnnGraphNotSupportedError as e:
+        print(f"TEST WAIVED: unsupported graph. {e}")
+        pytest.skip("TEST WAIVED: unsupported graph.")
+
     graph.build_plans()
 
     Y_actual = torch.empty_like(x_gpu)

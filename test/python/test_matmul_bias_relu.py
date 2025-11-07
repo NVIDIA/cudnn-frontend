@@ -76,7 +76,17 @@ def test_int8_bf16_matmul(cudnn_handle):
     )
     C.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
 
-    graph.build([cudnn.heur_mode.A])
+    graph.validate()
+    graph.build_operation_graph()
+
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+    except cudnn.cudnnGraphNotSupportedError as e:
+        print(f"TEST WAIVED: unsupported graph. {e}")
+        pytest.skip("TEST WAIVED: unsupported graph.")
+
+    graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
 
     # Run pyt reference
     C_expected = torch.matmul(A_gpu.to(torch.bfloat16), B_gpu.to(torch.bfloat16))
@@ -187,7 +197,17 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type, cudnn_h
     )
     C.set_output(True).set_data_type(convert_to_cudnn_type(MMA_data_type))
 
-    graph.build([cudnn.heur_mode.A])
+    graph.validate()
+    graph.build_operation_graph()
+
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+    except cudnn.cudnnGraphNotSupportedError as e:
+        print(f"TEST WAIVED: unsupported graph. {e}")
+        pytest.skip("TEST WAIVED: unsupported graph.")
+
+    graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
 
     # Run pyt reference
     C_expected = torch.matmul(A_gpu.to(MMA_data_type), B_gpu.to(MMA_data_type))

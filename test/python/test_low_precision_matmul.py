@@ -354,12 +354,46 @@ def pack_uint4(uint8_data) -> torch.Tensor:
     return (uint8_data[1::2] << 4 | uint8_data[::2]).view(down_size(shape))
 
 
+def unpack_uint4(packed_data):
+    """Unpack uint4 data from packed uint8 format.
+    Reverses the operation of pack_uint4.
+    """
+    shape = packed_data.shape
+    # Create output shape with last dimension doubled
+    unpacked_shape = (*shape[:-1], shape[-1] * 2)
+
+    # View as uint8 and flatten
+    packed_uint8 = packed_data.view(torch.uint8).contiguous().view(-1)
+
+    # Create unpacked array
+    unpacked = torch.zeros(
+        packed_uint8.shape[0] * 2, dtype=torch.uint8, device=packed_data.device
+    )
+
+    # Extract lower and upper 4 bits
+    unpacked[::2] = packed_uint8 & 0x0F  # Lower 4 bits
+    unpacked[1::2] = (packed_uint8 >> 4) & 0x0F  # Upper 4 bits
+
+    return unpacked.view(unpacked_shape)
+
+
 def _bfloat16_to_float4_e2m1fn_x2(x):
     assert x.dtype == torch.bfloat16
     x = _f32_to_floatx_unpacked(x.float(), FP4_EBITS, FP4_MBITS)
     x = pack_uint4(x)
     x = x.view(torch.float4_e2m1fn_x2)
     return x
+
+
+def float4_e2m1fn_x2_to_float32(fp4_tensor):
+    """Convert torch.float4_e2m1fn_x2 tensor to torch.float32."""
+    # View as uint8 and unpack
+    unpacked_uint8 = unpack_uint4(fp4_tensor)
+
+    # Convert to float32 using the existing conversion function
+    f32_tensor = _floatx_unpacked_to_f32(unpacked_uint8, FP4_EBITS, FP4_MBITS)
+
+    return f32_tensor
 
 
 @pytest.mark.skipif(get_cc() < 100, reason="requires Blackwell or newer arch")

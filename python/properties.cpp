@@ -163,6 +163,14 @@ init_properties(py::module_& m) {
         .def("set_is_pass_by_value", &cudnn_frontend::graph::Tensor_attributes::set_is_pass_by_value)
         .def("get_uid", &cudnn_frontend::graph::Tensor_attributes::get_uid)
         .def("set_uid", &cudnn_frontend::graph::Tensor_attributes::set_uid)
+        .def("get_reordering_type", &cudnn_frontend::graph::Tensor_attributes::get_reordering_type)
+        .def("set_reordering_type",
+             &cudnn_frontend::graph::Tensor_attributes::set_reordering_type,
+             py::return_value_policy::reference)
+        .def("get_alignment", &cudnn_frontend::graph::Tensor_attributes::get_alignment)
+        .def("set_alignment",
+             &cudnn_frontend::graph::Tensor_attributes::set_alignment,
+             py::return_value_policy::reference)
         .def("set_ragged_offset", &cudnn_frontend::graph::Tensor_attributes::set_ragged_offset)
         .def("__repr__", [](cudnn_frontend::graph::Tensor_attributes const& props) {
             std::ostringstream out;
@@ -290,7 +298,8 @@ init_properties(py::module_& m) {
         .value("RUNTIME_COMPILATION", cudnn_frontend::BehaviorNote_t::RUNTIME_COMPILATION)
         .value("REQUIRES_FILTER_INT8x32_REORDER", cudnn_frontend::BehaviorNote_t::REQUIRES_FILTER_INT8x32_REORDER)
         .value("REQUIRES_BIAS_INT8x32_REORDER", cudnn_frontend::BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER)
-        .value("SUPPORTS_CUDA_GRAPH_NATIVE_API", cudnn_frontend::BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API);
+        .value("SUPPORTS_CUDA_GRAPH_NATIVE_API", cudnn_frontend::BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API)
+        .value("CUBLASLT_DEPENDENCY", cudnn_frontend::BehaviorNote_t::CUBLASLT_DEPENDENCY);
 
     py::enum_<cudnn_frontend::DiagonalAlignment_t>(m, "diagonal_alignment")
         .value("TOP_LEFT", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT)
@@ -300,6 +309,11 @@ init_properties(py::module_& m) {
         .value("AUTO", cudnn_frontend::AttentionImplementation_t::AUTO)
         .value("COMPOSITE", cudnn_frontend::AttentionImplementation_t::COMPOSITE)
         .value("UNIFIED", cudnn_frontend::AttentionImplementation_t::UNIFIED);
+
+    py::enum_<cudnn_frontend::MoeGroupedMatmulMode_t>(m, "moe_grouped_matmul_mode")
+        .value("NONE", cudnn_frontend::MoeGroupedMatmulMode_t::NONE)
+        .value("GATHER", cudnn_frontend::MoeGroupedMatmulMode_t::GATHER)
+        .value("SCATTER", cudnn_frontend::MoeGroupedMatmulMode_t::SCATTER);
 }
 
 }  // namespace python_bindings

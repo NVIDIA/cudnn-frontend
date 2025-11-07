@@ -19,6 +19,7 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
                        py::object const& attn_scale,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& block_mask,
                        bool const use_alibi_mask,
                        bool const use_padding_mask,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
@@ -58,6 +59,10 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                           .set_implementation(implementation)
                           .set_logit_max(score_max)
                           .set_score_sum_exp(score_sum_exp);
+
+    if (block_mask) {
+        attributes.set_block_mask(block_mask);
+    }
 
     // Set generate_stats
     if (!generate_stats.is_none()) {
@@ -210,6 +215,7 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               py::object const& is_inference,
               py::object const& attn_scale,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& block_mask,
               bool const use_alibi_mask,
               bool const use_padding_mask,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
@@ -294,6 +300,7 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          v,
                                          attn_scale,
                                          bias,
+                                         block_mask,
                                          use_alibi_mask,
                                          use_padding_mask,
                                          seq_len_q,
@@ -493,7 +500,8 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                   py::object const& generate_stats,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp) {
-    cudnn_frontend::DataType_t mma_core_mode = cudnn_frontend::DataType_t::FP8_E4M3;
+    cudnn_frontend::DataType_t mma_core_mode                             = cudnn_frontend::DataType_t::FP8_E4M3;
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> block_mask = nullptr;
 
     // Handle sliding_window to left_bound mapping for backward compatibility
     py::object actual_left_bound = left_bound;
@@ -549,6 +557,7 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          v,
                                          attn_scale,
                                          bias,
+                                         block_mask,
                                          use_alibi_mask,
                                          use_padding_mask,
                                          seq_len_q,
@@ -696,6 +705,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("is_inference", py::none()),
           py::arg_v("attn_scale", py::none()),
           py::arg_v("bias", nullptr),
+          py::arg_v("block_mask", nullptr),
           py::arg_v("use_alibi_mask", false),
           py::arg_v("use_padding_mask", false),
           py::arg_v("seq_len_q", nullptr),

@@ -373,7 +373,7 @@ for causal, headdim, bs_seqlen, nheads in itertools.product(
 
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
-        graph_fwd.create_execution_plans([cudnn.heur_mode.A])
+        graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph_fwd.check_support()
         graph_fwd.build_plans()
 
@@ -416,7 +416,7 @@ for causal, headdim, bs_seqlen, nheads in itertools.product(
         if headdim != 256:
             graph_bwd.validate()
             graph_bwd.build_operation_graph()
-            graph_bwd.create_execution_plans([cudnn.heur_mode.A])
+            graph_bwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
             graph_bwd.check_support()
             graph_bwd.build_plans()
 
@@ -588,7 +588,7 @@ for causal, headdim, bs_seqlen, nheads in itertools.product(
 
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
-        graph_fwd.create_execution_plans([cudnn.heur_mode.A])
+        graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph_fwd.check_support()
         graph_fwd.build_plans()
 
@@ -671,7 +671,7 @@ for causal, headdim, bs_seqlen, nheads in itertools.product(
         if headdim == 128:
             graph_bwd.validate()
             graph_bwd.build_operation_graph()
-            graph_bwd.create_execution_plans([cudnn.heur_mode.A])
+            graph_bwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
             graph_bwd.check_support()
             graph_bwd.build_plans()
 

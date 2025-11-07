@@ -127,7 +127,13 @@ def test_layernorm(param_extract, cudnn_handle):
 
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    except cudnn.cudnnGraphNotSupportedError as e:
+        print(f"TEST WAIVED: unsupported graph. {e}")
+        pytest.skip("TEST WAIVED: unsupported graph.")
+
     graph.check_support()
     graph.build_plans()
 
@@ -196,7 +202,13 @@ def test_layernorm(param_extract, cudnn_handle):
 
     bwd_graph.validate()
     bwd_graph.build_operation_graph()
-    bwd_graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+
+    try:
+        bwd_graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    except cudnn.cudnnGraphNotSupportedError as e:
+        print(f"TEST WAIVED: unsupported graph. {e}")
+        pytest.skip("TEST WAIVED: unsupported graph.")
+
     bwd_graph.check_support()
     bwd_graph.build_plans()
 

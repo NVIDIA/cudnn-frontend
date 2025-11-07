@@ -7,14 +7,14 @@ name = "nvidia-cudnn-frontend"
 dynamic = ["version"]
 description = "CUDNN FrontEnd python library"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.9"
 license = {text = "NVIDIA Proprietary Software"}
 classifiers = [
     "Programming Language :: Python :: 3",
 ]
 
 [tool.setuptools]
-packages = ["cudnn", "include"]
+packages = ["cudnn", "include", "cudnn.gemm_swiglu", "cudnn.gemm_amax"]
 package-dir = {"" = "python", "include" = "include"}
 include-package-data = true
 
@@ -27,3 +27,10 @@ version = {attr = "cudnn.__version__"}
 
 [tool.setuptools.package-data]
 include = ["**/*"]
+
+[project.optional-dependencies]
+cutedsl = [
+    "nvidia-cutlass-dsl",
+    "cuda-python",
+    "torch",
+]

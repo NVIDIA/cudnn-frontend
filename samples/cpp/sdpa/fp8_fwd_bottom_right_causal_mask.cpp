@@ -36,6 +36,11 @@ TEST_CASE("sdpa_fp8_fprop_brcm", "[graph][sdpa][fp8][forward][brcm]") {
     return;
 #endif
 
+    if (!is_hopper_arch() && !is_blackwell_computing_arch()) {
+        SKIP("sdpa fp8: Sample requires Hopper or Blackwell Computing GPU");
+        return;
+    }
+
     int64_t b    = 2;  // batch size
     int64_t h    = 2;  // head dim
     int64_t s_q  = 512;

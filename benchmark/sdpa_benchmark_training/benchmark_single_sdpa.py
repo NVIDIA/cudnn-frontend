@@ -9,6 +9,7 @@ The SDPA backend can be chosen. Performance is measured using CUDA events.
 import argparse
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.bias import causal_lower_right
 import os
 import numpy as np
 import functools
@@ -53,7 +54,6 @@ parser.add_argument(
     type=int,
     help="Number of iterations to run the layer",
 )
-parser.add_argument("--is_causal", action="store_true", help="Is causal masking on")
 parser.add_argument("--verbose", action="store_true", help="Verbose output")
 parser.add_argument(
     "--fwd_bwd",
@@ -64,8 +64,8 @@ parser.add_argument(
     "--attn_mask",
     default="no_mask",
     type=str,
-    help="Attn mask to use. Can be 'padding_causal' or 'no_mask'. If padding_causal, is_causal must be set to false. Only works for cuDNN FE or PyTorch backends.",
-    choices=["padding_causal", "no_mask"],
+    help="Attn mask to use. Can be 'top_left', 'bottom_right', or 'no_mask'.",
+    choices=["top_left", "bottom_right", "no_mask"],
 )
 parser.add_argument(
     "--sdpa_backend",
@@ -111,12 +111,6 @@ if args.data_type == "fp8":
             f"FP8 is only supported for cudnn_fe and flash_attention_3 backends"
         )
 
-if args.attn_mask == "padding_causal":
-    assert not args.is_causal, "Padding causal attn mask requires is_causal to be false"
-    assert (
-        args.q_seqlen <= args.kv_seqlen
-    ), "Padding causal attn mask requires q_seqlen <= kv_seqlen"
-
 # Parse input arguments
 num_iters = args.num_iterations
 batch_size = args.batch_size
@@ -125,30 +119,16 @@ kv_seqlen = args.kv_seqlen
 num_q_heads = args.num_q_heads
 num_kv_heads = args.num_kv_heads
 head_dim = args.head_dim
-is_causal = args.is_causal
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 assert device.type == "cuda", "Requires CUDA device"
-
 enable_gqa = num_q_heads != num_kv_heads
+assert args.attn_mask != "bottom_right" or q_seqlen <= kv_seqlen, "Bottom right causal mask not supported when q_seqlen > kv_seqlen"
+
+if args.sdpa_backend in ["flash_attention", "flash_attention_3", "pyt_flash_attention"]:
+    assert args.attn_mask != "top_left", "Flash Attention does not support top left causal mask"
 
 #############################################################
 ########### Set up SDPA function for each backend ###########
-## Define various SDPA functions for each backend
-if args.attn_mask == "padding_causal":
-    # Mask construction: rectangular tensor + triangular tensor
-    rect_mask = torch.ones(
-        q_seqlen, (kv_seqlen - q_seqlen), dtype=torch.bool, device=device
-    )
-    tri_mask = torch.tril(
-        torch.ones(q_seqlen, q_seqlen, dtype=torch.bool, device=device)
-    )
-
-    attn_mask = torch.cat(
-        [rect_mask, tri_mask], dim=1
-    )  # .unsqueeze(0).repeat(batch_size, 1, 1)
-    padding_fraction = attn_mask.sum() / attn_mask.numel()
-else:
-    padding_fraction = 0.0
 
 ## If using cuDNN FE, set up cuDNN graph.
 if args.sdpa_backend == "cudnn_fe":
@@ -318,8 +298,8 @@ if args.sdpa_backend == "cudnn_fe":
             # generate_stats=not is_infer,
             is_inference=is_infer,
             attn_scale=attn_scale,
-            use_causal_mask=is_causal,
-            use_padding_mask=False,
+            diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT if args.attn_mask =="bottom_right" else cudnn.diagonal_alignment.TOP_LEFT,
+            diagonal_band_right_bound=None if args.attn_mask == "no_mask" else 0,
             # dropout=dropout_tuple if is_dropout else None,
         )
     else:
@@ -333,8 +313,8 @@ if args.sdpa_backend == "cudnn_fe":
             # generate_stats=not is_infer,
             is_inference=is_infer,
             attn_scale=attn_scale,
-            use_causal_mask=is_causal,
-            use_causal_mask_bottom_right=args.attn_mask == "padding_causal",
+            diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT if args.attn_mask =="bottom_right" else cudnn.diagonal_alignment.TOP_LEFT,
+            diagonal_band_right_bound=None if args.attn_mask == "no_mask" else 0,
             dropout=dropout_tuple if is_dropout else None,
         )
 
@@ -378,7 +358,7 @@ if args.sdpa_backend == "cudnn_fe":
         ).set_data_type(cudnn.data_type.FLOAT)
     graph_fwd.validate()
     graph_fwd.build_operation_graph()
-    graph_fwd.create_execution_plans([cudnn.heur_mode.A])
+    graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     graph_fwd.check_support()
     graph_fwd.build_plans()
 
@@ -452,8 +432,8 @@ if args.sdpa_backend == "cudnn_fe":
                 scale_dV=scale_dV_bwd,
                 scale_dP=scale_dP_bwd,
                 attn_scale=attn_scale,
-                use_causal_mask=is_causal,
-                use_causal_mask_bottom_right=args.attn_mask == "padding_causal",
+                diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT if args.attn_mask =="bottom_right" else cudnn.diagonal_alignment.TOP_LEFT,
+                diagonal_band_right_bound=None if args.attn_mask == "no_mask" else 0,
                 dropout=dropout_tuple if is_dropout else None,
             )
         else:
@@ -471,8 +451,8 @@ if args.sdpa_backend == "cudnn_fe":
                 dO=dO_bwd,
                 stats=stats_bwd,
                 attn_scale=attn_scale,
-                use_causal_mask=is_causal,
-                use_causal_mask_bottom_right=args.attn_mask == "padding_causal",
+                diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT if args.attn_mask =="bottom_right" else cudnn.diagonal_alignment.TOP_LEFT,
+                diagonal_band_right_bound=None if args.attn_mask == "no_mask" else 0,
                 dropout=dropout_tuple if is_dropout else None,
             )
 
@@ -505,7 +485,7 @@ if args.sdpa_backend == "cudnn_fe":
 
         graph_bwd.validate()
         graph_bwd.build_operation_graph()
-        graph_bwd.create_execution_plans([cudnn.heur_mode.A])
+        graph_bwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph_bwd.check_support()
         graph_bwd.build_plans()
 
@@ -620,41 +600,17 @@ if args.sdpa_backend == "cudnn_fe":
         variant_pack_bwd[offset_bwd] = dropout_offset
 ## Done setting up cuDNN graph.
 
-
-# Reference implementation for output check
-def pyt_reference_sdpa(query, key, value):
-    if args.attn_mask == "padding_causal":
+# For backends MATH, EFFICIENT_ATTENTION, CUDNN_ATTENTION, PYTORCH_FLASH_ATTENTION
+def pyt_backend_sdpa(query, key, value, backend):
+    with sdpa_kernel(backends=[backend]):
         return torch.nn.functional.scaled_dot_product_attention(
             query,
             key,
             value,
             enable_gqa=enable_gqa,
-            is_causal=is_causal,
-            attn_mask=attn_mask,
+            is_causal=args.attn_mask == "top_left",
+            attn_mask=causal_lower_right(q_seqlen, kv_seqlen) if args.attn_mask == "bottom_right" else None,
         )
-    else:
-        return torch.nn.functional.scaled_dot_product_attention(
-            query, key, value, enable_gqa=enable_gqa, is_causal=is_causal
-        )
-
-
-# For backends MATH, EFFICIENT_ATTENTION, CUDNN_ATTENTION, FLASH_ATTENTION
-def pyt_backend_sdpa(query, key, value, backend):
-    if args.attn_mask == "padding_causal":
-        with sdpa_kernel(backends=[backend]):
-            return torch.nn.functional.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                enable_gqa=enable_gqa,
-                is_causal=is_causal,
-                attn_mask=attn_mask,
-            )
-    else:
-        with sdpa_kernel(backends=[backend]):
-            return torch.nn.functional.scaled_dot_product_attention(
-                query, key, value, enable_gqa=enable_gqa, is_causal=is_causal
-            )
 
 
 if args.sdpa_backend == "flash_attention":
@@ -663,7 +619,7 @@ if args.sdpa_backend == "flash_attention":
 
     # Flash Attention Native
     def flash_attention_sdpa(query, key, value):
-        return flash_attn_func(query, key, value, causal=is_causal)
+        return flash_attn_func(query, key, value, causal=args.attn_mask != "no_mask")
 
 
 if args.sdpa_backend == "flash_attention_3":
@@ -671,7 +627,7 @@ if args.sdpa_backend == "flash_attention_3":
 
     def flash_attention_3_sdpa(query, key, value):
         output, _ = flash_attn_interface.flash_attn_func(
-            query, key, value, causal=is_causal
+            query, key, value, causal=args.attn_mask != "no_mask"
         )
         return output
 
@@ -731,24 +687,26 @@ def flops(
     kv_seqlen,
     head_dim,
     num_q_heads,
-    num_kv_heads,
-    causal,
+    attn_mask,
     mode="fwd",
-    padding_fraction=0.0,
 ):
     assert mode in ["fwd", "bwd", "fwd_bwd"]
-    f = (
-        4
-        * batch_size
-        * q_seqlen
-        * kv_seqlen
-        * num_q_heads
-        * head_dim
-        // (2 if causal else 1)
-    )
-    if padding_fraction > 0.0:
-        f = f * padding_fraction
-    return f if mode == "fwd" else (2.5 * f if mode == "bwd" else 3.5 * f)
+    
+    if attn_mask == "no_mask":
+        num_nonmasked_elems = q_seqlen * kv_seqlen
+    elif attn_mask == "top_left":
+        num_nonmasked_elems = torch.tril(torch.ones((q_seqlen, kv_seqlen), dtype=torch.bool)).sum()
+    elif attn_mask == "bottom_right":
+        diagonal_offset = kv_seqlen - q_seqlen
+        num_nonmasked_elems = torch.tril(
+            torch.ones((q_seqlen, kv_seqlen), dtype=torch.bool),
+            diagonal=diagonal_offset,
+        ).sum()
+    attention_weights = batch_size * num_q_heads * head_dim * num_nonmasked_elems
+    flops_per_gemm = attention_weights * 2
+
+    result = flops_per_gemm * 2 if mode == "fwd" else (5 * flops_per_gemm if mode == "bwd" else 7 * flops_per_gemm)
+    return result
 
 
 def tflops_per_sec(
@@ -757,11 +715,9 @@ def tflops_per_sec(
     kv_seqlen,
     head_dim,
     num_q_heads,
-    num_kv_heads,
-    causal,
+    attn_mask,
     time,
     mode="fwd",
-    padding_fraction=0.0,
 ):
     assert mode in ["fwd", "bwd", "fwd_bwd"]
     f = flops(
@@ -770,10 +726,8 @@ def tflops_per_sec(
         kv_seqlen,
         head_dim,
         num_q_heads,
-        num_kv_heads,
-        causal,
+        attn_mask,
         mode,
-        padding_fraction,
     )
     return f / time / 1e9 if not math.isnan(time) else 0.0  # Assume time is in msec
 
@@ -1078,7 +1032,14 @@ for i in range(num_iters):
     )
     if args.data_type != "fp8":
         try:
-            output_ref = pyt_reference_sdpa(query, key, value)
+            output_ref = torch.nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                enable_gqa=enable_gqa,
+                is_causal=args.attn_mask == "top_left",
+                attn_mask=causal_lower_right(q_seqlen, kv_seqlen) if args.attn_mask == "bottom_right" else None,
+            )
             torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
             forward_diffs.append(
                 torch.max(torch.abs(output.detach() - output_ref.detach())).item()
@@ -1109,11 +1070,9 @@ fwd_tflops = tflops_per_sec(
     args.kv_seqlen,
     args.head_dim,
     args.num_q_heads,
-    args.num_kv_heads,
-    args.is_causal,
+    args.attn_mask,
     fwd_median_time,
     "fwd",
-    padding_fraction,
 )
 if args.fwd_bwd:
     bwd_median_time = np.median(np.array(backward_times[5:]))
@@ -1123,11 +1082,9 @@ if args.fwd_bwd:
         args.kv_seqlen,
         args.head_dim,
         args.num_q_heads,
-        args.num_kv_heads,
-        args.is_causal,
+        args.attn_mask,
         bwd_median_time,
         "bwd",
-        padding_fraction,
     )
     if args.format_output:
         print(
