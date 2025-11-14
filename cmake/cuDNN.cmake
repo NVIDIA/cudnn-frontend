@@ -19,7 +19,9 @@ function(find_cudnn_library NAME)
     endif()
 
     find_library(
-        ${NAME}_LIBRARY ${NAME} "lib${NAME}.so.${CUDNN_MAJOR_VERSION}"
+        ${NAME}_LIBRARY
+        NAMES ${NAME} "lib${NAME}.so.${CUDNN_MAJOR_VERSION}"
+        NAMES_PER_DIR
         HINTS $ENV{CUDNN_LIBRARY_PATH} ${CUDNN_LIBRARY_PATH} $ENV{CUDNN_PATH} ${CUDNN_PATH} ${Python_SITEARCH}/nvidia/cudnn ${CUDAToolkit_LIBRARY_DIR}
         PATH_SUFFIXES lib64 lib/x64 lib
         ${_cudnn_required}
