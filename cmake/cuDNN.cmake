@@ -18,8 +18,13 @@ function(find_cudnn_library NAME)
         set(_cudnn_required "")
     endif()
 
+    if(CUDNN_STATIC_LINK)
+        set(library_names "${NAME}_static" "lib${NAME}_static_v${CUDNN_MAJOR_VERSION}.a")
+    else()
+        set(library_names ${NAME} "lib${NAME}.so.${CUDNN_MAJOR_VERSION}")
+    endif()
     find_library(
-        ${NAME}_LIBRARY ${NAME} "lib${NAME}.so.${CUDNN_MAJOR_VERSION}"
+        ${NAME}_LIBRARY ${library_names}
         HINTS $ENV{CUDNN_LIBRARY_PATH} ${CUDNN_LIBRARY_PATH} $ENV{CUDNN_PATH} ${CUDNN_PATH} ${Python_SITEARCH}/nvidia/cudnn ${CUDAToolkit_LIBRARY_DIR}
         PATH_SUFFIXES lib64 lib/x64 lib
         ${_cudnn_required}
@@ -38,12 +43,14 @@ function(find_cudnn_library NAME)
     endif()
 endfunction()
 
-find_cudnn_library(cudnn)
+if(NOT CUDNN_STATIC_LINK)
+    find_cudnn_library(cudnn)
+endif()
 
 include (FindPackageHandleStandardArgs)
 find_package_handle_standard_args(
     LIBRARY REQUIRED_VARS
-    CUDNN_INCLUDE_DIR cudnn_LIBRARY
+    CUDNN_INCLUDE_DIR $<$<BOOL:${CUDNN_STATIC_LINK}>:cudnn_LIBRARY>
 )
 
 if(CUDNN_INCLUDE_DIR AND cudnn_LIBRARY)
@@ -66,11 +73,23 @@ target_include_directories(
     $<BUILD_INTERFACE:${CUDNN_INCLUDE_DIR}>
 )
 
-target_link_libraries(
-    CUDNN::cudnn_all
-    INTERFACE
-    CUDNN::cudnn 
-)
+if(CUDNN_STATIC_LINK)
+    add_library(CUDNN::cudnn INTERFACE IMPORTED)
+    target_link_libraries(
+        CUDNN::cudnn
+        INTERFACE
+        CUDNN::cudnn_all
+    )
+
+    set(ZLIB_USE_STATIC_LIBS ON)
+    find_package(ZLIB)
+else()
+    target_link_libraries(
+        CUDNN::cudnn_all
+        INTERFACE
+        CUDNN::cudnn 
+    )
+endif()
 
 if(CUDNN_MAJOR_VERSION EQUAL 8)
     find_cudnn_library(cudnn_adv_infer)
@@ -102,12 +121,16 @@ elseif(CUDNN_MAJOR_VERSION EQUAL 9)
     target_link_libraries(
         CUDNN::cudnn_all
         INTERFACE
+        # Ref: https://docs.nvidia.com/deeplearning/cudnn/installation/latest/build-run-cudnn.html#running-a-cudnn-dependent-program
+        $<$<BOOL:CUDNN_STATIC_LINK>:-Wl,--whole-archive>
         CUDNN::cudnn_graph
         CUDNN::cudnn_engines_runtime_compiled
         CUDNN::cudnn_ops
         CUDNN::cudnn_cnn
         CUDNN::cudnn_adv
-        CUDNN::cudnn_engines_precompiled
+        $<$<NOT:$<BOOL:${CUDNN_SKIP_PRECOMPILED_LINK}>>:CUDNN::cudnn_engines_precompiled>
         CUDNN::cudnn_heuristic
+        $<$<BOOL:CUDNN_STATIC_LINK>:-Wl,--no-whole-archive>
+        $<$<BOOL:CUDNN_STATIC_LINK>:CUDA::cublasLt_static CUDA::nvrtc_static ZLIB::ZLIB>
     )
 endif()
