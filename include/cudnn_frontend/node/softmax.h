@@ -54,7 +54,12 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
         }
         //////////////// TODO //////////////////////////
         // Check Stride (Before setting dimension?)
-        max_output->set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+        if (max_output->get_dim().empty()) {
+            max_output->set_dim({b, h, s_q, 1});
+        }
+        if (max_output->get_stride().empty()) {
+            max_output->set_stride({h * s_q, s_q, 1, 1});
+        }
 
         auto max_attributes = Reduction_attributes().set_name("Max").set_mode(ReductionMode_t::MAX);
         // If sink tensor is present, we also need to take a pointwise max with sink
@@ -84,7 +89,13 @@ class SoftmaxNode : public NodeCRTP<SoftmaxNode> {
             sum_output = std::make_shared<Tensor_attributes>();
             sum_output->set_is_virtual(true);
         }
-        sum_output->set_name("SumExp").set_dim({b, h, s_q, 1}).set_stride({h * s_q, s_q, 1, 1});
+        sum_output->set_name("SumExp");
+        if (sum_output->get_dim().empty()) {
+            sum_output->set_dim({b, h, s_q, 1});
+        }
+        if (sum_output->get_stride().empty()) {
+            sum_output->set_stride({h * s_q, s_q, 1, 1});
+        }
         auto sum_attributes = Reduction_attributes().set_name("sum").set_mode(ReductionMode_t::ADD);
         // If sink tensor is present, also subtract it and take its exp
         if (attributes.inputs.find(Softmax_attributes::input_names::SINK) != attributes.inputs.end()) {
