@@ -4,12 +4,36 @@ find_path(
     CUDNN_INCLUDE_DIR cudnn.h
     HINTS $ENV{CUDNN_INCLUDE_PATH} ${CUDNN_INCLUDE_PATH} $ENV{CUDNN_PATH} ${CUDNN_PATH} ${Python_SITEARCH}/nvidia/cudnn ${CUDAToolkit_INCLUDE_DIRS}
     PATH_SUFFIXES include
-    REQUIRED
 )
 
-file(READ "${CUDNN_INCLUDE_DIR}/cudnn_version.h" cudnn_version_header)
-string(REGEX MATCH "#define CUDNN_MAJOR [1-9]+" macrodef "${cudnn_version_header}")
-string(REGEX MATCH "[1-9]+" CUDNN_MAJOR_VERSION "${macrodef}")
+if(CUDNN_INCLUDE_DIR)
+    # Get cuDNN version
+    if(EXISTS ${CUDNN_INCLUDE_DIR}/cudnn_version.h)
+        file(READ ${CUDNN_INCLUDE_DIR}/cudnn_version.h CUDNN_HEADER_CONTENTS)
+    else()
+        file(READ ${CUDNN_INCLUDE_DIR}/cudnn.h CUDNN_HEADER_CONTENTS)
+    endif()
+    string(REGEX MATCH "define CUDNN_MAJOR * +([0-9]+)"
+                CUDNN_VERSION_MAJOR "${CUDNN_HEADER_CONTENTS}")
+    string(REGEX REPLACE "define CUDNN_MAJOR * +([0-9]+)" "\\1"
+                CUDNN_VERSION_MAJOR "${CUDNN_VERSION_MAJOR}")
+    string(REGEX MATCH "define CUDNN_MINOR * +([0-9]+)"
+                CUDNN_VERSION_MINOR "${CUDNN_HEADER_CONTENTS}")
+    string(REGEX REPLACE "define CUDNN_MINOR * +([0-9]+)" "\\1"
+                CUDNN_VERSION_MINOR "${CUDNN_VERSION_MINOR}")
+    string(REGEX MATCH "define CUDNN_PATCHLEVEL * +([0-9]+)"
+                CUDNN_VERSION_PATCH "${CUDNN_HEADER_CONTENTS}")
+    string(REGEX REPLACE "define CUDNN_PATCHLEVEL * +([0-9]+)" "\\1"
+                CUDNN_VERSION_PATCH "${CUDNN_VERSION_PATCH}")
+    # Assemble cuDNN version
+    if(NOT CUDNN_VERSION_MAJOR)
+        set(CUDNN_VERSION "?")
+    else()
+        set(CUDNN_VERSION
+            "${CUDNN_VERSION_MAJOR}.${CUDNN_VERSION_MINOR}.${CUDNN_VERSION_PATCH}")
+    endif()
+    set(CUDNN_MAJOR_VERSION ${CUDNN_VERSION_MAJOR})
+endif()
 
 function(find_cudnn_library NAME)
     if(NOT "${ARGV1}" STREQUAL "OPTIONAL")
