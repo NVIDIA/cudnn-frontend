@@ -47,12 +47,13 @@ endfunction()
 
 if(NOT CUDNN_STATIC_LINK)
     find_cudnn_library(cudnn)
+    set(CUDNN_LIBRARY_VAR cudnn_LIBRARY)
 endif()
 
 include (FindPackageHandleStandardArgs)
 find_package_handle_standard_args(
     LIBRARY REQUIRED_VARS
-    CUDNN_INCLUDE_DIR $<$<BOOL:${CUDNN_STATIC_LINK}>:cudnn_LIBRARY>
+    CUDNN_INCLUDE_DIR ${CUDNN_LIBRARY_VAR}
 )
 
 if(CUDNN_INCLUDE_DIR AND cudnn_LIBRARY)
