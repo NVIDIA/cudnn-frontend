@@ -18,7 +18,7 @@ function(find_cudnn_library NAME)
         set(_cudnn_required "")
     endif()
 
-    if(CUDNN_STATIC_LINK)
+    if(CUDNN_STATIC)
         set(library_names "${NAME}_static" "lib${NAME}_static_v${CUDNN_MAJOR_VERSION}.a")
     else()
         set(library_names ${NAME} "lib${NAME}.so.${CUDNN_MAJOR_VERSION}")
@@ -45,7 +45,7 @@ function(find_cudnn_library NAME)
     endif()
 endfunction()
 
-if(NOT CUDNN_STATIC_LINK)
+if(NOT CUDNN_STATIC)
     find_cudnn_library(cudnn)
     set(CUDNN_LIBRARY_VAR cudnn_LIBRARY)
 endif()
@@ -56,7 +56,7 @@ find_package_handle_standard_args(
     CUDNN_INCLUDE_DIR ${CUDNN_LIBRARY_VAR}
 )
 
-if(CUDNN_INCLUDE_DIR AND cudnn_LIBRARY)
+if(CUDNN_INCLUDE_DIR AND (CUDNN_STATIC OR cudnn_LIBRARY))
 
     message(STATUS "cuDNN: ${cudnn_LIBRARY}")
     message(STATUS "cuDNN: ${CUDNN_INCLUDE_DIR}")
@@ -76,7 +76,7 @@ target_include_directories(
     $<BUILD_INTERFACE:${CUDNN_INCLUDE_DIR}>
 )
 
-if(CUDNN_STATIC_LINK)
+if(CUDNN_STATIC)
     add_library(CUDNN::cudnn INTERFACE IMPORTED)
     target_link_libraries(
         CUDNN::cudnn
@@ -124,7 +124,7 @@ elseif(CUDNN_MAJOR_VERSION EQUAL 9)
         CUDNN::cudnn_all
         INTERFACE
         # Ref: https://docs.nvidia.com/deeplearning/cudnn/installation/latest/build-run-cudnn.html#running-a-cudnn-dependent-program
-        $<$<BOOL:CUDNN_STATIC_LINK>:-Wl,--whole-archive>
+        $<$<BOOL:CUDNN_STATIC>:-Wl,--whole-archive>
         CUDNN::cudnn_graph
         CUDNN::cudnn_engines_runtime_compiled
         CUDNN::cudnn_ops
@@ -132,7 +132,7 @@ elseif(CUDNN_MAJOR_VERSION EQUAL 9)
         CUDNN::cudnn_adv
         $<$<NOT:$<BOOL:${CUDNN_SKIP_PRECOMPILED_LINK}>>:CUDNN::cudnn_engines_precompiled>
         CUDNN::cudnn_heuristic
-        $<$<BOOL:CUDNN_STATIC_LINK>:-Wl,--no-whole-archive>
-        $<$<BOOL:CUDNN_STATIC_LINK>:CUDA::cublasLt_static CUDA::nvrtc_static ZLIB::ZLIB>
+        $<$<BOOL:CUDNN_STATIC>:-Wl,--no-whole-archive>
+        $<$<BOOL:CUDNN_STATIC>:CUDA::cublasLt_static $<IF:$<TARGET_EXISTS:CUDA::nvrtc_static>,CUDA::nvrtc_static,CUDA::nvrtc> ZLIB::ZLIB>
     )
 endif()
