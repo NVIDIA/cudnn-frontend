@@ -969,7 +969,7 @@ class Graph : public ICudnn, public INode {
             extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, deserialized_pass_by_value));
 
         auto cudnn_status = execute(handle, tensor_uid_to_pointer_map, tmp_pointer);
-        [[maybe_unused]]cudnn_status;  // No need to check bad executes
+        (void)cudnn_status;  // No need to check bad executes
 
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_end_capture(fake_stream, &graph_obj));
 
