@@ -923,6 +923,11 @@ class Graph : public ICudnn, public INode {
                                 << capture_status << " original_stream "
                                 << ((original_stream == nullptr) ? "DEFAULT (NULL) Stream" : "NON-DEFAULT Stream"));
 
+        if (capture_status != cudaStreamCaptureStatusNone) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: cuda graph capture active, aborting warmup");
+            return {error_code_t::OK, "cuda graph capture active, aborting warmup"};
+        }
+
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_begin_capture(fake_stream, cudaStreamCaptureModeRelaxed));
 
         std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
@@ -963,7 +968,8 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(
             extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, deserialized_pass_by_value));
 
-        CHECK_CUDNN_FRONTEND_ERROR(execute(handle, tensor_uid_to_pointer_map, tmp_pointer));
+        auto cudnn_status = execute(handle, tensor_uid_to_pointer_map, tmp_pointer);
+        (void)cudnn_status;  // No need to check bad executes
 
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_end_capture(fake_stream, &graph_obj));
 
