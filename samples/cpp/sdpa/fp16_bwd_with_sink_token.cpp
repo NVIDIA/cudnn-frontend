@@ -55,21 +55,21 @@ This example shows how to construct a sdpa backward graph with sink token.
 
 // Function to create the SDPA (Scaled Dot-Product Attention) backward graph
 std::shared_ptr<fe::graph::Graph>
-create_sdpa_backward_graph(int64_t const b,
-                           int64_t const h_q,
-                           int64_t const h_k,
-                           int64_t const h_v,
-                           int64_t const s_q,
-                           int64_t const s_kv,
-                           int64_t const d_qk,
-                           int64_t const d_v,
-                           float const attn_scale                     = 1.0f,
-                           [[maybe_unused]] bool const generate_stats = true,
-                           bool const causal_mask                     = false,
-                           bool const alibi_mask                      = false,
-                           bool const padding_mask                    = false,
-                           bool has_attn_bias                         = false,
-                           bool has_sink_token                        = false) {
+create_sdpa_backward_graph_with_sink(int64_t const b,
+                                     int64_t const h_q,
+                                     int64_t const h_k,
+                                     int64_t const h_v,
+                                     int64_t const s_q,
+                                     int64_t const s_kv,
+                                     int64_t const d_qk,
+                                     int64_t const d_v,
+                                     float const attn_scale                     = 1.0f,
+                                     [[maybe_unused]] bool const generate_stats = true,
+                                     bool const causal_mask                     = false,
+                                     bool const alibi_mask                      = false,
+                                     bool const padding_mask                    = false,
+                                     bool has_attn_bias                         = false,
+                                     bool has_sink_token                        = false) {
     // Create a graph and set common global properties
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(fe::DataType_t::BFLOAT16)
@@ -227,21 +227,21 @@ TEST_CASE("Toy sdpa backward with sink", "[graph][sdpa][flash][backward]") {
     auto handle     = *handle_ptr;
 
     // Create the SDPA backward graph
-    auto graph = create_sdpa_backward_graph(b,
-                                            h_q,
-                                            h_k,
-                                            h_v,
-                                            s_q,
-                                            s_kv,
-                                            d_qk,
-                                            d_v,
-                                            attn_scale,
-                                            generate_stats,
-                                            causal_mask,
-                                            alibi_mask,
-                                            padding_mask,
-                                            has_attn_bias,
-                                            has_sink_token);
+    auto graph = create_sdpa_backward_graph_with_sink(b,
+                                                      h_q,
+                                                      h_k,
+                                                      h_v,
+                                                      s_q,
+                                                      s_kv,
+                                                      d_qk,
+                                                      d_v,
+                                                      attn_scale,
+                                                      generate_stats,
+                                                      causal_mask,
+                                                      alibi_mask,
+                                                      padding_mask,
+                                                      has_attn_bias,
+                                                      has_sink_token);
 
     // Supported starting 9.13+
     auto status = graph->validate();

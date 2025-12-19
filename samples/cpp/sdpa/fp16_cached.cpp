@@ -67,7 +67,8 @@ create_sdpa_backward_graph(int64_t const b,
                            bool const causal_mask    = false,
                            bool const alibi_mask     = false,
                            bool const padding_mask   = false,
-                           bool has_attn_bias        = false);
+                           bool has_attn_bias        = false,
+                           bool is_deterministic     = false);
 
 #define Q_UID 1
 #define K_UID 2

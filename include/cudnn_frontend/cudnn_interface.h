@@ -64,6 +64,11 @@ create_cudnn_tensor(
         .setByValue(props->get_is_pass_by_value())
         .setReorderType(props->get_reordering_type());
 
+    // Set vector count and dimension if they are non-default
+    if (props->get_vector_count() > 1 || props->get_vector_dimension() >= 0) {
+        tensor_builder.setVectorCountAndDimension(props->get_vector_count(), props->get_vector_dimension());
+    }
+
     if (auto ragged_offset_props = props->get_ragged_offset()) {
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(ragged_offset_props, tensors, potential_uid, used_uids));
         tensor_builder.setRaggedOffset(tensors.at(ragged_offset_props->get_uid()));

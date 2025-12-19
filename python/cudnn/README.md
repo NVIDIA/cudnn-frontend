@@ -39,3 +39,8 @@ To add a new frontend-only API, follow these steps:
 **Currently implemented frontend-only APIs**:
 - `GEMM + Amax`
 - `GEMM + SwiGLU`
+
+**In progress frontend-only APIs**:
+- GEMM + Dswiglu
+- GEMM + RoPE
+- Native Sparse Attention (NSA)

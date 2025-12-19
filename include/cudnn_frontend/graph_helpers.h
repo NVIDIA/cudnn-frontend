@@ -429,6 +429,161 @@ generate_matmul_output_dim(const std::vector<int64_t>& a_dim,
     return {error_code_t::OK, ""};
 }
 
+inline std::string
+to_hex(const void* data, size_t num_elements, size_t elem_size) {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    std::stringstream ss;
+    ss << "[";
+    for (size_t i = 0; i < num_elements; ++i) {
+        if (i > 0) ss << ", ";
+        ss << "0x" << std::hex << std::uppercase;
+        switch (elem_size) {
+            case 1:
+                ss << static_cast<unsigned>(bytes[i]);
+                break;
+            case 2:
+                ss << *reinterpret_cast<const uint16_t*>(&bytes[i * 2]);
+                break;
+            case 4:
+                ss << *reinterpret_cast<const uint32_t*>(&bytes[i * 4]);
+                break;
+            case 8:
+                ss << *reinterpret_cast<const uint64_t*>(&bytes[i * 8]);
+                break;
+            default:
+                ss << "?";
+        }
+    }
+    ss << "]";
+    return ss.str();
+}
+
+inline std::string
+to_decimal(const void* data, size_t num_elements, size_t elem_size) {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    std::stringstream ss;
+    ss << "[";
+    for (size_t i = 0; i < num_elements; ++i) {
+        if (i > 0) ss << ", ";
+        switch (elem_size) {
+            case 1:
+                ss << static_cast<int>(bytes[i]);
+                break;
+            case 2:
+                ss << *reinterpret_cast<const int16_t*>(&bytes[i * 2]);
+                break;
+            case 4:
+                ss << *reinterpret_cast<const int32_t*>(&bytes[i * 4]);
+                break;
+            case 8:
+                ss << *reinterpret_cast<const int64_t*>(&bytes[i * 8]);
+                break;
+            default:
+                ss << "?";
+        }
+    }
+    ss << "]";
+    return ss.str();
+}
+
+inline std::string
+to_base64(const void* data, size_t total_bytes) {
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const auto* bytes         = static_cast<const unsigned char*>(data);
+    std::string result;
+    result.reserve(((total_bytes + 2) / 3) * 4);
+    for (size_t i = 0; i < total_bytes; i += 3) {
+        uint32_t n = static_cast<uint32_t>(bytes[i]) << 16;
+        if (i + 1 < total_bytes) n |= static_cast<uint32_t>(bytes[i + 1]) << 8;
+        if (i + 2 < total_bytes) n |= static_cast<uint32_t>(bytes[i + 2]);
+        result.push_back(table[(n >> 18) & 0x3F]);
+        result.push_back(table[(n >> 12) & 0x3F]);
+        result.push_back((i + 1 < total_bytes) ? table[(n >> 6) & 0x3F] : '=');
+        result.push_back((i + 2 < total_bytes) ? table[n & 0x3F] : '=');
+    }
+    return result;
+}
+
+inline error_t
+log_dump_tensor_content(int64_t uid,
+                        std::string const& name,
+                        void* ptr,
+                        size_t num_elements,
+                        size_t elem_size,
+                        char fmt,
+                        cudaStream_t stream) {
+    if (!isLoggingEnabled()) return {error_code_t::OK, ""};
+
+    size_t total_bytes = num_elements * elem_size;
+
+    cudaPointerAttributes attr;
+    _CUDNN_CHECK_CUDA_ERROR(cuda_pointer_get_attributes(&attr, ptr));
+
+    std::vector<unsigned char> host_buf(total_bytes);
+    if (attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged) {
+        _CUDNN_CHECK_CUDA_ERROR(cuda_mem_cpy_async(host_buf.data(), ptr, total_bytes, cudaMemcpyDeviceToHost, stream));
+        _CUDNN_CHECK_CUDA_ERROR(cuda_stream_synchronize(stream));
+    } else {
+        std::memcpy(host_buf.data(), ptr, total_bytes);
+    }
+
+    std::string data_str;
+    switch (fmt) {
+        case 'x':
+            data_str = to_hex(host_buf.data(), num_elements, elem_size);
+            break;
+        case 'd':
+            data_str = to_decimal(host_buf.data(), num_elements, elem_size);
+            break;
+        case 'b':
+            data_str = to_base64(host_buf.data(), total_bytes);
+            break;
+        default:
+            data_str = to_hex(host_buf.data(), num_elements, elem_size);
+    }
+    CUDNN_FE_LOG_LABEL_ENDL("Tensor Dump Uid: " << uid << " Name: " << name << " Data: " << data_str);
+    return {error_code_t::OK, ""};
+}
+
+inline error_t
+log_variant_pack_memory_type(int64_t uid, void* ptr) {
+    if (!isLoggingEnabled()) return {error_code_t::OK, ""};
+
+    cudaPointerAttributes attributes;
+    _CUDNN_CHECK_CUDA_ERROR(cuda_pointer_get_attributes(&attributes, ptr));
+
+    auto memory_type_to_string = [](cudaMemoryType type) {
+        switch (type) {
+            case cudaMemoryTypeHost:
+                return std::string("Host");
+            case cudaMemoryTypeDevice:
+                return std::string("Device");
+            case cudaMemoryTypeManaged:
+                return std::string("Managed");
+            case cudaMemoryTypeUnregistered:
+                return std::string("Unregistered");
+            default:
+                return "UNKNOWN cudaMemoryType (" + std::to_string(type) + ")";
+        }
+    };
+
+    auto ptr_to_string = [](void* p) {
+        std::stringstream ss;
+        ss << "0x" << std::hex << std::setw(sizeof(void*) * 2) << std::setfill('0') << reinterpret_cast<uintptr_t>(p);
+        return ss.str();
+    };
+
+    // clang-format off
+    CUDNN_FE_LOG_LABEL_ENDL("Variant Pack" << std::setw(0) << " Uid: " << std::setw(20) << uid
+                                           << std::setw(0) << " MemoryType: " << std::setw(12) << memory_type_to_string(attributes.type)
+                                           << std::setw(0) << " Device: " << std::setw(4) << attributes.device
+                                           << std::setw(0) << " UnifiedPtr: " << std::setw(20) << ptr_to_string(ptr)
+                                           << std::setw(0) << " DevicePtr: " << std::setw(20) << ptr_to_string(attributes.devicePointer)
+                                           << std::setw(0) << " HostPtr: " << std::setw(20) << ptr_to_string(attributes.hostPointer));
+    // clang-format on
+    return {error_code_t::OK, ""};
+}
+
 }  // namespace detail
 
 class cudnnGraphNotSupportedException : public std::runtime_error {

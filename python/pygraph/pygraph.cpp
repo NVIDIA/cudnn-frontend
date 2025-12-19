@@ -1003,8 +1003,8 @@ init_pygraph_submodule(py::module_& m) {
                 Args:
                     index (int): The index of the plan to build.
             )pbdoc")
-        .def("build", (void(PyGraph::*)(std::vector<cudnn_frontend::HeurMode_t> const&)) & PyGraph::build)
-        .def("build", (void(PyGraph::*)()) & PyGraph::build)
+        .def("build", (void (PyGraph::*)(std::vector<cudnn_frontend::HeurMode_t> const&))&PyGraph::build)
+        .def("build", (void (PyGraph::*)())&PyGraph::build)
         .def("get_execution_plan_count",
              &PyGraph::get_execution_plan_count,
              R"pbdoc(
@@ -1042,10 +1042,10 @@ init_pygraph_submodule(py::module_& m) {
         .def("update_cuda_graph", &PyGraph::update_cuda_graph)
         .def("serialize", &PyGraph::serialize)
         .def("deserialize",
-             (void(PyGraph::*)(std::optional<std::intptr_t>, py::object const&)) & PyGraph::deserialize,
+             (void (PyGraph::*)(std::optional<std::intptr_t>, py::object const&))&PyGraph::deserialize,
              py::arg("handle_"),
              py::arg("pyobj"))
-        .def("deserialize", (void(PyGraph::*)(py::object const&)) & PyGraph::deserialize, py::arg("pyobj"))
+        .def("deserialize", (void (PyGraph::*)(py::object const&))&PyGraph::deserialize, py::arg("pyobj"))
         .def("_execute_plan_at_index", &PyGraph::execute_plan_at_index)
         .def("__repr__", [](PyGraph const& pygraph) {
             std::stringstream ss;

@@ -54,6 +54,7 @@ _default_cudnn_handle = None
 # Configure logging
 logger = logging.getLogger(__name__)
 
+
 def _graph_tensor(graph: cudnn.pygraph, tensor: "torch.Tensor") -> cudnn.tensor:
     """Create a tensor in the graph object.
 
@@ -68,11 +69,11 @@ def _graph_tensor(graph: cudnn.pygraph, tensor: "torch.Tensor") -> cudnn.tensor:
         If the input tensor has requires_grad=True, it will be detached
         before creating the graph tensor to avoid gradient tracking issues.
     """
-    try:
-        return graph.tensor_like(tensor)
-    except RuntimeError:
+    if hasattr(tensor, "requires_grad") and tensor.requires_grad:
         # PyTorch tensor with requires_grad=True need to be detached first
         return graph.tensor_like(tensor.detach())
+    else:
+        return graph.tensor_like(tensor)
 
 
 def _find_tensor(
@@ -154,7 +155,9 @@ def _extract_tensor(
         return None  # not found
 
 
-def _tensor_like(cudnn_tensor: cudnn.tensor, tensor_type: str = "pyt") -> "torch.Tensor":
+def _tensor_like(
+    cudnn_tensor: cudnn.tensor, tensor_type: str = "pyt"
+) -> "torch.Tensor":
     """Create a tensor like the provided cudnn tensor
 
     Args:

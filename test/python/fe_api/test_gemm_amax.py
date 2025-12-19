@@ -3,7 +3,6 @@ import torch
 import pytest
 
 from test_utils import torch_fork_set_rng
-from cuda.bindings import driver as cuda
 from fe_api.test_gemm_amax_utils import (
     with_gemm_amax_params,
 )
@@ -32,6 +31,7 @@ def test_gemm_amax_compile_execute(
 ):
     try:
         from cudnn import GemmAmaxSm100
+        from cuda.bindings import driver as cuda
         from fe_api.test_gemm_amax_utils import (
             allocate_input_tensors,
             allocate_output_tensors,
@@ -129,6 +129,7 @@ def test_gemm_amax_wrapper(
 ):
     try:
         from cudnn import gemm_amax_wrapper_sm100
+        from cuda.bindings import driver as cuda
         from fe_api.test_gemm_amax_utils import (
             allocate_input_tensors,
             allocate_output_tensors,
@@ -168,19 +169,20 @@ def test_gemm_amax_wrapper(
     )
 
     try:
-        c_torch, amax_torch = gemm_amax_wrapper_sm100(
-            a_tensor=a_torch,
-            b_tensor=b_torch,
-            sfa_tensor=sfa_torch,
-            sfb_tensor=sfb_torch,
-            c_major=cfg["c_major"],
-            c_dtype=cfg["c_dtype"],
-            acc_dtype=cfg["acc_dtype"],
-            mma_tiler_mn=cfg["mma_tiler_mn"],
-            cluster_shape_mn=cfg["cluster_shape_mn"],
-            sf_vec_size=cfg["sf_vec_size"],
-            stream=stream,
-        )
+        for _ in range(2):  # Run twice to test caching path
+            c_torch, amax_torch = gemm_amax_wrapper_sm100(
+                a_tensor=a_torch,
+                b_tensor=b_torch,
+                sfa_tensor=sfa_torch,
+                sfb_tensor=sfb_torch,
+                c_major=cfg["c_major"],
+                c_dtype=cfg["c_dtype"],
+                acc_dtype=cfg["acc_dtype"],
+                mma_tiler_mn=cfg["mma_tiler_mn"],
+                cluster_shape_mn=cfg["cluster_shape_mn"],
+                sf_vec_size=cfg["sf_vec_size"],
+                stream=stream,
+            )
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
 

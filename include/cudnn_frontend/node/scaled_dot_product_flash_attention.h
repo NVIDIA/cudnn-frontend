@@ -724,8 +724,9 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     mutable std::shared_ptr<Tensor_attributes>
         workaround_padding_mask_seq_len_q;  // Will be edited in pre_validate_node()
     mutable std::shared_ptr<Tensor_attributes>
-        workaround_padding_mask_seq_len_kv;                      // Will be edited in pre_validate_node()
-    mutable int64_t batch_size_for_workaround_padding_mask = 0;  // Will be edited in pre_validate_node()
+        workaround_padding_mask_seq_len_kv;                                  // Will be edited in pre_validate_node()
+    mutable int64_t batch_size_for_workaround_padding_mask         = 0;      // Will be edited in pre_validate_node()
+    mutable bool is_deterministic_algorithm_supported_on_blackwell = false;  // Will be edited in pre_validate_node()
 
    public:
     mutable SDPA_backward_attributes attributes;  // Will be edited in pre_validate_node() for workaround padding mask
@@ -955,9 +956,18 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                                        "Dropout probability cannot be 1 as corresponding scale wont be well formed.");
 
         // validate options for deterministic algorithm
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.is_deterministic_algorithm && (prop.major == 10),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Deterministic algorithm is not supported on blackwell architecture");
+        if(attributes.is_deterministic_algorithm && (prop.major == 10)) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF( (detail::get_backend_version() < 91800),
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Deterministic algorithm is not supported on blackwell architecture with cudnn version below 9.18.0");
+
+            // dbias bias rng/dropout alibi
+            RETURN_CUDNN_FRONTEND_ERROR_IF(is_dbias || is_rng || is_dropout || attributes.alibi_mask,
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Deterministic algorithm is not supported on blackwell architecture when dbias, rng/dropout, alibi is enabled");
+
+            is_deterministic_algorithm_supported_on_blackwell = true;
+        }
 
         // version specific validation
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 8906 && ((s_kv % 64 != 0) || (d_qk % 64 != 0)),
@@ -998,9 +1008,9 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                                        "Dropout RNG dump is not supported for SM Major version 10");
 
         // TODO add version check once fixed
-        RETURN_CUDNN_FRONTEND_ERROR_IF(prop.major == 10 && is_ragged && (is_dbias || attributes.is_deterministic_algorithm),
+        RETURN_CUDNN_FRONTEND_ERROR_IF(prop.major == 10 && is_ragged && is_dbias,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Deterministic kernel or dbias with ragged is not supported for SM Major version 10");
+                                       "dbias with ragged is not supported for SM Major version 10");
 
         // validate that datatype is set for the graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(this->context.get_intermediate_data_type() == DataType_t::NOT_SET,
@@ -1111,6 +1121,15 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
 
         bool use_dp_workspace = false;
 
+        cudaDeviceProp prop;
+        if (context.get_sm_version() > 0) {
+            prop.major = context.get_sm_version() / 10;
+        } else {
+            int device;
+            _CUDNN_CHECK_CUDA_ERROR(detail::cuda_get_device(&device));
+            _CUDNN_CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, device));
+        }
+
         if (detail::get_backend_version() >= 8905 && detail::get_backend_version() < 90000) {
             // workspace optimization is enabled by default when:
             //   8.9.5 <= cudnn version < 9.0.0
@@ -1123,8 +1142,6 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=-1     - always enable workspace opt.
             // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=0      - always disable workspace opt.
             // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=n      - enable workspace opt. until the n byte limit
-            struct cudaDeviceProp prop;
-            _CUDNN_CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, 0));
 
             // hopper or above
             if (prop.major >= 9) {
@@ -1161,7 +1178,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
 
         // Force dP workspace implementation if:
         //  - dBias is enabled (dBias is only supported on workspace implementation)
-        //  - the user force requests deterministic algorithm
+        //  - the user force requests deterministic algorithm on hopper
         if (attributes.outputs[output_names::dBias] || attributes.is_deterministic_algorithm) {
             use_dp_workspace = true;
         }
@@ -1630,6 +1647,15 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         }
 
         return {error_code_t::OK, ""};
+    }
+
+    std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
+    override_heuristics_query() const {
+        if (is_deterministic_algorithm_supported_on_blackwell) {
+            return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
+        } else {
+            return {-1, {}};
+        }
     }
 
     virtual int64_t

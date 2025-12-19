@@ -14,7 +14,7 @@ classifiers = [
 ]
 
 [tool.setuptools]
-packages = ["cudnn", "include", "cudnn.gemm_swiglu", "cudnn.gemm_amax"]
+packages = ["cudnn", "include", "cudnn.native_sparse_attention", "cudnn.native_sparse_attention.selection", "cudnn.native_sparse_attention.sliding_window_attention", "cudnn.native_sparse_attention.top_k", "cudnn.gemm_swiglu", "cudnn.gemm_amax"]
 package-dir = {"" = "python", "include" = "include"}
 include-package-data = true
 
@@ -30,7 +30,7 @@ include = ["**/*"]
 
 [project.optional-dependencies]
 cutedsl = [
-    "nvidia-cutlass-dsl",
+    "nvidia-cutlass-dsl==4.3.1",
     "cuda-python",
     "torch",
 ]

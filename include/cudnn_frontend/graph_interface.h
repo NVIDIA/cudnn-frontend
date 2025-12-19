@@ -22,7 +22,6 @@
 #include "node/resample.h"
 #include "node/reshape.h"
 #include "node/slice.h"
-// #include "node/scaled_dot_product_attention.h"
 #include "node/scaled_dot_product_flash_attention.h"
 #include "node/sdpa_fp8_bwd.h"
 #include "node/block_scale_quantize.h"
@@ -47,6 +46,9 @@ class Graph : public ICudnn, public INode {
     std::unordered_set<std::shared_ptr<Tensor_attributes>> deserialized_tensor_properties;
     std::unordered_map<uid_t, pass_by_values_t> deserialized_pass_by_value;
     std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> deserialized_workspace_modifications;
+
+    // char: 'x'=hex, 'd'=decimal, 'b'=base64
+    std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>> tensors_to_dump;
 
     error_t
     get_pre_assigned_uids(std::unordered_set<Tensor_attributes::uid_t> &used_uids) {
@@ -277,6 +279,21 @@ class Graph : public ICudnn, public INode {
             attributes.inputs.at(SDPA_attributes::input_names::Scale_O) != nullptr) {
             sdpa_outputs.Amax_O = attributes.outputs[SDPA_attributes::output_names::Amax_O] =
                 output_tensor(attributes.name + "::Amax_O");
+        }
+
+        auto seq_len_q_it  = attributes.inputs.find(SDPA_attributes::input_names::SEQ_LEN_Q);
+        auto seq_len_kv_it = attributes.inputs.find(SDPA_attributes::input_names::SEQ_LEN_KV);
+        if (seq_len_q_it != attributes.inputs.end() && seq_len_q_it->second != nullptr) {
+            tensors_to_dump.emplace_back(seq_len_q_it->second, 'd');
+        }
+        if (seq_len_kv_it != attributes.inputs.end() && seq_len_kv_it->second != nullptr) {
+            tensors_to_dump.emplace_back(seq_len_kv_it->second, 'd');
+        }
+
+        for (auto t : {q, k, v, sdpa_outputs.O}) {
+            if (auto ragged = t->get_ragged_offset()) {
+                tensors_to_dump.emplace_back(ragged, 'd');
+            }
         }
 
         if (attributes.implementation == AttentionImplementation_t::AUTO) {
@@ -854,6 +871,25 @@ class Graph : public ICudnn, public INode {
         // this is where cudnn backend can start using workspace for its execution plans
         void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
 
+        if (isLoggingEnabled()) {
+            cudaStream_t stream;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+            for (auto const &[uid, ptr] : tensor_uid_to_pointer_map) {
+                CHECK_CUDNN_FRONTEND_ERROR(detail::log_variant_pack_memory_type(uid, ptr));
+            }
+            for (auto const &[tensor, fmt] : tensors_to_dump) {
+                auto it = tensor_uid_to_pointer_map.find(tensor->get_uid());
+                if (it != tensor_uid_to_pointer_map.end()) {
+                    auto const &dims    = tensor->get_dim();
+                    size_t num_elements = 1;
+                    for (auto d : dims) num_elements *= static_cast<size_t>(d);
+                    size_t elem_size = detail::get_data_type_size(tensor->get_data_type());
+                    CHECK_CUDNN_FRONTEND_ERROR(detail::log_dump_tensor_content(
+                        it->first, tensor->get_name(), it->second, num_elements, elem_size, fmt, stream));
+                }
+            }
+        }
+
         CHECK_CUDNN_FRONTEND_ERROR(
             execute_cudnn_plan_with_uid(handle, tensor_uid_to_pointer_map, cudnn_workspace, plan_index));
 
@@ -888,6 +924,25 @@ class Graph : public ICudnn, public INode {
         // offset workspace by the already used fe graph workspace
         // this is where cudnn backend can start using workspace for its execution plans
         void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+
+        if (isLoggingEnabled()) {
+            cudaStream_t stream;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+            for (auto const &[uid, ptr] : tensor_uid_to_pointer_map) {
+                CHECK_CUDNN_FRONTEND_ERROR(detail::log_variant_pack_memory_type(uid, ptr));
+            }
+            for (auto const &[tensor, fmt] : tensors_to_dump) {
+                auto it = tensor_uid_to_pointer_map.find(tensor->get_uid());
+                if (it != tensor_uid_to_pointer_map.end()) {
+                    auto const &dims    = tensor->get_dim();
+                    size_t num_elements = 1;
+                    for (auto d : dims) num_elements *= static_cast<size_t>(d);
+                    size_t elem_size = detail::get_data_type_size(tensor->get_data_type());
+                    CHECK_CUDNN_FRONTEND_ERROR(detail::log_dump_tensor_content(
+                        it->first, tensor->get_name(), it->second, num_elements, elem_size, fmt, stream));
+                }
+            }
+        }
 
         CHECK_CUDNN_FRONTEND_ERROR(
             execute_cudnn_plan_with_uid(handle, tensor_uid_to_pointer_map, cudnn_workspace, plans.candidate));
@@ -1018,6 +1073,12 @@ class Graph : public ICudnn, public INode {
 
         j["fe_workspace_size"] = fe_workspace_size;
 
+        std::vector<std::pair<uid_t, char>> tensors_to_dump_uids;
+        for (auto const &[tensor, fmt] : tensors_to_dump) {
+            tensors_to_dump_uids.emplace_back(tensor->get_uid(), fmt);
+        }
+        j["tensors_to_dump"] = tensors_to_dump_uids;
+
         data = json::to_ubjson(j);
         CUDNN_FE_LOG_BANNER(" SERIALIZE PLAN (ALL OK) ");
         return {error_code_t::OK, ""};
@@ -1058,6 +1119,18 @@ class Graph : public ICudnn, public INode {
         variant_pack_replacements = j["variant_pack_replacements"];
 
         fe_workspace_size = j["fe_workspace_size"];
+
+        if (j.contains("tensors_to_dump")) {
+            auto dump_uids = j["tensors_to_dump"].get<std::vector<std::pair<uid_t, char>>>();
+            for (auto const &[uid, fmt] : dump_uids) {
+                for (auto const &tensor : deserialized_tensor_properties) {
+                    if (tensor->get_uid() == uid) {
+                        tensors_to_dump.emplace_back(tensor, fmt);
+                        break;
+                    }
+                }
+            }
+        }
 
         CHECK_CUDNN_FRONTEND_ERROR(warmup(handle));
 
@@ -1738,6 +1811,22 @@ Graph::get_knobs_for_engine(int64_t const engine, std::vector<Knob> &knobs) {
 inline error_t
 Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
     CUDNN_FE_LOG_BANNER("  CREATE EXECUTION PLANS  (HEURISTICS QUERY)  ");
+
+    // CHECK IF NEED TO OVERRIDE HEURISTICS QUERY
+    for (auto &sub_node : sub_nodes) {
+        if (auto [engine_id, user_knobs] = sub_node->override_heuristics_query(); engine_id != -1) {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Overriding heuristics query with engine ID "
+                                    << engine_id << " and user knobs " << nlohmann::json(user_knobs).dump());
+#else
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Overriding heuristics query with engine ID "
+                                    << engine_id << " and user knobs " << static_cast<int>(user_knobs.size()));
+#endif
+            CHECK_CUDNN_FRONTEND_ERROR(create_execution_plan(engine_id, user_knobs));
+            return {error_code_t::OK, ""};
+        }
+    }
+
     EngineConfigList op_graph_to_configs;
     CHECK_CUDNN_FRONTEND_ERROR(detail::query_cudnn_heuristics_impl(
         operation_graph, op_graph_to_configs, mode, context.get_target_sm_count(), device_properties));

@@ -46,7 +46,7 @@ for symbol_name in symbols_to_import:
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.16.0"
+__version__ = "1.17.0"
 
 
 def _tensor(
@@ -226,7 +226,17 @@ from typing import Any
 
 
 def __getattr__(name: str) -> Any:
-    if name == "GemmSwigluSm100":
+    if name == "NSA":
+        try:
+            from .native_sparse_attention import NSA as _NSA
+
+            return _NSA
+        except Exception as e:
+            raise ImportError(
+                f"NSA requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
+    elif name == "GemmSwigluSm100":
         try:
             from .gemm_swiglu import GemmSwigluSm100 as _GemmSwigluSm100
 

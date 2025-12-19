@@ -337,6 +337,11 @@ class INode {
     virtual Type
     getType() = 0;
 
+    virtual std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
+    override_heuristics_query() const {
+        return {-1, {}};
+    }
+
     std::shared_ptr<Tensor_attributes> matmul(std::shared_ptr<Tensor_attributes>,
                                               std::shared_ptr<Tensor_attributes>,
                                               Matmul_attributes);

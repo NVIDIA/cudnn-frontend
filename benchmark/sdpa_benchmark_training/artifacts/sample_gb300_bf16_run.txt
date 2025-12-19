@@ -1,58 +1,52 @@
-[INFO] torch.__version__ = '2.9.0a0+50eac811a6.nv25.09'
+[INFO] torch.__version__ = '2.10.0a0+b558c986e8.nv25.11'
 [INFO] torch.version.cuda = '13.0'
 [INFO] torch.cuda.is_available() = True
 [INFO] torch.cuda.device_count() = 4
 [INFO] torch.cuda.current_device() = 0
 [INFO] torch.cuda.get_device_name(torch.cuda.current_device()) = 'NVIDIA GB300'
-[INFO] torch.backends.cudnn.version() = 91300
+[INFO] cuDNN Backend Version: cudnn.backend_version() = 91700
+[INFO] cuDNN Frontend Version: cudnn.__version__ = '1.16.0'
 [INFO] torch.backends.cudnn.enabled = True
-[INFO] flash_attn.__version__ = '2.7.4.post1'
+[INFO] flash_attn.__version__ = '2.8.3'
 [INFO] Begin benchmark for layers (batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim)
 [INFO] sdpa_configs = [(1, 512, 512, 128, 8, 128), (1, 1024, 1024, 128, 8, 128), (1, 2048, 2048, 128, 8, 128), (1, 4096, 4096, 128, 8, 128), (1, 8192, 8192, 128, 8, 128), (1, 16384, 16384, 128, 8, 128), (1, 32768, 32768, 128, 8, 128), (1, 65536, 65536, 128, 8, 128), (1, 131072, 131072, 128, 8, 128)]
 [INFO] Running layer (1, 512, 512, 128, 8, 128)
-[INFO]   Benchmarking backend pyt_math
-[INFO]   Benchmarking backend pyt_cudnn
+[INFO]   Benchmarking backend cudnn_fe
+/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_bf16_sdpa.py:240: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+  data_df = pd.concat([data_df, pd.DataFrame([result])], ignore_index=True)
 [INFO]   Benchmarking backend pyt_flash_attention
-[INFO]   Benchmarking backend flash_attention
+[INFO]   Benchmarking backend cudnn_fe_fp8
 [INFO] Running layer (1, 1024, 1024, 128, 8, 128)
-[INFO]   Benchmarking backend pyt_math
-[INFO]   Benchmarking backend pyt_cudnn
+[INFO]   Benchmarking backend cudnn_fe
 [INFO]   Benchmarking backend pyt_flash_attention
-[INFO]   Benchmarking backend flash_attention
+[INFO]   Benchmarking backend cudnn_fe_fp8
 [INFO] Running layer (1, 2048, 2048, 128, 8, 128)
-[INFO]   Benchmarking backend pyt_math
-[INFO]   Benchmarking backend pyt_cudnn
+[INFO]   Benchmarking backend cudnn_fe
 [INFO]   Benchmarking backend pyt_flash_attention
-[INFO]   Benchmarking backend flash_attention
+[INFO]   Benchmarking backend cudnn_fe_fp8
 [INFO] Running layer (1, 4096, 4096, 128, 8, 128)
-[INFO]   Benchmarking backend pyt_math
-[INFO]   Benchmarking backend pyt_cudnn
+[INFO]   Benchmarking backend cudnn_fe
 [INFO]   Benchmarking backend pyt_flash_attention
-[INFO]   Benchmarking backend flash_attention
+[INFO]   Benchmarking backend cudnn_fe_fp8
 [INFO] Running layer (1, 8192, 8192, 128, 8, 128)
-[INFO]   Benchmarking backend pyt_math
-[INFO]   Benchmarking backend pyt_cudnn
+[INFO]   Benchmarking backend cudnn_fe
 [INFO]   Benchmarking backend pyt_flash_attention
-[INFO]   Benchmarking backend flash_attention
+[INFO]   Benchmarking backend cudnn_fe_fp8
 [INFO] Running layer (1, 16384, 16384, 128, 8, 128)
-[INFO]   Benchmarking backend pyt_math
-[INFO]   Benchmarking backend pyt_cudnn
+[INFO]   Benchmarking backend cudnn_fe
 [INFO]   Benchmarking backend pyt_flash_attention
-[INFO]   Benchmarking backend flash_attention
+[INFO]   Benchmarking backend cudnn_fe_fp8
 [INFO] Running layer (1, 32768, 32768, 128, 8, 128)
-[INFO]   Benchmarking backend pyt_math
-[INFO]   Benchmarking backend pyt_cudnn
+[INFO]   Benchmarking backend cudnn_fe
 [INFO]   Benchmarking backend pyt_flash_attention
-[INFO]   Benchmarking backend flash_attention
+[INFO]   Benchmarking backend cudnn_fe_fp8
 [INFO] Running layer (1, 65536, 65536, 128, 8, 128)
-[INFO]   Benchmarking backend pyt_math
-[INFO]   Benchmarking backend pyt_cudnn
+[INFO]   Benchmarking backend cudnn_fe
 [INFO]   Benchmarking backend pyt_flash_attention
-[INFO]   Benchmarking backend flash_attention
+[INFO]   Benchmarking backend cudnn_fe_fp8
 [INFO] Running layer (1, 131072, 131072, 128, 8, 128)
-[INFO]   Benchmarking backend pyt_math
-[INFO]   Benchmarking backend pyt_cudnn
+[INFO]   Benchmarking backend cudnn_fe
 [INFO]   Benchmarking backend pyt_flash_attention
-[INFO]   Benchmarking backend flash_attention
+[INFO]   Benchmarking backend cudnn_fe_fp8
 [INFO] Saving results to ./artifacts/sdpa_bf16_benchmark_results_NVIDIA_GB300.csv
 [INFO] Saving plot to ./artifacts/sdpa_bf16_benchmark_results_NVIDIA_GB300.png

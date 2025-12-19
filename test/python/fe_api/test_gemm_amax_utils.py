@@ -10,30 +10,7 @@ from test_low_precision_matmul import (
     _bfloat16_to_float4_e2m1fn_x2,
     float4_e2m1fn_x2_to_float32,
 )
-
-
-try:
-    import cutlass.cute as cute
-
-    @cute.jit
-    def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
-        sf_ref_tensor: cute.Tensor,
-        sf_mma_tensor: cute.Tensor,
-    ):
-        """Convert scale factor tensor from MKL layout to mma specification M(32x4xrest_m)xK(4xrest_k)xL layout"""
-        # sf_mma_tensor has flatten shape (32, 4, rest_m, 4, rest_k, l)
-        # group to ((32, 4, rest_m), (4, rest_k), l)
-        import cutlass
-
-        sf_mma_tensor = cute.group_modes(sf_mma_tensor, 0, 3)
-        sf_mma_tensor = cute.group_modes(sf_mma_tensor, 1, 3)
-        for i in cutlass.range(cute.size(sf_ref_tensor)):
-            mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
-            sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
-
-except Exception:
-    cute = None
-    cvt_sf_MKL_to_M32x4xrm_K4xrk_L = None
+from test_fe_api_utils import create_and_permute_tensor, create_scale_factor_tensor
 
 
 # Parameterization marks for GEMM Amax
@@ -134,8 +111,8 @@ def allocate_input_tensors(
     m, n, k, l, ab_dtype, sf_dtype, sf_vec_size, a_major, b_major
 ):
     """Allocate and initialize input tensors for GEMM Amax tests."""
-    a_ref, a_tensor = _create_and_permute_tensor(l, m, k, a_major == "m", ab_dtype)
-    b_ref, b_tensor = _create_and_permute_tensor(l, n, k, b_major == "n", ab_dtype)
+    a_ref, a_tensor = create_and_permute_tensor(l, m, k, a_major == "m", ab_dtype)
+    b_ref, b_tensor = create_and_permute_tensor(l, n, k, b_major == "n", ab_dtype)
     sfa_ref, sfa_tensor = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
     sfb_ref, sfb_tensor = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
 
@@ -144,7 +121,7 @@ def allocate_input_tensors(
 
 def allocate_output_tensors(m, n, l, c_dtype, c_major):
     """Allocate and initialize output tensors for GEMM Amax tests."""
-    _, c_tensor = _create_and_permute_tensor(l, m, n, c_major == "m", c_dtype)
+    _, c_tensor = create_and_permute_tensor(l, m, n, c_major == "m", c_dtype)
     amax_tensor = torch.full(
         (1, 1, 1), -float("inf"), device="cuda", dtype=torch.float32
     )
@@ -220,97 +197,3 @@ def check_ref_gemm_amax(a, b, sfa_ref, sfb_ref, c, amax, skip_ref=False):
         torch.testing.assert_close(c_ref, c.cpu(), atol=0.01, rtol=0.01)
 
     torch.testing.assert_close(amax_ref, amax.cpu(), atol=1e-01, rtol=1e-01)
-
-
-def _create_and_permute_tensor(l_val, mode0, mode1, is_mode0_major, dtype):
-    # is_mode0_major: (l, mode1, mode0) -> (mode0, mode1, l)
-    # else: (l, mode0, mode1) -> (mode0, mode1, l)
-    shape = (l_val, mode1, mode0) if is_mode0_major else (l_val, mode0, mode1)
-    permute_order = (2, 1, 0) if is_mode0_major else (1, 2, 0)
-    f32_tensor = torch.rand(shape, dtype=torch.float32)
-
-    dtype_tensor = None
-    ref_tensor = None
-    if dtype not in {torch.float4_e2m1fn_x2, torch.uint8}:
-        dtype_tensor = f32_tensor.to(dtype).permute(permute_order).cuda()
-        ref_tensor = dtype_tensor.to(torch.float32)
-    else:
-        dtype_tensor = _bfloat16_to_float4_e2m1fn_x2(f32_tensor.to(torch.bfloat16))
-        ref_tensor = (
-            float4_e2m1fn_x2_to_float32(dtype_tensor)
-            .to(torch.float32)
-            .permute(permute_order)
-            .cuda()
-        )
-        dtype_tensor = dtype_tensor.permute(permute_order).cuda().view(dtype)
-
-    return ref_tensor, dtype_tensor
-
-
-# Create scale factor tensor SFA/SFB
-def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):
-    def ceil_div(a, b):
-        return (a + b - 1) // b
-
-    sf_k = ceil_div(k, sf_vec_size)
-    ref_shape = (l, mn, sf_k)
-
-    atom_m = (32, 4)
-    atom_k = 4
-    mma_shape = (
-        l,
-        ceil_div(mn, atom_m[0] * atom_m[1]),
-        ceil_div(sf_k, atom_k),
-        atom_m[0],
-        atom_m[1],
-        atom_k,
-    )
-
-    ref_permute_order = (1, 2, 0)
-    mma_permute_order = (3, 4, 1, 5, 2, 0)
-
-    # Create f32 ref torch tensor (cpu)
-    ref_f32_torch_tensor_cpu = (
-        torch.empty(ref_shape, dtype=torch.float32)
-        .uniform_(1, 3)
-        .permute(ref_permute_order)
-        .to(torch.int8)
-        .to(torch.float32)
-    )
-
-    # Create f32 cute torch tensor (cpu)
-    cute_f32_torch_tensor_cpu = torch.zeros(mma_shape, dtype=torch.float32).permute(
-        mma_permute_order
-    )
-
-    # convert ref f32 tensor to cute f32 tensor
-    try:
-        from cutlass.cute.runtime import from_dlpack
-
-        cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
-            from_dlpack(ref_f32_torch_tensor_cpu),
-            from_dlpack(cute_f32_torch_tensor_cpu),
-        )
-    except Exception:
-        pytest.skip(
-            "CUTLASS is not installed; skipping GEMM Amax tests requiring CUTLASS."
-        )
-
-    # reshape makes memory contiguous
-    ref_f32_torch_tensor_cpu = (
-        ref_f32_torch_tensor_cpu.permute(2, 0, 1)
-        .unsqueeze(-1)
-        .expand(l, mn, sf_k, sf_vec_size)
-        .reshape(l, mn, sf_k * sf_vec_size)
-        .permute(*ref_permute_order)
-    )
-    ref_f32_torch_tensor_cpu = ref_f32_torch_tensor_cpu[:, :k, :]
-
-    if dtype != torch.int8:
-        cute_torch_tensor = cute_f32_torch_tensor_cpu.to(dtype).cuda()
-    else:
-        cute_torch_tensor = (
-            cute_f32_torch_tensor_cpu.to(torch.float8_e8m0fnu).cuda().view(dtype)
-        )
-
-    return ref_f32_torch_tensor_cpu.cuda(), cute_torch_tensor

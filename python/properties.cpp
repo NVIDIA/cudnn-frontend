@@ -171,6 +171,11 @@ init_properties(py::module_& m) {
         .def("set_alignment",
              &cudnn_frontend::graph::Tensor_attributes::set_alignment,
              py::return_value_policy::reference)
+        .def("get_vector_count", &cudnn_frontend::graph::Tensor_attributes::get_vector_count)
+        .def("get_vector_dimension", &cudnn_frontend::graph::Tensor_attributes::get_vector_dimension)
+        .def("set_vector_count_and_dimension",
+             &cudnn_frontend::graph::Tensor_attributes::set_vector_count_and_dimension,
+             py::return_value_policy::reference)
         .def("set_ragged_offset", &cudnn_frontend::graph::Tensor_attributes::set_ragged_offset)
         .def("__repr__", [](cudnn_frontend::graph::Tensor_attributes const& props) {
             std::ostringstream out;

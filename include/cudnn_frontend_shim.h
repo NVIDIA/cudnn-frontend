@@ -387,6 +387,11 @@ cuda_get_device(int *device) {
     NV_FE_CALL_TO_CUDA(cuda_get_device, cudaGetDevice, device);
 }
 
+inline cudaError_t
+cuda_pointer_get_attributes(cudaPointerAttributes *attributes, const void *ptr) {
+    NV_FE_CALL_TO_CUDA(cuda_pointer_get_attributes, cudaPointerGetAttributes, attributes, ptr);
+}
+
 inline const char *
 cuda_get_error_string(cudaError_t error) {
     NV_FE_CALL_TO_CUDA(cuda_get_error_string, cudaGetErrorString, error);
@@ -400,6 +405,11 @@ cu_get_error_string(CUresult error, const char **pStr) {
 inline cudaError_t
 cuda_device_synchronize() {
     NV_FE_CALL_TO_CUDA(cuda_device_synchronize, cudaDeviceSynchronize);
+}
+
+inline cudaError_t
+cuda_stream_synchronize(cudaStream_t stream) {
+    NV_FE_CALL_TO_CUDA(cuda_stream_synchronize, cudaStreamSynchronize, stream);
 }
 
 inline cudaError_t

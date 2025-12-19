@@ -73,7 +73,9 @@ class Tensor_attributes {
     bool uid_assigned                  = false;
 
     std::shared_ptr<Tensor_attributes> ragged_offset;
-    int64_t alignment = 16;  // Default to 16 bytes
+    int64_t alignment        = 16;  // Default to 16 bytes
+    int64_t vector_count     = 1;   // Default to 1 (no vectorization)
+    int64_t vector_dimension = -1;  // Default to -1 (not set)
 
     auto
     fill_from_context(detail::Context const& context) -> Tensor_attributes& {
@@ -242,6 +244,23 @@ class Tensor_attributes {
     auto
     set_alignment(int64_t const value) -> Tensor_attributes& {
         alignment = value;
+        return *this;
+    }
+
+    int64_t
+    get_vector_count() const {
+        return vector_count;
+    }
+
+    int64_t
+    get_vector_dimension() const {
+        return vector_dimension;
+    }
+
+    auto
+    set_vector_count_and_dimension(int64_t const count, int64_t const dimension) -> Tensor_attributes& {
+        vector_count     = count;
+        vector_dimension = dimension;
         return *this;
     }
 

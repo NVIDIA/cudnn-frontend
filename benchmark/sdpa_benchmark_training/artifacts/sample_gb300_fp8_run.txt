@@ -1,6 +1,6 @@
-[INFO] cuDNN Backend Version: cudnn.backend_version() = 91301
-[INFO] cuDNN Frontend Version: cudnn.__version__ = '1.14.1'
-[INFO] torch.__version__ = '2.9.0a0+50eac811a6.nv25.09'
+[INFO] cuDNN Backend Version: cudnn.backend_version() = 91700                                                                                                             [16/1484]
+[INFO] cuDNN Frontend Version: cudnn.__version__ = '1.16.0'
+[INFO] torch.__version__ = '2.10.0a0+b558c986e8.nv25.11'
 [INFO] torch.version.cuda = '13.0'
 [INFO] torch.cuda.is_available() = True
 [INFO] torch.cuda.device_count() = 4
@@ -10,6 +10,8 @@
 [INFO] sdpa_configs = [(1, 512, 512, 128, 8, 128), (1, 1024, 1024, 128, 8, 128), (1, 2048, 2048, 128, 8, 128), (1, 4096, 4096, 128, 8, 128), (1, 8192, 8192, 128, 8, 128), (1, 16384, 16384, 128, 8, 128), (1, 32768, 32768, 128, 8, 128), (1, 65536, 65536, 128, 8, 128), (1, 131072, 131072, 128, 8, 128)]
 [INFO] Running layer (1, 512, 512, 128, 8, 128)
 [INFO]   Benchmarking data type fp8
+/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_fp8_sdpa.py:227: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+  data_df = pd.concat([data_df, pd.DataFrame([result])], ignore_index=True)
 [INFO]   Benchmarking data type bf16
 [INFO] Running layer (1, 1024, 1024, 128, 8, 128)
 [INFO]   Benchmarking data type fp8

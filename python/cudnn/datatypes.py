@@ -118,20 +118,29 @@ def _torch_to_cudnn_data_type(torch_data_type) -> cudnn_data_type:
         return None
 
 
-def _torch_to_cutlass_data_type(data_type):
+def _torch_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = False):
     if is_cutlass_available() and is_torch_available():
-        return _torch_to_cutlass_data_type_dict.get(data_type, None)
+        import torch
+
+        if interpret_uint8_as_fp4x2 and data_type == torch.uint8:
+            import cutlass
+
+            return getattr(cutlass, "Float4E2M1FN", None)
+        else:
+            return _torch_to_cutlass_data_type_dict.get(data_type, None)
     return None
 
 
-def _convert_to_cutlass_data_type(data_type):
+def _convert_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = False):
     if is_cutlass_available():
         import cutlass
 
         if isinstance(data_type, type) and issubclass(data_type, cutlass.Numeric):
             return data_type
         elif data_type is not None:
-            cutlass_data_type = _torch_to_cutlass_data_type(data_type)
+            cutlass_data_type = _torch_to_cutlass_data_type(
+                data_type, interpret_uint8_as_fp4x2=interpret_uint8_as_fp4x2
+            )
             if cutlass_data_type is None:
                 raise ValueError("Unsupported tensor data type.")
             return cutlass_data_type
