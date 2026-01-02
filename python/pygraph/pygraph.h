@@ -141,8 +141,10 @@ class PyGraph {
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& scale,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& epsilon,
-              cudnn_frontend::DataType_t const& compute_data_type,
-              std::string const& name);
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> pre_calculated_mean   = nullptr,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> pre_calculated_invvar = nullptr,
+              cudnn_frontend::DataType_t const& compute_data_type = cudnn_frontend::DataType_t::NOT_SET,
+              std::string const& name                             = "");
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     batchnorm_inference(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& x,
