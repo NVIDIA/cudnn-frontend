@@ -43,6 +43,8 @@ PyGraph::layernorm(cudnn_frontend::NormFwdPhase_t const forward_phase,
                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& scale,
                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& bias,
                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& epsilon,
+                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> pre_calculated_mean,
+                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> pre_calculated_invvar,
                    cudnn_frontend::DataType_t const& compute_data_type,
                    std::string const& name) {
     auto attributes = cudnn_frontend::graph::Layernorm_attributes()
@@ -50,6 +52,10 @@ PyGraph::layernorm(cudnn_frontend::NormFwdPhase_t const forward_phase,
                           .set_compute_data_type(compute_data_type)
                           .set_epsilon(epsilon)
                           .set_name(name);
+
+     if (pre_calculated_mean && pre_calculated_invvar) {
+          attributes.set_prev_mean_and_inv_variance(pre_calculated_mean, pre_calculated_invvar);
+     }
 
     auto [Y, mean, inv_var] = graph->layernorm(x, scale, bias, attributes);
     return {Y, mean, inv_var};
@@ -232,6 +238,8 @@ init_pygraph_norm_submodule(py::class_<PyGraph>& m) {
              py::arg("scale"),
              py::arg("bias"),
              py::arg("epsilon"),
+             py::arg_v("pre_calculated_mean", nullptr),
+             py::arg_v("pre_calculated_invvar", nullptr),
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("name", ""))
         .def("adalayernorm",

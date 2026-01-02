@@ -160,11 +160,24 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Layernorm_attributes::output_names::Y);
         layernorm_operation_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
 
+        // Set mean and inverse variance
+        // In TRAINING mode: these are OUTPUTS (what we compute), user should not use these PREV_* variables, see line 170 instead.
+        // In INFERENCE mode with pre-calculated stats: these are INPUTS (what the user provides)
+        auto PREV_MEAN_input         = attributes.inputs.find(Layernorm_attributes::input_names::PREV_MEAN);
+        auto PREV_INV_VARIANCE_input = attributes.inputs.find(Layernorm_attributes::input_names::PREV_INV_VARIANCE);
+
         if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
+            // TRAINING: Set mean/invvar as OUTPUTS
             CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(MEAN, Layernorm_attributes::output_names::MEAN);
             CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(INV_VARIANCE, Layernorm_attributes::output_names::INV_VARIANCE);
             layernorm_operation_builder.setSavedMeanAndInvVar(*(tensors.at(MEAN->second->get_uid())),
                                                               *(tensors.at(INV_VARIANCE->second->get_uid())));
+        } else if (PREV_MEAN_input != attributes.inputs.end() && PREV_MEAN_input->second != nullptr &&
+            PREV_INV_VARIANCE_input != attributes.inputs.end() && PREV_INV_VARIANCE_input->second != nullptr) {
+            // INFERENCE with pre-calculated: Set mean/invvar as INPUTS
+            layernorm_operation_builder.setSavedMeanAndInvVar(
+            *(tensors.at(PREV_MEAN_input->second->get_uid())),
+            *(tensors.at(PREV_INV_VARIANCE_input->second->get_uid())));
         }
 #ifdef NV_CUDNN_DISABLE_EXCEPTION
         // disable exception macro is defined. Calling build will not throw.

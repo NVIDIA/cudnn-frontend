@@ -1006,7 +1006,7 @@ class Layernorm_attributes : public Attributes<Layernorm_attributes> {
     NormFwdPhase_t forward_phase = NormFwdPhase_t::NOT_SET;
 
    public:
-    enum class input_names { X, SCALE, BIAS, EPSILON };
+    enum class input_names { X, SCALE, BIAS, EPSILON, PREV_MEAN, PREV_INV_VARIANCE };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y, MEAN, INV_VARIANCE };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
@@ -1021,6 +1021,14 @@ class Layernorm_attributes : public Attributes<Layernorm_attributes> {
     Layernorm_attributes&
     set_epsilon(std::shared_ptr<Tensor_attributes>& value) {
         inputs[Layernorm_attributes::input_names::EPSILON] = value;
+        return *this;
+    }
+
+    Layernorm_attributes&
+    set_prev_mean_and_inv_variance(std::shared_ptr<Tensor_attributes>& mean,
+                                   std::shared_ptr<Tensor_attributes>& inv_variance) {
+        inputs[Layernorm_attributes::input_names::PREV_MEAN]         = mean;
+        inputs[Layernorm_attributes::input_names::PREV_INV_VARIANCE] = inv_variance;
         return *this;
     }
 };
