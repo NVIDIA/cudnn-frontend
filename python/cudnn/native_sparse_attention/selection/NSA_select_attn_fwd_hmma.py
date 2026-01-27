@@ -42,11 +42,7 @@ class HopperSelectAttentionFwd:
 
         assert self.dtype in [cutlass.Float16, cutlass.BFloat16]
         assert self.acc_dtype in [cutlass.Float16, cutlass.BFloat16, cutlass.Float32]
-        assert (
-            self.block_size % 8 == 0
-            and self.block_size >= 16
-            and self.block_size <= 128
-        ), "block_size should be a multiple of 8 and >= 16 and <= 128"
+        assert self.block_size % 8 == 0 and self.block_size >= 16 and self.block_size <= 128, "block_size should be a multiple of 8 and >= 16 and <= 128"
 
         self.K_stage = 1
         self.V_stage = 1
@@ -62,9 +58,7 @@ class HopperSelectAttentionFwd:
         self.GQA_group_size = GQA_group_size
         self.log2_e = 1.4426950408889634074
 
-        assert (
-            self.GQA_group_size <= 16
-        ), "GQA_group_size should be less than or equal to 16"
+        assert self.GQA_group_size <= 16, "GQA_group_size should be less than or equal to 16"
 
     @cute.jit
     def __call__(
@@ -117,9 +111,7 @@ class HopperSelectAttentionFwd:
         self.O_dtype = O.element_type
 
         if cutlass.const_expr(self.Q_dtype.width != self.K_dtype.width):
-            raise TypeError(
-                f"Type width mismatch: {self.Q_dtype.width} != {self.K_dtype.width}"
-            )
+            raise TypeError(f"Type width mismatch: {self.Q_dtype.width} != {self.K_dtype.width}")
 
         mma_n_itr = self.block_size // 8
         tiled_mma_QK = cute.make_tiled_mma(
@@ -143,10 +135,7 @@ class HopperSelectAttentionFwd:
             cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_INTER,
             self.Q_dtype,
         )
-        assert (
-            self.Q_layout.sm90_mma_major_mode()
-            == cute.nvgpu.warpgroup.OperandMajorMode.K
-        ), "Q_layout should be K-major"
+        assert self.Q_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K, "Q_layout should be K-major"
         Q_smem_layout_staged = cute.tile_to_shape(
             Q_smem_layout_atom,
             cute.append(Q_smem_shape, 1),
@@ -155,16 +144,11 @@ class HopperSelectAttentionFwd:
 
         K_smem_shape = (self.block_size, self.tile_shape_mnk_QK[2])
         K_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(
-                self.K_layout, self.K_dtype, K_smem_shape[1]
-            ),  # K-major by default
+            sm90_utils.get_smem_layout_atom(self.K_layout, self.K_dtype, K_smem_shape[1]),  # K-major by default
             # cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_INTER,
             self.K_dtype,
         )
-        assert (
-            self.K_layout.sm90_mma_major_mode()
-            == cute.nvgpu.warpgroup.OperandMajorMode.K
-        ), "K_layout should be K-major"
+        assert self.K_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K, "K_layout should be K-major"
         K_smem_layout_staged = cute.tile_to_shape(
             K_smem_layout_atom,
             cute.append(K_smem_shape, self.K_stage),
@@ -173,17 +157,12 @@ class HopperSelectAttentionFwd:
 
         V_smem_shape = (self.tile_shape_mnk_PV[2], self.tile_shape_mnk_PV[1])
         V_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(
-                self.V_layout, self.V_dtype, V_smem_shape[1]
-            ),  # K-major by default
+            sm90_utils.get_smem_layout_atom(self.V_layout, self.V_dtype, V_smem_shape[1]),  # K-major by default
             # cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_INTER,
             self.V_dtype,
         )
 
-        assert (
-            self.V_layout.sm90_mma_major_mode()
-            == cute.nvgpu.warpgroup.OperandMajorMode.K
-        ), "V_layout should be K-major"
+        assert self.V_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K, "V_layout should be K-major"
         V_smem_layout_staged = cute.tile_to_shape(
             V_smem_layout_atom,
             cute.append(V_smem_shape, self.V_stage),
@@ -191,25 +170,15 @@ class HopperSelectAttentionFwd:
         )
 
         # import pdb; pdb.set_trace()
-        V_layout_atom = sm90_utils.get_smem_layout_atom(
-            self.V_layout, self.V_dtype, V_smem_shape[1]
-        )
+        V_layout_atom = sm90_utils.get_smem_layout_atom(self.V_layout, self.V_dtype, V_smem_shape[1])
 
-        if cutlass.const_expr(
-            V_layout_atom == cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128
-        ):
+        if cutlass.const_expr(V_layout_atom == cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128):
             Vt_layout_atom = cute.nvgpu.warpgroup.SmemLayoutAtomKind.MN_SW128
-        elif cutlass.const_expr(
-            V_layout_atom == cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW64
-        ):
+        elif cutlass.const_expr(V_layout_atom == cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW64):
             Vt_layout_atom = cute.nvgpu.warpgroup.SmemLayoutAtomKind.MN_SW64
-        elif cutlass.const_expr(
-            V_layout_atom == cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW32
-        ):
+        elif cutlass.const_expr(V_layout_atom == cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW32):
             Vt_layout_atom = cute.nvgpu.warpgroup.SmemLayoutAtomKind.MN_SW32
-        elif cutlass.const_expr(
-            V_layout_atom == cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_INTER
-        ):
+        elif cutlass.const_expr(V_layout_atom == cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_INTER):
             Vt_layout_atom = cute.nvgpu.warpgroup.SmemLayoutAtomKind.MN_INTER
         else:
             raise ValueError(f"Unsupported V_layout_atom: {V_layout_atom}")
@@ -228,9 +197,7 @@ class HopperSelectAttentionFwd:
 
         O_smem_shape = self.epi_tile
         O_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(
-                self.O_layout, self.O_dtype, O_smem_shape[1]
-            ),  # K-major by default
+            sm90_utils.get_smem_layout_atom(self.O_layout, self.O_dtype, O_smem_shape[1]),  # K-major by default
             self.O_dtype,
         )
         O_smem_layout_staged = cute.tile_to_shape(
@@ -265,9 +232,7 @@ class HopperSelectAttentionFwd:
         )
 
         smem_layout_O = cute.slice_(O_smem_layout_staged, (None, None, 0))
-        O_cta_v_layout = cute.composition(
-            cute.make_identity_layout(O.shape), self.epi_tile
-        )
+        O_cta_v_layout = cute.composition(cute.make_identity_layout(O.shape), self.epi_tile)
         tma_atom_O, tma_tensor_O = cute.nvgpu.cpasync.make_tiled_tma_atom(
             cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
             O,
@@ -276,24 +241,16 @@ class HopperSelectAttentionFwd:
         )
 
         L_smem_shape = (self.tile_shape_mnk_QK[0], 1)
-        L_smem_layout = cute.make_layout(
-            shape=L_smem_shape, stride=(1, self.tile_shape_mnk_QK[0])
-        )
+        L_smem_layout = cute.make_layout(shape=L_smem_shape, stride=(1, self.tile_shape_mnk_QK[0]))
         M_smem_shape = (self.tile_shape_mnk_QK[0], 1)
-        M_smem_layout = cute.make_layout(
-            shape=M_smem_shape, stride=(1, self.tile_shape_mnk_QK[0])
-        )
+        M_smem_layout = cute.make_layout(shape=M_smem_shape, stride=(1, self.tile_shape_mnk_QK[0]))
 
         BUFFER_ALIGN_BYTES = 128
 
         @cute.struct
         class SharedStorageShare:
-            mainloop_pipeline_array_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.K_stage * 2
-            ]
-            mainloop_pipeline_v_array_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.V_stage * 2
-            ]
+            mainloop_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.K_stage * 2]
+            mainloop_pipeline_v_array_ptr: cute.struct.MemRange[cutlass.Int64, self.V_stage * 2]
             prefetchQ_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, 1 * 2]
             sQ: cute.struct.Align[
                 cute.struct.MemRange[self.Q_dtype, cute.cosize(Q_smem_layout_staged)],
@@ -312,9 +269,7 @@ class HopperSelectAttentionFwd:
                 BUFFER_ALIGN_BYTES,
             ]
 
-        assert cute.cosize(Q_smem_layout_staged) + cute.cosize(
-            K_smem_layout_staged
-        ) + cute.cosize(V_smem_layout_staged) >= cute.cosize(
+        assert cute.cosize(Q_smem_layout_staged) + cute.cosize(K_smem_layout_staged) + cute.cosize(V_smem_layout_staged) >= cute.cosize(
             O_smem_layout_staged
         ), "shared storage size is not enough for so"
         self.shared_storage = SharedStorageShare
@@ -360,9 +315,7 @@ class HopperSelectAttentionFwd:
             stream=stream,
         )
 
-    def _threadquad_reduce(
-        self, val: cutlass.Float32, op: Callable, mask: int
-    ) -> cutlass.Float32:
+    def _threadquad_reduce(self, val: cutlass.Float32, op: Callable, mask: int) -> cutlass.Float32:
         """thread quad reduction
 
         :param val: register value
@@ -382,9 +335,7 @@ class HopperSelectAttentionFwd:
         )
         return val
 
-    def _threadquad_reduce_max(
-        self, val: cutlass.Float32, mask: int
-    ) -> cutlass.Float32:
+    def _threadquad_reduce_max(self, val: cutlass.Float32, mask: int) -> cutlass.Float32:
         """thread quad reduction max
 
         :param val: register value
@@ -394,9 +345,7 @@ class HopperSelectAttentionFwd:
         """
         return self._threadquad_reduce(val, lambda x, y: cute.arch.fmax(x, y), mask)
 
-    def _threadquad_reduce_sum(
-        self, val: cutlass.Float32, mask: int
-    ) -> cutlass.Float32:
+    def _threadquad_reduce_sum(self, val: cutlass.Float32, mask: int) -> cutlass.Float32:
         """thread quad reduction sum
 
         :param val: register value
@@ -441,9 +390,7 @@ class HopperSelectAttentionFwd:
         return cute.make_tensor(acc.iterator, acc_layout_mn)
 
     @cute.jit
-    def _exp2f(
-        self, x: Union[cute.TensorSSA, cutlass.Float32]
-    ) -> Union[cute.TensorSSA, cutlass.Float32]:
+    def _exp2f(self, x: Union[cute.TensorSSA, cutlass.Float32]) -> Union[cute.TensorSSA, cutlass.Float32]:
         """exp2f calculation for both vector and scalar.
 
         :param x: input value
@@ -503,9 +450,7 @@ class HopperSelectAttentionFwd:
         t, KV_head_idx, offset_idx = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
 
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
 
         smem = cutlass.utils.SmemAllocator()
@@ -518,12 +463,8 @@ class HopperSelectAttentionFwd:
         K_tma_copy_bytes = cute.size_in_bytes(self.K_dtype, K_smem_layout)
         # one consumer
         consumer_arrive_cnt = self.threads_per_block // 32
-        mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread
-        )
-        mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, consumer_arrive_cnt
-        )
+        mainloop_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, consumer_arrive_cnt)
         mainloop_pipeline_array_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
         mainloop_pipeline = pipeline.PipelineTmaAsync.create(
             barrier_storage=mainloop_pipeline_array_ptr,
@@ -534,12 +475,8 @@ class HopperSelectAttentionFwd:
         )
 
         Q_tma_copy_bytes = cute.size_in_bytes(self.Q_dtype, Q_smem_layout)
-        prefetchQ_pipeline_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread
-        )
-        prefetchQ_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, consumer_arrive_cnt
-        )
+        prefetchQ_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        prefetchQ_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, consumer_arrive_cnt)
         prefetchQ_pipeline_array_ptr = storage.prefetchQ_pipeline_array_ptr.data_ptr()
         prefetchQ_pipeline = pipeline.PipelineTmaAsync.create(
             barrier_storage=prefetchQ_pipeline_array_ptr,
@@ -550,12 +487,8 @@ class HopperSelectAttentionFwd:
         )
 
         V_tma_copy_bytes = cute.size_in_bytes(self.V_dtype, V_smem_layout)
-        mainloop_pipeline_producer_group_v = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread
-        )
-        mainloop_pipeline_consumer_group_v = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, consumer_arrive_cnt
-        )
+        mainloop_pipeline_producer_group_v = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        mainloop_pipeline_consumer_group_v = pipeline.CooperativeGroup(pipeline.Agent.Thread, consumer_arrive_cnt)
         mainloop_pipeline_array_ptr_v = storage.mainloop_pipeline_v_array_ptr.data_ptr()
         mainloop_pipeline_V = pipeline.PipelineTmaAsync.create(
             barrier_storage=mainloop_pipeline_array_ptr_v,
@@ -565,21 +498,11 @@ class HopperSelectAttentionFwd:
             tx_count=V_tma_copy_bytes,
         )
 
-        sQ = storage.sQ.get_tensor(
-            Q_smem_layout_staged.outer, swizzle=Q_smem_layout_staged.inner
-        )
-        sK = storage.sK.get_tensor(
-            K_smem_layout_staged.outer, swizzle=K_smem_layout_staged.inner
-        )
-        sV = storage.sV.get_tensor(
-            V_smem_layout_staged.outer, swizzle=V_smem_layout_staged.inner
-        )
-        sVt = storage.sV.get_tensor(
-            Vt_smem_layout_staged.outer, swizzle=Vt_smem_layout_staged.inner
-        )
-        sO = storage.sQ.get_tensor(
-            O_smem_layout_staged.outer, swizzle=O_smem_layout_staged.inner
-        )  # sO shared with sK
+        sQ = storage.sQ.get_tensor(Q_smem_layout_staged.outer, swizzle=Q_smem_layout_staged.inner)
+        sK = storage.sK.get_tensor(K_smem_layout_staged.outer, swizzle=K_smem_layout_staged.inner)
+        sV = storage.sV.get_tensor(V_smem_layout_staged.outer, swizzle=V_smem_layout_staged.inner)
+        sVt = storage.sV.get_tensor(Vt_smem_layout_staged.outer, swizzle=Vt_smem_layout_staged.inner)
+        sO = storage.sQ.get_tensor(O_smem_layout_staged.outer, swizzle=O_smem_layout_staged.inner)  # sO shared with sK
         sIDX = storage.sIDX.get_tensor(block_indices.shape[2])
 
         smem_copy_atom_Q = cute.make_copy_atom(
@@ -605,21 +528,12 @@ class HopperSelectAttentionFwd:
 
         seq_len = seq_offsets[offset_idx + 1] - seq_offsets[offset_idx]
         offset = seq_offsets[offset_idx]
-        for i in cutlass.range(
-            (block_indices.shape[2] + self.threads_per_block - 1)
-            // self.threads_per_block
-        ):
+        for i in cutlass.range((block_indices.shape[2] + self.threads_per_block - 1) // self.threads_per_block):
             if i * self.threads_per_block + tidx < block_indices.shape[2]:
-                sIDX[i * self.threads_per_block + tidx] = block_indices[
-                    offset + t, KV_head_idx, i * self.threads_per_block + tidx
-                ]
+                sIDX[i * self.threads_per_block + tidx] = block_indices[offset + t, KV_head_idx, i * self.threads_per_block + tidx]
         cute.arch.sync_threads()
 
-        seq_len_aligned = (
-            (seq_len + self.tile_shape_mnk_QK[1] - 1)
-            // self.tile_shape_mnk_QK[1]
-            * self.tile_shape_mnk_QK[1]
-        )
+        seq_len_aligned = (seq_len + self.tile_shape_mnk_QK[1] - 1) // self.tile_shape_mnk_QK[1] * self.tile_shape_mnk_QK[1]
 
         mQ_offset = cute.domain_offset((0, 0, offset, 0), mQ)
         mQ = cute.make_tensor(
@@ -632,16 +546,12 @@ class HopperSelectAttentionFwd:
         mK_offset = cute.domain_offset((offset, 0, 0), mK)
         mK = cute.make_tensor(
             mK_offset.iterator,
-            cute.make_layout(
-                shape=(seq_len_aligned, mK.shape[1], mK.shape[2]), stride=mK.stride
-            ),
+            cute.make_layout(shape=(seq_len_aligned, mK.shape[1], mK.shape[2]), stride=mK.stride),
         )
         mV_offset = cute.domain_offset((offset, 0, 0), mV)  # `[K, B*T, H]`
         mV = cute.make_tensor(
             mV_offset.iterator,
-            cute.make_layout(
-                shape=(seq_len_aligned, mV.shape[1], mV.shape[2]), stride=mV.stride
-            ),
+            cute.make_layout(shape=(seq_len_aligned, mV.shape[1], mV.shape[2]), stride=mV.stride),
         )
         mO_offset = cute.domain_offset((0, 0, offset, 0), mO)
         mO = cute.make_tensor(
@@ -654,16 +564,12 @@ class HopperSelectAttentionFwd:
         mL_offset = cute.domain_offset((0, offset, 0), mL)
         mL = cute.make_tensor(
             mL_offset.iterator,
-            cute.make_layout(
-                shape=(mL.shape[0], seq_len_aligned, mL.shape[2]), stride=mL.stride
-            ),
+            cute.make_layout(shape=(mL.shape[0], seq_len_aligned, mL.shape[2]), stride=mL.stride),
         )
         mM_offset = cute.domain_offset((0, offset, 0), mM)
         mM = cute.make_tensor(
             mM_offset.iterator,
-            cute.make_layout(
-                shape=(mM.shape[0], seq_len_aligned, mM.shape[2]), stride=mM.stride
-            ),
+            cute.make_layout(shape=(mM.shape[0], seq_len_aligned, mM.shape[2]), stride=mM.stride),
         )
 
         if t < seq_len:
@@ -707,9 +613,7 @@ class HopperSelectAttentionFwd:
 
             thr_mma_QK = tiled_mma_QK.get_slice(tidx)
 
-            q_cta_layout = cute.make_layout(
-                cute.slice_(cta_layout_mnk, (0, None, 0)).shape
-            )
+            q_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (0, None, 0)).shape)
             q_cta_crd = cluster_coord_mnk[1]
             sQ_for_tma_partition = cute.group_modes(sQ, 0, 2)
             gQ_for_tma_partition = cute.group_modes(gQ, 0, 2)
@@ -722,9 +626,7 @@ class HopperSelectAttentionFwd:
                 gQ_for_tma_partition,
             )
 
-            K_cta_layout = cute.make_layout(
-                cute.slice_(cta_layout_mnk, (None, 0, 0)).shape
-            )
+            K_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
             k_cta_crd = cluster_coord_mnk[0]
             sK_for_tma_partition = cute.group_modes(sK, 0, 2)
             gK_for_tma_partition = cute.group_modes(gK, 0, 2)
@@ -736,9 +638,7 @@ class HopperSelectAttentionFwd:
                 gK_for_tma_partition,
             )
 
-            v_cta_layout = cute.make_layout(
-                cute.slice_(cta_layout_mnk, (None, 0, 0)).shape
-            )
+            v_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
             v_cta_crd = cluster_coord_mnk[0]
             sV_for_tma_partition = cute.group_modes(sV, 0, 2)
             gV_for_tma_partition = cute.group_modes(gV, 0, 2)
@@ -758,56 +658,32 @@ class HopperSelectAttentionFwd:
             tSsK = smem_thr_copy_K.partition_S(sK)
             # import ipdb; ipdb.set_trace()
 
-            acc_shape_QK = thr_mma_QK.partition_shape_C(
-                (self.tile_shape_mnk_QK[0], self.tile_shape_mnk_QK[1])
-            )
+            acc_shape_QK = thr_mma_QK.partition_shape_C((self.tile_shape_mnk_QK[0], self.tile_shape_mnk_QK[1]))
             acc_QK = cute.make_rmem_tensor(acc_shape_QK, self.acc_dtype)
             acc_QK.fill(0)
 
-            mainloop_producer_state_K = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.K_stage
-            )
+            mainloop_producer_state_K = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.K_stage)
 
-            prefetchQ_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, 1
-            )
+            prefetchQ_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
 
-            mainloop_producer_state_V = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.V_stage
-            )
-            mainloop_consumer_read_state_V = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.V_stage
-            )
-            mainloop_consumer_release_state_V = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.V_stage
-            )
+            mainloop_producer_state_V = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.V_stage)
+            mainloop_consumer_read_state_V = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.V_stage)
+            mainloop_consumer_release_state_V = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.V_stage)
 
-            mainloop_consumer_read_state_K = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.K_stage
-            )
+            mainloop_consumer_read_state_K = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.K_stage)
 
-            mainloop_consumer_release_state_K = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.K_stage
-            )
+            mainloop_consumer_release_state_K = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.K_stage)
 
-            prefetchQ_consumer_read_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, 1
-            )
-            prefetchQ_consumer_release_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, 1
-            )
+            prefetchQ_consumer_read_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+            prefetchQ_consumer_release_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
 
             # ********************
             # softmax intermediate result
             # ********************
 
             # shape:(mmaSahpeM * mma_m)
-            row_max = cute.make_rmem_tensor(
-                (acc_shape_QK[0][0] * acc_shape_QK[1]), cutlass.Float32
-            )
-            row_sum = cute.make_rmem_tensor(
-                (acc_shape_QK[0][0] * acc_shape_QK[1]), cutlass.Float32
-            )
+            row_max = cute.make_rmem_tensor((acc_shape_QK[0][0] * acc_shape_QK[1]), cutlass.Float32)
+            row_sum = cute.make_rmem_tensor((acc_shape_QK[0][0] * acc_shape_QK[1]), cutlass.Float32)
             row_max.fill(-cutlass.Float32.inf)
             row_sum.fill(0.0)
 
@@ -816,9 +692,7 @@ class HopperSelectAttentionFwd:
             # ********************
             K_tile_cnt = block_counts[offset + t, KV_head_idx]
             prefetch_K_tile_cnt = cutlass.max(cutlass.min(self.K_stage, K_tile_cnt), 0)
-            prefetch_V_tile_cnt = cutlass.max(
-                cutlass.min(self.V_stage - 1, K_tile_cnt), 0
-            )
+            prefetch_V_tile_cnt = cutlass.max(cutlass.min(self.V_stage - 1, K_tile_cnt), 0)
 
             if warp_idx == 0:
                 prefetchQ_pipeline.producer_acquire(prefetchQ_producer_state)
@@ -828,9 +702,7 @@ class HopperSelectAttentionFwd:
                     tma_atom_Q,
                     tAgQ_k,
                     tAsQ_pipe,
-                    tma_bar_ptr=prefetchQ_pipeline.producer_get_barrier(
-                        prefetchQ_producer_state
-                    ),
+                    tma_bar_ptr=prefetchQ_pipeline.producer_get_barrier(prefetchQ_producer_state),
                 )
                 prefetchQ_pipeline.producer_commit(prefetchQ_producer_state)
                 prefetchQ_producer_state.advance()
@@ -847,9 +719,7 @@ class HopperSelectAttentionFwd:
                         tma_atom_K,
                         tKgK_k,
                         tKsK_pipe,
-                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                            mainloop_producer_state_K
-                        ),
+                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(mainloop_producer_state_K),
                     )
 
                     mainloop_pipeline.producer_commit(mainloop_producer_state_K)
@@ -866,9 +736,7 @@ class HopperSelectAttentionFwd:
                         tma_atom_V,
                         tVgV_k,
                         tVsV_pipe,
-                        tma_bar_ptr=mainloop_pipeline_V.producer_get_barrier(
-                            mainloop_producer_state_V
-                        ),
+                        tma_bar_ptr=mainloop_pipeline_V.producer_get_barrier(mainloop_producer_state_V),
                     )
                     mainloop_pipeline_V.producer_commit(mainloop_producer_state_V)
                     mainloop_producer_state_V.advance()
@@ -876,9 +744,7 @@ class HopperSelectAttentionFwd:
                     #     cute.printf("prefetch_idx: %d, block_idx: %d, mainloop_producer_state_V.index: %d\n", prefetch_idx, block_idx, mainloop_producer_state_V.index)
 
             peek_q_full_status = cutlass.Boolean(1)
-            peek_q_full_status = prefetchQ_pipeline.consumer_try_wait(
-                prefetchQ_consumer_read_state
-            )
+            peek_q_full_status = prefetchQ_pipeline.consumer_try_wait(prefetchQ_consumer_read_state)
 
             # tiled_mma_QK.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
             num_K_blocks = cute.size(tSrQ, mode=[2])
@@ -888,9 +754,7 @@ class HopperSelectAttentionFwd:
             # ********************
 
             thr_mma_PV = tiled_mma_PV.get_slice(tidx)
-            acc_shape_PV = thr_mma_PV.partition_shape_C(
-                (self.tile_shape_mnk_PV[0], self.tile_shape_mnk_PV[1])
-            )
+            acc_shape_PV = thr_mma_PV.partition_shape_C((self.tile_shape_mnk_PV[0], self.tile_shape_mnk_PV[1]))
 
             acc_PV = cute.make_rmem_tensor(acc_shape_PV, self.acc_dtype)
             acc_PV.fill(0)
@@ -903,9 +767,7 @@ class HopperSelectAttentionFwd:
             gL_thr = tiled_mma_QK.get_slice(tidx).partition_C(gL)
             gM_thr = tiled_mma_QK.get_slice(tidx).partition_C(gM)
 
-            prefetchQ_pipeline.consumer_wait(
-                prefetchQ_consumer_read_state, peek_q_full_status
-            )
+            prefetchQ_pipeline.consumer_wait(prefetchQ_consumer_read_state, peek_q_full_status)
             for k in cutlass.range_constexpr(0, cute.size(tSrQ, mode=[2])):
                 cute.copy(
                     smem_tiled_copy_Q,
@@ -915,14 +777,10 @@ class HopperSelectAttentionFwd:
 
             peak_k_full_status = cutlass.Boolean(1)
             if prefetch_K_tile_cnt > 0:
-                peak_k_full_status = mainloop_pipeline.consumer_try_wait(
-                    mainloop_consumer_read_state_K
-                )
+                peak_k_full_status = mainloop_pipeline.consumer_try_wait(mainloop_consumer_read_state_K)
 
             for K_tile in cutlass.range(0, K_tile_cnt, 1, unroll=1):
-                mainloop_pipeline.consumer_wait(
-                    mainloop_consumer_read_state_K, peak_k_full_status
-                )
+                mainloop_pipeline.consumer_wait(mainloop_consumer_read_state_K, peak_k_full_status)
                 acc_QK.fill(0)
                 # cute.nvgpu.warpgroup.fence()
                 # if tidx == 0:
@@ -940,9 +798,7 @@ class HopperSelectAttentionFwd:
                         tma_atom_V,
                         tVgV_k,
                         tVsV_pipe,
-                        tma_bar_ptr=mainloop_pipeline_V.producer_get_barrier(
-                            mainloop_producer_state_V
-                        ),
+                        tma_bar_ptr=mainloop_pipeline_V.producer_get_barrier(mainloop_producer_state_V),
                     )
                     mainloop_pipeline_V.producer_commit(mainloop_producer_state_V)
                     mainloop_producer_state_V.advance()
@@ -953,18 +809,12 @@ class HopperSelectAttentionFwd:
                     tSrK_copy_view[None, None, 0, mainloop_consumer_read_state_K.index],
                 )
 
-                for k in cutlass.range_constexpr(
-                    0, cute.size(tSrQ, mode=[2]), unroll=True
-                ):
+                for k in cutlass.range_constexpr(0, cute.size(tSrQ, mode=[2]), unroll=True):
                     if k < cute.size(tSrK, mode=[2]) - 1:
                         cute.copy(
                             smem_tiled_copy_K,
-                            tSsK[
-                                None, None, k + 1, mainloop_consumer_read_state_K.index
-                            ],
-                            tSrK_copy_view[
-                                None, None, k + 1, mainloop_consumer_read_state_K.index
-                            ],
+                            tSsK[None, None, k + 1, mainloop_consumer_read_state_K.index],
+                            tSrK_copy_view[None, None, k + 1, mainloop_consumer_read_state_K.index],
                         )
 
                     cute.gemm(
@@ -992,9 +842,7 @@ class HopperSelectAttentionFwd:
                         tma_atom_K,
                         tKgK_k,
                         tKsK_pipe,
-                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                            mainloop_producer_state_K
-                        ),
+                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(mainloop_producer_state_K),
                     )
 
                     mainloop_pipeline.producer_commit(mainloop_producer_state_K)
@@ -1010,42 +858,26 @@ class HopperSelectAttentionFwd:
                 for r in cutlass.range_constexpr(cute.size(gL_thr.shape[0][1])):
                     if cute.elem_less(cLM_thr[(0, r), 0, 0][0], self.GQA_group_size):
                         acc_QK_row = acc_QK_mn[r, None].load() * softmax_scale
-                        row_max_cur_row = acc_QK_row.reduce(
-                            cute.ReductionOp.MAX, -cutlass.Float32.inf, 0
-                        )
-                        row_max_cur_row = self._threadquad_reduce_max(
-                            row_max_cur_row, mask=(1 << self.GQA_group_size) - 1
-                        )
+                        row_max_cur_row = acc_QK_row.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, 0)
+                        row_max_cur_row = self._threadquad_reduce_max(row_max_cur_row, mask=(1 << self.GQA_group_size) - 1)
 
                         row_max_prev_row = row_max_prev[r]
                         if is_not_first_n_block:
-                            row_max_cur_row = cute.arch.fmax(
-                                row_max_prev_row, row_max_cur_row
-                            )
+                            row_max_cur_row = cute.arch.fmax(row_max_prev_row, row_max_cur_row)
 
                         acc_QK_row_exp = cute.TensorSSA(  # e^{Sn-mn}
                             self._exp2f((acc_QK_row - row_max_cur_row) * self.log2_e),
                             tuple(acc_QK_row.shape),
                             cutlass.Float32,
                         )
-                        acc_QK_row_sum = acc_QK_row_exp.reduce(
-                            cute.ReductionOp.ADD, cutlass.Float32.zero, 0
-                        )
-                        acc_QK_row_sum = self._threadquad_reduce_sum(
-                            acc_QK_row_sum, mask=(1 << self.GQA_group_size) - 1
-                        )  # rowsum(e^{Sn-mn})
+                        acc_QK_row_sum = acc_QK_row_exp.reduce(cute.ReductionOp.ADD, cutlass.Float32.zero, 0)
+                        acc_QK_row_sum = self._threadquad_reduce_sum(acc_QK_row_sum, mask=(1 << self.GQA_group_size) - 1)  # rowsum(e^{Sn-mn})
                         if is_not_first_n_block:
-                            prev_minus_cur_exp = self._exp2f(  # e^{M^{(n-1)} - M^{(n)}}
-                                (row_max_prev_row - row_max_cur_row) * self.log2_e
-                            )
+                            prev_minus_cur_exp = self._exp2f((row_max_prev_row - row_max_cur_row) * self.log2_e)  # e^{M^{(n-1)} - M^{(n)}}
                             # L^{(n)} = rowsum(e^{Sn-mn}) + L^{(n-1)} * e^{M^{(n-1)} - M^{(n)}}
-                            acc_QK_row_sum = (
-                                acc_QK_row_sum + row_sum[r] * prev_minus_cur_exp
-                            )
+                            acc_QK_row_sum = acc_QK_row_sum + row_sum[r] * prev_minus_cur_exp
                             # O^{(n-1)}' = O^{(n-1)} * e^{M^{(n-1)} - M^{(n)}}
-                            acc_PV_mn[r, None] = (
-                                acc_PV_mn[r, None].load() * prev_minus_cur_exp
-                            )
+                            acc_PV_mn[r, None] = acc_PV_mn[r, None].load() * prev_minus_cur_exp
 
                         row_max[r] = row_max_cur_row
                         row_sum[r] = acc_QK_row_sum
@@ -1055,9 +887,7 @@ class HopperSelectAttentionFwd:
                 # p@V gemm calculation
                 # ///////////////////////////////////////////////////////////////////////////////
                 peak_v_full_status = cutlass.Boolean(1)
-                peak_v_full_status = mainloop_pipeline_V.consumer_try_wait(
-                    mainloop_consumer_read_state_V
-                )
+                peak_v_full_status = mainloop_pipeline_V.consumer_try_wait(mainloop_consumer_read_state_V)
 
                 rP = cute.make_fragment_like(acc_QK, self.dtype)
                 # rP.store(acc_QK.load().to(self.dtype))
@@ -1070,13 +900,9 @@ class HopperSelectAttentionFwd:
 
                 # convert rP from ((2, 2, 2*num_k_blocks_pv), 1, 1) to ((2, 2, 2), 1, 1, num_k_blocks_pv)
                 num_k_blocks_pv = cute.size(tOrVt, mode=[2])
-                rP_divided_dim3 = thr_mma_PV.partition_shape_A(
-                    (self.tile_shape_mnk_PV[0], self.tile_shape_mnk_PV[2])
-                )[0][2]
+                rP_divided_dim3 = thr_mma_PV.partition_shape_A((self.tile_shape_mnk_PV[0], self.tile_shape_mnk_PV[2]))[0][2]
 
-                rP_layout_divided = cute.logical_divide(
-                    rP.layout, (None, None, rP_divided_dim3)
-                )
+                rP_layout_divided = cute.logical_divide(rP.layout, (None, None, rP_divided_dim3))
                 rP_mma_view = cute.make_layout(
                     (
                         (
@@ -1100,26 +926,18 @@ class HopperSelectAttentionFwd:
 
                 rP = cute.make_tensor(rP.iterator, rP_mma_view)
 
-                mainloop_pipeline_V.consumer_wait(
-                    mainloop_consumer_read_state_V, peak_v_full_status
-                )
+                mainloop_pipeline_V.consumer_wait(mainloop_consumer_read_state_V, peak_v_full_status)
                 cute.copy(
                     smem_tiled_copy_V,
                     tOsVt[None, None, 0, mainloop_consumer_read_state_V.index],
-                    tOrVt_copy_view[
-                        None, None, 0, mainloop_consumer_read_state_V.index
-                    ],
+                    tOrVt_copy_view[None, None, 0, mainloop_consumer_read_state_V.index],
                 )
                 for k in cutlass.range_constexpr(0, cute.size(tOrVt, mode=[2])):
                     if k < cute.size(tOrVt, mode=[2]) - 1:
                         cute.copy(
                             smem_tiled_copy_V,
-                            tOsVt[
-                                None, None, k + 1, mainloop_consumer_read_state_V.index
-                            ],
-                            tOrVt_copy_view[
-                                None, None, k + 1, mainloop_consumer_read_state_V.index
-                            ],
+                            tOsVt[None, None, k + 1, mainloop_consumer_read_state_V.index],
+                            tOrVt_copy_view[None, None, k + 1, mainloop_consumer_read_state_V.index],
                         )
                     cute.gemm(
                         tiled_mma_PV,
@@ -1131,9 +949,7 @@ class HopperSelectAttentionFwd:
 
                 peak_k_full_status = cutlass.Boolean(1)
                 if K_tile < K_tile_cnt - 1:
-                    peak_k_full_status = mainloop_pipeline.consumer_try_wait(
-                        mainloop_consumer_read_state_K
-                    )
+                    peak_k_full_status = mainloop_pipeline.consumer_try_wait(mainloop_consumer_read_state_K)
 
                 mainloop_pipeline_V.consumer_release(mainloop_consumer_release_state_V)
                 mainloop_consumer_read_state_V.advance()
@@ -1152,14 +968,8 @@ class HopperSelectAttentionFwd:
             # softmax normalization: O^{(n)} = O^{(n)} / L^{(n)}
             for row_idx in cutlass.range(gL_thr.shape[0][1]):
                 if cute.elem_less(cLM_thr[(0, row_idx), 0, 0][0], self.GQA_group_size):
-                    acc_pv_mn_is_zero_or_nan = (
-                        row_sum[row_idx] == 0.0 or row_sum[row_idx] != row_sum[row_idx]
-                    )
-                    scale = (
-                        1.0
-                        if acc_pv_mn_is_zero_or_nan
-                        else cute.arch.rcp_approx(row_sum[row_idx])
-                    )
+                    acc_pv_mn_is_zero_or_nan = row_sum[row_idx] == 0.0 or row_sum[row_idx] != row_sum[row_idx]
+                    scale = 1.0 if acc_pv_mn_is_zero_or_nan else cute.arch.rcp_approx(row_sum[row_idx])
                     acc_PV_mn[row_idx, None] = acc_PV_mn[row_idx, None].load() * scale
 
             tOgO_for_tma_partition = cute.zipped_divide(
@@ -1251,9 +1061,7 @@ class HopperSelectAttentionFwd:
 
             # Copy from D registers to shared memory
             epi_buffer = epi_idx % cute.size(tRS_dv_sD, mode=[3])
-            cute.copy(
-                tiled_copy_r2s, tRS_rD_out, tRS_dv_sD[(None, None, None, epi_buffer)]
-            )
+            cute.copy(tiled_copy_r2s, tRS_rD_out, tRS_dv_sD[(None, None, None, epi_buffer)])
 
             cute.arch.fence_proxy(
                 cute.arch.ProxyKind.async_shared,
@@ -1262,9 +1070,7 @@ class HopperSelectAttentionFwd:
             # barrier for sync
             cute.arch.barrier()
 
-            epi_tile_layout = cute.make_layout(
-                epi_tile_shape, stride=(epi_tile_shape[1], 1)
-            )
+            epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
             gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from shared memory to global memory
             if warp_idx == 0:

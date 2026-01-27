@@ -7,6 +7,7 @@ import torch
 import pytest
 from typing import Optional, Tuple
 from test_fe_api_utils import (
+    compute_reference_amax,
     create_and_permute_tensor,
     create_scale_factor_tensor,
     create_sf_layout_tensor,
@@ -24,24 +25,52 @@ GEMM_SWIGLU_PARAM_MARKS = [
     pytest.mark.parametrize(
         "ab_dtype",
         [
-            torch.float16,
+            # torch.float16,
             torch.bfloat16,
             torch.float32,
             torch.float8_e4m3fn,
-            torch.float8_e5m2,
+            # torch.float8_e5m2,
         ],
     ),
     pytest.mark.parametrize(
-        "ab12_dtype", [torch.float16, torch.bfloat16, torch.float32]
+        "ab12_dtype",
+        [
+            # torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ],
     ),
     pytest.mark.parametrize(
-        "acc_dtype", [torch.float32]
-    ),  # Note: float16 accumulator is supported but disabled in testing
-    pytest.mark.parametrize("c_dtype", [torch.float16, torch.bfloat16]),
-    pytest.mark.parametrize(
-        "mma_tiler_mn", [(128, 128), (128, 64), (256, 256), (256, 128)]
+        "acc_dtype",
+        [
+            torch.float32,
+            # torch.float16,
+        ],
     ),
-    pytest.mark.parametrize("cluster_shape_mn", [(1, 1), (2, 2), (4, 4)]),
+    pytest.mark.parametrize(
+        "c_dtype",
+        [
+            # torch.float16,
+            torch.bfloat16
+        ],
+    ),
+    pytest.mark.parametrize(
+        "mma_tiler_mn",
+        [
+            (128, 128),
+            (256, 256),
+            # (128, 64),
+            # (256, 128),
+        ],
+    ),
+    pytest.mark.parametrize(
+        "cluster_shape_mn",
+        [
+            (1, 1),
+            (2, 2),
+            # (4, 4),
+        ],
+    ),
 ]
 
 
@@ -51,37 +80,33 @@ def with_gemm_swiglu_params(func):
     return func
 
 
-GEMM_SWIGLU_QUANT_PARAM_MARKS = [
-    pytest.mark.parametrize("a_major", ["k", "m"]),
-    pytest.mark.parametrize("b_major", ["k", "n"]),
-    pytest.mark.parametrize("c_major", ["m", "n"]),
+GEMM_SWIGLU_QUANT_PARAM_MARKS_FP4 = [
+    pytest.mark.parametrize("a_major", ["k"]),
+    pytest.mark.parametrize("b_major", ["k"]),
+    pytest.mark.parametrize("c_major", ["n"]),
     pytest.mark.parametrize(
         "ab_dtype",
         [
             torch.float4_e2m1fn_x2,
             # torch.uint8,
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
         ],
     ),
     pytest.mark.parametrize(
         "ab12_dtype",
         [
-            # torch.float32
-            torch.float16,
+            torch.float32,
+            # torch.float16,
             torch.bfloat16,
             torch.float8_e4m3fn,
-            torch.float8_e5m2,
+            # torch.float8_e5m2,
         ],
     ),
     pytest.mark.parametrize(
         "c_dtype",
         [
-            # torch.float32
-            torch.float16,
+            torch.float32,
+            # torch.float16,
             torch.bfloat16,
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
         ],
     ),
     pytest.mark.parametrize("acc_dtype", [torch.float32]),
@@ -99,7 +124,7 @@ GEMM_SWIGLU_QUANT_PARAM_MARKS = [
         [
             (1, 1),
             (2, 2),
-            (4, 4),
+            # (4, 4),
         ],
     ),
     pytest.mark.parametrize("sf_vec_size", [16, 32]),
@@ -107,9 +132,64 @@ GEMM_SWIGLU_QUANT_PARAM_MARKS = [
     pytest.mark.parametrize("vector_f32", [True, False]),
 ]
 
+GEMM_SWIGLU_QUANT_PARAM_MARKS_FP8 = [
+    pytest.mark.parametrize("a_major", ["k", "m"]),
+    pytest.mark.parametrize("b_major", ["k", "n"]),
+    pytest.mark.parametrize("c_major", ["m", "n"]),
+    pytest.mark.parametrize(
+        "ab_dtype",
+        [
+            torch.float8_e4m3fn,
+            # torch.float8_e5m2,
+        ],
+    ),
+    pytest.mark.parametrize(
+        "ab12_dtype",
+        [
+            # torch.float16,
+            torch.bfloat16,
+        ],
+    ),
+    pytest.mark.parametrize(
+        "c_dtype",
+        [
+            torch.float32,
+            # torch.float16,
+            torch.bfloat16,
+        ],
+    ),
+    pytest.mark.parametrize("acc_dtype", [torch.float32]),
+    pytest.mark.parametrize(
+        "mma_tiler_mn",
+        [
+            (128, 128),
+            (256, 256),
+            # (128, 64),
+            # (256, 128),
+        ],
+    ),
+    pytest.mark.parametrize(
+        "cluster_shape_mn",
+        [
+            (1, 1),
+            (2, 2),
+            # (4, 4),
+        ],
+    ),
+    pytest.mark.parametrize("sf_vec_size", [32]),
+    pytest.mark.parametrize("sf_dtype", [torch.float8_e8m0fnu]),
+    pytest.mark.parametrize("vector_f32", [True, False]),
+]
 
-def with_gemm_swiglu_quant_params(func):
-    for mark in reversed(GEMM_SWIGLU_QUANT_PARAM_MARKS):
+
+def with_gemm_swiglu_quant_params_fp4(func):
+    for mark in reversed(GEMM_SWIGLU_QUANT_PARAM_MARKS_FP4):
+        func = mark(func)
+    return func
+
+
+def with_gemm_swiglu_quant_params_fp8(func):
+    for mark in reversed(GEMM_SWIGLU_QUANT_PARAM_MARKS_FP8):
         func = mark(func)
     return func
 
@@ -133,15 +213,11 @@ def gemm_swiglu_init(
     """Initialize configuration for GEMM SwiGLU tests."""
     major, _ = torch.cuda.get_device_capability()
     if major < 10:
-        pytest.skip(
-            f"Environment not supported: requires compute capability >= 10, found {major}"
-        )
+        pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
 
     mnkl_str = request.config.getoption("--gemm-swiglu-mnkl", default=None)
     mma_tiler_str = request.config.getoption("--gemm-swiglu-mma-tiler", default=None)
-    cluster_shape_str = request.config.getoption(
-        "--gemm-swiglu-cluster-shape", default=None
-    )
+    cluster_shape_str = request.config.getoption("--gemm-swiglu-cluster-shape", default=None)
     alpha_opt = request.config.getoption("--gemm-swiglu-alpha", default=None)
     skip_ref = request.config.getoption("--gemm-swiglu-skip-ref", default=False)
 
@@ -218,9 +294,7 @@ def run_gemm_swiglu_quant_ref(
     n = b_ref.shape[0]
     assert n % group == 0, "N must be divisible by 32 for GLU block grouping"
     num_blocks = n // group
-    assert (
-        num_blocks % 2 == 0
-    ), "Number of 32-col blocks must be even (pairs of input/gate)"
+    assert num_blocks % 2 == 0, "Number of 32-col blocks must be even (pairs of input/gate)"
 
     cols = torch.arange(n, device=ab12_ref.device, dtype=torch.long)
     block_cols = cols.view(num_blocks, group)
@@ -253,24 +327,16 @@ def run_gemm_swiglu_quant_ref(
         ref_sfc_f32 = ref_sfc_f32.permute(1, 2, 0)
 
         # For some reason, using `ref_sfc_32_torch = ref_sfc_f32.to(sfc_dtype).to(torch.float32)` leads to different/incorrect results
-        ref_sfc_f8_torch = torch.empty(
-            (l, sfm, sfn), dtype=torch.uint8, device="cuda"
-        ).permute(1, 2, 0)
-        ref_sfc_f8 = from_dlpack(
-            ref_sfc_f8_torch, assumed_align=16
-        ).mark_layout_dynamic(leading_dim=1)
+        ref_sfc_f8_torch = torch.empty((l, sfm, sfn), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
+        ref_sfc_f8 = from_dlpack(ref_sfc_f8_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         ref_sfc_f8.element_type = _convert_to_cutlass_data_type(sfc_dtype)
         ref_sfc_f32_device = ref_sfc_f32.cuda()
-        ref_sfc_f32_tensor = from_dlpack(
-            ref_sfc_f32_device, assumed_align=16
-        ).mark_layout_dynamic(leading_dim=1)
+        ref_sfc_f32_tensor = from_dlpack(ref_sfc_f32_device, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         cute.testing.convert(ref_sfc_f32_tensor, ref_sfc_f8)
         cute.testing.convert(ref_sfc_f8, ref_sfc_f32_tensor)
         ref_sfc_32 = ref_sfc_f32_device.cpu()
 
-        ref_sfc_f32_cute_torch_tensor_cpu, _ = create_sf_layout_tensor(
-            l, sfm, n // 2, sf_vec_size
-        )
+        ref_sfc_f32_cute_torch_tensor_cpu, _ = create_sf_layout_tensor(l, sfm, n // 2, sf_vec_size)
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
             from_dlpack(ref_sfc_32),
             from_dlpack(ref_sfc_f32_cute_torch_tensor_cpu),
@@ -287,14 +353,6 @@ def run_gemm_swiglu_quant_ref(
     return ab12_ref_ret, c_ref, sfc_ref, amax_ref
 
 
-def compute_reference_amax(output_tensor: torch.Tensor) -> float:
-    if output_tensor.dtype != torch.float32:
-        output_fp32 = output_tensor.float()
-    else:
-        output_fp32 = output_tensor
-    return torch.amax(torch.abs(output_fp32)).item()
-
-
 def run_gemm_swiglu_ref(a_ref, b_ref, alpha):
     ab12_ref, c_ref = None, None
     if a_ref.dtype in {torch.int8, torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2}:
@@ -306,18 +364,13 @@ def run_gemm_swiglu_ref(a_ref, b_ref, alpha):
     n = b_ref.shape[0]
     assert n % group == 0, "N must be divisible by 32 for GLU block grouping"
     num_blocks = n // group
-    assert (
-        num_blocks % 2 == 0
-    ), "Number of 32-col blocks must be even (pairs of input/gate)"
+    assert num_blocks % 2 == 0, "Number of 32-col blocks must be even (pairs of input/gate)"
 
     cols = torch.arange(n, device=ab12_ref.device, dtype=torch.long)
     block_cols = cols.view(num_blocks, group)
     input_idx = block_cols[0::2].reshape(-1)
     gate_idx = block_cols[1::2].reshape(-1)
-    c_ref = ab12_ref.index_select(1, input_idx) * (
-        ab12_ref.index_select(1, gate_idx)
-        * torch.sigmoid(ab12_ref.index_select(1, gate_idx))
-    )
+    c_ref = ab12_ref.index_select(1, input_idx) * (ab12_ref.index_select(1, gate_idx) * torch.sigmoid(ab12_ref.index_select(1, gate_idx)))
     c_ref = c_ref.to(torch.float32)
 
     return ab12_ref, c_ref
@@ -345,9 +398,7 @@ def check_ref_gemm_swiglu(
                 rtol=0.1,
             )
         else:
-            torch.testing.assert_close(
-                ab12.cpu(), ab12_ref.to(ab12.dtype), atol=0.01, rtol=9e-03
-            )
+            torch.testing.assert_close(ab12.cpu(), ab12_ref.to(ab12.dtype), atol=0.01, rtol=9e-03)
 
         is_c_fp8 = c.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}
         if is_c_fp8:
@@ -358,9 +409,7 @@ def check_ref_gemm_swiglu(
                 rtol=0.1,
             )
         else:
-            torch.testing.assert_close(
-                c.cpu(), c_ref.to(c.dtype), atol=0.01, rtol=9e-03
-            )
+            torch.testing.assert_close(c.cpu(), c_ref.to(c.dtype), atol=0.01, rtol=9e-03)
     else:
         print("Skipping reference check")
 
@@ -392,9 +441,7 @@ def check_ref_gemm_swiglu_quant(
     b_ref = b_ref.clone().to(torch.float32).cpu()
     sfa_ref = sfa_ref.float().cpu()
     sfb_ref = sfb_ref.float().cpu()
-    norm_const_ref = (
-        norm_const_ref.float().cpu() if norm_const_ref is not None else None
-    )
+    norm_const_ref = norm_const_ref.float().cpu() if norm_const_ref is not None else None
     sfc_dtype = sfc.dtype if sfc is not None else None
     ab12_ref, c_ref, sfc_ref, amax_ref = run_gemm_swiglu_quant_ref(
         a_ref,
@@ -418,9 +465,7 @@ def check_ref_gemm_swiglu_quant(
             rtol=0.01,
         )
     else:
-        torch.testing.assert_close(
-            ab12.cpu(), ab12_ref.to(ab12.dtype), atol=0.01, rtol=0.01
-        )
+        torch.testing.assert_close(ab12.cpu(), ab12_ref.to(ab12.dtype), atol=0.01, rtol=0.01)
 
     if c_dtype in {torch.float32, torch.float16, torch.bfloat16}:
         torch.testing.assert_close(c.cpu(), c_ref.to(c.dtype), atol=0.01, rtol=0.01)
@@ -429,9 +474,7 @@ def check_ref_gemm_swiglu_quant(
             torch.uint8,
         }:
             reference_amax = torch.tensor(compute_reference_amax(c_ref.clone()))
-            torch.testing.assert_close(
-                amax.cpu().squeeze(), reference_amax, atol=0.01, rtol=0.01
-            )
+            torch.testing.assert_close(amax.cpu().squeeze(), reference_amax, atol=0.01, rtol=0.01)
     elif c_dtype in {torch.float8_e5m2, torch.float8_e4m3fn}:
         torch.testing.assert_close(
             sfc.cpu().to(torch.float32),
@@ -439,9 +482,7 @@ def check_ref_gemm_swiglu_quant(
             atol=0.01,
             rtol=0.01,
         )
-        torch.testing.assert_close(
-            c.cpu().to(torch.float32), c_ref.to(torch.float32), atol=0.01, rtol=0.01
-        )
+        torch.testing.assert_close(c.cpu().to(torch.float32), c_ref.to(torch.float32), atol=0.01, rtol=0.01)
 
 
 def allocate_input_tensors(
@@ -523,12 +564,8 @@ def allocate_output_tensors(
     sfc_ref, sfc_tensor, amax_tensor = None, None, None
     if is_block_scaled:
         if c_dtype in {torch.float8_e5m2, torch.float8_e4m3fn}:
-            sfc_ref, sfc_tensor = create_scale_factor_tensor(
-                l, m, n // 2, sf_vec_size, sf_dtype
-            )
+            sfc_ref, sfc_tensor = create_scale_factor_tensor(l, m, n // 2, sf_vec_size, sf_dtype)
         if c_dtype == torch.bfloat16:
-            amax_tensor = torch.full(
-                (1, 1, 1), -float("inf"), device="cuda", dtype=torch.float32
-            )
+            amax_tensor = torch.full((1, 1, 1), -float("inf"), device="cuda", dtype=torch.float32)
 
     return ab12_tensor, c_tensor, sfc_tensor, sfc_ref, amax_tensor

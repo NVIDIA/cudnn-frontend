@@ -32,9 +32,7 @@ def build_rope_cache(
     return cos, sin
 
 
-def apply_rope_ref(
-    q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> torch.Tensor:
+def apply_rope_ref(q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     def fn(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         head_size = x.size(-1)
         x1 = x[..., : head_size // 2]  # (B, nh, T, hs/2)
@@ -103,9 +101,7 @@ def test_apply_rope(cudnn_handle):
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
-    g, uids = create_rope_graph(
-        cudnn_handle, x1_gpu, x2_gpu, cos1_gpu, cos2_gpu, sin1_gpu, sin2_gpu
-    )
+    g, uids = create_rope_graph(cudnn_handle, x1_gpu, x2_gpu, cos1_gpu, cos2_gpu, sin1_gpu, sin2_gpu)
     x1_uid, x2_uid, sin1_uid, sin2_uid, cos1_uid, cos2_uid, Y1_uid, Y2_uid = uids
 
     workspace = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)

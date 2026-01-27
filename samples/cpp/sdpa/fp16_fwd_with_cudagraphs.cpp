@@ -62,9 +62,7 @@ create_sdpa_forward_graph(int64_t const b,
                           float const attn_scale    = 1.0f,
                           bool const generate_stats = true,
                           bool const causal_mask    = false,
-                          bool const alibi_mask     = false,
-                          bool const padding_mask   = false,
-                          bool has_attn_bias        = false);
+                          bool const padding_mask   = false);
 
 // Convenience class to encapsulate SDPA test data for this example
 class SdpaTestData {
@@ -80,7 +78,6 @@ class SdpaTestData {
                  int64_t const workspace_size,
                  bool const generate_stats,
                  bool const padding_mask,
-                 bool const has_attn_bias,
                  float const qkv_fill_value)
         : q_tensor(b * h_q * s_q * d_qk, false, cpu_float2half_rn(qkv_fill_value)),
           k_tensor(b * h_k * d_qk * s_kv, false, cpu_float2half_rn(qkv_fill_value)),
@@ -92,8 +89,7 @@ class SdpaTestData {
           statsTensor(b * h_q * s_q * 1, false),
           workspace(workspace_size, false),
           generate_stats_(generate_stats),
-          padding_mask_(padding_mask),
-          has_attn_bias_(has_attn_bias) {}
+          padding_mask_(padding_mask) {}
 
     std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *>
     build_variant_pack() {
@@ -102,9 +98,6 @@ class SdpaTestData {
         variant_pack[K_UID] = k_tensor.devPtr;
         variant_pack[V_UID] = v_tensor.devPtr;
         variant_pack[O_UID] = o_tensor.devPtr;
-        if (has_attn_bias_) {
-            variant_pack[BIAS_UID] = bias_tensor.devPtr;
-        }
         if (padding_mask_) {
             variant_pack[SEQ_LEN_Q_UID]  = devActualSeqlenQ.devPtr;
             variant_pack[SEQ_LEN_KV_UID] = devActualSeqlenKV.devPtr;
@@ -168,7 +161,6 @@ class SdpaTestData {
     Surface<int8_t> workspace;
     bool generate_stats_;
     bool padding_mask_;
-    bool has_attn_bias_;
 };
 
 TEST_CASE("Toy sdpa forward as CUDA graph", "[graph][sdpa][flash][forward][cudagraph]") {
@@ -176,9 +168,6 @@ TEST_CASE("Toy sdpa forward as CUDA graph", "[graph][sdpa][flash][forward][cudag
     // Because the below test depends on some CUDA graph APIs that changed
     // between CUDA 11.x and 12.0, it wouldn't even compile in <12.0 anyway,
     // so we just disable the whole test by #if in that case.
-#if (CUDART_VERSION < 12000)
-    SKIP("Test requires cuda toolkit 12.0 or above");
-#else
     // Also check the CUDA version at runtime, for good measure.
     if (cudnnGetCudartVersion() < 12000) {
         SKIP("Test requires cuda toolkit 12.0 or above");
@@ -202,27 +191,13 @@ TEST_CASE("Toy sdpa forward as CUDA graph", "[graph][sdpa][flash][forward][cudag
     float attn_scale    = 0.123f;
     bool causal_mask    = true;
     bool padding_mask   = (cudnnGetVersion() >= 8903);
-    bool alibi_mask     = false;  // TODO: (cudnnGetVersion() >= 8904)
-    bool has_attn_bias  = (cudnnGetVersion() >= 8903);
 
     // Create a unique_ptr for the cuDNN handle
     auto handle_ptr = create_cudnn_handle();
     auto handle     = *handle_ptr;
 
-    auto graph = create_sdpa_forward_graph(b,
-                                           h_q,
-                                           h_k,
-                                           h_v,
-                                           s_q,
-                                           s_kv,
-                                           d_qk,
-                                           d_v,
-                                           attn_scale,
-                                           generate_stats,
-                                           causal_mask,
-                                           alibi_mask,
-                                           padding_mask,
-                                           has_attn_bias);
+    auto graph = create_sdpa_forward_graph(
+        b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v, attn_scale, generate_stats, causal_mask, padding_mask);
 
     // Validate the graph and lower the FE graph to BE graph
     REQUIRE(graph->validate().is_good());
@@ -254,7 +229,6 @@ TEST_CASE("Toy sdpa forward as CUDA graph", "[graph][sdpa][flash][forward][cudag
                              workspace_size,
                              generate_stats,
                              padding_mask,
-                             has_attn_bias,
                              /*fillValue_qkv=*/1.1f);
     auto variant_pack_1 = test_data_1.build_variant_pack();
 
@@ -284,7 +258,6 @@ TEST_CASE("Toy sdpa forward as CUDA graph", "[graph][sdpa][flash][forward][cudag
                              workspace_size,
                              generate_stats,
                              padding_mask,
-                             has_attn_bias,
                              /*fillValue_qkv=*/1.3f);
     auto variant_pack_3 = test_data_3.build_variant_pack();
     REQUIRE(
@@ -306,5 +279,4 @@ TEST_CASE("Toy sdpa forward as CUDA graph", "[graph][sdpa][flash][forward][cudag
     //// Cleanup
     CUDA_CHECK(cudaGraphExecDestroy(cuda_graph_exec));
     CUDA_CHECK(cudaGraphDestroy(cudnn_cuda_graph));
-#endif  // CUDART_VERSION < 12000
 }

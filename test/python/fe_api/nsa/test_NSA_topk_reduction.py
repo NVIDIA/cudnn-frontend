@@ -30,9 +30,7 @@ def test_nsa_topk_reduction_compile_execute(
         from cudnn import NSA
         from cuda.bindings import driver as cuda
     except ImportError as e:
-        pytest.skip(
-            "Environment not supported: cudnn optional dependencies not installed"
-        )
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
     cfg = nsa_init(
         request=request,
@@ -48,9 +46,7 @@ def test_nsa_topk_reduction_compile_execute(
         s_kv_default_override=128,
     )
 
-    Q, K, _, LSE, _, _, cum_seqlen_q, cum_seqlen_kv, max_s_q, max_s_kv = (
-        allocate_input_tensors(cfg)
-    )
+    Q, K, _, LSE, _, _, cum_seqlen_q, cum_seqlen_kv, max_s_q, max_s_kv = allocate_input_tensors(cfg)
     _, _, _, topk_scores, topk_indices = allocate_output_tensors(cfg)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -106,9 +102,7 @@ def test_nsa_topk_reduction_wrapper(
         from cudnn import NSA
         from cuda.bindings import driver as cuda
     except ImportError as e:
-        pytest.skip(
-            "Environment not supported: cudnn optional dependencies not installed"
-        )
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
     cfg = nsa_init(
         request=request,
@@ -124,9 +118,7 @@ def test_nsa_topk_reduction_wrapper(
         s_kv_default_override=128,
     )
 
-    Q, K, _, LSE, _, _, cum_seqlen_q, cum_seqlen_kv, max_s_q, max_s_kv = (
-        allocate_input_tensors(cfg)
-    )
+    Q, K, _, LSE, _, _, cum_seqlen_q, cum_seqlen_kv, max_s_q, max_s_kv = allocate_input_tensors(cfg)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     topk_scores, topk_indices = NSA.topk_reduction_wrapper(

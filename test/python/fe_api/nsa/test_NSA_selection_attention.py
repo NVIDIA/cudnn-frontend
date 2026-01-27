@@ -33,13 +33,9 @@ def test_nsa_selection_compile_execute(
         from cudnn import NSA
         from cuda.bindings import driver as cuda
     except ImportError as e:
-        pytest.skip(
-            "Environment not supported: cudnn optional dependencies not installed"
-        )
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
     if layout != "thd":
-        pytest.skip(
-            "Only THD layout supported for selection attention, bshd layout not yet implemented"
-        )
+        pytest.skip("Only THD layout supported for selection attention, bshd layout not yet implemented")
 
     cfg = nsa_init(
         request=request,
@@ -50,9 +46,7 @@ def test_nsa_selection_compile_execute(
         block_size=block_size,
     )
 
-    Q, K, V, _, actual_s_q, _, cum_seqlen_q, cum_seqlen_kv, max_s_q, max_s_kv = (
-        allocate_input_tensors(cfg)
-    )
+    Q, K, V, _, actual_s_q, _, cum_seqlen_q, cum_seqlen_kv, max_s_q, max_s_kv = allocate_input_tensors(cfg)
     block_counts, block_indices = generate_block_indices(
         cfg["actual_s_q"],
         cfg["h_k"],
@@ -129,14 +123,10 @@ def test_nsa_selection_wrapper(
         from cudnn import NSA
         from cuda.bindings import driver as cuda
     except ImportError as e:
-        pytest.skip(
-            "Environment not supported: cudnn optional dependencies not installed"
-        )
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
     if layout != "thd":
-        pytest.skip(
-            "Only THD layout supported for selection attention, bshd layout not yet implemented"
-        )
+        pytest.skip("Only THD layout supported for selection attention, bshd layout not yet implemented")
 
     cfg = nsa_init(
         request=request,
@@ -147,9 +137,7 @@ def test_nsa_selection_wrapper(
         block_size=block_size,
     )
 
-    Q, K, V, _, actual_s_q, _, cum_seqlen_q, cum_seqlen_kv, max_s_q, max_s_kv = (
-        allocate_input_tensors(cfg)
-    )
+    Q, K, V, _, actual_s_q, _, cum_seqlen_q, cum_seqlen_kv, max_s_q, max_s_kv = allocate_input_tensors(cfg)
     block_counts, block_indices = generate_block_indices(
         cfg["actual_s_q"],
         cfg["h_k"],

@@ -68,9 +68,7 @@ class FineGrainedReductionQK:
         self.k_value = k_value
         self.selection_block_size = selection_block_size
         self.compress_block_sliding_stride = compress_block_sliding_stride
-        self.num_elem_for_reduction = (
-            selection_block_size // compress_block_sliding_stride
-        )
+        self.num_elem_for_reduction = selection_block_size // compress_block_sliding_stride
 
         self.cluster_shape_mn = (1, 1)
         self.mma_tiler = mma_tiler
@@ -121,15 +119,9 @@ class FineGrainedReductionQK:
         stride_b_q = s_q * head_dim * h_k * h_r if cumulative_s_q is None else 0
         stride_b_k = s_k * head_dim * h_k if cumulative_s_k is None else 0
         stride_b_lse = s_q * h_r * h_k if cumulative_s_q is None else 0
-        stride_b_out = (
-            s_q * (s_k_max // self.num_elem_for_reduction) * h_k
-            if cumulative_s_q is None
-            else 0
-        )
+        stride_b_out = s_q * (s_k_max // self.num_elem_for_reduction) * h_k if cumulative_s_q is None else 0
         stride_b_topk_scores = s_q * self.k_value * h_k if cumulative_s_q is None else 0
-        stride_b_topk_indices = (
-            s_q * self.k_value * h_k if cumulative_s_q is None else 0
-        )
+        stride_b_topk_indices = s_q * self.k_value * h_k if cumulative_s_q is None else 0
 
         Q = cute.make_tensor(
             Q.iterator,
@@ -253,29 +245,17 @@ class FineGrainedReductionQK:
 
         @cute.struct
         class SharedStorage:
-            load_mma_Q_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.load_mma_Q_stage * 2
-            ]
-            load_mma_K_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.load_mma_K_stage * 2
-            ]
-            load_compute_LSE_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.load_compute_LSE_stage * 2
-            ]
-            mma_compute_S_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.mma_compute_S_stage * 2
-            ]
+            load_mma_Q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_mma_Q_stage * 2]
+            load_mma_K_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_mma_K_stage * 2]
+            load_compute_LSE_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_compute_LSE_stage * 2]
+            mma_compute_S_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_compute_S_stage * 2]
 
             sQ: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.element_dtype, cute.cosize(Q_smem_layout_staged)
-                ],
+                cute.struct.MemRange[self.element_dtype, cute.cosize(Q_smem_layout_staged)],
                 1024,
             ]
             sK: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.element_dtype, cute.cosize(K_smem_layout_staged)
-                ],
+                cute.struct.MemRange[self.element_dtype, cute.cosize(K_smem_layout_staged)],
                 1024,
             ]
             sLSE: cute.struct.Align[
@@ -315,12 +295,8 @@ class FineGrainedReductionQK:
         )
 
     def make_and_init_load_mma_Q_pipeline(self, load_mma_Q_mbar_ptr):
-        load_mma_Q_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, len([self.load_warp_id])
-        )
-        load_mma_Q_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, len([self.mma_warp_id])
-        )
+        load_mma_Q_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, len([self.load_warp_id]))
+        load_mma_Q_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, len([self.mma_warp_id]))
         return pipeline.PipelineTmaUmma.create(
             barrier_storage=load_mma_Q_mbar_ptr,
             num_stages=self.load_mma_Q_stage,
@@ -330,12 +306,8 @@ class FineGrainedReductionQK:
         )
 
     def make_and_init_load_mma_K_pipeline(self, load_mma_K_mbar_ptr):
-        load_mma_K_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, len([self.load_warp_id])
-        )
-        load_mma_K_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, len([self.mma_warp_id])
-        )
+        load_mma_K_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, len([self.load_warp_id]))
+        load_mma_K_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, len([self.mma_warp_id]))
         return pipeline.PipelineTmaUmma.create(
             barrier_storage=load_mma_K_mbar_ptr,
             num_stages=self.load_mma_K_stage,
@@ -407,29 +379,15 @@ class FineGrainedReductionQK:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        load_mma_Q_pipeline = self.make_and_init_load_mma_Q_pipeline(
-            storage.load_mma_Q_mbar_ptr.data_ptr()
-        )
-        load_mma_K_pipeline = self.make_and_init_load_mma_K_pipeline(
-            storage.load_mma_K_mbar_ptr.data_ptr()
-        )
-        load_compute_LSE_pipeline = self.make_and_init_load_compute_LSE_pipeline(
-            storage.load_compute_LSE_mbar_ptr.data_ptr()
-        )
-        mma_compute_S_pipeline = self.make_and_init_mma_compute_S_pipeline(
-            storage.mma_compute_S_mbar_ptr.data_ptr()
-        )
+        load_mma_Q_pipeline = self.make_and_init_load_mma_Q_pipeline(storage.load_mma_Q_mbar_ptr.data_ptr())
+        load_mma_K_pipeline = self.make_and_init_load_mma_K_pipeline(storage.load_mma_K_mbar_ptr.data_ptr())
+        load_compute_LSE_pipeline = self.make_and_init_load_compute_LSE_pipeline(storage.load_compute_LSE_mbar_ptr.data_ptr())
+        mma_compute_S_pipeline = self.make_and_init_mma_compute_S_pipeline(storage.mma_compute_S_mbar_ptr.data_ptr())
 
-        cute.arch.barrier(
-            barrier_id=self.cta_sync_bar_id, number_of_threads=self.threads_per_cta
-        )
+        cute.arch.barrier(barrier_id=self.cta_sync_bar_id, number_of_threads=self.threads_per_cta)
 
-        sQ = storage.sQ.get_tensor(
-            Q_smem_layout_staged.outer, swizzle=Q_smem_layout_staged.inner
-        )
-        sK = storage.sK.get_tensor(
-            K_smem_layout_staged.outer, swizzle=K_smem_layout_staged.inner
-        )
+        sQ = storage.sQ.get_tensor(Q_smem_layout_staged.outer, swizzle=Q_smem_layout_staged.inner)
+        sK = storage.sK.get_tensor(K_smem_layout_staged.outer, swizzle=K_smem_layout_staged.inner)
         sLSE = storage.sLSE.get_tensor(LSE_smem_layout)
 
         block_offset = (Int32(0), Int32(0), Int32(0), (Int32(0), Int32(0), Int32(0)))
@@ -455,24 +413,18 @@ class FineGrainedReductionQK:
         mQ = cute.domain_offset(cute.select(block_offset, mode=[0, 2, 3]), tma_tensor_Q)
         mK = cute.domain_offset(cute.select(block_offset, mode=[1, 2, 3]), tma_tensor_K)
         mTopk_scores = cute.make_tensor(
-            Topk_scores.iterator
-            + cute.assume(block_offset[0] * Topk_scores.stride[0], divby=self.k_value),
+            Topk_scores.iterator + cute.assume(block_offset[0] * Topk_scores.stride[0], divby=self.k_value),
             Topk_scores.layout,
         )
         mTopk_indices = cute.make_tensor(
-            Topk_indices.iterator
-            + cute.assume(block_offset[0] * Topk_indices.stride[0], divby=self.k_value),
+            Topk_indices.iterator + cute.assume(block_offset[0] * Topk_indices.stride[0], divby=self.k_value),
             Topk_indices.layout,
         )
 
         # (MMA_M, MMA_K, REST_M, REST_K, (H_r, H_k, B))
-        gQ = cute.local_tile(
-            mQ, cute.select(self.mma_tiler, mode=[0, 2]), (None, None, None)
-        )
+        gQ = cute.local_tile(mQ, cute.select(self.mma_tiler, mode=[0, 2]), (None, None, None))
         # (MMA_N, MMA_K, REST_N, REST_K, (1, H_k, B))
-        gK = cute.local_tile(
-            mK, cute.select(self.mma_tiler, mode=[0, 2]), (None, None, None)
-        )
+        gK = cute.local_tile(mK, cute.select(self.mma_tiler, mode=[0, 2]), (None, None, None))
 
         # (MMA_M, MMA_K, H_r)
         gQ = gQ[None, None, bidx, 0, (None, bidy, bidz)]
@@ -506,9 +458,7 @@ class FineGrainedReductionQK:
 
         tSrQ = QK_tiled_mma.make_fragment_A(sQ)
         tSrK = QK_tiled_mma.make_fragment_B(sK)
-        tStS_shape = QK_tiled_mma.partition_shape_C(
-            cute.select(self.mma_tiler, mode=[0, 1])
-        )
+        tStS_shape = QK_tiled_mma.partition_shape_C(cute.select(self.mma_tiler, mode=[0, 1]))
         # ((MMA_M, MMA_N), REST_M, REST_N)
         tStS = QK_tiled_mma.make_fragment_C(tStS_shape)
         # another tmem for reduction
@@ -528,22 +478,14 @@ class FineGrainedReductionQK:
                 # TODO: reconfig regs
                 cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
-                load_mma_Q_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.load_mma_Q_stage
-                )
-                load_mma_K_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.load_mma_K_stage
-                )
-                load_compute_LSE_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.load_compute_LSE_stage
-                )
+                load_mma_Q_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_Q_stage)
+                load_mma_K_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_K_stage)
+                load_compute_LSE_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_compute_LSE_stage)
 
                 while load_iter_count > 0:
                     # Wait for K to be empty
                     load_mma_K_pipeline.producer_acquire(load_mma_K_producer_state)
-                    K_tma_barrier = load_mma_K_pipeline.producer_get_barrier(
-                        load_mma_K_producer_state
-                    )
+                    K_tma_barrier = load_mma_K_pipeline.producer_get_barrier(load_mma_K_producer_state)
 
                     # Load K tile
                     cute.copy(
@@ -558,9 +500,7 @@ class FineGrainedReductionQK:
                     # Load Q and LSE
                     for h_r_idx in cutlass.range(cute.size(tQgQ, mode=[1])):
 
-                        load_compute_LSE_pipeline.producer_acquire(
-                            load_compute_LSE_producer_state
-                        )
+                        load_compute_LSE_pipeline.producer_acquire(load_compute_LSE_producer_state)
 
                         # Load LSE
                         thread_idx = tidx % self.threads_per_warp
@@ -576,10 +516,7 @@ class FineGrainedReductionQK:
                         LSE_for_copy = cute.flat_divide(LSE, (1,))
                         LSE_idx_offset = block_offset[0] * LSE.stride[0]
                         for i in cutlass.range_constexpr(async_copy_num_elts):
-                            LSE_idx = (
-                                self.mma_tiler[0] * bidx
-                                + thread_idx * async_copy_num_elts
-                            )
+                            LSE_idx = self.mma_tiler[0] * bidx + thread_idx * async_copy_num_elts
                             if cute.elem_less(LSE_idx + i, cur_s_q):
                                 cute.copy(
                                     atom_async_copy,
@@ -603,16 +540,12 @@ class FineGrainedReductionQK:
                                     load_compute_LSE_producer_state.index,
                                 ].fill(0.0)
 
-                        load_compute_LSE_pipeline.producer_commit(
-                            load_compute_LSE_producer_state
-                        )
+                        load_compute_LSE_pipeline.producer_commit(load_compute_LSE_producer_state)
                         load_compute_LSE_producer_state.advance()
 
                         # Wait for Q to be empty
                         load_mma_Q_pipeline.producer_acquire(load_mma_Q_producer_state)
-                        Q_tma_barrier = load_mma_Q_pipeline.producer_get_barrier(
-                            load_mma_Q_producer_state
-                        )
+                        Q_tma_barrier = load_mma_Q_pipeline.producer_get_barrier(load_mma_Q_producer_state)
 
                         # Load Q tile
                         cute.copy(
@@ -639,15 +572,9 @@ class FineGrainedReductionQK:
                     number_of_threads=self.threads_per_warp,
                 )
 
-                load_mma_Q_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.load_mma_Q_stage
-                )
-                load_mma_K_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.load_mma_K_stage
-                )
-                mma_compute_S_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.mma_compute_S_stage
-                )
+                load_mma_Q_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_Q_stage)
+                load_mma_K_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_K_stage)
+                mma_compute_S_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.mma_compute_S_stage)
 
                 while mma_iter_count > 0:
                     # Wait for K to be full
@@ -656,14 +583,10 @@ class FineGrainedReductionQK:
                     for h_r_idx in cutlass.range(cute.size(tQgQ, mode=[1])):
                         # Wait for Q to be full
                         load_mma_Q_pipeline.consumer_wait(load_mma_Q_consumer_state)
-                        mma_compute_S_pipeline.producer_acquire(
-                            mma_compute_S_producer_state
-                        )
+                        mma_compute_S_pipeline.producer_acquire(mma_compute_S_producer_state)
 
                         QK_tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)
-                        for k_block_idx in cutlass.range_constexpr(
-                            cute.size(tSrQ, mode=[2])
-                        ):
+                        for k_block_idx in cutlass.range_constexpr(cute.size(tSrQ, mode=[2])):
                             cute.gemm(
                                 QK_tiled_mma,
                                 tStS,
@@ -683,9 +606,7 @@ class FineGrainedReductionQK:
                             )
                             QK_tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)
 
-                        mma_compute_S_pipeline.producer_commit(
-                            mma_compute_S_producer_state
-                        )
+                        mma_compute_S_pipeline.producer_commit(mma_compute_S_producer_state)
                         mma_compute_S_producer_state.advance()
 
                         load_mma_Q_pipeline.consumer_release(load_mma_Q_consumer_state)
@@ -701,12 +622,8 @@ class FineGrainedReductionQK:
             if warp_idx in self.compute_warp_id:
                 cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
 
-                mma_compute_S_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.mma_compute_S_stage
-                )
-                load_compute_LSE_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.load_compute_LSE_stage
-                )
+                mma_compute_S_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_compute_S_stage)
+                load_compute_LSE_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_compute_LSE_stage)
 
                 load_compute_LSE_pipeline.consumer_wait(load_compute_LSE_consumer_state)
                 thread_idx = tidx % (self.threads_per_warp * self.num_compute_warps)
@@ -714,12 +631,8 @@ class FineGrainedReductionQK:
                 heap_size_ref = cute.make_rmem_tensor((1,), Int32)
                 heap_size_ref[0] = 0
                 # # Create temporary register heaps for computation
-                scores_heap_rf = cute.make_rmem_tensor(
-                    ((4, self.k_value // 4), 1, 1), Float32
-                )
-                idx_heap_rf = cute.make_rmem_tensor(
-                    ((4, self.k_value // 4), 1, 1), Int32
-                )
+                scores_heap_rf = cute.make_rmem_tensor(((4, self.k_value // 4), 1, 1), Float32)
+                idx_heap_rf = cute.make_rmem_tensor(((4, self.k_value // 4), 1, 1), Int32)
 
                 tmem_load_atom = cute.make_copy_atom(
                     tcgen05.Ld32x32bOp(tcgen05.copy.Repetition(32)),
@@ -733,15 +646,9 @@ class FineGrainedReductionQK:
                 cS = cute.make_identity_tensor((self.mma_tiler[0], self.mma_tiler[1]))
 
                 comp_tile_size = 32
-                tStS_tiled = cute.logical_divide(
-                    tStS, cute.make_layout((self.mma_tiler[0], comp_tile_size))
-                )
-                tStS_compute_tiled = cute.logical_divide(
-                    tStS_reduce, cute.make_layout((self.mma_tiler[0], comp_tile_size))
-                )
-                cS_tiled = cute.logical_divide(
-                    cS, cute.make_layout((self.mma_tiler[0], comp_tile_size))
-                )
+                tStS_tiled = cute.logical_divide(tStS, cute.make_layout((self.mma_tiler[0], comp_tile_size)))
+                tStS_compute_tiled = cute.logical_divide(tStS_reduce, cute.make_layout((self.mma_tiler[0], comp_tile_size)))
+                cS_tiled = cute.logical_divide(cS, cute.make_layout((self.mma_tiler[0], comp_tile_size)))
 
                 tStS_slice = tStS_tiled[None, 0]  # ((128, 16), 8)
                 tStS_compute_slice = tStS_compute_tiled[None, 0]
@@ -753,108 +660,61 @@ class FineGrainedReductionQK:
                 tTR_cS = thr_t2r.partition_D(cS_tiled)
                 tTR_tS = thr_t2r.partition_S(tStS_tiled)
                 tTR_tS_compute = thr_t2r.partition_S(tStS_compute_tiled)
-                tTR_rS = cute.make_rmem_tensor(
-                    tTR_cS[None, None, 0].shape, self.acc_dtype
-                )
-                tTR_rS_compute = cute.make_rmem_tensor(
-                    tTR_cS[None, None, 0].shape, self.acc_dtype
-                )
+                tTR_rS = cute.make_rmem_tensor(tTR_cS[None, None, 0].shape, self.acc_dtype)
+                tTR_rS_compute = cute.make_rmem_tensor(tTR_cS[None, None, 0].shape, self.acc_dtype)
 
                 tiled_r2t = tcgen05.make_tmem_copy(tmem_store_atom, tStS_compute_slice)
                 thr_r2t = tiled_r2t.get_slice(thread_idx)
                 tRT_tS_compute = thr_r2t.partition_D(tStS_compute_tiled)
 
-                tiled_t2r_reduce = tcgen05.make_tmem_copy(
-                    tmem_load_atom, tStS[(None, None), 0, 0]
-                )
+                tiled_t2r_reduce = tcgen05.make_tmem_copy(tmem_load_atom, tStS[(None, None), 0, 0])
                 thr_t2r_reduce = tiled_t2r_reduce.get_slice(thread_idx)
-                tTR_tS_reduce = thr_t2r_reduce.partition_S(
-                    tStS_reduce[(None, None), 0, 0]
-                )
+                tTR_tS_reduce = thr_t2r_reduce.partition_S(tStS_reduce[(None, None), 0, 0])
                 tTR_cS_reduce = thr_t2r_reduce.partition_D(cS)
-                tTR_rS_reduce = cute.make_rmem_tensor(
-                    tTR_cS_reduce.shape, self.acc_dtype
-                )
+                tTR_rS_reduce = cute.make_rmem_tensor(tTR_cS_reduce.shape, self.acc_dtype)
 
-                tmp = cute.make_rmem_tensor(
-                    (self.mma_tiler[1] // self.num_elem_for_reduction), self.acc_dtype
-                )
+                tmp = cute.make_rmem_tensor((self.mma_tiler[1] // self.num_elem_for_reduction), self.acc_dtype)
 
                 while compute_iter_count > 0:
 
                     for h_r_idx in range(cute.size(tQgQ, mode=[1])):
-                        mma_compute_S_pipeline.consumer_wait(
-                            mma_compute_S_consumer_state
-                        )
+                        mma_compute_S_pipeline.consumer_wait(mma_compute_S_consumer_state)
 
                         # TODO: Added this as we should wait for the producer to load
-                        load_compute_LSE_pipeline.consumer_wait(
-                            load_compute_LSE_consumer_state
-                        )
+                        load_compute_LSE_pipeline.consumer_wait(load_compute_LSE_consumer_state)
 
-                        for sub_tile in cutlass.range(
-                            self.mma_tiler[1] // comp_tile_size
-                        ):
+                        for sub_tile in cutlass.range(self.mma_tiler[1] // comp_tile_size):
                             tTR_tS_sub_tile = tTR_tS[None, None, sub_tile]
-                            tTR_tS_compute_sub_tile = tTR_tS_compute[
-                                None, None, sub_tile
-                            ]
-                            tRT_tS_compute_sub_tile = tRT_tS_compute[
-                                None, None, sub_tile
-                            ]
+                            tTR_tS_compute_sub_tile = tTR_tS_compute[None, None, sub_tile]
+                            tRT_tS_compute_sub_tile = tRT_tS_compute[None, None, sub_tile]
                             tTR_cS_sub_tile = tTR_cS[None, None, sub_tile]
 
                             # Copy S from tmem to rmem
                             cute.copy(tiled_t2r, tTR_tS_sub_tile, tTR_rS)
 
-                            is_residual_k = (
-                                compute_iter_index * self.mma_tiler[1]
-                                + self.mma_tiler[1]
-                                > cur_s_k
-                            )
+                            is_residual_k = compute_iter_index * self.mma_tiler[1] + self.mma_tiler[1] > cur_s_k
 
                             leading_causal_masking = cutlass.Boolean(False)
                             if cutlass.const_expr(self.is_causal):
                                 leading_causal_masking = (
-                                    ((compute_iter_index + 1) * self.mma_tiler[1] + 1)
-                                    * self.compress_block_sliding_stride
-                                    - 1
-                                    > bidx * self.mma_tiler[0]
-                                )
-                                leading_causal_masking = cute.arch.shuffle_sync(
-                                    leading_causal_masking, 0
-                                )
+                                    (compute_iter_index + 1) * self.mma_tiler[1] + 1
+                                ) * self.compress_block_sliding_stride - 1 > bidx * self.mma_tiler[0]
+                                leading_causal_masking = cute.arch.shuffle_sync(leading_causal_masking, 0)
                             trailing_residual_masking = cutlass.Boolean(False)
                             trailing_residual_masking = is_residual_k
-                            trailing_residual_masking = cute.arch.shuffle_sync(
-                                trailing_residual_masking, 0
-                            )
+                            trailing_residual_masking = cute.arch.shuffle_sync(trailing_residual_masking, 0)
 
-                            is_masked_tile = (
-                                leading_causal_masking or trailing_residual_masking
-                            )
+                            is_masked_tile = leading_causal_masking or trailing_residual_masking
 
                             # Apply mask
                             if is_masked_tile:
-                                for i in cutlass.range(
-                                    cute.size(tTR_rS), unroll_full=True
-                                ):
-                                    q_idx = (
-                                        cute.get(tTR_cS_sub_tile[i], mode=[0])
-                                        + bidx * self.mma_tiler[0]
-                                    )
-                                    k_block_idx = (
-                                        cute.get(tTR_cS_sub_tile[i], mode=[1])
-                                        + compute_iter_index * self.mma_tiler[1]
-                                    )
+                                for i in cutlass.range(cute.size(tTR_rS), unroll_full=True):
+                                    q_idx = cute.get(tTR_cS_sub_tile[i], mode=[0]) + bidx * self.mma_tiler[0]
+                                    k_block_idx = cute.get(tTR_cS_sub_tile[i], mode=[1]) + compute_iter_index * self.mma_tiler[1]
 
                                     if is_masked_tile:
                                         if cutlass.const_expr(self.is_causal):
-                                            k_idx = (
-                                                (k_block_idx + 1)
-                                                * self.compress_block_sliding_stride
-                                                - 1
-                                            )
+                                            k_idx = (k_block_idx + 1) * self.compress_block_sliding_stride - 1
                                             if k_idx > q_idx:
                                                 tTR_rS[i] = -cutlass.Float32.inf
                                             if q_idx > cur_s_q or k_block_idx > cur_s_k:
@@ -867,9 +727,7 @@ class FineGrainedReductionQK:
                             # LSE should be set negative before and has be already multiplied by log2_e
 
                             # Copy S_reduce from tmem to rmem
-                            cute.copy(
-                                tiled_t2r, tTR_tS_compute_sub_tile, tTR_rS_compute
-                            )
+                            cute.copy(tiled_t2r, tTR_tS_compute_sub_tile, tTR_rS_compute)
 
                             for i in cutlass.range(0, cute.size(tTR_rS, mode=[0]), 2):
                                 lse = (
@@ -892,47 +750,34 @@ class FineGrainedReductionQK:
                                     lse,
                                 )
                                 tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
-                                tTR_rS[i + 1] = cute.math.exp2(
-                                    tTR_rS[i + 1], fastmath=True
-                                )
+                                tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
 
                                 if h_r_idx == 0:
-                                    (tTR_rS_compute[i], tTR_rS_compute[i + 1]) = (
-                                        cute.arch.add_packed_f32x2(
-                                            (0.0, 0.0),
-                                            (tTR_rS[i], tTR_rS[i + 1]),
-                                        )
+                                    tTR_rS_compute[i], tTR_rS_compute[i + 1] = cute.arch.add_packed_f32x2(
+                                        (0.0, 0.0),
+                                        (tTR_rS[i], tTR_rS[i + 1]),
                                     )
                                 else:
-                                    (tTR_rS_compute[i], tTR_rS_compute[i + 1]) = (
-                                        cute.arch.add_packed_f32x2(
-                                            (tTR_rS_compute[i], tTR_rS_compute[i + 1]),
-                                            (tTR_rS[i], tTR_rS[i + 1]),
-                                        )
+                                    tTR_rS_compute[i], tTR_rS_compute[i + 1] = cute.arch.add_packed_f32x2(
+                                        (tTR_rS_compute[i], tTR_rS_compute[i + 1]),
+                                        (tTR_rS[i], tTR_rS[i + 1]),
                                     )
 
                             cute.arch.fence_view_async_tmem_load()
                             cute.arch.barrier(
                                 barrier_id=self.compute_sync_bar_id,
-                                number_of_threads=self.num_compute_warps
-                                * self.threads_per_warp,
+                                number_of_threads=self.num_compute_warps * self.threads_per_warp,
                             )
 
                             # Copy tS_reduce back to tmem
-                            cute.copy(
-                                tiled_r2t, tTR_rS_compute, tRT_tS_compute_sub_tile
-                            )
+                            cute.copy(tiled_r2t, tTR_rS_compute, tRT_tS_compute_sub_tile)
 
                             cute.arch.fence_view_async_tmem_store()
 
-                        load_compute_LSE_pipeline.consumer_release(
-                            load_compute_LSE_consumer_state
-                        )
+                        load_compute_LSE_pipeline.consumer_release(load_compute_LSE_consumer_state)
                         load_compute_LSE_consumer_state.advance()
 
-                        mma_compute_S_pipeline.consumer_release(
-                            mma_compute_S_consumer_state
-                        )
+                        mma_compute_S_pipeline.consumer_release(mma_compute_S_consumer_state)
                         mma_compute_S_consumer_state.advance()
 
                     # Reduce
@@ -983,12 +828,8 @@ class FineGrainedReductionQK:
                     compute_iter_index += 1
 
                 # (s_q, k_value, (1, h_k, b))
-                gTopk_scores = cute.flat_divide(
-                    mTopk_scores, (self.epi_tile[0], self.k_value)
-                )
-                gTopk_indices = cute.flat_divide(
-                    mTopk_indices, (self.epi_tile[0], self.k_value)
-                )
+                gTopk_scores = cute.flat_divide(mTopk_scores, (self.epi_tile[0], self.k_value))
+                gTopk_indices = cute.flat_divide(mTopk_indices, (self.epi_tile[0], self.k_value))
                 gTopk_scores = gTopk_scores[None, None, bidx, 0, (0, bidy, bidz)]
                 gTopk_indices = gTopk_indices[None, None, bidx, 0, (0, bidy, bidz)]
                 cTopk = cute.make_identity_tensor((self.epi_tile[0], self.k_value))

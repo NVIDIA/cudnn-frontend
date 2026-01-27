@@ -1,8 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_ReductionDesc.h"
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
@@ -65,42 +62,98 @@ class ReductionNode : public NodeCRTP<ReductionNode> {
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FE_LOG_LABEL("INFO: " << "Building ReductionNode operations " << attributes.name << " ");
 
-        auto reduction_descriptor = cudnn_frontend::ReductionDescBuilder()
-                                        .setComputeType(attributes.compute_data_type)
-                                        .setReductionOp(attributes.get_mode().value())
-                                        .setIsDeterministic(attributes.get_is_deterministic())
-                                        .build();
+        // Create reduction descriptor by directly calling cuDNN backend API
+        ReductionDesc_v8 reduction_descriptor;
 
-        auto&& reduction_operation_builder =
-            cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR);
+        // 1. Create the backend descriptor
 
-        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Reduction_attributes::input_names::X);
-        reduction_operation_builder.setxDesc(*(tensors.at(X->second->get_uid())));
+        _CUDNN_CHECK_CUDNN_ERROR(
+            reduction_descriptor.initialize_managed_backend_pointer(CUDNN_BACKEND_REDUCTION_DESCRIPTOR));
 
-        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Reduction_attributes::output_names::Y);
-        reduction_operation_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
+        // 2. Set compute type attribute
+        cudnnDataType_t cudnn_data_type;
 
-        reduction_operation_builder.setreductionDesc(reduction_descriptor);
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.compute_data_type, cudnn_data_type));
 
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = reduction_operation_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = reduction_operation_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reduction_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_REDUCTION_COMP_TYPE,
+                                                       CUDNN_TYPE_DATA_TYPE,
+                                                       1,
+                                                       &cudnn_data_type));
+
+        // 3. Set reduction operator attribute
+        cudnnReduceTensorOp_t cudnn_reduction_mode;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.get_mode().value(), cudnn_reduction_mode));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reduction_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_REDUCTION_OPERATOR,
+                                                       CUDNN_TYPE_REDUCTION_OPERATOR_TYPE,
+                                                       1,
+                                                       &cudnn_reduction_mode));
+
+        // 4. Set deterministic mode if supported
+#if (CUDNN_VERSION >= 91100)
+        if (detail::get_backend_version() >= 91100) {
+            bool is_deterministic = attributes.get_is_deterministic();
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reduction_descriptor.get_raw_desc(),
+                                                           CUDNN_ATTR_REDUCTION_IS_DETERMINISTIC,
+                                                           CUDNN_TYPE_BOOLEAN,
+                                                           1,
+                                                           &is_deterministic));
         }
 #endif
+
+        // 5. Finalize the descriptor
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(reduction_descriptor.get_raw_desc()));
+        CUDNN_FE_LOG_LABEL_ENDL(reduction_descriptor);
+
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 reduction_operation;
+
+        // Validate input tensors are set
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Reduction_attributes::input_names::X);
+        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Reduction_attributes::output_names::Y);
+
+        // 1. Create the backend operation descriptor
+
+        _CUDNN_CHECK_CUDNN_ERROR(
+            reduction_operation.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR));
+
+        // 2. Set the reduction descriptor attribute
+        auto reduction_desc_ptr = reduction_descriptor.get_raw_desc();
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reduction_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_REDUCTION_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &reduction_desc_ptr));
+
+        // 3. Set the input tensor (X) descriptor attribute
+        auto x_backend_desc = tensors.at(X->second->get_uid())->get_raw_desc();
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reduction_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_REDUCTION_XDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &x_backend_desc));
+
+        // 4. Set the output tensor (Y) descriptor attribute
+        auto y_backend_desc = tensors.at(Y->second->get_uid())->get_raw_desc();
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reduction_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_REDUCTION_YDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &y_backend_desc));
+
+        // 5. Finalize the operation descriptor
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(reduction_operation.get_raw_desc()));
+
+        operations.push_back(std::make_shared<Operation_v8>(std::move(reduction_operation)));
 
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());

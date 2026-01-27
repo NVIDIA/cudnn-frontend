@@ -89,83 +89,47 @@ class SelectionAttention(APIBase):
             t, h_q, d_v = self.sample_o.shape
 
             if self.sample_q.shape != (t, h_q, d_qk):
-                raise ValueError(
-                    f"Input shape mismatch: expected Q tensor shape {t, h_q, d_qk}, got {self.sample_q.shape}"
-                )
+                raise ValueError(f"Input shape mismatch: expected Q tensor shape {t, h_q, d_qk}, got {self.sample_q.shape}")
             if self.sample_k.shape != (t, h_kv, d_qk):
-                raise ValueError(
-                    f"Input shape mismatch: expected K tensor shape {t, h_kv, d_qk}, got {self.sample_k.shape}"
-                )
+                raise ValueError(f"Input shape mismatch: expected K tensor shape {t, h_kv, d_qk}, got {self.sample_k.shape}")
             if self.sample_v.shape != (t, h_kv, d_v):
-                raise ValueError(
-                    f"Input shape mismatch: expected V tensor shape {t, h_kv, d_v}, got {self.sample_v.shape}"
-                )
+                raise ValueError(f"Input shape mismatch: expected V tensor shape {t, h_kv, d_v}, got {self.sample_v.shape}")
             if self.sample_o.shape != (t, h_q, d_v):
-                raise ValueError(
-                    f"Output shape mismatch: expected O tensor shape {t, h_q, d_v}, got {self.sample_o.shape}"
-                )
+                raise ValueError(f"Output shape mismatch: expected O tensor shape {t, h_q, d_v}, got {self.sample_o.shape}")
             self.sample_l = self._unpad_tensor_to_ndim(self.sample_l, 2, "sample_l")
             if self.sample_l.shape != (t, h_q):
-                raise ValueError(
-                    f"Output shape mismatch: expected L tensor shape {t, h_q}, got {self.sample_l.shape}"
-                )
+                raise ValueError(f"Output shape mismatch: expected L tensor shape {t, h_q}, got {self.sample_l.shape}")
             self.sample_m = self._unpad_tensor_to_ndim(self.sample_m, 2, "sample_m")
             if self.sample_m.shape != (t, h_q):
-                raise ValueError(
-                    f"Output shape mismatch: expected M tensor shape {t, h_q}, got {self.sample_m.shape}"
-                )
+                raise ValueError(f"Output shape mismatch: expected M tensor shape {t, h_q}, got {self.sample_m.shape}")
 
             if self.sample_cum_seqlen_q is None:
-                raise ValueError(
-                    f"sample_cum_seqlen_q must be provided for T,H,D format, got {self.sample_cum_seqlen_q}"
-                )
-            if self.sample_cum_seqlen_k is not None and not torch.equal(
-                self.sample_cum_seqlen_q, self.sample_cum_seqlen_k
-            ):
+                raise ValueError(f"sample_cum_seqlen_q must be provided for T,H,D format, got {self.sample_cum_seqlen_q}")
+            if self.sample_cum_seqlen_k is not None and not torch.equal(self.sample_cum_seqlen_q, self.sample_cum_seqlen_k):
                 raise NotImplementedError(
                     f"SelectionAttention requires sample_cum_seqlen_q and sample_cum_seqlen_k to be identical, but got {self.sample_cum_seqlen_q} and {self.sample_cum_seqlen_k}"
                 )
             if self.max_s_q is None:
-                raise ValueError(
-                    f"max_s_q must be provided for T,H,D format, got {self.max_s_q}"
-                )
+                raise ValueError(f"max_s_q must be provided for T,H,D format, got {self.max_s_q}")
             if self.max_s_k is not None and self.max_s_q != self.max_s_k:
-                raise NotImplementedError(
-                    f"SelectionAttention requires max_s_q and max_s_k to be identical, but got {self.max_s_q} and {self.max_s_k}"
-                )
+                raise NotImplementedError(f"SelectionAttention requires max_s_q and max_s_k to be identical, but got {self.max_s_q} and {self.max_s_k}")
 
             self.batch_size = len(self.sample_cum_seqlen_q) - 1
             if self.batch_size <= 0:
-                raise ValueError(
-                    f"batch_size (len(sample_cum_seqlen_q) - 1) must be greater than 0, got {self.batch_size}"
-                )
+                raise ValueError(f"batch_size (len(sample_cum_seqlen_q) - 1) must be greater than 0, got {self.batch_size}")
             if self.sample_cum_seqlen_q.dtype not in (torch.int32, torch.int64):
-                raise ValueError(
-                    f"sample_cum_seqlen_q must be int32 or int64, got {self.sample_cum_seqlen_q.dtype}"
-                )
+                raise ValueError(f"sample_cum_seqlen_q must be int32 or int64, got {self.sample_cum_seqlen_q.dtype}")
 
-            if (
-                self.sample_block_indices.shape[:2] != (t, h_kv)
-                and self.sample_block_indices.ndim != 3
-            ):
-                raise ValueError(
-                    f"sample_block_indices shape mismatch: expected {(t, h_kv, 'K')}, got {tuple(self.sample_block_indices.shape)}"
-                )
+            if self.sample_block_indices.shape[:2] != (t, h_kv) and self.sample_block_indices.ndim != 3:
+                raise ValueError(f"sample_block_indices shape mismatch: expected {(t, h_kv, 'K')}, got {tuple(self.sample_block_indices.shape)}")
             if self.sample_block_counts.shape != (t, h_kv):
-                raise ValueError(
-                    f"sample_block_counts shape mismatch: expected {(t, h_kv)}, got {tuple(self.sample_block_counts.shape)}"
-                )
-            if (
-                self.sample_block_indices.dtype != torch.int32
-                or self.sample_block_counts.dtype != torch.int32
-            ):
+                raise ValueError(f"sample_block_counts shape mismatch: expected {(t, h_kv)}, got {tuple(self.sample_block_counts.shape)}")
+            if self.sample_block_indices.dtype != torch.int32 or self.sample_block_counts.dtype != torch.int32:
                 raise ValueError(
                     f"sample_block_indices and sample_block_counts must be int32, got {self.sample_block_indices.dtype} and {self.sample_block_counts.dtype}"
                 )
         else:
-            raise ValueError(
-                f"sample_q must be rank-3 (T,H,D) or rank-4 (B,H,S,D), got {self.sample_q.ndim}"
-            )
+            raise ValueError(f"sample_q must be rank-3 (T,H,D) or rank-4 (B,H,S,D), got {self.sample_q.ndim}")
 
         # Shared derived attributes
         if h_q % h_kv != 0:
@@ -179,12 +143,7 @@ class SelectionAttention(APIBase):
         # Validate dtypes and config
         self._logger.debug("Checking dtypes and config")
         self.dtype = self.sample_q.dtype
-        if not (
-            self.dtype
-            == self.sample_k.dtype
-            == self.sample_v.dtype
-            == self.sample_o.dtype
-        ):
+        if not (self.dtype == self.sample_k.dtype == self.sample_v.dtype == self.sample_o.dtype):
             raise ValueError("All input/output tensors must have the same dtype")
         if self.dtype not in {torch.float16, torch.bfloat16}:
             raise ValueError("dtype must be Float16 or BFloat16")
@@ -206,12 +165,8 @@ class SelectionAttention(APIBase):
         major, minor = torch.cuda.get_device_capability(device)
         compute_capability = major * 10 + minor
         if compute_capability < 90:
-            self._logger.error(
-                f"Requires SM90+ compute capability, but found SM{compute_capability} on device {device}"
-            )
-            raise RuntimeError(
-                f"Requires SM90+ compute capability, but found SM{compute_capability} on device {device}"
-            )
+            self._logger.error(f"Requires SM90+ compute capability, but found SM{compute_capability} on device {device}")
+            raise RuntimeError(f"Requires SM90+ compute capability, but found SM{compute_capability} on device {device}")
         if compute_capability == 103:
             raise RuntimeError("cuteDSL SelectionAttention is not supported on SM103")
 
@@ -265,29 +220,17 @@ class SelectionAttention(APIBase):
             return original.data_ptr() == reshaped.data_ptr()
 
         if not shares_memory(q, q_reshaped):
-            raise ValueError(
-                "Q tensor memory changed during reshape - expected view operation"
-            )
+            raise ValueError("Q tensor memory changed during reshape - expected view operation")
         if not shares_memory(k, k_reshaped):
-            raise ValueError(
-                "K tensor memory changed during reshape - expected view operation"
-            )
+            raise ValueError("K tensor memory changed during reshape - expected view operation")
         if not shares_memory(v, v_reshaped):
-            raise ValueError(
-                "V tensor memory changed during reshape - expected view operation"
-            )
+            raise ValueError("V tensor memory changed during reshape - expected view operation")
         if not shares_memory(o, o_reshaped):
-            raise ValueError(
-                "O tensor memory changed during reshape - expected view operation"
-            )
+            raise ValueError("O tensor memory changed during reshape - expected view operation")
         if not shares_memory(l, l_reshaped):
-            raise ValueError(
-                "L tensor memory changed during reshape - expected view operation"
-            )
+            raise ValueError("L tensor memory changed during reshape - expected view operation")
         if not shares_memory(m, m_reshaped):
-            raise ValueError(
-                "M tensor memory changed during reshape - expected view operation"
-            )
+            raise ValueError("M tensor memory changed during reshape - expected view operation")
 
         return q_reshaped, k_reshaped, v_reshaped, o_reshaped, l_reshaped, m_reshaped
 
@@ -306,15 +249,13 @@ class SelectionAttention(APIBase):
         )
 
         self._logger.debug("Reshaping tensors to kernel expected format")
-        q_reshaped, k_reshaped, v_reshaped, o_reshaped, l_reshaped, m_reshaped = (
-            self._reshape_tensors(
-                self.sample_q,
-                self.sample_k,
-                self.sample_v,
-                self.sample_o,
-                self.sample_l,
-                self.sample_m,
-            )
+        q_reshaped, k_reshaped, v_reshaped, o_reshaped, l_reshaped, m_reshaped = self._reshape_tensors(
+            self.sample_q,
+            self.sample_k,
+            self.sample_v,
+            self.sample_o,
+            self.sample_l,
+            self.sample_m,
         )
 
         mQ = from_dlpack(q_reshaped, assumed_align=128)
@@ -368,10 +309,8 @@ class SelectionAttention(APIBase):
         self._logger.debug("Reshaping tensors to kernel expected format")
         l_tensor = self._unpad_tensor_to_ndim(l_tensor, 2, "l_tensor")
         m_tensor = self._unpad_tensor_to_ndim(m_tensor, 2, "m_tensor")
-        q_reshaped, k_reshaped, v_reshaped, o_reshaped, l_reshaped, m_reshaped = (
-            self._reshape_tensors(
-                q_tensor, k_tensor, v_tensor, o_tensor, l_tensor, m_tensor
-            )
+        q_reshaped, k_reshaped, v_reshaped, o_reshaped, l_reshaped, m_reshaped = self._reshape_tensors(
+            q_tensor, k_tensor, v_tensor, o_tensor, l_tensor, m_tensor
         )
 
         mQ = from_dlpack(q_reshaped, assumed_align=128)
@@ -461,20 +400,10 @@ def selection_attention_wrapper(
     Returns:
         tuple: (o_tensor, l_tensor, m_tensor) - Output, logsumexp, and max tensors
     """
-    _logger.debug(
-        "selection_attention_wrapper: Creating empty output tensors o, l, and m"
-    )
+    _logger.debug("selection_attention_wrapper: Creating empty output tensors o, l, and m")
 
-    max_s_q = (
-        max(cum_seqlen_q_tensor[1:] - cum_seqlen_q_tensor[:-1]).item()
-        if max_s_q is None
-        else max_s_q
-    )
-    max_s_k = (
-        max(cum_seqlen_k_tensor[1:] - cum_seqlen_k_tensor[:-1]).item()
-        if max_s_k is None
-        else max_s_k
-    )
+    max_s_q = max(cum_seqlen_q_tensor[1:] - cum_seqlen_q_tensor[:-1]).item() if max_s_q is None else max_s_q
+    max_s_k = max(cum_seqlen_k_tensor[1:] - cum_seqlen_k_tensor[:-1]).item() if max_s_k is None else max_s_k
 
     t, h_q, d = q_tensor.shape
     _, h_kv, d_v = v_tensor.shape
@@ -509,9 +438,7 @@ def selection_attention_wrapper(
         max_s_k,
     )
     if cache_key in _cache_of_SelectionAttentionObjects:
-        _logger.debug(
-            "selection_attention_wrapper: Using previously cached SelectionAttention object"
-        )
+        _logger.debug("selection_attention_wrapper: Using previously cached SelectionAttention object")
         selection_attention = _cache_of_SelectionAttentionObjects[cache_key]
         selection_attention.execute(
             q_tensor=q_tensor,
@@ -528,9 +455,7 @@ def selection_attention_wrapper(
             current_stream=stream,
         )
     else:
-        _logger.debug(
-            "selection_attention_wrapper: No previously cached SelectionAttention object found, creating new SelectionAttention object"
-        )
+        _logger.debug("selection_attention_wrapper: No previously cached SelectionAttention object found, creating new SelectionAttention object")
         selection_attention = SelectionAttention(
             sample_q=q_tensor,
             sample_k=k_tensor,

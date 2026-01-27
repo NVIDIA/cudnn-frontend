@@ -15,9 +15,7 @@ def make_tensor_strided_like(
     """
     q_strides = q_tensor.stride()
     rank_out = len(o_shape)
-    order = tuple(
-        sorted(range(min(len(q_strides), rank_out)), key=lambda i: q_strides[i])
-    )
+    order = tuple(sorted(range(min(len(q_strides), rank_out)), key=lambda i: q_strides[i]))
 
     strides = [0] * rank_out
     current = 1

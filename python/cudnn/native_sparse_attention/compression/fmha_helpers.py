@@ -76,9 +76,7 @@ class FmhaStaticTileSchedulerParams:
         for obj, n_items in zip([self.problem_shape_mbh], self._values_pos):
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
-        return FmhaStaticTileSchedulerParams(
-            self.is_persistent, *(tuple(obj_list)), loc=self._loc
-        )
+        return FmhaStaticTileSchedulerParams(self.is_persistent, *(tuple(obj_list)), loc=self._loc)
 
 
 class FmhaStaticTileScheduler:
@@ -135,9 +133,7 @@ class FmhaStaticTileScheduler:
         self._grid_shape = grid_shape
         self._is_persistent = params.is_persistent
         self._current_work_linear_idx = current_work_linear_idx
-        self._problem_shape_mbh = cute.make_layout(
-            params.problem_shape_mbh, loc=loc, ip=ip
-        )
+        self._problem_shape_mbh = cute.make_layout(params.problem_shape_mbh, loc=loc, ip=ip)
         self._num_blocks = cute.size(self._problem_shape_mbh, loc=loc, ip=ip)
         self._is_first_block = True
         self.num_persistent_sm = cute.size(grid_shape, loc=loc, ip=ip)
@@ -210,17 +206,11 @@ class FmhaStaticTileScheduler:
         :return: WorkTileInfo containing tile coordinates and validity flag.
         :rtype: WorkTileInfo
         """
-        is_valid = (
-            self._current_work_linear_idx < self._num_blocks
-            if self._is_persistent
-            else self._is_first_block
-        )
+        is_valid = self._current_work_linear_idx < self._num_blocks if self._is_persistent else self._is_first_block
 
         blk_coord = (0, 0, 0)
         if self._is_persistent:
-            blk_coord = self._problem_shape_mbh.get_hier_coord(
-                self._current_work_linear_idx, loc=loc, ip=ip
-            )
+            blk_coord = self._problem_shape_mbh.get_hier_coord(self._current_work_linear_idx, loc=loc, ip=ip)
         else:
             blk_coord = self._blk_coord
 
@@ -266,14 +256,10 @@ class FmhaStaticTileScheduler:
     def __new_from_mlir_values__(self, values):
         assert len(values) == 10
         new_params = new_from_mlir_values(self._params, values[0:3])
-        new_current_work_linear_idx = new_from_mlir_values(
-            self._current_work_linear_idx, [values[3]]
-        )
+        new_current_work_linear_idx = new_from_mlir_values(self._current_work_linear_idx, [values[3]])
         new_blk_coord = new_from_mlir_values(self._blk_coord, values[4:7])
         new_grid_shape = new_from_mlir_values(self._grid_shape, values[7:])
-        return FmhaStaticTileScheduler(
-            new_params, new_current_work_linear_idx, new_blk_coord, new_grid_shape
-        )
+        return FmhaStaticTileScheduler(new_params, new_current_work_linear_idx, new_blk_coord, new_grid_shape)
 
 
 def create_fmha_static_tile_scheduler(
@@ -425,17 +411,10 @@ class FusedMask:
         """
         result = 0
 
-        offset = (
-            0
-            if cutlass.const_expr(mask_type is not MaskType.WINDOW_MASK_INFERENCE)
-            else seqlen_k - seqlen_q
-        )
+        offset = 0 if cutlass.const_expr(mask_type is not MaskType.WINDOW_MASK_INFERENCE) else seqlen_k - seqlen_q
         if cutlass.const_expr(mask_type == MaskType.RESIDUAL_MASK):
             result = cute.ceil_div(seqlen_k, tile_shape[1])
-        if cutlass.const_expr(
-            mask_type == MaskType.WINDOW_MASK
-            or mask_type == MaskType.WINDOW_MASK_INFERENCE
-        ):
+        if cutlass.const_expr(mask_type == MaskType.WINDOW_MASK or mask_type == MaskType.WINDOW_MASK_INFERENCE):
             if cutlass.const_expr(window_size_right is None):
                 result = cute.ceil_div(seqlen_k, tile_shape[1])
             else:
@@ -447,20 +426,14 @@ class FusedMask:
         elif cutlass.const_expr(mask_type == MaskType.COMPRESSED_CAUSAL_MASK):
             compression_factor = seqlen_q // seqlen_k
 
-            block_end = (
-                (blk_coord[0] + 1) * tile_shape[0] - 1 + offset + window_size_right
-            )
+            block_end = (blk_coord[0] + 1) * tile_shape[0] - 1 + offset + window_size_right
 
-            tmp_blocks_k = cute.ceil_div(
-                ((block_end + 1) // compression_factor), tile_shape[1]
-            )
+            tmp_blocks_k = cute.ceil_div(((block_end + 1) // compression_factor), tile_shape[1])
 
             max_blocks_k = cute.ceil_div(seqlen_k, tile_shape[1])
             result = max(1, min(max_blocks_k, tmp_blocks_k))
 
-        start_block = FusedMask.get_trip_start(
-            mask_type, blk_coord, tile_shape, seqlen_q, seqlen_k, window_size_left
-        )
+        start_block = FusedMask.get_trip_start(mask_type, blk_coord, tile_shape, seqlen_q, seqlen_k, window_size_left)
         result = result - start_block
 
         return result
@@ -493,11 +466,7 @@ class FusedMask:
         :type window_size_right: Optional[Int32]
         """
         result = 0
-        offset = (
-            0
-            if cutlass.const_expr(mask_type is not MaskType.WINDOW_MASK_INFERENCE)
-            else seqlen_k - seqlen_q
-        )
+        offset = 0 if cutlass.const_expr(mask_type is not MaskType.WINDOW_MASK_INFERENCE) else seqlen_k - seqlen_q
         if cutlass.const_expr(window_size_left is not None):
             min_idx_q = blk_coord[0] * tile_shape[0]
             idx_k = min_idx_q + offset - window_size_left
@@ -536,14 +505,8 @@ class FusedMask:
         :return: Tuple of (begin, end) tile idx for the leading mask.
         :rtype: Tuple[Int32, Int32]
         """
-        offset = (
-            0
-            if cutlass.const_expr(mask_type is not MaskType.WINDOW_MASK_INFERENCE)
-            else seqlen_k - seqlen_q
-        )
-        leading_mask_begin = FusedMask.get_trip_start(
-            mask_type, blk_coord, tile_shape, seqlen_q, seqlen_k, window_size_left
-        )
+        offset = 0 if cutlass.const_expr(mask_type is not MaskType.WINDOW_MASK_INFERENCE) else seqlen_k - seqlen_q
+        leading_mask_begin = FusedMask.get_trip_start(mask_type, blk_coord, tile_shape, seqlen_q, seqlen_k, window_size_left)
         trip_count = FusedMask.get_trip_count(
             mask_type,
             blk_coord,
@@ -554,9 +517,7 @@ class FusedMask:
             window_size_right,
         )
         min_idx_q = (blk_coord[0] + 1) * tile_shape[0] + offset - window_size_left
-        leading_mask_end = min(
-            max(min_idx_q // tile_shape[1], 0), trip_count + leading_mask_begin - 1
-        )
+        leading_mask_end = min(max(min_idx_q // tile_shape[1], 0), trip_count + leading_mask_begin - 1)
         return leading_mask_begin, leading_mask_end
 
     @cute.jit
@@ -590,14 +551,8 @@ class FusedMask:
         :return: Tuple of (begin, end) tile idx for the trailing mask.
         :rtype: Tuple[Int32, Int32]
         """
-        offset = (
-            0
-            if cutlass.const_expr(mask_type is not MaskType.WINDOW_MASK_INFERENCE)
-            else seqlen_k - seqlen_q
-        )
-        trip_start = FusedMask.get_trip_start(
-            mask_type, blk_coord, tile_shape, seqlen_q, seqlen_k, window_size_left
-        )
+        offset = 0 if cutlass.const_expr(mask_type is not MaskType.WINDOW_MASK_INFERENCE) else seqlen_k - seqlen_q
+        trip_start = FusedMask.get_trip_start(mask_type, blk_coord, tile_shape, seqlen_q, seqlen_k, window_size_left)
         trip_count = FusedMask.get_trip_count(
             mask_type,
             blk_coord,
@@ -608,9 +563,7 @@ class FusedMask:
             window_size_right,
         )
         min_idx_q = blk_coord[0] * tile_shape[0] + offset + window_size_right
-        trailing_mask_begin = max(
-            min(min_idx_q // tile_shape[1], trip_count + trip_start - 1), 0
-        )
+        trailing_mask_begin = max(min(min_idx_q // tile_shape[1], trip_count + trip_start - 1), 0)
         trailing_mask_end = trip_count + trip_start - 1
         return trailing_mask_begin, trailing_mask_end
 
@@ -700,10 +653,7 @@ class FusedMask:
         """
         result = 0
 
-        if cutlass.const_expr(
-            mask_type == MaskType.WINDOW_MASK
-            or mask_type == MaskType.WINDOW_MASK_INFERENCE
-        ):
+        if cutlass.const_expr(mask_type == MaskType.WINDOW_MASK or mask_type == MaskType.WINDOW_MASK_INFERENCE):
             if cutlass.const_expr(window_size_right is not None):
                 trailing_mask_begin, trailing_mask_end = FusedMask.get_trailing_mask_id(
                     mask_type,
@@ -715,16 +665,14 @@ class FusedMask:
                     window_size_right,
                 )
                 if cutlass.const_expr(window_size_left is not None):
-                    leading_mask_begin, leading_mask_end = (
-                        FusedMask.get_leading_mask_id(
-                            mask_type,
-                            blk_coord,
-                            tile_shape,
-                            seqlen_q,
-                            seqlen_k,
-                            window_size_left,
-                            window_size_right,
-                        )
+                    leading_mask_begin, leading_mask_end = FusedMask.get_leading_mask_id(
+                        mask_type,
+                        blk_coord,
+                        tile_shape,
+                        seqlen_q,
+                        seqlen_k,
+                        window_size_left,
+                        window_size_right,
                     )
                     if trailing_mask_begin <= leading_mask_end:
                         result = trailing_mask_end - leading_mask_end
@@ -865,14 +813,10 @@ class FusedMask:
             offset = seqlen_k - seqlen_q
         for i in cutlass.range(cute.size(acc_qk)):
             index_q, index_k = index_qk[i]
-            if cutlass.const_expr(
-                window_size_left is not None or window_size_right is not None
-            ):
+            if cutlass.const_expr(window_size_left is not None or window_size_right is not None):
                 if cutlass.const_expr(mask_type == MaskType.COMPRESSED_CAUSAL_MASK):
                     compression_factor = seqlen_q // seqlen_k
-                    if (
-                        index_q + 1
-                    ) // compression_factor - 1 < index_k or index_k >= seqlen_k:
+                    if (index_q + 1) // compression_factor - 1 < index_k or index_k >= seqlen_k:
                         acc_qk[i] = -Float32.inf
                     if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
                         acc_qk[i] = -Float32.inf

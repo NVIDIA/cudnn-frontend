@@ -969,6 +969,12 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             is_deterministic_algorithm_supported_on_blackwell = true;
         }
 
+        if(detail::get_backend_version() >= 91801) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop.major || 12 == prop.major) && attributes.is_deterministic_algorithm,
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Deterministic algorithm is not supported for bprop thd on SM8X and SM12X GPUs");
+        }
+
         // version specific validation
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 8906 && ((s_kv % 64 != 0) || (d_qk % 64 != 0)),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -1041,6 +1047,18 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             CUDNN_FE_LOG_LABEL_ENDL("WARNING: sdpa_backward.attributes.max_total_seq_len has been set, but d is not a multiple of 16 has a known functional issue. The workspace memory size required to execute this graph may be unexpectedly large");
             attributes.max_total_seq_len_q.reset();
             attributes.max_total_seq_len_kv.reset();
+        }
+
+
+        if(detail::get_backend_version() >= 91801) {
+            cudaDeviceProp prop;
+            int device;
+            _CUDNN_CHECK_CUDA_ERROR(detail::cuda_get_device(&device));
+            _CUDNN_CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, device));
+            if((8 == prop.major || 12 == prop.major) && (attributes.max_total_seq_len_q.has_value() || attributes.max_total_seq_len_kv.has_value())) {
+                attributes.max_total_seq_len_q.reset();
+                attributes.max_total_seq_len_kv.reset();
+            }
         }
         // clang-format on
 

@@ -57,9 +57,7 @@ create_sdpa_forward_graph(int64_t const b,
                           float const attn_scale    = 1.0f,
                           bool const generate_stats = true,
                           bool const causal_mask    = false,
-                          bool const alibi_mask     = false,
-                          bool const padding_mask   = false,
-                          bool has_attn_bias        = false) {
+                          bool const padding_mask   = false) {
     // Create a graph and set common global properties.
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(fe::DataType_t::BFLOAT16)
@@ -87,22 +85,11 @@ create_sdpa_forward_graph(int64_t const b,
     auto sdpa_options = fe::graph::SDPA_attributes()
                             .set_name("flash_attention")
                             .set_generate_stats(generate_stats)
-                            .set_alibi_mask(alibi_mask)
                             .set_attn_scale(attn_scale);
 
     if (causal_mask) {
         sdpa_options.set_diagonal_alignment(cudnn_frontend::DiagonalAlignment_t::TOP_LEFT)
             .set_diagonal_band_right_bound(0);
-    }
-
-    if (has_attn_bias) {
-        auto bias = graph->tensor(fe::graph::Tensor_attributes()
-                                      .set_name("bias")
-                                      .set_uid(BIAS_UID)
-                                      .set_data_type(fe::DataType_t::HALF)
-                                      .set_dim({b, 1, s_q, s_kv})
-                                      .set_stride({s_q * s_kv, s_q * s_kv, s_kv, 1}));
-        sdpa_options.set_bias(bias);
     }
 
     if (padding_mask) {
@@ -147,8 +134,6 @@ TEST_CASE("Toy sdpa forward", "[graph][sdpa][flash][forward]") {
     float attn_scale    = 0.123f;
     bool causal_mask    = true;
     bool padding_mask   = (cudnnGetVersion() >= 8903);
-    bool alibi_mask     = (cudnnGetVersion() >= 8904);
-    bool has_attn_bias  = (cudnnGetVersion() >= 8903);
 
     if (cudnnGetVersion() < 8903) {
         SKIP("Test requires cudnn 8.9.3 or above");
@@ -159,20 +144,8 @@ TEST_CASE("Toy sdpa forward", "[graph][sdpa][flash][forward]") {
     auto handle_ptr = create_cudnn_handle();
     auto handle     = *handle_ptr;
 
-    auto graph = create_sdpa_forward_graph(b,
-                                           h_q,
-                                           h_k,
-                                           h_v,
-                                           s_q,
-                                           s_kv,
-                                           d_qk,
-                                           d_v,
-                                           attn_scale,
-                                           generate_stats,
-                                           causal_mask,
-                                           alibi_mask,
-                                           padding_mask,
-                                           has_attn_bias);
+    auto graph = create_sdpa_forward_graph(
+        b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v, attn_scale, generate_stats, causal_mask, padding_mask);
 
     REQUIRE(graph->build(handle, {fe::HeurMode_t::A}).is_good());
 
@@ -187,9 +160,6 @@ TEST_CASE("Toy sdpa forward", "[graph][sdpa][flash][forward]") {
         {Q_UID, q_tensor.devPtr}, {K_UID, k_tensor.devPtr}, {V_UID, v_tensor.devPtr}, {O_UID, o_tensor.devPtr}};
 
     Surface<half> bias_tensor(b * 1 * s_q * s_kv, false);
-    if (has_attn_bias) {
-        variant_pack[BIAS_UID] = bias_tensor.devPtr;
-    }
 
     Surface<int32_t> devActualSeqlenQ(b, false);
     Surface<int32_t> devActualSeqlenKV(b, false);

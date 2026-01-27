@@ -20,6 +20,33 @@ execute(cudnnHandle_t handle,
         ExecutionPlan* plan,
         std::vector<void*>& device_ptrs,
         std::vector<int64_t> const& uids,
+        void* workspace_ptr,
+        std::vector<int64_t> const& override_uids,
+        std::vector<std::vector<int64_t>> const& override_shapes,
+        std::vector<std::vector<int64_t>> const& override_strides) {
+    // TODO: below line fails with MSVC. warning C4127: conditional expression is constant
+    // RETURN_CUDNN_FRONTEND_ERROR_IF(!plan, error_code_t::GRAPH_EXECUTION_FAILED, "No plan found to execute!!");
+    CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing " << plan->getTag() << "...");
+
+    backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
+    RETURN_CUDNN_FRONTEND_ERROR_IF(variant_pack_descriptor.get_status() != CUDNN_STATUS_SUCCESS,
+                                   error_code_t::CUDNN_BACKEND_API_FAILED,
+                                   "Failed to create variant pack's backend descriptor.");
+
+    CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(
+        variant_pack_descriptor, device_ptrs, uids, workspace_ptr, override_uids, override_shapes, override_strides));
+    _CUDNN_CHECK_CUDNN_ERROR(execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()));
+
+    CUDNN_FE_LOG_LABEL_ENDL("INFO: Executed " << plan->getTag() << ".");
+
+    return {error_code_t::OK, ""};
+}
+
+inline error_t
+execute(cudnnHandle_t handle,
+        ExecutionPlan* plan,
+        std::vector<void*>& device_ptrs,
+        std::vector<int64_t> const& uids,
         void* workspace_ptr) {
     // TODO: below line fails with MSVC. warning C4127: conditional expression is constant
     // RETURN_CUDNN_FRONTEND_ERROR_IF(!plan, error_code_t::GRAPH_EXECUTION_FAILED, "No plan found to execute!!");

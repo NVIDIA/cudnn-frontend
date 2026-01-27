@@ -181,7 +181,10 @@ class ICudnn {
     execute_cudnn_plan_with_uid(cudnnHandle_t handle,
                                 std::unordered_map<int64_t, void*> const& tensor_uid_to_pointer_map,
                                 void* workspace_ptr,
-                                int64_t plan_index) const {
+                                int64_t plan_index,
+                                std::vector<int64_t> const& override_uids,
+                                std::vector<std::vector<int64_t>> const& override_shapes,
+                                std::vector<std::vector<int64_t>> const& override_strides) const {
         // Make sure device pointer is provided for all uids expected for this plan
         std::vector<void*> device_ptrs;
         std::vector<uid_t> uids;
@@ -196,10 +199,22 @@ class ICudnn {
 
         CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(plan_index));
 
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing plan at index " << plan_index << ".");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing plan at index " << plan_index
+                                                                 << " with override uids: " << override_uids.size());
 
-        CHECK_CUDNN_FRONTEND_ERROR(
-            detail::execute(handle, plans.execution_plans[plan_index].get(), device_ptrs, uids, workspace_ptr));
+        if (override_uids.size() == 0) {
+            CHECK_CUDNN_FRONTEND_ERROR(
+                detail::execute(handle, plans.execution_plans[plan_index].get(), device_ptrs, uids, workspace_ptr));
+        } else {
+            CHECK_CUDNN_FRONTEND_ERROR(detail::execute(handle,
+                                                       plans.execution_plans[plan_index].get(),
+                                                       device_ptrs,
+                                                       uids,
+                                                       workspace_ptr,
+                                                       override_uids,
+                                                       override_shapes,
+                                                       override_strides));
+        }
 
         return {error_code_t::OK, ""};
     }

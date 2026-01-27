@@ -23,9 +23,7 @@ def conv_reduce_cache_key(handle, X_gpu, W_gpu):
 @cudnn.graph_cache(key_fn=conv_reduce_cache_key)
 def create_conv_reduce_graph(handle, X_gpu, W_gpu):
     with cudnn.graph(handle) as (g, _):
-        print(
-            f"Creating graph with X_gpu shape: {X_gpu.shape} and W_gpu shape: {W_gpu.shape}"
-        )
+        print(f"Creating graph with X_gpu shape: {X_gpu.shape} and W_gpu shape: {W_gpu.shape}")
         X = g.tensor_like(X_gpu)
         W = g.tensor_like(W_gpu)
         Y_conv = g.conv_fprop(X, W, padding=[1, 1], stride=[1, 1], dilation=[1, 1])
@@ -45,17 +43,11 @@ def test_reduction(cudnn_handle):
     padding = stride = dilation = [1, 1]
 
     # Reference
-    X_gpu = torch.randn(N, C, H, W, dtype=torch.float16, device="cuda").to(
-        memory_format=torch.channels_last
-    )
-    W_gpu = torch.randn(K, C, R, S, dtype=torch.float16, device="cuda").to(
-        memory_format=torch.channels_last
-    )
+    X_gpu = torch.randn(N, C, H, W, dtype=torch.float16, device="cuda").to(memory_format=torch.channels_last)
+    W_gpu = torch.randn(K, C, R, S, dtype=torch.float16, device="cuda").to(memory_format=torch.channels_last)
     # Perform convolution using FP32 computation while input and filter remain in FP16
-    with torch.cuda.amp.autocast(dtype=torch.float32):
-        conv_output = torch.nn.functional.conv2d(
-            X_gpu, W_gpu, padding=padding, stride=stride, dilation=dilation
-        )
+    with torch.amp.autocast("cuda", dtype=torch.float32):
+        conv_output = torch.nn.functional.conv2d(X_gpu, W_gpu, padding=padding, stride=stride, dilation=dilation)
         Y_expected = conv_output.sum(dim=1)
 
     stream = torch.cuda.current_stream().cuda_stream
@@ -67,12 +59,8 @@ def test_reduction(cudnn_handle):
 
     X_uid, W_uid, Y_uid = uids
 
-    X_gpu_2 = torch.randn(N, C, H, W, dtype=torch.float16, device="cuda").to(
-        memory_format=torch.channels_last
-    )
-    W_gpu_2 = torch.randn(K, C, R, S, dtype=torch.float16, device="cuda").to(
-        memory_format=torch.channels_last
-    )
+    X_gpu_2 = torch.randn(N, C, H, W, dtype=torch.float16, device="cuda").to(memory_format=torch.channels_last)
+    W_gpu_2 = torch.randn(K, C, R, S, dtype=torch.float16, device="cuda").to(memory_format=torch.channels_last)
 
     g2, uids2 = create_conv_reduce_graph(cudnn_handle, X_gpu_2, W_gpu_2)
 
@@ -88,9 +76,7 @@ def test_reduction(cudnn_handle):
 
     workspace = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
-    g.execute(
-        {X_uid: X_gpu, W_uid: W_gpu, Y_uid: Y_actual}, workspace, handle=cudnn_handle
-    )
+    g.execute({X_uid: X_gpu, W_uid: W_gpu, Y_uid: Y_actual}, workspace, handle=cudnn_handle)
 
     # g.execute(
     #     {X_uid: X_gpu_2, W_uid: W_gpu_2, Y_uid: Y_actual_2}, workspace, handle=cudnn_handle

@@ -19,9 +19,7 @@ def convert_thd_to_bshd(thd_tensor, seq_len: torch.Tensor, s: int):
     b = seq_len.size(0)
     seq_len = seq_len.flatten()
 
-    bshd_tensor = torch.zeros(
-        (b, s, h, d), dtype=thd_tensor.dtype, device=thd_tensor.device
-    )
+    bshd_tensor = torch.zeros((b, s, h, d), dtype=thd_tensor.dtype, device=thd_tensor.device)
 
     cumulative_seq_len = torch.cumsum(seq_len, dim=0) - seq_len
     for bi in range(b):
@@ -43,9 +41,7 @@ def convert_bshd_to_thd(bshd_tensor, seq_len: torch.Tensor, maxT: int):
     assert seq_len.size(1) == seq_len.size(2) == seq_len.size(3) == 1
     seq_len = seq_len.flatten()
 
-    thd_tensor = torch.zeros(
-        (maxT, h, d), dtype=bshd_tensor.dtype, device=bshd_tensor.device
-    )
+    thd_tensor = torch.zeros((maxT, h, d), dtype=bshd_tensor.dtype, device=bshd_tensor.device)
 
     # Interpret input as (b, s, h, d) in memory while keeping the (b, h, s, d) layout
     bshd_base = bshd_tensor.permute(0, 2, 1, 3)
@@ -142,16 +138,10 @@ def run_ref_nsa_selection_attention(
                 dtype=torch.float32,
             )
             seq_block_counts = block_counts[seq_offset:seq_end, h]  # [seq_len]
-            seq_block_indices = block_indices[
-                seq_offset:seq_end, h, :
-            ]  # [seq_len, topk_size]
+            seq_block_indices = block_indices[seq_offset:seq_end, h, :]  # [seq_len, topk_size]
             topk_size = seq_block_indices.size(-1)
-            block_range = torch.arange(topk_size, device=mask.device).unsqueeze(
-                0
-            )  # [1, topk_size]
-            valid_mask = block_range < seq_block_counts.unsqueeze(
-                1
-            )  # [seq_len, topk_size]
+            block_range = torch.arange(topk_size, device=mask.device).unsqueeze(0)  # [1, topk_size]
+            valid_mask = block_range < seq_block_counts.unsqueeze(1)  # [seq_len, topk_size]
 
             query_indices, block_indices_flat = torch.where(valid_mask)
             if len(query_indices) > 0:
@@ -163,27 +153,17 @@ def run_ref_nsa_selection_attention(
                 max_block_size = block_sizes.max().item() if len(block_sizes) > 0 else 0
 
                 if max_block_size > 0:
-                    offsets = torch.arange(
-                        max_block_size, device=mask.device
-                    )  # [max_block_size]
+                    offsets = torch.arange(max_block_size, device=mask.device)  # [max_block_size]
 
                     num_blocks = len(block_ids)
-                    offsets_expanded = offsets.unsqueeze(0).expand(
-                        num_blocks, -1
-                    )  # [num_blocks, max_block_size]
+                    offsets_expanded = offsets.unsqueeze(0).expand(num_blocks, -1)  # [num_blocks, max_block_size]
                     block_sizes_expanded = block_sizes.unsqueeze(1)  # [num_blocks, 1]
                     token_starts_expanded = token_starts.unsqueeze(1)  # [num_blocks, 1]
-                    query_indices_expanded = query_indices.unsqueeze(
-                        1
-                    )  # [num_blocks, 1]
+                    query_indices_expanded = query_indices.unsqueeze(1)  # [num_blocks, 1]
 
-                    position_valid = (
-                        offsets_expanded < block_sizes_expanded
-                    )  # [num_blocks, max_block_size]
+                    position_valid = offsets_expanded < block_sizes_expanded  # [num_blocks, max_block_size]
 
-                    token_positions = (
-                        token_starts_expanded + offsets_expanded
-                    )  # [num_blocks, max_block_size]
+                    token_positions = token_starts_expanded + offsets_expanded  # [num_blocks, max_block_size]
 
                     valid_positions = torch.where(position_valid)
                     if len(valid_positions[0]) > 0:
@@ -196,39 +176,25 @@ def run_ref_nsa_selection_attention(
                         mask[final_query_indices, final_key_indices] = 0.0
 
             # Step 3: Apply mask to attention scores
-            qk_scores_fp32 = qk_scores.float() + mask.unsqueeze(
-                1
-            )  # [seq_len, 1, seq_len] -> [seq_len, GQA_group_size, seq_len]
+            qk_scores_fp32 = qk_scores.float() + mask.unsqueeze(1)  # [seq_len, 1, seq_len] -> [seq_len, GQA_group_size, seq_len]
 
             # Step 4: Compute softmax
-            qk_max = torch.max(qk_scores_fp32, dim=-1, keepdim=True)[
-                0
-            ]  # [seq_len, GQA_group_size, 1]
-            qk_exp = torch.exp(
-                qk_scores_fp32 - qk_max
-            )  # [seq_len, GQA_group_size, seq_len]
-            qk_sum = torch.sum(
-                qk_exp, dim=-1, keepdim=True
-            )  # [seq_len, GQA_group_size, 1]
+            qk_max = torch.max(qk_scores_fp32, dim=-1, keepdim=True)[0]  # [seq_len, GQA_group_size, 1]
+            qk_exp = torch.exp(qk_scores_fp32 - qk_max)  # [seq_len, GQA_group_size, seq_len]
+            qk_sum = torch.sum(qk_exp, dim=-1, keepdim=True)  # [seq_len, GQA_group_size, 1]
             attn_weights = qk_exp / qk_sum  # [seq_len, GQA_group_size, seq_len]
 
             # Step 5: Compute output O = attention_weights @ V
             # attn_weights: [seq_len, GQA_group_size, seq_len] @ v_seq: [seq_len, d_v] -> [seq_len, GQA_group_size, d_v]
-            output = torch.matmul(
-                attn_weights, v_seq.float()
-            )  # [seq_len, GQA_group_size, d_v]
+            output = torch.matmul(attn_weights, v_seq.float())  # [seq_len, GQA_group_size, d_v]
 
             # Store results
             O[seq_offset:seq_end, h, :, :] = output.to(dtype)
 
             # Store L (sum of exp) and M (max) statistics - reusing computed values
             # L should store the sum of exponentials (row_sum), not logsumexp, to match reference
-            L[seq_offset:seq_end, h, :] = qk_sum.squeeze(
-                -1
-            )  # [seq_len, GQA_group_size]
-            M[seq_offset:seq_end, h, :] = qk_max.squeeze(
-                -1
-            )  # [seq_len, GQA_group_size]
+            L[seq_offset:seq_end, h, :] = qk_sum.squeeze(-1)  # [seq_len, GQA_group_size]
+            M[seq_offset:seq_end, h, :] = qk_max.squeeze(-1)  # [seq_len, GQA_group_size]
 
         seq_offset = seq_end
 
@@ -287,9 +253,7 @@ def run_ref_nsa_compression_attention(
         q_coords = torch.arange(0, s_q_i, device=s_i.device).view(-1, 1)
         num_compress_blocks = s_k_i
         stride = max(1, s_q_i // max(1, s_k_i))
-        k_coords = (
-            ((torch.arange(0, num_compress_blocks, device=s_i.device) + 1) * stride) - 1
-        ).view(1, -1)
+        k_coords = (((torch.arange(0, num_compress_blocks, device=s_i.device) + 1) * stride) - 1).view(1, -1)
         _mask = k_coords > q_coords
         s_i = s_i.masked_fill(_mask, -torch.inf)
 
@@ -469,19 +433,11 @@ def check_ref_nsa_compression_attention(
         )
         return
     scale_softmax = (
-        scale_softmax
-        if scale_softmax is not None
-        else (
-            test_config["scale_softmax"]
-            if test_config is not None
-            else 1.0 / math.sqrt(test_config["d_qk"])
-        )
+        scale_softmax if scale_softmax is not None else (test_config["scale_softmax"] if test_config is not None else 1.0 / math.sqrt(test_config["d_qk"]))
     )
 
     if test_config["layout"] == "thd":
-        assert (
-            "actual_s_q" in test_config
-        ), "actual_s_q is required when using T,H,D layout"
+        assert "actual_s_q" in test_config, "actual_s_q is required when using T,H,D layout"
         seq_len_q = test_config["actual_s_q"].to(device=Q.device)
         max_seq_len_q = int(seq_len_q.max().item())
 
@@ -501,9 +457,7 @@ def check_ref_nsa_compression_attention(
 
         # Convert O_ref back to THD for comparison
         total_T = int(seq_len_q.sum().item())
-        O_ref_thd = convert_bshd_to_thd(O_ref_bshd, seq_len_q, total_T).to(
-            dtype=O.dtype
-        )
+        O_ref_thd = convert_bshd_to_thd(O_ref_bshd, seq_len_q, total_T).to(dtype=O.dtype)
         torch.testing.assert_close(O, O_ref_thd, atol=atol, rtol=rtol)
 
         if LSE is not None:

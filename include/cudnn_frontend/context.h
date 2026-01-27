@@ -10,6 +10,7 @@ class Context {
     DataType_t io_data_type           = DataType_t::NOT_SET;
     int32_t target_sm_count           = -1;
     int32_t target_sm_version         = -1;
+    bool is_dynamic_shape_enabled     = false;
 
     std::string name = "";
 
@@ -68,6 +69,17 @@ class Context {
     set_sm_version(int32_t version) {
         target_sm_version = version;
         return *this;
+    }
+
+    Context&
+    set_dynamic_shape_enabled(bool is_enabled) {
+        is_dynamic_shape_enabled = is_enabled;
+        return *this;
+    }
+
+    bool
+    get_dynamic_shape_enabled() const {
+        return is_dynamic_shape_enabled;
     }
 
     int32_t

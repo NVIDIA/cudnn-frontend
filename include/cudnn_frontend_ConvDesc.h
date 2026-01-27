@@ -23,6 +23,22 @@
 #pragma once
 
 #include <algorithm>
+
+namespace cudnn_frontend {
+namespace graph {
+class ConvolutionNode;
+}
+}  // namespace cudnn_frontend
+namespace cudnn_frontend {
+namespace graph {
+class DgradNode;
+}
+}  // namespace cudnn_frontend
+namespace cudnn_frontend {
+namespace graph {
+class WgradNode;
+}
+}  // namespace cudnn_frontend
 #include <array>
 #include <functional>
 #include <memory>
@@ -51,6 +67,9 @@ namespace cudnn_frontend {
 class ConvDesc_v8 : public BackendDescriptor {
    public:
     friend class ConvDescBuilder_v8;
+    friend class cudnn_frontend::graph::ConvolutionNode;
+    friend class cudnn_frontend::graph::DgradNode;
+    friend class cudnn_frontend::graph::WgradNode;
     std::string
     describe() const override {
         std::stringstream ss;

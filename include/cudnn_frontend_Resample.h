@@ -32,6 +32,12 @@
 #include "cudnn_frontend_utils.h"
 
 namespace cudnn_frontend {
+namespace graph {
+class ResampleNode;
+}
+}  // namespace cudnn_frontend
+
+namespace cudnn_frontend {
 
 ///
 /// Resample Descriptor Class
@@ -44,6 +50,7 @@ namespace cudnn_frontend {
 class ResampleDesc_v8 : public BackendDescriptor {
    public:
     friend class ResampleDescBuilder_v8;
+    friend class graph::ResampleNode;
     std::string
     describe() const override {
         std::stringstream ss;

@@ -29,6 +29,11 @@ except Exception:
     cvt_sf_MKL_to_M32x4xrm_K4xrk_L = None
 
 
+def ceil_div(a: int, b: int) -> int:
+    """Compute ceiling division of a by b."""
+    return (a + b - 1) // b
+
+
 def create_and_permute_tensor(l, mode0, mode1, is_mode0_major, dtype):
     # is_mode0_major: (l, mode1, mode0) -> (mode0, mode1, l)
     # else: (l, mode0, mode1) -> (mode0, mode1, l)
@@ -47,38 +52,44 @@ def create_and_permute_tensor(l, mode0, mode1, is_mode0_major, dtype):
 
     # Generate random values according to dtype support
     if dtype in {torch.int8, torch.int16, torch.int32, torch.int64}:
-        ref_tensor = torch.randint(
-            int(min_val), int(max_val), shape, dtype=torch.int32, device="cuda"
-        ).permute(permute_order)
+        ref_tensor = torch.randint(int(min_val), int(max_val), shape, dtype=torch.int32, device="cuda").permute(permute_order)
         dtype_tensor = ref_tensor.to(dtype)
     if dtype not in {torch.float4_e2m1fn_x2, torch.uint8}:
-        dtype_tensor = (
-            torch.empty(shape, dtype=torch.float32, device="cuda")
-            .uniform_(float(min_val), float(max_val))
-            .permute(permute_order)
-            .to(dtype)
-        )
+        dtype_tensor = torch.empty(shape, dtype=torch.float32, device="cuda").uniform_(float(min_val), float(max_val)).permute(permute_order).to(dtype)
         ref_tensor = dtype_tensor.to(torch.float32)
     else:
         dtype_tensor = _bfloat16_to_float4_e2m1fn_x2(
-            torch.empty(shape, dtype=torch.float32, device="cuda")
-            .uniform_(float(min_val), float(max_val))
-            .to(torch.bfloat16)
+            torch.empty(shape, dtype=torch.float32, device="cuda").uniform_(float(min_val), float(max_val)).to(torch.bfloat16)
         )
-        ref_tensor = (
-            float4_e2m1fn_x2_to_float32(dtype_tensor)
-            .to(torch.float32)
-            .permute(permute_order)
-        )
+        ref_tensor = float4_e2m1fn_x2_to_float32(dtype_tensor).to(torch.float32).permute(permute_order)
         dtype_tensor = dtype_tensor.permute(permute_order).view(dtype)
 
     return ref_tensor, dtype_tensor
 
 
-def create_sf_layout_tensor(l, mn, nk, sf_vec_size):
-    def ceil_div(a, b):
-        return (a + b - 1) // b
+def compute_reference_amax(output_tensor: torch.Tensor) -> float:
+    """
+    Compute reference amax value on CPU.
 
+    Args:
+        output_tensor: torch.Tensor, GEMM output result (CPU tensor)
+
+    Returns:
+        float: reference amax value
+    """
+    # Ensure FP32 for computation
+    if output_tensor.dtype != torch.float32:
+        output_fp32 = output_tensor.float()
+    else:
+        output_fp32 = output_tensor
+
+    # Compute absolute maximum value
+    reference_amax = torch.amax(torch.abs(output_fp32))
+
+    return reference_amax.item()
+
+
+def create_sf_layout_tensor(l, mn, nk, sf_vec_size):
     sf_k = ceil_div(nk, sf_vec_size)
 
     atom_m = (32, 4)
@@ -95,9 +106,7 @@ def create_sf_layout_tensor(l, mn, nk, sf_vec_size):
     mma_permute_order = (3, 4, 1, 5, 2, 0)
 
     # Create f32 cute torch tensor (cpu)
-    cute_f32_torch_tensor_cpu = torch.zeros(mma_shape, dtype=torch.float32).permute(
-        mma_permute_order
-    )
+    cute_f32_torch_tensor_cpu = torch.zeros(mma_shape, dtype=torch.float32).permute(mma_permute_order)
 
     return cute_f32_torch_tensor_cpu, sf_k
 
@@ -109,13 +118,7 @@ def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):
     ref_permute_order = (1, 2, 0)
 
     # Create f32 ref torch tensor (cpu)
-    ref_f32_torch_tensor_cpu = (
-        torch.empty(ref_shape, dtype=torch.float32)
-        .uniform_(1, 3)
-        .permute(ref_permute_order)
-        .to(torch.int8)
-        .to(torch.float32)
-    )
+    ref_f32_torch_tensor_cpu = torch.empty(ref_shape, dtype=torch.float32).uniform_(1, 3).permute(ref_permute_order).to(torch.int8).to(torch.float32)
 
     # convert ref f32 tensor to cute f32 tensor
     try:
@@ -126,25 +129,17 @@ def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):
             from_dlpack(cute_f32_torch_tensor_cpu),
         )
     except Exception:
-        pytest.skip(
-            "CUTLASS is not installed; skipping tests due to scale factor tensor creation requiring CUTLASS."
-        )
+        pytest.skip("CUTLASS is not installed; skipping tests due to scale factor tensor creation requiring CUTLASS.")
 
     # reshape makes memory contiguous
     ref_f32_torch_tensor_cpu = (
-        ref_f32_torch_tensor_cpu.permute(2, 0, 1)
-        .unsqueeze(-1)
-        .expand(l, mn, sf_k, sf_vec_size)
-        .reshape(l, mn, sf_k * sf_vec_size)
-        .permute(*ref_permute_order)
+        ref_f32_torch_tensor_cpu.permute(2, 0, 1).unsqueeze(-1).expand(l, mn, sf_k, sf_vec_size).reshape(l, mn, sf_k * sf_vec_size).permute(*ref_permute_order)
     )
     ref_f32_torch_tensor_cpu = ref_f32_torch_tensor_cpu[:, :k, :]
 
     if dtype != torch.int8:
         cute_torch_tensor = cute_f32_torch_tensor_cpu.to(dtype).cuda()
     else:
-        cute_torch_tensor = (
-            cute_f32_torch_tensor_cpu.to(torch.float8_e8m0fnu).cuda().view(dtype)
-        )
+        cute_torch_tensor = cute_f32_torch_tensor_cpu.to(torch.float8_e8m0fnu).cuda().view(dtype)
 
     return ref_f32_torch_tensor_cpu.cuda(), cute_torch_tensor

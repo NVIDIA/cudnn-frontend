@@ -60,7 +60,8 @@ class PyGraph {
             py::object sm_count,
             py::object sm_version,
             std::shared_ptr<KernelCache> kernel_cache,
-            std::shared_ptr<cudnn_frontend::DeviceProperties> device_properties)
+            std::shared_ptr<cudnn_frontend::DeviceProperties> device_properties,
+            bool is_dynamic_shape_enabled)
         : graph(std::make_shared<cudnn_frontend::graph::Graph>()) {
         graph->set_compute_data_type(compute_data_type)
             .set_intermediate_data_type(intermediate_data_type)
@@ -82,6 +83,10 @@ class PyGraph {
 
         if (sm_version.is(py::none()) == false) {
             graph->set_sm_version(sm_version.cast<int32_t>());
+        }
+
+        if (is_dynamic_shape_enabled) {
+            graph->set_dynamic_shape_enabled(true);
         }
 
         if (kernel_cache) {
@@ -475,6 +480,7 @@ class PyGraph {
                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
                       bool const use_causal_mask,
                       bool const use_causal_mask_bottom_right,
+                      bool const use_deterministic_algorithm,
                       py::object const& dropout,
                       cudnn_frontend::DataType_t const& compute_data_type,
                       std::string const& name);
@@ -542,13 +548,21 @@ class PyGraph {
                       std::intptr_t cuda_graph);
 
     void
-    execute(std::unordered_map<int64_t, int64_t> var_pack, int64_t workspace, std::optional<std::intptr_t>);
+    execute(std::unordered_map<int64_t, int64_t> var_pack,
+            int64_t workspace,
+            std::optional<std::intptr_t>,
+            py::object override_uids    = py::none(),
+            py::object override_shapes  = py::none(),
+            py::object override_strides = py::none());
 
     void
     execute_plan_at_index(std::unordered_map<int64_t, int64_t> var_pack,
                           int64_t workspace,
                           int64_t index,
-                          std::optional<std::intptr_t>);
+                          std::optional<std::intptr_t>,
+                          py::object override_uids    = py::none(),
+                          py::object override_shapes  = py::none(),
+                          py::object override_strides = py::none());
 
     std::vector<BehaviorNote_t>
     get_behavior_notes();

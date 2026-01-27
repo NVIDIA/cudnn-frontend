@@ -17,6 +17,9 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
     using input_names  = SDPA_fp8_backward_attributes::input_names;
     using output_names = SDPA_fp8_backward_attributes::output_names;
 
+   private:
+    mutable bool is_deterministic_algorithm_supported_on_blackwell = false;  // Will be edited in pre_validate_node()
+
    public:
     SDPA_fp8_backward_attributes attributes;
 
@@ -106,9 +109,13 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
         // validate basic dimension requirements
         if(prop.major >= 10) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 16 != 0) || (d_v > 128) || (d_v % 16 != 0),
+            RETURN_CUDNN_FRONTEND_ERROR_IF(((d_qk > 128) || (d_qk % 16 != 0)) && !(d_qk == 192 && d_v == 128),
                                             error_code_t::GRAPH_NOT_SUPPORTED,
-                                            "hidden_dim shoud be less than 128 and hidden_dim should be multiple of 16");
+                                            "hidden_dim d_qk shoud be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128");
+
+            RETURN_CUDNN_FRONTEND_ERROR_IF(((d_v > 128) || (d_v % 16 != 0)),
+                                            error_code_t::GRAPH_NOT_SUPPORTED,
+                                            "hidden_dim d_v shoud be less than or equal to 128 and hidden_dim d_v should be multiple of 16");
         }
         else {
             RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk != 128) || (d_qk % 16 != 0) || (d_v != 128) || (d_v % 16 != 0),
@@ -185,6 +192,20 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_intermediate_data_type() == DataType_t::NOT_SET,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Intermediate tensor data type needs to be set as internal tensors require it.");
+
+        // validate options for deterministic algorithm
+        if (attributes.is_deterministic_algorithm && (prop.major == 10)) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF((detail::get_backend_version() < 91900),
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "FP8 deterministic algorithm is not supported on blackwell architecture with cudnn version below 9.19.0");
+
+            // dbias bias rng/dropout alibi
+            RETURN_CUDNN_FRONTEND_ERROR_IF(is_dropout,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "FP8 deterministic algorithm is not supported on blackwell architecture when dropout is enabled");
+
+            is_deterministic_algorithm_supported_on_blackwell = true;
+        }
 
         // if output data type is half or bfloat16 for any of dq, dk, dv, and version is below 9.13 or is not blackwell, return NOT_SUPPORTED
         RETURN_CUDNN_FRONTEND_ERROR_IF(
@@ -605,6 +626,15 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                    attributes.outputs[output_names::Amax_dK]);
 
         return {error_code_t::OK, ""};
+    }
+
+    std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
+    override_heuristics_query() const {
+        if (is_deterministic_algorithm_supported_on_blackwell) {
+            return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
+        } else {
+            return {-1, {}};
+        }
     }
 
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB

@@ -31,7 +31,7 @@ try:
 
     graph.deserialize(data)
 
-    graph.build([cudnn.heur_mode.A])
+    graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
 
     print("Graph built successfully and can be executed.")
 

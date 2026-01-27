@@ -20,9 +20,7 @@ class CSBR(torch.nn.Module):
     ):
         if b is not None:
             b = b.reshape(-1)  # Conv2d needs a 1D tensor
-        conv_output = torch.nn.functional.conv2d(
-            x, w, bias=b, padding=padding, stride=stride, dilation=dilation
-        )
+        conv_output = torch.nn.functional.conv2d(x, w, bias=b, padding=padding, stride=stride, dilation=dilation)
         return torch.clamp(conv_output, min=lower_clip, max=upper_clip)
 
 
@@ -58,18 +56,14 @@ def create_conv_bias_relu_graph(
         )
 
         bias_output = g.bias(name="bias", input=conv_output, bias=B)
-        Y = g.relu(
-            name="relu", input=bias_output, lower_clip=lower_clip, upper_clip=upper_clip
-        )
+        Y = g.relu(name="relu", input=bias_output, lower_clip=lower_clip, upper_clip=upper_clip)
         Y.set_output(True)
 
         return g, [X, W, B, Y]
 
 
 @cudnn.jit(heur_modes=[cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-def create_conv_relu_graph(
-    handle, X_gpu, W_gpu, padding, stride, dilation, lower_clip=0.5, upper_clip=0.55
-):
+def create_conv_relu_graph(handle, X_gpu, W_gpu, padding, stride, dilation, lower_clip=0.5, upper_clip=0.55):
     with cudnn.graph(
         handle,
         io_data_type=cudnn.data_type.HALF,
@@ -79,13 +73,9 @@ def create_conv_relu_graph(
         X = g.tensor_like(X_gpu)
         W = g.tensor_like(W_gpu)
 
-        conv_output = g.conv_fprop(
-            image=X, weight=W, padding=padding, stride=stride, dilation=dilation
-        )
+        conv_output = g.conv_fprop(image=X, weight=W, padding=padding, stride=stride, dilation=dilation)
 
-        Y = g.relu(
-            name="relu", input=conv_output, lower_clip=lower_clip, upper_clip=upper_clip
-        )
+        Y = g.relu(name="relu", input=conv_output, lower_clip=lower_clip, upper_clip=upper_clip)
         Y.set_output(True)
 
         return g, [X, W, Y]
@@ -99,15 +89,9 @@ def create_conv_relu_graph(
 @torch_fork_set_rng(seed=0)
 def test_conv_bias_relu(cudnn_handle):
     # Reference code
-    X_gpu = torch.randn(4, 16, 56, 56, device="cuda", dtype=torch.float16).to(
-        memory_format=torch.channels_last
-    )
-    W_gpu = torch.randn(16, 16, 3, 3, device="cuda", dtype=torch.float16).to(
-        memory_format=torch.channels_last
-    )
-    B_gpu = torch.randn(1, 16, 1, 1, device="cuda", dtype=torch.float16).to(
-        memory_format=torch.channels_last
-    )
+    X_gpu = torch.randn(4, 16, 56, 56, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
+    W_gpu = torch.randn(16, 16, 3, 3, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
+    B_gpu = torch.randn(1, 16, 1, 1, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
     padding = [1, 1]
     stride = [3, 3]
     dilation = [1, 1]
@@ -128,12 +112,8 @@ def test_conv_bias_relu(cudnn_handle):
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
-    single_mode_graph = cudnn.jit(heur_modes=cudnn.heur_mode.A)(
-        create_conv_bias_relu_graph.__wrapped__
-    )
-    g, uids = single_mode_graph(
-        cudnn_handle, X_gpu, W_gpu, B_gpu, padding, stride, dilation
-    )
+    single_mode_graph = cudnn.jit(heur_modes=cudnn.heur_mode.A)(create_conv_bias_relu_graph.__wrapped__)
+    g, uids = single_mode_graph(cudnn_handle, X_gpu, W_gpu, B_gpu, padding, stride, dilation)
 
     X_uid, W_uid, B_uid, Y_uid = uids
 
@@ -154,12 +134,8 @@ def test_conv_bias_relu(cudnn_handle):
 @torch_fork_set_rng(seed=0)
 def test_conv_relu(cudnn_handle):
     # Reference code
-    X_gpu = torch.randn(20, 40, 30, 40, device="cuda", dtype=torch.float16).to(
-        memory_format=torch.channels_last
-    )
-    W_gpu = torch.randn(54, 40, 3, 4, device="cuda", dtype=torch.float16).to(
-        memory_format=torch.channels_last
-    )
+    X_gpu = torch.randn(20, 40, 30, 40, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
+    W_gpu = torch.randn(54, 40, 3, 4, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
     padding = [0, 1]
     stride = [2, 3]
     dilation = [1, 1]
@@ -179,17 +155,13 @@ def test_conv_relu(cudnn_handle):
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
-    g, uids = create_conv_relu_graph(
-        cudnn_handle, X_gpu, W_gpu, padding, stride, dilation
-    )
+    g, uids = create_conv_relu_graph(cudnn_handle, X_gpu, W_gpu, padding, stride, dilation)
     X_uid, W_uid, Y_uid = uids
 
     Y_actual = torch.zeros_like(Y_expected)
     workspace = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
-    g.execute(
-        {X_uid: X_gpu, W_uid: W_gpu, Y_uid: Y_actual}, workspace, handle=cudnn_handle
-    )
+    g.execute({X_uid: X_gpu, W_uid: W_gpu, Y_uid: Y_actual}, workspace, handle=cudnn_handle)
 
     torch.cuda.synchronize()
     torch.testing.assert_close(Y_expected, Y_actual, atol=1e-3, rtol=1e-3)
@@ -199,12 +171,8 @@ def test_conv_relu(cudnn_handle):
 @torch_fork_set_rng(seed=0)
 def test_conv_relu_execution_plan_creation(cudnn_handle):
     # Reference code
-    X_gpu = torch.randn(
-        20, 40, 30, 40, requires_grad=False, device="cuda", dtype=torch.float16
-    ).to(memory_format=torch.channels_last)
-    W_gpu = torch.randn(
-        54, 40, 3, 4, requires_grad=False, device="cuda", dtype=torch.float16
-    ).to(memory_format=torch.channels_last)
+    X_gpu = torch.randn(20, 40, 30, 40, requires_grad=False, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
+    W_gpu = torch.randn(54, 40, 3, 4, requires_grad=False, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
     padding = [0, 1]
     stride = [2, 3]
     dilation = [1, 1]
@@ -230,16 +198,10 @@ def test_conv_relu_execution_plan_creation(cudnn_handle):
         handle=cudnn_handle,
     )
 
-    X = graph.tensor(
-        name="X", dim=X_gpu.size(), stride=X_gpu.stride(), data_type=X_gpu.dtype
-    )
-    W = graph.tensor(
-        name="W", dim=W_gpu.size(), stride=W_gpu.stride(), data_type=W_gpu.dtype
-    )
+    X = graph.tensor(name="X", dim=X_gpu.size(), stride=X_gpu.stride(), data_type=X_gpu.dtype)
+    W = graph.tensor(name="W", dim=W_gpu.size(), stride=W_gpu.stride(), data_type=W_gpu.dtype)
 
-    conv_output = graph.conv_fprop(
-        image=X, weight=W, padding=padding, stride=stride, dilation=dilation
-    )
+    conv_output = graph.conv_fprop(image=X, weight=W, padding=padding, stride=stride, dilation=dilation)
 
     Y = graph.relu(name="relu", input=conv_output, lower_clip=0.5, upper_clip=0.55)
     Y.set_output(True)
@@ -256,22 +218,16 @@ def test_conv_relu_execution_plan_creation(cudnn_handle):
 
         for knob in knobs:
             if knob.type == cudnn.knob_type.KERNEL_CFG:
-                for kernel_cfg in range(
-                    knob.min_value, knob.max_value + 1, knob.stride
-                ):
+                for kernel_cfg in range(knob.min_value, knob.max_value + 1, knob.stride):
                     try:
-                        graph.create_execution_plan(
-                            engine, {cudnn.knob_type.KERNEL_CFG: kernel_cfg}
-                        )
+                        graph.create_execution_plan(engine, {cudnn.knob_type.KERNEL_CFG: kernel_cfg})
                     except RuntimeError:
                         continue
 
     graph.check_support()
     graph.build_plans()
 
-    workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
     Y_actual = torch.zeros_like(Y_expected)
     graph.execute({X: X_gpu, W: W_gpu, Y: Y_actual}, workspace, handle=cudnn_handle)
@@ -281,9 +237,7 @@ def test_conv_relu_execution_plan_creation(cudnn_handle):
 
 
 @cudnn.jit(heur_modes=[cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-def create_conv3d_bias_leaky_relu_graph(
-    handle, X_gpu, W_gpu, B_gpu, padding, stride, dilation, negative_slope
-):
+def create_conv3d_bias_leaky_relu_graph(handle, X_gpu, W_gpu, B_gpu, padding, stride, dilation, negative_slope):
     with cudnn.graph(
         handle,
         io_data_type=cudnn.data_type.HALF,
@@ -294,9 +248,7 @@ def create_conv3d_bias_leaky_relu_graph(
         W = g.tensor_like(W_gpu)
         B = g.tensor_like(B_gpu)
 
-        conv_output = g.conv_fprop(
-            image=X, weight=W, padding=padding, stride=stride, dilation=dilation
-        )
+        conv_output = g.conv_fprop(image=X, weight=W, padding=padding, stride=stride, dilation=dilation)
 
         bias_output = g.bias(name="bias", input=conv_output, bias=B)
         Y = g.leaky_relu(name="relu", input=bias_output, negative_slope=negative_slope)
@@ -320,15 +272,9 @@ def test_conv3d_bias_leaky_relu(cudnn_handle):
     negative_slope = 0.01
 
     # Reference code
-    X_gpu = torch.randn(N, D, H, W, C, device="cuda", dtype=torch.float16).permute(
-        0, 4, 1, 2, 3
-    )
-    W_gpu = torch.randn(K, R, S, T, C, device="cuda", dtype=torch.float16).permute(
-        0, 4, 1, 2, 3
-    )
-    B_gpu = torch.randn(1, 1, 1, 1, K, device="cuda", dtype=torch.float16).permute(
-        0, 4, 1, 2, 3
-    )
+    X_gpu = torch.randn(N, D, H, W, C, device="cuda", dtype=torch.float16).permute(0, 4, 1, 2, 3)
+    W_gpu = torch.randn(K, R, S, T, C, device="cuda", dtype=torch.float16).permute(0, 4, 1, 2, 3)
+    B_gpu = torch.randn(1, 1, 1, 1, K, device="cuda", dtype=torch.float16).permute(0, 4, 1, 2, 3)
 
     # Get reference result
     conv_out_expected = (
@@ -343,16 +289,12 @@ def test_conv3d_bias_leaky_relu(cudnn_handle):
         .to("cuda")
         .to(torch.float16)
     )
-    Y_expected = torch.nn.functional.leaky_relu(
-        conv_out_expected, negative_slope=negative_slope
-    )
+    Y_expected = torch.nn.functional.leaky_relu(conv_out_expected, negative_slope=negative_slope)
 
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
-    g, uids = create_conv3d_bias_leaky_relu_graph(
-        cudnn_handle, X_gpu, W_gpu, B_gpu, padding, stride, dilation, negative_slope
-    )
+    g, uids = create_conv3d_bias_leaky_relu_graph(cudnn_handle, X_gpu, W_gpu, B_gpu, padding, stride, dilation, negative_slope)
     X_uid, W_uid, B_uid, Y_uid = uids
 
     Y_actual = torch.zeros_like(Y_expected)
@@ -392,12 +334,8 @@ def test_leaky_relu_backward(cudnn_handle):
     negative_slope = 0.01
 
     # Reference code
-    loss_gpu = torch.randn(N, C, H, W, device="cuda", dtype=torch.float16).to(
-        memory_format=torch.channels_last
-    )
-    input_gpu = torch.randn(N, C, H, W, device="cuda", dtype=torch.float16).to(
-        memory_format=torch.channels_last
-    )
+    loss_gpu = torch.randn(N, C, H, W, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
+    input_gpu = torch.randn(N, C, H, W, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
 
     def dleaky_relu(grad: torch.Tensor, mask: torch.Tensor, negative_slope: float):
         return torch.ones_like(grad).masked_fill_(mask <= 0.0, negative_slope) * grad
@@ -407,9 +345,7 @@ def test_leaky_relu_backward(cudnn_handle):
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
-    g, uids = create_leaky_relu_backward_graph(
-        cudnn_handle, loss_gpu, input_gpu, negative_slope
-    )
+    g, uids = create_leaky_relu_backward_graph(cudnn_handle, loss_gpu, input_gpu, negative_slope)
     loss_uid, input_uid, Y_uid = uids
 
     Y_actual = torch.zeros_like(Y_expected)
@@ -436,9 +372,7 @@ def create_conv_int8_graph(handle, X_gpu, W_gpu, padding, stride, dilation):
         X = g.tensor_like(X_gpu)
         W = g.tensor_like(W_gpu)
 
-        conv_output = g.conv_fprop(
-            image=X, weight=W, padding=padding, stride=stride, dilation=dilation
-        )
+        conv_output = g.conv_fprop(image=X, weight=W, padding=padding, stride=stride, dilation=dilation)
         Y = g.identity(name="identity", input=conv_output)
         Y.set_output(True).set_data_type(cudnn.data_type.INT32)
 
@@ -461,43 +395,25 @@ def test_conv_int8(cudnn_handle):
     compare_output = True
 
     # Reference code
-    X_gpu = torch.randint(-127, 128, (N, C, H, W), device="cuda", dtype=torch.int8).to(
-        memory_format=torch.channels_last
-    )
-    W_gpu = torch.randint(-127, 128, (K, C, R, S), device="cuda", dtype=torch.int8).to(
-        memory_format=torch.channels_last
-    )
+    X_gpu = torch.randint(-127, 128, (N, C, H, W), device="cuda", dtype=torch.int8).to(memory_format=torch.channels_last)
+    W_gpu = torch.randint(-127, 128, (K, C, R, S), device="cuda", dtype=torch.int8).to(memory_format=torch.channels_last)
 
     try:
-        Y_expected = (
-            torch.nn.functional.conv2d(
-                X_gpu, W_gpu, padding=padding, stride=stride, dilation=dilation
-            )
-            .to("cuda")
-            .to(torch.int32)
-        )
+        Y_expected = torch.nn.functional.conv2d(X_gpu, W_gpu, padding=padding, stride=stride, dilation=dilation).to("cuda").to(torch.int32)
     except:
-        print(
-            "Torch does not support int8 convolution. Disabling comparison of output tensor"
-        )
+        print("Torch does not support int8 convolution. Disabling comparison of output tensor")
         compare_output = False
 
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
-    g, uids = create_conv_int8_graph(
-        cudnn_handle, X_gpu, W_gpu, padding, stride, dilation
-    )
+    g, uids = create_conv_int8_graph(cudnn_handle, X_gpu, W_gpu, padding, stride, dilation)
     X_uid, W_uid, Y_uid = uids
 
-    Y_actual = torch.randint(0, 127, X_gpu.size(), device="cuda", dtype=torch.int32).to(
-        memory_format=torch.channels_last
-    )
+    Y_actual = torch.randint(0, 127, X_gpu.size(), device="cuda", dtype=torch.int32).to(memory_format=torch.channels_last)
     workspace = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
-    g.execute(
-        {X_uid: X_gpu, W_uid: W_gpu, Y_uid: Y_actual}, workspace, handle=cudnn_handle
-    )
+    g.execute({X_uid: X_gpu, W_uid: W_gpu, Y_uid: Y_actual}, workspace, handle=cudnn_handle)
 
     torch.cuda.synchronize()
 

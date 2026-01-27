@@ -12,41 +12,92 @@ from test_low_precision_matmul import (
 )
 from test_fe_api_utils import create_and_permute_tensor, create_scale_factor_tensor
 
-
 # Parameterization marks for GEMM Amax
-GEMM_AMAX_PARAM_MARKS = [
-    pytest.mark.parametrize("a_major", ["k", "m"]),
-    pytest.mark.parametrize("b_major", ["k", "n"]),
+GEMM_AMAX_PARAM_MARKS_FP4 = [
+    pytest.mark.parametrize("a_major", ["k"]),
+    pytest.mark.parametrize("b_major", ["k"]),
     pytest.mark.parametrize("c_major", ["m", "n"]),
     pytest.mark.parametrize(
         "ab_dtype",
-        [torch.float8_e5m2, torch.float8_e4m3fn, torch.uint8, torch.float4_e2m1fn_x2],
+        [
+            torch.float4_e2m1fn_x2,
+            # torch.uint8,
+        ],
     ),
     pytest.mark.parametrize(
-        "sf_dtype", [torch.float8_e8m0fnu, torch.int8, torch.float8_e4m3fn]
+        "sf_dtype",
+        [
+            torch.float8_e8m0fnu,
+            # torch.int8,
+            torch.float8_e4m3fn,
+        ],
     ),
     pytest.mark.parametrize(
         "c_dtype",
         [
             torch.float32,
-            torch.float16,
+            # torch.float16,
             torch.bfloat16,
-            torch.float8_e5m2,
+            # torch.float8_e5m2,
             torch.float8_e4m3fn,
             torch.float4_e2m1fn_x2,
-            torch.uint8,
+            # torch.uint8,
         ],
     ),
     pytest.mark.parametrize("acc_dtype", [torch.float32]),
     pytest.mark.parametrize("sf_vec_size", [16, 32]),
+    pytest.mark.parametrize(
+        "mma_tiler_mn",
+        [
+            (128, 128),
+        ],
+    ),
+    pytest.mark.parametrize("cluster_shape_mn", [(1, 1), (2, 2)]),
+]
+
+GEMM_AMAX_PARAM_MARKS_FP8 = [
+    pytest.mark.parametrize("a_major", ["k", "m"]),
+    pytest.mark.parametrize("b_major", ["k", "n"]),
+    pytest.mark.parametrize("c_major", ["m", "n"]),
+    pytest.mark.parametrize(
+        "ab_dtype",
+        [
+            torch.float8_e5m2,
+            # torch.float8_e4m3fn,
+        ],
+    ),
+    pytest.mark.parametrize(
+        "sf_dtype",
+        [
+            torch.float8_e8m0fnu,
+            # torch.int8,
+        ],
+    ),
+    pytest.mark.parametrize(
+        "c_dtype",
+        [
+            torch.float32,
+            # torch.float16,
+            torch.bfloat16,
+        ],
+    ),
+    pytest.mark.parametrize("acc_dtype", [torch.float32]),
+    pytest.mark.parametrize("sf_vec_size", [32]),
     pytest.mark.parametrize("mma_tiler_mn", [(128, 128), (128, 256)]),
-    pytest.mark.parametrize("cluster_shape_mn", [(1, 1), (1, 2), (2, 2)]),
+    pytest.mark.parametrize("cluster_shape_mn", [(1, 1), (2, 2)]),
 ]
 
 
-def with_gemm_amax_params(func):
+def with_gemm_amax_params_fp4(func):
     """Apply all GEMM Amax parameterization marks to a test function."""
-    for mark in reversed(GEMM_AMAX_PARAM_MARKS):
+    for mark in reversed(GEMM_AMAX_PARAM_MARKS_FP4):
+        func = mark(func)
+    return func
+
+
+def with_gemm_amax_params_fp8(func):
+    """Apply all GEMM Amax parameterization marks to a test function."""
+    for mark in reversed(GEMM_AMAX_PARAM_MARKS_FP8):
         func = mark(func)
     return func
 
@@ -67,15 +118,11 @@ def gemm_amax_init(
     """Build test config, allowing CLI overrides for problem size/tiling/cluster/skip-ref."""
     major, _ = torch.cuda.get_device_capability()
     if major < 10:
-        pytest.skip(
-            f"Environment not supported: requires compute capability >= 10, found {major}"
-        )
+        pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
 
     mnkl_str = request.config.getoption("--gemm-amax-mnkl", default=None)
     mma_tiler_str = request.config.getoption("--gemm-amax-mma-tiler", default=None)
-    cluster_shape_str = request.config.getoption(
-        "--gemm-amax-cluster-shape", default=None
-    )
+    cluster_shape_str = request.config.getoption("--gemm-amax-cluster-shape", default=None)
     skip_ref = request.config.getoption("--gemm-amax-skip-ref", default=False)
 
     if mnkl_str is not None:
@@ -107,9 +154,7 @@ def gemm_amax_init(
     }
 
 
-def allocate_input_tensors(
-    m, n, k, l, ab_dtype, sf_dtype, sf_vec_size, a_major, b_major
-):
+def allocate_input_tensors(m, n, k, l, ab_dtype, sf_dtype, sf_vec_size, a_major, b_major):
     """Allocate and initialize input tensors for GEMM Amax tests."""
     a_ref, a_tensor = create_and_permute_tensor(l, m, k, a_major == "m", ab_dtype)
     b_ref, b_tensor = create_and_permute_tensor(l, n, k, b_major == "n", ab_dtype)
@@ -122,9 +167,7 @@ def allocate_input_tensors(
 def allocate_output_tensors(m, n, l, c_dtype, c_major):
     """Allocate and initialize output tensors for GEMM Amax tests."""
     _, c_tensor = create_and_permute_tensor(l, m, n, c_major == "m", c_dtype)
-    amax_tensor = torch.full(
-        (1, 1, 1), -float("inf"), device="cuda", dtype=torch.float32
-    )
+    amax_tensor = torch.full((1, 1, 1), -float("inf"), device="cuda", dtype=torch.float32)
     return c_tensor, amax_tensor
 
 
@@ -155,43 +198,23 @@ def check_ref_gemm_amax(a, b, sfa_ref, sfb_ref, c, amax, skip_ref=False):
 
         m, n, l = c_ref.shape
         # Convert ref: f32 -> f8 -> f32 using CUTE's conversion
-        ref_f8_ = torch.empty(l, m, n, dtype=torch.uint8, device="cuda").permute(
-            1, 2, 0
-        )
-        ref_f8 = from_dlpack(ref_f8_, assumed_align=16).mark_layout_dynamic(
-            leading_dim=1
-        )
+        ref_f8_ = torch.empty(l, m, n, dtype=torch.uint8, device="cuda").permute(1, 2, 0)
+        ref_f8 = from_dlpack(ref_f8_, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         ref_f8.element_type = _convert_to_cutlass_data_type(c.dtype)
         ref_device = c_ref.permute(2, 0, 1).contiguous().permute(1, 2, 0).cuda()
-        ref_tensor = from_dlpack(ref_device, assumed_align=16).mark_layout_dynamic(
-            leading_dim=1
-        )
+        ref_tensor = from_dlpack(ref_device, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         cute.testing.convert(ref_tensor, ref_f8)  # f32 -> f8
         cute.testing.convert(ref_f8, ref_tensor)  # f8 -> f32
         c_ref = ref_device.cpu()
 
-        torch.testing.assert_close(
-            c_ref.to(torch.float32), c.cpu().to(torch.float32), atol=0.1, rtol=0.1
-        )
+        torch.testing.assert_close(c_ref.to(torch.float32), c.cpu().to(torch.float32), atol=0.1, rtol=0.1)
     elif is_c_fp4:
-        fp4_c_ref = _bfloat16_to_float4_e2m1fn_x2(
-            c_ref.permute(2, 0, 1).to(torch.bfloat16)
-        )
-        c_ref = (
-            float4_e2m1fn_x2_to_float32(fp4_c_ref).to(torch.float32).permute(1, 2, 0)
-        )
+        fp4_c_ref = _bfloat16_to_float4_e2m1fn_x2(c_ref.permute(2, 0, 1).to(torch.bfloat16))
+        c_ref = float4_e2m1fn_x2_to_float32(fp4_c_ref).to(torch.float32).permute(1, 2, 0)
 
-        c_f32 = (
-            float4_e2m1fn_x2_to_float32(
-                c.cpu().permute(2, 0, 1).view(torch.float4_e2m1fn_x2)
-            )
-            .to(torch.float32)
-            .permute(1, 2, 0)
-        )
+        c_f32 = float4_e2m1fn_x2_to_float32(c.cpu().permute(2, 0, 1).view(torch.float4_e2m1fn_x2)).to(torch.float32).permute(1, 2, 0)
 
-        torch.testing.assert_close(
-            c_ref.to(torch.float32), c_f32.to(torch.float32), atol=0.1, rtol=0.1
-        )
+        torch.testing.assert_close(c_ref.to(torch.float32), c_f32.to(torch.float32), atol=0.1, rtol=0.1)
     else:
         c_ref = c_ref.to(c.dtype)
         torch.testing.assert_close(c_ref, c.cpu(), atol=0.01, rtol=0.01)

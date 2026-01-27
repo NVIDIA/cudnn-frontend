@@ -95,15 +95,9 @@ def nsa_init(
 ):
     major, _ = torch.cuda.get_device_capability()
     if major < 10:
-        pytest.skip(
-            f"Environment not supported: requires compute capability >= 10, found {major}"
-        )
+        pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
 
-    b = (
-        int(request.config.getoption("--nsa-b"))
-        if request.config.getoption("--nsa-b") is not None
-        else 2
-    )
+    b = int(request.config.getoption("--nsa-b")) if request.config.getoption("--nsa-b") is not None else 2
     s_q = (
         int(request.config.getoption("--nsa-s_q"))
         if request.config.getoption("--nsa-s_q") is not None
@@ -114,43 +108,15 @@ def nsa_init(
         if request.config.getoption("--nsa-s_kv") is not None
         else 1024 if s_kv_default_override is None else s_kv_default_override
     )
-    d_qk = (
-        int(request.config.getoption("--nsa-d_qk"))
-        if request.config.getoption("--nsa-d_qk") is not None
-        else 128
-    )
-    d_v = (
-        int(request.config.getoption("--nsa-d_v"))
-        if request.config.getoption("--nsa-d_v") is not None
-        else 128
-    )
-    h_q = (
-        int(request.config.getoption("--nsa-h_q"))
-        if request.config.getoption("--nsa-h_q") is not None
-        else 4
-    )
-    h_k = (
-        int(request.config.getoption("--nsa-h_k"))
-        if request.config.getoption("--nsa-h_k") is not None
-        else 1
-    )
-    h_v = (
-        int(request.config.getoption("--nsa-h_v"))
-        if request.config.getoption("--nsa-h_v") is not None
-        else 1
-    )
+    d_qk = int(request.config.getoption("--nsa-d_qk")) if request.config.getoption("--nsa-d_qk") is not None else 128
+    d_v = int(request.config.getoption("--nsa-d_v")) if request.config.getoption("--nsa-d_v") is not None else 128
+    h_q = int(request.config.getoption("--nsa-h_q")) if request.config.getoption("--nsa-h_q") is not None else 4
+    h_k = int(request.config.getoption("--nsa-h_k")) if request.config.getoption("--nsa-h_k") is not None else 1
+    h_v = int(request.config.getoption("--nsa-h_v")) if request.config.getoption("--nsa-h_v") is not None else 1
 
-    actual_s_q = (
-        torch.tensor([s_q] * b, dtype=torch.int32).cuda() if layout == "thd" else None
-    )
-    actual_s_kv = (
-        torch.tensor([s_kv] * b, dtype=torch.int32).cuda() if layout == "thd" else None
-    )
-    topk_sizes = (
-        torch.tensor([topk_size] * b, dtype=torch.int32).cuda()
-        if (layout == "thd" and topk_size is not None)
-        else None
-    )
+    actual_s_q = torch.tensor([s_q] * b, dtype=torch.int32).cuda() if layout == "thd" else None
+    actual_s_kv = torch.tensor([s_kv] * b, dtype=torch.int32).cuda() if layout == "thd" else None
+    topk_sizes = torch.tensor([topk_size] * b, dtype=torch.int32).cuda() if (layout == "thd" and topk_size is not None) else None
 
     scale_softmax = 1.0 / math.sqrt(d_qk) if scale_softmax is None else scale_softmax
 
@@ -223,26 +189,12 @@ def allocate_input_tensors(cfg):
         Q = torch.randn(b, s_q, h_q, d_qk, dtype=dtype).transpose(1, 2).cuda()
         K = torch.randn(b, s_kv, h_k, d_qk, dtype=dtype).transpose(1, 2).cuda()
         V = torch.randn(b, s_kv, h_k, d_v, dtype=dtype).transpose(1, 2).cuda()
-        LSE = (
-            -1.0
-            * torch.randn(b, s_q, h_q, dtype=torch.float32)
-            .transpose(1, 2)
-            .contiguous()
-            .cuda()
-        )
+        LSE = -1.0 * torch.randn(b, s_q, h_q, dtype=torch.float32).transpose(1, 2).contiguous().cuda()
 
         block_counts, block_indices = None, None  # TODO
     elif layout == "thd":
-        cum_seqlen_q = (
-            torch.cat([torch.tensor([0]).cuda(), torch.cumsum(actual_s_q, dim=0)])
-            .to(torch.int32)
-            .cuda()
-        )
-        cum_seqlen_kv = (
-            torch.cat([torch.tensor([0]).cuda(), torch.cumsum(actual_s_kv, dim=0)])
-            .to(torch.int32)
-            .cuda()
-        )
+        cum_seqlen_q = torch.cat([torch.tensor([0]).cuda(), torch.cumsum(actual_s_q, dim=0)]).to(torch.int32).cuda()
+        cum_seqlen_kv = torch.cat([torch.tensor([0]).cuda(), torch.cumsum(actual_s_kv, dim=0)]).to(torch.int32).cuda()
         max_s_q = max(actual_s_q).item()
         max_s_kv = max(actual_s_kv).item()
 
@@ -255,12 +207,7 @@ def allocate_input_tensors(cfg):
         # V: (T, H_kv, D_v)
         V = torch.randn((total_seq_len_kv, h_k, d_v), dtype=dtype).cuda()
         # LSE: (T, H_q, 1)
-        LSE = (
-            -1.0
-            * torch.randn((1, h_q, total_seq_len_q), dtype=torch.float32)
-            .transpose(0, 2)
-            .cuda()
-        )
+        LSE = -1.0 * torch.randn((1, h_q, total_seq_len_q), dtype=torch.float32).transpose(0, 2).cuda()
 
         # block_counts: (T, H_kv), block_indices: (T, H_kv, max(topk_sizes))
         block_counts, block_indices = None, None  # TODO
@@ -299,16 +246,8 @@ def allocate_output_tensors(cfg):
         M = torch.empty(b, s_q, h_q, 1, dtype=torch.float32).transpose(1, 2).cuda()
 
         if k_value is not None:
-            topk_scores = (
-                torch.empty(b, s_q, h_k, k_value, dtype=acc_dtype)
-                .transpose(1, 2)
-                .cuda()
-            )
-            topk_indices = (
-                torch.empty(b, s_q, h_k, k_value, dtype=torch.int32)
-                .transpose(1, 2)
-                .cuda()
-            )
+            topk_scores = torch.empty(b, s_q, h_k, k_value, dtype=acc_dtype).transpose(1, 2).cuda()
+            topk_indices = torch.empty(b, s_q, h_k, k_value, dtype=torch.int32).transpose(1, 2).cuda()
     elif layout == "thd":
         total_seq_len = actual_s_q.sum().item()
 
@@ -317,12 +256,8 @@ def allocate_output_tensors(cfg):
         M = torch.empty(total_seq_len, h_q, 1, dtype=torch.float32).cuda()
 
         if k_value is not None:
-            topk_scores = torch.empty(
-                total_seq_len, h_k, k_value, dtype=acc_dtype
-            ).cuda()
-            topk_indices = torch.empty(
-                total_seq_len, h_k, k_value, dtype=torch.int32
-            ).cuda()
+            topk_scores = torch.empty(total_seq_len, h_k, k_value, dtype=acc_dtype).cuda()
+            topk_indices = torch.empty(total_seq_len, h_k, k_value, dtype=torch.int32).cuda()
 
     return (
         O,
@@ -384,9 +319,7 @@ def generate_ragged_offset(cfg):
     )
 
 
-def generate_block_indices(
-    seq_lens: list[int], num_kv_heads: int, topk_sizes: list[int], block_size: int
-):
+def generate_block_indices(seq_lens: list[int], num_kv_heads: int, topk_sizes: list[int], block_size: int):
     """
     Generate block indices and counts for sparse attention.
 
@@ -402,23 +335,17 @@ def generate_block_indices(
     total_seq_len = sum(seq_lens)
     max_topk_size = max(topk_sizes)
     block_counts = torch.zeros(total_seq_len, num_kv_heads, dtype=torch.int32)
-    block_indices = torch.zeros(
-        total_seq_len, num_kv_heads, max_topk_size, dtype=torch.int32
-    )
+    block_indices = torch.zeros(total_seq_len, num_kv_heads, max_topk_size, dtype=torch.int32)
 
     seq_len_offset = 0
     for i in range(len(seq_lens)):
         seq_len = seq_lens[i]
         topk_size = topk_sizes[i]
         max_index = seq_len // block_size
-        assert (
-            topk_size <= max_index
-        ), "topk_size must be less than or equal to the number of blocks"
+        assert topk_size <= max_index, "topk_size must be less than or equal to the number of blocks"
         for t in range(seq_len):
             for h in range(num_kv_heads):
-                block_indices[seq_len_offset + t, h, :topk_size] = (
-                    torch.randperm(max_index)[:topk_size].sort().values
-                )
+                block_indices[seq_len_offset + t, h, :topk_size] = torch.randperm(max_index)[:topk_size].sort().values
                 block_counts[seq_len_offset + t, h] = topk_size
         seq_len_offset += seq_len
 

@@ -23,6 +23,34 @@
 #pragma once
 
 #include <algorithm>
+
+namespace cudnn_frontend {
+namespace graph {
+class ReductionNode;
+class PointwiseNode;
+class MatmulNode;
+class ConvolutionNode;
+class DgradNode;
+class WgradNode;
+class LayerNormNode;
+class BatchNormNode;
+class BatchnormInferenceNode;
+class RMSNormNode;
+class DRMSNormNode;
+class InstanceNormNode;
+class DINNode;
+class DLNNode;
+class DBNNode;
+class DBNWeightNode;
+class BatchNormFinalizeNode;
+class GenstatsNode;
+class ReshapeNode;
+class ResampleNode;
+class RngNode;
+class PagedCacheLoadNode;
+}  // namespace graph
+}  // namespace cudnn_frontend
+
 #include <array>
 #include <cstddef>
 #include <functional>
@@ -77,6 +105,28 @@ namespace cudnn_frontend {
 class Operation_v8 : public BackendDescriptor {
    public:
     friend class OperationBuilder_v8;
+    friend class cudnn_frontend::graph::ReductionNode;
+    friend class cudnn_frontend::graph::PointwiseNode;
+    friend class cudnn_frontend::graph::MatmulNode;
+    friend class cudnn_frontend::graph::ConvolutionNode;
+    friend class cudnn_frontend::graph::DgradNode;
+    friend class cudnn_frontend::graph::WgradNode;
+    friend class cudnn_frontend::graph::LayerNormNode;
+    friend class cudnn_frontend::graph::BatchNormNode;
+    friend class cudnn_frontend::graph::BatchnormInferenceNode;
+    friend class cudnn_frontend::graph::RMSNormNode;
+    friend class cudnn_frontend::graph::DRMSNormNode;
+    friend class cudnn_frontend::graph::InstanceNormNode;
+    friend class cudnn_frontend::graph::DINNode;
+    friend class cudnn_frontend::graph::DLNNode;
+    friend class cudnn_frontend::graph::DBNNode;
+    friend class cudnn_frontend::graph::DBNWeightNode;
+    friend class cudnn_frontend::graph::BatchNormFinalizeNode;
+    friend class cudnn_frontend::graph::GenstatsNode;
+    friend class cudnn_frontend::graph::ReshapeNode;
+    friend class cudnn_frontend::graph::ResampleNode;
+    friend class cudnn_frontend::graph::RngNode;
+    friend class cudnn_frontend::graph::PagedCacheLoadNode;
     std::string
     describe() const override {
         std::stringstream ss;

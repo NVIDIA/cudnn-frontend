@@ -164,24 +164,15 @@ def compute_ref(
         causal_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=device)
         causal_mask.triu_(diagonal=1 + right_bound)
         s = s.masked_fill(causal_mask, float("-inf"))
-    elif (
-        diagonal_alignment == diagonal_alignment.BOTTOM_RIGHT
-        and right_bound is not None
-    ):
+    elif diagonal_alignment == diagonal_alignment.BOTTOM_RIGHT and right_bound is not None:
         causal_mask_bottom_right = None
         if padding:
-            causal_mask_bottom_right = torch.ones(
-                b, 1, s_q, s_kv, dtype=torch.bool, device=device
-            )
+            causal_mask_bottom_right = torch.ones(b, 1, s_q, s_kv, dtype=torch.bool, device=device)
             seq_len_q, seq_len_kv = padding
             for i in range(b):
-                causal_mask_bottom_right[i, :, :, :].triu_(
-                    diagonal=seq_len_kv[i] - seq_len_q[i] + 1 + right_bound
-                )
+                causal_mask_bottom_right[i, :, :, :].triu_(diagonal=seq_len_kv[i] - seq_len_q[i] + 1 + right_bound)
         else:
-            causal_mask_bottom_right = torch.ones(
-                s_q, s_kv, dtype=torch.bool, device=device
-            )
+            causal_mask_bottom_right = torch.ones(s_q, s_kv, dtype=torch.bool, device=device)
             causal_mask_bottom_right.triu_(diagonal=s_kv - s_q + 1 + right_bound)
         s = s.masked_fill(causal_mask_bottom_right, float("-inf"))
     if left_bound is not None:
@@ -196,9 +187,7 @@ def compute_ref(
                 swa_mask = torch.ones(b, 1, s_q, s_kv, dtype=torch.bool, device=device)
                 seq_len_q, seq_len_kv = padding
                 for i in range(b):
-                    swa_mask[i, :, :, :].tril_(
-                        diagonal=seq_len_kv[i] - seq_len_q[i] - left_bound
-                    )
+                    swa_mask[i, :, :, :].tril_(diagonal=seq_len_kv[i] - seq_len_q[i] - left_bound)
             # BRCM + SWA for fixed sequence lengths
             else:
                 swa_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=device)
@@ -216,9 +205,7 @@ def compute_ref(
 
     # apply dropout mask over softmax outputs
     if dropout_prob != 0.0:
-        assert (
-            dropout_mask != None
-        ), "PyTorch reference must have dropout_mask for dropout"
+        assert dropout_mask != None, "PyTorch reference must have dropout_mask for dropout"
         p = (p * dropout_mask) / (1 - dropout_prob)
 
     o = torch.einsum("bhqk,bhkd->bhqd", p, v)
@@ -427,18 +414,10 @@ def generate_ragged_offset(
     else:  # sbh3d
         raise ValueError()
 
-    q_ragged_offset = q_ragged_offset.to(
-        dtype=torch.int64 if cudnn_version >= "9.6.0" else torch.int32
-    )
-    k_ragged_offset = k_ragged_offset.to(
-        dtype=torch.int64 if cudnn_version >= "9.6.0" else torch.int32
-    )
-    v_ragged_offset = v_ragged_offset.to(
-        dtype=torch.int64 if cudnn_version >= "9.6.0" else torch.int32
-    )
-    o_ragged_offset = o_ragged_offset.to(
-        dtype=torch.int64 if cudnn_version >= "9.6.0" else torch.int32
-    )
+    q_ragged_offset = q_ragged_offset.to(dtype=torch.int64 if cudnn_version >= "9.6.0" else torch.int32)
+    k_ragged_offset = k_ragged_offset.to(dtype=torch.int64 if cudnn_version >= "9.6.0" else torch.int32)
+    v_ragged_offset = v_ragged_offset.to(dtype=torch.int64 if cudnn_version >= "9.6.0" else torch.int32)
+    o_ragged_offset = o_ragged_offset.to(dtype=torch.int64 if cudnn_version >= "9.6.0" else torch.int32)
 
     return q_ragged_offset, k_ragged_offset, v_ragged_offset, o_ragged_offset
 
@@ -446,13 +425,9 @@ def generate_ragged_offset(
 # @brief Convert a padded page table into a packed page table
 # @return packed_page_table: packed page table
 # @return ragged_offset: offset into the packed page table
-def convert_uniform_to_ragged_page_tables(
-    uniform_tensor, seq_len, block_size, cudnn_version
-):
+def convert_uniform_to_ragged_page_tables(uniform_tensor, seq_len, block_size, cudnn_version):
     [B, H, S, D] = uniform_tensor.size()
-    ragged_offset = torch.zeros(
-        B + 1, 1, 1, 1, dtype=torch.int32, device=uniform_tensor.device
-    )  # Initialize with first offset as 0
+    ragged_offset = torch.zeros(B + 1, 1, 1, 1, dtype=torch.int32, device=uniform_tensor.device)  # Initialize with first offset as 0
     for i in range(1, B + 1):
         prev_seq_len = seq_len[i - 1]
         num_pages_prev_batch = (prev_seq_len + block_size - 1) // block_size
@@ -462,17 +437,13 @@ def convert_uniform_to_ragged_page_tables(
     ragged_offset.to(dtype=torch.int64 if cudnn_version >= "9.6.0" else torch.int32)
     # ragged_offset.to(dtype=torch.int32)
 
-    packed_page_table = torch.zeros(B * S, H, D).to(
-        dtype=uniform_tensor.dtype, device=uniform_tensor.device
-    )
+    packed_page_table = torch.zeros(B * S, H, D).to(dtype=uniform_tensor.dtype, device=uniform_tensor.device)
 
     uniform_tensor_thd = torch.einsum("bhsd->bshd", uniform_tensor).reshape(B * S, H, D)
 
     t_0 = 0
     for b, t_1 in enumerate(ragged_offset.flatten()[1:]):
-        packed_page_table[t_0:t_1, :, :] = uniform_tensor_thd[
-            b * S : b * S + (t_1 - t_0), :, :
-        ]
+        packed_page_table[t_0:t_1, :, :] = uniform_tensor_thd[b * S : b * S + (t_1 - t_0), :, :]
         t_0 = t_1
 
     packed_page_table = packed_page_table.reshape(B, S, H, D)
@@ -496,9 +467,7 @@ def convert_ragged_to_uniform(ragged_tensor, seq_len):
     seq_len = seq_len.flatten()
 
     # convert bhsd to bshd and flatten
-    uniform_tensor = torch.zeros(b, s, h, d).to(
-        dtype=ragged_tensor.dtype, device=ragged_tensor.device
-    )
+    uniform_tensor = torch.zeros(b, s, h, d).to(dtype=ragged_tensor.dtype, device=ragged_tensor.device)
     ragged_tensor_thd = torch.einsum("bhsd->bshd", ragged_tensor).reshape(b * s, h, d)
 
     # copy
@@ -512,26 +481,18 @@ def convert_ragged_to_uniform(ragged_tensor, seq_len):
     return uniform_tensor
 
 
-def generate_actual_seq_lens(
-    b, s_q, s_kv, layout, head_group, is_padding, force_sq_less_or_equal_than_skv
-):
+def generate_actual_seq_lens(b, s_q, s_kv, layout, head_group, is_padding, force_sq_less_or_equal_than_skv):
     seq_len_q_gpu = None
     seq_len_kv_gpu = None
 
     if is_padding:
-        seq_len_q_gpu = torch.randint(
-            1, s_q + 1, (b, 1, 1, 1), dtype=torch.int32, device="cuda"
-        )
+        seq_len_q_gpu = torch.randint(1, s_q + 1, (b, 1, 1, 1), dtype=torch.int32, device="cuda")
 
         if not (layout == "bs3hd" and head_group == "multi_head"):
-            seq_len_kv_gpu = torch.randint(
-                1, s_kv + 1, (b, 1, 1, 1), dtype=torch.int32, device="cuda"
-            )
+            seq_len_kv_gpu = torch.randint(1, s_kv + 1, (b, 1, 1, 1), dtype=torch.int32, device="cuda")
             # Avoid seq_len_q > seq_len_kv (known limitation):
             if force_sq_less_or_equal_than_skv:
-                seq_len_q_gpu = torch.max(
-                    torch.tensor(1), seq_len_q_gpu % seq_len_kv_gpu
-                )
+                seq_len_q_gpu = torch.max(torch.tensor(1), seq_len_q_gpu % seq_len_kv_gpu)
         else:
             seq_len_kv_gpu = seq_len_q_gpu
 

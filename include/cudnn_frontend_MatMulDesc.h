@@ -23,6 +23,12 @@
 #pragma once
 
 #include <algorithm>
+
+namespace cudnn_frontend {
+namespace graph {
+class MatmulNode;
+}
+}  // namespace cudnn_frontend
 #include <array>
 #include <functional>
 #include <memory>
@@ -44,6 +50,7 @@ namespace cudnn_frontend {
 class MatMulDesc_v8 : public BackendDescriptor {
    public:
     friend class MatMulDescBuilder_v8;
+    friend class cudnn_frontend::graph::MatmulNode;
     std::string
     describe() const override {
         std::stringstream ss;
