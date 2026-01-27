@@ -42,15 +42,9 @@ def test_in(param_extract, cudnn_handle):
 
     epsilon_value = 1e-5
 
-    x_gpu = torch.randn(
-        (N, C, H, W), requires_grad=True, device="cuda", dtype=input_type
-    ).to(memory_format=torch.channels_last)
-    scale_gpu = torch.randn(
-        (1, C, 1, 1), requires_grad=True, device="cuda", dtype=input_type
-    ).to(memory_format=torch.channels_last)
-    bias_gpu = torch.randn(
-        (1, C, 1, 1), requires_grad=True, device="cuda", dtype=input_type
-    ).to(memory_format=torch.channels_last)
+    x_gpu = torch.randn((N, C, H, W), requires_grad=True, device="cuda", dtype=input_type).to(memory_format=torch.channels_last)
+    scale_gpu = torch.randn((1, C, 1, 1), requires_grad=True, device="cuda", dtype=input_type).to(memory_format=torch.channels_last)
+    bias_gpu = torch.randn((1, C, 1, 1), requires_grad=True, device="cuda", dtype=input_type).to(memory_format=torch.channels_last)
     epsilon_cpu = torch.full(
         (1, 1, 1, 1),
         epsilon_value,
@@ -59,13 +53,9 @@ def test_in(param_extract, cudnn_handle):
         dtype=torch.float32,
     )
 
-    Y_expected = torch.nn.functional.instance_norm(
-        x_gpu, weight=scale_gpu.view(C), bias=bias_gpu.view(C)
-    )
+    Y_expected = torch.nn.functional.instance_norm(x_gpu, weight=scale_gpu.view(C), bias=bias_gpu.view(C))
     mean_expected = x_gpu.to(torch.float32).mean(dim=(2, 3), keepdim=True)
-    inv_var_expected = torch.rsqrt(
-        torch.var(x_gpu.to(torch.float32), dim=(2, 3), keepdim=True) + epsilon_value
-    )
+    inv_var_expected = torch.rsqrt(torch.var(x_gpu.to(torch.float32), dim=(2, 3), keepdim=True) + epsilon_value)
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
@@ -109,9 +99,7 @@ def test_in(param_extract, cudnn_handle):
     mean_actual = torch.empty_like(mean_expected)
     inv_var_actual = torch.empty_like(inv_var_expected)
 
-    workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
     graph.execute(
         {
@@ -188,9 +176,7 @@ def test_in(param_extract, cudnn_handle):
     DScale_actual = torch.empty_like(scale_gpu)
     Dbias_actual = torch.empty_like(bias_gpu)
 
-    workspace = torch.empty(
-        bwd_graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(bwd_graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
     bwd_graph.execute(
         {

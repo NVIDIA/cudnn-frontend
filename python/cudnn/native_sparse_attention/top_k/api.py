@@ -78,10 +78,7 @@ class TopKReduction(APIBase):
         if self.sample_cum_seqlen_q is None and self.sample_cum_seqlen_k is None:
             self.input_layout = "B,H,S,D"
 
-        elif (
-            self.sample_cum_seqlen_q is not None
-            and self.sample_cum_seqlen_k is not None
-        ):
+        elif self.sample_cum_seqlen_q is not None and self.sample_cum_seqlen_k is not None:
             self.input_layout = "T,H,D"
 
             if self.sample_q.ndim == 3:
@@ -95,129 +92,70 @@ class TopKReduction(APIBase):
                 self.sample_lse = self.sample_lse.unsqueeze(0).transpose(1, 2)
             elif self.sample_lse.ndim == 3:
                 self._logger.info("reshaping lse_tensor from T,H,1 to 1,H,T")
-                self.sample_lse = (
-                    self._unpad_tensor_to_ndim(self.sample_lse, 2, "sample_lse")
-                    .unsqueeze(0)
-                    .transpose(1, 2)
-                )
+                self.sample_lse = self._unpad_tensor_to_ndim(self.sample_lse, 2, "sample_lse").unsqueeze(0).transpose(1, 2)
             if self.sample_topk_scores.ndim == 3:
                 self._logger.info("reshaping topk_scores_tensor from T,H,D to 1,H,T,D")
-                self.sample_topk_scores = self.sample_topk_scores.unsqueeze(
-                    0
-                ).transpose(1, 2)
+                self.sample_topk_scores = self.sample_topk_scores.unsqueeze(0).transpose(1, 2)
             if self.sample_topk_indices.ndim == 3:
                 self._logger.info("reshaping topk_indices_tensor from T,H,D to 1,H,T,D")
-                self.sample_topk_indices = self.sample_topk_indices.unsqueeze(
-                    0
-                ).transpose(1, 2)
+                self.sample_topk_indices = self.sample_topk_indices.unsqueeze(0).transpose(1, 2)
             if self.sample_cum_seqlen_q.ndim != 1:
-                self._logger.info(
-                    "cum_seqlen_q must be 1D tensor. Attempting to squeeze last dimension(s)"
-                )
+                self._logger.info("cum_seqlen_q must be 1D tensor. Attempting to squeeze last dimension(s)")
                 for _ in range(self.sample_cum_seqlen_q.ndim - 1):
                     self.sample_cum_seqlen_q = self.sample_cum_seqlen_q.squeeze(-1)
                 if self.sample_cum_seqlen_q.ndim != 1:
-                    raise ValueError(
-                        f"cum_seqlen_q must be 1D tensor, got {self.sample_cum_seqlen_q.ndim}D"
-                    )
+                    raise ValueError(f"cum_seqlen_q must be 1D tensor, got {self.sample_cum_seqlen_q.ndim}D")
             if self.sample_cum_seqlen_k.ndim != 1:
-                self._logger.info(
-                    "cum_seqlen_k must be 1D tensor. Attempting to squeeze last dimension(s)"
-                )
+                self._logger.info("cum_seqlen_k must be 1D tensor. Attempting to squeeze last dimension(s)")
                 for _ in range(self.sample_cum_seqlen_k.ndim - 1):
                     self.sample_cum_seqlen_k = self.sample_cum_seqlen_k.squeeze(-1)
                 if self.sample_cum_seqlen_k.ndim != 1:
-                    raise ValueError(
-                        f"cum_seqlen_k must be 1D tensor, got {self.sample_cum_seqlen_k.ndim}D"
-                    )
+                    raise ValueError(f"cum_seqlen_k must be 1D tensor, got {self.sample_cum_seqlen_k.ndim}D")
             if self.max_s_q is None:
-                self._logger.warning(
-                    "max_s_q not provided, inferring from cum_seqlen_q"
-                )
-                self.max_s_q = (
-                    (self.sample_cum_seqlen_q[1:] - self.sample_cum_seqlen_q[:-1])
-                    .max()
-                    .item()
-                )
+                self._logger.warning("max_s_q not provided, inferring from cum_seqlen_q")
+                self.max_s_q = (self.sample_cum_seqlen_q[1:] - self.sample_cum_seqlen_q[:-1]).max().item()
             if self.max_s_k is None:
-                self._logger.warning(
-                    "max_s_k not provided, inferring from cum_seqlen_k"
-                )
-                self.max_s_k = (
-                    (self.sample_cum_seqlen_k[1:] - self.sample_cum_seqlen_k[:-1])
-                    .max()
-                    .item()
-                )
+                self._logger.warning("max_s_k not provided, inferring from cum_seqlen_k")
+                self.max_s_k = (self.sample_cum_seqlen_k[1:] - self.sample_cum_seqlen_k[:-1]).max().item()
         else:
-            raise ValueError(
-                f"cum_seqlen_q and cum_seqlen_k must be None or both not None, got {self.sample_cum_seqlen_q} and {self.sample_cum_seqlen_k}"
-            )
+            raise ValueError(f"cum_seqlen_q and cum_seqlen_k must be None or both not None, got {self.sample_cum_seqlen_q} and {self.sample_cum_seqlen_k}")
 
         b, h_q, s_q, d = self.sample_q.shape
         b, h_k, s_k, d = self.sample_k.shape
         if self.sample_q.shape != (b, h_q, s_q, d):
-            raise ValueError(
-                f"Input shape mismatch: expected Q tensor shape {b, h_q, s_q, d}, got {self.sample_q.shape}"
-            )
+            raise ValueError(f"Input shape mismatch: expected Q tensor shape {b, h_q, s_q, d}, got {self.sample_q.shape}")
         if self.sample_k.shape != (b, h_k, s_k, d):
-            raise ValueError(
-                f"Input shape mismatch: expected K tensor shape {b, h_k, s_k, d}, got {self.sample_k.shape}"
-            )
+            raise ValueError(f"Input shape mismatch: expected K tensor shape {b, h_k, s_k, d}, got {self.sample_k.shape}")
         if self.sample_lse.shape == (b, h_q, s_q, 1):
-            self._logger.info(
-                "reshaping lse_tensor from (b, h_q, s_q, 1) to (b, h_q, s_q)"
-            )
+            self._logger.info("reshaping lse_tensor from (b, h_q, s_q, 1) to (b, h_q, s_q)")
             self.sample_lse = self.sample_lse.squeeze(-1)
         if self.sample_lse.shape != (b, h_q, s_q):
-            raise ValueError(
-                f"Input shape mismatch: expected LSE tensor shape {b, h_q, s_q}, got {self.sample_lse.shape}"
-            )
+            raise ValueError(f"Input shape mismatch: expected LSE tensor shape {b, h_q, s_q}, got {self.sample_lse.shape}")
         if self.sample_lse.stride(-1) != 1:
-            self._logger.warning(
-                "lse_tensor is expected to have leading stride in last dimension of shape (b, h_q, s_q), copying lse_tensor to contiguous"
-            )
+            self._logger.warning("lse_tensor is expected to have leading stride in last dimension of shape (b, h_q, s_q), copying lse_tensor to contiguous")
             self.sample_lse = self.sample_lse.contiguous()
         if self.sample_topk_scores.shape != (b, h_k, s_q, self.k_value):
-            raise ValueError(
-                f"Input shape mismatch: expected TopK Scores tensor shape {b, h_k, s_q, self.k_value}, got {self.sample_topk_scores.shape}"
-            )
+            raise ValueError(f"Input shape mismatch: expected TopK Scores tensor shape {b, h_k, s_q, self.k_value}, got {self.sample_topk_scores.shape}")
         if self.sample_topk_indices.shape != (b, h_k, s_q, self.k_value):
-            raise ValueError(
-                f"Input shape mismatch: expected TopK Indices tensor shape {b, h_k, s_q, self.k_value}, got {self.sample_topk_indices.shape}"
-            )
+            raise ValueError(f"Input shape mismatch: expected TopK Indices tensor shape {b, h_k, s_q, self.k_value}, got {self.sample_topk_indices.shape}")
 
-        self.batch_size = (
-            b
-            if (self.input_layout == "B,H,S,D")
-            else (len(self.sample_cum_seqlen_q) - 1)
-        )
+        self.batch_size = b if (self.input_layout == "B,H,S,D") else (len(self.sample_cum_seqlen_q) - 1)
         self.h_q, self.h_k, self.head_dim = h_q, h_k, d
         if self.input_layout == "B,H,S,D":
             self.max_s_q, self.max_s_k = s_q, s_k
 
         self._logger.debug("Checking dtypes")
         if self.sample_q.dtype != self.sample_k.dtype:
-            raise ValueError(
-                f"Q and K must have the same dtype, got {self.sample_q.dtype} and {self.sample_k.dtype}"
-            )
+            raise ValueError(f"Q and K must have the same dtype, got {self.sample_q.dtype} and {self.sample_k.dtype}")
         self.dtype = self.sample_q.dtype
         if self.sample_lse.dtype != self.acc_dtype:
-            raise ValueError(
-                f"LSE and Accumulator must have the same dtype, got {self.sample_lse.dtype} and {self.acc_dtype}"
-            )
+            raise ValueError(f"LSE and Accumulator must have the same dtype, got {self.sample_lse.dtype} and {self.acc_dtype}")
         if self.sample_topk_scores.dtype != self.acc_dtype:
-            raise ValueError(
-                f"TopK Scores and Accumulator must have the same dtype, got {self.sample_topk_scores.dtype} and {self.acc_dtype}"
-            )
+            raise ValueError(f"TopK Scores and Accumulator must have the same dtype, got {self.sample_topk_scores.dtype} and {self.acc_dtype}")
         if self.sample_topk_indices.dtype != torch.int32:
-            raise ValueError(
-                f"TopK Indices must be int32, got {self.sample_topk_indices.dtype}"
-            )
+            raise ValueError(f"TopK Indices must be int32, got {self.sample_topk_indices.dtype}")
         if self.input_layout == "T,H,D":
-            if (
-                self.sample_cum_seqlen_q.dtype != torch.int32
-                or self.sample_cum_seqlen_k.dtype != torch.int32
-            ):
+            if self.sample_cum_seqlen_q.dtype != torch.int32 or self.sample_cum_seqlen_k.dtype != torch.int32:
                 raise ValueError(
                     f"cum_seqlen_q and cum_seqlen_k tensors must be int32, got {self.sample_cum_seqlen_q.dtype} and {self.sample_cum_seqlen_k.dtype}"
                 )
@@ -230,9 +168,7 @@ class TopKReduction(APIBase):
         major, minor = torch.cuda.get_device_capability(device)
         compute_capability = major * 10 + minor
         if compute_capability < 100:
-            raise RuntimeError(
-                f"TopKReduction requires SM100+ compute capability, but found SM{compute_capability} on device {device}"
-            )
+            raise RuntimeError(f"TopKReduction requires SM100+ compute capability, but found SM{compute_capability} on device {device}")
         if compute_capability == 103:
             raise RuntimeError("cuteDSL TopKReduction is not supported on SM103")
 
@@ -257,11 +193,7 @@ class TopKReduction(APIBase):
             is_causal=self.is_causal,
         )
 
-        scale_softmax = (
-            1.0 / math.sqrt(self.head_dim)
-            if self.scale_softmax is None
-            else self.scale_softmax
-        )
+        scale_softmax = 1.0 / math.sqrt(self.head_dim) if self.scale_softmax is None else self.scale_softmax
         log2_e = math.log2(math.e)
         softmax_scale_log2_e = scale_softmax * log2_e
         problem_size = (
@@ -273,31 +205,13 @@ class TopKReduction(APIBase):
             self.head_dim,
         )
 
-        sample_q_cute = from_dlpack(
-            self.sample_q, assumed_align=16
-        ).mark_layout_dynamic(leading_dim=3)
-        sample_k_cute = from_dlpack(
-            self.sample_k, assumed_align=16
-        ).mark_layout_dynamic(leading_dim=3)
-        sample_lse_cute = from_dlpack(
-            self.sample_lse, assumed_align=16
-        ).mark_layout_dynamic(leading_dim=2)
-        sample_topk_scores_cute = from_dlpack(
-            self.sample_topk_scores, assumed_align=16
-        ).mark_layout_dynamic(leading_dim=3)
-        sample_topk_indices_cute = from_dlpack(
-            self.sample_topk_indices, assumed_align=16
-        ).mark_layout_dynamic(leading_dim=3)
-        sample_cum_seqlen_q_cute = (
-            from_dlpack(self.sample_cum_seqlen_q).mark_layout_dynamic()
-            if self.input_layout == "T,H,D"
-            else None
-        )
-        sample_cum_seqlen_k_cute = (
-            from_dlpack(self.sample_cum_seqlen_k).mark_layout_dynamic()
-            if self.input_layout == "T,H,D"
-            else None
-        )
+        sample_q_cute = from_dlpack(self.sample_q, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        sample_k_cute = from_dlpack(self.sample_k, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        sample_lse_cute = from_dlpack(self.sample_lse, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        sample_topk_scores_cute = from_dlpack(self.sample_topk_scores, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        sample_topk_indices_cute = from_dlpack(self.sample_topk_indices, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        sample_cum_seqlen_q_cute = from_dlpack(self.sample_cum_seqlen_q).mark_layout_dynamic() if self.input_layout == "T,H,D" else None
+        sample_cum_seqlen_k_cute = from_dlpack(self.sample_cum_seqlen_k).mark_layout_dynamic() if self.input_layout == "T,H,D" else None
 
         self._compiled_kernel = cute.compile(
             topk_reduction,
@@ -331,9 +245,7 @@ class TopKReduction(APIBase):
 
         if self.input_layout == "T,H,D":
             if cumulative_s_q_tensor is None or cumulative_s_k_tensor is None:
-                raise ValueError(
-                    "cumulative_s_q_tensor and cumulative_s_k_tensor are required when using T,H,D layout"
-                )
+                raise ValueError("cumulative_s_q_tensor and cumulative_s_k_tensor are required when using T,H,D layout")
             if q_tensor.ndim == 3:
                 self._logger.info("reshaping q_tensor from T,H,D to 1,H,T,D")
                 q_tensor = q_tensor.unsqueeze(0).transpose(1, 2)
@@ -345,11 +257,7 @@ class TopKReduction(APIBase):
                 lse_tensor = lse_tensor.unsqueeze(0).transpose(1, 2)
             elif lse_tensor.ndim == 3:
                 self._logger.info("reshaping lse_tensor from T,H,1 to 1,H,T")
-                lse_tensor = (
-                    self._unpad_tensor_to_ndim(lse_tensor, 2, "lse_tensor")
-                    .unsqueeze(0)
-                    .transpose(1, 2)
-                )
+                lse_tensor = self._unpad_tensor_to_ndim(lse_tensor, 2, "lse_tensor").unsqueeze(0).transpose(1, 2)
             if topk_scores_tensor.ndim == 3:
                 self._logger.info("reshaping topk_scores_tensor from T,H,D to 1,H,T,D")
                 topk_scores_tensor = topk_scores_tensor.unsqueeze(0).transpose(1, 2)
@@ -361,41 +269,17 @@ class TopKReduction(APIBase):
             self._logger.info("reshaping lse_tensor to remove trailing dimension")
             lse_tensor = lse_tensor.squeeze(-1)
         if lse_tensor.stride(-1) != 1:
-            self._logger.warning(
-                "lse_tensor is expected to have leading stride in last dimension of shape (b, h_q, s_q), copying lse_tensor to contiguous"
-            )
+            self._logger.warning("lse_tensor is expected to have leading stride in last dimension of shape (b, h_q, s_q), copying lse_tensor to contiguous")
             lse_tensor = lse_tensor.contiguous()
 
-        q_cute = from_dlpack(q_tensor, assumed_align=16).mark_layout_dynamic(
-            leading_dim=3
-        )
-        k_cute = from_dlpack(k_tensor, assumed_align=16).mark_layout_dynamic(
-            leading_dim=3
-        )
-        lse_cute = from_dlpack(lse_tensor, assumed_align=16).mark_layout_dynamic(
-            leading_dim=2
-        )
-        topk_scores_cute = from_dlpack(
-            topk_scores_tensor, assumed_align=16
-        ).mark_layout_dynamic(leading_dim=3)
-        topk_indices_cute = from_dlpack(
-            topk_indices_tensor, assumed_align=16
-        ).mark_layout_dynamic(leading_dim=3)
-        cumulative_s_q_cute = (
-            from_dlpack(cumulative_s_q_tensor).mark_layout_dynamic()
-            if self.input_layout == "T,H,D"
-            else None
-        )
-        cumulative_s_k_cute = (
-            from_dlpack(cumulative_s_k_tensor).mark_layout_dynamic()
-            if self.input_layout == "T,H,D"
-            else None
-        )
-        scale_softmax = (
-            1.0 / math.sqrt(self.head_dim)
-            if self.scale_softmax is None
-            else self.scale_softmax
-        )
+        q_cute = from_dlpack(q_tensor, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        k_cute = from_dlpack(k_tensor, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        lse_cute = from_dlpack(lse_tensor, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        topk_scores_cute = from_dlpack(topk_scores_tensor, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        topk_indices_cute = from_dlpack(topk_indices_tensor, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        cumulative_s_q_cute = from_dlpack(cumulative_s_q_tensor).mark_layout_dynamic() if self.input_layout == "T,H,D" else None
+        cumulative_s_k_cute = from_dlpack(cumulative_s_k_tensor).mark_layout_dynamic() if self.input_layout == "T,H,D" else None
+        scale_softmax = 1.0 / math.sqrt(self.head_dim) if self.scale_softmax is None else self.scale_softmax
         log2_e = math.log2(math.e)
         softmax_scale_log2_e = scale_softmax * log2_e
         problem_size = (
@@ -479,21 +363,13 @@ def topk_reduction_wrapper(
     if cum_seqlen_q_tensor is not None and cum_seqlen_k_tensor is not None:  # T,H,D
         total_seq_len_q = cum_seqlen_q_tensor[-1].item()
         h_k = k_tensor.shape[1]
-        topk_scores_tensor = torch.empty(
-            total_seq_len_q, h_k, k_value, dtype=acc_dtype, device=q_tensor.device
-        )
-        topk_indices_tensor = torch.empty(
-            total_seq_len_q, h_k, k_value, dtype=torch.int32, device=q_tensor.device
-        )
+        topk_scores_tensor = torch.empty(total_seq_len_q, h_k, k_value, dtype=acc_dtype, device=q_tensor.device)
+        topk_indices_tensor = torch.empty(total_seq_len_q, h_k, k_value, dtype=torch.int32, device=q_tensor.device)
     elif cum_seqlen_q_tensor is None and cum_seqlen_k_tensor is None:  # B,H,S,D
         b, _, s_q, _ = q_tensor.shape
         _, h_k, _, _ = k_tensor.shape
-        topk_scores_tensor = torch.empty(
-            b, s_q, h_k, k_value, dtype=acc_dtype, device=q_tensor.device
-        ).transpose(1, 2)
-        topk_indices_tensor = torch.empty(
-            b, s_q, h_k, k_value, dtype=torch.int32, device=q_tensor.device
-        ).transpose(1, 2)
+        topk_scores_tensor = torch.empty(b, s_q, h_k, k_value, dtype=acc_dtype, device=q_tensor.device).transpose(1, 2)
+        topk_indices_tensor = torch.empty(b, s_q, h_k, k_value, dtype=torch.int32, device=q_tensor.device).transpose(1, 2)
     else:
         raise ValueError(
             f"cum_seqlen_q_tensor and cum_seqlen_k_tensor must either both be None (B,H,S,D) or both not None (T,H,D), got {cum_seqlen_q_tensor} and {cum_seqlen_k_tensor}"
@@ -527,9 +403,7 @@ def topk_reduction_wrapper(
     )
 
     if cache_key in _cache_of_TopKReductionObjects:
-        _logger.debug(
-            "topk_reduction_wrapper: Using previously cached TopKReduction object"
-        )
+        _logger.debug("topk_reduction_wrapper: Using previously cached TopKReduction object")
         topk_reduction = _cache_of_TopKReductionObjects[cache_key]
         topk_reduction.execute(
             q_tensor=q_tensor,

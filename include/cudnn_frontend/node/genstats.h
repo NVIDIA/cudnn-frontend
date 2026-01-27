@@ -1,7 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
@@ -72,38 +70,63 @@ class GenstatsNode : public NodeCRTP<GenstatsNode> {
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FE_LOG_LABEL("INFO: " << "Building GenstatsNode operations " << attributes.name << " ");
 
-        auto&& genstats_operation_builder =
-            cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_GEN_STATS_DESCRIPTOR);
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 genstats_operation;
 
+        _CUDNN_CHECK_CUDNN_ERROR(
+            genstats_operation.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATION_GEN_STATS_DESCRIPTOR));
+
+        // Set input tensor X
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Genstats_attributes::input_names::X);
-        genstats_operation_builder.setxDesc(*(tensors.at(X->second->get_uid())));
+        auto x_desc = tensors.at(X->second->get_uid())->get_raw_desc();
 
-        genstats_operation_builder.setGenStatsMode(CUDNN_GENSTATS_SUM_SQSUM);
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(genstats_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_GENSTATS_XDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &x_desc));
 
+        // Set gen stats mode
+        cudnnGenStatsMode_t genstats_mode = CUDNN_GENSTATS_SUM_SQSUM;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(genstats_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_GENSTATS_MODE,
+                                                       CUDNN_TYPE_GENSTATS_MODE,
+                                                       1,
+                                                       &genstats_mode));
+
+        // Set math precision based on X tensor data type
+        cudnnDataType_t math_prec = static_cast<cudnnDataType_t>(tensors.at(X->second->get_uid())->getDataType());
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(genstats_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_GENSTATS_MATH_PREC,
+                                                       CUDNN_TYPE_DATA_TYPE,
+                                                       1,
+                                                       &math_prec));
+
+        // Set SUM output tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(SUM, Genstats_attributes::output_names::SUM);
-        genstats_operation_builder.setSumDesc(*(tensors.at(SUM->second->get_uid())));
+        auto sum_desc = tensors.at(SUM->second->get_uid())->get_raw_desc();
 
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(genstats_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_GENSTATS_SUMDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &sum_desc));
+
+        // Set SQ_SUM output tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(SQ_SUM, Genstats_attributes::output_names::SQ_SUM);
-        genstats_operation_builder.setSqSumDesc(*(tensors.at(SQ_SUM->second->get_uid())));
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = genstats_operation_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = genstats_operation_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
-        }
-#endif
+        auto sq_sum_desc = tensors.at(SQ_SUM->second->get_uid())->get_raw_desc();
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(genstats_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_GENSTATS_SQSUMDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &sq_sum_desc));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(genstats_operation.get_raw_desc()));
+
+        operations.push_back(std::make_shared<Operation_v8>(std::move(genstats_operation)));
 
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());

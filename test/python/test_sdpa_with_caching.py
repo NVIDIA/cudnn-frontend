@@ -28,9 +28,7 @@ batch_buckets = {
 cuda_graphs = {}
 
 H_Q = H_K = H_V = 6
-D_QK = D_VO = (
-    128  # If you are changing D_VO != D_QK, you need to change the code in create_qkv_tensors for ragged offsets of O
-)
+D_QK = D_VO = 128  # If you are changing D_VO != D_QK, you need to change the code in create_qkv_tensors for ragged offsets of O
 
 MAX_SEQ_LEN_Q = 1024
 MAX_SEQ_LEN_KV = 1024
@@ -174,11 +172,9 @@ def lookup_or_create_sdpa_graph(handle, batch_size):
             compute_data_type=cudnn.data_type.FLOAT,
         )
 
-        O.set_uid(UIDs.O_UID.value).set_output(True).set_dim(
-            [batch_size, H_Q, MAX_SEQ_LEN_Q, D_VO]
-        ).set_stride([MAX_SEQ_LEN_Q * D_VO * H_Q, D_VO, D_VO * H_Q, 1]).set_data_type(
-            cudnn.data_type.BFLOAT16
-        )
+        O.set_uid(UIDs.O_UID.value).set_output(True).set_dim([batch_size, H_Q, MAX_SEQ_LEN_Q, D_VO]).set_stride(
+            [MAX_SEQ_LEN_Q * D_VO * H_Q, D_VO, D_VO * H_Q, 1]
+        ).set_data_type(cudnn.data_type.BFLOAT16)
 
         O.set_ragged_offset(ragged_q)
 
@@ -193,9 +189,7 @@ def lookup_or_create_sdpa_graph(handle, batch_size):
 
 def pad_batch_size(batch_size, actual_seq_lens_q, actual_seq_lens_kv, ragged_offset_q):
     batch_buckets_keys = list(batch_buckets.keys())
-    batch_size_padded = next(
-        (b for b in batch_buckets_keys if b >= batch_size), batch_buckets_keys[-1]
-    )
+    batch_size_padded = next((b for b in batch_buckets_keys if b >= batch_size), batch_buckets_keys[-1])
     zeros = torch.zeros(
         (batch_size_padded - batch_size, 1, 1, 1),
         dtype=actual_seq_lens_q.dtype,
@@ -242,9 +236,7 @@ def test_ragged_sdpa_with_caching(cudnn_handle):
     # For example, you can bucket by sequence length, or masking pattern, etc.
 
     for _batch_size in batch_buckets.keys():
-        batch_buckets[_batch_size] = lookup_or_create_sdpa_graph(
-            cudnn_handle, _batch_size
-        )
+        batch_buckets[_batch_size] = lookup_or_create_sdpa_graph(cudnn_handle, _batch_size)
 
     logger.info(f"Buckets initialized")
 
@@ -271,9 +263,7 @@ def test_ragged_sdpa_with_caching(cudnn_handle):
             device=device,
         )
 
-        q_gpu, k_gpu, v_gpu, ragged_offset_q, out_gpu = create_qkv_tensors(
-            batch_size, actual_seq_lens_q, actual_seq_lens_kv
-        )
+        q_gpu, k_gpu, v_gpu, ragged_offset_q, out_gpu = create_qkv_tensors(batch_size, actual_seq_lens_q, actual_seq_lens_kv)
 
         samples.append(
             (
@@ -313,14 +303,10 @@ def test_ragged_sdpa_with_caching(cudnn_handle):
                 padded_actual_seq_lens_q,
                 padded_actual_seq_lens_kv,
                 padded_ragged_offset_q,
-            ) = pad_batch_size(
-                batch_size, actual_seq_lens_q, actual_seq_lens_kv, ragged_offset_q
-            )
+            ) = pad_batch_size(batch_size, actual_seq_lens_q, actual_seq_lens_kv, ragged_offset_q)
             torch.cuda.nvtx.range_pop()
 
-            logger.info(
-                f"Executing the sample with actual batch_size: {batch_size} and padded_batch_size: {padded_batch_size}"
-            )
+            logger.info(f"Executing the sample with actual batch_size: {batch_size} and padded_batch_size: {padded_batch_size}")
 
             # This will not create a new graph, it will return the graph from the bucket by the key function
             torch.cuda.nvtx.range_push("Look up the graph")

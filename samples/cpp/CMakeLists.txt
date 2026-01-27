@@ -10,6 +10,7 @@ add_executable(
     sdpa/fp16_bwd_with_flexible_graphs.cpp
     sdpa/fp16_fwd_with_custom_dropout.cpp
     sdpa/fp16_fwd_with_paged_caches.cpp
+    sdpa/fp16_dynamic_shapes.cpp
     sdpa/fp16_fwd_paged_decode_and_prefill.cpp
     sdpa/fp16_fwd_with_cudagraphs.cpp
     sdpa/fp16_bwd_with_cudagraphs.cpp
@@ -38,6 +39,8 @@ add_executable(
     matmul/blackwell_nvfp4_mxfp8_block_scale_matmul.cpp
     matmul/general_block_scale_matmul.cpp
     matmul/complex_fp32_matmul.cpp
+
+    moe_grouped_matmul/moe_grouped_matmul.cpp
 
     norm/batchnorm.cpp
     norm/layernorm.cpp

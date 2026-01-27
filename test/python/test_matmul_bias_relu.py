@@ -25,7 +25,7 @@ def convert_to_cudnn_type(torch_type):
 
 
 def get_cc():
-    (major, minor) = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability()
     return major * 10 + minor
 
 
@@ -33,9 +33,7 @@ def get_cc():
     LooseVersion(cudnn.backend_version_string()) < "8.9.6",
     reason="requires cudnn 8.9.6 or higher",
 )
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch"
-)
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch")
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_int8_bf16_matmul(cudnn_handle):
@@ -44,17 +42,8 @@ def test_int8_bf16_matmul(cudnn_handle):
     B, M, N, K = 16, 32, 64, 128
 
     # Initialize input tensors
-    A_gpu = (
-        torch.randint(
-            3, (B, M, K), requires_grad=False, device="cuda", dtype=torch.int8
-        )
-        - 2
-    )
-    B_gpu = (
-        3
-        * torch.randn(B, K, N, requires_grad=False, device="cuda", dtype=torch.bfloat16)
-        - 1.25
-    )
+    A_gpu = torch.randint(3, (B, M, K), requires_grad=False, device="cuda", dtype=torch.int8) - 2
+    B_gpu = 3 * torch.randn(B, K, N, requires_grad=False, device="cuda", dtype=torch.bfloat16) - 1.25
 
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
@@ -71,9 +60,7 @@ def test_int8_bf16_matmul(cudnn_handle):
     A_casted = graph.identity(input=A, compute_data_type=cudnn.data_type.FLOAT)
     A_casted.set_data_type(cudnn.data_type.BFLOAT16)
 
-    C = graph.matmul(
-        name="matmul", A=A_casted, B=B, compute_data_type=cudnn.data_type.FLOAT
-    )
+    C = graph.matmul(name="matmul", A=A_casted, B=B, compute_data_type=cudnn.data_type.FLOAT)
     C.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
 
     graph.validate()
@@ -93,9 +80,7 @@ def test_int8_bf16_matmul(cudnn_handle):
 
     # Run cudnn graph
     C_actual = torch.zeros_like(C_expected)
-    workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     graph.execute({A: A_gpu, B: B_gpu, C: C_actual}, workspace, handle=cudnn_handle)
 
     torch.cuda.synchronize()
@@ -112,9 +97,7 @@ MMA_data_type_options = [torch.bfloat16, torch.float16, torch.float32]
     LooseVersion(cudnn.backend_version_string()) < "8.9.6",
     reason="requires cudnn 8.9.6 or higher",
 )
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch"
-)
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch")
 @pytest.mark.parametrize("A_data_type", A_data_type_options)
 @pytest.mark.parametrize("B_data_type", B_data_type_options)
 @pytest.mark.parametrize("MMA_data_type", MMA_data_type_options)
@@ -127,36 +110,14 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type, cudnn_h
 
     # Initialize input tensors
     if A_data_type != torch.int8:
-        A_gpu = (
-            2
-            * torch.randn(
-                B, M, K, requires_grad=False, device="cuda", dtype=A_data_type
-            )
-            - 0.5
-        )
+        A_gpu = 2 * torch.randn(B, M, K, requires_grad=False, device="cuda", dtype=A_data_type) - 0.5
     else:
-        A_gpu = (
-            torch.randint(
-                4, (B, M, K), requires_grad=False, device="cuda", dtype=A_data_type
-            )
-            - 1
-        )
+        A_gpu = torch.randint(4, (B, M, K), requires_grad=False, device="cuda", dtype=A_data_type) - 1
 
     if B_data_type != torch.int8:
-        B_gpu_strided = (
-            3
-            * torch.randn(
-                B, K, N, requires_grad=False, device="cuda", dtype=B_data_type
-            )
-            - 1.25
-        )
+        B_gpu_strided = 3 * torch.randn(B, K, N, requires_grad=False, device="cuda", dtype=B_data_type) - 1.25
     else:
-        B_gpu_strided = (
-            torch.randint(
-                3, (B, K, N), requires_grad=False, device="cuda", dtype=B_data_type
-            ).contiguous()
-            - 2
-        )
+        B_gpu_strided = torch.randint(3, (B, K, N), requires_grad=False, device="cuda", dtype=B_data_type).contiguous() - 2
 
     B_gpu = torch.as_strided(B_gpu_strided, (B, K, N), (N * K, 1, N))
 
@@ -176,10 +137,7 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type, cudnn_h
     A_casted.set_data_type(convert_to_cudnn_type(MMA_data_type))
 
     # Casting input tensor B is only supported from cudnn v9
-    if (
-        B_data_type != MMA_data_type
-        and LooseVersion(cudnn.backend_version_string()) < "9"
-    ):
+    if B_data_type != MMA_data_type and LooseVersion(cudnn.backend_version_string()) < "9":
         pytest.skip("mixed precision on B only supported from cudnn v9.")
 
     if LooseVersion(cudnn.backend_version_string()) < "9":
@@ -192,9 +150,7 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type, cudnn_h
 
     # CAUTION: Hardcodes to fp32 as tests today dont cover inputs that are casted to ints.
     # In case your usecase does cast inputs to int8, use int32 as compute type here.
-    C = graph.matmul(
-        name="matmul", A=A_casted, B=B_casted, compute_data_type=cudnn.data_type.FLOAT
-    )
+    C = graph.matmul(name="matmul", A=A_casted, B=B_casted, compute_data_type=cudnn.data_type.FLOAT)
     C.set_output(True).set_data_type(convert_to_cudnn_type(MMA_data_type))
 
     graph.validate()
@@ -214,9 +170,7 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type, cudnn_h
 
     # Run cudnn graph
     C_actual = torch.zeros_like(C_expected)
-    workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     graph.execute({A: A_gpu, B: B_gpu, C: C_actual}, workspace, handle=cudnn_handle)
 
     torch.cuda.synchronize()
@@ -227,9 +181,7 @@ def test_mixed_precision_matmul(A_data_type, B_data_type, MMA_data_type, cudnn_h
 problem_size_options = [(1, 128, 768), (16, 512, 1600), (1, 128, 1024)]
 input_type_options = [torch.bfloat16, torch.float16]
 
-all_options = [
-    elem for elem in itertools.product(*[problem_size_options, input_type_options])
-]
+all_options = [elem for elem in itertools.product(*[problem_size_options, input_type_options])]
 
 
 @pytest.fixture(params=all_options)
@@ -252,15 +204,9 @@ def test_matmul_bias(param_extract, cudnn_handle):
         pytest.skip("matmul broadcast on ampere with 8.9.6 is not supported.")
 
     X_gpu = torch.randn(b, s, e, requires_grad=False, device="cuda", dtype=input_type)
-    W_gpu = torch.randn(
-        1, e, e * 4, requires_grad=False, device="cuda", dtype=input_type
-    )
-    B_gpu = torch.randn(
-        1, 1, e * 4, requires_grad=False, device="cuda", dtype=input_type
-    )
-    Y_expected = torch.nn.functional.linear(
-        X_gpu, W_gpu.squeeze().T, bias=B_gpu.squeeze()
-    )
+    W_gpu = torch.randn(1, e, e * 4, requires_grad=False, device="cuda", dtype=input_type)
+    B_gpu = torch.randn(1, 1, e * 4, requires_grad=False, device="cuda", dtype=input_type)
+    Y_expected = torch.nn.functional.linear(X_gpu, W_gpu.squeeze().T, bias=B_gpu.squeeze())
 
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
@@ -309,15 +255,11 @@ def test_matmul_bias(param_extract, cudnn_handle):
     notes = graph.get_behavior_notes()
     assert cudnn.behavior_note.RUNTIME_COMPILATION in notes
 
-    workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
     Y_actual = torch.zeros_like(Y_expected)
 
-    graph.execute(
-        {X: X_gpu, W: W_gpu, B: B_gpu, Y: Y_actual}, workspace, handle=cudnn_handle
-    )
+    graph.execute({X: X_gpu, W: W_gpu, B: B_gpu, Y: Y_actual}, workspace, handle=cudnn_handle)
 
     atol = 0.0625 if get_cc() == 89 else 1e-3
     rtol = 1e-2 if input_type == torch.bfloat16 else 1e-3

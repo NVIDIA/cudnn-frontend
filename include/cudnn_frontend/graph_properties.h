@@ -2183,9 +2183,10 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
     friend class SDPAFP8BackwardNode;
     friend class Graph;
 
-    bool padding_mask             = false;
-    bool causal_mask              = false;
-    bool causal_mask_bottom_right = false;
+    bool padding_mask               = false;
+    bool causal_mask                = false;
+    bool causal_mask_bottom_right   = false;
+    bool is_deterministic_algorithm = false;
 
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
@@ -2235,7 +2236,8 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
                                    causal_mask,
                                    dropout_probability,
                                    causal_mask_bottom_right,
-                                   attn_scale_value)
+                                   attn_scale_value,
+                                   is_deterministic_algorithm)
 
     SDPA_fp8_backward_attributes&
     set_attn_scale(std::shared_ptr<Tensor_attributes> value) {
@@ -2302,6 +2304,12 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
         inputs[SDPA_fp8_backward_attributes::input_names::Dropout_mask]      = mask;
         inputs[SDPA_fp8_backward_attributes::input_names::Dropout_scale]     = scale;
         inputs[SDPA_fp8_backward_attributes::input_names::Dropout_scale_inv] = scale_inv;
+        return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_deterministic_algorithm(bool const value) {
+        is_deterministic_algorithm = value;
         return *this;
     }
 };

@@ -32,6 +32,12 @@
 #include "cudnn_frontend_utils.h"
 
 namespace cudnn_frontend {
+namespace graph {
+class RngNode;
+}
+}  // namespace cudnn_frontend
+
+namespace cudnn_frontend {
 
 ///
 /// Rng Descriptor Class
@@ -44,6 +50,7 @@ namespace cudnn_frontend {
 class RngDesc_v8 : public BackendDescriptor {
    public:
     friend class RngDescBuilder_v8;
+    friend class graph::RngNode;
     std::string
     describe() const override {
         std::stringstream ss;

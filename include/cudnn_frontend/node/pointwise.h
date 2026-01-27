@@ -1,9 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_PointWiseDesc.h"
-#include "../../cudnn_frontend_Heuristics.h"
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
@@ -81,92 +77,204 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FE_LOG_LABEL("INFO: " << "Building PointwiseNode operations " << attributes.name << " ");
 
-        auto&& pointwise_descriptor_builder = cudnn_frontend::PointwiseDescBuilder();
+        // Create pointwise descriptor by directly calling cuDNN backend API
+        PointWiseDesc_v8 pointwise_descriptor;
 
-        if (attributes.get_axis().has_value()) {
-            pointwise_descriptor_builder.setAxis(attributes.get_axis().value());
+        _CUDNN_CHECK_CUDNN_ERROR(
+            pointwise_descriptor.initialize_managed_backend_pointer(CUDNN_BACKEND_POINTWISE_DESCRIPTOR));
+
+        // Set pointwise mode
+        cudnnPointwiseMode_t cudnn_pointwise_mode;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.mode, cudnn_pointwise_mode));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_POINTWISE_MODE,
+                                                       CUDNN_TYPE_POINTWISE_MODE,
+                                                       1,
+                                                       &cudnn_pointwise_mode));
+
+        // Set compute type
+        cudnnDataType_t cudnn_data_type;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.compute_data_type, cudnn_data_type));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_POINTWISE_MATH_PREC,
+                                                       CUDNN_TYPE_DATA_TYPE,
+                                                       1,
+                                                       &cudnn_data_type));
+
+        // Set mode-specific attributes
+        if (attributes.mode == PointwiseMode_t::RELU_FWD || attributes.mode == PointwiseMode_t::RELU_BWD) {
+            cudnnNanPropagation_t nan_propagation = CUDNN_PROPAGATE_NAN;
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_descriptor.get_raw_desc(),
+                                                           CUDNN_ATTR_POINTWISE_NAN_PROPAGATION,
+                                                           CUDNN_TYPE_NAN_PROPOGATION,
+                                                           1,
+                                                           &nan_propagation));
+
+            double lower_clip = attributes.relu_lower_clip.value_or(0.0);
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_descriptor.get_raw_desc(),
+                                                           CUDNN_ATTR_POINTWISE_RELU_LOWER_CLIP,
+                                                           CUDNN_TYPE_DOUBLE,
+                                                           1,
+                                                           &lower_clip));
+
+            double upper_clip = attributes.relu_upper_clip.value_or(std::numeric_limits<double>::max());
+            if (attributes.compute_data_type == DataType_t::FLOAT) {
+                upper_clip = std::min<double>(upper_clip, std::numeric_limits<float>::max());
+            }
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_descriptor.get_raw_desc(),
+                                                           CUDNN_ATTR_POINTWISE_RELU_UPPER_CLIP,
+                                                           CUDNN_TYPE_DOUBLE,
+                                                           1,
+                                                           &upper_clip));
+
+            double lower_clip_slope = attributes.relu_lower_clip_slope.value_or(0.0);
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_descriptor.get_raw_desc(),
+                                                           CUDNN_ATTR_POINTWISE_RELU_LOWER_CLIP_SLOPE,
+                                                           CUDNN_TYPE_DOUBLE,
+                                                           1,
+                                                           &lower_clip_slope));
+        } else if (attributes.mode == PointwiseMode_t::ELU_FWD || attributes.mode == PointwiseMode_t::ELU_BWD) {
+            double elu_alpha = attributes.elu_alpha.value_or(1.0);
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
+                pointwise_descriptor.get_raw_desc(), CUDNN_ATTR_POINTWISE_ELU_ALPHA, CUDNN_TYPE_DOUBLE, 1, &elu_alpha));
+        } else if (attributes.mode == PointwiseMode_t::SOFTPLUS_FWD ||
+                   attributes.mode == PointwiseMode_t::SOFTPLUS_BWD) {
+            double softplus_beta = attributes.softplus_beta.value_or(1.0);
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_descriptor.get_raw_desc(),
+                                                           CUDNN_ATTR_POINTWISE_SOFTPLUS_BETA,
+                                                           CUDNN_TYPE_DOUBLE,
+                                                           1,
+                                                           &softplus_beta));
+        } else if (attributes.mode == PointwiseMode_t::SWISH_FWD || attributes.mode == PointwiseMode_t::SWISH_BWD) {
+            double swish_beta = attributes.swish_beta.value_or(1.0);
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_descriptor.get_raw_desc(),
+                                                           CUDNN_ATTR_POINTWISE_SWISH_BETA,
+                                                           CUDNN_TYPE_DOUBLE,
+                                                           1,
+                                                           &swish_beta));
+        } else if (attributes.mode == PointwiseMode_t::GEN_INDEX) {
+            int64_t axis = attributes.get_axis().value_or(-1);
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
+                pointwise_descriptor.get_raw_desc(), CUDNN_ATTR_POINTWISE_AXIS, CUDNN_TYPE_INT64, 1, &axis));
         }
 
-        if (attributes.relu_lower_clip_slope.has_value()) {
-            pointwise_descriptor_builder.setReluLowerClipSlope(attributes.relu_lower_clip_slope.value());
-        }
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(pointwise_descriptor.get_raw_desc()));
+        CUDNN_FE_LOG_LABEL_ENDL(pointwise_descriptor);
 
-        if (attributes.relu_lower_clip.has_value()) {
-            pointwise_descriptor_builder.setReluLowerClip(attributes.relu_lower_clip.value());
-        }
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 pointwise_operation;
 
-        if (attributes.relu_upper_clip.has_value()) {
-            pointwise_descriptor_builder.setReluUpperClip(attributes.relu_upper_clip.value());
-        }
+        _CUDNN_CHECK_CUDNN_ERROR(
+            pointwise_operation.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR));
 
-        if (attributes.swish_beta.has_value()) {
-            pointwise_descriptor_builder.setSwishBeta(attributes.swish_beta.value());
-        }
+        // Set the pointwise descriptor
+        auto pw_desc_ptr = pointwise_descriptor.get_raw_desc();
 
-        if (attributes.elu_alpha.has_value()) {
-            pointwise_descriptor_builder.setEluAlpha(attributes.elu_alpha.value());
-        }
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_POINTWISE_PW_DESCRIPTOR,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &pw_desc_ptr));
 
-        if (attributes.softplus_beta.has_value()) {
-            pointwise_descriptor_builder.setSoftplusBeta(attributes.softplus_beta.value());
-        }
+        auto const port_count        = get_pointwise_mode_port_count(attributes.mode);
+        bool const is_activation_bwd = detail::is_activation_backward_mode(attributes.mode);
 
-        pointwise_descriptor_builder.setComputeType(attributes.compute_data_type);
-        pointwise_descriptor_builder.setMode(attributes.mode);
-        auto pointwise_descriptor = pointwise_descriptor_builder.build();
-
-        auto const port_count = get_pointwise_mode_port_count(attributes.mode);
-
-        auto&& pointwise_operation_builder =
-            cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_POINTWISE_DESCRIPTOR);
-        pointwise_operation_builder.setpwDesc(pointwise_descriptor);
-
-        if (detail::is_activation_backward_mode(attributes.mode)) {
+        if (is_activation_bwd) {
+            // Backward mode: IN_0 is dy, IN_1 is x, OUT_0 is dx
             CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_0, Pointwise_attributes::input_names::IN_0);
-            pointwise_operation_builder.setdyDesc(*(tensors.at(IN_0->second->get_uid())));
+            auto dy_desc = tensors.at(IN_0->second->get_uid())->get_raw_desc();
 
             CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_1, Pointwise_attributes::input_names::IN_1);
-            pointwise_operation_builder.setxDesc(*(tensors.at(IN_1->second->get_uid())));
+            auto x_desc = tensors.at(IN_1->second->get_uid())->get_raw_desc();
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_POINTWISE_XDESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &x_desc));
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_POINTWISE_DYDESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &dy_desc));
 
             CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(OUT_0, Pointwise_attributes::output_names::OUT_0);
-            pointwise_operation_builder.setdxDesc(*(tensors.at(OUT_0->second->get_uid())));
+            auto dx_desc = tensors.at(OUT_0->second->get_uid())->get_raw_desc();
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_POINTWISE_DXDESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &dx_desc));
         } else {
+            // Forward mode
             CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_0, Pointwise_attributes::input_names::IN_0);
-            pointwise_operation_builder.setxDesc(*(tensors.at(IN_0->second->get_uid())));
+            auto x_desc = tensors.at(IN_0->second->get_uid())->get_raw_desc();
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_POINTWISE_XDESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &x_desc));
+
+            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(OUT_0, Pointwise_attributes::output_names::OUT_0);
+            auto y_desc = tensors.at(OUT_0->second->get_uid())->get_raw_desc();
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_POINTWISE_YDESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &y_desc));
 
             if (port_count >= 3) {
                 CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_1, Pointwise_attributes::input_names::IN_1);
-                pointwise_operation_builder.setbDesc(*(tensors.at(IN_1->second->get_uid())));
+                auto b_desc = tensors.at(IN_1->second->get_uid())->get_raw_desc();
+
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_operation.get_raw_desc(),
+                                                               CUDNN_ATTR_OPERATION_POINTWISE_BDESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &b_desc));
             }
 
             if (port_count >= 4) {
                 CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(IN_2, Pointwise_attributes::input_names::IN_2);
-                pointwise_operation_builder.settDesc(*(tensors.at(IN_2->second->get_uid())));
+                auto t_desc = tensors.at(IN_2->second->get_uid())->get_raw_desc();
+
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(pointwise_operation.get_raw_desc(),
+                                                               CUDNN_ATTR_OPERATION_POINTWISE_TDESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &t_desc));
             }
-
-            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(OUT_0, Pointwise_attributes::output_names::OUT_0);
-            pointwise_operation_builder.setyDesc(*(tensors.at(OUT_0->second->get_uid())));
         }
 
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = pointwise_operation_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = pointwise_operation_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
-        }
-#endif
+        // Set alpha scaling factors (always set to 1.0)
+        float alpha1 = 1.0f;
+        float alpha2 = 1.0f;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
+            pointwise_operation.get_raw_desc(), CUDNN_ATTR_OPERATION_POINTWISE_ALPHA1, CUDNN_TYPE_FLOAT, 1, &alpha1));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
+            pointwise_operation.get_raw_desc(), CUDNN_ATTR_OPERATION_POINTWISE_ALPHA2, CUDNN_TYPE_FLOAT, 1, &alpha2));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(pointwise_operation.get_raw_desc()));
+
+        operations.push_back(std::make_shared<Operation_v8>(std::move(pointwise_operation)));
 
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());

@@ -1,0 +1,41 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,fwd_time_ms,bwd_time_ms,fwd_tflops,bwd_tflops,max_diff,num_iterations,success,error_message,gpu_name,cudnn_version,cudnn_backend_version
+dsv3,dsv3,cudnn,bfloat16,top_left,1,32768,32768,128,128,192,128,both,True,21.319,80.520,2063.000,1420.000,0.000,10,True,,NVIDIA GB300,1.18.0,91801.000
+dsv3,dsv3,cudnn,fp8,top_left,1,32768,32768,128,128,192,128,both,True,inf,inf,0.000,0.000,0.000,10,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 560, in <module>
+    graph_fwd.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)
+
+stdout: ",,,
+dsv3,dsv3,cudnn,bfloat16,top_left,1,16384,16384,128,128,192,128,both,True,5.584,20.381,1969.000,1403.000,0.000,10,True,,NVIDIA GB300,1.18.0,91801.000
+dsv3,dsv3,cudnn,fp8,top_left,1,16384,16384,128,128,192,128,both,True,inf,inf,0.000,0.000,0.000,10,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 560, in <module>
+    graph_fwd.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)
+
+stdout: ",,,
+dsv3,dsv3,cudnn,bfloat16,top_left,1,8192,8192,128,128,192,128,both,True,1.518,5.412,1811.000,1321.000,0.000,10,True,,NVIDIA GB300,1.18.0,91801.000
+dsv3,dsv3,cudnn,fp8,top_left,1,8192,8192,128,128,192,128,both,True,inf,inf,0.000,0.000,0.000,10,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 560, in <module>
+    graph_fwd.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)
+
+stdout: ",,,
+dsv3,dsv3,cudnn,bfloat16,top_left,1,4096,4096,128,128,192,128,both,True,0.438,1.541,1570.000,1160.000,0.000,10,True,,NVIDIA GB300,1.18.0,91801.000
+dsv3,dsv3,cudnn,fp8,top_left,1,4096,4096,128,128,192,128,both,True,inf,inf,0.000,0.000,0.000,10,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 560, in <module>
+    graph_fwd.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)
+
+stdout: ",,,
+dsv3,dsv3,cudnn,bfloat16,top_left,1,2048,2048,128,128,192,128,both,True,0.148,0.493,1158.000,906.000,0.000,10,True,,NVIDIA GB300,1.18.0,91801.000
+dsv3,dsv3,cudnn,fp8,top_left,1,2048,2048,128,128,192,128,both,True,inf,inf,0.000,0.000,0.000,10,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 560, in <module>
+    graph_fwd.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)
+
+stdout: ",,,

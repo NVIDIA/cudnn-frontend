@@ -7,6 +7,7 @@ Base classes for cuDNN API wrappers.
 This module provides abstract base classes that define common interfaces
 for cuDNN API wrapper classes, including validation, compilation, and execution patterns.
 """
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -22,6 +23,11 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def is_power_of_2(n: int) -> bool:
+    """Check if n is a power of 2."""
+    return n > 0 and (n & (n - 1)) == 0
 
 
 class APIBase(ABC):
@@ -218,9 +224,7 @@ class APIBase(ABC):
             ...     # ... rest of compilation
         """
         if not self._is_supported:
-            self._logger.info(
-                f"{self.__class__.__name__}: check_support not previously called, calling now"
-            )
+            self._logger.info(f"{self.__class__.__name__}: check_support not previously called, calling now")
             assert self.check_support(), "Unsupported configuration"
 
     def _get_default_stream(self, stream: Optional[cuda.CUstream]) -> cuda.CUstream:
@@ -241,9 +245,7 @@ class APIBase(ABC):
             ...     # Now current_stream is guaranteed to be a valid stream
         """
         if stream is None:
-            self._logger.debug(
-                f"{self.__class__.__name__}: No CUDA stream provided, using default stream"
-            )
+            self._logger.debug(f"{self.__class__.__name__}: No CUDA stream provided, using default stream")
             return cutlass.cuda.default_stream()
         return stream
 
@@ -292,9 +294,7 @@ class APIBase(ABC):
             for _ in range(tensor.ndim - ndim):
                 tensor = tensor.squeeze(-1)
             if tensor.ndim != ndim:
-                self._logger.critical(
-                    f"Unpadding {name} resulted in shape {tensor.shape}, expected {ndim}D"
-                )
+                self._logger.critical(f"Unpadding {name} resulted in shape {tensor.shape}, expected {ndim}D")
         return tensor
 
     def _is_fp4x2(self, tensor_or_dtype: torch.Tensor | torch.dtype) -> bool:
@@ -307,14 +307,8 @@ class APIBase(ABC):
         """
         if tensor_or_dtype is None:
             return False
-        dtype = (
-            tensor_or_dtype.dtype
-            if isinstance(tensor_or_dtype, torch.Tensor)
-            else tensor_or_dtype
-        )
-        return (dtype == torch.float4_e2m1fn_x2) or (
-            self._interpret_uint8_as_fp4x2 and dtype == torch.uint8
-        )
+        dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, torch.Tensor) else tensor_or_dtype
+        return (dtype == torch.float4_e2m1fn_x2) or (self._interpret_uint8_as_fp4x2 and dtype == torch.uint8)
 
     def _is_fp8(self, tensor_or_dtype: torch.Tensor | torch.dtype) -> bool:
         """Check if tensor or dtype is an FP8 datatype.
@@ -326,11 +320,7 @@ class APIBase(ABC):
         """
         if tensor_or_dtype is None:
             return False
-        dtype = (
-            tensor_or_dtype.dtype
-            if isinstance(tensor_or_dtype, torch.Tensor)
-            else tensor_or_dtype
-        )
+        dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, torch.Tensor) else tensor_or_dtype
         return dtype in {torch.float8_e5m2, torch.float8_e4m3fn}
 
     def _get_innermost_stride_dim(self, tensor: torch.Tensor, name: str = "") -> int:
@@ -343,9 +333,7 @@ class APIBase(ABC):
             self._logger.critical(
                 f"tensor {name} has shape: {tensor.shape} stride {tensor.stride()} – innermost contiguous (stride == 1) dimension not found. "
             )
-            raise RuntimeError(
-                f"tensor {name} has shape: {tensor.shape} stride {tensor.stride()} – innermost contiguous (stride == 1) dimension not found. "
-            )
+            raise RuntimeError(f"tensor {name} has shape: {tensor.shape} stride {tensor.stride()} – innermost contiguous (stride == 1) dimension not found. ")
         return idx
 
     def _tensor_shape(
@@ -371,13 +359,8 @@ class APIBase(ABC):
 
         if self._is_fp4x2(tensor):
             innermost_dim_index = self._get_innermost_stride_dim(tensor, name=name)
-            shape = tuple(
-                dim * 2 if i == innermost_dim_index else dim
-                for i, dim in enumerate(tensor.shape)
-            )
-            self._logger.debug(
-                f"FP4x2 tensor {name}: physical shape {tensor.shape} -> logical shape {shape}"
-            )
+            shape = tuple(dim * 2 if i == innermost_dim_index else dim for i, dim in enumerate(tensor.shape))
+            self._logger.debug(f"FP4x2 tensor {name}: physical shape {tensor.shape} -> logical shape {shape}")
             return shape
         else:
             return tensor.shape
@@ -405,13 +388,8 @@ class APIBase(ABC):
 
         if self._is_fp4x2(tensor):
             innermost_dim_index = self._get_innermost_stride_dim(tensor, name=name)
-            strides = tuple(
-                s * 2 if i != innermost_dim_index else s
-                for i, s in enumerate(tensor.stride())
-            )
-            self._logger.debug(
-                f"FP4x2 tensor {name}: physical stride {tensor.stride()} -> logical stride {strides}"
-            )
+            strides = tuple(s * 2 if i != innermost_dim_index else s for i, s in enumerate(tensor.stride()))
+            self._logger.debug(f"FP4x2 tensor {name}: physical stride {tensor.stride()} -> logical stride {strides}")
             return strides
         else:
             return tensor.stride()
@@ -436,21 +414,13 @@ class APIBase(ABC):
         """
         if tensor_or_shape is None:
             return None
-        tensor_shape = (
-            self._tensor_shape(tensor_or_shape, name=name)
-            if isinstance(tensor_or_shape, torch.Tensor)
-            else tensor_or_shape
-        )
+        tensor_shape = self._tensor_shape(tensor_or_shape, name=name) if isinstance(tensor_or_shape, torch.Tensor) else tensor_or_shape
         if isinstance(shape, tuple):
             if tensor_shape != shape:
-                raise ValueError(
-                    f"{name} tensor shape mismatch: expected {shape}, got {tensor_shape}"
-                )
+                raise ValueError(f"{name} tensor shape mismatch: expected {shape}, got {tensor_shape}")
         elif isinstance(shape, list):
             if tensor_shape not in shape:
-                raise ValueError(
-                    f"{name} tensor shape mismatch: expected one of {shape}, got {tensor_shape}"
-                )
+                raise ValueError(f"{name} tensor shape mismatch: expected one of {shape}, got {tensor_shape}")
         else:
             raise ValueError(f"Expected shape to be a tuple or list, got {type(shape)}")
         return tensor_shape
@@ -461,6 +431,7 @@ class APIBase(ABC):
         stride: Optional[Tuple[int, ...] | List[Tuple[int, ...]]] = None,
         stride_order: Optional[Tuple[int, ...] | List[Tuple[int, ...]]] = None,
         name: str = "",
+        extra_error_msg: str = "",
     ) -> Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]]:
         """Check if the stride of a tensor matches the expected stride(s) or stride order(s).
 
@@ -472,51 +443,53 @@ class APIBase(ABC):
         :type stride_order: Tuple[int, ...] | List[Tuple[int, ...]]
         :param name: Logical tensor name for logging
         :type name: str
+        :param extra_error_msg: Extra error message to add to the error
+        :type extra_error_msg: str
         :raises ValueError: If the stride of the tensor does not match the expected stride order
         :return: The stride and stride order of the tensor
         :rtype: Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]]
         """
         if tensor_or_stride is None:
-            return None
-        tensor_stride = (
-            self._tensor_stride(tensor_or_stride, name=name)
-            if isinstance(tensor_or_stride, torch.Tensor)
-            else tensor_or_stride
-        )
-        tensor_stride_order = tuple(
-            i for i, s in sorted(enumerate(tensor_stride), key=lambda x: x[1])
-        )
+            return None, None
+        tensor_stride = self._tensor_stride(tensor_or_stride, name=name) if isinstance(tensor_or_stride, torch.Tensor) else tensor_or_stride
+        tensor_stride_order = tuple(i for i, s in sorted(enumerate(tensor_stride), key=lambda x: x[1]))
 
         if stride is not None:
             if isinstance(stride, tuple):
                 if tensor_stride != stride:
-                    raise ValueError(
-                        f"{name} tensor stride mismatch: expected {stride}, got {tensor_stride}"
-                    )
+                    error_msg = f"{name} tensor stride mismatch: expected {stride}, got {tensor_stride}"
+                    if extra_error_msg:
+                        error_msg += f": {extra_error_msg}"
+                    raise ValueError(error_msg)
             elif isinstance(stride, list):
                 if tensor_stride not in stride:
-                    raise ValueError(
-                        f"{name} tensor stride mismatch: expected one of {stride}, got {tensor_stride}"
-                    )
+                    error_msg = f"{name} tensor stride mismatch: expected one of {stride}, got {tensor_stride}"
+                    if extra_error_msg:
+                        error_msg += f": {extra_error_msg}"
+                    raise ValueError(error_msg)
             else:
-                raise ValueError(
-                    f"Expected stride to be a tuple or list, got {type(stride)}"
-                )
+                error_msg = f"Expected stride to be a tuple or list, got {type(stride)}"
+                if extra_error_msg:
+                    error_msg += f": {extra_error_msg}"
+                raise ValueError(error_msg)
         if stride_order is not None:
             if isinstance(stride_order, tuple):
                 if tensor_stride_order != stride_order:
-                    raise ValueError(
-                        f"{name} tensor stride order mismatch: expected {stride_order}, got {tensor_stride_order}"
-                    )
+                    error_msg = f"{name} tensor stride order mismatch: expected {stride_order}, got {tensor_stride_order}"
+                    if extra_error_msg:
+                        error_msg += f": {extra_error_msg}"
+                    raise ValueError(error_msg)
             elif isinstance(stride_order, list):
                 if tensor_stride_order not in stride_order:
-                    raise ValueError(
-                        f"{name} tensor stride order mismatch: expected one of {stride_order}, got {tensor_stride_order}"
-                    )
+                    error_msg = f"{name} tensor stride order mismatch: expected one of {stride_order}, got {tensor_stride_order}"
+                    if extra_error_msg:
+                        error_msg += f": {extra_error_msg}"
+                    raise ValueError(error_msg)
             else:
-                raise ValueError(
-                    f"Expected stride order to be a tuple or list, got {type(stride_order)}"
-                )
+                error_msg = f"Expected stride order to be a tuple or list, got {type(stride_order)}"
+                if extra_error_msg:
+                    error_msg += f": {extra_error_msg}"
+                raise ValueError(error_msg)
         return tensor_stride, tensor_stride_order
 
     def _check_dtype(
@@ -540,16 +513,10 @@ class APIBase(ABC):
         """
         if tensor_or_dtype is None:
             return None
-        tensor_dtype = (
-            tensor_or_dtype.dtype
-            if isinstance(tensor_or_dtype, torch.Tensor)
-            else tensor_or_dtype
-        )
+        tensor_dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, torch.Tensor) else tensor_or_dtype
         if isinstance(dtype, torch.dtype):
             if tensor_dtype != dtype:
-                error_msg = (
-                    f"{name} dtype mismatch: expected {dtype}, got {tensor_dtype}"
-                )
+                error_msg = f"{name} dtype mismatch: expected {dtype}, got {tensor_dtype}"
                 if extra_error_msg:
                     error_msg += f": {extra_error_msg}"
                 raise ValueError(error_msg)
@@ -560,9 +527,7 @@ class APIBase(ABC):
                     error_msg += f": {extra_error_msg}"
                 raise ValueError(error_msg)
         else:
-            raise ValueError(
-                f"Expected dtype to be a torch.dtype or list, got {type(dtype)}"
-            )
+            raise ValueError(f"Expected dtype to be a torch.dtype or list, got {type(dtype)}")
         return tensor_dtype
 
     def _value_error_if(self, condition: bool, error_msg: str) -> None:
@@ -601,9 +566,7 @@ class APIBase(ABC):
         if condition:
             raise RuntimeError(error_msg)
 
-    def _make_cute_pointer(
-        self, tensor: torch.Tensor, assumed_align: int = 16
-    ) -> cute.Pointer:
+    def _make_cute_pointer(self, tensor: torch.Tensor, assumed_align: int = 16) -> cute.Pointer:
         """Make a cute.Pointer for a tensor.
 
         :param tensor: The tensor to make a cute.Pointer for
@@ -616,9 +579,7 @@ class APIBase(ABC):
         if tensor is None:
             return None
         return cute.runtime.make_ptr(
-            _convert_to_cutlass_data_type(
-                tensor.dtype, interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2
-            ),
+            _convert_to_cutlass_data_type(tensor.dtype, interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2),
             tensor.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=assumed_align,
@@ -643,7 +604,37 @@ class APIBase(ABC):
         tensor_ptr = self._make_cute_pointer(tensor, assumed_align=assumed_align)
         tensor_shape = self._tensor_shape(tensor, name=name)
         tensor_stride = self._tensor_stride(tensor, name=name)
-        tensor_stride_order = tuple(
-            i for i, s in sorted(enumerate(tensor_stride), key=lambda x: x[1])
-        )
+        tensor_stride_order = tuple(i for i, s in sorted(enumerate(tensor_stride), key=lambda x: x[1]))
         return tensor_ptr, tensor_shape, tensor_stride_order
+
+
+class TupleDict(dict):
+    """A dictionary that supports tuple unpacking.
+
+    This class extends dict to allow unpacking like a tuple while still
+    providing dictionary-style key access. The unpacking order is determined
+    by the _keys attribute which preserves insertion order.
+
+    Example:
+        >>> result = TupleDict(a=1, b=2, c=3)
+        >>> x, y, z = result  # Unpacks as (1, 2, 3)
+        >>> result['a']  # Returns 1
+        >>> result[0]  # Returns 1 (integer indexing)
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Store keys in order for tuple unpacking
+        self._keys = list(self.keys())
+
+    def __iter__(self):
+        """Iterate over values in insertion order for tuple unpacking."""
+        return (self[k] for k in self._keys)
+
+    def __getitem__(self, key):
+        """Support both string keys and integer indices."""
+        if isinstance(key, int):
+            if key < 0 or key >= len(self._keys):
+                raise IndexError(f"index {key} out of range for TupleDict with {len(self._keys)} items")
+            return super().__getitem__(self._keys[key])
+        return super().__getitem__(key)

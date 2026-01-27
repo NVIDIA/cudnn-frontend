@@ -1,9 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_ConvDesc.h"
-#include "../../cudnn_frontend_Heuristics.h"
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
@@ -89,52 +85,140 @@ class ConvolutionNode : public NodeCRTP<ConvolutionNode> {
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FE_LOG_LABEL("INFO: Building ConvolutionNode operations " << attributes.name << " ");
 
-        // convolution descriptor
+        // Create convolution descriptor by directly calling cuDNN backend API
+        ConvDesc_v8 convolution_descriptor;
         int64_t const spatial_dim_count = attributes.get_pre_padding().size();
-        auto convolution_descriptor     = cudnn_frontend::ConvDescBuilder()
-                                          .setComputeType(attributes.compute_data_type)
-                                          .setMathMode(attributes.math_mode)
-                                          .setSpatialDimCount(spatial_dim_count)
-                                          .setSpatialStride(spatial_dim_count, attributes.get_stride().data())
-                                          .setPrePadding(spatial_dim_count, attributes.get_pre_padding().data())
-                                          .setPostPadding(spatial_dim_count, attributes.get_post_padding().data())
-                                          .setDilation(spatial_dim_count, attributes.get_dilation().data())
-                                          .build();
 
-        // Create the convolution operation.
-        auto&& convolution_operation_builder =
-            cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR);
+        _CUDNN_CHECK_CUDNN_ERROR(
+            convolution_descriptor.initialize_managed_backend_pointer(CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR));
 
+        // Set compute type
+        cudnnDataType_t cudnn_data_type;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.compute_data_type, cudnn_data_type));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(convolution_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_CONVOLUTION_COMP_TYPE,
+                                                       CUDNN_TYPE_DATA_TYPE,
+                                                       1,
+                                                       &cudnn_data_type));
+
+        // Set convolution mode
+        cudnnConvolutionMode_t mode = detail::convert_to_cudnn_type(attributes.math_mode);
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(convolution_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_CONVOLUTION_CONV_MODE,
+                                                       CUDNN_TYPE_CONVOLUTION_MODE,
+                                                       1,
+                                                       &mode));
+
+        // Set spatial dimensions
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(convolution_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_CONVOLUTION_SPATIAL_DIMS,
+                                                       CUDNN_TYPE_INT64,
+                                                       1,
+                                                       &spatial_dim_count));
+
+        // Set pre-padding
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(convolution_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS,
+                                                       CUDNN_TYPE_INT64,
+                                                       spatial_dim_count,
+                                                       attributes.get_pre_padding().data()));
+
+        // Set post-padding
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(convolution_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_CONVOLUTION_POST_PADDINGS,
+                                                       CUDNN_TYPE_INT64,
+                                                       spatial_dim_count,
+                                                       attributes.get_post_padding().data()));
+
+        // Set dilation
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(convolution_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_CONVOLUTION_DILATIONS,
+                                                       CUDNN_TYPE_INT64,
+                                                       spatial_dim_count,
+                                                       attributes.get_dilation().data()));
+
+        // Set strides
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(convolution_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_CONVOLUTION_FILTER_STRIDES,
+                                                       CUDNN_TYPE_INT64,
+                                                       spatial_dim_count,
+                                                       attributes.get_stride().data()));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(convolution_descriptor.get_raw_desc()));
+        CUDNN_FE_LOG_LABEL_ENDL(convolution_descriptor);
+
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 convolution_operation;
+
+        _CUDNN_CHECK_CUDNN_ERROR(convolution_operation.initialize_managed_backend_pointer(
+            CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR));
+
+        // Set input tensor X
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Conv_fprop_attributes::input_names::X);
-        convolution_operation_builder.setxDesc(*(tensors[X->second->get_uid()]));
+        auto x_desc = tensors.at(X->second->get_uid())->get_raw_desc();
 
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(convolution_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &x_desc));
+
+        // Set weight tensor W
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(W, Conv_fprop_attributes::input_names::W);
-        convolution_operation_builder.setwDesc(*(tensors[W->second->get_uid()]));
+        auto w_desc = tensors.at(W->second->get_uid())->get_raw_desc();
 
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(convolution_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &w_desc));
+
+        // Set output tensor Y
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Conv_fprop_attributes::output_names::Y);
-        convolution_operation_builder.setyDesc(*(tensors[Y->second->get_uid()]));
+        auto y_desc = tensors.at(Y->second->get_uid())->get_raw_desc();
 
-        convolution_operation_builder.setcDesc(convolution_descriptor).setAlpha(1.f).setBeta(0.f);
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(convolution_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &y_desc));
 
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = convolution_operation_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = convolution_operation_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
-        }
-#endif
+        // Set convolution descriptor
+        auto conv_desc_ptr = convolution_descriptor.get_raw_desc();
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(convolution_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &conv_desc_ptr));
+
+        // Set alpha and beta
+        float alpha = 1.0f;
+        float beta  = 0.0f;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(convolution_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA,
+                                                       CUDNN_TYPE_FLOAT,
+                                                       1,
+                                                       &alpha));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(convolution_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA,
+                                                       CUDNN_TYPE_FLOAT,
+                                                       1,
+                                                       &beta));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(convolution_operation.get_raw_desc()));
+
+        operations.push_back(std::make_shared<Operation_v8>(std::move(convolution_operation)));
 
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());

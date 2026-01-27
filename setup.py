@@ -66,9 +66,7 @@ class CMakeBuild(build_ext):
             cmake_args.append(f"-DCUDNN_PATH={os.environ['CUDNN_PATH']}")
 
         if "FETCHCONTENT_SOURCE_DIR_DLPACK" in os.environ:
-            cmake_args.append(
-                f"-DFETCHCONTENT_SOURCE_DIR_DLPACK={os.environ['FETCHCONTENT_SOURCE_DIR_DLPACK']}"
-            )
+            cmake_args.append(f"-DFETCHCONTENT_SOURCE_DIR_DLPACK={os.environ['FETCHCONTENT_SOURCE_DIR_DLPACK']}")
 
         # Using Ninja-build since it a) is available as a wheel and b)
         # multithreads automatically. MSVC would require all variables be
@@ -104,12 +102,8 @@ class CMakeBuild(build_ext):
             build_temp.mkdir(parents=True)
 
         print(" ".join(cmake_args))
-        subprocess.run(
-            ["cmake", ext.sourcedir, *cmake_args], cwd=build_temp, check=True
-        )
-        subprocess.run(
-            ["cmake", "--build", ".", *build_args], cwd=build_temp, check=True
-        )
+        subprocess.run(["cmake", ext.sourcedir, *cmake_args], cwd=build_temp, check=True)
+        subprocess.run(["cmake", "--build", ".", *build_args], cwd=build_temp, check=True)
 
 
 setup(

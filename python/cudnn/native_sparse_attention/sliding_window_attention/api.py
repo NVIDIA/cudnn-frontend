@@ -43,47 +43,23 @@ class SlidingWindowAttention(APIBase):
         self.sample_v = sample_v
         self.sample_o = sample_o
         self.is_infer = sample_stats is None
-        self.sample_stats = (
-            self._pad_tensor_to_ndim(sample_stats, self.sample_o.ndim, "sample_stats")
-            if sample_stats is not None
-            else None
-        )
+        self.sample_stats = self._pad_tensor_to_ndim(sample_stats, self.sample_o.ndim, "sample_stats") if sample_stats is not None else None
         self.left_bound = left_bound
         self.right_bound = right_bound
 
-        self.sample_seq_len_q = self._pad_tensor_to_ndim(
-            sample_seq_len_q, 4, "sample_seq_len_q"
-        )
-        self.sample_seq_len_kv = self._pad_tensor_to_ndim(
-            sample_seq_len_kv, 4, "sample_seq_len_kv"
-        )
+        self.sample_seq_len_q = self._pad_tensor_to_ndim(sample_seq_len_q, 4, "sample_seq_len_q")
+        self.sample_seq_len_kv = self._pad_tensor_to_ndim(sample_seq_len_kv, 4, "sample_seq_len_kv")
         self.max_seq_len_q = max_seq_len_q
         self.max_seq_len_kv = max_seq_len_kv
-        self.sample_q_ragged_offset = self._pad_tensor_to_ndim(
-            sample_q_ragged_offset, 4, "sample_q_ragged_offset"
-        )
-        self.sample_k_ragged_offset = self._pad_tensor_to_ndim(
-            sample_k_ragged_offset, 4, "sample_k_ragged_offset"
-        )
-        self.sample_v_ragged_offset = self._pad_tensor_to_ndim(
-            sample_v_ragged_offset, 4, "sample_v_ragged_offset"
-        )
-        self.sample_o_ragged_offset = self._pad_tensor_to_ndim(
-            sample_o_ragged_offset, 4, "sample_o_ragged_offset"
-        )
+        self.sample_q_ragged_offset = self._pad_tensor_to_ndim(sample_q_ragged_offset, 4, "sample_q_ragged_offset")
+        self.sample_k_ragged_offset = self._pad_tensor_to_ndim(sample_k_ragged_offset, 4, "sample_k_ragged_offset")
+        self.sample_v_ragged_offset = self._pad_tensor_to_ndim(sample_v_ragged_offset, 4, "sample_v_ragged_offset")
+        self.sample_o_ragged_offset = self._pad_tensor_to_ndim(sample_o_ragged_offset, 4, "sample_o_ragged_offset")
         self.sample_stats_ragged_offset = (
-            self._pad_tensor_to_ndim(
-                sample_stats_ragged_offset, 4, "sample_stats_ragged_offset"
-            )
-            if sample_stats_ragged_offset is not None
-            else None
+            self._pad_tensor_to_ndim(sample_stats_ragged_offset, 4, "sample_stats_ragged_offset") if sample_stats_ragged_offset is not None else None
         )
 
-        self.attn_scale = (
-            attn_scale
-            if attn_scale is not None
-            else 1.0 / math.sqrt(self.sample_q.shape[-1])
-        )
+        self.attn_scale = attn_scale if attn_scale is not None else 1.0 / math.sqrt(self.sample_q.shape[-1])
         self.intermediate_data_type = intermediate_data_type
         self.compute_data_type = compute_data_type
 
@@ -95,9 +71,7 @@ class SlidingWindowAttention(APIBase):
             self._logger.critical(
                 "cudnn_handle not provided, creating new handle. This is not recommended as this is significant overhead and will occur for each SlidingWindowAttention object created."
             )
-        self._cudnn_handle = (
-            cudnn_handle if cudnn_handle is not None else cudnn.create_handle()
-        )
+        self._cudnn_handle = cudnn_handle if cudnn_handle is not None else cudnn.create_handle()
         self._cudnn_swa_graph = None
         self._cudnn_compiled = False
         self._logger.debug(
@@ -130,25 +104,11 @@ class SlidingWindowAttention(APIBase):
             )
 
         # Calculate ragged offsets
-        q_ragged_offset = (
-            compute_exclusive_prefix_sum(seq_len_q) * self.sample_q.stride()[0]
-        ).to(dtype=torch.int64)
-        k_ragged_offset = (
-            compute_exclusive_prefix_sum(seq_len_kv) * self.sample_k.stride()[0]
-        ).to(dtype=torch.int64)
-        v_ragged_offset = (
-            compute_exclusive_prefix_sum(seq_len_kv) * self.sample_v.stride()[0]
-        ).to(dtype=torch.int64)
-        o_ragged_offset = (
-            compute_exclusive_prefix_sum(seq_len_q) * self.sample_o.stride()[0]
-        ).to(dtype=torch.int64)
-        stats_ragged_offset = (
-            (
-                compute_exclusive_prefix_sum(seq_len_q) * self.sample_stats.stride()[0]
-            ).to(dtype=torch.int64)
-            if not self.is_infer
-            else None
-        )
+        q_ragged_offset = (compute_exclusive_prefix_sum(seq_len_q) * self.sample_q.stride()[0]).to(dtype=torch.int64)
+        k_ragged_offset = (compute_exclusive_prefix_sum(seq_len_kv) * self.sample_k.stride()[0]).to(dtype=torch.int64)
+        v_ragged_offset = (compute_exclusive_prefix_sum(seq_len_kv) * self.sample_v.stride()[0]).to(dtype=torch.int64)
+        o_ragged_offset = (compute_exclusive_prefix_sum(seq_len_q) * self.sample_o.stride()[0]).to(dtype=torch.int64)
+        stats_ragged_offset = (compute_exclusive_prefix_sum(seq_len_q) * self.sample_stats.stride()[0]).to(dtype=torch.int64) if not self.is_infer else None
 
         return (
             q_ragged_offset,
@@ -164,10 +124,7 @@ class SlidingWindowAttention(APIBase):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
         self.dtype = self.sample_q.dtype
-        self.sm_version = (
-            torch.cuda.get_device_capability()[0] * 10
-            + torch.cuda.get_device_capability()[1]
-        )
+        self.sm_version = torch.cuda.get_device_capability()[0] * 10 + torch.cuda.get_device_capability()[1]
         if self.sample_q.ndim == 4:
             self._logger.debug("Inferred bshd layout")
             self.input_layout = "bshd"
@@ -179,9 +136,7 @@ class SlidingWindowAttention(APIBase):
 
         swa_graph = cudnn.pygraph(
             io_data_type=_torch_to_cudnn_data_type(self.dtype),
-            intermediate_data_type=_torch_to_cudnn_data_type(
-                self.intermediate_data_type
-            ),
+            intermediate_data_type=_torch_to_cudnn_data_type(self.intermediate_data_type),
             compute_data_type=_torch_to_cudnn_data_type(self.compute_data_type),
             handle=self._cudnn_handle,
             sm_version=self.sm_version,
@@ -206,37 +161,23 @@ class SlidingWindowAttention(APIBase):
             b, h_q, s_q, d_v = self.sample_o.shape
 
             if self.sample_q.shape != (b, h_q, s_q, d_qk):
-                raise ValueError(
-                    f"Input shape mismatch: expected Q tensor shape {b, h_q, s_q, d_qk}, got {self.sample_q.shape}"
-                )
+                raise ValueError(f"Input shape mismatch: expected Q tensor shape {b, h_q, s_q, d_qk}, got {self.sample_q.shape}")
             if self.sample_k.shape != (b, h_kv, s_kv, d_qk):
-                raise ValueError(
-                    f"Input shape mismatch: expected K tensor shape {b, h_kv, s_kv, d_qk}, got {self.sample_k.shape}"
-                )
+                raise ValueError(f"Input shape mismatch: expected K tensor shape {b, h_kv, s_kv, d_qk}, got {self.sample_k.shape}")
             if self.sample_v.shape != (b, h_kv, s_kv, d_v):
-                raise ValueError(
-                    f"Input shape mismatch: expected V tensor shape {b, h_kv, s_kv, d_v}, got {self.sample_v.shape}"
-                )
+                raise ValueError(f"Input shape mismatch: expected V tensor shape {b, h_kv, s_kv, d_v}, got {self.sample_v.shape}")
             if self.sample_o.shape != (b, h_q, s_q, d_v):
-                raise ValueError(
-                    f"Output shape mismatch: expected O tensor shape {b, h_q, s_q, d_v}, got {self.sample_o.shape}"
-                )
+                raise ValueError(f"Output shape mismatch: expected O tensor shape {b, h_q, s_q, d_v}, got {self.sample_o.shape}")
             if not self.is_infer:
-                self.sample_stats = self._pad_tensor_to_ndim(
-                    self.sample_stats, 4, "sample_stats"
-                )
+                self.sample_stats = self._pad_tensor_to_ndim(self.sample_stats, 4, "sample_stats")
                 if self.sample_stats.shape != (b, h_q, s_q, 1):
-                    raise ValueError(
-                        f"Output shape mismatch: expected Stats tensor shape {b, h_q, s_q, 1}, got {self.sample_stats.shape}"
-                    )
+                    raise ValueError(f"Output shape mismatch: expected Stats tensor shape {b, h_q, s_q, 1}, got {self.sample_stats.shape}")
             if self.sample_seq_len_q is not None or self.sample_seq_len_kv is not None:
                 raise ValueError(
                     f"sample_seq_len_q and sample_seq_len_kv should be None for bshd layout, got {self.sample_seq_len_q} and {self.sample_seq_len_kv}"
                 )
             if self.max_seq_len_q is not None or self.max_seq_len_kv is not None:
-                raise ValueError(
-                    f"max_seq_len_q and max_seq_len_kv should be None for bshd layout, got {self.max_seq_len_q} and {self.max_seq_len_kv}"
-                )
+                raise ValueError(f"max_seq_len_q and max_seq_len_kv should be None for bshd layout, got {self.max_seq_len_q} and {self.max_seq_len_kv}")
             if (
                 self.sample_q_ragged_offset is not None
                 or self.sample_k_ragged_offset is not None
@@ -258,38 +199,24 @@ class SlidingWindowAttention(APIBase):
             t, h_q, d_v = self.sample_o.shape
 
             if self.sample_q.shape != (t, h_q, d_qk):
-                raise ValueError(
-                    f"Input shape mismatch: expected Q tensor shape {t, h_q, d_qk}, got {self.sample_q.shape}"
-                )
+                raise ValueError(f"Input shape mismatch: expected Q tensor shape {t, h_q, d_qk}, got {self.sample_q.shape}")
             if self.sample_k.shape != (t, h_kv, d_qk):
-                raise ValueError(
-                    f"Input shape mismatch: expected K tensor shape {t, h_kv, d_qk}, got {self.sample_k.shape}"
-                )
+                raise ValueError(f"Input shape mismatch: expected K tensor shape {t, h_kv, d_qk}, got {self.sample_k.shape}")
             if self.sample_v.shape != (t, h_kv, d_v):
-                raise ValueError(
-                    f"Input shape mismatch: expected V tensor shape {t, h_kv, d_v}, got {self.sample_v.shape}"
-                )
+                raise ValueError(f"Input shape mismatch: expected V tensor shape {t, h_kv, d_v}, got {self.sample_v.shape}")
             if self.sample_o.shape != (t, h_q, d_v):
-                raise ValueError(
-                    f"Output shape mismatch: expected O tensor shape {t, h_q, d_v}, got {self.sample_o.shape}"
-                )
+                raise ValueError(f"Output shape mismatch: expected O tensor shape {t, h_q, d_v}, got {self.sample_o.shape}")
             if not self.is_infer:
-                self.sample_stats = self._pad_tensor_to_ndim(
-                    self.sample_stats, 3, "sample_stats"
-                )
+                self.sample_stats = self._pad_tensor_to_ndim(self.sample_stats, 3, "sample_stats")
                 if self.sample_stats.shape != (t, h_q, 1):
-                    raise ValueError(
-                        f"Output shape mismatch: expected Stats tensor shape {t, h_q, 1}, got {self.sample_stats.shape}"
-                    )
+                    raise ValueError(f"Output shape mismatch: expected Stats tensor shape {t, h_q, 1}, got {self.sample_stats.shape}")
 
             if self.sample_seq_len_q is None or self.sample_seq_len_kv is None:
                 raise ValueError(
                     f"sample_seq_len_q and sample_seq_len_kv must be provided for thd layout, got {self.sample_seq_len_q} and {self.sample_seq_len_kv}"
                 )
             if self.max_seq_len_q is None or self.max_seq_len_kv is None:
-                raise ValueError(
-                    f"max_seq_len_q and max_seq_len_kv must be provided for thd layout, got {self.max_seq_len_q} and {self.max_seq_len_kv}"
-                )
+                raise ValueError(f"max_seq_len_q and max_seq_len_kv must be provided for thd layout, got {self.max_seq_len_q} and {self.max_seq_len_kv}")
 
             if (
                 self.sample_q_ragged_offset is None
@@ -303,17 +230,12 @@ class SlidingWindowAttention(APIBase):
                     or self.sample_k_ragged_offset is not None
                     or self.sample_v_ragged_offset is not None
                     or self.sample_o_ragged_offset is not None
-                    or (
-                        not self.is_infer
-                        and self.sample_stats_ragged_offset is not None
-                    )
+                    or (not self.is_infer and self.sample_stats_ragged_offset is not None)
                 ):
                     raise ValueError(
                         f"sample_q_ragged_offset, sample_k_ragged_offset, sample_v_ragged_offset, sample_o_ragged_offset, and sample_stats_ragged_offset must be all provided or all None, got {self.sample_q_ragged_offset}, {self.sample_k_ragged_offset}, {self.sample_v_ragged_offset}, {self.sample_o_ragged_offset}, and {self.sample_stats_ragged_offset}"
                     )
-                self._logger.info(
-                    "Calculating ragged offsets internally assuming fully packed THD layout"
-                )
+                self._logger.info("Calculating ragged offsets internally assuming fully packed THD layout")
                 (
                     self.sample_q_ragged_offset,
                     self.sample_k_ragged_offset,
@@ -360,22 +282,12 @@ class SlidingWindowAttention(APIBase):
             )
             self.seq_len_q_cudnn = swa_graph.tensor_like(self.sample_seq_len_q)
             self.seq_len_kv_cudnn = swa_graph.tensor_like(self.sample_seq_len_kv)
-            self.q_ragged_offset_cudnn = swa_graph.tensor_like(
-                self.sample_q_ragged_offset
-            )
-            self.k_ragged_offset_cudnn = swa_graph.tensor_like(
-                self.sample_k_ragged_offset
-            )
-            self.v_ragged_offset_cudnn = swa_graph.tensor_like(
-                self.sample_v_ragged_offset
-            )
-            self.o_ragged_offset_cudnn = swa_graph.tensor_like(
-                self.sample_o_ragged_offset
-            )
+            self.q_ragged_offset_cudnn = swa_graph.tensor_like(self.sample_q_ragged_offset)
+            self.k_ragged_offset_cudnn = swa_graph.tensor_like(self.sample_k_ragged_offset)
+            self.v_ragged_offset_cudnn = swa_graph.tensor_like(self.sample_v_ragged_offset)
+            self.o_ragged_offset_cudnn = swa_graph.tensor_like(self.sample_o_ragged_offset)
             if not self.is_infer:
-                self.stats_ragged_offset_cudnn = swa_graph.tensor_like(
-                    self.sample_stats_ragged_offset
-                )
+                self.stats_ragged_offset_cudnn = swa_graph.tensor_like(self.sample_stats_ragged_offset)
 
             self.q_cudnn.set_ragged_offset(self.q_ragged_offset_cudnn)
             self.k_cudnn.set_ragged_offset(self.k_ragged_offset_cudnn)
@@ -408,9 +320,7 @@ class SlidingWindowAttention(APIBase):
             self.o_cudnn.set_dim(self.sample_o.shape).set_stride(self.sample_o.stride())
             if not self.is_infer:
                 self.stats_cudnn.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-                self.stats_cudnn.set_dim(self.sample_stats.shape).set_stride(
-                    self.sample_stats.stride()
-                )
+                self.stats_cudnn.set_dim(self.sample_stats.shape).set_stride(self.sample_stats.stride())
         elif self.input_layout == "thd":
             self.o_cudnn.set_dim((b, h_q, self.max_seq_len_q, d_v))
             self.o_cudnn.set_stride(
@@ -439,9 +349,7 @@ class SlidingWindowAttention(APIBase):
         try:
             swa_graph.validate()
         except cudnn.cudnnGraphNotSupportedError as e:
-            self._logger.error(
-                f"Graph not supported (cudnnGraphNotSupportedError): {e}"
-            )
+            self._logger.error(f"Graph not supported (cudnnGraphNotSupportedError): {e}")
             return False
         except Exception as e:
             self._logger.error(f"Graph not supported: {e}")
@@ -454,16 +362,12 @@ class SlidingWindowAttention(APIBase):
 
     def compile(self, current_stream: Optional[cuda.CUstream] = None) -> None:
         if current_stream is not None:
-            self._logger.warning(
-                "Overwriting cudnn_handle stream with provided cuda stream. Do not pass in current_stream if this is not intended."
-            )
+            self._logger.warning("Overwriting cudnn_handle stream with provided cuda stream. Do not pass in current_stream if this is not intended.")
             cudnn.set_stream(self._cudnn_handle, current_stream)
         self._ensure_support_checked()
 
         self._cudnn_swa_graph.build_operation_graph()
-        self._cudnn_swa_graph.create_execution_plans(
-            [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
-        )
+        self._cudnn_swa_graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         self._cudnn_swa_graph.check_support()
         self._cudnn_swa_graph.build_plans()
 
@@ -491,57 +395,31 @@ class SlidingWindowAttention(APIBase):
         self._logger.debug("Entering execute")
         cudnn_handle = self._cudnn_handle if cudnn_handle is None else cudnn_handle
         if current_stream is not None:
-            self._logger.info(
-                "Overwriting cudnn_handle stream with provided cuda stream. Do not pass in current_stream if this is not intended."
-            )
+            self._logger.info("Overwriting cudnn_handle stream with provided cuda stream. Do not pass in current_stream if this is not intended.")
             cudnn.set_stream(cudnn_handle, current_stream)
 
         if skip_compile:
-            raise NotImplementedError(
-                "cudnn sliding window attention kernel does not support skip_compile"
-            )
+            raise NotImplementedError("cudnn sliding window attention kernel does not support skip_compile")
         if self._cudnn_swa_graph is None or not self._cudnn_compiled:
             raise ValueError("SlidingWindowAttention kernel not compiled")
         self._logger.debug("Executing with compiled kernel")
 
         self._logger.debug("Reshaping tensors to kernel expected format")
-        stats_tensor = (
-            self._pad_tensor_to_ndim(stats_tensor, self.sample_o.ndim, "stats_tensor")
-            if stats_tensor is not None
-            else None
-        )
-        seq_len_q_tensor = self._pad_tensor_to_ndim(
-            seq_len_q_tensor, 4, "seq_len_q_tensor"
-        )
-        seq_len_kv_tensor = self._pad_tensor_to_ndim(
-            seq_len_kv_tensor, 4, "seq_len_kv_tensor"
-        )
-        q_ragged_offset_tensor = self._pad_tensor_to_ndim(
-            q_ragged_offset_tensor, 4, "q_ragged_offset_tensor"
-        )
-        k_ragged_offset_tensor = self._pad_tensor_to_ndim(
-            k_ragged_offset_tensor, 4, "k_ragged_offset_tensor"
-        )
-        v_ragged_offset_tensor = self._pad_tensor_to_ndim(
-            v_ragged_offset_tensor, 4, "v_ragged_offset_tensor"
-        )
-        o_ragged_offset_tensor = self._pad_tensor_to_ndim(
-            o_ragged_offset_tensor, 4, "o_ragged_offset_tensor"
-        )
-        stats_ragged_offset_tensor = self._pad_tensor_to_ndim(
-            stats_ragged_offset_tensor, 4, "stats_ragged_offset_tensor"
-        )
+        stats_tensor = self._pad_tensor_to_ndim(stats_tensor, self.sample_o.ndim, "stats_tensor") if stats_tensor is not None else None
+        seq_len_q_tensor = self._pad_tensor_to_ndim(seq_len_q_tensor, 4, "seq_len_q_tensor")
+        seq_len_kv_tensor = self._pad_tensor_to_ndim(seq_len_kv_tensor, 4, "seq_len_kv_tensor")
+        q_ragged_offset_tensor = self._pad_tensor_to_ndim(q_ragged_offset_tensor, 4, "q_ragged_offset_tensor")
+        k_ragged_offset_tensor = self._pad_tensor_to_ndim(k_ragged_offset_tensor, 4, "k_ragged_offset_tensor")
+        v_ragged_offset_tensor = self._pad_tensor_to_ndim(v_ragged_offset_tensor, 4, "v_ragged_offset_tensor")
+        o_ragged_offset_tensor = self._pad_tensor_to_ndim(o_ragged_offset_tensor, 4, "o_ragged_offset_tensor")
+        stats_ragged_offset_tensor = self._pad_tensor_to_ndim(stats_ragged_offset_tensor, 4, "stats_ragged_offset_tensor")
 
         if not self.is_infer and stats_tensor is None:
-            raise ValueError(
-                f"stats_tensor must be provided when compiled in non-inference mode, got {stats_tensor}"
-            )
+            raise ValueError(f"stats_tensor must be provided when compiled in non-inference mode, got {stats_tensor}")
 
         if self.input_layout == "thd":
             if seq_len_q_tensor is None or seq_len_kv_tensor is None:
-                raise ValueError(
-                    f"seq_len_q_tensor and seq_len_kv_tensor must be provided for thd layout, got {seq_len_q_tensor} and {seq_len_kv_tensor}"
-                )
+                raise ValueError(f"seq_len_q_tensor and seq_len_kv_tensor must be provided for thd layout, got {seq_len_q_tensor} and {seq_len_kv_tensor}")
             if (
                 q_ragged_offset_tensor is None
                 or k_ragged_offset_tensor is None
@@ -559,9 +437,7 @@ class SlidingWindowAttention(APIBase):
                     raise ValueError(
                         f"q_ragged_offset_tensor, k_ragged_offset_tensor, v_ragged_offset_tensor, o_ragged_offset_tensor, and stats_ragged_offset_tensor must be all provided or all None, got {q_ragged_offset_tensor}, {k_ragged_offset_tensor}, {v_ragged_offset_tensor}, {o_ragged_offset_tensor}, and {stats_ragged_offset_tensor}"
                     )
-                self._logger.info(
-                    "Calculating ragged offsets internally assuming fully packed THD layout"
-                )
+                self._logger.info("Calculating ragged offsets internally assuming fully packed THD layout")
                 (
                     q_ragged_offset_tensor,
                     k_ragged_offset_tensor,
@@ -637,37 +513,21 @@ def sliding_window_attention_wrapper(
     o_tensor, stats_tensor = None, None
     o_dtype = o_dtype if o_dtype is not None else q_tensor.dtype
     if q_tensor.ndim == 3:  # thd
-        _logger.debug(
-            "sliding_window_attention_wrapper: Creating empty output tensor o for thd layout"
-        )
+        _logger.debug("sliding_window_attention_wrapper: Creating empty output tensor o for thd layout")
         t, h_q, d = q_tensor.shape
         _, h_k, d_v = v_tensor.shape
-        o_tensor = make_tensor_strided_like(
-            q_tensor, (t, h_q, d_v), dtype=o_dtype, device=q_tensor.device
-        )
+        o_tensor = make_tensor_strided_like(q_tensor, (t, h_q, d_v), dtype=o_dtype, device=q_tensor.device)
         if not is_infer:
-            _logger.debug(
-                "sliding_window_attention_wrapper: Creating empty output tensor stats for thd layout"
-            )
-            stats_tensor = make_tensor_strided_like(
-                q_tensor, (t, h_q, 1), dtype=torch.float32, device=q_tensor.device
-            )
+            _logger.debug("sliding_window_attention_wrapper: Creating empty output tensor stats for thd layout")
+            stats_tensor = make_tensor_strided_like(q_tensor, (t, h_q, 1), dtype=torch.float32, device=q_tensor.device)
     else:  # bshd
-        _logger.debug(
-            "sliding_window_attention_wrapper: Creating empty output tensor o for bshd layout"
-        )
+        _logger.debug("sliding_window_attention_wrapper: Creating empty output tensor o for bshd layout")
         b, h_q, s_q, d = q_tensor.shape
         _, h_k, s_k, d_v = v_tensor.shape
-        o_tensor = make_tensor_strided_like(
-            q_tensor, (b, h_q, s_q, d_v), dtype=o_dtype, device=q_tensor.device
-        )
+        o_tensor = make_tensor_strided_like(q_tensor, (b, h_q, s_q, d_v), dtype=o_dtype, device=q_tensor.device)
         if not is_infer:
-            _logger.debug(
-                "sliding_window_attention_wrapper: Creating empty output tensor stats for bshd layout"
-            )
-            stats_tensor = make_tensor_strided_like(
-                q_tensor, (b, h_q, s_q, 1), dtype=torch.float32, device=q_tensor.device
-            )
+            _logger.debug("sliding_window_attention_wrapper: Creating empty output tensor stats for bshd layout")
+            stats_tensor = make_tensor_strided_like(q_tensor, (b, h_q, s_q, 1), dtype=torch.float32, device=q_tensor.device)
 
     cache_key = (
         q_tensor.shape,
@@ -679,11 +539,7 @@ def sliding_window_attention_wrapper(
         k_ragged_offset_tensor.shape if k_ragged_offset_tensor is not None else None,
         v_ragged_offset_tensor.shape if v_ragged_offset_tensor is not None else None,
         o_ragged_offset_tensor.shape if o_ragged_offset_tensor is not None else None,
-        (
-            stats_ragged_offset_tensor.shape
-            if stats_ragged_offset_tensor is not None
-            else None
-        ),
+        (stats_ragged_offset_tensor.shape if stats_ragged_offset_tensor is not None else None),
         q_tensor.stride(),
         k_tensor.stride(),
         v_tensor.stride(),
@@ -693,11 +549,7 @@ def sliding_window_attention_wrapper(
         k_ragged_offset_tensor.stride() if k_ragged_offset_tensor is not None else None,
         v_ragged_offset_tensor.stride() if v_ragged_offset_tensor is not None else None,
         o_ragged_offset_tensor.stride() if o_ragged_offset_tensor is not None else None,
-        (
-            stats_ragged_offset_tensor.stride()
-            if stats_ragged_offset_tensor is not None
-            else None
-        ),
+        (stats_ragged_offset_tensor.stride() if stats_ragged_offset_tensor is not None else None),
         q_tensor.dtype,
         k_tensor.dtype,
         v_tensor.dtype,
@@ -710,12 +562,8 @@ def sliding_window_attention_wrapper(
     )
     sliding_window_attention_object = None
     if cache_key in _cache_of_SlidingWindowAttentionObjects:
-        _logger.debug(
-            "sliding_window_attention_wrapper: Using previously cached SlidingWindowAttention object"
-        )
-        sliding_window_attention_object = _cache_of_SlidingWindowAttentionObjects[
-            cache_key
-        ]
+        _logger.debug("sliding_window_attention_wrapper: Using previously cached SlidingWindowAttention object")
+        sliding_window_attention_object = _cache_of_SlidingWindowAttentionObjects[cache_key]
 
         sliding_window_attention_object.execute(
             q_tensor=q_tensor,
@@ -734,9 +582,7 @@ def sliding_window_attention_wrapper(
             cudnn_handle=cudnn_handle,
         )
     else:
-        _logger.debug(
-            "sliding_window_attention_wrapper: No previously cached SlidingWindowAttention object found, creating new SlidingWindowAttention object"
-        )
+        _logger.debug("sliding_window_attention_wrapper: No previously cached SlidingWindowAttention object found, creating new SlidingWindowAttention object")
         sliding_window_attention_object = SlidingWindowAttention(
             sample_q=q_tensor,
             sample_k=k_tensor,
@@ -750,12 +596,8 @@ def sliding_window_attention_wrapper(
             sample_v_ragged_offset=v_ragged_offset_tensor,
             sample_o_ragged_offset=o_ragged_offset_tensor,
             sample_stats_ragged_offset=stats_ragged_offset_tensor,
-            max_seq_len_q=(
-                max(seq_len_q_tensor).item() if seq_len_q_tensor is not None else None
-            ),
-            max_seq_len_kv=(
-                max(seq_len_kv_tensor).item() if seq_len_kv_tensor is not None else None
-            ),
+            max_seq_len_q=(max(seq_len_q_tensor).item() if seq_len_q_tensor is not None else None),
+            max_seq_len_kv=(max(seq_len_kv_tensor).item() if seq_len_kv_tensor is not None else None),
             left_bound=left_bound,
             right_bound=right_bound,
             attn_scale=attn_scale,
@@ -781,8 +623,6 @@ def sliding_window_attention_wrapper(
             stats_ragged_offset_tensor=stats_ragged_offset_tensor,
             current_stream=stream,
         )
-        _cache_of_SlidingWindowAttentionObjects[cache_key] = (
-            sliding_window_attention_object
-        )
+        _cache_of_SlidingWindowAttentionObjects[cache_key] = sliding_window_attention_object
 
     return o_tensor, stats_tensor

@@ -613,3 +613,99 @@ TEST_CASE("Matmul with restricted shared memory", "[matmul][graph]") {
         {A, A_gpu.devPtr}, {B, B_gpu.devPtr}, {C, C_gpu.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 }
+
+TEST_CASE("Matmul dynamic shape overrides", "[matmul][graph][dynamic_shape]") {
+#if (CUDNN_VERSION < 91800)
+    SKIP("Dynamic shape with overrides is not supported in cudnn versions prior to 9.18.0");
+#endif
+
+    namespace fe = cudnn_frontend;
+
+    constexpr int A_UID = 1;
+    constexpr int B_UID = 2;
+    constexpr int C_UID = 3;
+
+    struct matmul_shapes {
+        int64_t b, m, n, k;
+    };
+
+    matmul_shapes matmul_cache_shape     = {1, 1024, 1024, 1024};
+    matmul_shapes matmul_dynamic_shape[] = {
+        {2, 1024, 1024, 1024},
+        {2, 2048, 2048, 2048},
+    };
+
+    constexpr int matmul_dynamic_shape_count = sizeof(matmul_dynamic_shape) / sizeof(matmul_cache_shape);
+
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+
+    // build graph and execution plan with a fake shape
+    auto graph = std::make_shared<fe::graph::Graph>();
+
+    graph->set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT)
+        .set_dynamic_shape_enabled(true);  // must be set true for dynamic shape
+
+    auto A = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("A")
+                               .set_uid(A_UID)
+                               .set_dim({matmul_cache_shape.b, matmul_cache_shape.m, matmul_cache_shape.k})
+                               .set_stride({matmul_cache_shape.m * matmul_cache_shape.k, matmul_cache_shape.k, 1})
+                               .set_data_type(fe::DataType_t::BFLOAT16));
+
+    auto B = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("B")
+                               .set_uid(B_UID)
+                               .set_dim({matmul_cache_shape.b, matmul_cache_shape.k, matmul_cache_shape.n})
+                               .set_stride({matmul_cache_shape.n * matmul_cache_shape.k, 1, matmul_cache_shape.k})
+                               .set_data_type(fe::DataType_t::BFLOAT16));
+
+    auto C = graph->matmul(A, B, fe::graph::Matmul_attributes().set_compute_data_type(fe::DataType_t::FLOAT));
+    C->set_uid(C_UID).set_output(true).set_data_type(fe::DataType_t::BFLOAT16);
+
+    // For dynamic shape, recommend to query fallback plan to get a general good performance
+    // Heuristics Mode A is recommended if the dynamic problem shapes are similar in size
+    REQUIRE(graph->build(handle, {fe::HeurMode_t::FALLBACK}).is_good());
+
+    // run graph with dynamic shapes
+    for (int idx_shape = 0; idx_shape < matmul_dynamic_shape_count; ++idx_shape) {
+        std::vector<int64_t> override_uids                = {A_UID, B_UID, C_UID};
+        std::vector<std::vector<int64_t>> override_shapes = {
+            {matmul_dynamic_shape[idx_shape].b, matmul_dynamic_shape[idx_shape].m, matmul_dynamic_shape[idx_shape].k},
+            {matmul_dynamic_shape[idx_shape].b, matmul_dynamic_shape[idx_shape].k, matmul_dynamic_shape[idx_shape].n},
+            {matmul_dynamic_shape[idx_shape].b, matmul_dynamic_shape[idx_shape].m, matmul_dynamic_shape[idx_shape].n}};
+        std::vector<std::vector<int64_t>> override_strides = {
+            {matmul_dynamic_shape[idx_shape].m * matmul_dynamic_shape[idx_shape].k,
+             matmul_dynamic_shape[idx_shape].k,
+             1},
+            {matmul_dynamic_shape[idx_shape].n * matmul_dynamic_shape[idx_shape].k,
+             1,
+             matmul_dynamic_shape[idx_shape].k},
+            {matmul_dynamic_shape[idx_shape].m * matmul_dynamic_shape[idx_shape].n,
+             matmul_dynamic_shape[idx_shape].n,
+             1}};
+
+        Surface<half> A_gpu(
+            matmul_dynamic_shape[idx_shape].b * matmul_dynamic_shape[idx_shape].m * matmul_dynamic_shape[idx_shape].k,
+            false);
+        Surface<half> B_gpu(
+            matmul_dynamic_shape[idx_shape].b * matmul_dynamic_shape[idx_shape].k * matmul_dynamic_shape[idx_shape].n,
+            false);
+        Surface<half> C_gpu(
+            matmul_dynamic_shape[idx_shape].b * matmul_dynamic_shape[idx_shape].m * matmul_dynamic_shape[idx_shape].n,
+            false);
+
+        std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> variant_pack = {
+            {A_UID, A_gpu.devPtr}, {B_UID, B_gpu.devPtr}, {C_UID, C_gpu.devPtr}};
+
+        int64_t workspace_size = 0;
+        REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+        Surface<int8_t> workspace(workspace_size, false);
+
+        REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr, override_uids, override_shapes, override_strides)
+                    .is_good());
+
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+}

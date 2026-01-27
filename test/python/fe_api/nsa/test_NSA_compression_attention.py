@@ -32,9 +32,7 @@ def test_nsa_compression_compile_execute(
         from cudnn import NSA
         from cuda.bindings import driver as cuda
     except ImportError as e:
-        pytest.skip(
-            "Environment not supported: cudnn optional dependencies not installed"
-        )
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
     cfg = nsa_init(
         request=request,
@@ -50,9 +48,7 @@ def test_nsa_compression_compile_execute(
         scale_softmax=scale_softmax,
     )
 
-    Q, K, V, _, _, _, cum_seqlen_q, cum_seqlen_k, max_s_q, max_s_k = (
-        allocate_input_tensors(cfg)
-    )
+    Q, K, V, _, _, _, cum_seqlen_q, cum_seqlen_k, max_s_q, max_s_k = allocate_input_tensors(cfg)
     O, LSE, _, _, _ = allocate_output_tensors(cfg)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -128,9 +124,7 @@ def test_nsa_compression_wrapper(
         from cudnn import NSA
         from cuda.bindings import driver as cuda
     except ImportError as e:
-        pytest.skip(
-            "Environment not supported: cudnn optional dependencies not installed"
-        )
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
     cfg = nsa_init(
         request=request,
@@ -146,9 +140,7 @@ def test_nsa_compression_wrapper(
         scale_softmax=scale_softmax,
     )
 
-    Q, K, V, _, _, _, cum_seqlen_q, cum_seqlen_k, max_s_q, max_s_k = (
-        allocate_input_tensors(cfg)
-    )
+    Q, K, V, _, _, _, cum_seqlen_q, cum_seqlen_k, max_s_q, max_s_k = allocate_input_tensors(cfg)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     O, LSE = NSA.compression_attention_wrapper(

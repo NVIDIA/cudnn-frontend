@@ -1,8 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_Heuristics.h"
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
@@ -141,50 +138,107 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FE_LOG_LABEL("INFO: " << "Building LayerNormNode operations " << attributes.name << " ");
 
-        auto&& layernorm_operation_builder =
-            cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_FORWARD_DESCRIPTOR);
-        layernorm_operation_builder.setNormalizationMode(NormMode_t::LAYER_NORM)
-            .setNormFwdPhase(attributes.forward_phase);
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 layernorm_operation;
 
+        _CUDNN_CHECK_CUDNN_ERROR(
+            layernorm_operation.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR));
+
+        // Set norm mode
+        cudnnBackendNormMode_t cudnn_norm_mode;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(NormMode_t::LAYER_NORM, cudnn_norm_mode));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(layernorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_MODE,
+                                                       CUDNN_TYPE_NORM_MODE,
+                                                       1,
+                                                       &cudnn_norm_mode));
+
+        // Set forward phase
+        cudnnBackendNormFwdPhase_t cudnn_norm_fwd_phase;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.forward_phase, cudnn_norm_fwd_phase));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(layernorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_PHASE,
+                                                       CUDNN_TYPE_NORM_FWD_PHASE,
+                                                       1,
+                                                       &cudnn_norm_fwd_phase));
+
+        // Set input tensor X
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Layernorm_attributes::input_names::X);
-        layernorm_operation_builder.setxDesc(*(tensors.at(X->second->get_uid())));
+        auto x_desc = tensors.at(X->second->get_uid())->get_raw_desc();
 
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(layernorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_XDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &x_desc));
+
+        // Set scale and bias tensors
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Layernorm_attributes::input_names::SCALE);
+        auto scale_desc = tensors.at(SCALE->second->get_uid())->get_raw_desc();
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(layernorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &scale_desc));
+
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(BIAS, Layernorm_attributes::input_names::BIAS);
-        layernorm_operation_builder.setScaleAndBias(*(tensors.at(SCALE->second->get_uid())),
-                                                    *(tensors.at(BIAS->second->get_uid())));
+        auto bias_desc = tensors.at(BIAS->second->get_uid())->get_raw_desc();
 
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(layernorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_BIAS_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &bias_desc));
+
+        // Set epsilon tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(EPSILON, Layernorm_attributes::input_names::EPSILON);
-        layernorm_operation_builder.setEpsilonTensor(*(tensors.at(EPSILON->second->get_uid())));
+        auto epsilon_desc = tensors.at(EPSILON->second->get_uid())->get_raw_desc();
 
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(layernorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_EPSILON_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &epsilon_desc));
+
+        // Set output tensor Y
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Layernorm_attributes::output_names::Y);
-        layernorm_operation_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
+        auto y_desc = tensors.at(Y->second->get_uid())->get_raw_desc();
 
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(layernorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_YDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &y_desc));
+
+        // Set mean and inv_variance for training phase
         if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
             CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(MEAN, Layernorm_attributes::output_names::MEAN);
+            auto mean_desc = tensors.at(MEAN->second->get_uid())->get_raw_desc();
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(layernorm_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_MEAN_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &mean_desc));
+
             CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(INV_VARIANCE, Layernorm_attributes::output_names::INV_VARIANCE);
-            layernorm_operation_builder.setSavedMeanAndInvVar(*(tensors.at(MEAN->second->get_uid())),
-                                                              *(tensors.at(INV_VARIANCE->second->get_uid())));
+            auto inv_var_desc = tensors.at(INV_VARIANCE->second->get_uid())->get_raw_desc();
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(layernorm_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_INV_VARIANCE_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &inv_var_desc));
         }
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = layernorm_operation_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = layernorm_operation_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
-        }
-#endif
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(layernorm_operation.get_raw_desc()));
+
+        operations.push_back(std::make_shared<Operation_v8>(std::move(layernorm_operation)));
 
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());

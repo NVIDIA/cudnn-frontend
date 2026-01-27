@@ -29,9 +29,7 @@ def test_nsa_swa_compile_execute(
     try:
         from cudnn import NSA
     except ImportError as e:
-        pytest.skip(
-            "Environment not supported: cudnn optional dependencies not installed"
-        )
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
     cfg = nsa_init(
         request=request,
         layout=layout,
@@ -115,9 +113,7 @@ def test_nsa_swa_wrapper(
     try:
         from cudnn import NSA
     except ImportError as e:
-        pytest.skip(
-            "Environment not supported: cudnn optional dependencies not installed"
-        )
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
     cfg = nsa_init(
         request=request,
         layout=layout,

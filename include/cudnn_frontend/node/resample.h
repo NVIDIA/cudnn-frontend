@@ -1,8 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_Resample.h"
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
@@ -105,53 +102,159 @@ class ResampleNode : public NodeCRTP<ResampleNode> {
 
         auto number_of_spatial_dim = static_cast<int64_t>(attributes.window.size());
 
-        // Define the resample descriptor
-        auto resample_descriptor = cudnn_frontend::ResampleDescBuilder_v8()
-                                       .setComputeType(attributes.compute_data_type)
-                                       .setNanPropagation(CUDNN_PROPAGATE_NAN)
-                                       .setResampleMode(attributes.resample_mode)
-                                       .setPaddingMode(attributes.padding_mode)
-                                       .setSpatialDim(number_of_spatial_dim, attributes.window.data())
-                                       .setSpatialStride(number_of_spatial_dim, attributes.stride.data())
-                                       .setPrePadding(number_of_spatial_dim, attributes.pre_padding.data())
-                                       .setPostPadding(number_of_spatial_dim, attributes.post_padding.data())
-                                       .build();
+        // Create resample descriptor by directly calling cuDNN backend API
+        ResampleDesc_v8 resample_descriptor;
 
-        auto&& resample_op_builder =
-            cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_RESAMPLE_FWD_DESCRIPTOR);
+        _CUDNN_CHECK_CUDNN_ERROR(
+            resample_descriptor.initialize_managed_backend_pointer(CUDNN_BACKEND_RESAMPLE_DESCRIPTOR));
 
+        // Set resample mode
+        cudnnResampleMode_t cudnn_resample_mode;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.resample_mode, cudnn_resample_mode));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(resample_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_RESAMPLE_MODE,
+                                                       CUDNN_TYPE_RESAMPLE_MODE,
+                                                       1,
+                                                       &cudnn_resample_mode));
+
+        // Set compute type
+        cudnnDataType_t cudnn_data_type;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.compute_data_type, cudnn_data_type));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(resample_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_RESAMPLE_COMP_TYPE,
+                                                       CUDNN_TYPE_DATA_TYPE,
+                                                       1,
+                                                       &cudnn_data_type));
+
+        // Set nan propagation
+        cudnnNanPropagation_t nan_opt = CUDNN_PROPAGATE_NAN;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(resample_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_RESAMPLE_NAN_PROPAGATION,
+                                                       CUDNN_TYPE_NAN_PROPOGATION,
+                                                       1,
+                                                       &nan_opt));
+
+        // Set padding mode
+        cudnnPaddingMode_t cudnn_padding_mode;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.padding_mode, cudnn_padding_mode));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(resample_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_RESAMPLE_PADDING_MODE,
+                                                       CUDNN_TYPE_PADDING_MODE,
+                                                       1,
+                                                       &cudnn_padding_mode));
+
+        // Set spatial dimensions
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(resample_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS,
+                                                       CUDNN_TYPE_INT64,
+                                                       1,
+                                                       &number_of_spatial_dim));
+
+        // Set window dimensions
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(resample_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_RESAMPLE_WINDOW_DIMS,
+                                                       CUDNN_TYPE_FRACTION,
+                                                       number_of_spatial_dim,
+                                                       attributes.window.data()));
+
+        // Set pre padding
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(resample_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_RESAMPLE_PRE_PADDINGS,
+                                                       CUDNN_TYPE_FRACTION,
+                                                       number_of_spatial_dim,
+                                                       attributes.pre_padding.data()));
+
+        // Set post padding
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(resample_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_RESAMPLE_POST_PADDINGS,
+                                                       CUDNN_TYPE_FRACTION,
+                                                       number_of_spatial_dim,
+                                                       attributes.post_padding.data()));
+
+        // Set strides
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(resample_descriptor.get_raw_desc(),
+                                                       CUDNN_ATTR_RESAMPLE_STRIDES,
+                                                       CUDNN_TYPE_FRACTION,
+                                                       number_of_spatial_dim,
+                                                       attributes.stride.data()));
+
+        // Finalize the descriptor
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(resample_descriptor.get_raw_desc()));
+        CUDNN_FE_LOG_LABEL_ENDL(resample_descriptor);
+
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 resample_operation;
+
+        _CUDNN_CHECK_CUDNN_ERROR(
+            resample_operation.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR));
+
+        // Set input tensor X
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Resample_attributes::input_names::X);
-        resample_op_builder.setxDesc(*(tensors.at(X->second->get_uid())));
+        auto x_desc = tensors.at(X->second->get_uid())->get_raw_desc();
 
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(resample_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_RESAMPLE_FWD_XDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &x_desc));
+
+        // Set output tensor Y
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Resample_attributes::output_names::Y);
-        resample_op_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
+        auto y_desc = tensors.at(Y->second->get_uid())->get_raw_desc();
 
-        resample_op_builder.setResampleDesc(resample_descriptor);
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(resample_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_RESAMPLE_FWD_YDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &y_desc));
 
+        // Set alpha and beta
+        double alpha = 1.0;
+        double beta  = 0.0;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
+            resample_operation.get_raw_desc(), CUDNN_ATTR_OPERATION_RESAMPLE_FWD_ALPHA, CUDNN_TYPE_DOUBLE, 1, &alpha));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
+            resample_operation.get_raw_desc(), CUDNN_ATTR_OPERATION_RESAMPLE_FWD_BETA, CUDNN_TYPE_DOUBLE, 1, &beta));
+
+        // Set resample descriptor
+        auto resample_raw_desc = resample_descriptor.get_raw_desc();
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(resample_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_RESAMPLE_FWD_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &resample_raw_desc));
+
+        // Set index tensor if available
         auto index = attributes.outputs.find(Resample_attributes::output_names::Index);
         if ((index != attributes.outputs.end()) && (index->second != nullptr)) {
-            resample_op_builder.setidxDesc(*tensors.at(index->second->get_uid()));
+            auto idx_desc = tensors.at(index->second->get_uid())->get_raw_desc();
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(resample_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_RESAMPLE_FWD_IDXDESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &idx_desc));
         }
 
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = resample_op_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = resample_op_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
-        }
-#endif
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(resample_operation.get_raw_desc()));
+
+        operations.push_back(std::make_shared<Operation_v8>(std::move(resample_operation)));
 
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());

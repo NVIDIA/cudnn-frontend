@@ -26,7 +26,9 @@ def cudnn_handle():
 # =================== PyTest Hooks =====================
 def pytest_load_initial_conftests(args, early_config, parser):
     if not any(arg.startswith("--tb=") for arg in args):
-        args.append("--tb=short")
+        args.insert(0, "--tb=short")
+    if "--no-header" not in args:
+        args.insert(0, "--no-header")
 
 
 def pytest_configure(config):
@@ -52,6 +54,8 @@ def pytest_addoption(parser):
     parser.addoption("--dryrun", action="store", nargs="?", const=1, type=int, default=0, help="show repro commands when 1, 2, or 3 (use with '-s')")
     parser.addoption("--diffs", action="store", type=int, default=10, help="set number of numerical mismatches to display")
     parser.addoption("--repro", action="store", type=str, default=None, help="specify config string to run repro function")
+    parser.addoption("--seed", action="store", type=int, default=None, help="[fuzzer] random seed for reproducibility")
+    parser.addoption("--num-tests", action="store", type=int, default=100, help="[fuzzer] number of random tests to run")
     parser.addoption("--perf", action="store_true", help="enable performance profiling")
 
     # MHA command line options to overwrite specific test dimensions in test_mhas.py and test_mhas_v2.py.
@@ -93,4 +97,10 @@ def pytest_addoption(parser):
     parser.addoption("--gemm-amax-mma-tiler", action="store", default=None, type=str, help="[test_gemm_amax.py] MMA tiler (M,N) dimensions as comma-separated values (e.g., '128,128')")
     parser.addoption("--gemm-amax-cluster-shape", action="store", default=None, type=str, help="[test_gemm_amax.py] Cluster shape (M,N) dimensions as comma-separated values (e.g., '1,1')")
     parser.addoption("--gemm-amax-skip-ref", action="store_true", help="[test_gemm_amax.py] Skip reference computation for performance testing")
+
+    # Grouped GEMM SwiGLU command line options for test_grouped_gemm_swiglu.py
+    parser.addoption("--grouped-gemm-nkl", action="store", default=None, type=str, help="[test_grouped_gemm_swiglu.py] N,K,L dimensions as comma-separated values (e.g., '512,512,4')")
+    parser.addoption("--grouped-gemm-group-m", action="store", default=None, type=str, help="[test_grouped_gemm_swiglu.py] M values per group as comma-separated values (e.g., '256,512,256,256')")
+    parser.addoption("--grouped-gemm-m-aligned", action="store", default=None, type=int, help="[test_grouped_gemm_swiglu.py] M alignment (e.g., 256)")
+    parser.addoption("--grouped-gemm-skip-ref", action="store_true", help="[test_grouped_gemm_swiglu.py] Skip reference computation for performance testing")
 # fmt: on

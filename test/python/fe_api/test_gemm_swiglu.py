@@ -8,10 +8,10 @@ from fe_api.test_gemm_swiglu_utils import (
     check_ref_gemm_swiglu,
     with_gemm_swiglu_params,
     gemm_swiglu_init,
-    with_gemm_swiglu_quant_params,
+    with_gemm_swiglu_quant_params_fp4,
+    with_gemm_swiglu_quant_params_fp8,
     check_ref_gemm_swiglu_quant,
 )
-
 
 """
 GemmSwiglu API with explicit set_params, compile, and execute paths. 
@@ -38,10 +38,7 @@ def test_gemm_swiglu_compile_execute(
         from cudnn import GemmSwigluSm100
         from cuda.bindings import driver as cuda
     except ImportError as e:
-        # raise e
-        pytest.skip(
-            "Environment not supported: cudnn optional dependencies not installed"
-        )
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
     cfg = gemm_swiglu_init(
         request,
         a_major,
@@ -65,9 +62,7 @@ def test_gemm_swiglu_compile_execute(
         cfg["a_major"],
         cfg["b_major"],
     )
-    ab12_torch, c_torch, _, _, _ = allocate_output_tensors(
-        cfg["m"], cfg["n"], cfg["l"], cfg["ab12_dtype"], cfg["c_dtype"], cfg["c_major"]
-    )
+    ab12_torch, c_torch, _, _, _ = allocate_output_tensors(cfg["m"], cfg["n"], cfg["l"], cfg["ab12_dtype"], cfg["c_dtype"], cfg["c_major"])
 
     gemm_swiglu = GemmSwigluSm100(
         sample_a=a_torch,
@@ -82,7 +77,6 @@ def test_gemm_swiglu_compile_execute(
     try:
         assert gemm_swiglu.check_support(), "Unsupported testcase"
     except (ValueError, NotImplementedError) as e:
-        # raise e
         pytest.skip(f"Unsupported testcase: {e}")
     gemm_swiglu.compile(current_stream=stream)
     gemm_swiglu.execute(
@@ -130,9 +124,7 @@ def test_gemm_swiglu_wrapper(
         from cuda.bindings import driver as cuda
     except ImportError as e:
         print(f"ImportError: {e}")
-        pytest.skip(
-            "Environment not supported: cudnn optional dependencies not installed"
-        )
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
     cfg = gemm_swiglu_init(
         request,
         a_major,
@@ -186,8 +178,145 @@ def test_gemm_swiglu_wrapper(
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-@with_gemm_swiglu_quant_params
-def test_gemm_swiglu_compile_execute_quantize(
+@with_gemm_swiglu_quant_params_fp4
+def test_gemm_swiglu_compile_execute_quant_fp4(
+    a_major,
+    b_major,
+    c_major,
+    ab_dtype,
+    ab12_dtype,
+    c_dtype,
+    acc_dtype,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    sf_vec_size,
+    sf_dtype,
+    vector_f32,
+    request,
+):
+    _test_gemm_swiglu_compile_execute_quant(
+        a_major=a_major,
+        b_major=b_major,
+        c_major=c_major,
+        ab_dtype=ab_dtype,
+        ab12_dtype=ab12_dtype,
+        c_dtype=c_dtype,
+        acc_dtype=acc_dtype,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+        vector_f32=vector_f32,
+        request=request,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@with_gemm_swiglu_quant_params_fp8
+def test_gemm_swiglu_compile_execute_quant_fp8(
+    a_major,
+    b_major,
+    c_major,
+    ab_dtype,
+    ab12_dtype,
+    c_dtype,
+    acc_dtype,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    sf_vec_size,
+    sf_dtype,
+    vector_f32,
+    request,
+):
+    _test_gemm_swiglu_compile_execute_quant(
+        a_major=a_major,
+        b_major=b_major,
+        c_major=c_major,
+        ab_dtype=ab_dtype,
+        ab12_dtype=ab12_dtype,
+        c_dtype=c_dtype,
+        acc_dtype=acc_dtype,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+        vector_f32=vector_f32,
+        request=request,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@with_gemm_swiglu_quant_params_fp4
+def test_gemm_swiglu_wrapper_quant_fp4(
+    a_major,
+    b_major,
+    c_major,
+    ab_dtype,
+    ab12_dtype,
+    c_dtype,
+    acc_dtype,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    sf_vec_size,
+    sf_dtype,
+    vector_f32,
+    request,
+):
+    _test_gemm_swiglu_wrapper_quant(
+        a_major=a_major,
+        b_major=b_major,
+        c_major=c_major,
+        ab_dtype=ab_dtype,
+        ab12_dtype=ab12_dtype,
+        c_dtype=c_dtype,
+        acc_dtype=acc_dtype,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+        vector_f32=vector_f32,
+        request=request,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@with_gemm_swiglu_quant_params_fp8
+def test_gemm_swiglu_wrapper_quant_fp8(
+    a_major,
+    b_major,
+    c_major,
+    ab_dtype,
+    ab12_dtype,
+    c_dtype,
+    acc_dtype,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    sf_vec_size,
+    sf_dtype,
+    vector_f32,
+    request,
+):
+    _test_gemm_swiglu_wrapper_quant(
+        a_major=a_major,
+        b_major=b_major,
+        c_major=c_major,
+        ab_dtype=ab_dtype,
+        ab12_dtype=ab12_dtype,
+        c_dtype=c_dtype,
+        acc_dtype=acc_dtype,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+        vector_f32=vector_f32,
+        request=request,
+    )
+
+
+def _test_gemm_swiglu_compile_execute_quant(
     a_major,
     b_major,
     c_major,
@@ -206,9 +335,7 @@ def test_gemm_swiglu_compile_execute_quantize(
         from cudnn import GemmSwigluSm100
         from cuda.bindings import driver as cuda
     except ImportError as e:
-        pytest.skip(
-            "Environment not supported: cudnn optional dependencies not installed"
-        )
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
     cfg = gemm_swiglu_init(
         request,
         a_major,
@@ -318,10 +445,7 @@ def test_gemm_swiglu_compile_execute_quantize(
     )
 
 
-@pytest.mark.L0
-@torch_fork_set_rng(seed=0)
-@with_gemm_swiglu_quant_params
-def test_gemm_swiglu_wrapper_quantize(
+def _test_gemm_swiglu_wrapper_quant(
     a_major,
     b_major,
     c_major,
@@ -340,9 +464,7 @@ def test_gemm_swiglu_wrapper_quantize(
         from cudnn import gemm_swiglu_wrapper_sm100
         from cuda.bindings import driver as cuda
     except ImportError as e:
-        pytest.skip(
-            "Environment not supported: cudnn optional dependencies not installed"
-        )
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
     cfg = gemm_swiglu_init(
         request,
         a_major,

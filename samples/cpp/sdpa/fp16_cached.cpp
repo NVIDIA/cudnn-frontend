@@ -48,9 +48,7 @@ create_sdpa_forward_graph(int64_t const b,
                           float const attn_scale    = 1.0f,
                           bool const generate_stats = true,
                           bool const causal_mask    = false,
-                          bool const alibi_mask     = false,
-                          bool const padding_mask   = false,
-                          bool has_attn_bias        = false);
+                          bool const padding_mask   = false);
 
 // Directly use the backward graph builder from the toy example
 std::shared_ptr<fe::graph::Graph>

@@ -28,20 +28,11 @@ def create_container_and_page_table(tensor, block_size):
 
     # Create the page table
     table_size = math.ceil(S / block_size)
-    page_table_temp = torch.linspace(
-        0, B * table_size - 1, B * table_size, device="cuda", dtype=torch.int32
-    ).reshape(table_size, 1, B, 1)
+    page_table_temp = torch.linspace(0, B * table_size - 1, B * table_size, device="cuda", dtype=torch.int32).reshape(table_size, 1, B, 1)
     page_table_temp = torch.transpose(page_table_temp, 0, 2)
 
     # Make batch size outer dimension (cuDNN backend requirement)
-    page_table = (
-        torch.randn(blocks_per_batch * B)
-        .int()
-        .cuda()
-        .as_strided(
-            (B, 1, blocks_per_batch, 1), (blocks_per_batch, blocks_per_batch, 1, 1)
-        )
-    )
+    page_table = torch.randn(blocks_per_batch * B).int().cuda().as_strided((B, 1, blocks_per_batch, 1), (blocks_per_batch, blocks_per_batch, 1, 1))
     page_table.copy_(page_table_temp)
 
     return (container, page_table)
@@ -88,9 +79,7 @@ def padding_mask(sdpa_graph, q_kt_tensor, seq_len_q, seq_len_kv, neg_inf):
     )
     padding_mask.set_data_type(cudnn.data_type.BOOLEAN)
 
-    out = sdpa_graph.binary_select(
-        input0=q_kt_tensor, input1=neg_inf, mask=padding_mask, name="binary_select"
-    )
+    out = sdpa_graph.binary_select(input0=q_kt_tensor, input1=neg_inf, mask=padding_mask, name="binary_select")
 
     return out
 
@@ -106,9 +95,7 @@ def softcap(sdpa_graph, q_kt_tensor, softcap_tensor):
     return out
 
 
-def decode_mask(
-    sdpa_graph, q_kt_tensor, seq_len_kv, seq_len_q, neg_inf, softcap_tensor
-):
+def decode_mask(sdpa_graph, q_kt_tensor, seq_len_kv, seq_len_q, neg_inf, softcap_tensor):
 
     softcap_out = softcap(sdpa_graph, q_kt_tensor, softcap_tensor)
 
@@ -125,9 +112,7 @@ def causal_mask(sdpa_graph, q_kt_tensor, neg_inf):
     col_index = sdpa_graph.gen_index(input=q_kt_tensor, axis=3)
     col_index.set_data_type(cudnn.data_type.INT32)
 
-    mask = sdpa_graph.cmp_ge(
-        input=row_index, comparison=col_index, compute_data_type=cudnn.data_type.BOOLEAN
-    )
+    mask = sdpa_graph.cmp_ge(input=row_index, comparison=col_index, compute_data_type=cudnn.data_type.BOOLEAN)
     mask.set_data_type(cudnn.data_type.BOOLEAN)
 
     out = sdpa_graph.binary_select(input0=q_kt_tensor, input1=neg_inf, mask=mask)
@@ -136,18 +121,14 @@ def causal_mask(sdpa_graph, q_kt_tensor, neg_inf):
 
 
 def constant_bound_mask(score_mod_graph, index, bound):
-    is_less_than_bound = score_mod_graph.cmp_lt(
-        input=index, comparison=bound, compute_data_type=cudnn.data_type.BOOLEAN
-    )
+    is_less_than_bound = score_mod_graph.cmp_lt(input=index, comparison=bound, compute_data_type=cudnn.data_type.BOOLEAN)
     is_less_than_bound.set_data_type(cudnn.data_type.INT32)
 
     return is_less_than_bound
 
 
 def diag_bound_mask(score_mod_graph, row_index, col_index, diag_bound_0, diag_bound_1):
-    row_minus_col = score_mod_graph.sub(
-        a=row_index, b=col_index, compute_data_type=cudnn.data_type.INT32
-    )
+    row_minus_col = score_mod_graph.sub(a=row_index, b=col_index, compute_data_type=cudnn.data_type.INT32)
     row_minus_col.set_data_type(cudnn.data_type.INT32)
     is_larger_or_equal_to_diag_bound_0 = score_mod_graph.cmp_ge(
         input=row_minus_col,
@@ -191,9 +172,7 @@ def arrow_mask(
     is_less_than_row_bound = constant_bound_mask(score_mod_graph, row_index, row_bound)
     is_less_than_col_bound = constant_bound_mask(score_mod_graph, col_index, col_bound)
 
-    is_within_diag_bound = diag_bound_mask(
-        score_mod_graph, row_index, col_index, diag_bound_0, diag_bound_1
-    )
+    is_within_diag_bound = diag_bound_mask(score_mod_graph, row_index, col_index, diag_bound_0, diag_bound_1)
 
     mask = score_mod_graph.logical_or(
         is_less_than_row_bound,
@@ -202,9 +181,7 @@ def arrow_mask(
     )
     mask.set_data_type(cudnn.data_type.INT32)
 
-    mask = score_mod_graph.logical_or(
-        mask, is_within_diag_bound, compute_data_type=cudnn.data_type.BOOLEAN
-    )
+    mask = score_mod_graph.logical_or(mask, is_within_diag_bound, compute_data_type=cudnn.data_type.BOOLEAN)
     mask.set_data_type(cudnn.data_type.INT32)
 
     out = score_mod_graph.binary_select(input0=q_kt_tensor, input1=neg_inf, mask=mask)
@@ -255,24 +232,16 @@ def test_sdpa_with_flexible_graph(cudnn_handle):
     )
 
     q = graph.tensor_like(q_gpu)
-    container_k_gpu, page_table_k_gpu = create_container_and_page_table(
-        k_gpu, block_size_k
-    )
-    container_v_gpu, page_table_v_gpu = create_container_and_page_table(
-        v_gpu, block_size_v
-    )
+    container_k_gpu, page_table_k_gpu = create_container_and_page_table(k_gpu, block_size_k)
+    container_v_gpu, page_table_v_gpu = create_container_and_page_table(v_gpu, block_size_v)
 
     container_k = graph.tensor_like(container_k_gpu)
     container_v = graph.tensor_like(container_v_gpu)
     page_table_k = graph.tensor_like(page_table_k_gpu)
     page_table_v = graph.tensor_like(page_table_v_gpu)
 
-    seq_len_q_gpu = torch.randint(
-        1, s_q + 1, (b, 1, 1, 1), dtype=torch.int32, device="cuda"
-    )
-    seq_len_kv_gpu = torch.randint(
-        1, s_kv + 1, (b, 1, 1, 1), dtype=torch.int32, device="cuda"
-    )
+    seq_len_q_gpu = torch.randint(1, s_q + 1, (b, 1, 1, 1), dtype=torch.int32, device="cuda")
+    seq_len_kv_gpu = torch.randint(1, s_kv + 1, (b, 1, 1, 1), dtype=torch.int32, device="cuda")
 
     seq_len_q = graph.tensor_like(seq_len_q_gpu)
     seq_len_kv = graph.tensor_like(seq_len_kv_gpu)
@@ -344,9 +313,7 @@ def test_sdpa_with_flexible_graph(cudnn_handle):
         seq_len_kv: seq_len_kv_gpu,
     }
 
-    workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     graph.execute(variant_pack, workspace)
     torch.cuda.synchronize()
 
@@ -393,9 +360,7 @@ def document_mask(sdpa_graph, q_kt_tensor, document_tensor, document_tensor_t, n
     )
     document_mask.set_data_type(cudnn.data_type.INT32)
 
-    out = sdpa_graph.binary_select(
-        input0=q_kt_tensor, input1=neg_inf, mask=document_mask, name="binary_select"
-    )
+    out = sdpa_graph.binary_select(input0=q_kt_tensor, input1=neg_inf, mask=document_mask, name="binary_select")
 
     return out
 
@@ -528,9 +493,7 @@ def test_sdpa_with_arrow_mask(cudnn_handle):
         diag_bound_1: diag_bound_1_cpu,
     }
 
-    workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     graph.execute(variant_pack, workspace)
     torch.cuda.synchronize()
 
@@ -562,15 +525,9 @@ def test_sdpa_with_document_mask(cudnn_handle):
     cudnn_version = LooseVersion(cudnn.backend_version_string())
 
     if cudnn_version < "9.9.0":
-        pytest.skip(
-            "SDPA fprop with document style mask requires cudnn 9.9.0 or higher"
-        )
+        pytest.skip("SDPA fprop with document style mask requires cudnn 9.9.0 or higher")
 
-    document_tensor_gpu = (
-        torch.randint(0, s_q, (1, 1, s_q, 1), device="cuda", dtype=torch.int32)
-        .sort(dim=2)
-        .values
-    )
+    document_tensor_gpu = torch.randint(0, s_q, (1, 1, s_q, 1), device="cuda", dtype=torch.int32).sort(dim=2).values
     document_tensor_gpu_t = document_tensor_gpu.reshape(1, 1, 1, s_q)
 
     graph = cudnn.pygraph(
@@ -637,8 +594,6 @@ def test_sdpa_with_document_mask(cudnn_handle):
         neg_inf_tensor: neg_inf_tensor_cpu,
     }
 
-    workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     graph.execute(variant_pack, workspace)
     torch.cuda.synchronize()
