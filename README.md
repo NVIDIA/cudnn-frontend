@@ -19,6 +19,47 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 *   **Ease of Use:** Simplified C++ and Python bindings (via `pybind11`) that abstract away the boilerplate of the backend API.
 *   **Performance:** Built-in autotuning and support for the latest NVIDIA GPU architectures.
 
+## Benchmarks
+
+To run the sdpa benchmarks, refer to [benchmarks/sdpa](https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/sdpa_benchmark_training/README.md) folder. Current results:
+
+### GB200 - Llama 3.1 Causal (top_left)
+![Llama 3.1 Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/gb200_918_only_cudnn/llama3.1_top_left_causal.png) 
+- SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=True`
+- Sequence lengths shown on x-axis
+- Results obtained on NVIDIA GB200 GPU
+
+### GB200 - Llama 3.1 Non-Causal (no_mask)
+![Llama 3.1 Non-Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/gb200_918_only_cudnn/llama3.1_no_mask.png)
+- SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=False`
+- Sequence lengths shown on x-axis
+- Results obtained on NVIDIA GB200 GPU
+
+### GB200 - DeepSeek V3 Causal (top_left)
+![DeepSeek V3 Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/gb200_918_only_cudnn/dsv3_top_left_causal.png)
+- SDPA parameters: `batch=1; num_q_heads=128; num_kv_heads=128; head_dim_qk=192; head_dim_vo=128; is_causal=True`
+- Sequence lengths shown on x-axis
+- Results obtained on NVIDIA GB200 GPU
+
+### GB300 - Llama 3.1 Causal (top_left)
+![Llama 3.1 Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/gb300_918_only_cudnn/llama3.1_top_left_causal.png)
+- SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=True`
+- Sequence lengths shown on x-axis
+- Results obtained on NVIDIA GB300 GPU
+
+### GB300 - Llama 3.1 Non-Causal (no_mask)
+![Llama 3.1 Non-Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/gb300_918_only_cudnn/llama3.1_no_mask.png)
+- SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=False`
+- Sequence lengths shown on x-axis
+- Results obtained on NVIDIA GB300 GPU
+
+### GB300 - DeepSeek V3 Causal (top_left)
+![DeepSeek V3 Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/gb300_918_only_cudnn/dsv3_top_left_causal.png)
+- SDPA parameters: `batch=1; num_q_heads=128; num_kv_heads=128; head_dim_qk=192; head_dim_vo=128; is_causal=True`
+- Sequence lengths shown on x-axis
+- Results obtained on NVIDIA GB300 GPU
+
+
 ## Installation
 
 ### 🐍 Python
@@ -93,7 +134,7 @@ export CUDNN_FRONTEND_LOG_INFO=1
 export CUDNN_FRONTEND_LOG_FILE=execution_log.txt
 ```
 
-Alternatively, you can control logging programmatically via `cudnn_frontend::isLoggingEnabled()`.
+Alternatively, you can control logging programmatically via `cudnn_frontend::isLoggingEnabled()`
 
 ## License
 
