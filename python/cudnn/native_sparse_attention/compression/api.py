@@ -6,10 +6,10 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_stream
 from cutlass.cute.typing import Int32
 
-from cudnn.api_base import APIBase
+from cudnn.api_base import APIBase, TupleDict
 from cudnn.datatypes import _convert_to_cutlass_data_type
 
 from ..utils import make_tensor_strided_like
@@ -43,14 +43,16 @@ class CompressionAttention(APIBase):
         self._logger.warning("CompressionAttention is an experimental API")
         self._logger.debug("Entering __init__")
 
-        self.sample_q = sample_q
-        self.sample_k = sample_k
-        self.sample_v = sample_v
-        self.sample_o = sample_o
-        self.sample_lse = sample_lse
+        self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
+        self.k_desc = self._make_tensor_desc(sample_k, name="sample_k")
+        self.v_desc = self._make_tensor_desc(sample_v, name="sample_v")
+        self.o_desc = self._make_tensor_desc(sample_o, name="sample_o")
+        self.lse_desc = self._make_tensor_desc(sample_lse, name="sample_lse")
         self.enable_lse = sample_lse is not None
-        self.sample_cum_seqlen_q = sample_cum_seqlen_q
-        self.sample_cum_seqlen_k = sample_cum_seqlen_k
+        self.cum_seqlen_q_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_cum_seqlen_q, name="sample_cum_seqlen_q"), 1, "sample_cum_seqlen_q")
+        self.cum_seqlen_k_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_cum_seqlen_k, name="sample_cum_seqlen_k"), 1, "sample_cum_seqlen_k")
+        self.max_cum_seqlen_q = int(sample_cum_seqlen_q.max().item()) if sample_cum_seqlen_q is not None else None
+        self.max_cum_seqlen_k = int(sample_cum_seqlen_k.max().item()) if sample_cum_seqlen_k is not None else None
 
         # Types and kernel configuration
         self.qk_acc_dtype_torch = qk_acc_dtype
@@ -77,7 +79,7 @@ class CompressionAttention(APIBase):
         self._compiled_kernel = None
 
         self._logger.debug(
-            f"__init__ completed with args: sample_q {sample_q.shape}, sample_k {sample_k.shape}, sample_v {sample_v.shape}, sample_o {sample_o.shape}, sample_lse {sample_lse.shape if sample_lse is not None else 'None'}, sample_cum_seqlen_q {sample_cum_seqlen_q.shape if sample_cum_seqlen_q is not None else 'None'}, sample_cum_seqlen_k {sample_cum_seqlen_k.shape if sample_cum_seqlen_k is not None else 'None'}, qk_acc_dtype {qk_acc_dtype}, pv_acc_dtype {pv_acc_dtype}, mma_tiler_mn {mma_tiler_mn}, is_persistent {is_persistent}, scale_q {scale_q}, scale_k {scale_k}, scale_v {scale_v}, inv_scale_o {inv_scale_o}, scale_softmax {scale_softmax}"
+            f"__init__ completed with args: sample_q {self.q_desc.shape}, sample_k {self.k_desc.shape}, sample_v {self.v_desc.shape}, sample_o {self.o_desc.shape}, sample_lse {self.lse_desc.shape if self.lse_desc is not None else 'None'}, sample_cum_seqlen_q {self.cum_seqlen_q_desc.shape if self.cum_seqlen_q_desc is not None else 'None'}, sample_cum_seqlen_k {self.cum_seqlen_k_desc.shape if self.cum_seqlen_k_desc is not None else 'None'}, qk_acc_dtype {qk_acc_dtype}, pv_acc_dtype {pv_acc_dtype}, mma_tiler_mn {mma_tiler_mn}, is_persistent {is_persistent}, scale_q {scale_q}, scale_k {scale_k}, scale_v {scale_v}, inv_scale_o {inv_scale_o}, scale_softmax {scale_softmax}"
         )
 
     def check_support(self) -> bool:
@@ -85,30 +87,27 @@ class CompressionAttention(APIBase):
 
         # shape normalization and validation
         self._logger.debug("Checking shape normalization and validation")
-        if self.sample_q.ndim == 4:
+        if self.q_desc.ndim == 4:
             self.input_layout = "B,H,S,D"
 
-            b, h_qo, s_qo, d_qk = self.sample_q.shape
-            b, h_kv, s_kv, d_qk = self.sample_k.shape
-            b, h_kv, s_kv, d_v = self.sample_v.shape
-            b, h_q, s_qo, d_v = self.sample_o.shape
+            b, h_qo, s_qo, d_qk = self.q_desc.shape
+            b, h_kv, s_kv, d_qk = self.k_desc.shape
+            b, h_kv, s_kv, d_v = self.v_desc.shape
+            b, h_q, s_qo, d_v = self.o_desc.shape
 
-            if self.sample_q.shape != (b, h_qo, s_qo, d_qk):
-                raise ValueError(f"Input shape mismatch: expected Q tensor shape {b, h_qo, s_qo, d_qk}, got {self.sample_q.shape}")
-            if self.sample_k.shape != (b, h_kv, s_kv, d_qk):
-                raise ValueError(f"Input shape mismatch: expected K tensor shape {b, h_kv, s_kv, d_qk}, got {self.sample_k.shape}")
-            if self.sample_v.shape != (b, h_kv, s_kv, d_v):
-                raise ValueError(f"Input shape mismatch: expected V tensor shape {b, h_kv, s_kv, d_v}, got {self.sample_v.shape}")
-            if self.sample_o.shape != (b, h_q, s_qo, d_v):
-                raise ValueError(f"Output shape mismatch: expected O tensor shape {b, h_q, s_qo, d_v}, got {self.sample_o.shape}")
+            self._check_tensor_shape(self.q_desc, (b, h_qo, s_qo, d_qk), name="Q")
+            self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
+            self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
+            self._check_tensor_shape(self.o_desc, (b, h_q, s_qo, d_v), name="O")
             if self.enable_lse:
-                self.sample_lse = self._unpad_tensor_to_ndim(self.sample_lse, 3, "sample_lse")
-                if self.sample_lse.shape != (b, h_q, s_qo):
-                    raise ValueError(f"Output shape mismatch: expected LSE tensor shape {b, h_q, s_qo}, got {self.sample_lse.shape}")
-                if not self.sample_lse.is_contiguous():
-                    raise ValueError("LSE tensor must be contiguous")
-            if self.sample_cum_seqlen_q is not None or self.sample_cum_seqlen_k is not None:
-                self._logger.warning("sample_cum_seqlen_q and sample_cum_seqlen_k are ignored for B,H,S,D layout")
+
+                self.lse_desc = self._unpad_tensor_to_ndim(self.lse_desc, 3, name="LSE")
+                self._check_tensor_shape(self.lse_desc, (b, h_q, s_qo), name="LSE")
+                self._check_tensor_stride(
+                    self.lse_desc, stride=(h_q * s_qo, s_qo, 1), name="LSE", extra_error_msg="LSE tensor must be contiguous"
+                )  # TODO @mingyangw: contiguous check
+            if self.cum_seqlen_q_desc is not None or self.cum_seqlen_k_desc is not None:
+                self._logger.warning("cum_seqlen_q and cum_seqlen_k are ignored for B,H,S,D layout")
 
             # Shapes
             self.batch_size = b
@@ -118,50 +117,35 @@ class CompressionAttention(APIBase):
             self.h_kv = h_kv
             self.h_r = h_q // h_kv
             self.head_dim = d_qk
-        elif self.sample_q.ndim == 3:
+        elif self.q_desc.ndim == 3:
             self.input_layout = "T,H,D"
 
-            t, h_q, d_qk = self.sample_q.shape
-            t_kv, h_kv, d_qk = self.sample_k.shape  # T has been compressed for K and V
-            t_kv, h_kv, d_v = self.sample_v.shape
-            t, h_q, d_v = self.sample_o.shape
+            t, h_q, d_qk = self.q_desc.shape
+            t_kv, h_kv, d_qk = self.k_desc.shape  # T has been compressed for K and V
+            t_kv, h_kv, d_v = self.v_desc.shape
+            t, h_q, d_v = self.o_desc.shape
 
-            if self.sample_q.shape != (t, h_q, d_qk):
-                raise ValueError(f"Input shape mismatch: expected Q tensor shape {t, h_q, d_qk}, got {self.sample_q.shape}")
-            if self.sample_k.shape != (t_kv, h_kv, d_qk):
-                raise ValueError(f"Input shape mismatch: expected K tensor shape {t_kv, h_kv, d_qk}, got {self.sample_k.shape}")
-            if self.sample_v.shape != (t_kv, h_kv, d_v):
-                raise ValueError(f"Input shape mismatch: expected V tensor shape {t_kv, h_kv, d_v}, got {self.sample_v.shape}")
-            if self.sample_o.shape != (t, h_q, d_v):
-                raise ValueError(f"Output shape mismatch: expected O tensor shape {t, h_q, d_v}, got {self.sample_o.shape}")
+            self._check_tensor_shape(self.q_desc, (t, h_q, d_qk), name="Q")
+            self._check_tensor_shape(self.k_desc, (t_kv, h_kv, d_qk), name="K")
+            self._check_tensor_shape(self.v_desc, (t_kv, h_kv, d_v), name="V")
+            self._check_tensor_shape(self.o_desc, (t, h_q, d_v), name="O")
             if self.enable_lse:
-                self.sample_lse = self._unpad_tensor_to_ndim(self.sample_lse, 2, "sample_lse")
-                if self.sample_lse.shape != (t, h_q):
-                    raise ValueError(f"Output shape mismatch: expected LSE tensor shape {t, h_q}, got {self.sample_lse.shape}")
+                self.lse_desc = self._unpad_tensor_to_ndim(self.lse_desc, 2, name="LSE")
+                self._check_tensor_shape(self.lse_desc, (t, h_q), name="LSE")
 
-            if self.sample_cum_seqlen_q is None or self.sample_cum_seqlen_k is None:
+            if self.cum_seqlen_q_desc is None or self.cum_seqlen_k_desc is None:
+                raise ValueError(f"cum_seqlen_q and cum_seqlen_k must be provided for T,H,D layout, got {self.cum_seqlen_q_desc} and {self.cum_seqlen_k_desc}")
+
+            if self.cum_seqlen_q_desc.ndim != 1 or self.cum_seqlen_k_desc.ndim != 1:
+                raise ValueError(f"cum_seqlen_q and cum_seqlen_k must be 1D tensors, got {self.cum_seqlen_q_desc.ndim} and {self.cum_seqlen_k_desc.ndim}")
+            self._check_dtype(self.cum_seqlen_q_desc, [torch.int32, torch.int64], name="cum_seqlen_q")
+            self._check_dtype(self.cum_seqlen_k_desc, [torch.int32, torch.int64], name="cum_seqlen_k")
+            if self.cum_seqlen_q_desc.shape[0] != self.cum_seqlen_k_desc.shape[0]:
                 raise ValueError(
-                    f"sample_cum_seqlen_q and sample_cum_seqlen_k must be provided for T,H,D layout, got {self.sample_cum_seqlen_q} and {self.sample_cum_seqlen_k}"
-                )
-            self.sample_cum_seqlen_q = self._unpad_tensor_to_ndim(self.sample_cum_seqlen_q, 1, "sample_cum_seqlen_q")
-            self.sample_cum_seqlen_k = self._unpad_tensor_to_ndim(self.sample_cum_seqlen_k, 1, "sample_cum_seqlen_k")
-            if self.sample_cum_seqlen_q.ndim != 1 or self.sample_cum_seqlen_k.ndim != 1:
-                raise ValueError(
-                    f"sample_cum_seqlen_q and sample_cum_seqlen_k must be 1D tensors, got {self.sample_cum_seqlen_q.ndim}D and {self.sample_cum_seqlen_k.ndim}D"
-                )
-            if self.sample_cum_seqlen_q.dtype not in {
-                torch.int32,
-                torch.int64,
-            } or self.sample_cum_seqlen_k.dtype not in {torch.int32, torch.int64}:
-                raise ValueError(
-                    f"sample_cum_seqlen_q and sample_cum_seqlen_k must be int32 or int64, got {self.sample_cum_seqlen_q.dtype} and {self.sample_cum_seqlen_k.dtype}"
-                )
-            if len(self.sample_cum_seqlen_q) != len(self.sample_cum_seqlen_k):
-                raise ValueError(
-                    f"sample_cum_seqlen_q and sample_cum_seqlen_k must have the same length, got {len(self.sample_cum_seqlen_q)} and {len(self.sample_cum_seqlen_k)}"
+                    f"cum_seqlen_q and cum_seqlen_k must have the same length, got {self.cum_seqlen_q_desc.shape[0]} and {self.cum_seqlen_k_desc.shape[0]}"
                 )
 
-            self.batch_size = len(self.sample_cum_seqlen_q) - 1
+            self.batch_size = self.cum_seqlen_q_desc.shape[0] - 1
             self.s_q = None
             self.s_kv = None
             self.h_q = h_q
@@ -170,7 +154,7 @@ class CompressionAttention(APIBase):
             self.head_dim = d_qk
 
         else:
-            raise ValueError(f"Invalid input layout: sample_q must be rank-3 (T,H,D) or rank-4 (B,H,S,D), got {self.sample_q.ndim}")
+            raise ValueError(f"Invalid input layout: q must be rank-3 (T,H,D) or rank-4 (B,H,S,D), got {self.q_desc.ndim}")
         if d_qk != d_v:
             raise ValueError("D_qk must match D_v")
         if d_qk not in {32, 64, 128}:
@@ -179,18 +163,12 @@ class CompressionAttention(APIBase):
             raise ValueError("H_q must be divisible by H_k (GQA/MQA constraint)")
 
         self._logger.debug("Checking dtypes")
-        in_dtype = self.sample_q.dtype
-        out_dtype = self.sample_o.dtype
-        if self.sample_k.dtype != in_dtype or self.sample_v.dtype != in_dtype:
-            raise ValueError(f"Inputs must have the same dtype, got K {self.sample_k.dtype}, V {self.sample_v.dtype} for Q {in_dtype}")
-        if in_dtype not in {torch.float16, torch.bfloat16, torch.float8_e4m3fn}:
-            raise ValueError(f"Inputs must be Float16, BFloat16, or Float8E4M3FN, got {in_dtype}")
-        if out_dtype not in {torch.float16, torch.bfloat16, torch.float8_e4m3fn}:
-            raise ValueError(f"Outputs must be Float16, BFloat16, or Float8E4M3FN, got {out_dtype}")
-        if self.qk_acc_dtype_torch not in {torch.float32}:
-            raise ValueError(f"qk_acc_dtype must be Float32, got {self.qk_acc_dtype_torch}")
-        if self.pv_acc_dtype_torch not in {torch.float32}:
-            raise ValueError(f"pv_acc_dtype must be Float32, got {self.pv_acc_dtype_torch}")
+        in_dtype = self._check_dtype(self.q_desc, dtype=[torch.float16, torch.bfloat16, torch.float8_e4m3fn], name="Q")
+        self._check_dtype(self.k_desc, dtype=in_dtype, name="K", extra_error_msg="K must have the same dtype as Q")
+        self._check_dtype(self.v_desc, dtype=in_dtype, name="V", extra_error_msg="V must have the same dtype as Q")
+        self._check_dtype(self.o_desc, dtype=[torch.float16, torch.bfloat16, torch.float8_e4m3fn], name="O")
+        self._check_dtype(self.qk_acc_dtype_torch, dtype=torch.float32, name="qk_acc_dtype", extra_error_msg="qk_acc_dtype must be Float32")
+        self._check_dtype(self.pv_acc_dtype_torch, dtype=torch.float32, name="pv_acc_dtype", extra_error_msg="pv_acc_dtype must be Float32")
 
         # Scale defaults
         if self.scale_softmax is None:
@@ -213,10 +191,12 @@ class CompressionAttention(APIBase):
         self._logger.debug("check_support completed successfully")
         return True
 
-    def compile(self, current_stream: Optional[cuda.CUstream] = None) -> None:
+    def compile(self) -> None:
         self._logger.debug("Entering compile")
-        current_stream = self._get_default_stream(current_stream)
         self._ensure_support_checked()
+        if self._compiled_kernel is not None:
+            self._logger.debug("Kernel already compiled; skipping recompilation")
+            return
 
         fmha_kernel = self._kernel(
             _convert_to_cutlass_data_type(self.qk_acc_dtype_torch),
@@ -232,8 +212,8 @@ class CompressionAttention(APIBase):
         scale_softmax_log2 = scale_softmax * log2_e
         scale_output = self.scale_v * self.inv_scale_o
 
-        s_q = self.s_q if self.input_layout == "B,H,S,D" else max(self.sample_cum_seqlen_q).item()
-        s_kv = self.s_kv if self.input_layout == "B,H,S,D" else max(self.sample_cum_seqlen_k).item()
+        s_q = self.s_q if self.input_layout == "B,H,S,D" else self.max_cum_seqlen_q
+        s_kv = self.s_kv if self.input_layout == "B,H,S,D" else self.max_cum_seqlen_k
         self.problem_size = (
             self.batch_size,
             s_q,
@@ -243,30 +223,97 @@ class CompressionAttention(APIBase):
             self.h_kv,
             self.head_dim,
         )
+        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         self._logger.debug("Compiling CompressionAttention kernel with cute.compile")
-        self._compiled_kernel = cute.compile(
+        if self.input_layout == "B,H,S,D":
+            _q_desc = self.q_desc.transpose(1, 2)
+            _k_desc = self.k_desc.transpose(1, 2)
+            _v_desc = self.v_desc.transpose(1, 2)
+            _o_desc = self.o_desc.transpose(1, 2)
+            _lse_desc = self.lse_desc.transpose(1, 2) if self.enable_lse else None
+        elif self.input_layout == "T,H,D":
+            _q_desc = self.q_desc.as_strided(size=(1, *self.q_desc.shape), stride=(self.q_desc.stride[0], *self.q_desc.stride))
+            _k_desc = self.k_desc.as_strided(size=(1, *self.k_desc.shape), stride=(self.k_desc.stride[0], *self.k_desc.stride))
+            _v_desc = self.v_desc.as_strided(size=(1, *self.v_desc.shape), stride=(self.v_desc.stride[0], *self.v_desc.stride))
+            _o_desc = self.o_desc.as_strided(size=(1, *self.o_desc.shape), stride=(self.o_desc.stride[0], *self.o_desc.stride))
+            # lse_local = self.sample_lse.as_strided(size=(1, *self.sample_lse.shape), stride=(self.sample_lse.stride()[0], *self.sample_lse.stride()))
+            _lse_desc = self.lse_desc.unsqueeze(0) if self.enable_lse else None
+        else:
+            raise NotImplementedError(f"Invalid input layout: {self.input_layout}")
+
+        # breakpoint()
+        _compiled_kernel = cute.compile(
             fmha_kernel,
-            q_iter=from_dlpack(self.sample_q, assumed_align=16).iterator,
-            q_stride=(self.sample_q.transpose(1, 2).stride() if self.input_layout == "B,H,S,D" else (self.sample_q.stride()[0], *self.sample_q.stride())),
-            k_iter=from_dlpack(self.sample_k, assumed_align=16).iterator,
-            k_stride=(self.sample_k.transpose(1, 2).stride() if self.input_layout == "B,H,S,D" else (self.sample_k.stride()[0], *self.sample_k.stride())),
-            v_iter=from_dlpack(self.sample_v, assumed_align=16).iterator,
-            v_stride=(self.sample_v.transpose(1, 2).stride() if self.input_layout == "B,H,S,D" else (self.sample_v.stride()[0], *self.sample_v.stride())),
-            o_iter=from_dlpack(self.sample_o, assumed_align=16).iterator,
-            o_stride=(self.sample_o.transpose(1, 2).stride() if self.input_layout == "B,H,S,D" else (self.sample_o.stride()[0], *self.sample_o.stride())),
+            Q=self._make_fake_cute_tensor_from_desc(_q_desc, assumed_align=16),
+            K=self._make_fake_cute_tensor_from_desc(_k_desc, assumed_align=16),
+            V=self._make_fake_cute_tensor_from_desc(_v_desc, assumed_align=16),
+            O=self._make_fake_cute_tensor_from_desc(_o_desc, assumed_align=16),
             problem_size=self.problem_size,
-            cum_seqlen_q=(from_dlpack(self.sample_cum_seqlen_q, assumed_align=16) if self.input_layout == "T,H,D" else None),
-            cum_seqlen_k=(from_dlpack(self.sample_cum_seqlen_k, assumed_align=16) if self.input_layout == "T,H,D" else None),
-            lse_iter=(from_dlpack(self.sample_lse, assumed_align=16).iterator if self.enable_lse else None),
-            lse_stride=(self.sample_lse.transpose(1, 2).stride() if self.input_layout == "B,H,S,D" else (0, *self.sample_lse.stride())),
+            cum_seqlen_q=(self._make_fake_cute_tensor_from_desc(self.cum_seqlen_q_desc, assumed_align=16) if self.input_layout == "T,H,D" else None),
+            cum_seqlen_k=(self._make_fake_cute_tensor_from_desc(self.cum_seqlen_k_desc, assumed_align=16) if self.input_layout == "T,H,D" else None),
+            LSE=(self._make_fake_cute_tensor_from_desc(_lse_desc, assumed_align=16) if self.enable_lse else None),
             scale_softmax_log2=scale_softmax_log2,
             scale_softmax=scale_softmax,
             scale_output=scale_output,
             window_size_left=None,
             window_size_right=Int32(0),
-            stream=current_stream,
+            stream=fake_stream,
+            options="--enable-tvm-ffi",
         )
+
+        def tensor_api(
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            problem_size,
+            cum_seqlen_q,
+            cum_seqlen_k,
+            lse_tensor,
+            scale_softmax_log2,
+            scale_softmax,
+            scale_output,
+            window_size_left,
+            window_size_right,
+            stream,
+        ):
+            if self.enable_lse:
+                lse_tensor = self._unpad_tensor_to_ndim(lse_tensor, self.o_desc.ndim - 1, "lse_tensor")
+            if self.input_layout == "B,H,S,D":
+                q_tensor = q_tensor.transpose(1, 2)
+                k_tensor = k_tensor.transpose(1, 2)
+                v_tensor = v_tensor.transpose(1, 2)
+                o_tensor = o_tensor.transpose(1, 2)
+                lse_tensor = lse_tensor.transpose(1, 2) if self.enable_lse else None
+            elif self.input_layout == "T,H,D":
+                q_tensor = q_tensor.as_strided(size=(1, *q_tensor.shape), stride=(q_tensor.stride()[0], *q_tensor.stride()))
+                k_tensor = k_tensor.as_strided(size=(1, *k_tensor.shape), stride=(k_tensor.stride()[0], *k_tensor.stride()))
+                v_tensor = v_tensor.as_strided(size=(1, *v_tensor.shape), stride=(v_tensor.stride()[0], *v_tensor.stride()))
+                o_tensor = o_tensor.as_strided(size=(1, *o_tensor.shape), stride=(o_tensor.stride()[0], *o_tensor.stride()))
+                lse_tensor = lse_tensor.unsqueeze(0) if self.enable_lse else None
+                cum_seqlen_q = self._unpad_tensor_to_ndim(cum_seqlen_q, 1, "cum_seqlen_q")
+                cum_seqlen_k = self._unpad_tensor_to_ndim(cum_seqlen_k, 1, "cum_seqlen_k")
+
+            return _compiled_kernel(
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                problem_size,
+                cum_seqlen_q,
+                cum_seqlen_k,
+                lse_tensor,
+                scale_softmax_log2,
+                scale_softmax,
+                scale_output,
+                window_size_left,
+                window_size_right,
+                stream,
+            )
+
+        self._compiled_kernel = tensor_api
+
         self._logger.debug("Kernel compiled successfully")
 
     def execute(
@@ -279,7 +326,6 @@ class CompressionAttention(APIBase):
         cum_seqlen_q_tensor: Optional[torch.Tensor] = None,
         cum_seqlen_k_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
-        skip_compile: bool = False,
         scale_q: Optional[float] = None,
         scale_k: Optional[float] = None,
         scale_v: Optional[float] = None,
@@ -292,14 +338,10 @@ class CompressionAttention(APIBase):
         if self.enable_lse:
             if lse_tensor is None:
                 raise ValueError("kernel was compiled with lse_tensor provided, but lse_tensor was not provided during execute")
-            lse_tensor = self._unpad_tensor_to_ndim(lse_tensor, o_tensor.ndim - 1, "lse_tensor")
+
         if self.input_layout == "T,H,D":
             if cum_seqlen_q_tensor is None or cum_seqlen_k_tensor is None:
-                raise ValueError(
-                    f"cum_seqlen_q_tensor and cum_seqlen_k_tensor must be provided for T,H,D layout, got {cum_seqlen_q_tensor} and {cum_seqlen_k_tensor}"
-                )
-            cum_seqlen_q_tensor = self._unpad_tensor_to_ndim(cum_seqlen_q_tensor, 1, "cum_seqlen_q_tensor")
-            cum_seqlen_k_tensor = self._unpad_tensor_to_ndim(cum_seqlen_k_tensor, 1, "cum_seqlen_k_tensor")
+                raise ValueError("cum_seqlen_q_tensor and cum_seqlen_k_tensor must be provided during execute for T,H,D layout")
 
         # Scale values
         scale_q = self.scale_q if scale_q is None else scale_q
@@ -312,82 +354,26 @@ class CompressionAttention(APIBase):
         scale_softmax_log2_val = scale_softmax_val * log2_e
         scale_output_val = scale_v * inv_scale_o
 
-        if not skip_compile:
-            if self._compiled_kernel is None:
-                raise ValueError("CompressionAttention kernel not compiled")
-            self._logger.debug("Executing with compiled kernel")
-            self._compiled_kernel(
-                q_iter=from_dlpack(
-                    (q_tensor.transpose(1, 2) if self.input_layout == "B,H,S,D" else q_tensor),
-                    assumed_align=16,
-                ).iterator,
-                k_iter=from_dlpack(
-                    (k_tensor.transpose(1, 2) if self.input_layout == "B,H,S,D" else k_tensor),
-                    assumed_align=16,
-                ).iterator,
-                v_iter=from_dlpack(
-                    (v_tensor.transpose(1, 2) if self.input_layout == "B,H,S,D" else v_tensor),
-                    assumed_align=16,
-                ).iterator,
-                o_iter=from_dlpack(
-                    (o_tensor.transpose(1, 2) if self.input_layout == "B,H,S,D" else o_tensor),
-                    assumed_align=16,
-                ).iterator,
-                problem_size=self.problem_size,
-                cum_seqlen_q=(from_dlpack(cum_seqlen_q_tensor, assumed_align=16).iterator if self.input_layout == "T,H,D" else None),
-                cum_seqlen_k=(from_dlpack(cum_seqlen_k_tensor, assumed_align=16).iterator if self.input_layout == "T,H,D" else None),
-                lse_iter=(from_dlpack(lse_tensor, assumed_align=16).iterator if self.enable_lse else None),
-                scale_softmax_log2=scale_softmax_log2_val,
-                scale_softmax=scale_softmax_val,
-                scale_output=scale_output_val,
-                window_size_left=None,
-                window_size_right=Int32(0),
-                stream=current_stream,
-            )
-            self._logger.debug("Executed with compiled kernel successfully")
-        else:
-            self._logger.debug("Executing without compiled kernel (JIT)")
-            fmha_kernel = self._kernel(
-                _convert_to_cutlass_data_type(self.qk_acc_dtype_torch),
-                _convert_to_cutlass_data_type(self.pv_acc_dtype_torch),
-                (*self.mma_tiler_mn, self.head_dim),
-                self.is_persistent,
-                mask_type=fmha_utils.MaskType.COMPRESSED_CAUSAL_MASK,
-            )
-            fmha_kernel(
-                q_iter=from_dlpack(
-                    (q_tensor.transpose(1, 2) if self.input_layout == "B,H,S,D" else q_tensor),
-                    assumed_align=16,
-                ).iterator,
-                q_stride=(q_tensor.transpose(1, 2).stride() if self.input_layout == "B,H,S,D" else (q_tensor.stride()[0], *q_tensor.stride())),
-                k_iter=from_dlpack(
-                    (k_tensor.transpose(1, 2) if self.input_layout == "B,H,S,D" else k_tensor),
-                    assumed_align=16,
-                ).iterator,
-                k_stride=(k_tensor.transpose(1, 2).stride() if self.input_layout == "B,H,S,D" else (k_tensor.stride()[0], *k_tensor.stride())),
-                v_iter=from_dlpack(
-                    (v_tensor.transpose(1, 2) if self.input_layout == "B,H,S,D" else v_tensor),
-                    assumed_align=16,
-                ).iterator,
-                v_stride=(v_tensor.transpose(1, 2).stride() if self.input_layout == "B,H,S,D" else (v_tensor.stride()[0], *v_tensor.stride())),
-                o_iter=from_dlpack(
-                    (o_tensor.transpose(1, 2) if self.input_layout == "B,H,S,D" else o_tensor),
-                    assumed_align=16,
-                ).iterator,
-                o_stride=(o_tensor.transpose(1, 2).stride() if self.input_layout == "B,H,S,D" else (o_tensor.stride()[0], *o_tensor.stride())),
-                problem_size=self.problem_size,
-                cum_seqlen_q=(from_dlpack(cum_seqlen_q_tensor, assumed_align=16) if self.input_layout == "T,H,D" else None),
-                cum_seqlen_k=(from_dlpack(cum_seqlen_k_tensor, assumed_align=16) if self.input_layout == "T,H,D" else None),
-                lse_iter=(from_dlpack(lse_tensor, assumed_align=16).iterator if self.enable_lse else None),
-                lse_stride=(lse_tensor.transpose(1, 2).stride() if self.input_layout == "B,H,S,D" else (0, *lse_tensor.stride())),
-                scale_softmax_log2=scale_softmax_log2_val,
-                scale_softmax=scale_softmax_val,
-                scale_output=scale_output_val,
-                window_size_left=None,
-                window_size_right=Int32(0),
-                stream=current_stream,
-            )
-            self._logger.debug("Executed successfully")
+        if self._compiled_kernel is None:
+            raise ValueError("CompressionAttention kernel not compiled")
+        self._logger.debug("Executing with compiled kernel")
+        self._compiled_kernel(
+            q_tensor=q_tensor,
+            k_tensor=k_tensor,
+            v_tensor=v_tensor,
+            o_tensor=o_tensor,
+            problem_size=self.problem_size,
+            cum_seqlen_q=(cum_seqlen_q_tensor if self.input_layout == "T,H,D" else None),
+            cum_seqlen_k=(cum_seqlen_k_tensor if self.input_layout == "T,H,D" else None),
+            lse_tensor=lse_tensor,
+            scale_softmax_log2=scale_softmax_log2_val,
+            scale_softmax=scale_softmax_val,
+            scale_output=scale_output_val,
+            window_size_left=None,
+            window_size_right=Int32(0),
+            stream=current_stream,
+        )
+        self._logger.debug("Executed with compiled kernel successfully")
 
 
 import logging
@@ -414,12 +400,12 @@ def compression_attention_wrapper(
     inv_scale_o: float = 1.0,
     scale_softmax: Optional[float] = None,
     stream: Optional[cuda.CUstream] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> TupleDict:
     """
-    Compression Attention Wrapper that returns output (and optionally LSE) tensors directly.
+    Compression Attention Wrapper that returns output (and optionally LSE) tensors.
 
     Returns:
-        tuple: (o_tensor, lse_tensor | None)
+        TupleDict: (o_tensor, lse_tensor | None)
     """
     _logger.debug("compression_attention_wrapper: Creating empty output tensor o and optional lse")
 
@@ -517,4 +503,7 @@ def compression_attention_wrapper(
         )
         _cache_of_CompressionAttentionObjects[cache_key] = comp_attn
 
-    return o_tensor, lse_tensor
+    return TupleDict(
+        o_tensor=o_tensor,
+        lse_tensor=lse_tensor,
+    )

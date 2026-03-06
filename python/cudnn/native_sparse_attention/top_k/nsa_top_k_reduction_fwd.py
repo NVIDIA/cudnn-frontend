@@ -26,22 +26,15 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import argparse
 from typing import Tuple, Type, Optional
-import math
 
 import cuda.bindings.driver as cuda
-import torch
-from torch.profiler import profile, ProfilerActivity
-import time
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass
 import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Float32, Int64
 
 from cutlass._mlir.dialects import cute_nvgpu
@@ -476,7 +469,7 @@ class FineGrainedReductionQK:
             # LOAD Q K WARP
             if warp_idx == self.load_warp_id:
                 # TODO: reconfig regs
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
 
                 load_mma_Q_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_Q_stage)
                 load_mma_K_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_K_stage)
@@ -563,7 +556,7 @@ class FineGrainedReductionQK:
             # MMA WARP
             if warp_idx == self.mma_warp_id:
                 # TODO: reconfig regs
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
 
                 num_tmem_cols = 512
                 cute.arch.alloc_tmem(num_tmem_cols, storage.tmem_holding_buf)
@@ -620,7 +613,7 @@ class FineGrainedReductionQK:
 
             # COMPUTE WARP
             if warp_idx in self.compute_warp_id:
-                cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
+                cute.arch.setmaxregister_increase(self.num_regs_compute)
 
                 mma_compute_S_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_compute_S_stage)
                 load_compute_LSE_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_compute_LSE_stage)

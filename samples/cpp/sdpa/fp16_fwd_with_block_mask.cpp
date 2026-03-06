@@ -175,9 +175,8 @@ TEST_CASE("Toy sdpa forward with block mask", "[graph][sdpa][flash][block_mask][
         return;
     }
 
-    if (!is_blackwell_arch()) {
-        SKIP("Block mask in unified SDPA node requires Blackwell");
-        return;
+    if (get_compute_capability() < 100 || get_compute_capability() >= 110) {
+        SKIP("SDPA block mask requires Blackwell and up");
     }
 
     // Create a unique_ptr for the cuDNN handle

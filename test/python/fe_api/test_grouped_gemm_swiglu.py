@@ -176,7 +176,6 @@ def _test_grouped_gemm_swiglu_compile_execute(
         from cudnn import GroupedGemmSwigluSm100
         from cuda.bindings import driver as cuda
     except ImportError as e:
-        raise e
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
     cfg = grouped_gemm_swiglu_init(
@@ -205,7 +204,6 @@ def _test_grouped_gemm_swiglu_compile_execute(
         sf_dtype=cfg["sf_dtype"],
         sf_vec_size=cfg["sf_vec_size"],
         m_aligned=cfg["m_aligned"],
-        cta_tile_m=cfg["mma_tiler_mn"][0],
     )
 
     outputs = allocate_grouped_gemm_output_tensors(
@@ -227,8 +225,7 @@ def _test_grouped_gemm_swiglu_compile_execute(
         sample_d=outputs["d_tensor"],
         sample_sfa=inputs["sfa_tensor"],
         sample_sfb=inputs["sfb_tensor"],
-        sample_tile_idx_to_expert_idx=inputs["tile_idx_to_expert_idx"],
-        sample_num_non_exiting_tiles=inputs["num_non_exiting_tiles"],
+        sample_padded_offsets=inputs["padded_offsets_tensor"],
         sample_alpha=inputs["alpha_tensor"],
         sample_amax=outputs.get("amax_tensor"),
         sample_d_col=outputs["d_col_tensor"],
@@ -236,7 +233,6 @@ def _test_grouped_gemm_swiglu_compile_execute(
         sample_sfd_col=outputs.get("sfd_col_tensor"),
         sample_norm_const=inputs.get("norm_const_tensor"),
         sample_prob=inputs.get("prob_tensor"),
-        sample_m_split_cumsum=inputs.get("num_m_split_cumsum_tensor"),
         acc_dtype=cfg["acc_dtype"],
         mma_tiler_mn=cfg["mma_tiler_mn"],
         cluster_shape_mn=cfg["cluster_shape_mn"],
@@ -251,7 +247,7 @@ def _test_grouped_gemm_swiglu_compile_execute(
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
 
-    api.compile(current_stream=stream)
+    api.compile()
     api.execute(
         a_tensor=inputs["a_tensor"],
         b_tensor=inputs["b_tensor"],
@@ -259,8 +255,7 @@ def _test_grouped_gemm_swiglu_compile_execute(
         d_tensor=outputs["d_tensor"],
         sfa_tensor=inputs["sfa_tensor"],
         sfb_tensor=inputs["sfb_tensor"],
-        tile_idx_to_expert_idx=inputs["tile_idx_to_expert_idx"],
-        num_non_exiting_tiles=inputs["num_non_exiting_tiles"],
+        padded_offsets=inputs["padded_offsets_tensor"],
         alpha_tensor=inputs["alpha_tensor"],
         d_col_tensor=outputs["d_col_tensor"],
         sfd_row_tensor=outputs.get("sfd_row_tensor"),
@@ -268,7 +263,6 @@ def _test_grouped_gemm_swiglu_compile_execute(
         norm_const_tensor=inputs.get("norm_const_tensor"),
         prob_tensor=inputs.get("prob_tensor"),
         amax_tensor=outputs.get("amax_tensor"),
-        m_split_cumsum=inputs.get("num_m_split_cumsum_tensor"),
         current_stream=stream,
     )
 
@@ -332,7 +326,6 @@ def _test_grouped_gemm_swiglu_wrapper(
         sf_dtype=cfg["sf_dtype"],
         sf_vec_size=cfg["sf_vec_size"],
         m_aligned=cfg["m_aligned"],
-        cta_tile_m=cfg["mma_tiler_mn"][0],
     )
 
     try:
@@ -342,12 +335,10 @@ def _test_grouped_gemm_swiglu_wrapper(
                 b_tensor=inputs["b_tensor"],
                 sfa_tensor=inputs["sfa_tensor"],
                 sfb_tensor=inputs["sfb_tensor"],
-                tile_idx_to_expert_idx=inputs["tile_idx_to_expert_idx"],
-                num_non_exiting_tiles=inputs["num_non_exiting_tiles"],
+                padded_offsets=inputs["padded_offsets_tensor"],
                 alpha_tensor=inputs["alpha_tensor"],
                 norm_const_tensor=inputs.get("norm_const_tensor"),
                 prob_tensor=inputs.get("prob_tensor"),
-                m_split_cumsum=inputs.get("num_m_split_cumsum_tensor"),
                 acc_dtype=cfg["acc_dtype"],
                 c_dtype=cfg["c_dtype"],
                 d_dtype=cfg["d_dtype"],

@@ -26,23 +26,19 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import argparse
 from typing import Type, Tuple, Union
 
 import cuda.bindings.driver as cuda
-import torch
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass._mlir.dialects import math, nvvm, llvm
 from cutlass.cutlass_dsl import T
-import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass.cute.runtime import from_dlpack
 
 """
 This example provides an experimental implementation of the SM100 batched dense blockscaled GEMM kernel, please note that the APIs and implementation details related to this kernel may change in future releases.
@@ -144,14 +140,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         - Float32
         - Float16/BFloat16
         - Float8E4M3FN/Float8E5M2
-        # {$nv-internal-release begin}
-        # Note: We don't have SFD generation support in this example for now, so Float4E2M1FN output is only for internal testing and will not be released.
-        - Float4E2M1FN
-        # {$nv-internal-release end}
 
     :note: Constraints:
         - MMA tiler M must be 128 or 256 (use_2cta_instrs)
-        # TODO: Add 64 and 192 support # {$nv-internal-release}
         - MMA tiler N must be 128/256
         - Cluster shape M must be multiple of 2 if Mma tiler M is 256
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
@@ -253,7 +244,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.mma_tiler[1],
         )
         # (CTA_Tile_Shape_M, Round_Up(MMA_Tile_Shape_N, 128), MMA_Inst_Shape_K)
-        # TODO: round up to 128, it is prepared for supporting N=64 or 192. # {$nv-internal-release}
         self.mma_inst_shape_mn_sfb = (
             self.mma_inst_shape_mn[0] // (2 if self.use_2cta_instrs else 1),
             cute.round_up(self.mma_inst_shape_mn[1], 128),
@@ -446,7 +436,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.mma_inst_shape_mn,
         )
 
-        # For 2CTA blockscaled kernels, SFB needs to be replicated across peer CTAs. # {$nv-internal-release}
+        # For 2CTA blockscaled kernels, SFB needs to be replicated across peer CTAs.
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
             self.a_major_mode,
@@ -807,7 +797,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cute.group_modes(tCgB, 0, 3),
         )
 
-        #  TMALDG_SFA partition_S/D
+        #  TMA load SFA partition_S/D
         sfa_cta_layout = a_cta_layout
         # ((atom_v, rest_v), STAGE)
         # ((atom_v, rest_v), RestM, RestK, RestL)
@@ -821,7 +811,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tAsSFA = cute.filter_zeros(tAsSFA)
         tAgSFA = cute.filter_zeros(tAgSFA)
 
-        # TMALDG_SFB partition_S/D
+        # TMA load SFB partition_S/D
         sfb_cta_layout = cute.make_layout(cute.slice_(cluster_layout_sfb_vmnk, (0, None, 0, 0)).shape)
         # ((atom_v, rest_v), STAGE)
         # ((atom_v, rest_v), RestN, RestK, RestL)
@@ -1286,8 +1276,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
+                        "async.shared",
+                        space="cta",
                     )
                     self.epilog_sync_barrier.arrive_and_wait()
 
@@ -1335,7 +1325,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     # Since we compute absolute values, all values are non-negative
                     _value_int = llvm.bitcast(T.i32(), block_amax.ir_value(), loc=None, ip=None)
                     _old_value_int = nvvm.atomicrmw(
-                        res=T.i32(),
                         op=nvvm.AtomicOpKind.MAX,
                         ptr=mAmax.iterator.llvm_ptr,
                         a=_value_int,
@@ -1695,64 +1684,3 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
         return tile_sched_params, grid
-
-
-class Sm100BlockScaledPersistentDenseGemmKernelNoDlpack:
-    """Wrapper around Sm100BlockScaledPersistentDenseGemmKernel that avoids DLPack.
-
-    This wrapper constructs cute.Tensors directly from cute.Pointer, shapes, and
-    explicit layout orders for operands A, B, SFA, SFB, C. The amax tensor is never fp8 or fp4 so is safe to use directly with dlpack.
-    """
-
-    def __init__(
-        self,
-        sf_vec_size: int,
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-    ):
-        self.kernel = Sm100BlockScaledPersistentDenseGemmKernel(
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-        )
-
-    @cute.jit
-    def __call__(
-        self,
-        a_ptr: cute.Pointer,
-        a_shape: cutlass.Constexpr[Tuple[int, int, int]],
-        a_order: cutlass.Constexpr[Tuple[int, int, int]],
-        b_ptr: cute.Pointer,
-        b_shape: cutlass.Constexpr[Tuple[int, int, int]],
-        b_order: cutlass.Constexpr[Tuple[int, int, int]],
-        sfa_ptr: cute.Pointer,
-        sfa_shape: cutlass.Constexpr[Tuple[int, ...]],
-        sfa_order: cutlass.Constexpr[Tuple[int, ...]],
-        sfb_ptr: cute.Pointer,
-        sfb_shape: cutlass.Constexpr[Tuple[int, ...]],
-        sfb_order: cutlass.Constexpr[Tuple[int, ...]],
-        c_ptr: cute.Pointer,
-        c_shape: cutlass.Constexpr[Tuple[int, int, int]],
-        c_order: cutlass.Constexpr[Tuple[int, int, int]],
-        amax_cute: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr[int],
-        stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
-    ):
-        a_cute = cute.make_tensor(a_ptr, layout=cute.make_ordered_layout(a_shape, order=a_order))
-        b_cute = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout(b_shape, order=b_order))
-        c_cute = cute.make_tensor(c_ptr, layout=cute.make_ordered_layout(c_shape, order=c_order))
-
-        sfa_cute = cute.make_tensor(sfa_ptr, layout=cute.make_ordered_layout(sfa_shape, order=sfa_order))
-        sfb_cute = cute.make_tensor(sfb_ptr, layout=cute.make_ordered_layout(sfb_shape, order=sfb_order))
-        self.kernel(
-            a_cute,
-            b_cute,
-            sfa_cute,
-            sfb_cute,
-            c_cute,
-            amax_cute,
-            max_active_clusters,
-            stream,
-            epilogue_op,
-        )

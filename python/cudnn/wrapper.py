@@ -166,8 +166,7 @@ def _tensor_like(cudnn_tensor: cudnn.tensor, tensor_type: str = "pyt") -> "torch
     dtype = cudnn.datatypes._cudnn_to_torch_data_type(cudnn_tensor.get_data_type())
     if dtype is None:
         raise TypeError(f"cuDNN uses an unsupported data type in PyTorch: {cudnn_tensor.get_data_type()}")
-    tensor = torch.empty(cudnn_tensor.get_dim(), device="cuda", dtype=dtype)
-    tensor = torch.as_strided(tensor, cudnn_tensor.get_dim(), cudnn_tensor.get_stride())
+    tensor = torch.empty_strided(cudnn_tensor.get_dim(), cudnn_tensor.get_stride(), device="cuda", dtype=dtype)
     return tensor
 
 
@@ -262,7 +261,7 @@ class Graph:
         if self.__graph is not None:
             raise RuntimeError("Graph already created")
         self.__graph = cudnn.pygraph(
-            # Pass handle only if self.__handle is not None
+            # Pass handle only if self.__handle is an existing handle
             **({"handle": self.__handle} if self.__handle not in ["auto", None] else {}),
             **self.__kwargs,
         )
@@ -313,6 +312,9 @@ class Graph:
         return self.__graph
 
     def __getattr__(self, name: str) -> Any:
+        """Intercept method calls to the graph object, usually during graph
+        construction, and handle them appropriately.
+        """
         attr = getattr(self.__graph, name)
         # calling tensor_like is unnecessary, just pass through
         pass_through = [

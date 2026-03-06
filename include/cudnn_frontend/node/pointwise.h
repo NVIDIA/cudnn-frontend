@@ -310,6 +310,19 @@ INode::pointwise(std::shared_ptr<Tensor_attributes> a,
     sub_nodes.emplace_back(std::make_unique<PointwiseNode>(std::move(attributes), context));
 }
 
+inline void
+INode::pointwise(std::shared_ptr<Tensor_attributes> a,
+                 std::shared_ptr<Tensor_attributes> b,
+                 std::shared_ptr<Tensor_attributes> c,
+                 Pointwise_attributes attributes,
+                 std::shared_ptr<Tensor_attributes> d) {
+    attributes.inputs[Pointwise_attributes::input_names::IN_0]    = a;
+    attributes.inputs[Pointwise_attributes::input_names::IN_1]    = b;
+    attributes.inputs[Pointwise_attributes::input_names::IN_2]    = c;
+    attributes.outputs[Pointwise_attributes::output_names::OUT_0] = d;
+    sub_nodes.emplace_back(std::make_unique<PointwiseNode>(std::move(attributes), context));
+}
+
 inline std::shared_ptr<Tensor_attributes>
 INode::pointwise(std::shared_ptr<Tensor_attributes> a, Pointwise_attributes attributes) {
     if (attributes.name.empty()) {

@@ -6,7 +6,14 @@ from .grouped_gemm_swiglu.api import (
     grouped_gemm_swiglu_wrapper_sm100,
 )
 
+from .grouped_gemm_dswiglu.api import (
+    GroupedGemmDswigluSm100,
+    grouped_gemm_dswiglu_wrapper_sm100,
+)
+
 __all__ = [
     "GroupedGemmSwigluSm100",
     "grouped_gemm_swiglu_wrapper_sm100",
+    "GroupedGemmDswigluSm100",
+    "grouped_gemm_dswiglu_wrapper_sm100",
 ]

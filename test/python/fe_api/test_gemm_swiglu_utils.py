@@ -211,9 +211,12 @@ def gemm_swiglu_init(
     vector_f32: Optional[bool] = None,
 ):
     """Initialize configuration for GEMM SwiGLU tests."""
-    major, _ = torch.cuda.get_device_capability()
-    if major < 10:
+    major, minor = torch.cuda.get_device_capability()
+    compute_capability = major * 10 + minor
+    if compute_capability < 100:
         pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
+    if compute_capability == 103:
+        pytest.skip("cuteDSL GemmSwiglu is not supported on SM103")
 
     mnkl_str = request.config.getoption("--gemm-swiglu-mnkl", default=None)
     mma_tiler_str = request.config.getoption("--gemm-swiglu-mma-tiler", default=None)

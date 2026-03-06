@@ -1,10 +1,10 @@
 from .NSA_select_attn_fwd_hmma import HopperSelectAttentionFwd
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.api_base import APIBase
+from cudnn.api_base import APIBase, TupleDict
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_stream
 from cuda.bindings import driver as cuda
 import torch
 from typing import Tuple, Optional
@@ -36,17 +36,19 @@ class SelectionAttention(APIBase):
         self._logger.warning("SelectionAttention is an experimental API")
         self._logger.debug("Entering __init__")
 
-        # Store sample tensors only; defer validation to check_support
-        self.sample_q = sample_q
-        self.sample_k = sample_k
-        self.sample_v = sample_v
-        self.sample_o = sample_o
-        self.sample_l = sample_l
-        self.sample_m = sample_m
-        self.sample_block_indices = sample_block_indices
-        self.sample_block_counts = sample_block_counts
-        self.sample_cum_seqlen_q = sample_cum_seqlen_q
-        self.sample_cum_seqlen_k = sample_cum_seqlen_k
+        self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
+        self.k_desc = self._make_tensor_desc(sample_k, name="sample_k")
+        self.v_desc = self._make_tensor_desc(sample_v, name="sample_v")
+        self.o_desc = self._make_tensor_desc(sample_o, name="sample_o")
+        self.l_desc = self._make_tensor_desc(sample_l, name="sample_l")
+        self.m_desc = self._make_tensor_desc(sample_m, name="sample_m")
+        self.block_indices_desc = self._make_tensor_desc(sample_block_indices, name="sample_block_indices")
+        self.block_counts_desc = self._make_tensor_desc(sample_block_counts, name="sample_block_counts")
+        self.cum_seqlen_q_desc = self._make_tensor_desc(sample_cum_seqlen_q, name="sample_cum_seqlen_q")
+        self.cum_seqlen_k_desc = self._make_tensor_desc(sample_cum_seqlen_k, name="sample_cum_seqlen_k")
+        if sample_cum_seqlen_q is not None and sample_cum_seqlen_k is not None:
+            if not torch.equal(sample_cum_seqlen_q, sample_cum_seqlen_k):
+                raise NotImplementedError("sample_cum_seqlen_k is not yet supported. Must be None or identical to sample_cum_seqlen_q")
         self.max_s_q = max_s_q
         self.max_s_k = max_s_k
 
@@ -66,7 +68,7 @@ class SelectionAttention(APIBase):
         self.scale_softmax = scale_softmax
 
         self._logger.debug(
-            f"__init__ completed with args: sample_q {sample_q.shape}, sample_k {sample_k.shape}, sample_v {sample_v.shape}, sample_o {sample_o.shape}, sample_l {sample_l.shape}, sample_m {sample_m.shape}, sample_block_indices {sample_block_indices.shape}, sample_block_counts {sample_block_counts.shape}, sample_cum_seqlen_q {sample_cum_seqlen_q.shape if sample_cum_seqlen_q is not None else 'None'}, sample_cum_seqlen_k {sample_cum_seqlen_k.shape if sample_cum_seqlen_k is not None else 'None'}, acc_dtype {acc_dtype}, max_s_q {max_s_q}, max_s_k {max_s_k}, block_size {block_size}, scale_softmax {scale_softmax}"
+            f"__init__ completed with args: sample_q {self.q_desc.shape}, sample_k {self.k_desc.shape}, sample_v {self.v_desc.shape}, sample_o {self.o_desc.shape}, sample_l {self.l_desc.shape}, sample_m {self.m_desc.shape}, sample_block_indices {self.block_indices_desc.shape}, sample_block_counts {self.block_counts_desc.shape}, sample_cum_seqlen_q {self.cum_seqlen_q_desc.shape if self.cum_seqlen_q_desc is not None else 'None'}, sample_cum_seqlen_k {self.cum_seqlen_k_desc.shape if self.cum_seqlen_k_desc is not None else 'None'}, acc_dtype {acc_dtype}, max_s_q {max_s_q}, max_s_k {max_s_k}, block_size {block_size}, scale_softmax {scale_softmax}"
         )
 
     def check_support(self) -> bool:
@@ -74,62 +76,49 @@ class SelectionAttention(APIBase):
 
         # Shape normalization and validation
         self._logger.debug("Checking shape normalization and validation")
-        if self.sample_q.ndim == 4:
+        if self.q_desc.ndim == 4:
             # B, H_q, S, D  format
             self.input_layout = "B,H,S,D"
 
             raise NotImplementedError("B, H_q, S, D format not implemented")
-        elif self.sample_q.ndim == 3:
+        elif self.q_desc.ndim == 3:
             # T, H_q, D  format
             self.input_layout = "T,H,D"
 
-            t, h_q, d_qk = self.sample_q.shape
-            t, h_kv, d_qk = self.sample_k.shape
-            t, h_kv, d_v = self.sample_v.shape
-            t, h_q, d_v = self.sample_o.shape
+            t, h_q, d_qk = self.q_desc.shape
+            t, h_kv, d_qk = self.k_desc.shape
+            t, h_kv, d_v = self.v_desc.shape
+            t, h_q, d_v = self.o_desc.shape
 
-            if self.sample_q.shape != (t, h_q, d_qk):
-                raise ValueError(f"Input shape mismatch: expected Q tensor shape {t, h_q, d_qk}, got {self.sample_q.shape}")
-            if self.sample_k.shape != (t, h_kv, d_qk):
-                raise ValueError(f"Input shape mismatch: expected K tensor shape {t, h_kv, d_qk}, got {self.sample_k.shape}")
-            if self.sample_v.shape != (t, h_kv, d_v):
-                raise ValueError(f"Input shape mismatch: expected V tensor shape {t, h_kv, d_v}, got {self.sample_v.shape}")
-            if self.sample_o.shape != (t, h_q, d_v):
-                raise ValueError(f"Output shape mismatch: expected O tensor shape {t, h_q, d_v}, got {self.sample_o.shape}")
-            self.sample_l = self._unpad_tensor_to_ndim(self.sample_l, 2, "sample_l")
-            if self.sample_l.shape != (t, h_q):
-                raise ValueError(f"Output shape mismatch: expected L tensor shape {t, h_q}, got {self.sample_l.shape}")
-            self.sample_m = self._unpad_tensor_to_ndim(self.sample_m, 2, "sample_m")
-            if self.sample_m.shape != (t, h_q):
-                raise ValueError(f"Output shape mismatch: expected M tensor shape {t, h_q}, got {self.sample_m.shape}")
-
-            if self.sample_cum_seqlen_q is None:
-                raise ValueError(f"sample_cum_seqlen_q must be provided for T,H,D format, got {self.sample_cum_seqlen_q}")
-            if self.sample_cum_seqlen_k is not None and not torch.equal(self.sample_cum_seqlen_q, self.sample_cum_seqlen_k):
-                raise NotImplementedError(
-                    f"SelectionAttention requires sample_cum_seqlen_q and sample_cum_seqlen_k to be identical, but got {self.sample_cum_seqlen_q} and {self.sample_cum_seqlen_k}"
-                )
+            self._check_tensor_shape(self.q_desc, (t, h_q, d_qk), name="Q")
+            self._check_tensor_shape(self.k_desc, (t, h_kv, d_qk), name="K")
+            self._check_tensor_shape(self.v_desc, (t, h_kv, d_v), name="V")
+            self._check_tensor_shape(self.o_desc, (t, h_q, d_v), name="O")
+            self.l_desc = self._unpad_tensor_to_ndim(self.l_desc, 2, "sample_l")
+            self._check_tensor_shape(self.l_desc, (t, h_q), name="L")
+            self.m_desc = self._unpad_tensor_to_ndim(self.m_desc, 2, "sample_m")
+            self._check_tensor_shape(self.m_desc, (t, h_q), name="M")
+            if self.cum_seqlen_q_desc is None:
+                raise ValueError(f"cum_seqlen_q must be provided for T,H,D format, got {self.cum_seqlen_q_desc}")
             if self.max_s_q is None:
                 raise ValueError(f"max_s_q must be provided for T,H,D format, got {self.max_s_q}")
             if self.max_s_k is not None and self.max_s_q != self.max_s_k:
                 raise NotImplementedError(f"SelectionAttention requires max_s_q and max_s_k to be identical, but got {self.max_s_q} and {self.max_s_k}")
 
-            self.batch_size = len(self.sample_cum_seqlen_q) - 1
+            self.batch_size = self.cum_seqlen_q_desc.shape[0] - 1
             if self.batch_size <= 0:
-                raise ValueError(f"batch_size (len(sample_cum_seqlen_q) - 1) must be greater than 0, got {self.batch_size}")
-            if self.sample_cum_seqlen_q.dtype not in (torch.int32, torch.int64):
-                raise ValueError(f"sample_cum_seqlen_q must be int32 or int64, got {self.sample_cum_seqlen_q.dtype}")
+                raise ValueError(f"batch_size (len(cum_seqlen_q) - 1) must be greater than 0, got {self.batch_size}")
+            if self.cum_seqlen_q_desc.dtype not in (torch.int32, torch.int64):
+                raise ValueError(f"cum_seqlen_q must be int32 or int64, got {self.cum_seqlen_q_desc.dtype}")
 
-            if self.sample_block_indices.shape[:2] != (t, h_kv) and self.sample_block_indices.ndim != 3:
-                raise ValueError(f"sample_block_indices shape mismatch: expected {(t, h_kv, 'K')}, got {tuple(self.sample_block_indices.shape)}")
-            if self.sample_block_counts.shape != (t, h_kv):
-                raise ValueError(f"sample_block_counts shape mismatch: expected {(t, h_kv)}, got {tuple(self.sample_block_counts.shape)}")
-            if self.sample_block_indices.dtype != torch.int32 or self.sample_block_counts.dtype != torch.int32:
-                raise ValueError(
-                    f"sample_block_indices and sample_block_counts must be int32, got {self.sample_block_indices.dtype} and {self.sample_block_counts.dtype}"
-                )
+            if self.block_indices_desc.shape[:2] != (t, h_kv) and self.block_indices_desc.ndim != 3:
+                raise ValueError(f"block_indices shape mismatch: expected {(t, h_kv, 'K')}, got {tuple(self.block_indices_desc.shape)}")
+            if self.block_counts_desc.shape != (t, h_kv):
+                raise ValueError(f"block_counts shape mismatch: expected {(t, h_kv)}, got {tuple(self.block_counts_desc.shape)}")
+            if self.block_indices_desc.dtype != torch.int32 or self.block_counts_desc.dtype != torch.int32:
+                raise ValueError(f"block_indices and block_counts must be int32, got {self.block_indices_desc.dtype} and {self.block_counts_desc.dtype}")
         else:
-            raise ValueError(f"sample_q must be rank-3 (T,H,D) or rank-4 (B,H,S,D), got {self.sample_q.ndim}")
+            raise ValueError(f"q must be rank-3 (T,H,D) or rank-4 (B,H,S,D), got {self.q_desc.ndim}")
 
         # Shared derived attributes
         if h_q % h_kv != 0:
@@ -142,13 +131,12 @@ class SelectionAttention(APIBase):
 
         # Validate dtypes and config
         self._logger.debug("Checking dtypes and config")
-        self.dtype = self.sample_q.dtype
-        if not (self.dtype == self.sample_k.dtype == self.sample_v.dtype == self.sample_o.dtype):
-            raise ValueError("All input/output tensors must have the same dtype")
-        if self.dtype not in {torch.float16, torch.bfloat16}:
-            raise ValueError("dtype must be Float16 or BFloat16")
-        if self.acc_dtype not in {torch.float32}:
-            raise ValueError("acc_dtype must be Float32")
+        self.dtype = self._check_dtype(self.q_desc, dtype=[torch.float16, torch.bfloat16], name="Q")
+        _ = self._check_dtype(self.k_desc, dtype=self.dtype, name="K", extra_error_msg="K must have the same dtype as Q")
+        _ = self._check_dtype(self.v_desc, dtype=self.dtype, name="V", extra_error_msg="V must have the same dtype as Q")
+        _ = self._check_dtype(self.o_desc, dtype=self.dtype, name="O", extra_error_msg="O must have the same dtype as Q")
+        _ = self._check_dtype(self.acc_dtype, dtype=torch.float32, name="Acc", extra_error_msg="acc_dtype must be Float32")
+
         if self.block_size not in {16, 32, 64}:
             raise ValueError("block_size must be 16, 32, or 64")
 
@@ -174,70 +162,12 @@ class SelectionAttention(APIBase):
         self._logger.debug("check_support completed successfully")
         return True
 
-    def _reshape_tensors(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        o: torch.Tensor,
-        l: torch.Tensor,
-        m: torch.Tensor,
-    ) -> Tuple[torch.Tensor, ...]:
-        """
-        Reshape tensors from input format to kernel expected format:
-        - Q: (gqa_group_size, d, T, h_kv)
-        - K: (T, d, h_kv)
-        - V: (T, d_v, h_kv)
-        - O: (gqa_group_size, d_v, T, h_kv)
-        - L: (gqa_group_size, T, h_kv)
-        - M: (gqa_group_size, T, h_kv)
-        """
-        if self.input_layout == "B,H,S,D":
-            raise NotImplementedError("B,H,S,D format not implemented")
-        elif self.input_layout == "T,H,D":
-            T, h_q, d = q.shape
-            _, h_kv, _ = k.shape
-            _, _, d_v = v.shape
-
-            # Reshape Q: (T, H_q, D) -> (gqa_group_size, D, T, H_kv)
-            q_reshaped = q.view(T, h_kv, self.gqa_group_size, d).permute(2, 3, 0, 1)
-            # Reshape K: (T, H_kv, D) -> (T, D, H_kv)
-            k_reshaped = k.permute(0, 2, 1)
-            # Reshape V: (T, H_kv, D_v) -> (T, D_v, H_kv)
-            v_reshaped = v.permute(0, 2, 1)
-            # Reshape O: (T, H_q, D_v) -> (gqa_group_size, D_v, T, H_kv)
-            o_reshaped = o.view(T, h_kv, self.gqa_group_size, d_v).permute(2, 3, 0, 1)
-            # Reshape L: (T, H_q) -> (gqa_group_size, T, H_kv)
-            l_reshaped = l.view(T, h_kv, self.gqa_group_size).permute(2, 0, 1)
-            # Reshape M: (T, H_q) -> (gqa_group_size, T, H_kv)
-            m_reshaped = m.view(T, h_kv, self.gqa_group_size).permute(2, 0, 1)
-        else:
-            raise ValueError(f"Invalid input layout: {self.input_layout}")
-
-        # Temporary: assert that no memory is copied during reshape
-        # Long term, we'd instead want to handle copying output tensors back to their original tensors
-        def shares_memory(original, reshaped):
-            return original.data_ptr() == reshaped.data_ptr()
-
-        if not shares_memory(q, q_reshaped):
-            raise ValueError("Q tensor memory changed during reshape - expected view operation")
-        if not shares_memory(k, k_reshaped):
-            raise ValueError("K tensor memory changed during reshape - expected view operation")
-        if not shares_memory(v, v_reshaped):
-            raise ValueError("V tensor memory changed during reshape - expected view operation")
-        if not shares_memory(o, o_reshaped):
-            raise ValueError("O tensor memory changed during reshape - expected view operation")
-        if not shares_memory(l, l_reshaped):
-            raise ValueError("L tensor memory changed during reshape - expected view operation")
-        if not shares_memory(m, m_reshaped):
-            raise ValueError("M tensor memory changed during reshape - expected view operation")
-
-        return q_reshaped, k_reshaped, v_reshaped, o_reshaped, l_reshaped, m_reshaped
-
-    def compile(self, current_stream: Optional[cuda.CUstream] = None) -> None:
+    def compile(self) -> None:
         self._logger.debug("Entering compile")
-        current_stream = self._get_default_stream(current_stream)
         self._ensure_support_checked()
+        if self._compiled_kernel is not None:
+            self._logger.debug("Kernel already compiled; skipping recompilation")
+            return
 
         selection_attention = self._kernel(
             head_dim=self.head_dim,
@@ -248,43 +178,74 @@ class SelectionAttention(APIBase):
             acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
         )
 
-        self._logger.debug("Reshaping tensors to kernel expected format")
-        q_reshaped, k_reshaped, v_reshaped, o_reshaped, l_reshaped, m_reshaped = self._reshape_tensors(
-            self.sample_q,
-            self.sample_k,
-            self.sample_v,
-            self.sample_o,
-            self.sample_l,
-            self.sample_m,
-        )
+        if self.input_layout == "T,H,D":
+            _q_desc = self.q_desc.unsqueeze(0)
+            _k_desc = self.k_desc.unsqueeze(0)
+            _v_desc = self.v_desc.unsqueeze(0)
+            _o_desc = self.o_desc.unsqueeze(0)
+            _l_desc = self.l_desc.unsqueeze(0)
+            _m_desc = self.m_desc.unsqueeze(0)
+        else:
+            raise NotImplementedError(f"Invalid input layout: {self.input_layout}")
 
-        mQ = from_dlpack(q_reshaped, assumed_align=128)
-        mK = from_dlpack(k_reshaped, assumed_align=128)
-        mV = from_dlpack(v_reshaped, assumed_align=128)
-        mO = from_dlpack(o_reshaped, assumed_align=128)
-        mL = from_dlpack(l_reshaped)
-        mM = from_dlpack(m_reshaped)
-        m_block_indices = from_dlpack(self.sample_block_indices)
-        m_block_counts = from_dlpack(self.sample_block_counts)
-        m_cum_seqlen_q = from_dlpack(self.sample_cum_seqlen_q)
-        # m_cum_seqlen_k = from_dlpack(self.sample_cum_seqlen_k) # unused
+        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         self._logger.debug("Compiling selection_attention")
-        self._compiled_kernel = cute.compile(
+        _compiled_kernel = cute.compile(
             selection_attention,
-            Q=mQ,
-            K=mK,
-            V=mV,
-            O=mO,
-            L=mL,
-            M=mM,
-            block_indices=m_block_indices,
-            block_counts=m_block_counts,
+            Q=self._make_fake_cute_tensor_from_desc(_q_desc, assumed_align=128),
+            K=self._make_fake_cute_tensor_from_desc(_k_desc, assumed_align=128),
+            V=self._make_fake_cute_tensor_from_desc(_v_desc, assumed_align=128),
+            O=self._make_fake_cute_tensor_from_desc(_o_desc, assumed_align=128),
+            L=self._make_fake_cute_tensor_from_desc(_l_desc),
+            M=self._make_fake_cute_tensor_from_desc(_m_desc),
+            block_indices=self._make_fake_cute_tensor_from_desc(self.block_indices_desc),
+            block_counts=self._make_fake_cute_tensor_from_desc(self.block_counts_desc),
             max_length=self.max_s_q,
-            seq_offsets=m_cum_seqlen_q,
+            seq_offsets=self._make_fake_cute_tensor_from_desc(self.cum_seqlen_q_desc),
             softmax_scale=self.scale_softmax,
-            stream=current_stream,
+            stream=fake_stream,
+            options="--enable-tvm-ffi",
         )
+
+        def tensor_api(
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            l_tensor,
+            m_tensor,
+            block_indices_tensor,
+            block_counts_tensor,
+            cum_seqlen_q_tensor,
+            softmax_scale,
+            stream,
+        ):
+            # assumed T,H,D format
+            q_tensor = q_tensor.unsqueeze(0)
+            k_tensor = k_tensor.unsqueeze(0)
+            v_tensor = v_tensor.unsqueeze(0)
+            o_tensor = o_tensor.unsqueeze(0)
+            l_tensor = self._unpad_tensor_to_ndim(l_tensor, 2, "l_tensor").unsqueeze(0)
+            m_tensor = self._unpad_tensor_to_ndim(m_tensor, 2, "m_tensor").unsqueeze(0)
+
+            return _compiled_kernel(
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                l_tensor,
+                m_tensor,
+                block_indices_tensor,
+                block_counts_tensor,
+                self.max_s_q,
+                cum_seqlen_q_tensor,
+                softmax_scale,
+                stream,
+            )
+
+        self._compiled_kernel = tensor_api
+
         self._logger.debug("Kernel compiled successfully")
 
     def execute(
@@ -301,75 +262,29 @@ class SelectionAttention(APIBase):
         cum_seqlen_k_tensor: Optional[torch.Tensor] = None,
         scale_softmax: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
-        skip_compile: bool = False,
     ):
         self._logger.debug("Entering execute")
         current_stream = self._get_default_stream(current_stream)
 
-        self._logger.debug("Reshaping tensors to kernel expected format")
-        l_tensor = self._unpad_tensor_to_ndim(l_tensor, 2, "l_tensor")
-        m_tensor = self._unpad_tensor_to_ndim(m_tensor, 2, "m_tensor")
-        q_reshaped, k_reshaped, v_reshaped, o_reshaped, l_reshaped, m_reshaped = self._reshape_tensors(
-            q_tensor, k_tensor, v_tensor, o_tensor, l_tensor, m_tensor
-        )
-
-        mQ = from_dlpack(q_reshaped, assumed_align=128)
-        mK = from_dlpack(k_reshaped, assumed_align=128)
-        mV = from_dlpack(v_reshaped, assumed_align=128)
-        mO = from_dlpack(o_reshaped, assumed_align=128)
-        mL = from_dlpack(l_reshaped)
-        mM = from_dlpack(m_reshaped)
-        m_block_indices = from_dlpack(block_indices_tensor)
-        m_block_counts = from_dlpack(block_counts_tensor)
-        m_cum_seqlen_q = from_dlpack(cum_seqlen_q_tensor)
-        # m_cum_seqlen_k = from_dlpack(cum_seqlen_k_tensor) # unused
-
         scale_softmax = self.scale_softmax if scale_softmax is None else scale_softmax
 
-        if not skip_compile:
-            if self._compiled_kernel is None:
-                raise RuntimeError("SelectionAttention kernel not compiled")
-            self._logger.debug("Executing with compiled kernel")
-            self._compiled_kernel(
-                Q=mQ,
-                K=mK,
-                V=mV,
-                O=mO,
-                L=mL,
-                M=mM,
-                block_indices=m_block_indices,
-                block_counts=m_block_counts,
-                max_length=self.max_s_q,
-                seq_offsets=m_cum_seqlen_q,
-                softmax_scale=scale_softmax,
-                stream=current_stream,
-            )
-            self._logger.debug("Executed with compiled kernel successfully")
-        else:
-            self._logger.debug("Executing without compiled kernel (JIT)")
-            selection_attention = self._kernel(
-                head_dim=self.head_dim,
-                value_dim=self.value_dim,
-                GQA_group_size=self.gqa_group_size,
-                block_size=self.block_size,
-                dtype=_convert_to_cutlass_data_type(self.dtype),
-                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-            )
-            selection_attention(
-                Q=mQ,
-                K=mK,
-                V=mV,
-                O=mO,
-                L=mL,
-                M=mM,
-                block_indices=m_block_indices,
-                block_counts=m_block_counts,
-                max_length=self.max_s_q,
-                seq_offsets=m_cum_seqlen_q,
-                softmax_scale=scale_softmax,
-                stream=current_stream,
-            )
-            self._logger.debug("Executed successfully")
+        if self._compiled_kernel is None:
+            raise RuntimeError("SelectionAttention kernel not compiled")
+        self._logger.debug("Executing with compiled kernel")
+        self._compiled_kernel(
+            q_tensor=q_tensor,
+            k_tensor=k_tensor,
+            v_tensor=v_tensor,
+            o_tensor=o_tensor,
+            l_tensor=l_tensor,
+            m_tensor=m_tensor,
+            block_indices_tensor=block_indices_tensor,
+            block_counts_tensor=block_counts_tensor,
+            cum_seqlen_q_tensor=cum_seqlen_q_tensor,
+            softmax_scale=scale_softmax,
+            stream=current_stream,
+        )
+        self._logger.debug("Executed with compiled kernel successfully")
 
 
 import logging
@@ -393,12 +308,12 @@ def selection_attention_wrapper(
     max_s_q: Optional[int] = None,
     max_s_k: Optional[int] = None,
     stream: Optional[cuda.CUstream] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> TupleDict:
     """
-    Selection Attention Wrapper that returns output tensors directly.
+    Selection Attention Wrapper that returns output tensors.
 
     Returns:
-        tuple: (o_tensor, l_tensor, m_tensor) - Output, logsumexp, and max tensors
+        TupleDict: (o_tensor, l_tensor, m_tensor) - Output, logsumexp, and max tensors
     """
     _logger.debug("selection_attention_wrapper: Creating empty output tensors o, l, and m")
 
@@ -491,4 +406,8 @@ def selection_attention_wrapper(
         )
         _cache_of_SelectionAttentionObjects[cache_key] = selection_attention
 
-    return o_tensor, l_tensor, m_tensor
+    return TupleDict(
+        o_tensor=o_tensor,
+        l_tensor=l_tensor,
+        m_tensor=m_tensor,
+    )

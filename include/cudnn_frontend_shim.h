@@ -85,7 +85,7 @@ load_cudart_so() {
     dlerror();
 
     // List of potential libcudart libraries (Adding major version to support python package)
-    constexpr const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
+    constexpr const char *libs[] = {"libcudart.so.13"};
     constexpr size_t num_libs    = sizeof(libs) / sizeof(libs[0]);
 
     HMODULE lib_handle = nullptr;

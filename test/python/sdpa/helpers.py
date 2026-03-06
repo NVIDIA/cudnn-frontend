@@ -4,6 +4,168 @@ import math
 
 # fmt: off
 
+def fill_sparse_small_int(tensor, rng, sparsity=0.8, abs_max=2):
+    """
+    Fill tensor with sparse small integers for better low-precision testing.
+
+    Using sparse integers instead of uniform/normal distributions:
+    - Reduces averaging effect in large multiply-add operations
+    - Uses exactly representable values in FP8/FP16/BF16
+    - Makes numerical errors easier to diagnose
+
+    Args:
+        tensor: Tensor to fill (modified in-place)
+        rng: torch.Generator for deterministic pseudo-random generation
+        sparsity: Fraction of zeros (0.8 = 80% zeros). Range [0, 1).
+        abs_max: Maximum absolute value. Fills with integers in [-abs_max, abs_max].
+
+    Returns:
+        The filled tensor (same object, modified in-place)
+    """
+    assert 0 <= sparsity < 1, f"sparsity must be in [0, 1), got {sparsity}"
+    assert abs_max >= 1, f"abs_max must be >= 1, got {abs_max}"
+
+    # Fill with random integers from [-abs_max, abs_max] inclusive
+    # random_ is [low, high) so we use abs_max + 1
+    tensor.random_(-abs_max, abs_max + 1, generator=rng)
+
+    # Zero out sparsity fraction
+    if sparsity > 0:
+        mask = torch.empty(tensor.shape, device=tensor.device, dtype=torch.float32)
+        mask.uniform_(generator=rng)
+        tensor[mask < sparsity] = 0
+
+    return tensor
+
+def create_sparse_int_tensor(shape, dtype, rng, *, device='cuda', sparsity=0.8, abs_max=2, memory_format=None):
+    """
+    Create a tensor filled with sparse small integers.
+
+    Args:
+        shape: Tensor shape (tuple or list)
+        dtype: PyTorch dtype
+        rng: torch.Generator for deterministic pseudo-random generation
+        device: Device to create tensor on (default 'cuda')
+        sparsity: Fraction of zeros (0.8 = 80% zeros). Range [0, 1).
+        abs_max: Maximum absolute value. Fills with integers in [-abs_max, abs_max].
+        memory_format: Optional memory format (e.g., torch.channels_last)
+
+    Returns:
+        Tensor filled with sparse small integers
+    """
+    tensor = torch.empty(shape, device=device, dtype=dtype)
+    if memory_format is not None:
+        tensor = tensor.to(memory_format=memory_format)
+    fill_sparse_small_int(tensor, rng, sparsity=sparsity, abs_max=abs_max)
+    return tensor
+
+def print_tensor_stats(tensor, tag=None):
+    """Print hash and statistics of a tensor's contents.
+
+    Prints hash (for determinism verification) and element statistics
+    (zeros, NaNs, +Inf, -Inf counts).
+
+    Args:
+        tensor: PyTorch tensor (can be on GPU or CPU)
+        tag: Optional name/tag for the tensor (used in print output)
+
+    Returns:
+        Hash value as uint64
+    """
+    if tensor is None:
+        return None
+
+    t = tensor.contiguous()
+    numel = t.numel()
+
+    # Compute hash using torch.hash_tensor (fast GPU operation)
+    # FP8 types not supported by hash_tensor, view as int8
+    if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        hash_value = torch.hash_tensor(t.view(torch.int8))
+    else:
+        hash_value = torch.hash_tensor(t)
+
+    # Compute statistics (all GPU operations)
+    num_zeros = numel - torch.count_nonzero(t).item()
+    if torch.is_floating_point(t):
+        num_nans = torch.isnan(t).sum().item()
+        num_pos_inf = torch.eq(t, float('inf')).sum().item()
+        num_neg_inf = torch.eq(t, float('-inf')).sum().item()
+    else:
+        num_nans = num_pos_inf = num_neg_inf = 0
+
+    if tag is not None:
+        def fmt(count):
+            pct = 100 * count / numel if numel > 0 else 0
+            return f"{count:,} ({pct:.0f}%)" if count > 0 else "0"
+        num_infs = num_pos_inf + num_neg_inf
+        stats = f"elems={numel:,}, zeros={fmt(num_zeros)}, NaNs={fmt(num_nans)}, Infs={fmt(num_infs)}"
+        print(f"%%%% {tag}: hash=0x{hash_value.item() >> 32:08X}, {stats}")
+
+    return hash_value.item()
+
+def compare_tensors(actual: torch.Tensor, expected: torch.Tensor,
+                    rtol: float = 1e-2, atol: float = 1e-2,
+                    num_diffs: int = 10):
+    """Compare two tensors and return detailed comparison results.
+
+    Args:
+        actual: The tensor to check (e.g., cuDNN output)
+        expected: The reference tensor (e.g., PyTorch reference)
+        rtol: Relative tolerance
+        atol: Absolute tolerance
+        num_diffs: Number of mismatches to show in detail
+
+    Returns:
+        Tuple of (passed: bool, num_mismatches: int, message: str)
+        - passed: True if all elements are within tolerance
+        - num_mismatches: Number of elements that failed tolerance check
+        - message: Detailed comparison info including max_diff, mean_diff, etc.
+    """
+    if expected.shape != actual.shape:
+        return False, -1, f"Shape mismatch: actual={actual.shape}, expected={expected.shape}"
+
+    # Convert to float32 for comparison
+    actual_f = actual.to(torch.float32).contiguous()
+    expected_f = expected.to(torch.float32).contiguous()
+
+    # Compute differences
+    diff = torch.abs(actual_f - expected_f)
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+
+    # Relative difference (avoid division by zero)
+    denom = torch.maximum(torch.abs(expected_f), torch.tensor(1e-6, device=actual.device))
+    rel_diff = diff / denom
+    max_rel_diff = rel_diff.max().item()
+
+    # Find mismatches using combined tolerance: |actual - expected| > atol + rtol * |expected|
+    tol = atol + rtol * torch.abs(expected_f)
+    mismatch_mask = diff > tol
+    mismatch_indices = torch.nonzero(mismatch_mask)
+    num_mismatches = mismatch_indices.shape[0]
+
+    passed = num_mismatches == 0
+    stats = f"max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}, max_rel_diff={max_rel_diff:.2e}"
+
+    if passed:
+        return True, 0, stats
+    else:
+        total_elements = actual.numel()
+        pct = 100.0 * num_mismatches / total_elements
+        msg = f"MISMATCH: {num_mismatches:,} of {total_elements:,} elements ({pct:.2f}%) differ\n"
+        msg += f"  {stats}\n"
+
+        for i in range(min(num_diffs, num_mismatches)):
+            idx = tuple(mismatch_indices[i].tolist())
+            act_val = actual_f[idx].item()
+            exp_val = expected_f[idx].item()
+            d = diff[idx].item()
+            t = tol[idx].item()
+            msg += f"  [{idx}]: actual={act_val:+.6e}, expected={exp_val:+.6e}, diff={d:.2e}, tol={t:.2e}\n"
+
+        return False, num_mismatches, msg
+
 def get_fp8_largest_po2(dtype: torch.dtype):
     if dtype == torch.float8_e4m3fn:
         return 128.0
@@ -43,7 +205,25 @@ def convert_to_cudnn_type(torch_type):
     else:
         assert False, "unsupported tensor data type"
 
-def alloc_tensor(shape, data_type, *, elems=None, strides=None, rng=None, mean=0.0, std=1.0, margins=512):
+def alloc_tensor(shape, data_type, *, elems=None, strides=None, rng=None, mean=0.1, std=0.1, margins=512, sparse_int=True, sparsity=0.8, abs_max=2):
+    """
+    Allocate a tensor with optional random initialization.
+
+    Args:
+        shape: Tensor shape
+        data_type: PyTorch dtype
+        elems: Number of elements (computed from shape/strides if not provided)
+        strides: Custom strides (contiguous if not provided)
+        rng: torch.Generator for random initialization. If None, tensor is not initialized.
+        mean, std: Parameters for normal distribution (only used if sparse_int=False)
+        margins: Safety margins for detecting buffer overruns
+        sparse_int: If True, use sparse small integers. If False, use normal distribution.
+        sparsity: Fraction of zeros when using sparse_int (default 0.8 = 80% zeros)
+        abs_max: Maximum absolute value when using sparse_int (default 2, gives [-2, 2])
+
+    Returns:
+        (tensor, sepbuf, rawbuf) tuple for boundary checking
+    """
     if strides is None:
         # Compute default contiguous strides
         if hasattr(shape, '__iter__'):
@@ -74,7 +254,10 @@ def alloc_tensor(shape, data_type, *, elems=None, strides=None, rng=None, mean=0
     sepbuf = (torch.as_strided(rawbuf, (2, margins), (elems+margins, 1), storage_offset=0) if margins > 0 else None)
 
     if rng is not None:
-        tensor.normal_(mean=mean, std=std, generator=rng)
+        if sparse_int:
+            fill_sparse_small_int(tensor, rng, sparsity=sparsity, abs_max=abs_max)
+        else:
+            tensor.normal_(mean=mean, std=std, generator=rng)
 
     if math.prod(shape) == elems:
         rawbuf = None

@@ -46,9 +46,9 @@ from cutlass.cutlass_dsl import (
     const_expr,
 )
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import scf, llvm, nvvm
+from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cutlass_dsl import T
-from cutlass.cute.typing import Float32, Int32 as CuteInt32
+from cutlass.cute.typing import Float32, Int32
 import cutlass.cute as cute
 import cutlass
 
@@ -89,36 +89,24 @@ def fmin(
     )
 
 
-def warp_redux_sync(
+def warp_redux_sync_fmax(
     value,
-    kind=None,
-    mask_and_clamp: int = 0xFFFFFFFF,
-    abs: bool = False,
-    nan: bool = None,
+    mask_and_clamp=0xFFFFFFFF,
     *,
     loc=None,
     ip=None,
 ):
-    """Perform a warp-level reduction synchronization for max with abs and NaN.
-
-    :param value: Value to reduce
-    :param kind: Reduction kind (unused, kept for API compatibility)
-    :param mask_and_clamp: Warp mask and clamp value
-    :param abs: Whether to use absolute value
-    :param nan: Whether to handle NaN values
-    :return: Reduced value across warp
-    """
     value_type = type(value)
     value_ir = value.ir_value(loc=loc, ip=ip)
     mask_ir = Int32(mask_and_clamp).ir_value(loc=loc, ip=ip)
-    ptx_instr = "redux.sync.max.abs.NaN.f32 $0, $1, $2;"
+    ptx_instr = f"redux.sync.max.abs.NaN.f32 $0, $1, $2;"
 
     return value_type(
         llvm.inline_asm(
             T.f32(),
             [value_ir, mask_ir],
-            ptx_instr,
-            "=f,f,i",
+            f"{ptx_instr}",
+            f"=f,f,i",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -145,7 +133,6 @@ def atomic_max_float32(
     value_int = llvm.bitcast(T.i32(), value.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
 
     old_value_int = nvvm.atomicrmw(
-        res=T.i32(),
         op=cutlass._mlir.dialects.nvvm.AtomicOpKind.MAX,
         ptr=ptr,
         a=value_int,
@@ -170,7 +157,6 @@ def atomic_add_float32(
     :return: The old value at the memory location
     """
     old_value = nvvm.atomicrmw(
-        res=T.f32(),
         op=cutlass._mlir.dialects.nvvm.AtomicOpKind.FADD,
         ptr=ptr,
         a=value.ir_value(loc=loc, ip=ip),
@@ -199,6 +185,133 @@ def silu_f32(a: Union[float, Float32], fastmath: bool = False) -> Union[float, F
     :return: SiLU of input
     """
     return a * sigmoid_f32(a, fastmath=fastmath)
+
+
+@cute.jit
+def search_expert_idx_full(
+    padded_offsets_in_lanes: cute.Tensor,
+    tile_m_start: cutlass.Int32,
+    num_offsets_per_thread: cutlass.Constexpr,
+) -> cutlass.Int32:
+    """
+    Full search algorithm for finding expert_idx. O(E/32) complexity.
+
+    Searches from the beginning of padded_offsets to find the first expert
+    whose end offset is greater than tile_m_start.
+
+    :param padded_offsets_in_lanes: Register tensor holding this thread's portion of padded_offsets.
+        Layout: padded_offsets_in_lanes[i] corresponds to padded_offsets[lane_id + i * 32]
+    :type padded_offsets_in_lanes: cute.Tensor
+    :param tile_m_start: Starting M position of the current tile
+    :type tile_m_start: cutlass.Int32
+    :param num_offsets_per_thread: Number of offsets each thread holds (ceil(expert_cnt/32))
+    :type num_offsets_per_thread: cutlass.Constexpr
+
+    :return: The expert index for this tile
+    :rtype: cutlass.Int32
+    """
+    expert_idx = cutlass.Int32(-1)
+    round_idx = cutlass.Int32(0)
+    not_found = cutlass.Boolean(True)
+
+    while not_found and round_idx < num_offsets_per_thread:
+        # Each thread compares its offset with tile_m_start
+        is_greater = padded_offsets_in_lanes[round_idx] > tile_m_start
+
+        # Collect comparison results from all threads
+        mask = cute.arch.vote_ballot_sync(is_greater)
+
+        # Check if any thread found offset > tile_m_start
+        any_found = cute.arch.vote_any_sync(is_greater)
+        if any_found:
+            # ffs using popc: find position of least significant 1
+            lowbit = mask & (-mask)
+            first_lane = cute.arch.popc(lowbit - cutlass.Int32(1))
+            expert_idx = round_idx * 32 + first_lane
+            not_found = cutlass.Boolean(False)  # Terminate loop
+
+        round_idx = round_idx + 1
+
+    return expert_idx
+
+
+@cute.jit
+def search_expert_idx_incremental(
+    padded_offsets_in_lanes: cute.Tensor,
+    tile_m_start: cutlass.Int32,
+    num_offsets_per_thread: cutlass.Constexpr,
+    prev_expert_idx: cutlass.Int32,
+    prev_expert_end: cutlass.Int32,
+) -> Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
+    """
+    Incremental search algorithm for finding expert_idx. O(1) average complexity.
+
+    Exploits the monotonicity property: when using N-major rasterization,
+    M coordinates are monotonically non-decreasing, so expert_idx >= prev_expert_idx.
+
+    Fast path: If tile_m_start < prev_expert_end, we're still in the same expert.
+    Slow path: Search forward from prev_expert_idx + 1.
+
+    :param padded_offsets_in_lanes: Register tensor holding this thread's portion of padded_offsets.
+    :type padded_offsets_in_lanes: cute.Tensor
+    :param tile_m_start: Starting M position of the current tile
+    :type tile_m_start: cutlass.Int32
+    :param num_offsets_per_thread: Number of offsets each thread holds
+    :type num_offsets_per_thread: cutlass.Constexpr
+    :param prev_expert_idx: Expert index from the previous tile (-1 for first tile)
+    :type prev_expert_idx: cutlass.Int32
+    :param prev_expert_end: End offset of the previous expert (0 for first tile)
+    :type prev_expert_end: cutlass.Int32
+
+    :return: Tuple of (expert_idx, new_prev_expert_idx, new_prev_expert_end)
+    :rtype: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]
+    """
+    expert_idx = cutlass.Int32(-1)
+    new_prev_expert_idx = prev_expert_idx
+    new_prev_expert_end = prev_expert_end
+
+    # Fast path: check if still in the same expert
+    if tile_m_start < prev_expert_end:
+        expert_idx = prev_expert_idx
+    else:
+        # Slow path: search forward from prev_expert_idx + 1
+        start_idx = prev_expert_idx + 1
+        start_round = start_idx // 32
+        start_lane_offset = start_idx % 32
+
+        round_idx = start_round
+        not_found = cutlass.Boolean(True)
+
+        while not_found and round_idx < num_offsets_per_thread:
+            is_greater = padded_offsets_in_lanes[round_idx] > tile_m_start
+            mask = cute.arch.vote_ballot_sync(is_greater)
+
+            # For the first round, clear bits before start_lane_offset
+            if round_idx == start_round:
+                clear_mask = (cutlass.Int32(1) << start_lane_offset) - 1
+                mask = mask & (~clear_mask)
+
+            if mask != 0:
+                lowbit = mask & (-mask)
+                first_lane = cute.arch.popc(lowbit - cutlass.Int32(1))
+                expert_idx = round_idx * 32 + first_lane
+                not_found = cutlass.Boolean(False)
+
+            round_idx = round_idx + 1
+
+        # Update cached values for next iteration
+        new_prev_expert_idx = expert_idx
+        # Get new_prev_expert_end via shuffle from the lane holding expert_idx
+        expert_round = expert_idx // 32
+        expert_lane = expert_idx % 32
+        new_prev_expert_end = cute.arch.shuffle_sync(
+            padded_offsets_in_lanes[expert_round],
+            offset=expert_lane,
+            mask=0xFFFFFFFF,
+            mask_and_clamp=31,
+        )
+
+    return expert_idx, new_prev_expert_idx, new_prev_expert_end
 
 
 ##############################################################################
@@ -321,13 +434,13 @@ class PersistentTileSchedulerParams:
             if raster_along_m:
                 self.problem_layout_ncluster_mnl = cute.make_layout(
                     (
-                        problem_shape_ncluster_mnl[0],
-                        (swizzle_size, problem_shape_ncluster_mnl[1] // swizzle_size),
+                        (swizzle_size, problem_shape_ncluster_mnl[0] // swizzle_size),
+                        problem_shape_ncluster_mnl[1],
                         problem_shape_ncluster_mnl[2],
                     ),
                     stride=(
+                        (1, swizzle_size * problem_shape_ncluster_mnl[1]),
                         swizzle_size,
-                        (1, swizzle_size * problem_shape_ncluster_mnl[0]),
                         problem_shape_ncluster_mnl[0] * problem_shape_ncluster_mnl[1],
                     ),
                     loc=loc,
@@ -336,13 +449,13 @@ class PersistentTileSchedulerParams:
             else:
                 self.problem_layout_ncluster_mnl = cute.make_layout(
                     (
-                        (swizzle_size, problem_shape_ncluster_mnl[0] // swizzle_size),
-                        problem_shape_ncluster_mnl[1],
+                        problem_shape_ncluster_mnl[0],
+                        (swizzle_size, problem_shape_ncluster_mnl[1] // swizzle_size),
                         problem_shape_ncluster_mnl[2],
                     ),
                     stride=(
-                        (1, swizzle_size * problem_shape_ncluster_mnl[1]),
                         swizzle_size,
+                        (1, swizzle_size * problem_shape_ncluster_mnl[0]),
                         problem_shape_ncluster_mnl[0] * problem_shape_ncluster_mnl[1],
                     ),
                     loc=loc,
@@ -670,11 +783,18 @@ class StaticPersistentTileScheduler:
         # The layout structure is: problem_layout_ncluster_mnl has shape (cluster_count_m, cluster_count_n, batch_count)
         # work_unit_id needs to be decomposed into (batch_l, cluster_n, cluster_m) in little-endian order
 
-        # First, get cluster_m using cluster_shape_m_fdd
-        cluster_n_batch, cluster_m = divmod(work_unit_id, self.params.cluster_shape_m_fdd)
+        if self.params._raster_along_m:
+            # First, get cluster_m using cluster_shape_m_fdd
+            cluster_n_batch, cluster_m = divmod(work_unit_id, self.params.cluster_shape_m_fdd)
 
-        # Then decode cluster_n_batch to get cluster_n and batch_l using FastDivmod
-        batch_l, cluster_n = divmod(cluster_n_batch, self.params.cluster_shape_n_fdd)
+            # Then decode cluster_n_batch to get cluster_n and batch_l using FastDivmod
+            batch_l, cluster_n = divmod(cluster_n_batch, self.params.cluster_shape_n_fdd)
+        else:
+            # First, get cluster_n using cluster_shape_n_fdd
+            cluster_m_batch, cluster_n = divmod(work_unit_id, self.params.cluster_shape_n_fdd)
+
+            # Then decode cluster_m_batch to get cluster_m and batch_l using FastDivmod
+            batch_l, cluster_m = divmod(cluster_m_batch, self.params.cluster_shape_m_fdd)
 
         return (cluster_m, cluster_n, batch_l)
 

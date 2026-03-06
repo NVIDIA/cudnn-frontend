@@ -10,6 +10,8 @@
 
 #include "backend/execution_helpers.h"
 #include "backend/plan_helpers.h"
+#include "experimental/sm90_sdpa_prefill_engine.h"
+#include "experimental/sm100_sdpa_prefill_engine.h"
 
 namespace cudnn_frontend {
 
@@ -678,6 +680,13 @@ class Execution_plan_list {
 
     error_t
     is_plan_index_executable(int64_t const index) const {
+        // OSS engine path
+        if (index == OSS_ENGINE_CANDIDATE) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !oss_engine_built_, error_code_t::GRAPH_EXECUTION_FAILED, "OSS engine not built.");
+            return {error_code_t::OK, ""};
+        }
+
         RETURN_CUDNN_FRONTEND_ERROR_IF((index < 0) || (static_cast<int64_t>(execution_plans.size()) <= index),
                                        error_code_t::GRAPH_EXECUTION_FAILED,
                                        "Plan index " + std::to_string(index) + " is invalid.");
@@ -688,6 +697,243 @@ class Execution_plan_list {
 
         return {error_code_t::OK, ""};
     }
+
+    // ================================================================
+    // Open-source NVRTC engine support
+    // ================================================================
+
+    static constexpr int64_t OSS_ENGINE_CANDIDATE = -2;
+
+    // Context cached from the Graph for OSS engine execution
+    struct OssEngineContext {
+        int64_t batch = 0, heads_q = 0, heads_kv = 0, seq_q = 0, seq_kv = 0, d = 0;
+        int64_t q_uid = -1, k_uid = -1, v_uid = -1, o_uid = -1, max_uid = -1, sum_exp_uid = -1;
+        std::vector<int64_t> q_stride, k_stride, v_stride, o_stride;
+        std::vector<int64_t> max_stride, sum_exp_stride;
+        std::optional<float> attn_scale;
+    };
+
+    void
+    set_oss_engine(std::shared_ptr<experimental::IOssSdpaEngine> engine) {
+        oss_engine_ = std::move(engine);
+    }
+
+    void
+    set_oss_engine_context(OssEngineContext ctx) {
+        oss_ctx_ = std::move(ctx);
+    }
+
+    bool
+    has_oss_engine() const {
+        return oss_engine_ != nullptr;
+    }
+
+    bool
+    is_oss_candidate() const {
+        return candidate == OSS_ENGINE_CANDIDATE;
+    }
+
+    error_t
+    check_oss_engine_support(int64_t sm_version) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!oss_engine_, error_code_t::GRAPH_NOT_SUPPORTED, "No OSS engine registered");
+        cudnn_frontend::experimental::AttentionShape_t shape = {
+            static_cast<uint32_t>(oss_ctx_.batch),
+            static_cast<uint32_t>(oss_ctx_.heads_q),
+            static_cast<uint32_t>(oss_ctx_.heads_kv),
+            static_cast<uint32_t>(oss_ctx_.heads_kv),
+            static_cast<uint32_t>(oss_ctx_.seq_q),
+            static_cast<uint32_t>(oss_ctx_.seq_kv),
+            static_cast<uint32_t>(oss_ctx_.d),
+            static_cast<uint32_t>(oss_ctx_.d),
+        };
+        auto status = oss_engine_->check_support(shape, sm_version);
+        if (status.is_good()) {
+            oss_engine_supported_ = true;
+            candidate             = OSS_ENGINE_CANDIDATE;
+        }
+        return status;
+    }
+
+    error_t
+    build_oss_engine() {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !oss_engine_supported_, error_code_t::GRAPH_NOT_SUPPORTED, "OSS engine not supported");
+        auto status = oss_engine_->build();
+        if (status.is_good()) {
+            oss_engine_built_ = true;
+            candidate         = OSS_ENGINE_CANDIDATE;
+        }
+        return status;
+    }
+
+    error_t
+    execute_oss_engine(std::unordered_map<int64_t, void*> const& tensor_uid_to_pointer_map,
+                       void* workspace,
+                       CUdevice device,
+                       cudaStream_t stream) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !oss_engine_built_, error_code_t::GRAPH_EXECUTION_FAILED, "OSS engine not built");
+
+        auto get_ptr = [&](int64_t uid) -> void* {
+            auto it = tensor_uid_to_pointer_map.find(uid);
+            return (it != tensor_uid_to_pointer_map.end()) ? it->second : nullptr;
+        };
+
+        void* q_ptr       = get_ptr(oss_ctx_.q_uid);
+        void* k_ptr       = get_ptr(oss_ctx_.k_uid);
+        void* v_ptr       = get_ptr(oss_ctx_.v_uid);
+        void* o_ptr       = get_ptr(oss_ctx_.o_uid);
+        void* max_ptr     = get_ptr(oss_ctx_.max_uid);
+        void* sum_exp_ptr = get_ptr(oss_ctx_.sum_exp_uid);
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!q_ptr || !k_ptr || !v_ptr || !o_ptr,
+                                       error_code_t::INVALID_VARIANT_PACK,
+                                       "Missing Q/K/V/O pointers in variant pack for OSS engine");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!max_ptr || !sum_exp_ptr,
+                                       error_code_t::INVALID_VARIANT_PACK,
+                                       "Missing max/sum_exp pointers in variant pack for OSS engine");
+
+        return oss_engine_->execute(static_cast<int>(oss_ctx_.batch),
+                                    static_cast<int>(oss_ctx_.heads_q),
+                                    static_cast<int>(oss_ctx_.heads_kv),
+                                    static_cast<int>(oss_ctx_.seq_q),
+                                    static_cast<int>(oss_ctx_.seq_kv),
+                                    static_cast<int>(oss_ctx_.d),
+                                    q_ptr,
+                                    oss_ctx_.q_stride,
+                                    k_ptr,
+                                    oss_ctx_.k_stride,
+                                    v_ptr,
+                                    oss_ctx_.v_stride,
+                                    o_ptr,
+                                    oss_ctx_.o_stride,
+                                    max_ptr,
+                                    oss_ctx_.max_stride,
+                                    sum_exp_ptr,
+                                    oss_ctx_.sum_exp_stride,
+                                    workspace,
+                                    device,
+                                    stream,
+                                    oss_ctx_.attn_scale);
+    }
+
+    // Dynamic-shape overload: resolve overridden dims/strides from override vectors,
+    // then delegate to the engine's execute() with the resolved values.
+    error_t
+    execute_oss_engine(std::unordered_map<int64_t, void*> const& tensor_uid_to_pointer_map,
+                       void* workspace,
+                       CUdevice device,
+                       cudaStream_t stream,
+                       std::vector<int64_t> const& override_uids,
+                       std::vector<std::vector<int64_t>> const& override_shapes,
+                       std::vector<std::vector<int64_t>> const& override_strides) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !oss_engine_built_, error_code_t::GRAPH_EXECUTION_FAILED, "OSS engine not built");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            override_uids.size() != override_shapes.size() || override_uids.size() != override_strides.size(),
+            error_code_t::INVALID_VALUE,
+            "override_uids/shapes/strides must have the same size");
+
+        // Build uid → index lookup
+        std::unordered_map<int64_t, size_t> uid_to_idx;
+        for (size_t i = 0; i < override_uids.size(); ++i) {
+            uid_to_idx[override_uids[i]] = i;
+        }
+
+        // Helper: resolve shape/stride for a given tensor UID
+        auto resolve_shape = [&](int64_t uid,
+                                 std::vector<int64_t> const& default_shape) -> std::vector<int64_t> const& {
+            auto it = uid_to_idx.find(uid);
+            return (it != uid_to_idx.end()) ? override_shapes[it->second] : default_shape;
+        };
+        auto resolve_stride = [&](int64_t uid,
+                                  std::vector<int64_t> const& default_stride) -> std::vector<int64_t> const& {
+            auto it = uid_to_idx.find(uid);
+            return (it != uid_to_idx.end()) ? override_strides[it->second] : default_stride;
+        };
+
+        // Resolve Q shape → extract batch, heads_q, seq_q, d
+        std::vector<int64_t> q_default_shape = {oss_ctx_.batch, oss_ctx_.heads_q, oss_ctx_.seq_q, oss_ctx_.d};
+        auto const& q_shape                  = resolve_shape(oss_ctx_.q_uid, q_default_shape);
+        auto const& q_stride                 = resolve_stride(oss_ctx_.q_uid, oss_ctx_.q_stride);
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            q_shape.size() < 4, error_code_t::INVALID_VALUE, "Q override shape must have at least 4 elements");
+
+        int64_t batch   = q_shape[0];
+        int64_t heads_q = q_shape[1];
+        int64_t seq_q   = q_shape[2];
+        int64_t d       = q_shape[3];
+
+        // d must not change (kernel is compiled for a specific d)
+        RETURN_CUDNN_FRONTEND_ERROR_IF(d != oss_ctx_.d,
+                                       error_code_t::INVALID_VALUE,
+                                       "Cannot change d dimension dynamically (compiled kernel is d=" +
+                                           std::to_string(oss_ctx_.d) + ", override d=" + std::to_string(d) + ")");
+
+        // Resolve K shape → extract heads_kv, seq_kv
+        std::vector<int64_t> k_default_shape = {oss_ctx_.batch, oss_ctx_.heads_kv, oss_ctx_.seq_kv, oss_ctx_.d};
+        auto const& k_shape                  = resolve_shape(oss_ctx_.k_uid, k_default_shape);
+        auto const& k_stride                 = resolve_stride(oss_ctx_.k_uid, oss_ctx_.k_stride);
+
+        int64_t heads_kv = k_shape[1];
+        int64_t seq_kv   = k_shape[2];
+
+        // Resolve V, O, max, sum_exp strides
+        auto const& v_stride   = resolve_stride(oss_ctx_.v_uid, oss_ctx_.v_stride);
+        auto const& o_stride   = resolve_stride(oss_ctx_.o_uid, oss_ctx_.o_stride);
+        auto const& max_stride = resolve_stride(oss_ctx_.max_uid, oss_ctx_.max_stride);
+        auto const& se_stride  = resolve_stride(oss_ctx_.sum_exp_uid, oss_ctx_.sum_exp_stride);
+
+        // Look up device pointers
+        auto get_ptr = [&](int64_t uid) -> void* {
+            auto it = tensor_uid_to_pointer_map.find(uid);
+            return (it != tensor_uid_to_pointer_map.end()) ? it->second : nullptr;
+        };
+
+        void* q_ptr       = get_ptr(oss_ctx_.q_uid);
+        void* k_ptr       = get_ptr(oss_ctx_.k_uid);
+        void* v_ptr       = get_ptr(oss_ctx_.v_uid);
+        void* o_ptr       = get_ptr(oss_ctx_.o_uid);
+        void* max_ptr     = get_ptr(oss_ctx_.max_uid);
+        void* sum_exp_ptr = get_ptr(oss_ctx_.sum_exp_uid);
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!q_ptr || !k_ptr || !v_ptr || !o_ptr,
+                                       error_code_t::INVALID_VARIANT_PACK,
+                                       "Missing Q/K/V/O pointers in variant pack for OSS engine");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!max_ptr || !sum_exp_ptr,
+                                       error_code_t::INVALID_VARIANT_PACK,
+                                       "Missing max/sum_exp pointers in variant pack for OSS engine");
+
+        return oss_engine_->execute(static_cast<int>(batch),
+                                    static_cast<int>(heads_q),
+                                    static_cast<int>(heads_kv),
+                                    static_cast<int>(seq_q),
+                                    static_cast<int>(seq_kv),
+                                    static_cast<int>(d),
+                                    q_ptr,
+                                    q_stride,
+                                    k_ptr,
+                                    k_stride,
+                                    v_ptr,
+                                    v_stride,
+                                    o_ptr,
+                                    o_stride,
+                                    max_ptr,
+                                    max_stride,
+                                    sum_exp_ptr,
+                                    se_stride,
+                                    workspace,
+                                    device,
+                                    stream,
+                                    oss_ctx_.attn_scale);
+    }
+
+   private:
+    std::shared_ptr<experimental::IOssSdpaEngine> oss_engine_;
+    bool oss_engine_supported_ = false;
+    bool oss_engine_built_     = false;
+    OssEngineContext oss_ctx_;
 };
 
 }  // namespace graph

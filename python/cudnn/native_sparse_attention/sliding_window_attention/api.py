@@ -5,7 +5,7 @@ import torch
 
 from cuda.bindings import driver as cuda
 from cudnn.datatypes import _torch_to_cudnn_data_type
-from cudnn.api_base import APIBase
+from cudnn.api_base import APIBase, TupleDict
 from typing import Optional
 
 from ..utils import make_tensor_strided_like
@@ -360,10 +360,7 @@ class SlidingWindowAttention(APIBase):
         self._logger.debug("check_support completed successfully")
         return True
 
-    def compile(self, current_stream: Optional[cuda.CUstream] = None) -> None:
-        if current_stream is not None:
-            self._logger.warning("Overwriting cudnn_handle stream with provided cuda stream. Do not pass in current_stream if this is not intended.")
-            cudnn.set_stream(self._cudnn_handle, current_stream)
+    def compile(self) -> None:
         self._ensure_support_checked()
 
         self._cudnn_swa_graph.build_operation_graph()
@@ -509,7 +506,7 @@ def sliding_window_attention_wrapper(
     compute_data_type: torch.dtype = torch.float32,
     cudnn_handle: Optional[cudnn.handle] = None,
     stream: Optional[cuda.CUstream] = None,
-):
+) -> TupleDict:
     o_tensor, stats_tensor = None, None
     o_dtype = o_dtype if o_dtype is not None else q_tensor.dtype
     if q_tensor.ndim == 3:  # thd
@@ -607,7 +604,7 @@ def sliding_window_attention_wrapper(
         )
 
         assert sliding_window_attention_object.check_support()
-        sliding_window_attention_object.compile(current_stream=stream)
+        sliding_window_attention_object.compile()
         sliding_window_attention_object.execute(
             q_tensor=q_tensor,
             k_tensor=k_tensor,
@@ -625,4 +622,7 @@ def sliding_window_attention_wrapper(
         )
         _cache_of_SlidingWindowAttentionObjects[cache_key] = sliding_window_attention_object
 
-    return o_tensor, stats_tensor
+    return TupleDict(
+        o_tensor=o_tensor,
+        stats_tensor=stats_tensor,
+    )

@@ -1,0 +1,55 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,fwd_time_ms,bwd_time_ms,fwd_tflops,bwd_tflops,max_diff,num_iterations,sliding_window_size,success,error_message,gpu_name,cudnn_version,cudnn_backend_version
+dsv3,dsv3,cudnn,bfloat16,top_left,1,32768,32768,128,128,192,128,both,True,inf,inf,0.000,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 806, in <module>
+    workspace = torch.empty(
+                ^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 256.02 GiB. GPU 0 has a total capacity of 139.80 GiB of which 129.00 GiB is free. Including non-PyTorch memory, this process has 10.79 GiB memory in use. Of the allocated memory 10.27 GiB is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+stdout: ",,,
+dsv3,dsv3,cudnn,fp8,top_left,1,32768,32768,128,128,192,128,both,True,inf,inf,0.000,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 731, in <module>
+    graph_bwd.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim shoud be equal to 128 and hidden_dim should be multiple of 16
+
+stdout: ",,,
+dsv3,dsv3,cudnn,bfloat16,top_left,1,16384,16384,128,128,192,128,both,True,inf,inf,0.000,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1165, in <module>
+    workspace = torch.empty(
+                ^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.01 GiB. GPU 0 has a total capacity of 139.80 GiB of which 6.38 GiB is free. Including non-PyTorch memory, this process has 133.42 GiB memory in use. Of the allocated memory 69.52 GiB is allocated by PyTorch, and 63.27 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+stdout: ",,,
+dsv3,dsv3,cudnn,fp8,top_left,1,16384,16384,128,128,192,128,both,True,inf,inf,0.000,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 731, in <module>
+    graph_bwd.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim shoud be equal to 128 and hidden_dim should be multiple of 16
+
+stdout: ",,,
+dsv3,dsv3,cudnn,bfloat16,top_left,1,8192,8192,128,128,192,128,both,True,4.278,16.162,643.000,442.000,0.000,10,,True,,NVIDIA H200,1.19.0,91901.000
+dsv3,dsv3,cudnn,fp8,top_left,1,8192,8192,128,128,192,128,both,True,inf,inf,0.000,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 731, in <module>
+    graph_bwd.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim shoud be equal to 128 and hidden_dim should be multiple of 16
+
+stdout: ",,,
+dsv3,dsv3,cudnn,bfloat16,top_left,1,4096,4096,128,128,192,128,both,True,1.148,4.424,599.000,404.000,0.000,10,,True,,NVIDIA H200,1.19.0,91901.000
+dsv3,dsv3,cudnn,fp8,top_left,1,4096,4096,128,128,192,128,both,True,inf,inf,0.000,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 731, in <module>
+    graph_bwd.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim shoud be equal to 128 and hidden_dim should be multiple of 16
+
+stdout: ",,,
+dsv3,dsv3,cudnn,bfloat16,top_left,1,2048,2048,128,128,192,128,both,True,0.330,1.271,522.000,352.000,0.000,10,,True,,NVIDIA H200,1.19.0,91901.000
+dsv3,dsv3,cudnn,fp8,top_left,1,2048,2048,128,128,192,128,both,True,inf,inf,0.000,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/workspace/cudnn_frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 731, in <module>
+    graph_bwd.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim shoud be equal to 128 and hidden_dim should be multiple of 16
+
+stdout: ",,,

@@ -48,7 +48,8 @@ enum class [[nodiscard]] error_code_t {
     CUDNN_BACKEND_API_FAILED,
     INVALID_CUDA_DEVICE,
     HANDLE_ERROR,
-    INVALID_VALUE
+    INVALID_VALUE,
+    NVRTC_COMPILATION_FAILED
 };
 
 typedef struct [[nodiscard]] error_object {
@@ -175,6 +176,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(error_code_t,
                                  {error_code_t::UNSUPPORTED_GRAPH_FORMAT, "UNSUPPORTED_GRAPH_FORMAT"},
                                  {error_code_t::HANDLE_ERROR, "HANDLE_ERROR"},
                                  {error_code_t::INVALID_VALUE, "INVALID_VALUE"},
+                                 {error_code_t::NVRTC_COMPILATION_FAILED, "NVRTC_COMPILATION_FAILED"},
                              })
 
 static inline std::ostream&

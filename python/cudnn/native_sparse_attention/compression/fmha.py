@@ -26,15 +26,9 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import argparse
-import math
-import os
-import sys
-import time
-from typing import Type, Tuple, Union, Optional
 
-import torch
-import torch.nn.functional as F
+from typing import Type, Tuple, Optional
+
 import cuda.bindings.driver as cuda
 
 
@@ -43,10 +37,7 @@ import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
-import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
-import cutlass.cute.testing as testing
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64, Float32
 
 from cudnn.native_sparse_attention.compression import fmha_helpers as fmha_utils
@@ -231,19 +222,14 @@ class BlackwellFusedMultiHeadAttentionForward:
     @cute.jit
     def __call__(
         self,
-        q_iter: cute.Pointer,
-        q_stride: cutlass.Constexpr[[Tuple[int, int, int, int]]],
-        k_iter: cute.Pointer,
-        k_stride: cutlass.Constexpr[Tuple[int, int, int, int]],
-        v_iter: cute.Pointer,
-        v_stride: cutlass.Constexpr[Tuple[int, int, int, int]],
-        o_iter: cute.Pointer,
-        o_stride: cutlass.Constexpr[Tuple[int, int, int, int]],
-        problem_size: Tuple[Int32, Int32, Int32, Int32, Int32, Int32],
+        Q: cute.Tensor,
+        K: cute.Tensor,
+        V: cute.Tensor,
+        O: cute.Tensor,
+        problem_size: Tuple[Int32, Int32, Int32, Int32, Int32, Int32, Int32],
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
-        lse_iter: Optional[cute.Pointer],
-        lse_stride: cutlass.Constexpr[Tuple[int, int, int]],
+        LSE: Optional[cute.Tensor],
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
@@ -281,7 +267,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         :param o_stride: The stride of the output tensor. (B, S, H, D) for bshd, (T, T, H, D) for thd (note that the T stride is duplicated)
         :type o_stride: cutlass.Constexpr[Tuple[int, int, int, int]]
         :param problem_size: The problem size with shape [b, s_q, s_lse, s_k, h_q, h_k, d]. If cum_seqlen_q or cum_seqlen_k is not None, s_q and s_k are the max of the cumulative sequence length respectively.
-        :type problem_size: Tuple[Int32, Int32, Int32, Int32, Int32, Int32]
+        :type problem_size: Tuple[Int32, Int32, Int32, Int32, Int32, Int32, Int32]
         :param cum_seqlen_q: The cumulative sequence length tensor for query
         :type cum_seqlen_q: Optional[cute.Tensor]
         :param cum_seqlen_k: The cumulative sequence length tensor for key
@@ -313,48 +299,48 @@ class BlackwellFusedMultiHeadAttentionForward:
         q_layout = cute.make_layout(
             (s_q, d, ((h_r, h_k), b_qo)),
             stride=(
-                q_stride[1],
-                q_stride[3],
-                ((q_stride[2], q_stride[2] * h_r), q_stride[0]),
+                Q.stride[1],
+                Q.stride[3],
+                ((Q.stride[2], Q.stride[2] * h_r), Q.stride[0]),
             ),
         )
-        q_offset = 0 if cum_seqlen_q is None else -s_q * q_stride[1]
-        q = cute.make_tensor(q_iter + q_offset, q_layout)
+        q_offset = 0 if cum_seqlen_q is None else -s_q * Q.stride[1]
+        q = cute.make_tensor(Q.iterator + q_offset, q_layout)
         # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         k_layout = cute.make_layout(
             (s_k, d, ((h_r, h_k), b_kv)),
-            stride=(k_stride[1], k_stride[3], ((0, k_stride[2]), k_stride[0])),
+            stride=(K.stride[1], K.stride[3], ((0, K.stride[2]), K.stride[0])),
         )
-        k_offset = 0 if cum_seqlen_k is None else -s_k * k_stride[1]
-        k = cute.make_tensor(k_iter + k_offset, k_layout)
+        k_offset = 0 if cum_seqlen_k is None else -s_k * K.stride[1]
+        k = cute.make_tensor(K.iterator + k_offset, k_layout)
         # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         v_layout = cute.make_layout(
             (d, s_k, ((h_r, h_k), b_kv)),
-            stride=(1, v_stride[1], ((0, v_stride[2]), v_stride[0])),
+            stride=(1, V.stride[1], ((0, V.stride[2]), V.stride[0])),
         )
-        v_offset = 0 if cum_seqlen_k is None else -s_k * v_stride[1]
-        v = cute.make_tensor(v_iter + v_offset, v_layout)
+        v_offset = 0 if cum_seqlen_k is None else -s_k * V.stride[1]
+        v = cute.make_tensor(V.iterator + v_offset, v_layout)
         # (s, d, ((h_r, h_k), b))
-        o_offset = 0 if cum_seqlen_q is None else -s_q * o_stride[1]
+        o_offset = 0 if cum_seqlen_q is None else -s_q * O.stride[1]
         o_layout = cute.make_layout(
             (s_q, d, ((h_r, h_k), b_qo)),
             stride=(
-                o_stride[1],
-                o_stride[3],
-                ((o_stride[2], o_stride[2] * h_r), o_stride[0]),
+                O.stride[1],
+                O.stride[3],
+                ((O.stride[2], O.stride[2] * h_r), O.stride[0]),
             ),
         )
-        o = cute.make_tensor(o_iter + o_offset, o_layout)
-        if cutlass.const_expr(lse_iter is not None):
+        o = cute.make_tensor(O.iterator + o_offset, o_layout)
+        if cutlass.const_expr(LSE is not None):
             # (s, ((h_r, h_k), b))
             lse_layout = cute.make_layout(
                 (s_lse, ((h_r, h_k), b_lse)),
                 stride=(
-                    lse_stride[1],
-                    ((lse_stride[2], h_r * lse_stride[2]), lse_stride[0]),
+                    LSE.stride[1],
+                    ((LSE.stride[2], h_r * LSE.stride[2]), LSE.stride[0]),
                 ),
             )
-            lse = cute.make_tensor(lse_iter, lse_layout)
+            lse = cute.make_tensor(LSE.iterator, lse_layout)
         else:
             lse = None
 
@@ -780,13 +766,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  EMPTY
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.empty_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
 
             tile_sched = fmha_utils.create_fmha_static_tile_scheduler(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
@@ -968,7 +954,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
 
             # Alloc tmem buffer
             tmem_alloc_cols = Int32(self.tmem_alloc_cols)
@@ -1236,7 +1222,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  Epilogue
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.epilogue_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             tile_sched = fmha_utils.create_fmha_static_tile_scheduler(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
 
@@ -1315,7 +1301,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx < self.softmax1_warp_ids[0]:
             # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
+            cute.arch.setmaxregister_increase(self.num_regs_softmax)
 
             self.softmax(
                 stage=0,
@@ -1342,7 +1328,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
             # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
+            cute.arch.setmaxregister_increase(self.num_regs_softmax)
 
             self.softmax(
                 stage=1,
@@ -1368,7 +1354,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)
+            cute.arch.setmaxregister_decrease(self.num_regs_correction)
 
             cS = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
             tScS = qk_thr_mma.partition_C(cS)
@@ -2254,6 +2240,6 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         # fence view async shared
         cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
+            "async.shared",
+            space="cta",
         )

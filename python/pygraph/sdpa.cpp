@@ -38,6 +38,7 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        py::object const& generate_stats,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
                        cudnn_frontend::DataType_t const& mma_core_mode,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_q,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_k,
@@ -62,6 +63,10 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 
     if (block_mask) {
         attributes.set_block_mask(block_mask);
+    }
+
+    if (sink_token) {
+        attributes.set_sink_token(sink_token);
     }
 
     // Set generate_stats
@@ -237,7 +242,8 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               py::object const& generate_stats,
               cudnn_frontend::AttentionImplementation_t const& implementation,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
-              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp) {
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token) {
     cudnn_frontend::DataType_t mma_core_mode                            = cudnn_frontend::DataType_t::HALF;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_q = nullptr;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_k = nullptr;
@@ -319,6 +325,7 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          actual_generate_stats,
                                          score_max,
                                          score_sum_exp,
+                                         sink_token,
                                          mma_core_mode,
                                          descale_q,
                                          descale_k,
@@ -358,7 +365,11 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
                        bool const use_deterministic_algorithm,
                        cudnn_frontend::DataType_t const& compute_data_type,
-                       std::string const& name) {
+                       std::string const& name,
+                       std::optional<PyCallback> fn,
+                       std::optional<PyCallback> fn_bprop,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token) {
     auto attributes =
         cudnn_frontend::graph::SDPA_backward_attributes()
             .set_bias(bias)
@@ -374,6 +385,23 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
             .set_deterministic_algorithm(use_deterministic_algorithm)
             .set_compute_data_type(compute_data_type)
             .set_name(name);
+
+    // Score modification callbacks
+    if (fn.has_value()) {
+        attributes.set_score_mod(wrapper_function);
+        callback_fn = fn;
+    }
+    if (fn_bprop.has_value()) {
+        attributes.set_score_mod_bprop(wrapper_function_bprop);
+        callback_fn_bprop = fn_bprop;
+    }
+
+    if (sink_token) {
+        attributes.set_sink_token(sink_token);
+    }
+    if (dSink_token) {
+        attributes.set_dsink_token(dSink_token);
+    }
 
     py::object cudnn_tensor_type = py::module_::import("cudnn").attr("tensor");
 
@@ -576,6 +604,7 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          actual_generate_stats,
                                          score_max,
                                          score_sum_exp,
+                                         /*sink_token=*/nullptr,
                                          mma_core_mode,
                                          descale_q,
                                          descale_k,
@@ -586,6 +615,105 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
 
     // Return all 4 outputs as array for backward compatibility
     return {internal_result.O, internal_result.Stats, internal_result.Amax_S, internal_result.Amax_O};
+}
+
+// MXFP8 SDPA forward - uses block-wise scale factors (E8M0 with F8_128x4 reordering)
+std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 3>
+PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
+                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
+                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
+                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_q,
+                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_k,
+                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_v,
+                    py::object const& attn_scale,
+                    bool const use_causal_mask,
+                    bool const use_causal_mask_bottom_right,
+                    cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
+                    py::object const& left_bound,
+                    py::object const& right_bound,
+                    cudnn_frontend::DataType_t const& compute_data_type,
+                    std::string const& name,
+                    py::object const& generate_stats) {
+    auto attributes =
+        cudnn_frontend::graph::SDPA_fp8_attributes().set_name(name).set_compute_data_type(compute_data_type);
+
+    // Handle causal mask settings
+    cudnn_frontend::DiagonalAlignment_t actual_diagonal_alignment = diagonal_alignment;
+    py::object actual_right_bound                                 = right_bound;
+
+    if (use_causal_mask && use_causal_mask_bottom_right) {
+        throw std::runtime_error("use_causal_mask and use_causal_mask_bottom_right cannot both be true");
+    }
+
+    if (use_causal_mask && !right_bound.is_none()) {
+        throw std::runtime_error("use_causal_mask and diagonal_band_right_bound cannot be set at the same time");
+    }
+
+    if (use_causal_mask_bottom_right && !right_bound.is_none()) {
+        throw std::runtime_error(
+            "use_causal_mask_bottom_right and diagonal_band_right_bound cannot be set at the same time");
+    }
+
+    if (use_causal_mask) {
+        actual_diagonal_alignment = cudnn_frontend::DiagonalAlignment_t::TOP_LEFT;
+        actual_right_bound        = py::int_(0);
+    }
+
+    if (use_causal_mask_bottom_right) {
+        actual_diagonal_alignment = cudnn_frontend::DiagonalAlignment_t::BOTTOM_RIGHT;
+        actual_right_bound        = py::int_(0);
+    }
+
+    attributes.set_diagonal_alignment(actual_diagonal_alignment);
+
+    // Set diagonal masking bounds
+    if (!left_bound.is_none()) {
+        if (py::isinstance<py::int_>(left_bound)) {
+            attributes.set_diagonal_band_left_bound(left_bound.cast<int64_t>());
+        } else {
+            throw std::runtime_error("diagonal_band_left_bound must be an int (or None)");
+        }
+    }
+
+    if (!actual_right_bound.is_none()) {
+        if (py::isinstance<py::int_>(actual_right_bound)) {
+            attributes.set_diagonal_band_right_bound(actual_right_bound.cast<int64_t>());
+        } else {
+            throw std::runtime_error("diagonal_band_right_bound must be an int (or None)");
+        }
+    }
+
+    // Set generate_stats
+    if (!generate_stats.is_none()) {
+        if (py::isinstance<py::bool_>(generate_stats)) {
+            attributes.set_generate_stats(generate_stats.cast<bool>());
+        } else {
+            throw std::runtime_error("generate_stats must be a bool.");
+        }
+    } else {
+        throw std::runtime_error("generate_stats must be provided.");
+    }
+
+    // Set attn_scale
+    if (!attn_scale.is_none()) {
+        if (py::isinstance<py::float_>(attn_scale)) {
+            auto const attn_scale_value = attn_scale.cast<float>();
+            attributes.set_attn_scale(attn_scale_value);
+        } else {
+            auto const attn_scale_tensor = attn_scale.cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            if (!attn_scale_tensor) {
+                throw std::runtime_error("attn_scale must be a cudnn_tensor or float.");
+            }
+            attributes.set_attn_scale(attn_scale_tensor);
+        }
+    }
+
+    // Call the MXFP8 6-parameter overload of sdpa_fp8
+    // This uses block scale factors (E8M0 + F8_128x4) instead of regular scalar descales
+    auto result_array = graph->sdpa_fp8(q, k, v, descale_q, descale_k, descale_v, attributes);
+
+    // Return [O, Stats, Amax_O]
+    return {result_array[0], result_array[1], result_array[2]};
 }
 
 std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 7>
@@ -613,19 +741,63 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
                            bool const use_causal_mask,
                            bool const use_causal_mask_bottom_right,
+                           cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
+                           py::object const& left_bound,
+                           py::object const& right_bound,
                            bool const use_deterministic_algorithm,
                            py::object const& dropout,
                            cudnn_frontend::DataType_t const& compute_data_type,
                            std::string const& name) {
+    cudnn_frontend::DiagonalAlignment_t actual_diagonal_alignment = diagonal_alignment;
+    py::object actual_right_bound                                 = right_bound;
+
+    if (use_causal_mask && use_causal_mask_bottom_right) {
+        throw std::runtime_error("use_causal_mask and use_causal_mask_bottom_right cannot both be true");
+    }
+
+    if (use_causal_mask && !right_bound.is_none()) {
+        throw std::runtime_error("use_causal_mask and diagonal_band_right_bound cannot be set at the same time");
+    }
+
+    if (use_causal_mask_bottom_right && !right_bound.is_none()) {
+        throw std::runtime_error(
+            "use_causal_mask_bottom_right and diagonal_band_right_bound cannot be set at the same time");
+    }
+
+    if (use_causal_mask) {
+        actual_diagonal_alignment = cudnn_frontend::DiagonalAlignment_t::TOP_LEFT;
+        actual_right_bound        = py::int_(0);
+    }
+
+    if (use_causal_mask_bottom_right) {
+        actual_diagonal_alignment = cudnn_frontend::DiagonalAlignment_t::BOTTOM_RIGHT;
+        actual_right_bound        = py::int_(0);
+    }
+
     auto attributes = cudnn_frontend::graph::SDPA_fp8_backward_attributes()
                           .set_padding_mask(use_padding_mask)
                           .set_seq_len_q(seq_len_q)
                           .set_seq_len_kv(seq_len_kv)
-                          .set_causal_mask(use_causal_mask)
-                          .set_causal_mask_bottom_right(use_causal_mask_bottom_right)
+                          .set_diagonal_alignment(actual_diagonal_alignment)
                           .set_deterministic_algorithm(use_deterministic_algorithm)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
+
+    if (!left_bound.is_none()) {
+        if (py::isinstance<py::int_>(left_bound)) {
+            attributes.set_diagonal_band_left_bound(left_bound.cast<int64_t>());
+        } else {
+            throw std::runtime_error("left_bound must be an int (or None)");
+        }
+    }
+
+    if (!actual_right_bound.is_none()) {
+        if (py::isinstance<py::int_>(actual_right_bound)) {
+            attributes.set_diagonal_band_right_bound(actual_right_bound.cast<int64_t>());
+        } else {
+            throw std::runtime_error("right_bound must be an int (or None)");
+        }
+    }
 
     if (!attn_scale.is_none()) {
         if (py::isinstance<py::float_>(attn_scale)) {
@@ -697,6 +869,163 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
     return {dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP};
 }
 
+// MXFP8 SDPA backward - uses block-wise scale factors (E8M0 with F8_128x4 reordering)
+std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 6>
+PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q_T,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k_T,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& o_f16,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO_f16,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO_T,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& stats,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_q,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_q_T,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_k,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_k_T,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_v,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_dO,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_dO_T,
+                             py::object const& attn_scale,
+                             bool const use_padding_mask,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                             bool const use_causal_mask,
+                             bool const use_causal_mask_bottom_right,
+                             cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
+                             py::object const& left_bound,
+                             py::object const& right_bound,
+                             bool const use_deterministic_algorithm,
+                             py::object const& dropout,
+                             cudnn_frontend::DataType_t const& compute_data_type,
+                             std::string const& name) {
+    cudnn_frontend::DiagonalAlignment_t actual_diagonal_alignment = diagonal_alignment;
+    py::object actual_right_bound                                 = right_bound;
+
+    if (use_causal_mask && use_causal_mask_bottom_right) {
+        throw std::runtime_error("use_causal_mask and use_causal_mask_bottom_right cannot both be true");
+    }
+
+    if (use_causal_mask && !right_bound.is_none()) {
+        throw std::runtime_error("use_causal_mask and diagonal_band_right_bound cannot be set at the same time");
+    }
+
+    if (use_causal_mask_bottom_right && !right_bound.is_none()) {
+        throw std::runtime_error(
+            "use_causal_mask_bottom_right and diagonal_band_right_bound cannot be set at the same time");
+    }
+
+    if (use_causal_mask) {
+        actual_diagonal_alignment = cudnn_frontend::DiagonalAlignment_t::TOP_LEFT;
+        actual_right_bound        = py::int_(0);
+    }
+
+    if (use_causal_mask_bottom_right) {
+        actual_diagonal_alignment = cudnn_frontend::DiagonalAlignment_t::BOTTOM_RIGHT;
+        actual_right_bound        = py::int_(0);
+    }
+
+    auto attributes = cudnn_frontend::graph::SDPA_fp8_backward_attributes()
+                          .set_padding_mask(use_padding_mask)
+                          .set_seq_len_q(seq_len_q)
+                          .set_seq_len_kv(seq_len_kv)
+                          .set_diagonal_alignment(actual_diagonal_alignment)
+                          .set_deterministic_algorithm(use_deterministic_algorithm)
+                          .set_compute_data_type(compute_data_type)
+                          .set_name(name);
+
+    if (!left_bound.is_none()) {
+        if (py::isinstance<py::int_>(left_bound)) {
+            attributes.set_diagonal_band_left_bound(left_bound.cast<int64_t>());
+        } else {
+            throw std::runtime_error("left_bound must be an int (or None)");
+        }
+    }
+
+    if (!actual_right_bound.is_none()) {
+        if (py::isinstance<py::int_>(actual_right_bound)) {
+            attributes.set_diagonal_band_right_bound(actual_right_bound.cast<int64_t>());
+        } else {
+            throw std::runtime_error("right_bound must be an int (or None)");
+        }
+    }
+
+    // Set attn_scale
+    if (!attn_scale.is_none()) {
+        if (py::isinstance<py::float_>(attn_scale)) {
+            auto const attn_scale_value = attn_scale.cast<float>();
+            attributes.set_attn_scale(attn_scale_value);
+        } else {
+            auto const attn_scale_tensor = attn_scale.cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            if (!attn_scale_tensor) {
+                throw std::runtime_error("attn_scale must be a cudnn_tensor or float.");
+            }
+            attributes.set_attn_scale(attn_scale_tensor);
+        }
+    }
+
+    py::object cudnn_tensor_type = py::module_::import("cudnn").attr("tensor");
+
+    if (!dropout.is_none()) {
+        if (!py::isinstance<py::tuple>(dropout)) {
+            throw std::runtime_error(
+                "dropout must be a tuple of (float probability, a seed tensor"
+                ", and an offset tensor) or (mask tensor, scale tensor)");
+        }
+        py::tuple dropout_tuple = dropout.cast<py::tuple>();
+        if (dropout_tuple.size() != 3) {
+            throw std::runtime_error(
+                "dropout must be a tuple of (float probability, a seed tensor"
+                ", and an offset tensor) or (mask tensor, scale tensor)");
+        }
+
+        if (py::isinstance<py::float_>(dropout_tuple[0]) && py::isinstance(dropout_tuple[1], cudnn_tensor_type) &&
+            py::isinstance(dropout_tuple[2], cudnn_tensor_type)) {
+            auto const probability = dropout_tuple[0].cast<float>();
+            auto const seed        = dropout_tuple[1].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const offset      = dropout_tuple[2].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            attributes.set_dropout(probability, seed, offset);
+        } else if (py::isinstance(dropout_tuple[0], cudnn_tensor_type) &&
+                   py::isinstance(dropout_tuple[1], cudnn_tensor_type) &&
+                   py::isinstance(dropout_tuple[2], cudnn_tensor_type)) {
+            auto const mask      = dropout_tuple[0].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const scale     = dropout_tuple[1].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const scale_inv = dropout_tuple[2].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            attributes.set_dropout(mask, scale, scale_inv);
+        } else {
+            throw std::runtime_error(
+                "dropout must be a tuple of (float probability, a seed tensor"
+                ", and an offset tensor) or (mask tensor, scale tensor)");
+        }
+    }
+
+    // Call the MXFP8 backward
+    // This uses block scale factors (E8M0 + F8_128x4) instead of regular scalar descales
+    auto result_array = graph->sdpa_fp8_backward(q,
+                                                 q_T,
+                                                 k,
+                                                 k_T,
+                                                 v,
+                                                 o_f16,
+                                                 dO_f16,
+                                                 dO,
+                                                 dO_T,
+                                                 stats,
+                                                 descale_q,
+                                                 descale_q_T,
+                                                 descale_k,
+                                                 descale_k_T,
+                                                 descale_v,
+                                                 descale_dO,
+                                                 descale_dO_T,
+                                                 attributes);
+
+    // Return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV]
+    return {result_array[0], result_array[1], result_array[2], result_array[3], result_array[4], result_array[5]};
+}
+
 void
 init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
     m.def("sdpa",
@@ -730,6 +1059,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("implementation", cudnn_frontend::AttentionImplementation_t::AUTO),
           py::arg_v("score_max", nullptr),
           py::arg_v("score_sum_exp", nullptr),
+          py::arg_v("sink_token", nullptr),
           R"pbdoc(
                 Perform scaled dot product attention.
 
@@ -750,10 +1080,11 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     paged_attention_max_seq_len_kv (Optional[integer]): The maximum sequence length for k/v caches when paged attention is active.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                     name (Optional[str]): The name of the operation.
-                    generate_stats (Optional[bool]): If true, compute and output softmax stats (useful at training time). Default is None, but one of {generate_stats, is_inference} must be set.   
-                    implementation (Optional[cudnn.attention_implementation]): Which underlying implementation to use in the cuDNN backend. Default is AUTO (recommended).              
+                    generate_stats (Optional[bool]): If true, compute and output softmax stats (useful at training time). Default is None, but one of {generate_stats, is_inference} must be set.
+                    implementation (Optional[cudnn.attention_implementation]): Which underlying implementation to use in the cuDNN backend. Default is AUTO (recommended).
                     score_max (Optional[cudnn_tensor]): The max of attention score.
                     score_sum_exp (Optional[cudnn_tensor]): The numerically stable sum of exponents using normalized values wrt max score.
+                    sink_token (Optional[cudnn_tensor]): The sink attention token tensor. Shape is (1, h_q, 1, 1), type is float32.
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and diagonal_band_right_bound=0. Default is TOP_LEFT.
                     diagonal_band_left_bound (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
@@ -799,6 +1130,10 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("use_deterministic_algorithm", false),
           py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
           py::arg_v("name", ""),
+          py::arg_v("score_mod", std::nullopt),
+          py::arg_v("score_mod_bprop", std::nullopt),
+          py::arg_v("sink_token", nullptr),
+          py::arg_v("dSink_token", nullptr),
           R"pbdoc(
                 Compute the key, query, value gradients of scaled dot product attention.
 
@@ -823,6 +1158,10 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     use_deterministic_algorithm (Optional[bool]): Whether to always use deterministic algorithm. Default is False.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                     name (Optional[str]): The name of the operation.
+                    score_mod (Optional[callable]): An optional callback function for attention score modification during forward recomputation in the backward pass. Default is None.
+                    score_mod_bprop (Optional[callable]): An optional callback function for the backward pass of the attention score modification. Default is None.
+                    sink_token (Optional[cudnn_tensor]): The sink attention token tensor for backward. Shape is (1, h_q, 1, 1), type is float32.
+                    dSink_token (Optional[cudnn_tensor]): The sink attention token gradient tensor. Shape is (1, h_q, 1, 1), type is float32.
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and diagonal_band_right_bound=0. Default is TOP_LEFT.
                     diagonal_band_left_bround (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
@@ -919,6 +1258,66 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     amax_s (cudnn_tensor): The absolute maximum of S tensor.
                     amax_o (cudnn_tensor): The absolute maximum of output tensor.
             )pbdoc");
+    m.def("sdpa_mxfp8",
+          &PyGraph::sdpa_mxfp8,
+          py::arg("q"),
+          py::arg("k"),
+          py::arg("v"),
+          py::arg("descale_q"),
+          py::arg("descale_k"),
+          py::arg("descale_v"),
+          py::arg_v("attn_scale", py::none()),
+          py::arg_v("use_causal_mask", false),
+          py::arg_v("use_causal_mask_bottom_right", false),
+          py::arg_v("diagonal_alignment", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT),
+          py::arg_v("diagonal_band_left_bound", py::none()),
+          py::arg_v("diagonal_band_right_bound", py::none()),
+          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+          py::arg_v("name", ""),
+          py::arg("generate_stats"),
+          R"pbdoc(
+                Perform MXFP8 (Microscaling FP8) scaled dot product attention.
+
+                MXFP8 uses block-wise scale factors with E8M0 data type and F8_128x4 reordering.
+                This is different from regular FP8 which uses scalar descale factors.
+
+                Requirements:
+                - cuDNN 9.21.0 or later
+                - Blackwell GPU architecture or newer
+                - Scale factor tensors must have:
+                  - Data type: FP8_E8M0
+                  - Reordering type: F8_128x4
+                  - descale_q/descale_k: d dimension scaled (block size 32), stride[3]=1
+                  - descale_v: s dimension scaled (block size 32), stride[2]=1
+
+                Args:
+                    q (cudnn_tensor): The query data (FP8_E4M3), shape [B, H, S_q, D].
+                    k (cudnn_tensor): The key data (FP8_E4M3), shape [B, H, S_kv, D].
+                    v (cudnn_tensor): The value data (FP8_E4M3), shape [B, H, S_kv, D].
+                    descale_q (cudnn_tensor): Block scale factor for Q (E8M0, F8_128x4).
+                        Shape [B, H, S_q_padded, D_scale] where D_scale = ceil(D/32), padded to multiple of 4.
+                        Must have d_scale dimension contiguous (stride[3]=1).
+                    descale_k (cudnn_tensor): Block scale factor for K (E8M0, F8_128x4).
+                        Shape [B, H, S_kv_padded, D_scale] where S_kv_padded is multiple of 128.
+                        Must have d_scale dimension contiguous (stride[3]=1).
+                    descale_v (cudnn_tensor): Block scale factor for V (E8M0, F8_128x4).
+                        Shape [B, H, S_scale, D_padded] where S_scale = ceil(S_kv/32), padded to multiple of 4.
+                        Must have s_scale dimension contiguous (stride[2]=1).
+                    attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
+                    use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
+                    use_causal_mask_bottom_right (Optional[bool]): Whether to use bottom right aligned causal mask. Default is False.
+                    diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. Default is TOP_LEFT.
+                    diagonal_band_left_bound (Optional[int]): Offset to the left of main diagonal to attend to. Default is None (+Inf).
+                    diagonal_band_right_bound (Optional[int]): Offset to the right of main diagonal to attend to. Default is None (+Inf).
+                    compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
+                    name (Optional[str]): The name of the operation.
+                    generate_stats (bool): If true, compute and output softmax stats (required for training).
+
+                Returns:
+                    o (cudnn_tensor): The output data.
+                    stats (Optional[cudnn_tensor]): The softmax statistics if generate_stats is True.
+                    amax_o (cudnn_tensor): The absolute maximum of output tensor.
+            )pbdoc");
     m.def("sdpa_fp8_backward",
           &PyGraph::sdpa_fp8_backward,
           py::arg("q"),
@@ -945,6 +1344,9 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("seq_len_kv", nullptr),
           py::arg_v("use_causal_mask", false),
           py::arg_v("use_causal_mask_bottom_right", false),
+          py::arg_v("diagonal_alignment", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT),
+          py::arg_v("left_bound", py::none()),
+          py::arg_v("right_bound", py::none()),
           py::arg_v("use_deterministic_algorithm", false),
           py::arg_v("dropout", py::none()),
           py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
@@ -977,6 +1379,9 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key.
                     use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
                     use_causal_mask_bottom_right (Optional[bool]): Whether to use bottom right aligned causal mask. Default is False.
+                    diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. Default is TOP_LEFT.
+                    left_bound (Optional[int]): Offset to the left of the main diagonal to attend to. Default is None (+Inf).
+                    right_bound (Optional[int]): Offset to the right of the main diagonal to attend to. Default is None (+Inf).
                     use_deterministic_algorithm (Optional[bool]): Whether to always use deterministic algorithm. Default is False.
                     dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
@@ -991,6 +1396,81 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     amax_dV (cudnn_tensor): The absolute maximum of value gradient tensor.
                     amax_dP (cudnn_tensor): The absolute maximum of dP tensor.
             )pbdoc");
+    m.def("sdpa_mxfp8_backward",
+          &PyGraph::sdpa_mxfp8_backward,
+          py::arg("q"),
+          py::arg("q_T"),
+          py::arg("k"),
+          py::arg("k_T"),
+          py::arg("v"),
+          py::arg("o_f16"),
+          py::arg("dO_f16"),
+          py::arg("dO"),
+          py::arg("dO_T"),
+          py::arg("stats"),
+          py::arg("descale_q"),
+          py::arg("descale_q_T"),
+          py::arg("descale_k"),
+          py::arg("descale_k_T"),
+          py::arg("descale_v"),
+          py::arg("descale_dO"),
+          py::arg("descale_dO_T"),
+          py::arg_v("attn_scale", py::none()),
+          py::arg_v("use_padding_mask", false),
+          py::arg_v("seq_len_q", nullptr),
+          py::arg_v("seq_len_kv", nullptr),
+          py::arg_v("use_causal_mask", false),
+          py::arg_v("use_causal_mask_bottom_right", false),
+          py::arg_v("diagonal_alignment", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT),
+          py::arg_v("left_bound", py::none()),
+          py::arg_v("right_bound", py::none()),
+          py::arg_v("use_deterministic_algorithm", false),
+          py::arg_v("dropout", py::none()),
+          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+          py::arg_v("name", ""),
+          R"pbdoc(
+                      Compute the key, query, value gradients of scaled dot product attention with mxfp8 (Microscaling FP8) datatype inputs and outputs.
+
+                      Args:
+                          q (cudnn_tensor): The query data.
+                          q_T (cudnn_tensor): The transposed query data.
+                          k (cudnn_tensor): The key data.
+                          k_T (cudnn_tensor): The transposed key data.
+                          v (cudnn_tensor): The value data.
+                          o_f16 (cudnn_tensor): The output data (FP16).
+                          dO_f16 (cudnn_tensor): The output gradient data (FP16).
+                          dO (cudnn_tensor): The output gradient data.
+                          dO_T (cudnn_tensor): The transposed output gradient data.
+                          stats (cudnn_tensor): The softmax statistics in case the operation is in a training step.
+                          descale_q (cudnn_tensor): Descale factor for query.
+                          descale_q_T (cudnn_tensor): Descale factor for transposed query.
+                          descale_k (cudnn_tensor): Descale factor for key.
+                          descale_k_T (cudnn_tensor): Descale factor for transposed key.
+                          descale_v (cudnn_tensor): Descale factor for value.
+                          descale_dO (cudnn_tensor): Descale factor for output gradient.
+                          descale_dO_T (cudnn_tensor): Descale factor for transposed output gradient.
+                          attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
+                          use_padding_mask (bool): Whether it is an inference step or training step.
+                          seq_len_q (Optional[cudnn_tensor]): The sequence length of the query.
+                          seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key.
+                          use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
+                          use_causal_mask_bottom_right (Optional[bool]): Whether to use bottom right aligned causal mask. Default is False.
+                          diagonal_alignment (Optional[cudnn.diagonal_alignment]): Alignment of the diagonal band. Default is TOP_LEFT.
+                          left_bound (Optional[int]): Left bound for sliding window attention. Default is None (no left bound).
+                          right_bound (Optional[int]): Right bound for sliding window attention. Default is None (no right bound).
+                          use_deterministic_algorithm (Optional[bool]): Whether to always use deterministic algorithm. Default is False.
+                          dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
+                          compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
+                          name (Optional[str]): The name of the operation.
+
+                      Returns:
+                          dQ (cudnn_tensor): The query gradient data.
+                          dK (cudnn_tensor): The key gradient data.
+                          dV (cudnn_tensor): The value gradient data.
+                          amax_dQ (cudnn_tensor): The absolute maximum of query gradient tensor.
+                          amax_dK (cudnn_tensor): The absolute maximum of key gradient tensor.
+                          amax_dV (cudnn_tensor): The absolute maximum of value gradient tensor.
+                  )pbdoc");
     m.attr("scaled_dot_product_flash_attention")          = m.attr("sdpa");
     m.attr("scaled_dot_product_flash_attention_backward") = m.attr("sdpa_backward");
 }

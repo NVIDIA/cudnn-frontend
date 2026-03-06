@@ -46,7 +46,7 @@ for symbol_name in symbols_to_import:
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.18.0"
+__version__ = "1.19.0"
 
 
 def _tensor(
@@ -304,6 +304,26 @@ def __getattr__(name: str) -> Any:
         except Exception as e:
             raise ImportError(
                 f"grouped_gemm_swiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
+    elif name == "GroupedGemmDswigluSm100":
+        try:
+            from .grouped_gemm import GroupedGemmDswigluSm100 as _GroupedGemmDswigluSm100
+
+            return _GroupedGemmDswigluSm100
+        except Exception as e:
+            raise ImportError(f"GroupedGemmDswigluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
+
+    elif name == "grouped_gemm_dswiglu_wrapper_sm100":
+        try:
+            from .grouped_gemm import (
+                grouped_gemm_dswiglu_wrapper_sm100 as _grouped_gemm_dswiglu_wrapper_sm100,
+            )
+
+            return _grouped_gemm_dswiglu_wrapper_sm100
+        except Exception as e:
+            raise ImportError(
+                f"grouped_gemm_dswiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
             ) from e
 
     else:

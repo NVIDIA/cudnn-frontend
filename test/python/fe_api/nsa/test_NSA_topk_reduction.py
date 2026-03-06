@@ -69,7 +69,7 @@ def test_nsa_topk_reduction_compile_execute(
         scale_softmax=None,
     )
     assert topk_reduction.check_support()
-    topk_reduction.compile(current_stream=stream)
+    topk_reduction.compile()
     topk_reduction.execute(
         q_tensor=Q,
         k_tensor=K,

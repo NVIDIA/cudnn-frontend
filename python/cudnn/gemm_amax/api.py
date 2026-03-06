@@ -1,19 +1,17 @@
 from .dense_blockscaled_gemm_persistent_amax import (
     Sm100BlockScaledPersistentDenseGemmKernel,
-    Sm100BlockScaledPersistentDenseGemmKernelNoDlpack,
 )
 
 from cuda.bindings import driver as cuda
 import torch
 from typing import Tuple, Optional
-from packaging import version
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.api_base import APIBase, is_power_of_2, ceil_div
+from cudnn.api_base import APIBase, TensorDesc, TupleDict, is_power_of_2, ceil_div
 
 
 class GemmAmaxSm100(APIBase):
@@ -35,12 +33,13 @@ class GemmAmaxSm100(APIBase):
         self._logger.warning("GemmAmaxSm100 is an experimental API")
         self._logger.debug("Entering __init__")
 
-        self.sample_a = sample_a
-        self.sample_b = sample_b
-        self.sample_sfa = sample_sfa
-        self.sample_sfb = sample_sfb
-        self.sample_c = sample_c
-        self.sample_amax = self._pad_tensor_to_ndim(sample_amax, 3, "sample_amax")
+        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
+        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
+        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
+        self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
+        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
+        self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax")
+
         self.acc_dtype = acc_dtype
         self.mma_tiler_mn = mma_tiler_mn
         self.cluster_shape_mn = cluster_shape_mn
@@ -52,7 +51,7 @@ class GemmAmaxSm100(APIBase):
 
         self._interpret_uint8_as_fp4x2 = True
         self._logger.debug(
-            f"__init__ completed with args: sample_a {sample_a.shape}, sample_b {sample_b.shape}, sample_sfa {sample_sfa.shape}, sample_sfb {sample_sfb.shape}, sample_c {sample_c.shape}, sample_amax {self.sample_amax.shape}, acc_dtype {acc_dtype}, mma_tiler_mn {mma_tiler_mn}, cluster_shape_mn {cluster_shape_mn}, sf_vec_size {sf_vec_size}"
+            f"__init__ completed with args: sample_a {self.a_desc.shape}, sample_b {self.b_desc.shape}, sample_sfa {self.sfa_desc.shape}, sample_sfb {self.sfb_desc.shape}, sample_c {self.c_desc.shape}, sample_amax {self.amax_desc.shape}, acc_dtype {acc_dtype}, mma_tiler_mn {mma_tiler_mn}, cluster_shape_mn {cluster_shape_mn}, sf_vec_size {sf_vec_size}"
         )
 
     def check_support(self) -> bool:
@@ -60,12 +59,12 @@ class GemmAmaxSm100(APIBase):
 
         self._logger.debug("Checking dtypes and sf_vec_size")
         ab_dtype = self._check_dtype(
-            self.sample_a,
+            self.a_desc,
             dtype=[torch.float4_e2m1fn_x2, torch.uint8, torch.float8_e5m2, torch.float8_e4m3fn],
             name="A",
         )
         self._check_dtype(
-            self.sample_b,
+            self.b_desc,
             dtype=ab_dtype,
             name="B",
             extra_error_msg="A and B tensor dtypes must match",
@@ -79,12 +78,12 @@ class GemmAmaxSm100(APIBase):
         )
 
         sf_dtype = self._check_dtype(
-            self.sample_sfa,
+            self.sfa_desc,
             dtype=[torch.float8_e8m0fnu, torch.float8_e4m3fn, torch.int8],
             name="sfa",
         )
         self._check_dtype(
-            self.sample_sfb,
+            self.sfb_desc,
             dtype=sf_dtype,
             name="sfb",
             extra_error_msg="sfa and sfb tensor dtypes must match",
@@ -102,7 +101,7 @@ class GemmAmaxSm100(APIBase):
         )
 
         c_dtype = self._check_dtype(
-            self.sample_c,
+            self.c_desc,
             dtype=[torch.float32, torch.float16, torch.bfloat16, torch.float8_e5m2, torch.float8_e4m3fn, torch.float4_e2m1fn_x2, torch.uint8],
             name="C",
         )
@@ -125,26 +124,26 @@ class GemmAmaxSm100(APIBase):
         self.c_dtype = c_dtype
 
         self._logger.debug("Checking tensor layout")
-        m, k, l = self._tensor_shape(self.sample_a, name="sample_a")
-        n, _, _ = self._tensor_shape(self.sample_b, name="sample_b")
-        _, _, _ = self._tensor_shape(self.sample_c, name="sample_c")
-        _, _, m_div_atom_m0_m1, _, sf_k_div_atom_k, _ = self.sample_sfa.shape
-        _, _, n_div_atom_m0_m1, _, sf_k_div_atom_k, _ = self.sample_sfb.shape
+        m, k, l = self.a_desc.shape
+        n, _, _ = self.b_desc.shape
+        _, _, m_div_atom_m0_m1, _, sf_k_div_atom_k, _ = self.sfa_desc.shape
+        _, _, n_div_atom_m0_m1, _, sf_k_div_atom_k, _ = self.sfb_desc.shape
 
-        self._check_tensor_shape(self.sample_a, (m, k, l), "A")
-        self._check_tensor_shape(self.sample_b, (n, k, l), "B")
-        self._check_tensor_shape(self.sample_c, (m, n, l), "C")
+        self._check_tensor_shape(self.a_desc, (m, k, l), "A")
+        self._check_tensor_shape(self.b_desc, (n, k, l), "B")
+        self._check_tensor_shape(self.c_desc, (m, n, l), "C")
         self._check_tensor_shape(
-            self.sample_sfa,
+            self.sfa_desc,
             (self.atom_m[0], self.atom_m[1], m_div_atom_m0_m1, self.atom_k, sf_k_div_atom_k, l),
             "sfa",
         )
         self._check_tensor_shape(
-            self.sample_sfb,
+            self.sfb_desc,
             (self.atom_m[0], self.atom_m[1], n_div_atom_m0_m1, self.atom_k, sf_k_div_atom_k, l),
             "sfb",
         )
-        self._check_tensor_shape(self.sample_amax, (1, 1, 1), "amax")
+        self.amax_desc = self._pad_tensor_to_ndim(self.amax_desc, 3, "amax")
+        self._check_tensor_shape(self.amax_desc, (1, 1, 1), "amax")
 
         expected_m_div_atom = ceil_div(m, self.atom_m[0] * self.atom_m[1])
         expected_n_div_atom = ceil_div(n, self.atom_m[0] * self.atom_m[1])
@@ -158,26 +157,26 @@ class GemmAmaxSm100(APIBase):
         )
 
         # Check tensor strides
-        a_stride, self.a_stride_order = self._check_tensor_stride(
-            self.sample_a,
+        _ = self._check_tensor_stride(
+            self.a_desc,
             stride=[(1, m, m * k), (k, 1, m * k)],
             name="A",
         )
-        b_stride, self.b_stride_order = self._check_tensor_stride(
-            self.sample_b,
+        _ = self._check_tensor_stride(
+            self.b_desc,
             stride=[(1, n, n * k), (k, 1, n * k)],
             name="B",
         )
-        c_stride, self.c_stride_order = self._check_tensor_stride(
-            self.sample_c,
+        _ = self._check_tensor_stride(
+            self.c_desc,
             stride=[(1, m, m * n), (n, 1, m * n)],
             name="C",
         )
 
         # Derive major mode from stride order
-        self.a_major = "m" if self.a_stride_order == (0, 1, 2) else "k"
-        self.b_major = "n" if self.b_stride_order == (0, 1, 2) else "k"
-        self.c_major = "m" if self.c_stride_order == (0, 1, 2) else "n"
+        self.a_major = "m" if self.a_desc.stride_order == (0, 1, 2) else "k"
+        self.b_major = "n" if self.b_desc.stride_order == (0, 1, 2) else "k"
+        self.c_major = "m" if self.c_desc.stride_order == (0, 1, 2) else "n"
 
         self._value_error_if(
             self._is_fp4x2(ab_dtype) and not (self.a_major == "k" and self.b_major == "k"),
@@ -259,27 +258,18 @@ class GemmAmaxSm100(APIBase):
             "cuteDSL GemmAmax is not supported on SM103",
         )
 
-        is_ab_fp4 = self._is_fp4x2(self.ab_dtype)
-        is_c_fp4 = self._is_fp4x2(self.c_dtype)
-        is_ab_fp8 = self._is_fp8(self.ab_dtype)
-        torch_version = version.parse(torch.__version__)
-        _fp8_dlpack_supported = version.parse(torch_version.base_version) >= version.parse("2.10.0")
-        use_no_dlpack_kernel = is_ab_fp4 or is_c_fp4 or (is_ab_fp8 and not _fp8_dlpack_supported)
-
-        if use_no_dlpack_kernel:
-            self._logger.debug("Running no_dlpack kernel wrapper due to fp4 dtype or fp8 dtype on incompatible torch version")
-            self._kernel = Sm100BlockScaledPersistentDenseGemmKernelNoDlpack
-        else:
-            self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
+        self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")
         return True
 
-    def compile(self, current_stream: Optional[cuda.CUstream] = None) -> None:
+    def compile(self) -> None:
         self._logger.debug("Entering compile")
-        current_stream = self._get_default_stream(current_stream)
         self._ensure_support_checked()
+        if self._compiled_kernel is not None:
+            self._logger.debug("Kernel already compiled; skipping recompilation")
+            return
 
         gemm_amax = self._kernel(
             sf_vec_size=self.sf_vec_size,
@@ -289,55 +279,55 @@ class GemmAmaxSm100(APIBase):
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
 
-        if self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
-            self._logger.debug("Compiling gemm_amax")
-            self._compiled_kernel = cute.compile(
-                gemm_amax,
-                a_tensor=from_dlpack(self.sample_a, assumed_align=16),
-                b_tensor=from_dlpack(self.sample_b, assumed_align=16),
-                sfa_tensor=from_dlpack(self.sample_sfa, assumed_align=16),
-                sfb_tensor=from_dlpack(self.sample_sfb, assumed_align=16),
-                c_tensor=from_dlpack(self.sample_c, assumed_align=16),
-                amax_tensor=from_dlpack(self.sample_amax, assumed_align=16),
-                max_active_clusters=max_active_clusters,
-                stream=current_stream,
-            )
-        elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernelNoDlpack:
-            # Create cute pointers/tensors manually to avoid DLPack requirements
-            # amax is never fp4 or fp8 and is safe to use directly with dlpack
-            self._logger.debug("Compiling gemm_amax (no dlpack)")
+        self._logger.debug("Compiling gemm_amax")
+        a_cute = self._make_fake_cute_tensor_from_desc(self.a_desc, assumed_align=16)
+        b_cute = self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16)
+        sfa_cute = self._make_fake_cute_tensor_from_desc(self.sfa_desc, assumed_align=16)
+        sfb_cute = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
+        c_cute = self._make_fake_cute_tensor_from_desc(self.c_desc, assumed_align=16)
+        amax_cute = self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16)
+        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
-            is_ab_fp4 = self._is_fp4x2(self.ab_dtype)
-            is_c_fp4 = self._is_fp4x2(self.c_dtype)
-            a_ptr, a_shape, a_stride_order = self._make_cute_tensor_descriptor(self.sample_a, assumed_align=32 if is_ab_fp4 else 16, name="A")
-            b_ptr, b_shape, b_stride_order = self._make_cute_tensor_descriptor(self.sample_b, assumed_align=32 if is_ab_fp4 else 16, name="B")
-            c_ptr, c_shape, c_stride_order = self._make_cute_tensor_descriptor(self.sample_c, assumed_align=32 if is_c_fp4 else 16, name="C")
-            sfa_ptr, sfa_shape, sfa_stride_order = self._make_cute_tensor_descriptor(self.sample_sfa, assumed_align=16, name="sfa")
-            sfb_ptr, sfb_shape, sfb_stride_order = self._make_cute_tensor_descriptor(self.sample_sfb, assumed_align=16, name="sfb")
+        _compiled_kernel = cute.compile(
+            gemm_amax,
+            a_tensor=a_cute,
+            b_tensor=b_cute,
+            sfa_tensor=sfa_cute,
+            sfb_tensor=sfb_cute,
+            c_tensor=c_cute,
+            amax_tensor=amax_cute,
+            max_active_clusters=max_active_clusters,
+            stream=fake_stream,
+            options="--enable-tvm-ffi",
+        )
 
-            self._compiled_kernel = cute.compile(
-                gemm_amax,
-                a_ptr=a_ptr,
-                a_shape=a_shape,
-                a_order=a_stride_order,
-                b_ptr=b_ptr,
-                b_shape=b_shape,
-                b_order=b_stride_order,
-                sfa_ptr=sfa_ptr,
-                sfa_shape=sfa_shape,
-                sfa_order=sfa_stride_order,
-                sfb_ptr=sfb_ptr,
-                sfb_shape=sfb_shape,
-                sfb_order=sfb_stride_order,
-                c_ptr=c_ptr,
-                c_shape=c_shape,
-                c_order=c_stride_order,
-                amax_cute=from_dlpack(self.sample_amax, assumed_align=16),
-                max_active_clusters=max_active_clusters,
-                stream=current_stream,
+        def tensor_api(
+            a_tensor: torch.Tensor,
+            b_tensor: torch.Tensor,
+            sfa_tensor: torch.Tensor,
+            sfb_tensor: torch.Tensor,
+            c_tensor: torch.Tensor,
+            amax_tensor: torch.Tensor,
+            stream: cuda.CUstream,
+        ):
+            amax_tensor = self._pad_tensor_to_ndim(amax_tensor, 3, "amax")
+
+            return _compiled_kernel(
+                a_tensor,
+                b_tensor,
+                sfa_tensor,
+                sfb_tensor,
+                c_tensor,
+                amax_tensor,
+                stream,
             )
-        else:
-            raise NotImplementedError(f"Unreachable: invalid kernel type {self._kernel}")
+
+        self._compiled_kernel = tensor_api
+
+        for attr_name in tuple(vars(self)):
+            if attr_name.startswith("sample_"):
+                setattr(self, attr_name, None)
+
         self._logger.debug("Kernel compiled successfully")
 
     def execute(
@@ -349,103 +339,26 @@ class GemmAmaxSm100(APIBase):
         c_tensor: torch.Tensor,
         amax_tensor: torch.Tensor,
         current_stream: Optional[cuda.CUstream] = None,
-        skip_compile: bool = False,
     ) -> None:
         self._logger.debug("Entering execute")
         current_stream = self._get_default_stream(current_stream)
 
-        amax_tensor = self._pad_tensor_to_ndim(amax_tensor, 3, "amax_tensor")
+        self._runtime_error_if(
+            self._compiled_kernel is None,
+            "GemmAmaxSm100 kernel not compiled; call compile() first",
+        )
+        self._logger.debug("Executing with compiled kernel")
 
-        is_ab_fp4 = self._is_fp4x2(self.ab_dtype)
-        is_c_fp4 = self._is_fp4x2(self.c_dtype)
-
-        if not skip_compile:
-            self._runtime_error_if(
-                self._compiled_kernel is None,
-                "GemmAmaxSm100 kernel not compiled; call compile() first or use execute(skip_compile=True)",
-            )
-            self._logger.debug("Executing with compiled kernel")
-
-            if self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
-                self._compiled_kernel(
-                    a_tensor=from_dlpack(a_tensor, assumed_align=16),
-                    b_tensor=from_dlpack(b_tensor, assumed_align=16),
-                    sfa_tensor=from_dlpack(sfa_tensor, assumed_align=16),
-                    sfb_tensor=from_dlpack(sfb_tensor, assumed_align=16),
-                    c_tensor=from_dlpack(c_tensor, assumed_align=16),
-                    amax_tensor=from_dlpack(amax_tensor, assumed_align=16),
-                    stream=current_stream,
-                )
-            elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernelNoDlpack:
-                a_ptr = self._make_cute_pointer(a_tensor, assumed_align=32 if is_ab_fp4 else 16)
-                b_ptr = self._make_cute_pointer(b_tensor, assumed_align=32 if is_ab_fp4 else 16)
-                c_ptr = self._make_cute_pointer(c_tensor, assumed_align=32 if is_c_fp4 else 16)
-                sfa_ptr = self._make_cute_pointer(sfa_tensor, assumed_align=16)
-                sfb_ptr = self._make_cute_pointer(sfb_tensor, assumed_align=16)
-
-                self._compiled_kernel(
-                    a_ptr=a_ptr,
-                    b_ptr=b_ptr,
-                    sfa_ptr=sfa_ptr,
-                    sfb_ptr=sfb_ptr,
-                    c_ptr=c_ptr,
-                    amax_cute=from_dlpack(amax_tensor, assumed_align=16),
-                    stream=current_stream,
-                )
-            else:
-                raise NotImplementedError(f"Unreachable: invalid kernel type {self._kernel}")
-            self._logger.debug("Executed with compiled kernel successfully")
-        else:
-            self._logger.debug("Executing without compiled kernel (JIT)")
-            gemm_amax = self._kernel(
-                sf_vec_size=self.sf_vec_size,
-                mma_tiler_mn=self.mma_tiler_mn,
-                cluster_shape_mn=self.cluster_shape_mn,
-            )
-            hardware_info = cutlass.utils.HardwareInfo()
-            max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
-
-            if self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
-                gemm_amax(
-                    a_tensor=from_dlpack(a_tensor, assumed_align=16),
-                    b_tensor=from_dlpack(b_tensor, assumed_align=16),
-                    sfa_tensor=from_dlpack(sfa_tensor, assumed_align=16),
-                    sfb_tensor=from_dlpack(sfb_tensor, assumed_align=16),
-                    c_tensor=from_dlpack(c_tensor, assumed_align=16),
-                    amax_tensor=from_dlpack(amax_tensor, assumed_align=16),
-                    max_active_clusters=max_active_clusters,
-                    stream=current_stream,
-                )
-            elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernelNoDlpack:
-                a_ptr, a_shape, a_stride_order = self._make_cute_tensor_descriptor(a_tensor, assumed_align=32 if is_ab_fp4 else 16, name="A")
-                b_ptr, b_shape, b_stride_order = self._make_cute_tensor_descriptor(b_tensor, assumed_align=32 if is_ab_fp4 else 16, name="B")
-                c_ptr, c_shape, c_stride_order = self._make_cute_tensor_descriptor(c_tensor, assumed_align=32 if is_c_fp4 else 16, name="C")
-                sfa_ptr, sfa_shape, sfa_stride_order = self._make_cute_tensor_descriptor(sfa_tensor, assumed_align=16, name="sfa")
-                sfb_ptr, sfb_shape, sfb_stride_order = self._make_cute_tensor_descriptor(sfb_tensor, assumed_align=16, name="sfb")
-
-                gemm_amax(
-                    a_ptr=a_ptr,
-                    a_shape=a_shape,
-                    a_order=a_stride_order,
-                    b_ptr=b_ptr,
-                    b_shape=b_shape,
-                    b_order=b_stride_order,
-                    sfa_ptr=sfa_ptr,
-                    sfa_shape=sfa_shape,
-                    sfa_order=sfa_stride_order,
-                    sfb_ptr=sfb_ptr,
-                    sfb_shape=sfb_shape,
-                    sfb_order=sfb_stride_order,
-                    c_ptr=c_ptr,
-                    c_shape=c_shape,
-                    c_order=c_stride_order,
-                    amax_cute=from_dlpack(amax_tensor, assumed_align=16),
-                    max_active_clusters=max_active_clusters,
-                    stream=current_stream,
-                )
-            else:
-                raise NotImplementedError(f"Unreachable: invalid kernel type {self._kernel}")
-        self._logger.debug("Executed successfully")
+        self._compiled_kernel(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            c_tensor=c_tensor,
+            amax_tensor=amax_tensor,
+            stream=current_stream,
+        )
+        self._logger.debug("Executed with compiled kernel successfully")
 
 
 import logging
@@ -466,7 +379,7 @@ def gemm_amax_wrapper_sm100(
     cluster_shape_mn: Tuple[int, int] = (1, 1),
     sf_vec_size: int = 32,
     stream: Optional[cuda.CUstream] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> TupleDict:
 
     _logger.debug("gemm_amax_wrapper_sm100: Creating empty output tensors c and amax")
 
@@ -528,7 +441,7 @@ def gemm_amax_wrapper_sm100(
             sf_vec_size=sf_vec_size,
         )
         assert gemm_amax.check_support()
-        gemm_amax.compile(current_stream=stream)
+        gemm_amax.compile()
         gemm_amax.execute(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
@@ -540,4 +453,7 @@ def gemm_amax_wrapper_sm100(
         )
         _cache_of_GemmAmaxSm100Objects[cache_key] = gemm_amax
 
-    return c_tensor, amax_tensor
+    return TupleDict(
+        c_tensor=c_tensor,
+        amax_tensor=amax_tensor,
+    )

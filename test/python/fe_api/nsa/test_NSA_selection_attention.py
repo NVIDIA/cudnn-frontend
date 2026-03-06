@@ -74,7 +74,7 @@ def test_nsa_selection_compile_execute(
         scale_softmax=cfg["scale_softmax"],
     )
     assert selection_attention.check_support()
-    selection_attention.compile(current_stream=stream)
+    selection_attention.compile()
     selection_attention.execute(
         q_tensor=Q,
         k_tensor=K,

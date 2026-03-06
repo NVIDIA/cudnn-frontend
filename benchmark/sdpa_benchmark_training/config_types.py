@@ -108,6 +108,7 @@ class BenchmarkConfig:
     num_warmup_iterations: int = 0
     skip_ref: bool = True
     deterministic_bwd: List[bool] = field(default_factory=lambda: [False])
+    sliding_window_size: Optional[int] = None  # None = no sliding window, int = window size
     output_dir: str = "../results"
 
 
@@ -173,11 +174,10 @@ class BenchmarkResult:
     max_diff: float
     num_iterations: int
 
-    # Status
+    # Optional fields (must come after required fields)
+    sliding_window_size: Optional[int] = None
     success: bool = True
     error_message: Optional[str] = None
-
-    # Metadata
     gpu_name: Optional[str] = None
     cudnn_version: Optional[str] = None
     cudnn_backend_version: Optional[int] = None

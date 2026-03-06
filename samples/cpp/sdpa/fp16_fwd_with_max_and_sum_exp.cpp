@@ -30,9 +30,9 @@ namespace fe = cudnn_frontend;
 
 /*
 Run this example by using command:
-bin/samples "Toy sdpa forward with sink"
+bin/samples "Toy sdpa forward with max and sum exp"
 
-This example shows how to construct a sdpa forward graph with sink token.
+This example shows how to construct a sdpa forward graph with max and sum exp.
 */
 
 // Tensors in forward pass
@@ -126,6 +126,7 @@ create_sdpa_forward_graph_with_max_and_sum_exp(int64_t const b,
 
     if (generate_max) {
         auto Max = graph->tensor(fe::graph::Tensor_attributes()
+                                     .set_output(true)
                                      .set_name("Max")
                                      .set_uid(MAX_UID)
                                      .set_dim({b, h_q, s_q, 1})
@@ -136,6 +137,7 @@ create_sdpa_forward_graph_with_max_and_sum_exp(int64_t const b,
 
     if (generate_sum_exp) {
         auto Sum_exp = graph->tensor(fe::graph::Tensor_attributes()
+                                         .set_output(true)
                                          .set_name("Sum_exp")
                                          .set_uid(SUM_EXP_UID)
                                          .set_dim({b, h_q, s_q, 1})
@@ -146,7 +148,11 @@ create_sdpa_forward_graph_with_max_and_sum_exp(int64_t const b,
 
     auto [O, Stats] = graph->sdpa(Q, K, V, std::move(sdpa_options));
 
-    O->set_output(true).set_dim({b, h_q, s_q, d_v}).set_stride({h_q * d_v, d_v, b * h_q * d_v, 1}).set_uid(O_UID);
+    O->set_output(true)
+        .set_name("O")
+        .set_dim({b, h_q, s_q, d_v})
+        .set_stride({h_q * d_v, d_v, b * h_q * d_v, 1})
+        .set_uid(O_UID);
 
     if (generate_stats) {
         Stats->set_output(true).set_data_type(fe::DataType_t::FLOAT).set_uid(STATS_UID);
@@ -158,15 +164,16 @@ create_sdpa_forward_graph_with_max_and_sum_exp(int64_t const b,
 }
 
 TEST_CASE("Toy sdpa forward with max and sum exp", "[graph][sdpa][flash][forward]") {
-    int64_t b             = 3;     // batch size
-    int64_t h_q           = 4;     // head dim
-    int64_t h_k           = 4;     // head dim
-    int64_t h_v           = 4;     // head dim
-    int64_t s_q           = 1024;  // q tensor is padded to this seq length
-    int64_t s_kv          = 1024;  // k and v tensor is padded to this seq length
-    int64_t d_qk          = 128;   // hidden dim
-    int64_t d_v           = 128;   // hidden dim
-    bool generate_stats   = false;
+    int64_t b    = 3;     // batch size
+    int64_t h_q  = 4;     // head dim
+    int64_t h_k  = 4;     // head dim
+    int64_t h_v  = 4;     // head dim
+    int64_t s_q  = 1024;  // q tensor is padded to this seq length
+    int64_t s_kv = 1024;  // k and v tensor is padded to this seq length
+    int64_t d_qk = 128;   // hidden dim
+    int64_t d_v  = 128;   // hidden dim
+    // Only 9.20.0 and above supports generating all 3 outputs (stats, max, sum_exp) simultaneously.
+    bool generate_stats   = (cudnnGetVersion() >= 92000);
     bool generate_max     = true;
     bool generate_sum_exp = true;
     float attn_scale      = 0.123f;

@@ -43,8 +43,8 @@ class TestBlockScaleQuantizeMatmulDynamicShape:
     """
 
     @pytest.mark.skipif(
-        cudnn.backend_version() < 91800,
-        reason="block_scale_quantize requires cuDNN >= 9.18.0",
+        cudnn.backend_version() < 91901,
+        reason="block_scale_quantize requires cuDNN >= 9.19.1",
     )
     @pytest.mark.skipif(
         get_cc() < 100,
@@ -54,6 +54,8 @@ class TestBlockScaleQuantizeMatmulDynamicShape:
         "b,m,n,k",
         [
             (1, 1024, 1024, 1024),
+            (1, 1, 1024, 1024),
+            (2, 1, 1024, 1024),
         ],
     )
     @pytest.mark.L0
@@ -70,6 +72,8 @@ class TestBlockScaleQuantizeMatmulDynamicShape:
         This mirrors the C++ test at lines 749-910.
         """
         # Skip FP4 tests if PyTorch doesn't support it
+        print(f"\n ----> Testing with cached shape: b={b}, m={m}, n={n}, k={k}")
+
         if not hasattr(torch, "float4_e2m1fn_x2"):
             pytest.skip("PyTorch does not support float4_e2m1fn_x2")
 
@@ -86,8 +90,17 @@ class TestBlockScaleQuantizeMatmulDynamicShape:
         block_size = 16
 
         matmul_dynamic_shapes = [
+            {"b": 1, "m": 1, "n": 1024, "k": 1024},
+            {"b": 1, "m": 4, "n": 1024, "k": 1024},
+            {"b": 1, "m": 24, "n": 1024, "k": 1024},
+            {"b": 1, "m": 57, "n": 1024, "k": 1024},
+            {"b": 1, "m": 64, "n": 1024, "k": 1024},
+            {"b": 1, "m": 128, "n": 1024, "k": 1024},
+            {"b": 1, "m": 200, "n": 1024, "k": 1024},
+            {"b": 1, "m": 512, "n": 1024, "k": 1024},
+            {"b": 1, "m": 2000, "n": 1024, "k": 1024},
+            {"b": 1, "m": 2048, "n": 1024, "k": 1024},
             {"b": 2, "m": 1024, "n": 1024, "k": 1024},
-            {"b": 2, "m": 2048, "n": 2048, "k": 2048},
         ]
 
         graph = cudnn.pygraph(
@@ -148,7 +161,7 @@ class TestBlockScaleQuantizeMatmulDynamicShape:
 
         graph.validate()
         graph.build_operation_graph()
-        graph.create_execution_plans([cudnn.heur_mode.FALLBACK])
+        graph.create_execution_plans([cudnn.heur_mode.A])
         graph.check_support()
         graph.build_plans()
 
@@ -219,9 +232,10 @@ class TestBlockScaleQuantizeMatmulDynamicShape:
             workspace_size = graph.get_workspace_size()
             workspace = torch.empty(workspace_size, dtype=torch.uint8, device="cuda")
 
-            graph.execute(
+            graph.execute_plan_at_index(
                 variant_pack,
                 workspace,
+                0,
                 handle=cudnn_handle,
                 override_uids=override_uids,
                 override_shapes=override_shapes,
@@ -230,4 +244,6 @@ class TestBlockScaleQuantizeMatmulDynamicShape:
 
             torch.cuda.synchronize()
 
-        print(f"✓ Test passed: b={b}, m={m}, n={n}, k={k}")
+            print(f"✓ Test passed with dynamic shape: b={dynamic_shape['b']}, m={dynamic_shape['m']}, n={dynamic_shape['n']}, k={dynamic_shape['k']}")
+
+        print(f"✓ All tests passed with cached kernel shape: b={b}, m={m}, n={n}, k={k}")

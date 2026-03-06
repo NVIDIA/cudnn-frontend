@@ -171,13 +171,13 @@ create_sdpa_backward_graph_with_sink(int64_t const b,
                                             .set_data_type(fe::DataType_t::FLOAT));
         sdpa_options.set_sink_token(sink_token);
 
-        auto dsink_token = graph->tensor(fe::graph::Tensor_attributes()
-                                             .set_name("dsink_token")
+        auto dSink_token = graph->tensor(fe::graph::Tensor_attributes()
+                                             .set_name("dSink_token")
                                              .set_uid(DSINK_TOKEN_UID)
                                              .set_dim({1, h_q, 1, 1})
                                              .set_stride({h_q, 1, 1, 1})
                                              .set_data_type(fe::DataType_t::FLOAT));
-        sdpa_options.set_dsink_token(dsink_token);
+        sdpa_options.set_dsink_token(dSink_token);
     }
 
     // Compute SDPA backward and get gradients dQ, dK, dV
@@ -315,10 +315,10 @@ TEST_CASE("Toy sdpa backward with sink", "[graph][sdpa][flash][backward]") {
 
     // If sink token is enabled, add it to the variant pack
     Surface<float> sink_token_tensor(1 * h_q * 1 * 1, false);
-    Surface<float> dsink_token_tensor(1 * h_q * 1 * 1, false);
+    Surface<float> dSink_token_tensor(1 * h_q * 1 * 1, false);
     if (has_sink_token) {
         variant_pack[SINK_TOKEN_UID]  = sink_token_tensor.devPtr;
-        variant_pack[DSINK_TOKEN_UID] = dsink_token_tensor.devPtr;
+        variant_pack[DSINK_TOKEN_UID] = dSink_token_tensor.devPtr;
     }
 
     // Allocate workspace

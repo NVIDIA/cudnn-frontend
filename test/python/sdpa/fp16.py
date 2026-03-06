@@ -16,6 +16,7 @@ from .helpers import (
     create_container_and_page_table,
     time_execution,
     profile_execution,
+    print_tensor_stats,
 )
 
 # fmt: off
@@ -38,7 +39,7 @@ class TensorUid(IntEnum):
     k_ragged_offset = 14
     v_ragged_offset = 15
     o_ragged_offset = 16
-    stats_ragged_offset = 17
+    stats_ragged_offset = 17  # Also used for score_max and score_sum_exp
     seed = 18
     offset = 19
     rng_dump = 20
@@ -48,7 +49,10 @@ class TensorUid(IntEnum):
     page_table_k = 24
     page_table_v = 25
     workspace = 26
-
+    score_max = 27
+    score_sum_exp = 28
+    sink_token = 29
+    dSink_token = 30
 
 def validate_config(cfg):
     if not all((x > 0 and type(x) == int) for x in (cfg.batches, cfg.d_qk, cfg.d_v, cfg.s_q, cfg.s_kv, cfg.h_q, cfg.h_k, cfg.h_v)):
@@ -58,6 +62,7 @@ def validate_config(cfg):
     assert cfg.shape_k == (cfg.batches, cfg.h_k, cfg.s_kv, cfg.d_qk), f"wrong shape_k={cfg.shape_k}"
     assert cfg.shape_v == (cfg.batches, cfg.h_v, cfg.s_kv, cfg.d_v), f"wrong shape_v={cfg.shape_v}"
     assert cfg.shape_o == (cfg.batches, cfg.h_q, cfg.s_q, cfg.d_v), f"wrong shape_o={cfg.shape_o}"
+    assert cfg.shape_stats == (cfg.batches, cfg.h_q, cfg.s_q, 1), f"wrong shape_stats={cfg.shape_stats}"
 
     if cfg.is_train:
         assert cfg.is_paged == False and cfg.block_size == None, "paged attention not allowed in backward pass"
@@ -93,6 +98,11 @@ def validate_config(cfg):
         print("@@@@ Overall result: WAIVED, skipping known issue of s_q == s_kv == 1.")
         pytest.skip("skipping known issue of s_q == s_kv == 1")
 
+    if cudnn_version < "9.20.0" and (cfg.is_train, cfg.with_score_max, cfg.with_score_sum_exp) not in \
+        [(False, False, False), (True, False, False), (False, True, True)]:
+        print("@@@@ Overall result: WAIVED, certain combinations of softmax outputs require cuDNN 9.20.0 or higher.")
+        pytest.skip("certain combinations of softmax outputs require cuDNN 9.20.0 or higher")
+
 
 def allocate_tensors(cfg, rng_data_gen):
     allocs = {}
@@ -105,6 +115,8 @@ def allocate_tensors(cfg, rng_data_gen):
         allocs[TensorUid.v] = alloc_tensor((max_t_kv, cfg.h_v, cfg.d_v), cfg.data_type, rng=rng_data_gen, mean=-0.5, std=1.0)
         allocs[TensorUid.o] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_v), cfg.data_type)
         allocs[TensorUid.stats] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32) if cfg.is_train else (None, None, None)
+        allocs[TensorUid.score_max] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32) if cfg.with_score_max else (None, None, None)
+        allocs[TensorUid.score_sum_exp] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32) if cfg.with_score_sum_exp else (None, None, None)
         if cfg.is_train:
             allocs[TensorUid.dQ] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_qk), cfg.data_type)
             allocs[TensorUid.dK] = alloc_tensor((max_t_kv, cfg.h_k, cfg.d_qk), cfg.data_type)
@@ -115,7 +127,9 @@ def allocate_tensors(cfg, rng_data_gen):
         allocs[TensorUid.k] = alloc_tensor(cfg.shape_k, cfg.data_type, strides=cfg.stride_k, rng=rng_data_gen, mean=-0.5, std=1.0)
         allocs[TensorUid.v] = alloc_tensor(cfg.shape_v, cfg.data_type, strides=cfg.stride_v, rng=rng_data_gen, mean=-0.5, std=1.0)
         allocs[TensorUid.o] = alloc_tensor(cfg.shape_o, cfg.data_type, strides=cfg.stride_o)
-        allocs[TensorUid.stats] = alloc_tensor((cfg.batches, cfg.h_q, cfg.s_q, 1), torch.float32) if cfg.is_train else (None, None, None)
+        allocs[TensorUid.stats] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if cfg.is_train else (None, None, None)
+        allocs[TensorUid.score_max] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if cfg.with_score_max else (None, None, None)
+        allocs[TensorUid.score_sum_exp] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if cfg.with_score_sum_exp else (None, None, None)
         if cfg.is_train:
             allocs[TensorUid.dQ] = alloc_tensor(cfg.shape_q, cfg.data_type, strides=cfg.stride_q)
             allocs[TensorUid.dK] = alloc_tensor(cfg.shape_k, cfg.data_type, strides=cfg.stride_k)
@@ -148,6 +162,10 @@ def allocate_tensors(cfg, rng_data_gen):
         allocs[TensorUid.seed] = (torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda"), None, None)
         allocs[TensorUid.offset] = (torch.full((1, 1, 1, 1), 789, dtype=torch.int64, device="cuda"), None, None)
         allocs[TensorUid.rng_dump] = (torch.zeros((cfg.batches, cfg.h_q, cfg.s_q, cfg.s_kv), dtype=torch.float32, device="cuda"), None, None)
+    if cfg.with_sink_token:
+        allocs[TensorUid.sink_token] = alloc_tensor((1, cfg.h_q, 1, 1), torch.float32, rng=rng_data_gen, mean=0.0, std=0.5)
+    if cfg.is_train and cfg.with_sink_token:
+        allocs[TensorUid.dSink_token] = alloc_tensor((1, cfg.h_q, 1, 1), torch.float32)
 
     if cfg.is_paged:
         container_k, page_table_k = create_container_and_page_table(allocs[TensorUid.k][0], cfg.block_size)
@@ -208,12 +226,23 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
     k_ragged_offset = graph.tensor(uid=int(TensorUid.k_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
     v_ragged_offset = graph.tensor(uid=int(TensorUid.v_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
     o_ragged_offset = graph.tensor(uid=int(TensorUid.o_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
-    stats_ragged_offset = graph.tensor(uid=int(TensorUid.stats_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged and cfg.is_train else None
+    stats_ragged_offset = graph.tensor(uid=int(TensorUid.stats_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
 
     if cfg.is_ragged:
         q.set_ragged_offset(q_ragged_offset)
         k.set_ragged_offset(k_ragged_offset)
         v.set_ragged_offset(v_ragged_offset)
+
+    # Create graph tensors for score_max and score_sum_exp
+    score_max = score_sum_exp = sink_token = None
+    if cfg.with_score_max:
+        score_max = graph.tensor(uid=int(TensorUid.score_max), dim=cfg.shape_stats, stride=cfg.stride_stats, data_type=cudnn.data_type.FLOAT)
+        score_max.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    if cfg.with_score_sum_exp:
+        score_sum_exp = graph.tensor(uid=int(TensorUid.score_sum_exp), dim=cfg.shape_stats, stride=cfg.stride_stats, data_type=cudnn.data_type.FLOAT)
+        score_sum_exp.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    if cfg.with_sink_token:
+        sink_token = graph.tensor(uid=int(TensorUid.sink_token), dim=(1, cfg.h_q, 1, 1), stride=(cfg.h_q, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
 
     attn_scale = 0.125
 
@@ -237,16 +266,22 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         paged_attention_v_table=page_table_v,
         paged_attention_max_seq_len_kv=paged_attention_max_seq_len_kv,
         implementation=cfg.implementation,
+        score_max=score_max,
+        score_sum_exp=score_sum_exp,
+        sink_token=sink_token,
     )
 
     o.set_uid(int(TensorUid.o)).set_output(True).set_dim(cfg.shape_o).set_stride(cfg.stride_o)
     if cfg.is_ragged:
         o.set_ragged_offset(o_ragged_offset)
 
+        if cfg.with_score_max:
+            score_max.set_ragged_offset(stats_ragged_offset)
+        if cfg.with_score_sum_exp:
+            score_sum_exp.set_ragged_offset(stats_ragged_offset)
+    
     if cfg.is_train:
-        dim_stats = (cfg.batches, cfg.h_q, cfg.s_q, 1)
-        stride_stats = (cfg.s_q * cfg.h_q, 1, cfg.h_q, 1) if cfg.is_ragged else (cfg.h_q * cfg.s_q, cfg.s_q, 1, 1)
-        stats.set_uid(int(TensorUid.stats)).set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim(dim_stats).set_stride(stride_stats)
+        stats.set_uid(int(TensorUid.stats)).set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim(cfg.shape_stats).set_stride(cfg.stride_stats)
         if cfg.is_ragged:
             stats.set_ragged_offset(stats_ragged_offset)
 
@@ -278,6 +313,9 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         int(TensorUid.stats_ragged_offset): tensors.get(TensorUid.stats_ragged_offset),
         int(TensorUid.o): tensors.get(TensorUid.o),
         int(TensorUid.stats): tensors.get(TensorUid.stats),
+        int(TensorUid.score_max): tensors.get(TensorUid.score_max),
+        int(TensorUid.score_sum_exp): tensors.get(TensorUid.score_sum_exp),
+        int(TensorUid.sink_token): tensors.get(TensorUid.sink_token),
         int(TensorUid.page_table_k): tensors.get(TensorUid.page_table_k),
         int(TensorUid.page_table_v): tensors.get(TensorUid.page_table_v),
         int(TensorUid.seed): tensors.get(TensorUid.seed),
@@ -303,15 +341,12 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         sm_version=sm_version
     )
 
-    dim_stats = (cfg.batches, cfg.h_q, cfg.s_q, 1)
-    stride_stats = (cfg.s_q * cfg.h_q, 1, cfg.h_q, 1) if cfg.is_ragged else (cfg.h_q * cfg.s_q, cfg.s_q, 1, 1)
-
     q = graph.tensor(uid=int(TensorUid.q), dim=cfg.shape_q, stride=cfg.stride_q, data_type=cudnn_dtype)
     k = graph.tensor(uid=int(TensorUid.k), dim=cfg.shape_k, stride=cfg.stride_k, data_type=cudnn_dtype)
     v = graph.tensor(uid=int(TensorUid.v), dim=cfg.shape_v, stride=cfg.stride_v, data_type=cudnn_dtype)
     o = graph.tensor(uid=int(TensorUid.o), dim=cfg.shape_o, stride=cfg.stride_o, data_type=cudnn_dtype)
     dO = graph.tensor(uid=int(TensorUid.dO), dim=cfg.shape_o, stride=cfg.stride_o, data_type=cudnn_dtype)
-    stats = graph.tensor(uid=int(TensorUid.stats), dim=dim_stats, stride=stride_stats, data_type=cudnn.data_type.FLOAT)
+    stats = graph.tensor(uid=int(TensorUid.stats), dim=cfg.shape_stats, stride=cfg.stride_stats, data_type=cudnn.data_type.FLOAT)
 
     bias_dim = (1, cfg.h_q, cfg.s_q, cfg.s_kv)
     bias_stride = (cfg.h_q * cfg.s_q * cfg.s_kv, cfg.s_q * cfg.s_kv, cfg.s_kv, 1)
@@ -326,6 +361,11 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         seed = graph.tensor(uid=int(TensorUid.seed), dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
         offset = graph.tensor(uid=int(TensorUid.offset), dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
         dropout_tuple = (cfg.dropout_prob, seed, offset)
+
+    sink_token = dSink_token = None
+    if cfg.with_sink_token:
+        sink_token = graph.tensor(uid=int(TensorUid.sink_token), dim=(1, cfg.h_q, 1, 1), stride=(cfg.h_q, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
+        dSink_token = graph.tensor(uid=int(TensorUid.dSink_token), dim=(1, cfg.h_q, 1, 1), stride=(cfg.h_q, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
 
     attn_scale = 0.125
 
@@ -346,6 +386,8 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         diagonal_alignment=cfg.diag_align,
         dropout=dropout_tuple,
         use_deterministic_algorithm=cfg.is_determin,
+        sink_token=sink_token,
+        dSink_token=dSink_token,
     )
 
     dQ.set_uid(int(TensorUid.dQ)).set_output(True).set_dim(cfg.shape_q).set_stride(cfg.stride_q)
@@ -387,6 +429,8 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         int(TensorUid.v): tensors.get(TensorUid.v),
         int(TensorUid.o): tensors.get(TensorUid.o),
         int(TensorUid.stats): tensors.get(TensorUid.stats),
+        int(TensorUid.sink_token): tensors.get(TensorUid.sink_token),
+        int(TensorUid.dSink_token): tensors.get(TensorUid.dSink_token),
         int(TensorUid.dQ): tensors.get(TensorUid.dQ),
         int(TensorUid.dK): tensors.get(TensorUid.dK),
         int(TensorUid.dV): tensors.get(TensorUid.dV),
@@ -415,15 +459,20 @@ def check_deterministic(cfg, tensors, allocs, bwd_graph, bwd_pack, cudnn_handle,
     dQ_gpu = tensors.get(TensorUid.dQ)
     dK_gpu = tensors.get(TensorUid.dK)
     dV_gpu = tensors.get(TensorUid.dV)
+    dBias_gpu = tensors.get(TensorUid.dBias)
     workspace = allocs[TensorUid.workspace]
 
     dQ_gpu_rerun = dQ_gpu.clone().detach()
     dK_gpu_rerun = dK_gpu.clone().detach()
     dV_gpu_rerun = dV_gpu.clone().detach()
-
+    if cfg.is_bias:
+        dBias_gpu_rerun = dBias_gpu.clone().detach()
+    
     torch.fill_(dQ_gpu, float("nan"))
     torch.fill_(dK_gpu, float("nan"))
     torch.fill_(dV_gpu, float("nan"))
+    if cfg.is_bias:
+        torch.fill_(dBias_gpu, float("nan"))
     bwd_graph.execute(bwd_pack, workspace[0], cudnn_handle)
     torch.cuda.synchronize()
 
@@ -431,11 +480,16 @@ def check_deterministic(cfg, tensors, allocs, bwd_graph, bwd_pack, cudnn_handle,
     determin_err_count += exact_equal(dQ_gpu, dQ_gpu_rerun, tag="dQ_determin", disp_elems=request.config.getoption("--diffs"))
     determin_err_count += exact_equal(dK_gpu, dK_gpu_rerun, tag="dK_determin", disp_elems=request.config.getoption("--diffs"))
     determin_err_count += exact_equal(dV_gpu, dV_gpu_rerun, tag="dV_determin", disp_elems=request.config.getoption("--diffs"))
+    if cfg.is_bias:
+        determin_err_count += exact_equal(dBias_gpu, dBias_gpu_rerun, tag="dBias_determin", disp_elems=request.config.getoption("--diffs"))
+    # NOTE: dSink_token is implemented non-deterministically (even if determinism enabled),
+    # therefore not included in this check.
 
     if determin_err_count != 0:
         print("@@@@ Overall result: FAILED, determinism check failed - outputs differ between runs.")
         pytest.fail("determinism check failed", pytrace=False)
-    print("@@@@ Determinism check: PASSED, dQ, dK, dV bitwise match between runs.")
+    print("@@@@ Determinism check: PASSED, dQ, dK, dV" + 
+          (", dBias" if cfg.is_bias else "") + " bitwise match between runs.")
 
 
 def execute_graph(graph, variant_pack, allocs, tensors, cudnn_handle, request, label="Graph"):
@@ -469,6 +523,9 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
     block_mask_gpu = tensors.get(TensorUid.block_mask)
     bias_gpu = tensors.get(TensorUid.bias)
     rng_dump_gpu = tensors.get(TensorUid.rng_dump)
+    score_max_gpu = tensors.get(TensorUid.score_max)
+    score_sum_exp_gpu = tensors.get(TensorUid.score_sum_exp)
+    sink_token_gpu = tensors.get(TensorUid.sink_token)
 
     q_ref = q_gpu.detach().float()
     k_ref = k_gpu.detach().float()
@@ -479,11 +536,14 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
     block_mask_ref = block_mask_gpu.detach() if block_mask_gpu is not None else None
     bias_ref = bias_gpu.detach().float() if bias_gpu is not None else None
     rng_dump_ref = rng_dump_gpu.detach().float() if rng_dump_gpu is not None else None
+    sink_token_ref = sink_token_gpu.detach().float() if sink_token_gpu is not None else None
 
     if cfg.is_train:
         q_ref.requires_grad_()
         k_ref.requires_grad_()
         v_ref.requires_grad_()
+    if cfg.is_train and cfg.with_sink_token:
+        sink_token_ref.requires_grad_()
     if cfg.is_train and cfg.is_bias:
         bias_ref.requires_grad_()
 
@@ -511,10 +571,10 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
         diag_align=cfg.diag_align,
         dropout_prob=cfg.dropout_prob,
         dropout_mask=rng_dump_ref,
-        generate_stats=cfg.is_train,
+        sink_token=sink_token_ref,
     )
 
-    o_ref, stats_ref = ret if cfg.is_train else (ret, None)
+    o_ref, stats_ref, score_max_ref, score_sum_exp_ref = ret
 
     o_gpu = tensors.get(TensorUid.o)
     stats_gpu = tensors.get(TensorUid.stats)
@@ -529,14 +589,31 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
                     stats_gpu[i, :, m:, :] = 0
                 else:
                     stats_ref[i, :, m:, :] = -float("inf")
+            # zero out padded regions for score_max and score_sum_exp
+            if cfg.with_score_max:
+                score_max_ref[i, :, m:, :] = 0
+                score_max_gpu[i, :, m:, :] = 0
+            if cfg.with_score_sum_exp:
+                score_sum_exp_ref[i, :, m:, :] = 0
+                score_sum_exp_gpu[i, :, m:, :] = 0
 
     if cfg.is_train:
-        inputs_ref = [q_ref, k_ref, v_ref, bias_ref] if cfg.is_bias else [q_ref, k_ref, v_ref]
+        inputs_ref = [q_ref, k_ref, v_ref]
+        if cfg.is_bias:
+            inputs_ref.append(bias_ref)
+        if cfg.with_sink_token:
+            inputs_ref.append(sink_token_ref)
         grads = torch.autograd.grad(outputs=o_ref, inputs=inputs_ref, grad_outputs=dO_ref)
         dQ_ref = grads[0]
         dK_ref = grads[1]
         dV_ref = grads[2]
-        dBias_ref = grads[3] if cfg.is_bias else None
+        idx = 3
+        if cfg.is_bias:
+            dBias_ref = grads[idx]
+            idx += 1
+        if cfg.with_sink_token:
+            dSink_token_ref = grads[idx]
+            idx += 1
 
     if cfg.is_train and cfg.is_padding:
         for i, (m, n) in enumerate(zip(seq_len_q_ref, seq_len_kv_ref)):
@@ -546,14 +623,43 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
 
     if cfg.is_ragged:
         o_ref = convert_uniform_to_packed(o_ref, seq_len_q_ref, max_t_q)
+        if cfg.with_score_max:
+            score_max_ref = convert_uniform_to_packed(score_max_ref, seq_len_q_ref, max_t_q)
+        if cfg.with_score_sum_exp:
+            score_sum_exp_ref = convert_uniform_to_packed(score_sum_exp_ref, seq_len_q_ref, max_t_q)
     if cfg.is_train and cfg.is_ragged:
         dQ_ref = convert_uniform_to_packed(dQ_ref, seq_len_q_ref, max_t_q)
         dK_ref = convert_uniform_to_packed(dK_ref, seq_len_kv_ref, max_t_kv)
         dV_ref = convert_uniform_to_packed(dV_ref, seq_len_kv_ref, max_t_kv)
         stats_ref = convert_uniform_to_packed(stats_ref, seq_len_q_ref, max_t_q)
 
+    # Print hash and stats BEFORE comparison (approx_equal destroys tensor contents)
+    print_tensor_stats(allocs[TensorUid.o][0], tag="o_gpu")
+    if not cfg.is_infer:
+        print_tensor_stats(allocs[TensorUid.stats][0], tag="stats_gpu")
+        print_tensor_stats(allocs[TensorUid.dQ][0], tag="dQ_gpu")
+        print_tensor_stats(allocs[TensorUid.dK][0], tag="dK_gpu")
+        print_tensor_stats(allocs[TensorUid.dV][0], tag="dV_gpu")
+        if cfg.is_bias:
+            print_tensor_stats(allocs[TensorUid.dBias][0], tag="dBias_gpu")
+        if cfg.with_sink_token:
+            print_tensor_stats(allocs[TensorUid.dSink_token][0], tag="dSink_token_gpu")
+
+    # Sanity check: fail if output is all NaN (indicates computation failure)
+    # o_tensor = allocs[TensorUid.o][0]
+    # nan_ratio = torch.isnan(o_tensor).sum().item() / o_tensor.numel()
+    # if nan_ratio > 0.5:
+    #     print(f"%%%% ERROR: Output is {nan_ratio*100:.1f}% NaN - computation likely failed")
+    #     pytest.fail(f"Output is {nan_ratio*100:.1f}% NaN - computation failed", pytrace=False)
+
+    # Compare tensors (note: approx_equal fills tensors with NaN for boundary checks)
     err_count = 0
     err_count += approx_equal(allocs[TensorUid.o], o_ref, atol=2e-2, rtol=2e-2, tag="o", disp_elems=diffs)
+    if cfg.with_score_max:
+        err_count += approx_equal(allocs[TensorUid.score_max], score_max_ref, atol=2e-2, rtol=2e-2, tag="score_max", disp_elems=diffs)
+    if cfg.with_score_sum_exp:
+        err_count += approx_equal(allocs[TensorUid.score_sum_exp], score_sum_exp_ref, atol=2e-2, rtol=2e-2, tag="score_sum_exp", disp_elems=diffs)
+
     if cfg.is_train:
         dkv_atol = 2e-2 if cfg.data_type == torch.float16 else 7e-2
         err_count += approx_equal(allocs[TensorUid.stats], stats_ref, atol=2e-2, rtol=2e-2, tag="stats", disp_elems=diffs)
@@ -562,6 +668,8 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
         err_count += approx_equal(allocs[TensorUid.dV], dV_ref, atol=dkv_atol, rtol=2e-2, tag="dV", disp_elems=diffs)
     if cfg.is_train and cfg.is_bias:
         err_count += approx_equal(allocs[TensorUid.dBias], dBias_ref, atol=2e-2, rtol=2e-2, tag="dBias", disp_elems=diffs)
+    if cfg.is_train and cfg.with_sink_token:
+        err_count += approx_equal(allocs[TensorUid.dSink_token], dSink_token_ref, atol=2e-2, rtol=2e-2, tag="dSink_token", disp_elems=diffs)
 
     if err_count != 0:
         print("@@@@ Overall result: FAILED, disallowed mismatches")
