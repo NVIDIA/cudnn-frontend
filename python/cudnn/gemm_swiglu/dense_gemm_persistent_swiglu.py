@@ -35,11 +35,8 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
-import cutlass.cute.testing as testing
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.runtime import from_dlpack
 import cutlass.cute.math as math
-import inspect
 
 # Mathematical constant: log2(e) for converting exp(x) to exp2(x * log2(e))
 LOG2_E = 1.4426950408889634
@@ -1115,8 +1112,8 @@ class PersistentDenseGemmKernel:
 
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
+                        "async.shared",
+                        space="cta",
                     )
                     epilog_threads = 32 * len(self.epilog_warp_id)
                     cute.arch.barrier(
@@ -1527,57 +1524,3 @@ class PersistentDenseGemmKernel:
         num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
 
         return num_tmem_alloc_cols
-
-
-class PersistentDenseGemmKernelNoDlpack:
-    """Wrapper around PersistentDenseGemmKernel that avoids DLPack.
-
-    This wrapper constructs cute.Tensors directly from cute.Pointer, shapes, and
-    explicit layout orders for operands A, B, AB12 and C.
-    """
-
-    def __init__(
-        self,
-        acc_dtype: Type[cutlass.Numeric],
-        use_2cta_instrs: bool,
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-    ):
-        self.kernel = PersistentDenseGemmKernel(
-            acc_dtype=acc_dtype,
-            use_2cta_instrs=use_2cta_instrs,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-        )
-
-    @cute.jit
-    def __call__(
-        self,
-        a_ptr: cute.Pointer,
-        a_shape: cutlass.Constexpr[Tuple[int, int, int]],
-        a_order: cutlass.Constexpr[Tuple[int, int, int]],
-        b_ptr: cute.Pointer,
-        b_shape: cutlass.Constexpr[Tuple[int, int, int]],
-        b_order: cutlass.Constexpr[Tuple[int, int, int]],
-        ab12_ptr: cute.Pointer,
-        ab12_shape: cutlass.Constexpr[Tuple[int, int, int]],
-        ab12_order: cutlass.Constexpr[Tuple[int, int, int]],
-        c_cute: cute.Tensor,
-        alpha: cutlass.Float32,
-        max_active_clusters: cutlass.Constexpr,
-        stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x / (1 + math.exp(-x, True)),
-    ):
-        a_cute = cute.make_tensor(a_ptr, layout=cute.make_ordered_layout(a_shape, order=a_order))
-        b_cute = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout(b_shape, order=b_order))
-        ab12_cute = cute.make_tensor(ab12_ptr, layout=cute.make_ordered_layout(ab12_shape, order=ab12_order))
-        self.kernel(
-            a_cute,
-            b_cute,
-            ab12_cute,
-            c_cute,
-            alpha,
-            max_active_clusters,
-            stream,
-            epilogue_op,
-        )

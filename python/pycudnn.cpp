@@ -56,6 +56,8 @@ throw_if(bool const cond, cudnn_frontend::error_code_t const error_code, std::st
             throw std::runtime_error(error_msg);
         case cudnn_frontend::error_code_t::INVALID_VALUE:
             throw std::runtime_error(error_msg);
+        case cudnn_frontend::error_code_t::NVRTC_COMPILATION_FAILED:
+            throw std::runtime_error(error_msg);
     }
 }
 

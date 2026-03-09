@@ -1,19 +1,12 @@
 from typing import Callable, Union
-import math
 
-import numpy as np
-import argparse
-import torch
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass.cute.runtime import from_dlpack
-from cutlass._mlir.dialects import llvm
 
 """
 A NSA(Native Sparse Attention) attention forward pass example for NVIDIA Ampere SM90 architecture using Cute DSL.
@@ -99,6 +92,53 @@ class HopperSelectAttentionFwd:
             stream (cuda.CUstream):
                 CUDA stream
         """
+        # (1, t, h_k * h_r, d) -> (h_r, d, t, h_k)
+        Q = cute.make_tensor(
+            Q.iterator,
+            cute.make_layout(
+                (self.GQA_group_size, Q.shape[3], Q.shape[1] * Q.shape[0], Q.shape[2] // self.GQA_group_size),
+                stride=(Q.stride[2], Q.stride[3], Q.stride[1], Q.stride[2] * self.GQA_group_size),
+            ),
+        )
+
+        # (1, t, h_k, d) -> (t, d, h_kv)
+        K = cute.make_tensor(
+            K.iterator,
+            cute.make_layout((K.shape[1] * K.shape[0], K.shape[3], K.shape[2]), stride=(K.stride[1], K.stride[3], K.stride[2])),
+        )
+
+        # (1, t, h_k, d) -> (t, d, h_kv)
+        V = cute.make_tensor(
+            V.iterator,
+            cute.make_layout((V.shape[1] * V.shape[0], V.shape[3], V.shape[2]), stride=(V.stride[1], V.stride[3], V.stride[2])),
+        )
+
+        # (1, t, h_k * h_r, d) -> (h_r, d, t, h_k)
+        O = cute.make_tensor(
+            O.iterator,
+            cute.make_layout(
+                (self.GQA_group_size, O.shape[3], O.shape[1] * O.shape[0], O.shape[2] // self.GQA_group_size),
+                stride=(O.stride[2], O.stride[3], O.stride[1], O.stride[2] * self.GQA_group_size),
+            ),
+        )
+
+        # (1, t, h_k * h_r) -> (h_r, t, h_k)
+        L = cute.make_tensor(
+            L.iterator,
+            cute.make_layout(
+                (self.GQA_group_size, L.shape[1] * L.shape[0], L.shape[2] // self.GQA_group_size),
+                stride=(L.stride[2], L.stride[1], L.stride[2] * self.GQA_group_size),
+            ),
+        )
+
+        # (1, t, h_k * h_r) -> (h_r, t, h_k)
+        M = cute.make_tensor(
+            M.iterator,
+            cute.make_layout(
+                (self.GQA_group_size, M.shape[1] * M.shape[0], M.shape[2] // self.GQA_group_size),
+                stride=(M.stride[2], M.stride[1], M.stride[2] * self.GQA_group_size),
+            ),
+        )
 
         self.Q_layout = utils.LayoutEnum.from_tensor(Q)
         self.K_layout = utils.LayoutEnum.from_tensor(K)
@@ -1005,8 +1045,8 @@ class HopperSelectAttentionFwd:
         warp_idx,
     ):
         cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
+            "async.shared",
+            space="cta",
         )
         cute.arch.barrier()
 
@@ -1064,8 +1104,8 @@ class HopperSelectAttentionFwd:
             cute.copy(tiled_copy_r2s, tRS_rD_out, tRS_dv_sD[(None, None, None, epi_buffer)])
 
             cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
+                "async.shared",
+                space="cta",
             )
             # barrier for sync
             cute.arch.barrier()

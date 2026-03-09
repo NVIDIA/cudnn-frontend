@@ -18,7 +18,7 @@ def compute_ref(
     right_bound=None,
     dropout_prob=0.0,
     dropout_mask=None,
-    generate_stats=False,
+    sink_token=None,
     device="cuda",
 ):
     b, h_q, s_q, d_qk = q.shape
@@ -44,6 +44,14 @@ def compute_ref(
         v = v.unsqueeze(2)
         v = v.expand(-1, -1, h_q // h_v, -1, -1)
         v = v.reshape(v.size(0), -1, v.size(3), v.size(4))
+
+    # Handle sink token - a scalar attention score per head that competes with Q*K scores
+    # sink_token shape: (1, h_q, 1, 1) - a scalar per head
+    # The sink absorbs attention but contributes zero to the output (no V for sink)
+    # This affects softmax: M = max(max_k(s_k), sink), p_i = exp(s_i - M) / (sum_k(exp(s_k - M)) + exp(sink - M))
+    has_sink_token = sink_token is not None
+    if has_sink_token:
+        sink_token = sink_token.to(dtype=torch.float32, device=device)
 
     # generate masks to compute reference values for padding mask (also called variable sequence length)
     if padding is not None:
@@ -151,7 +159,33 @@ def compute_ref(
         block_mask = block_mask[:, :, :s_q, :s_kv]
         s += torch.where(block_mask, torch.tensor(0.0), torch.tensor(float('-inf')))
 
-    p = torch.softmax(s, dim=-1)
+    # Compute softmax with optional sink_token, score_max and score_sum_exp (last two are for muon clip support)
+    # * sink_token is a scalar per head that competes with Q*K scores in softmax
+    #   but contributes zero to output (no V for sink), shape (1, h_q, 1, 1)
+    # * score_max: global max of attention scores per batch-head pair, shape (b, h_q, s_q, 1)
+    # * score_sum_exp: sum of exp(s - score_max) across all positions, shape (b, h_q, s_q, 1)
+    score_max_ref = s.amax(dim=-1, keepdim=True)  # (b, h_q, s_q, 1)
+    if has_sink_token:
+        # sink_token shape: (1, h_q, 1, 1) -> broadcast to (b, h_q, s_q, 1)
+        score_max_ref = torch.maximum(score_max_ref, sink_token)  # (b, h_q, s_q, 1)
+
+    # Compute normalized exponentials
+    s_normalized = torch.where(torch.isneginf(s), float('-inf'), s - score_max_ref)
+    exp_s = torch.exp(s_normalized)  # (b, h_q, s_q, s_kv)
+
+    # Sum across kv dimension for each query, then sum across query dimension
+    score_sum_exp_ref = exp_s.sum(dim=(-1), keepdim=True)  # (b, h_q, s_q, 1)
+
+    # Sum of exponentials including sink
+    if has_sink_token:
+        exp_sink = torch.exp(sink_token - score_max_ref)  # (b, h_q, s_q, 1)
+        score_sum_exp_ref += exp_sink  # (b, h_q, s_q, 1)
+
+    # Stats output
+    stats_ref = torch.log(score_sum_exp_ref) + score_max_ref
+
+    # Softmax probabilities (sink doesn't contribute to output, so no sink column in p)
+    p = exp_s / score_sum_exp_ref  # (b, h_q, s_q, s_kv)
 
     all_inf = torch.isneginf(s).all(dim=-1, keepdim=True)
     if torch.any(all_inf):
@@ -165,11 +199,6 @@ def compute_ref(
         assert dropout_mask != None, "PyTorch reference must have dropout_mask for dropout"
         p = (p * dropout_mask) / (1 - dropout_prob)
 
-    o = torch.einsum("bhqk,bhkd->bhqd", p, v)
+    o_ref = torch.einsum("bhqk,bhkd->bhqd", p, v)
 
-    # softmax stats is used for backwards computation
-    if generate_stats:
-        stats = torch.logsumexp(s, dim=-1, keepdim=True)
-        return o, stats
-
-    return o
+    return o_ref, stats_ref, score_max_ref, score_sum_exp_ref

@@ -93,9 +93,12 @@ def nsa_init(
     s_q_default_override: Optional[int] = None,
     s_kv_default_override: Optional[int] = None,
 ):
-    major, _ = torch.cuda.get_device_capability()
-    if major < 10:
+    major, minor = torch.cuda.get_device_capability()
+    compute_capability = major * 10 + minor
+    if compute_capability < 100:
         pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
+    if compute_capability == 103:
+        pytest.skip("cuteDSL is not supported on SM103")
 
     b = int(request.config.getoption("--nsa-b")) if request.config.getoption("--nsa-b") is not None else 2
     s_q = (

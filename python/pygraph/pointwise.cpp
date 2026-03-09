@@ -81,8 +81,8 @@ PyGraph::relu(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::swish(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
-               cudnn_frontend::DataType_t const& compute_data_type,
                std::optional<float> const& swish_beta,
+               cudnn_frontend::DataType_t const& compute_data_type,
                std::string const& name) {
     auto attributes = cudnn_frontend::graph::Pointwise_attributes()
                           .set_compute_data_type(compute_data_type)

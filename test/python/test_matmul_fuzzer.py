@@ -210,6 +210,9 @@ def fill_with_garbage(tensor: torch.Tensor, nan_probability: float = 0.1) -> Non
         tensor[nan_mask] = float('nan')
 
 
+from sdpa.helpers import create_sparse_int_tensor, print_tensor_stats, compare_tensors
+
+
 # ============================================================================
 # Test Configuration
 # ============================================================================
@@ -426,18 +429,9 @@ def create_tensors(config: MatmulConfig, rng: random.Random):
     config.b_elems = b_elems
     config.c_elems = c_elems
 
-    # Create tensors
-    if config.a_dtype == torch.int8:
-        a_storage = torch.randint(-2, 3, (a_elems,), device='cuda', dtype=torch.int8)
-    else:
-        a_storage = torch.empty(a_elems, device='cuda', dtype=config.a_dtype)
-        a_storage.normal_(mean=0.5, std=0.5, generator=torch_rng)
-
-    if config.b_dtype == torch.int8:
-        b_storage = torch.randint(-2, 3, (b_elems,), device='cuda', dtype=torch.int8)
-    else:
-        b_storage = torch.empty(b_elems, device='cuda', dtype=config.b_dtype)
-        b_storage.normal_(mean=0.5, std=0.5,generator=torch_rng)
+    # Create tensors using sparse small integers for better low-precision testing
+    a_storage = create_sparse_int_tensor((a_elems,), config.a_dtype, torch_rng)
+    b_storage = create_sparse_int_tensor((b_elems,), config.b_dtype, torch_rng)
 
     # Create strided views
     A = torch.as_strided(a_storage, a_shape, a_strides)
@@ -464,8 +458,7 @@ def create_tensors(config: MatmulConfig, rng: random.Random):
         config.bias_strides = bias_strides
         config.bias_elems = bias_elems
 
-        bias = torch.empty(bias_elems, device='cuda', dtype=config.c_dtype)
-        bias.normal_(mean=0.5, std=0.5, generator=torch_rng)
+        bias = create_sparse_int_tensor((bias_elems,), config.c_dtype, torch_rng)
         bias = torch.as_strided(bias, bias_shape, bias_strides)
 
     return A, B, C, bias
@@ -599,29 +592,7 @@ def compare_results(C_actual: torch.Tensor, C_expected: torch.Tensor, config: Ma
     rtol *= scale_factor
     atol *= scale_factor
 
-    try:
-        torch.testing.assert_close(C_actual, C_expected, rtol=rtol, atol=atol)
-        return True, 0, f"Numerical divergence within limits (rtol={rtol:.2e}, atol={atol:.2e})"
-    except AssertionError:
-        # Count mismatches
-        close_mask = torch.isclose(C_actual.float(), C_expected.float(), rtol=rtol, atol=atol)
-        mismatch_count = (~close_mask).sum().item()
-        total_elements = C_actual.numel()
-        percentage = 100.0 * mismatch_count / total_elements
-
-        msg = f"Found {mismatch_count:,} mismatches ({percentage:.2f}%) out of {total_elements:,} elements"
-
-        # Show some mismatches
-        if max_diffs > 0:
-            mismatches = torch.where(~close_mask)
-            for i in range(min(max_diffs, mismatch_count)):
-                idx = tuple(m[i].item() for m in mismatches)
-                actual = C_actual[idx].item()
-                expected = C_expected[idx].item()
-                diff = actual - expected
-                msg += f"\n  idx{idx}: actual={actual:+.6e}, expected={expected:+.6e}, diff={diff:+.2e}"
-
-        return False, mismatch_count, msg
+    return compare_tensors(C_actual, C_expected, rtol=rtol, atol=atol, num_diffs=max_diffs)
 
 
 # ============================================================================
@@ -767,8 +738,9 @@ def test_matmul_fuzz(test_num: int, total_tests: int, config_seed: int, config: 
     C_expected = None
 
     try:
-        # Print test header
+        # Print test header and flush to ensure repro info is saved before any potential crash
         print(format_test_header(test_num, total_tests, config))
+        sys.stdout.flush()
 
         # Compute reference
         C_expected = compute_reference(config, A, B, bias)
@@ -791,6 +763,9 @@ def test_matmul_fuzz(test_num: int, total_tests: int, config_seed: int, config: 
         passed, mismatch_count, compare_msg = compare_results(C, C_expected, config, max_diffs)
 
         print(format_test_result(passed, compare_msg))
+
+        # Print hash and stats for determinism verification
+        print_tensor_stats(C, tag="C_gpu")
 
         if not passed:
             pytest.fail(f"Numerical mismatch: {mismatch_count} elements differ")
@@ -830,8 +805,9 @@ def test_matmul_fuzz_unaligned(test_num: int, total_tests: int, config_seed: int
     C_expected = None
 
     try:
-        # Print test header
+        # Print test header and flush to ensure repro info is saved before any potential crash
         print(format_test_header(test_num, total_tests, config))
+        sys.stdout.flush()
 
         # Compute reference
         C_expected = compute_reference(config, A, B, bias)
@@ -854,6 +830,9 @@ def test_matmul_fuzz_unaligned(test_num: int, total_tests: int, config_seed: int
         passed, mismatch_count, compare_msg = compare_results(C, C_expected, config, max_diffs)
 
         print(format_test_result(passed, compare_msg))
+
+        # Print hash and stats for determinism verification
+        print_tensor_stats(C, tag="C_gpu")
 
         if not passed:
             pytest.fail(f"Numerical mismatch: {mismatch_count} elements differ")
@@ -900,6 +879,7 @@ def test_repro(cudnn_handle, request):
 
     try:
         print(format_test_header(1, 1, config))
+        sys.stdout.flush()
 
         C_expected = compute_reference(config, A, B, bias)
         success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
@@ -948,6 +928,7 @@ def test_matmul_basic_fp16(cudnn_handle):
 
     try:
         print(format_test_header(1, 1, config))
+        sys.stdout.flush()
 
         C_expected = compute_reference(config, A, B, bias)
         success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
@@ -988,6 +969,7 @@ def test_matmul_basic_bf16(cudnn_handle):
 
     try:
         print(format_test_header(1, 1, config))
+        sys.stdout.flush()
 
         C_expected = compute_reference(config, A, B, bias)
         success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)
@@ -1028,6 +1010,7 @@ def test_matmul_with_bias(cudnn_handle):
 
     try:
         print(format_test_header(1, 1, config))
+        sys.stdout.flush()
 
         C_expected = compute_reference(config, A, B, bias)
         success, msg = run_cudnn_matmul(config, A, B, C, bias, cudnn_handle)

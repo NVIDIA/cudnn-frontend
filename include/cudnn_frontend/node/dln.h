@@ -22,7 +22,6 @@ class DLNNode : public NodeCRTP<DLNNode> {
     infer_properties_node() override final {
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Inferencing properties for DLN node " << attributes.name);
 
-        // WAR as epsilon was required in previous versions
         if (detail::get_backend_version() < 8906) {
             attributes.inputs[Layernorm_backward_attributes::input_names::EPSILON] =
                 std::make_shared<Tensor_attributes>(0.0f);

@@ -42,7 +42,7 @@ causal_mask_bottom_right(std::shared_ptr<Graph> graph,
                                0,                     // right bound = 0
                                s_q,                   // s_q dimension (max Q sequence length)
                                s_kv,                  // s_kv dimension (max KV sequence length)
-                               std::move(seq_len_q),  // Actuall Q sequence lengths
+                               std::move(seq_len_q),  // Actual Q sequence lengths
                                std::move(seq_len_kv)  // Actual KV sequence lengths
     );
 }
@@ -173,178 +173,80 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
 
     // Note: the right and left bound subtrees can be constructed in different ways as well that yield functionally
     // correct results. However, for performance reasons in the cuDNN backend they are organized as they are. Be
-    // cautious of performance when editting.
+    // cautious of performance when editing.
 
     // Set the right bound
     if (right_bound.has_value()) {
-        auto row_index_attributes =
-            Pointwise_attributes().set_name("gen_row_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(2);
-        std::shared_ptr<Tensor_attributes> row_index = graph->pointwise(attention_score, row_index_attributes);
-        row_index->set_data_type(DataType_t::INT32);
-
-        auto col_index_attributes =
-            Pointwise_attributes().set_name("gen_col_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(3);
-        std::shared_ptr<Tensor_attributes> col_index = graph->pointwise(attention_score, col_index_attributes);
-        col_index->set_data_type(DataType_t::INT32);
-
+        std::shared_ptr<Tensor_attributes> effective_s_q;
+        std::shared_ptr<Tensor_attributes> effective_s_kv;
         if (diagonal_alignment == DiagonalAlignment_t::BOTTOM_RIGHT) {
-            row_index = graph->pointwise(
-                row_index,
-                // Use actual sequence lengths if they are provided
-                s_kv_ptr != nullptr ? s_kv_ptr : std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv)),
-                Pointwise_attributes()
-                    .set_name("row_idx_add_skv")
-                    .set_mode(PointwiseMode_t::ADD)
-                    .set_compute_data_type(DataType_t::INT32));
-
-            row_index->set_data_type(DataType_t::INT32);
-
-            row_index = graph->pointwise(
-                row_index,
-                // Use actual sequence lengths if they are provided
-                s_q_ptr != nullptr ? s_q_ptr : std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q)),
-                Pointwise_attributes()
-                    .set_name("row_idx_add_skv_sub_sq")
-                    .set_mode(PointwiseMode_t::SUB)
-                    .set_compute_data_type(DataType_t::INT32));
-            row_index->set_data_type(DataType_t::INT32);
+            effective_s_q =
+                s_q_ptr != nullptr ? s_q_ptr : std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q));
+            effective_s_kv =
+                s_kv_ptr != nullptr ? s_kv_ptr : std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv));
         }
 
-        // Shift the diagonal in case there is a non-zero right bound
+        std::shared_ptr<Tensor_attributes> effective_shift_right_bound;
         if (right_bound.value() != 0) {
-            row_index = graph->pointwise(row_index,
-                                         std::make_shared<Tensor_attributes>(static_cast<int32_t>(right_bound.value())),
-                                         Pointwise_attributes()
-                                             .set_name("row_idx_add_skv_sub_sq_add_right_bound")
-                                             .set_mode(PointwiseMode_t::ADD)
-                                             .set_compute_data_type(DataType_t::INT32));
-            row_index->set_data_type(DataType_t::INT32);
+            effective_shift_right_bound =
+                std::make_shared<Tensor_attributes>(static_cast<int32_t>(right_bound.value()));
         }
 
-        auto const& bool_mask = graph->pointwise(row_index,
-                                                 col_index,
-                                                 Pointwise_attributes()
-                                                     .set_name("row_greater_than_col")
-                                                     .set_mode(PointwiseMode_t::CMP_GE)
-                                                     .set_compute_data_type(DataType_t::BOOLEAN));
-        bool_mask->set_data_type(DataType_t::BOOLEAN);
-
-        return_mask =
-            graph->pointwise(attention_score,
-                             std::make_shared<Tensor_attributes>(get_negative_inf_value()),
-                             bool_mask,
-                             Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT));
+        return_mask = graph->diagonal_band_mask(/*x=*/attention_score,
+                                                /*b=*/std::make_shared<Tensor_attributes>(get_negative_inf_value()),
+                                                /*seq_len_q=*/effective_s_q,
+                                                /*seq_len_kv=*/effective_s_kv,
+                                                /*left_bound=*/nullptr,
+                                                /*shift_right_bound=*/effective_shift_right_bound,
+                                                DiagonalBandMask_attributes()
+                                                    .set_name("right_bound_diagonal_mask")
+                                                    .set_comparison_mode(PointwiseMode_t::CMP_GE));
     }
 
     // Set the left bound
     if (left_bound.has_value()) {
-        auto row_index_attributes =
-            Pointwise_attributes().set_name("gen_row_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(2);
-        std::shared_ptr<Tensor_attributes> row_index_output = graph->pointwise(return_mask, row_index_attributes);
+        std::shared_ptr<Tensor_attributes> effective_left_bound;
+        std::shared_ptr<Tensor_attributes> effective_s_q;
+        std::shared_ptr<Tensor_attributes> effective_s_kv;
 
-        auto col_index_attributes =
-            Pointwise_attributes().set_name("gen_col_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(3);
-        std::shared_ptr<Tensor_attributes> col_index_output = graph->pointwise(return_mask, col_index_attributes);
         // When the diagonal is top left aligned: setup a graph so we can compare column + window_size > row
         // All elements for which column + window_size > row, will be retained, all others will be masked out
         // Note that here and following sections, row refers to the s_q index and column refers to the s_kv index in
         // the s_q x s_kv masking matrix
         if (diagonal_alignment == DiagonalAlignment_t::TOP_LEFT) {
             // sliding window length parameter should be of float type
-            auto sliding_window_length = std::make_shared<Tensor_attributes>((float)left_bound.value());
-            auto add_col_attributes    = Pointwise_attributes()
-                                          .set_name("col+window")
-                                          .set_mode(PointwiseMode_t::ADD)
-                                          .set_compute_data_type(DataType_t::FLOAT)
-                                          .set_axis(3);
-
-            col_index_output = graph->pointwise(col_index_output, sliding_window_length, add_col_attributes);
+            effective_left_bound = std::make_shared<Tensor_attributes>((float)left_bound.value());
         }
         // With bottom right diagonal alignment, we need to shift the diagonal.
         // Setup a graph so we can compare column + window_size - (s_kv - s_q) > row
         // Optimization with fixed sequence lengths: single pointwise addition for the left-hand of the comparison
         // Again, all elements satisfying the comparison will be retained.
         else if (s_kv_ptr == nullptr && s_q_ptr == nullptr) {
-            auto sliding_window_length = std::make_shared<Tensor_attributes>((float)(left_bound.value() - s_kv + s_q));
-            auto add_col_attributes    = Pointwise_attributes()
-                                          .set_name("col+window-skv+sq")
-                                          .set_mode(PointwiseMode_t::ADD)
-                                          .set_compute_data_type(DataType_t::FLOAT)
-                                          .set_axis(3);
-
-            col_index_output = graph->pointwise(col_index_output, sliding_window_length, add_col_attributes);
+            effective_left_bound = std::make_shared<Tensor_attributes>((float)(left_bound.value() - s_kv + s_q));
         }
         // With bottom right diagonal alignment: general case when at least one of Q and KV have variable sequence
         // lengths.
         // Setup a graph so we can compare column + window_size - (s_k[i] - s_q[i]) > row  for each batch i
         // Also here, all elements satisfying the comparison will be retained.
         else {
-            col_index_output->set_data_type(DataType_t::INT32);
-            row_index_output->set_data_type(DataType_t::INT32);
-
-            auto sliding_window_length = std::make_shared<Tensor_attributes>((int32_t)left_bound.value());
-            auto add_col_attributes    = Pointwise_attributes()
-                                          .set_name("col+window")
-                                          .set_mode(PointwiseMode_t::ADD)
-                                          .set_compute_data_type(DataType_t::INT32)
-                                          .set_axis(3);
-
-            col_index_output = graph->pointwise(col_index_output, sliding_window_length, add_col_attributes);
-            col_index_output->set_data_type(DataType_t::INT32);
-
-            if (s_kv_ptr) {
-                col_index_output = graph->pointwise(col_index_output,
-                                                    s_kv_ptr,
-                                                    Pointwise_attributes()
-                                                        .set_name("col+window-skv")
-                                                        .set_mode(PointwiseMode_t::SUB)
-                                                        .set_compute_data_type(DataType_t::INT32));
-            } else {
-                col_index_output = graph->pointwise(col_index_output,
-                                                    std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv)),
-                                                    Pointwise_attributes()
-                                                        .set_name("col+window-skv")
-                                                        .set_mode(PointwiseMode_t::SUB)
-                                                        .set_compute_data_type(DataType_t::INT32));
-            }
-            col_index_output->set_data_type(DataType_t::INT32);
-
-            if (s_q_ptr) {
-                col_index_output = graph->pointwise(col_index_output,
-                                                    s_q_ptr,
-                                                    Pointwise_attributes()
-                                                        .set_name("col+window-skv+sq")
-                                                        .set_mode(PointwiseMode_t::ADD)
-                                                        .set_compute_data_type(DataType_t::INT32));
-            } else {
-                col_index_output = graph->pointwise(col_index_output,
-                                                    std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q)),
-                                                    Pointwise_attributes()
-                                                        .set_name("col+window-skv+sq")
-                                                        .set_mode(PointwiseMode_t::ADD)
-                                                        .set_compute_data_type(DataType_t::INT32));
-            }
-            col_index_output->set_data_type(DataType_t::INT32);
+            effective_left_bound = std::make_shared<Tensor_attributes>((int32_t)left_bound.value());
+            effective_s_kv =
+                s_kv_ptr != nullptr ? s_kv_ptr : std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv));
+            effective_s_q =
+                s_q_ptr != nullptr ? s_q_ptr : std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q));
         }
 
-        auto greater_than_attributes =
-            Pointwise_attributes().set_mode(PointwiseMode_t::CMP_GT).set_compute_data_type(DataType_t::BOOLEAN);
-
-        if (diagonal_alignment == DiagonalAlignment_t::TOP_LEFT) {
-            greater_than_attributes.set_name("col+ws>row");
-        } else {
-            greater_than_attributes.set_name("col+window-skv+sq>row");
-        }
-
-        auto swa_comparison_output = graph->pointwise(col_index_output, row_index_output, greater_than_attributes);
-        swa_comparison_output->set_data_type(DataType_t::BOOLEAN);
-
-        return_mask =
-            graph->pointwise(return_mask,
-                             std::make_shared<Tensor_attributes>(get_negative_inf_value()),
-                             swa_comparison_output,
-                             Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT));
+        return_mask = graph->diagonal_band_mask(/*x=*/return_mask,
+                                                /*b=*/std::make_shared<Tensor_attributes>(get_negative_inf_value()),
+                                                /*seq_len_q=*/effective_s_q,
+                                                /*seq_len_kv=*/effective_s_kv,
+                                                /*left_bound=*/effective_left_bound,
+                                                /*shift_right_bound=*/nullptr,
+                                                DiagonalBandMask_attributes()
+                                                    .set_name("left_bound_diagonal_mask")
+                                                    .set_comparison_mode(PointwiseMode_t::CMP_GT));
     }
+
     return return_mask;
 }
 

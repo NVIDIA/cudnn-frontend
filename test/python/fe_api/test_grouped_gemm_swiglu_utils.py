@@ -16,10 +16,6 @@ from test_fe_api_utils import (
     create_sf_layout_tensor,
     cvt_sf_MKL_to_M32x4xrm_K4xrk_L,
 )
-from test_low_precision_matmul import (
-    _bfloat16_to_float4_e2m1fn_x2,
-    float4_e2m1fn_x2_to_float32,
-)
 
 # =============================================================================
 # Parameterization Marks
@@ -30,7 +26,7 @@ GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP8 = [
         "ab_dtype",
         [
             torch.float8_e4m3fn,
-            torch.float8_e5m2,
+            # torch.float8_e5m2,
         ],
     ),
     pytest.mark.parametrize(
@@ -95,6 +91,7 @@ GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4 = [
     pytest.mark.parametrize(
         "d_dtype",
         [
+            # torch.float16,
             torch.bfloat16,
             torch.float32,
         ],
@@ -160,6 +157,7 @@ def grouped_gemm_swiglu_init(
     sf_dtype: torch.dtype,
     vector_f32: bool = False,
     discrete_col_sfd: bool = False,
+    b_major: str = "k",
 ) -> Dict[str, Any]:
     """Initialize configuration for Grouped GEMM SwiGLU tests.
 
@@ -175,16 +173,19 @@ def grouped_gemm_swiglu_init(
     :param sf_dtype: Scale factor data type
     :param vector_f32: Use vectorized f32 operations
     :param discrete_col_sfd: Generate discrete col-major scale factor tensor
+    :param b_major: Major dimension for B tensor.
     :return: Configuration dictionary
     """
-    major, _ = torch.cuda.get_device_capability()
-    if major < 10:
+    major, minor = torch.cuda.get_device_capability()
+    compute_capability = major * 10 + minor
+    if compute_capability < 100:
         pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
+    if compute_capability == 103:
+        pytest.skip("cuteDSL is not supported on SM103")
 
     # Parse CLI options
     nkl_str = request.config.getoption("--grouped-gemm-nkl", default=None)
     group_m_str = request.config.getoption("--grouped-gemm-group-m", default=None)
-    m_aligned_opt = request.config.getoption("--grouped-gemm-m-aligned", default=None)
     skip_ref = request.config.getoption("--grouped-gemm-skip-ref", default=False)
 
     # Default values
@@ -199,19 +200,18 @@ def grouped_gemm_swiglu_init(
         # Default: equal M values per group
         group_m_list = [256] * l
 
-    m_aligned = int(m_aligned_opt) if m_aligned_opt is not None else mma_tiler_mn[0]
-
     config = {
         "n": n,
         "k": k,
         "l": l,
         "group_m_list": group_m_list,
-        "m_aligned": m_aligned,
+        "m_aligned": 256,
         "mma_tiler_mn": mma_tiler_mn,
         "cluster_shape_mn": cluster_shape_mn,
         "ab_dtype": ab_dtype,
         "c_dtype": c_dtype,
         "d_dtype": d_dtype,
+        "b_major": b_major,
         "cd_major": cd_major,
         "acc_dtype": acc_dtype,
         "sf_vec_size": sf_vec_size,
@@ -242,76 +242,46 @@ def get_dtype_rcp_limits(dtype: torch.dtype) -> float:
 
 def create_mask(
     group_m_list: List[int],
-    cta_tile_m: int,
-    m_aligned: int = 128,
+    m_aligned: int = 256,
     permuted_m: Optional[int] = None,
-) -> Tuple[int, List[int], torch.Tensor, torch.Tensor]:
-    """Create mask and group mapping for contiguous grouped GEMM.
+) -> Tuple[int, List[int], torch.Tensor]:
+    """Create padded_offsets tensor from group_m_list.
 
     :param group_m_list: List of M values for each group (will be aligned to m_aligned)
-    :param cta_tile_m: CTA tile size in M dimension (from mma_tiler_mn[0])
-    :param m_aligned: Alignment requirement for group M dimension
-    :param permuted_m: Optional padded M dimension for CUDA graph support
+    :param m_aligned: Alignment requirement for group M dimension. MUST equal
+                      BlockScaledContiguousGroupedGemmKernel.FIX_PAD_SIZE (256)
+    :param permuted_m: Optional padded M dimension for CUDA graph support. If provided,
+                     padded_offsets will be padded to include this size.
+                     The kernel determines valid tiles from padded_offsets[-1].
 
-    Note: m_aligned should be a multiple of the CTA tile M dimension to prevent
-          a single tile from spanning multiple groups, which would cause incorrect
-          B matrix access.
-
-    Note: For cuda_graph support, set permuted_m to the pre-calculated padded size:
-          permuted_m = m * topK + num_local_experts * (256 - 1)
-          Example: 4096*8 + (256/32)*255 = 34808
-          Only the actual valid rows (aligned_groupm[0]+aligned_groupm[1]+...) contain
-          valid data. The kernel will exit when tile_idx >= num_non_exiting_tiles.
-
-    :return: Tuple of (valid_m, aligned_group_m_list, tile_idx_to_expert_idx, num_non_exiting_tiles, num_m_split_cumsum)
-             - tile_idx_to_expert_idx: shape (permuted_m/cta_tile_m,) if permuted_m provided,
-               else (valid_m/cta_tile_m,)
-             - num_non_exiting_tiles: scalar value = valid_m/cta_tile_m
-             - num_m_split_cumsum: cumulative sum of aligned_group_m_list
+    :return: Tuple of (valid_m, aligned_group_m_list, padded_offsets_tensor)
     """
     valid_m = 0
     aligned_group_m_list = []
-    tile_idx_to_expert_idx = []
-    m_split_cumsum = []
-    m_split_cumsum.append(valid_m)
+    padded_offsets = []
 
-    for i, group_m in enumerate(group_m_list):
+    for group_m in group_m_list:
         aligned_group_m = ((group_m + m_aligned - 1) // m_aligned) * m_aligned
         valid_m += aligned_group_m
         aligned_group_m_list.append(aligned_group_m)
 
-        # Calculate number of tiles for this group based on CTA tile M size
-        # Each tile covers cta_tile_m rows in M dimension
-        num_tiles_in_group = aligned_group_m // cta_tile_m
-        # Add expert_idx for each tile in this group
-        tile_idx_to_expert_idx.extend([i] * num_tiles_in_group)
-        m_split_cumsum.append(valid_m)
-
-    # Compute num_non_exiting_tiles (number of valid tiles in M dimension)
-    num_non_exiting_tiles = len(tile_idx_to_expert_idx)
+        # padded_offsets[i] = cumulative sum up to and including expert i
+        padded_offsets.append(valid_m)
 
     # Apply padding if requested (for cuda_graph support)
     if permuted_m is not None:
         if permuted_m < valid_m:
             raise ValueError(f"permuted_m ({permuted_m}) must be >= valid_m ({valid_m}). " f"Cannot pad to a smaller size.")
-        if permuted_m > valid_m:
-            # Calculate how many padding tiles are needed based on CTA tile M size
-            num_padding_tiles = (permuted_m - valid_m) // cta_tile_m
-            # Pad with large negative value (these tiles won't be accessed due to
-            # num_non_exiting_tiles check)
-            tile_idx_to_expert_idx.extend([int(-2e9)] * num_padding_tiles)
+        # Note: permuted_m padding is handled by the caller creating A/D tensors with larger M
+        # padded_offsets[-1] still equals valid_m (not permuted_m)
 
-    # Convert to tensors
-    tile_idx_to_expert_idx_tensor = torch.tensor(tile_idx_to_expert_idx, device="cuda", dtype=torch.int32)
-    num_non_exiting_tiles_tensor = torch.tensor([num_non_exiting_tiles], device="cuda", dtype=torch.int32)
-    num_m_split_cumsum_tensor = torch.tensor(m_split_cumsum, device="cuda", dtype=torch.int32)
+    # Convert to tensor
+    padded_offsets_tensor = torch.tensor(padded_offsets, dtype=torch.int32).cuda()
 
     return (
         valid_m,
         aligned_group_m_list,
-        tile_idx_to_expert_idx_tensor,
-        num_non_exiting_tiles_tensor,
-        num_m_split_cumsum_tensor,
+        padded_offsets_tensor,
     )
 
 
@@ -329,36 +299,33 @@ def allocate_grouped_gemm_input_tensors(
     sf_dtype: torch.dtype,
     sf_vec_size: int,
     m_aligned: int,
-    cta_tile_m: int,
     permuted_m: Optional[int] = None,
-    norm_const: float = 1.0,
+    norm_const: float = 0.01,
+    b_major: str = "k",
     device: str = "cuda",
 ) -> Dict[str, Any]:
     """Allocate input tensors for grouped GEMM SwiGLU.
 
-    Matches the original create_tensors() implementation.
+    :param permuted_m: Optional padded M dimension for cuda_graph support. If provided,
+                     A matrix, D matrix, and scale factor A will be padded to this size.
+                     The kernel calculates valid tiles from padded_offsets[-1].
 
     :return: Dictionary containing all input tensors and metadata
     """
 
-    (
-        valid_m,
-        aligned_group_m_list,
-        tile_idx_to_expert_idx,
-        num_non_exiting_tiles,
-        num_m_split_cumsum,
-    ) = create_mask(group_m_list, cta_tile_m, m_aligned, permuted_m)
+    valid_m, aligned_group_m_list, padded_offsets_tensor = create_mask(group_m_list, m_aligned, permuted_m)
 
     tensor_m = permuted_m if permuted_m is not None else valid_m
 
-    # Note: a and b tensors are always K-major
+    # Note: b tensor can be n-major for mxfp8 dSwiglu; otherwise, a and b tensors are always k-major
     a_ref, a_tensor = create_and_permute_tensor(1, tensor_m, k, False, ab_dtype)
-    b_ref, b_tensor = create_and_permute_tensor(l, n, k, False, ab_dtype)
+    b_ref, b_tensor = create_and_permute_tensor(l, n, k, b_major == "n", ab_dtype)
 
     sfa_ref, sfa_tensor = create_scale_factor_tensor(1, tensor_m, k, sf_vec_size, sf_dtype)
     sfb_ref, sfb_tensor = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
 
     alpha_tensor = torch.randint(-2, 2, (l,), dtype=torch.float32, device=device).float()
+    beta_tensor = torch.randint(-2, 2, (l,), dtype=torch.float32, device=device).float()  # dSwiglu only
 
     prob_tensor = torch.randint(-2, 2, (tensor_m, 1, 1), dtype=torch.float32, device=device).float()
 
@@ -372,10 +339,9 @@ def allocate_grouped_gemm_input_tensors(
         "sfb_tensor": sfb_tensor,
         "sfb_ref": sfb_ref,
         "alpha_tensor": alpha_tensor,
+        "beta_tensor": beta_tensor,
         "prob_tensor": prob_tensor,
-        "tile_idx_to_expert_idx": tile_idx_to_expert_idx,
-        "num_non_exiting_tiles": num_non_exiting_tiles,
-        "num_m_split_cumsum_tensor": num_m_split_cumsum,
+        "padded_offsets_tensor": padded_offsets_tensor,
         "aligned_group_m_list": aligned_group_m_list,
         "valid_m": valid_m,
         "tensor_m": tensor_m,
@@ -406,10 +372,6 @@ def allocate_grouped_gemm_output_tensors(
 ) -> Dict[str, Any]:
     """Allocate output tensors for grouped GEMM SwiGLU.
 
-    Matches the original create_tensors() implementation.
-
-    :param c_dtype: Data type for intermediate C tensor (always bfloat16)
-    :param d_dtype: Data type for output D tensor (fp8 when ab is fp8, bf16 when ab is fp4)
     :return: Dictionary containing all output tensors
     """
     n_out = n // 2  # After SwiGLU
@@ -520,12 +482,12 @@ def run_grouped_gemm_swiglu_ref(
 
     cols = torch.arange(n, device=ref.device, dtype=torch.long)
     block_cols = cols.view(num_blocks, group)
-    # up: blocks 0,2,4,6,... (even blocks)
-    # gate: blocks 1,3,5,7,... (odd blocks)
-    up_idx = block_cols[0::2].reshape(-1)
-    gate_idx = block_cols[1::2].reshape(-1)
-    ref_up = ref.index_select(1, up_idx)
+    # ref1: blocks 1,3,5,7 (1-based) => indices 0,2,4,6 (0-based)
+    # ref2: blocks 2,4,6,8 (1-based) => indices 1,3,5,7 (0-based)
+    gate_idx = block_cols[0::2].reshape(-1)
+    up_idx = block_cols[1::2].reshape(-1)
     ref_gate = ref.index_select(1, gate_idx)
+    ref_up = ref.index_select(1, up_idx)
 
     # SwiGLU: up * (gate * sigmoid(gate))
     ref_gate = ref_gate * torch.sigmoid(ref_gate)

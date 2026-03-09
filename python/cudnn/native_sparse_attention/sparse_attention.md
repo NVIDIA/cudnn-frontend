@@ -36,9 +36,10 @@ pip install nvidia-cudnn-frontend[cutedsl]
 ## Usage
 
 Sample usage and tests can be found in the (test/python) folder:
-- [test_NSA_selection_attention.py](test/python/test_NSA_selection_attention.py), `pytest test/python/test_NSA_selection_attention.py`
-- [test_NSA_compression_attention.py](test/python/test_NSA_compression_attention.py), `pytest test/python/test_NSA_compression_attention.py`
-- [test_NSA_swa.py](test/python/test_NSA_swa.py), `pytest test/python/test_NSA_swa.py`
+- [test_NSA_selection_attention.py](test/python/fe_api/nsa/test_NSA_selection_attention.py), `pytest test/python/test_NSA_selection_attention.py`
+- [test_NSA_topk_reduction.py](test/python/fe_api/nsa/test_NSA_topk_reduction.py), `pytest test/python/test_NSA_topk_reduction.py`
+- [test_NSA_compression_attention.py](test/python/fe_api/nsa/test_NSA_compression_attention.py), `pytest test/python/test_NSA_compression_attention.py`
+- [test_NSA_swa.py](test/python/fe_api/nsa/test_NSA_swa.py), `pytest test/python/test_NSA_swa.py`
 
 Once all components are implemented, we will offer a central NSA API that will do the full NSA computation end-to-end. We will also offer the individual components as standalone APIs, as demonstrated below.
 

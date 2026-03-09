@@ -34,8 +34,10 @@ class ReductionNode;
 class ResampleNode;
 class ReshapeNode;
 class RngNode;
-class SoftmaxNode;
+class CompositeSoftmaxNode;
+class UnifiedSoftmaxNode;
 class MoeGroupedMatmulNode;
+class UnifiedDiagonalBandMaskNode;
 
 // Interface for all nodes to follow.
 class INode {
@@ -138,8 +140,10 @@ class INode {
         CONCATENATE,
         ADALAYERNORM,
         DADALAYERNORM,
-        UNIFIED_SDPA,
+        SDPA,
         MOE_GROUPED_MATMUL,
+        DIAGONAL_BAND_MASK,
+        SOFTMAX,
     };
     Type tag;
 
@@ -184,6 +188,13 @@ class INode {
               std::shared_ptr<Tensor_attributes> b,
               Pointwise_attributes attributes,
               std::shared_ptr<Tensor_attributes> c);
+
+    void
+    pointwise(std::shared_ptr<Tensor_attributes> a,
+              std::shared_ptr<Tensor_attributes> b,
+              std::shared_ptr<Tensor_attributes> c,
+              Pointwise_attributes attributes,
+              std::shared_ptr<Tensor_attributes> d);
 
     void
     reduction(std::shared_ptr<Tensor_attributes> a,
@@ -362,6 +373,15 @@ class INode {
     std::shared_ptr<Tensor_attributes> rng(std::shared_ptr<Tensor_attributes>,
                                            std::shared_ptr<Tensor_attributes>,
                                            Rng_attributes);
+
+    std::shared_ptr<Tensor_attributes>
+    diagonal_band_mask(std::shared_ptr<Tensor_attributes> x,
+                       std::shared_ptr<Tensor_attributes> b,
+                       std::shared_ptr<Tensor_attributes> seq_len_q,
+                       std::shared_ptr<Tensor_attributes> seq_len_kv,
+                       std::shared_ptr<Tensor_attributes> left_bound,
+                       std::shared_ptr<Tensor_attributes> shift_right_bound,
+                       DiagonalBandMask_attributes attributes);
 
     INode(detail::Context const& context) : context(context) {}
 

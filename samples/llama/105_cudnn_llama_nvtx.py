@@ -164,7 +164,7 @@ def get_cudnn_rmsnorm_fwd(batch_size: int, seq_len: int, hidden_dim: int, dtype:
     with cudnn.Graph(
         handle="auto",
         io_data_type=dtype,
-        compute_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=torch.float32,
         inputs=["x", "scale", "epsilon"],
         outputs=["out", "invvar"],
     ) as graph:
@@ -174,7 +174,7 @@ def get_cudnn_rmsnorm_fwd(batch_size: int, seq_len: int, hidden_dim: int, dtype:
             name="epsilon",
             dim=(1, 1),
             stride=(1, 1),
-            data_type=cudnn.data_type.FLOAT,
+            data_type=torch.float32,
             is_pass_by_value=True,
         )
         out, inv_var = graph.rmsnorm(
@@ -185,7 +185,7 @@ def get_cudnn_rmsnorm_fwd(batch_size: int, seq_len: int, hidden_dim: int, dtype:
         )
         # set output, inv_var must be float32 tensor
         out.set_output(True).set_name("out")
-        inv_var.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_name("invvar")
+        inv_var.set_output(True).set_data_type(torch.float32).set_name("invvar")
     return graph
 
 
@@ -197,7 +197,7 @@ def get_cudnn_rmsnorm_bwd(batch_size: int, seq_len: int, hidden_dim: int, dtype:
     with cudnn.Graph(
         handle="auto",
         io_data_type=dtype,
-        compute_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=torch.float32,
         inputs=["grad", "x", "invvar", "scale"],
         outputs=["dx", "dscale"],
     ) as graph:
@@ -207,7 +207,7 @@ def get_cudnn_rmsnorm_bwd(batch_size: int, seq_len: int, hidden_dim: int, dtype:
             name="invvar",
             dim=(batch_size * seq_len, 1),
             stride=(1, 1),
-            data_type=cudnn.data_type.FLOAT,
+            data_type=torch.float32,
         )
         scale_gpu = graph.tensor(name="scale", dim=(1, hidden_dim), stride=(hidden_dim, 1))
         dx, dscale, dbias = graph.rmsnorm_backward(
@@ -331,9 +331,7 @@ class RMSNorm(nn.Module):
 
 
 @functools.lru_cache(maxsize=None)
-def get_cudnn_gqa_fwd(
-    batch_size: int, seq_len: int, heads_q: int, heads_kv: int, dim: int, dtype: torch.dtype
-) -> cudnn.Graph:
+def get_cudnn_gqa_fwd(batch_size: int, seq_len: int, heads_q: int, heads_kv: int, dim: int, dtype: torch.dtype) -> cudnn.Graph:
     """For use in the replacement of PyTorch GQA function. To compute GQA forward pass
     with causal mask
     """
@@ -345,8 +343,8 @@ def get_cudnn_gqa_fwd(
     with cudnn.Graph(
         handle="auto",
         io_data_type=dtype,
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
+        intermediate_data_type=torch.float32,
+        compute_data_type=torch.float32,
         inputs=["q", "k", "v"],
         outputs=["out", "stats"],
     ) as graph:
@@ -363,14 +361,12 @@ def get_cudnn_gqa_fwd(
         )
         # set output, inv_var must be float32 tensor
         out.set_output(True).set_dim(q_dim).set_stride(q_stride).set_name("out")
-        stats.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_name("stats")
+        stats.set_output(True).set_data_type(torch.float32).set_name("stats")
     return graph
 
 
 @functools.lru_cache(maxsize=None)
-def get_cudnn_gqa_bwd(
-    batch_size: int, seq_len: int, heads_q: int, heads_kv: int, dim: int, dtype: torch.dtype
-) -> cudnn.Graph:
+def get_cudnn_gqa_bwd(batch_size: int, seq_len: int, heads_q: int, heads_kv: int, dim: int, dtype: torch.dtype) -> cudnn.Graph:
     """For use in the replacement of PyTorch GQA function. To compute GQA backward pass
     with causal mask
     """
@@ -385,8 +381,8 @@ def get_cudnn_gqa_bwd(
     with cudnn.Graph(
         handle="auto",
         io_data_type=dtype,
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
+        intermediate_data_type=torch.float32,
+        compute_data_type=torch.float32,
         inputs=["q", "k", "v", "o", "dO", "stats"],
         outputs=["dQ", "dK", "dV"],
     ) as graph:
@@ -399,7 +395,7 @@ def get_cudnn_gqa_bwd(
             name="stats",
             dim=stats_dim,
             stride=stats_stride,
-            data_type=cudnn.data_type.FLOAT,
+            data_type=torch.float32,
         )
         dQ, dK, dV = graph.sdpa_backward(
             q=q_gpu,

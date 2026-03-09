@@ -206,7 +206,7 @@ def _test_gemm_amax_compile_execute(
         assert gemm.check_support(), "Unsupported testcase"
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
-    gemm.compile(current_stream=stream)
+    gemm.compile()
     gemm.execute(
         a_tensor=a_torch,
         b_tensor=b_torch,

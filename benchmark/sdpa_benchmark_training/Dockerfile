@@ -4,7 +4,7 @@ FROM nvcr.io/nvidia/pytorch:25.12-py3
 WORKDIR /workspace
 
 # Update libcudnn9-cuda-13
-RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb && \
+RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb && \
     dpkg -i cuda-keyring_1.1-1_all.deb && \
     apt-get remove -y *cudnn9* && \
     apt-get update && \
@@ -14,7 +14,7 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86
 
 # Clone cudnn_frontend and install latest cudnn
 RUN git clone https://github.com/NVIDIA/cudnn-frontend.git
-RUN pip install -v cudnn-frontend
+RUN pip install -v /workspace/cudnn-frontend
 
 # Clone flash-attention
 RUN pip uninstall -y flash-attn && \

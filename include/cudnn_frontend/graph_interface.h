@@ -280,8 +280,7 @@ class Graph : public ICudnn, public INode {
             sdpa_outputs.Amax_S = attributes.outputs[SDPA_attributes::output_names::Amax_S] =
                 output_tensor(attributes.name + "::Amax_S");
         }
-        if (attributes.inputs.find(SDPA_attributes::input_names::Scale_O) != attributes.inputs.end() &&
-            attributes.inputs.at(SDPA_attributes::input_names::Scale_O) != nullptr) {
+        if (attributes.mma_core_mode == DataType_t::FP8_E4M3 || attributes.mma_core_mode == DataType_t::FP8_E5M2) {
             sdpa_outputs.Amax_O = attributes.outputs[SDPA_attributes::output_names::Amax_O] =
                 output_tensor(attributes.name + "::Amax_O");
         }
@@ -320,6 +319,118 @@ class Graph : public ICudnn, public INode {
         }
 
         return sdpa_outputs;
+    }
+
+    // Register an OSS NVRTC engine for SDPA by extracting tensor metadata from the SDPA node's attributes
+    error_t
+    register_oss_engine_() {
+        // Find the SDPA node in the graph's sub_nodes via dynamic_cast
+        SDPA_attributes const *sdpa_attrs = nullptr;
+        for (auto const &sub_node : sub_nodes) {
+            if (auto *composite = dynamic_cast<CompositeSDPANode *>(sub_node.get())) {
+                sdpa_attrs = &composite->attributes;
+                break;
+            }
+            if (auto *unified = dynamic_cast<UnifiedSDPANode *>(sub_node.get())) {
+                sdpa_attrs = &unified->attributes;
+                break;
+            }
+        }
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            sdpa_attrs == nullptr, error_code_t::GRAPH_NOT_SUPPORTED, "No SDPA node found for OPENSOURCE engine");
+
+        graph::Execution_plan_list::OssEngineContext ctx;
+
+        // Q tensor
+        auto q_it = sdpa_attrs->inputs.find(SDPA_attributes::input_names::Q);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(q_it == sdpa_attrs->inputs.end() || !q_it->second,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Q tensor not found in SDPA node");
+        auto const &q = q_it->second;
+        ctx.q_uid     = q->get_uid();
+        ctx.q_stride  = q->get_stride();
+        ctx.batch     = q->get_dim()[0];
+        ctx.heads_q   = q->get_dim()[1];
+        ctx.seq_q     = q->get_dim()[2];
+        ctx.d         = q->get_dim()[3];
+
+        // K tensor — CompositeSDPANode transposes K in-place (swaps dims[2]/dims[3]
+        // and strides[2]/strides[3]) for the Q*K^T GEMM.  Detect and undo.
+        auto k_it = sdpa_attrs->inputs.find(SDPA_attributes::input_names::K);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(k_it == sdpa_attrs->inputs.end() || !k_it->second,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "K tensor not found in SDPA node");
+        auto const &k         = k_it->second;
+        auto const &k_dims    = k->get_dim();
+        auto const &k_strides = k->get_stride();
+        ctx.k_uid             = k->get_uid();
+        ctx.heads_kv          = k_dims[1];
+        if (k_dims[2] < k_dims[3]) {
+            // dims currently (B, H_kv, D, S_kv) — swapped
+            ctx.seq_kv   = k_dims[3];
+            ctx.k_stride = {k_strides[0], k_strides[1], k_strides[3], k_strides[2]};
+        } else {
+            ctx.seq_kv   = k_dims[2];
+            ctx.k_stride = k_strides;
+        }
+
+        // V tensor
+        auto v_it = sdpa_attrs->inputs.find(SDPA_attributes::input_names::V);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(v_it == sdpa_attrs->inputs.end() || !v_it->second,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "V tensor not found in SDPA node");
+        ctx.v_uid    = v_it->second->get_uid();
+        ctx.v_stride = v_it->second->get_stride();
+
+        // O tensor
+        auto o_it = sdpa_attrs->outputs.find(SDPA_attributes::output_names::O);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(o_it == sdpa_attrs->outputs.end() || !o_it->second,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "O tensor not found in SDPA node");
+        ctx.o_uid    = o_it->second->get_uid();
+        ctx.o_stride = o_it->second->get_stride();
+
+        // Max tensor (optional — only present if user called set_logit_max)
+        auto max_it = sdpa_attrs->outputs.find(SDPA_attributes::output_names::Max);
+        if (max_it != sdpa_attrs->outputs.end() && max_it->second) {
+            ctx.max_uid    = max_it->second->get_uid();
+            ctx.max_stride = max_it->second->get_stride();
+        }
+
+        // Sum_exp tensor (optional — only present if user called set_score_sum_exp)
+        auto se_it = sdpa_attrs->outputs.find(SDPA_attributes::output_names::Sum_exp);
+        if (se_it != sdpa_attrs->outputs.end() && se_it->second) {
+            ctx.sum_exp_uid    = se_it->second->get_uid();
+            ctx.sum_exp_stride = se_it->second->get_stride();
+        }
+
+        // Attention scale (use user-provided value if set, otherwise engine computes 1/sqrt(d))
+        if (sdpa_attrs->attn_scale_value.has_value()) {
+            ctx.attn_scale = sdpa_attrs->attn_scale_value.value();
+        }
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(ctx.q_uid == -1 || ctx.k_uid == -1 || ctx.v_uid == -1 || ctx.o_uid == -1,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Could not find Q/K/V/O tensors in SDPA node for OPENSOURCE engine");
+
+        // Detect SM version and instantiate the appropriate OSS engine
+        int oss_device_ordinal = 0;
+        experimental::detail::cuda_get_device(&oss_device_ordinal);
+        cudaDeviceProp oss_dev_prop;
+        experimental::detail::cuda_get_device_properties(&oss_dev_prop, oss_device_ordinal);
+        int oss_sm = oss_dev_prop.major * 10 + oss_dev_prop.minor;
+
+        std::shared_ptr<experimental::IOssSdpaEngine> engine;
+        if (oss_sm / 10 == 10) {
+            engine = std::make_shared<experimental::Sm100SdpaPrefillEngine>();
+        } else {
+            engine = std::make_shared<experimental::Sm90SdpaPrefillEngine>();
+        }
+        plans.set_oss_engine(engine);
+        plans.set_oss_engine_context(std::move(ctx));
+
+        return {error_code_t::OK, ""};
     }
 
    public:
@@ -731,6 +842,13 @@ class Graph : public ICudnn, public INode {
 
     error_t
     get_workspace_size_plan_at_index(int64_t plan_index, int64_t &cudnn_workspace_size) const {
+        // OSS engine workspace: 16 bytes for tile_id_counter
+        if (plan_index == graph::Execution_plan_list::OSS_ENGINE_CANDIDATE) {
+            cudnn_workspace_size = fe_workspace_size + experimental::Sm90SdpaPrefillEngine::get_workspace_size();
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is " << cudnn_workspace_size << " (OSS engine)");
+            return {error_code_t::OK, ""};
+        }
+
         // There are two workspaces:
         // - cudnn execution plan workspace
         // - FE node workspace (example: alibiSlope for fmha)
@@ -810,6 +928,7 @@ class Graph : public ICudnn, public INode {
                           void *workspace,
                           int64_t plan_index) const {
         CUDNN_FE_LOG_BANNER(" EXECUTE PLAN AT INDEX  for plan index (with Tensor keys) " << plan_index << "  ");
+        CUDNN_FE_LOG(*this << std::endl;);
         // First get all the uids from the map
         std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
         for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
@@ -824,7 +943,7 @@ class Graph : public ICudnn, public INode {
             std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
             void *workspace) const {
         CUDNN_FE_LOG_BANNER(" EXECUTE PLAN (with Tensor keys) ");
-
+        CUDNN_FE_LOG(*this << std::endl;);
         // First get all the uids from the map
         std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
         for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
@@ -845,6 +964,7 @@ class Graph : public ICudnn, public INode {
         // Using cached values to avoid repeated tree traversal overhead.
         // Object lifetime is controlled by cached_pass_by_value which persists for the Graph's lifetime.
         CUDNN_FE_LOG_BANNER("  EXECUTE PLAN AT INDEX  for plan index " << plan_index << "  ");
+        CUDNN_FE_LOG(*this << std::endl;);
 
         CHECK_CUDNN_FRONTEND_ERROR(
             extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, cached_pass_by_value));
@@ -860,12 +980,13 @@ class Graph : public ICudnn, public INode {
         // this is where cudnn backend can start using workspace for its execution plans
         void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
 
-        if (isLoggingEnabled()) {
-            cudaStream_t stream;
-            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+        if (isLoggingTensorDumpEnabled()) {
             for (auto const &[uid, ptr] : tensor_uid_to_pointer_map) {
                 CHECK_CUDNN_FRONTEND_ERROR(detail::log_variant_pack_memory_type(uid, ptr));
             }
+
+            cudaStream_t stream;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
             for (auto const &[tensor, fmt] : tensors_to_dump) {
                 auto it = tensor_uid_to_pointer_map.find(tensor->get_uid());
                 if (it != tensor_uid_to_pointer_map.end()) {
@@ -907,6 +1028,29 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(
             make_variant_pack_replacements(tensor_uid_to_pointer_map, variant_pack_replacements));
 
+        // OSS engine dispatch with dynamic shape overrides
+        if (plans.is_oss_candidate()) {
+            cudaStream_t stream = nullptr;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+
+            int device_ordinal = 0;
+            detail::cuda_get_device(&device_ordinal);
+            CUdevice cu_device;
+            experimental::detail::cu_device_get(&cu_device, device_ordinal);
+
+            void *oss_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+            CHECK_CUDNN_FRONTEND_ERROR(plans.execute_oss_engine(tensor_uid_to_pointer_map,
+                                                                oss_workspace,
+                                                                cu_device,
+                                                                stream,
+                                                                override_uids,
+                                                                override_shapes,
+                                                                override_strides));
+
+            CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK (OSS engine, dynamic shapes) ");
+            return {error_code_t::OK, ""};
+        }
+
         CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
 
         CHECK_CUDNN_FRONTEND_ERROR(extend_tensor_map_with_workspace_tensors_(
@@ -915,12 +1059,13 @@ class Graph : public ICudnn, public INode {
         // this is where cudnn backend can start using workspace for its execution plans
         void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
 
-        if (isLoggingEnabled()) {
-            cudaStream_t stream;
-            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+        if (isLoggingTensorDumpEnabled()) {
             for (auto const &[uid, ptr] : tensor_uid_to_pointer_map) {
                 CHECK_CUDNN_FRONTEND_ERROR(detail::log_variant_pack_memory_type(uid, ptr));
             }
+
+            cudaStream_t stream;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
             for (auto const &[tensor, fmt] : tensors_to_dump) {
                 auto it = tensor_uid_to_pointer_map.find(tensor->get_uid());
                 if (it != tensor_uid_to_pointer_map.end()) {
@@ -951,6 +1096,8 @@ class Graph : public ICudnn, public INode {
                           std::unordered_map<int64_t, void *> &tensor_uid_to_pointer_map,
                           void *workspace,
                           int64_t plan_index) const {
+        CUDNN_FE_LOG_BANNER(" EXECUTE PLAN AT INDEX  for plan index " << plan_index << "  ");
+        CUDNN_FE_LOG(*this << std::endl;);
         // Add pass_by_value data pointers to uid_to_pointer map
         // object lifetime is controlled by tensor_to_pass_by_value which means the pointer should stay valid during
         // execute.
@@ -966,11 +1113,31 @@ class Graph : public ICudnn, public INode {
         // Add pass_by_value data pointers to uid_to_pointer map.
         // Using cached values to avoid repeated tree traversal overhead.
         CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ");
+        CUDNN_FE_LOG(*this << std::endl;);
 
         CHECK_CUDNN_FRONTEND_ERROR(
             extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, cached_pass_by_value));
         CHECK_CUDNN_FRONTEND_ERROR(
             make_variant_pack_replacements(tensor_uid_to_pointer_map, variant_pack_replacements));
+
+        // OSS engine dispatch: bypass cuDNN backend entirely
+        if (plans.is_oss_candidate()) {
+            cudaStream_t stream = nullptr;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+
+            int device_ordinal = 0;
+            detail::cuda_get_device(&device_ordinal);
+            CUdevice cu_device;
+            experimental::detail::cu_device_get(&cu_device, device_ordinal);
+
+            // OSS engine workspace starts after FE workspace
+            void *oss_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+            CHECK_CUDNN_FRONTEND_ERROR(
+                plans.execute_oss_engine(tensor_uid_to_pointer_map, oss_workspace, cu_device, stream));
+
+            CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK (OSS engine) ");
+            return {error_code_t::OK, ""};
+        }
 
         CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
 
@@ -1311,10 +1478,20 @@ class Graph : public ICudnn, public INode {
                                                            std::shared_ptr<Tensor_attributes>,
                                                            SDPA_attributes);
 
+    // FP8 version
     std::array<std::shared_ptr<Tensor_attributes>, 4> sdpa_fp8(std::shared_ptr<Tensor_attributes>,
                                                                std::shared_ptr<Tensor_attributes>,
                                                                std::shared_ptr<Tensor_attributes>,
                                                                std::shared_ptr<Tensor_attributes>,
+                                                               std::shared_ptr<Tensor_attributes>,
+                                                               std::shared_ptr<Tensor_attributes>,
+                                                               std::shared_ptr<Tensor_attributes>,
+                                                               std::shared_ptr<Tensor_attributes>,
+                                                               std::shared_ptr<Tensor_attributes>,
+                                                               SDPA_fp8_attributes);
+
+    // MXFP8 version
+    std::array<std::shared_ptr<Tensor_attributes>, 3> sdpa_fp8(std::shared_ptr<Tensor_attributes>,
                                                                std::shared_ptr<Tensor_attributes>,
                                                                std::shared_ptr<Tensor_attributes>,
                                                                std::shared_ptr<Tensor_attributes>,
@@ -1341,6 +1518,26 @@ class Graph : public ICudnn, public INode {
                                                                                std::shared_ptr<Tensor_attributes>,
                                                                                std::shared_ptr<Tensor_attributes>,
                                                                                SDPA_fp8_backward_attributes);
+
+    // MXFP8 version
+    std::array<std::shared_ptr<Tensor_attributes>, 6> sdpa_fp8_backward(std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        std::shared_ptr<Tensor_attributes>,
+                                                                        SDPA_fp8_backward_attributes);
 
     std::array<std::shared_ptr<Tensor_attributes>, 3> sdpa_backward(std::shared_ptr<Tensor_attributes>,
                                                                     std::shared_ptr<Tensor_attributes>,
@@ -1413,6 +1610,18 @@ class Graph : public ICudnn, public INode {
     // overload for deviceless AoT compilation
     error_t
     check_support() {
+        // Check OSS engine first if registered
+
+        CHECK_CUDNN_FRONTEND_ERROR(context.populate_sm_version_from_device());
+        auto sm_version = context.get_sm_version();
+        if (plans.has_oss_engine()) {
+            auto oss_status = plans.check_oss_engine_support(sm_version);
+            if (oss_status.is_good()) {
+                return {error_code_t::OK, ""};
+            }
+            // Fall through to check cuDNN plans
+        }
+
         CHECK_CUDNN_FRONTEND_ERROR(plans.check_support());
         return {error_code_t::OK, ""};
     }
@@ -1575,14 +1784,31 @@ class Graph : public ICudnn, public INode {
                     continue;
                 }
 
-                std::string tensor_name = tensor_info["name"].get<std::string>();
+                // Determine the key to use for this tensor
+                std::string tensor_key;
+                json tensor_ref;
+                bool uid_assigned = tensor_info.contains("uid_assigned") && tensor_info["uid_assigned"].get<bool>();
+
+                if (uid_assigned && tensor_info.contains("uid") && tensor_info["uid"].is_number_integer()) {
+                    // Use numeric UID if it was explicitly assigned
+                    int64_t tensor_uid = tensor_info["uid"].get<int64_t>();
+                    tensor_key         = std::to_string(tensor_uid);
+                    tensor_ref         = json(tensor_uid);
+                } else if (tensor_info.contains("name")) {
+                    // Fall back to tensor name if UID not assigned
+                    tensor_key = tensor_info["name"].get<std::string>();
+                    tensor_ref = tensor_key;
+                } else {
+                    continue;
+                }
+
                 // Update short_node inputs
-                short_node["inputs"][port_name] = tensor_name;
+                short_node["inputs"][port_name] = tensor_ref;
 
                 // Check if the tensor is already in the tensors map
-                if (tensors.find(tensor_name) == tensors.end()) {
+                if (tensors.find(tensor_key) == tensors.end()) {
                     // If not, add it to the j["tensors"]
-                    j["tensors"][tensor_name] = tensor_info;
+                    j["tensors"][tensor_key] = tensor_info;
                 }
             }
 
@@ -1596,15 +1822,31 @@ class Graph : public ICudnn, public INode {
                     continue;
                 }
 
-                std::string tensor_name = tensor_info["name"].get<std::string>();
+                // Determine the key to use for this tensor
+                std::string tensor_key;
+                json tensor_ref;
+                bool uid_assigned = tensor_info.contains("uid_assigned") && tensor_info["uid_assigned"].get<bool>();
+
+                if (uid_assigned && tensor_info.contains("uid") && tensor_info["uid"].is_number_integer()) {
+                    // Use numeric UID if it was explicitly assigned
+                    int64_t tensor_uid = tensor_info["uid"].get<int64_t>();
+                    tensor_key         = std::to_string(tensor_uid);
+                    tensor_ref         = json(tensor_uid);
+                } else if (tensor_info.contains("name")) {
+                    // Fall back to tensor name if UID not assigned
+                    tensor_key = tensor_info["name"].get<std::string>();
+                    tensor_ref = tensor_key;
+                } else {
+                    continue;
+                }
 
                 // Update short_node outputs
-                short_node["outputs"][port_name] = tensor_name;
+                short_node["outputs"][port_name] = tensor_ref;
 
                 // Check if the tensor is already in the tensors map
-                if (tensors.find(tensor_name) == tensors.end()) {
+                if (tensors.find(tensor_key) == tensors.end()) {
                     // If not, add it to the j["tensors"]
-                    j["tensors"][tensor_name] = tensor_info;
+                    j["tensors"][tensor_key] = tensor_info;
                 }
             }
 
@@ -1654,10 +1896,15 @@ class Graph : public ICudnn, public INode {
 
                 // Iterate through each input of the sub-node
                 if (j_sub_node.contains("inputs") && j_sub_node["inputs"].is_object()) {
-                    for (auto &[port_name, tensor_name] : j_sub_node["inputs"].items()) {
-                        if (j.contains("tensors") && j["tensors"].contains(tensor_name)) {
+                    for (auto &[port_name, tensor_ref] : j_sub_node["inputs"].items()) {
+                        // Convert tensor reference (either numeric UID or string name) to string key
+                        std::string tensor_key = tensor_ref.is_number_integer()
+                                                     ? std::to_string(tensor_ref.get<int64_t>())
+                                                     : tensor_ref.get<std::string>();
+
+                        if (j.contains("tensors") && j["tensors"].contains(tensor_key)) {
                             // Add the input to the inputs JSON object
-                            inputs.push_back({port_name, j["tensors"][tensor_name]});
+                            inputs.push_back({port_name, j["tensors"][tensor_key]});
                         }
                     }
                 }
@@ -1667,10 +1914,15 @@ class Graph : public ICudnn, public INode {
 
                 // Iterate through each output of the sub-node
                 if (j_sub_node.contains("outputs") && j_sub_node["outputs"].is_object()) {
-                    for (auto &[port_name, tensor_name] : j_sub_node["outputs"].items()) {
-                        if (j.contains("tensors") && j["tensors"].contains(tensor_name)) {
+                    for (auto &[port_name, tensor_ref] : j_sub_node["outputs"].items()) {
+                        // Convert tensor reference (either numeric UID or string name) to string key
+                        std::string tensor_key = tensor_ref.is_number_integer()
+                                                     ? std::to_string(tensor_ref.get<int64_t>())
+                                                     : tensor_ref.get<std::string>();
+
+                        if (j.contains("tensors") && j["tensors"].contains(tensor_key)) {
                             // Add the output to the outputs JSON object
-                            outputs.push_back({port_name, j["tensors"][tensor_name]});
+                            outputs.push_back({port_name, j["tensors"][tensor_key]});
                         }
                     }
                 }
@@ -1732,7 +1984,7 @@ class Graph : public ICudnn, public INode {
                         FILL_GLOBAL_IO_TENSOR_MAP(reduction_attributes);
                         sub_nodes.emplace_back(
                             std::make_unique<ReductionNode>(std::move(reduction_attributes), context));
-                    } else if (tag == "SDPA_FWD") {
+                    } else if (tag == "SDPA") {
                         auto sdpa_attributes = j_sub_node.get<SDPA_attributes>();
                         CHECK_TENSORS(sdpa_attributes);
                         FILL_GLOBAL_IO_TENSOR_MAP(sdpa_attributes);
@@ -1871,18 +2123,42 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
         }
     }
 
-    EngineConfigList op_graph_to_configs;
-    CHECK_CUDNN_FRONTEND_ERROR(detail::query_cudnn_heuristics_impl(
-        operation_graph, op_graph_to_configs, mode, context.get_target_sm_count(), device_properties));
+    // Separate OPENSOURCE from cuDNN modes
+    bool has_opensource = false;
+    std::vector<HeurMode_t> cudnn_modes;
+    for (auto const &m : mode) {
+        if (m == HeurMode_t::OPENSOURCE) {
+            has_opensource = true;
+        } else {
+            cudnn_modes.push_back(m);
+        }
+    }
 
-    CUDNN_FE_LOG_LABEL_ENDL("INFO: Extracting engine configs.");
+    // Register OSS engine if OPENSOURCE mode requested
+    if (has_opensource) {
+        auto oss_status = register_oss_engine_();
+        if (oss_status.is_bad()) {
+            CUDNN_FE_LOG_LABEL_ENDL("WARN: Failed to register OSS engine: " << oss_status.get_message());
+        } else {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Registered OSS SDPA prefill engine");
+        }
+    }
 
-    plans.set_tag(operation_graph->getTag());
-    plans.enqueue_engine_configs(op_graph_to_configs);
-    plans.set_kernel_cache(kernel_cache);
+    // Query cuDNN heuristics for non-OPENSOURCE modes
+    if (!cudnn_modes.empty()) {
+        EngineConfigList op_graph_to_configs;
+        CHECK_CUDNN_FRONTEND_ERROR(detail::query_cudnn_heuristics_impl(
+            operation_graph, op_graph_to_configs, cudnn_modes, context.get_target_sm_count(), device_properties));
 
-    CUDNN_FE_LOG_LABEL_ENDL("INFO: Querying engine config properties.");
-    CHECK_CUDNN_FRONTEND_ERROR(plans.query_properties());
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Extracting engine configs.");
+
+        plans.set_tag(operation_graph->getTag());
+        plans.enqueue_engine_configs(op_graph_to_configs);
+        plans.set_kernel_cache(kernel_cache);
+
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Querying engine config properties.");
+        CHECK_CUDNN_FRONTEND_ERROR(plans.query_properties());
+    }
 
     CUDNN_FE_LOG_BANNER("  HEURISTICS QUERY ALL OK  ");
     return {error_code_t::OK, ""};
@@ -1927,6 +2203,21 @@ Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_b
 #else
     CUDNN_FE_LOG_BANNER("  BUILD PLANS  for policy " << static_cast<int>(policy) << "  ");
 #endif
+
+    // Build OSS engine if it passed check_support
+    if (plans.has_oss_engine()) {
+        auto oss_status = plans.build_oss_engine();
+        if (oss_status.is_good()) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: OSS engine built successfully (NVRTC compilation done)");
+            if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE) {
+                CUDNN_FE_LOG_BANNER("  BUILD PLANS ALL OK (OSS engine)  ");
+                return {error_code_t::OK, ""};
+            }
+        } else {
+            CUDNN_FE_LOG_LABEL_ENDL("WARN: OSS engine build failed: " << oss_status.get_message());
+        }
+    }
+
     CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(policy, do_multithreaded_builds));
     CUDNN_FE_LOG_BANNER("  BUILD PLANS ALL OK  ");
     return {error_code_t::OK, ""};
@@ -2522,6 +2813,28 @@ Graph::sdpa_fp8(std::shared_ptr<Tensor_attributes> q,
     return {internal_result.O, internal_result.Stats, internal_result.Amax_S, internal_result.Amax_O};
 }
 
+inline std::array<std::shared_ptr<Tensor_attributes>, 3>
+Graph::sdpa_fp8(std::shared_ptr<Tensor_attributes> q,
+                std::shared_ptr<Tensor_attributes> k,
+                std::shared_ptr<Tensor_attributes> v,
+                std::shared_ptr<Tensor_attributes> descale_q,
+                std::shared_ptr<Tensor_attributes> descale_k,
+                std::shared_ptr<Tensor_attributes> descale_v,
+                SDPA_fp8_attributes attributes) {
+    if (attributes.mma_core_mode == DataType_t::NOT_SET) {
+        attributes._set_mma_core_mode(DataType_t::FP8_E4M3);
+    }
+
+    // Set FP8 scaling inputs
+    attributes.inputs[SDPA_fp8_attributes::input_names::Descale_Q] = descale_q;
+    attributes.inputs[SDPA_fp8_attributes::input_names::Descale_K] = descale_k;
+    attributes.inputs[SDPA_fp8_attributes::input_names::Descale_V] = descale_v;
+
+    // Call internal implementation and return {Output, Stats, Amax_O} as array for backward compatibility
+    auto internal_result = sdpa_internal(q, k, v, std::move(attributes));
+    return {internal_result.O, internal_result.Stats, internal_result.Amax_O};
+}
+
 inline std::array<std::shared_ptr<Tensor_attributes>, 7>
 Graph::sdpa_fp8_backward(std::shared_ptr<Tensor_attributes> q,
                          std::shared_ptr<Tensor_attributes> k,
@@ -2583,6 +2896,64 @@ Graph::sdpa_fp8_backward(std::shared_ptr<Tensor_attributes> q,
     sub_nodes.emplace_back(std::make_unique<SDPAFP8BackwardNode>(std::move(attributes), context));
 
     return {dQ, dK, dV, Amax_dQ, Amax_dK, Amax_dV, Amax_dP};
+}
+
+inline std::array<std::shared_ptr<Tensor_attributes>, 6>
+Graph::sdpa_fp8_backward(std::shared_ptr<Tensor_attributes> q,
+                         std::shared_ptr<Tensor_attributes> q_T,
+                         std::shared_ptr<Tensor_attributes> k,
+                         std::shared_ptr<Tensor_attributes> k_T,
+                         std::shared_ptr<Tensor_attributes> v,
+                         std::shared_ptr<Tensor_attributes> o_f16,
+                         std::shared_ptr<Tensor_attributes> dO_f16,
+                         std::shared_ptr<Tensor_attributes> dO,
+                         std::shared_ptr<Tensor_attributes> dO_T,
+                         std::shared_ptr<Tensor_attributes> Stats,
+                         std::shared_ptr<Tensor_attributes> descale_q,
+                         std::shared_ptr<Tensor_attributes> descale_q_T,
+                         std::shared_ptr<Tensor_attributes> descale_k,
+                         std::shared_ptr<Tensor_attributes> descale_k_T,
+                         std::shared_ptr<Tensor_attributes> descale_v,
+                         std::shared_ptr<Tensor_attributes> descale_dO,
+                         std::shared_ptr<Tensor_attributes> descale_dO_T,
+                         SDPA_fp8_backward_attributes attributes) {
+    // Make required output tensors
+    auto dQ = attributes.outputs[SDPA_fp8_backward_attributes::output_names::dQ] =
+        output_tensor(attributes.name + "::dQ");
+    auto dK = attributes.outputs[SDPA_fp8_backward_attributes::output_names::dK] =
+        output_tensor(attributes.name + "::dK");
+    auto dV = attributes.outputs[SDPA_fp8_backward_attributes::output_names::dV] =
+        output_tensor(attributes.name + "::dV");
+    auto Amax_dQ = attributes.outputs[SDPA_fp8_backward_attributes::output_names::Amax_dQ] =
+        output_tensor(attributes.name + "::Amax_dQ");
+    auto Amax_dK = attributes.outputs[SDPA_fp8_backward_attributes::output_names::Amax_dK] =
+        output_tensor(attributes.name + "::Amax_dK");
+    auto Amax_dV = attributes.outputs[SDPA_fp8_backward_attributes::output_names::Amax_dV] =
+        output_tensor(attributes.name + "::Amax_dV");
+
+    // Set inputs
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::Q]      = q;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::K]      = k;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::V]      = v;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::Q_T]    = q_T;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::K_T]    = k_T;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::O]      = o_f16;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::dO_f16] = dO_f16;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::dO_T]   = dO_T;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::Stats]  = Stats;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::dO]     = dO;
+
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::Descale_Q]    = descale_q;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::Descale_Q_T]  = descale_q_T;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::Descale_K]    = descale_k;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::Descale_K_T]  = descale_k_T;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::Descale_V]    = descale_v;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::Descale_dO]   = descale_dO;
+    attributes.inputs[SDPA_fp8_backward_attributes::input_names::Descale_dO_T] = descale_dO_T;
+
+    sub_nodes.emplace_back(std::make_unique<SDPAFP8BackwardNode>(std::move(attributes), context));
+
+    return {dQ, dK, dV, Amax_dQ, Amax_dK, Amax_dV};
 }
 
 inline std::array<std::shared_ptr<Tensor_attributes>, 3>

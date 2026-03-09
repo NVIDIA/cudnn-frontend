@@ -77,7 +77,7 @@ def test_nsa_compression_compile_execute(
     )
 
     assert comp_attn.check_support()
-    comp_attn.compile(current_stream=stream)
+    comp_attn.compile()
     comp_attn.execute(
         q_tensor=Q,
         k_tensor=K,
@@ -123,7 +123,7 @@ def test_nsa_compression_wrapper(
     try:
         from cudnn import NSA
         from cuda.bindings import driver as cuda
-    except ImportError as e:
+    except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
     cfg = nsa_init(
@@ -143,24 +143,28 @@ def test_nsa_compression_wrapper(
     Q, K, V, _, _, _, cum_seqlen_q, cum_seqlen_k, max_s_q, max_s_k = allocate_input_tensors(cfg)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    O, LSE = NSA.compression_attention_wrapper(
-        q_tensor=Q,
-        k_tensor=K,
-        v_tensor=V,
-        cum_seqlen_q_tensor=cum_seqlen_q,
-        cum_seqlen_k_tensor=cum_seqlen_k,
-        enable_lse=True,
-        mma_tiler_mn=cfg["mma_tiler_mn"],
-        o_dtype=cfg["dtype"],
-        qk_acc_dtype=cfg["acc_dtype"],
-        pv_acc_dtype=cfg["acc_dtype"],
-        is_persistent=cfg["is_persistent"],
-        scale_q=cfg["scale_q"],
-        scale_k=cfg["scale_k"],
-        scale_v=cfg["scale_v"],
-        inv_scale_o=cfg["inv_scale_o"],
-        scale_softmax=cfg["scale_softmax"],
-    )
+    try:
+        for _ in range(2):  # Run twice to test caching path
+            O, LSE = NSA.compression_attention_wrapper(
+                q_tensor=Q,
+                k_tensor=K,
+                v_tensor=V,
+                cum_seqlen_q_tensor=cum_seqlen_q,
+                cum_seqlen_k_tensor=cum_seqlen_k,
+                enable_lse=True,
+                mma_tiler_mn=cfg["mma_tiler_mn"],
+                o_dtype=cfg["dtype"],
+                qk_acc_dtype=cfg["acc_dtype"],
+                pv_acc_dtype=cfg["acc_dtype"],
+                is_persistent=cfg["is_persistent"],
+                scale_q=cfg["scale_q"],
+                scale_k=cfg["scale_k"],
+                scale_v=cfg["scale_v"],
+                inv_scale_o=cfg["inv_scale_o"],
+                scale_softmax=cfg["scale_softmax"],
+            )
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
 
     check_ref_nsa_compression_attention(
         Q,

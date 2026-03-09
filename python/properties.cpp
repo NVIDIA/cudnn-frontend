@@ -24,29 +24,35 @@ class HandleManagement {
     create_handle() {
         cudnnHandle_t handle;
         auto status = detail::create_handle(&handle);
-        throw_if(
-            status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnHandle Create failed");
+        throw_if(status != CUDNN_STATUS_SUCCESS,
+                 cudnn_frontend::error_code_t::HANDLE_ERROR,
+                 "cudnnHandle Create failed " + detail::get_last_error_string_());
         return reinterpret_cast<std::intptr_t>(handle);
     }
 
     static void
     destroy_handle(std::intptr_t handle) {
         auto status = detail::destroy_handle((cudnnHandle_t)handle);
-        throw_if(
-            status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnHandle Destroy failed");
+        throw_if(status != CUDNN_STATUS_SUCCESS,
+                 cudnn_frontend::error_code_t::HANDLE_ERROR,
+                 "cudnnHandle Destroy failed " + detail::get_last_error_string_());
     }
 
     static void
     set_stream(std::intptr_t handle, std::intptr_t stream) {
         auto status = detail::set_stream((cudnnHandle_t)handle, (cudaStream_t)stream);
-        throw_if(status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnSetStream failed");
+        throw_if(status != CUDNN_STATUS_SUCCESS,
+                 cudnn_frontend::error_code_t::HANDLE_ERROR,
+                 "cudnnSetStream failed " + detail::get_last_error_string_());
     }
 
     static std::intptr_t
     get_stream(std::intptr_t handle) {
         cudaStream_t streamId = nullptr;
         auto status           = detail::get_stream((cudnnHandle_t)handle, &streamId);
-        throw_if(status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnGetStream failed");
+        throw_if(status != CUDNN_STATUS_SUCCESS,
+                 cudnn_frontend::error_code_t::HANDLE_ERROR,
+                 "cudnnGetStream failed " + detail::get_last_error_string_());
 
         return reinterpret_cast<std::intptr_t>(streamId);
     }
@@ -55,7 +61,9 @@ class HandleManagement {
 std::shared_ptr<cudnn_frontend::KernelCache>
 create_kernel_cache_helper() {
     auto kernel_cache = std::make_shared<cudnn_frontend::KernelCache>();
-    throw_if(kernel_cache == nullptr, cudnn_frontend::error_code_t::INVALID_VALUE, "kernel cache creation failed");
+    throw_if(kernel_cache == nullptr,
+             cudnn_frontend::error_code_t::INVALID_VALUE,
+             "kernel cache creation failed " + detail::get_last_error_string_());
     return kernel_cache;
 }
 
@@ -76,8 +84,9 @@ kernel_cache_from_json_helper(std::shared_ptr<cudnn_frontend::KernelCache> kerne
 std::shared_ptr<cudnn_frontend::DeviceProperties>
 create_device_properties_helper(int32_t device_id) {
     auto device_properties = std::make_shared<cudnn_frontend::DeviceProperties>();
-    throw_if(
-        device_properties == nullptr, cudnn_frontend::error_code_t::INVALID_VALUE, "device properties creation failed");
+    throw_if(device_properties == nullptr,
+             cudnn_frontend::error_code_t::INVALID_VALUE,
+             "device properties creation failed " + detail::get_last_error_string_());
     if (device_id >= 0) {
         auto err = device_properties->set_device_id(device_id).build();
         throw_if(!err.is_good(), err.code, err.get_message());
@@ -88,8 +97,9 @@ create_device_properties_helper(int32_t device_id) {
 std::shared_ptr<cudnn_frontend::DeviceProperties>
 create_device_properties_helper(std::string const& json_str) {
     auto device_properties = std::make_shared<cudnn_frontend::DeviceProperties>();
-    throw_if(
-        device_properties == nullptr, cudnn_frontend::error_code_t::INVALID_VALUE, "device properties creation failed");
+    throw_if(device_properties == nullptr,
+             cudnn_frontend::error_code_t::INVALID_VALUE,
+             "device properties creation failed " + detail::get_last_error_string_());
     std::vector<uint8_t> serialization_buf(json_str.begin(), json_str.end());
     auto err = device_properties->deserialize(serialization_buf);
     throw_if(err.is_bad(), err.code, err.get_message());
@@ -265,7 +275,8 @@ init_properties(py::module_& m) {
     py::enum_<cudnn_frontend::HeurMode_t>(m, "heur_mode")
         .value("A", cudnn_frontend::HeurMode_t::A)
         .value("B", cudnn_frontend::HeurMode_t::B)
-        .value("FALLBACK", cudnn_frontend::HeurMode_t::FALLBACK);
+        .value("FALLBACK", cudnn_frontend::HeurMode_t::FALLBACK)
+        .value("OPENSOURCE", cudnn_frontend::HeurMode_t::OPENSOURCE);
 
     py::enum_<cudnn_frontend::ConvolutionMode_t>(m, "convolution_mode")
         .value("CONVOLUTION", cudnn_frontend::ConvolutionMode_t::CONVOLUTION)

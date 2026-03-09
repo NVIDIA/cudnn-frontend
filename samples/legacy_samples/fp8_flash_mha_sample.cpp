@@ -238,7 +238,7 @@ createScale(cudnn_frontend::Tensor& prevBlockOutputTensor,
                                      false,
                                      isScaleByValue);  // is by value
 
-    // Hack to get the virtual id to not be same for all the virtual tensors
+    // To get the virtual id to not be same for all the virtual tensors
     int64_t outputUID = isOutputVirtual ? tensor_name_to_uid["VIRTUAL"] + tensor_name_to_uid[scale_tensor_name] + 5000
                                         : tensor_name_to_uid[output_tensor_name];
     auto afterScaleKTensor =
@@ -272,7 +272,7 @@ createScale(cudnn_frontend::Tensor& prevBlockOutputTensor,
         output_stride[i] = prevBlockOutputTensor.getStride()[i];
     }
 
-    // Hack to get the virtual id to not be same for all the virtual tensors
+    // To get the virtual id to not be same for all the virtual tensors
     int64_t outputUID =
         isOutputVirtual ? tensor_name_to_uid["VIRTUAL"] + UID_offset : tensor_name_to_uid[output_tensor_name];
     auto afterScaleTensor =
@@ -335,7 +335,7 @@ createScaleWithOffset(cudnn_frontend::Tensor& prevBlockOutputTensor,
                                      isScaleByValue);  // is by value
 
     cudnnDataType_t outputDataType = isOutputVirtual ? CUDNN_DATA_FLOAT : tensorType;
-    // Hack to get the virtual id to not be same for all the virtual tensors
+    // To get the virtual id to not be same for all the virtual tensors
     int64_t outputUID = isOutputVirtual ? tensor_name_to_uid["VIRTUAL"] + tensor_name_to_uid[scale_tensor_name] + 7000
                                         : tensor_name_to_uid[output_tensor_name];
     auto afterScaleTensor = tensor_create_with_offset(

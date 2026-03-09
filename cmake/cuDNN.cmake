@@ -1,3 +1,13 @@
+# Check if CUDNN:: targets already exist (integrated build)
+if(TARGET CUDNN::cudnn AND TARGET CUDNN::cudnn_all)
+    message(STATUS "cuDNN: Using existing CMake targets")
+    set(CUDNN_FOUND ON CACHE INTERNAL "cuDNN Library Found")
+    return()
+endif()
+
+# Original behavior: search for pre-built libraries
+message(STATUS "cuDNN: Searching for pre-built libraries")
+
 add_library(CUDNN::cudnn_all INTERFACE IMPORTED)
 
 find_path(
@@ -26,7 +36,7 @@ function(find_cudnn_library NAME)
         PATH_SUFFIXES lib64 lib/x64 lib
         ${_cudnn_required}
     )
-    
+
     if(${NAME}_LIBRARY)
         add_library(CUDNN::${NAME} UNKNOWN IMPORTED)
         set_target_properties(
@@ -52,7 +62,7 @@ if(CUDNN_INCLUDE_DIR AND cudnn_LIBRARY)
 
     message(STATUS "cuDNN: ${cudnn_LIBRARY}")
     message(STATUS "cuDNN: ${CUDNN_INCLUDE_DIR}")
-    
+
     set(CUDNN_FOUND ON CACHE INTERNAL "cuDNN Library Found")
 
 else()
@@ -71,7 +81,7 @@ target_include_directories(
 target_link_libraries(
     CUDNN::cudnn_all
     INTERFACE
-    CUDNN::cudnn 
+    CUDNN::cudnn
 )
 
 if(CUDNN_MAJOR_VERSION EQUAL 8)

@@ -36,6 +36,10 @@ TEST_CASE("sdpa_fp8_bprop_brcm", "[graph][sdpa][fp8][backward][brcm]") {
     return;
 #endif
 
+    if (get_compute_capability() < 100 || get_compute_capability() >= 110) {
+        SKIP("SDPA fp8 bottom right causal mask requires Blackwell and up");
+    }
+
     int64_t b = 2;    // batch size
     int64_t h = 2;    // head dim
     int64_t s = 512;  // q,k,v tensor is padded to this seq length

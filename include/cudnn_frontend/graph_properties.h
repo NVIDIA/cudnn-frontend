@@ -868,7 +868,7 @@ class Matmul_attributes : public Attributes<Matmul_attributes> {
 class Pointwise_attributes : public Attributes<Pointwise_attributes> {
     friend class Attributes<Pointwise_attributes>;
     friend class PointwiseNode;
-    friend class SoftmaxNode;
+    friend class CompositeSoftmaxNode;
     friend class INode;
 
     PointwiseMode_t mode = PointwiseMode_t::NOT_SET;
@@ -1635,10 +1635,6 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     AttentionScoreModifier_t attention_score_modifier = nullptr;
     DataType_t mma_core_mode                          = DataType_t::NOT_SET;
 
-    // Deprecated fields for backward compatibility with SDPA_fp8_attributes
-    bool causal_mask              = false;
-    bool causal_mask_bottom_right = false;
-
     AttentionImplementation_t implementation = AttentionImplementation_t::AUTO;
 
     bool
@@ -1649,6 +1645,11 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     bool
     has_causal_mask_bottom_right() const {
         return right_bound.has_value() && diagonal_alignment == DiagonalAlignment_t::BOTTOM_RIGHT;
+    }
+
+    bool
+    has_sink_token() const {
+        return inputs.find(input_names::SINK_TOKEN) != inputs.end() && inputs.at(input_names::SINK_TOKEN) != nullptr;
     }
 
    public:
@@ -1705,8 +1706,6 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
                                    left_bound,
                                    right_bound,
                                    diagonal_alignment,
-                                   causal_mask,
-                                   causal_mask_bottom_right,
                                    implementation)
 
     SDPA_attributes&
@@ -1800,11 +1799,8 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     set_causal_mask(bool const value) {
         if (value) {
             set_diagonal_alignment(DiagonalAlignment_t::TOP_LEFT);
-            if (!right_bound.has_value()) {
-                set_diagonal_band_right_bound(0);
-            }
+            set_diagonal_band_right_bound(0);
         }
-        causal_mask = value;
         return *this;
     }
 
@@ -1815,11 +1811,8 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     set_causal_mask_bottom_right(bool const value) {
         if (value) {
             set_diagonal_alignment(DiagonalAlignment_t::BOTTOM_RIGHT);
-            if (!right_bound.has_value()) {
-                set_diagonal_band_right_bound(0);
-            }
+            set_diagonal_band_right_bound(0);
         }
-        causal_mask_bottom_right = value;
         return *this;
     }
 
@@ -2092,9 +2085,7 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     set_causal_mask(bool const value) {
         if (value) {
             set_diagonal_alignment(DiagonalAlignment_t::TOP_LEFT);
-            if (!right_bound.has_value()) {
-                set_diagonal_band_right_bound(0);
-            }
+            set_diagonal_band_right_bound(0);
         }
         return *this;
     }
@@ -2106,9 +2097,7 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     set_causal_mask_bottom_right(bool const value) {
         if (value) {
             set_diagonal_alignment(DiagonalAlignment_t::BOTTOM_RIGHT);
-            if (!right_bound.has_value()) {
-                set_diagonal_band_right_bound(0);
-            }
+            set_diagonal_band_right_bound(0);
         }
         return *this;
     }
@@ -2184,9 +2173,10 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
     friend class Graph;
 
     bool padding_mask               = false;
-    bool causal_mask                = false;
-    bool causal_mask_bottom_right   = false;
     bool is_deterministic_algorithm = false;
+    std::optional<int64_t> left_bound;
+    std::optional<int64_t> right_bound;
+    DiagonalAlignment_t diagonal_alignment = DiagonalAlignment_t::TOP_LEFT;
 
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
@@ -2194,10 +2184,14 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
    public:
     enum class input_names {
         Q,
+        Q_T,
         K,
+        K_T,
         V,
         O,
         dO,
+        dO_T,
+        dO_f16,
         Stats,
         Attn_scale,
         Bias,
@@ -2214,6 +2208,9 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
         Descale_V,
         Descale_O,
         Descale_dO,
+        Descale_dO_T,
+        Descale_K_T,
+        Descale_Q_T,
         Descale_S,
         Descale_dP,
         Scale_dQ,
@@ -2233,9 +2230,10 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
                                    inputs,
                                    outputs,
                                    padding_mask,
-                                   causal_mask,
                                    dropout_probability,
-                                   causal_mask_bottom_right,
+                                   left_bound,
+                                   right_bound,
+                                   diagonal_alignment,
                                    attn_scale_value,
                                    is_deterministic_algorithm)
 
@@ -2275,16 +2273,55 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
         return *this;
     }
 
+    bool
+    has_causal_like_masking() const {
+        return right_bound.has_value();
+    }
+
+    bool
+    has_causal_mask_bottom_right() const {
+        return right_bound.has_value() && diagonal_alignment == DiagonalAlignment_t::BOTTOM_RIGHT;
+    }
+
     SDPA_fp8_backward_attributes&
     set_causal_mask(bool const value) {
-        causal_mask = value;
+        if (value) {
+            set_diagonal_alignment(DiagonalAlignment_t::TOP_LEFT);
+            set_diagonal_band_right_bound(0);
+        }
         return *this;
     }
 
     SDPA_fp8_backward_attributes&
     set_causal_mask_bottom_right(bool const value) {
-        causal_mask_bottom_right = value;
+        if (value) {
+            set_diagonal_alignment(DiagonalAlignment_t::BOTTOM_RIGHT);
+            set_diagonal_band_right_bound(0);
+        }
         return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_diagonal_alignment(DiagonalAlignment_t const alignment) {
+        diagonal_alignment = alignment;
+        return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_diagonal_band_right_bound(int const value) {
+        right_bound = value;
+        return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_diagonal_band_left_bound(int const value) {
+        left_bound = value;
+        return *this;
+    }
+
+    bool
+    has_sliding_window() const {
+        return left_bound.has_value();
     }
 
     SDPA_fp8_backward_attributes&
@@ -2317,9 +2354,13 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
 using Scaled_dot_product_flash_attention_attributes [[deprecated]]          = SDPA_attributes;
 using Scaled_dot_product_flash_attention_backward_attributes [[deprecated]] = SDPA_backward_attributes;
 
+class CompositeSoftmaxNode;
+class UnifiedSoftmaxNode;
+
 class Softmax_attributes : public Attributes<Softmax_attributes> {
     friend class Attributes<Softmax_attributes>;
-    friend class SoftmaxNode;
+    friend class CompositeSoftmaxNode;
+    friend class UnifiedSoftmaxNode;
     friend class INode;
 
    public:
@@ -2332,6 +2373,42 @@ class Softmax_attributes : public Attributes<Softmax_attributes> {
     Softmax_attributes&
     set_sink(std::shared_ptr<Tensor_attributes> value) {
         inputs[Softmax_attributes::input_names::SINK] = value;
+        return *this;
+    }
+};
+
+template <typename DerivedClass>
+class DiagonalBandMaskNodeBase;
+class CompositeDiagonalBandMaskNode;
+class UnifiedDiagonalBandMaskNode;
+
+class DiagonalBandMask_attributes : public Attributes<DiagonalBandMask_attributes> {
+    friend class Attributes<DiagonalBandMask_attributes>;
+    friend class CompositeDiagonalBandMaskNode;
+    friend class UnifiedDiagonalBandMaskNode;
+
+    PointwiseMode_t comparison_mode = PointwiseMode_t::CMP_GT;
+
+   public:
+    enum class input_names { X, SEQ_LEN_Q, SEQ_LEN_KV, LeftBound, ShiftRightBound, B };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { Y };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(DiagonalBandMask_attributes,
+                                   name,
+                                   compute_data_type,
+                                   inputs,
+                                   outputs,
+                                   comparison_mode)
+
+    PointwiseMode_t
+    get_comparison_mode() const {
+        return comparison_mode;
+    }
+
+    DiagonalBandMask_attributes&
+    set_comparison_mode(PointwiseMode_t value) {
+        comparison_mode = value;
         return *this;
     }
 };

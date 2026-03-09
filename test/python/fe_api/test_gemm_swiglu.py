@@ -78,7 +78,7 @@ def test_gemm_swiglu_compile_execute(
         assert gemm_swiglu.check_support(), "Unsupported testcase"
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
-    gemm_swiglu.compile(current_stream=stream)
+    gemm_swiglu.compile()
     gemm_swiglu.execute(
         a_tensor=a_torch,
         b_tensor=b_torch,
@@ -151,7 +151,7 @@ def test_gemm_swiglu_wrapper(
 
     try:
         for _ in range(2):  # Run twice to test caching path
-            ab12_torch, c_torch = gemm_swiglu_wrapper_sm100(
+            ab12_torch, c_torch, sfc_tensor, amax_tensor = gemm_swiglu_wrapper_sm100(
                 a_tensor=a_torch,
                 b_tensor=b_torch,
                 alpha=cfg["alpha"],
@@ -165,6 +165,8 @@ def test_gemm_swiglu_wrapper(
             )
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
+    assert sfc_tensor is None
+    assert amax_tensor is None
 
     check_ref_gemm_swiglu(
         a_torch,
@@ -412,7 +414,7 @@ def _test_gemm_swiglu_compile_execute_quant(
         assert gemm_swiglu.check_support(), "Unsupported testcase"
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
-    gemm_swiglu.compile(current_stream=stream)
+    gemm_swiglu.compile()
     gemm_swiglu.execute(
         a_tensor=a_torch,
         b_tensor=b_torch,

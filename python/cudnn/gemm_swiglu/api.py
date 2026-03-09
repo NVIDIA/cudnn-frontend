@@ -29,11 +29,9 @@
 
 from .dense_gemm_persistent_swiglu import (
     PersistentDenseGemmKernel,
-    PersistentDenseGemmKernelNoDlpack,
 )
 from .dense_blockscaled_gemm_persistent_swiglu_interleaved_quant import (
     Sm100BlockScaledPersistentDenseGemmKernel,
-    Sm100BlockScaledPersistentDenseGemmKernelNoDlpack,
 )
 from cuda.bindings import driver as cuda
 import torch
@@ -41,12 +39,10 @@ from typing import Tuple, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack, make_ptr
-from packaging import version
-import cutlass.cute.math as math
+from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.api_base import APIBase, ceil_div, is_power_of_2
+from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
 
 
 class GemmSwigluSm100(APIBase):
@@ -75,10 +71,10 @@ class GemmSwigluSm100(APIBase):
         self._logger.warning("GemmSwigluSm100 is an experimental API")
         self._logger.debug("Entering __init__")
 
-        self.sample_a = sample_a
-        self.sample_b = sample_b
-        self.sample_ab12 = sample_ab12
-        self.sample_c = sample_c
+        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
+        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
+        self.ab12_desc = self._make_tensor_desc(sample_ab12, name="sample_ab12")
+        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
         self.alpha = alpha
         self.acc_dtype = acc_dtype
         self.mma_tiler_mn = mma_tiler_mn
@@ -88,17 +84,17 @@ class GemmSwigluSm100(APIBase):
             self.cluster_shape_mn = cluster_shape_mn
 
         ### Quantize only arguments
-        self.sample_sfa = sample_sfa
-        self.sample_sfb = sample_sfb
-        self.sample_sfc = sample_sfc
-        self.sample_amax = self._unpad_tensor_to_ndim(sample_amax, 1, "amax")
-        self.sample_norm_const = self._unpad_tensor_to_ndim(sample_norm_const, 1, "norm_const")
+        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
+        self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
+        self.sfc_desc = self._make_tensor_desc(sample_sfc, name="sample_sfc")
+        self.amax_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_amax, name="sample_amax"), 1, "amax")
+        self.norm_const_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_norm_const, name="sample_norm_const"), 1, "norm_const")
         self.sf_vec_size = sf_vec_size
         self.vector_f32 = vector_f32
         self.ab12_stages = ab12_stages
 
         # Kernel selection
-        if self.sample_sfa is None and self.sample_sfb is None and self.sample_amax is None and self.sample_sfc is None and self.sample_norm_const is None:
+        if self.sfa_desc is None and self.sfb_desc is None and self.amax_desc is None and self.sfc_desc is None and self.norm_const_desc is None:
             self._logger.debug("No quantization arguments provided, using regular GEMM swiglu kernel")
             self._kernel = PersistentDenseGemmKernel
         else:
@@ -106,7 +102,7 @@ class GemmSwigluSm100(APIBase):
             self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
 
         self._logger.debug(
-            f"__init__ completed with args: sample_a {sample_a.shape}, sample_b {sample_b.shape}, sample_ab12 {sample_ab12.shape}, sample_c {sample_c.shape}, alpha {alpha}, acc_dtype {acc_dtype}, mma_tiler_mn {mma_tiler_mn}, cluster_shape_mn {cluster_shape_mn}, sample_sfa {sample_sfa.shape if sample_sfa is not None else None}, sample_sfb {sample_sfb.shape if sample_sfb is not None else None}, sample_amax {sample_amax.shape if sample_amax is not None else None}, sample_sfc {sample_sfc.shape if sample_sfc is not None else None}, sample_norm_const {sample_norm_const.shape if sample_norm_const is not None else None}, sf_vec_size {sf_vec_size}, vector_f32 {vector_f32}, ab12_stages {ab12_stages}"
+            f"__init__ completed with args: sample_a {self.a_desc.shape}, sample_b {self.b_desc.shape}, sample_ab12 {self.ab12_desc.shape}, sample_c {self.c_desc.shape}, alpha {alpha}, acc_dtype {acc_dtype}, mma_tiler_mn {mma_tiler_mn}, cluster_shape_mn {cluster_shape_mn}, sample_sfa {self.sfa_desc.shape if self.sfa_desc is not None else None}, sample_sfb {self.sfb_desc.shape if self.sfb_desc is not None else None}, sample_amax {self.amax_desc.shape if self.amax_desc is not None else None}, sample_sfc {self.sfc_desc.shape if self.sfc_desc is not None else None}, sample_norm_const {self.norm_const_desc.shape if self.norm_const_desc is not None else None}, sf_vec_size {sf_vec_size}, vector_f32 {vector_f32}, ab12_stages {ab12_stages}"
         )
 
         self._interpret_uint8_as_fp4x2 = True
@@ -115,44 +111,38 @@ class GemmSwigluSm100(APIBase):
         self._logger.debug("Entering check_support")
 
         self._logger.debug("Checking tensor shapes, strides, and dtypes")
-        m, k, l = self._tensor_shape(self.sample_a, name="sample_a")
-        n, k, l = self._tensor_shape(self.sample_b, name="sample_b")
-        m, n, l = self._tensor_shape(self.sample_ab12, name="sample_ab12")
-        m, n_2, l = self._tensor_shape(self.sample_c, name="sample_c")
+        m, k, l = self.a_desc.shape
+        n, k, l = self.b_desc.shape
+        m, n, l = self.ab12_desc.shape
+        m, n_2, l = self.c_desc.shape
 
-        self._check_tensor_shape(self.sample_a, (m, k, l), "A")
-        self._check_tensor_shape(self.sample_b, (n, k, l), "B")
-        self._check_tensor_shape(self.sample_ab12, (m, n, l), "AB12")
-        self._check_tensor_shape(self.sample_c, (m, n // 2, l), "C")
+        self._check_tensor_shape(self.a_desc, (m, k, l), "A")
+        self._check_tensor_shape(self.b_desc, (n, k, l), "B")
+        self._check_tensor_shape(self.ab12_desc, (m, n, l), "AB12")
+        self._check_tensor_shape(self.c_desc, (m, n // 2, l), "C")
 
-        if self._kernel in {
-            Sm100BlockScaledPersistentDenseGemmKernel,
-            Sm100BlockScaledPersistentDenseGemmKernelNoDlpack,
-        }:
+        if self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
             rest_k = ceil_div(ceil_div(k, self.sf_vec_size), 4)
-            self._check_tensor_shape(self.sample_sfa, (32, 4, ceil_div(m, 128), 4, rest_k, l), "SFA")
-            self._check_tensor_shape(self.sample_sfb, (32, 4, ceil_div(n, 128), 4, rest_k, l), "SFB")
-            self._check_tensor_shape(self.sample_amax, (1,), "amax")
+            self._check_tensor_shape(self.sfa_desc, (32, 4, ceil_div(m, 128), 4, rest_k, l), "SFA")
+            self._check_tensor_shape(self.sfb_desc, (32, 4, ceil_div(n, 128), 4, rest_k, l), "SFB")
+            self._check_tensor_shape(self.amax_desc, (1,), "amax")
             rest_n2 = ceil_div(ceil_div(n // 2, self.sf_vec_size), 4)
-            self._check_tensor_shape(self.sample_sfc, (32, 4, ceil_div(m, 128), 4, rest_n2, l), "SFC")
-            self._check_tensor_shape(self.sample_norm_const, (1,), "norm_const")
+            self._check_tensor_shape(self.sfc_desc, (32, 4, ceil_div(m, 128), 4, rest_n2, l), "SFC")
+            self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
 
-        _, self.a_stride_order = self._check_tensor_stride(self.sample_a, stride=[(1, m, m * k), (k, 1, m * k)])
-        _, self.b_stride_order = self._check_tensor_stride(self.sample_b, stride=[(1, n, n * k), (k, 1, n * k)])
-        _, self.ab12_stride_order = self._check_tensor_stride(self.sample_ab12, stride=[(1, m, m * n), (n, 1, m * n)])
-        _, self.c_stride_order = self._check_tensor_stride(self.sample_c, stride=[(1, m, m * n_2), (n_2, 1, m * n_2)])
+        _ = self._check_tensor_stride(self.a_desc, stride=[(1, m, m * k), (k, 1, m * k)])
+        _ = self._check_tensor_stride(self.b_desc, stride=[(1, n, n * k), (k, 1, n * k)])
+        _ = self._check_tensor_stride(self.ab12_desc, stride=[(1, m, m * n), (n, 1, m * n)])
+        _ = self._check_tensor_stride(self.c_desc, stride=[(1, m, m * n_2), (n_2, 1, m * n_2)])
         self._value_error_if(
-            self.ab12_stride_order != self.c_stride_order,
-            f"AB12 and C tensor stride orders must match, got {self.ab12_stride_order} and {self.c_stride_order}",
+            self.ab12_desc.stride_order != self.c_desc.stride_order,
+            f"AB12 and C tensor stride orders must match, got {self.ab12_desc.stride_order} and {self.c_desc.stride_order}",
         )
 
         self._logger.debug("Checking data types")
-        if self._kernel in {
-            PersistentDenseGemmKernel,
-            PersistentDenseGemmKernelNoDlpack,
-        }:
+        if self._kernel is PersistentDenseGemmKernel:
             self.ab_dtype = self._check_dtype(
-                self.sample_a,
+                self.a_desc,
                 dtype=[
                     torch.float16,
                     torch.bfloat16,
@@ -165,7 +155,7 @@ class GemmSwigluSm100(APIBase):
             match self.acc_dtype:
                 case torch.float32:
                     self.ab12_dtype = self._check_dtype(
-                        self.sample_ab12,
+                        self.ab12_desc,
                         dtype=[
                             torch.float32,
                             torch.float16,
@@ -181,29 +171,26 @@ class GemmSwigluSm100(APIBase):
                     )
                 case torch.float16:
                     self.ab12_dtype = self._check_dtype(
-                        self.sample_ab12,
+                        self.ab12_desc,
                         dtype=[torch.float16, torch.bfloat16],
                         name="AB12 (for float16 acc_dtype)",
                     )
                     self._check_dtype(
-                        self.ab_dtype,
+                        self.a_desc,
                         dtype=[torch.float16, torch.float8_e4m3fn, torch.float8_e5m2],
                         name="A/B (for float16 acc_dtype)",
                     )
                 case _:
                     raise ValueError(f"Unsupported acc_dtype: expected one of {{torch.float32, torch.float16}}, got {self.acc_dtype}")
-            self.c_dtype = self._check_dtype(self.sample_c, dtype=[torch.float16, torch.bfloat16], name="C")
-        elif self._kernel in {
-            Sm100BlockScaledPersistentDenseGemmKernel,
-            Sm100BlockScaledPersistentDenseGemmKernelNoDlpack,
-        }:
+            self.c_dtype = self._check_dtype(self.c_desc, dtype=[torch.float16, torch.bfloat16], name="C")
+        elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
             self._value_error_if(
-                self.sample_sfa is None or self.sample_sfb is None,
+                self.sfa_desc is None or self.sfb_desc is None,
                 "sfa and sfb must be provided for quantized GEMM swiglu kernel",
             )
 
             self.ab_dtype = self._check_dtype(
-                self.sample_a,
+                self.a_desc,
                 dtype=[
                     torch.float4_e2m1fn_x2,
                     torch.uint8,
@@ -218,7 +205,7 @@ class GemmSwigluSm100(APIBase):
                 name="Accumulator (for quantized GEMM swiglu kernel)",
             )
             self.ab12_dtype = self._check_dtype(
-                self.sample_ab12,
+                self.ab12_desc,
                 dtype=[
                     torch.float32,
                     torch.float16,
@@ -229,7 +216,7 @@ class GemmSwigluSm100(APIBase):
                 name="AB12 (for quantized GEMM swiglu kernel)",
             )
             self.c_dtype = self._check_dtype(
-                self.sample_c,
+                self.c_desc,
                 dtype=[
                     torch.float32,
                     torch.float16,
@@ -246,11 +233,11 @@ class GemmSwigluSm100(APIBase):
             )
 
             self._value_error_if(
-                self._is_fp8(self.c_dtype) and (self.sample_sfc is None or self.sample_norm_const is None),
+                self._is_fp8(self.c_dtype) and (self.sfc_desc is None or self.norm_const_desc is None),
                 "sfc and norm_const must be provided when c_dtype is fp8",
             )
             self._value_error_if(
-                (self._is_fp4x2(self.ab_dtype) and self.c_dtype == torch.bfloat16) and (self.sample_amax is None),
+                (self._is_fp4x2(self.ab_dtype) and self.c_dtype == torch.bfloat16) and (self.amax_desc is None),
                 "amax must be provided when ab_dtype is fp4 and c_dtype is bf16",
             )
 
@@ -264,18 +251,18 @@ class GemmSwigluSm100(APIBase):
                 f"sf_vec_size must be 16 or 32 when ab_dtype is {{torch.float8_e5m2, torch.float8_e4m3fn}}, got {self.sf_vec_size}",
             )
             self.sf_dtype = self._check_dtype(
-                self.sample_sfa,
+                self.sfa_desc,
                 dtype=[torch.float8_e8m0fnu, torch.float8_e4m3fn],
                 name="SFA",
             )
             self._check_dtype(
-                self.sample_sfb,
+                self.sfb_desc,
                 dtype=self.sf_dtype,
                 name="SFB",
                 extra_error_msg="SFB must have the same dtype as SFA",
             )
             self._check_dtype(
-                self.sample_sfc,
+                self.sfc_desc,
                 dtype=self.sf_dtype,
                 name="SFC",
                 extra_error_msg="SFC must have the same dtype as SFA",
@@ -293,15 +280,15 @@ class GemmSwigluSm100(APIBase):
 
             if self._is_fp4x2(self.ab_dtype):
                 self._value_error_if(
-                    self.a_stride_order != (1, 0, 2) or self.b_stride_order != (1, 0, 2),
+                    self.a_desc.stride_order != (1, 0, 2) or self.b_desc.stride_order != (1, 0, 2),
                     "Invalid A or B tensor stride: fp4 dtype requires k-major layout",
                 )
                 self._value_error_if(
-                    self.ab12_stride_order != (1, 0, 2),
+                    self.ab12_desc.stride_order != (1, 0, 2),
                     "Invalid AB12 tensor stride: fp4 dtype requires n-major layout",
                 )
         self._check_dtype(
-            self.sample_b,
+            self.b_desc,
             dtype=self.ab_dtype,
             name="B",
             extra_error_msg="A and B must have the same dtype",
@@ -313,19 +300,13 @@ class GemmSwigluSm100(APIBase):
             self.mma_tiler_mn[0] not in [128, 256],
             f"Invalid MMA tile shape: expected mma_tiler_mn[0] in {{128, 256}}, got {self.mma_tiler_mn[0]}",
         )
-        if self._kernel in {
-            PersistentDenseGemmKernel,
-            PersistentDenseGemmKernelNoDlpack,
-        }:
+        if self._kernel is PersistentDenseGemmKernel:
             self._value_error_if(
                 self.mma_tiler_mn[1] not in range(32, 257, 32),
                 f"Invalid MMA tile shape: expected mma_tiler_mn[1] in {{32, 64, ..., 224, 256}}, got {self.mma_tiler_mn[1]}",
             )
 
-        elif self._kernel in {
-            Sm100BlockScaledPersistentDenseGemmKernel,
-            Sm100BlockScaledPersistentDenseGemmKernelNoDlpack,
-        }:
+        elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
             if self._is_fp4x2(self.ab_dtype):
                 self._value_error_if(
                     self.mma_tiler_mn[1] not in range(64, 257, 64),
@@ -353,10 +334,7 @@ class GemmSwigluSm100(APIBase):
             f"Invalid cluster shape: expected values to be powers of 2 and cluster_shape_mn[0] * cluster_shape_mn[1] <= 16, got {self.cluster_shape_mn[0]},{self.cluster_shape_mn[1]}",
         )
 
-        if self._kernel in {
-            PersistentDenseGemmKernel,
-            PersistentDenseGemmKernelNoDlpack,
-        }:
+        if self._kernel is PersistentDenseGemmKernel:
             use_2cta_instrs = self.mma_tiler_mn[0] == 256
             self._value_error_if(
                 not use_2cta_instrs and self.cluster_shape_mn != (1, 1),
@@ -379,17 +357,14 @@ class GemmSwigluSm100(APIBase):
 
         self._value_error_if(
             not (
-                check_contigous_16B_alignment(self.ab_dtype, self.a_stride_order, (m, k, l))
-                and check_contigous_16B_alignment(self.ab_dtype, self.b_stride_order, (n, k, l))
-                and check_contigous_16B_alignment(self.ab12_dtype, self.ab12_stride_order, (m, n, l))
+                check_contigous_16B_alignment(self.ab_dtype, self.a_desc.stride_order, (m, k, l))
+                and check_contigous_16B_alignment(self.ab_dtype, self.b_desc.stride_order, (n, k, l))
+                and check_contigous_16B_alignment(self.ab12_dtype, self.ab12_desc.stride_order, (m, n, l))
             ),
             "Invalid tensor alignment: tensors must be 16B aligned",
         )
 
-        if self._kernel in {
-            Sm100BlockScaledPersistentDenseGemmKernel,
-            Sm100BlockScaledPersistentDenseGemmKernelNoDlpack,
-        }:
+        if self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
             self._value_error_if(
                 m % self.mma_tiler_mn[0] != 0 or n % self.mma_tiler_mn[1] != 0,
                 "Invalid tensor alignment: m and n must be aligned to mma_tiler_mn",
@@ -410,43 +385,21 @@ class GemmSwigluSm100(APIBase):
         self._logger.debug("check_support completed successfully")
         return True
 
-    def compile(self, current_stream: Optional[cuda.CUstream] = None) -> None:
+    def compile(self) -> None:
         self._logger.debug("Entering compile")
-        current_stream = self._get_default_stream(current_stream)
         self._ensure_support_checked()
+        if self._compiled_kernel is not None:
+            self._logger.debug("Kernel already compiled; skipping recompilation")
+            return
 
-        torch_version = version.parse(torch.__version__)
-        is_ab_fp4 = self._is_fp4x2(self.ab_dtype)
-        is_ab12_fp4 = self._is_fp4x2(self.ab12_dtype)
-        is_ab_fp8 = self._is_fp8(self.ab_dtype)
-        is_ab12_fp8 = self._is_fp8(self.ab12_dtype)
-        _fp8_dlpack_supported = version.parse(torch_version.base_version) >= version.parse("2.10.0")
-        use_no_dlpack_kernel = is_ab_fp4 or is_ab12_fp4 or ((is_ab_fp8 or is_ab12_fp8) and not _fp8_dlpack_supported)
-
-        if use_no_dlpack_kernel:
-            self._logger.debug("Running no_dlpack kernel wrapper due to fp4 dtype or fp8 dtype on incompatible torch version")
-            if self._kernel is PersistentDenseGemmKernel:
-                self._kernel = PersistentDenseGemmKernelNoDlpack
-            elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
-                self._kernel = Sm100BlockScaledPersistentDenseGemmKernelNoDlpack
-            else:
-                raise NotImplementedError(f"Unreachable: invalid kernel type {self._kernel}")
-
-        gemm_swiglu = None
-        if self._kernel in (
-            PersistentDenseGemmKernel,
-            PersistentDenseGemmKernelNoDlpack,
-        ):
+        if self._kernel is PersistentDenseGemmKernel:
             gemm_swiglu = self._kernel(
                 acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
                 use_2cta_instrs=(self.mma_tiler_mn[0] == 256),
                 mma_tiler_mn=self.mma_tiler_mn,
                 cluster_shape_mn=self.cluster_shape_mn,
             )
-        elif self._kernel in (
-            Sm100BlockScaledPersistentDenseGemmKernel,
-            Sm100BlockScaledPersistentDenseGemmKernelNoDlpack,
-        ):
+        elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
             gemm_swiglu = self._kernel(
                 sf_vec_size=self.sf_vec_size,
                 mma_tiler_mn=self.mma_tiler_mn,
@@ -459,108 +412,90 @@ class GemmSwigluSm100(APIBase):
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
+        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         if self._kernel is PersistentDenseGemmKernel:
-            self._logger.debug("Compiling gemm_swiglu (dlpack)")
-            self._compiled_kernel = cute.compile(
+            self._logger.debug("Compiling gemm_swiglu")
+            _compiled_kernel = cute.compile(
                 gemm_swiglu,
-                a=from_dlpack(self.sample_a),
-                b=from_dlpack(self.sample_b),
-                ab12=from_dlpack(self.sample_ab12),
-                c=from_dlpack(self.sample_c),
+                a=self._make_fake_cute_tensor_from_desc(self.a_desc),
+                b=self._make_fake_cute_tensor_from_desc(self.b_desc),
+                ab12=self._make_fake_cute_tensor_from_desc(self.ab12_desc),
+                c=self._make_fake_cute_tensor_from_desc(self.c_desc),
                 alpha=self.alpha,
                 max_active_clusters=max_active_clusters,
-                stream=current_stream,
+                stream=fake_stream,
+                options="--enable-tvm-ffi",
             )
+
+            def tensor_api(
+                a_tensor: torch.Tensor,
+                b_tensor: torch.Tensor,
+                ab12_tensor: torch.Tensor,
+                c_tensor: torch.Tensor,
+                alpha: float,
+                stream: cuda.CUstream,
+            ) -> None:
+                _compiled_kernel(
+                    a_tensor,
+                    b_tensor,
+                    ab12_tensor,
+                    c_tensor,
+                    alpha,
+                    stream,
+                )
+
+            self._compiled_kernel = tensor_api
         elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
-            self._logger.debug("Compiling gemm_swiglu_blockscaled_quantized (dlpack)")
-            self._compiled_kernel = cute.compile(
+            self._logger.debug("Compiling gemm_swiglu_blockscaled_quantized")
+            _compiled_kernel = cute.compile(
                 gemm_swiglu,
-                a_tensor=from_dlpack(self.sample_a, assumed_align=16),
-                b_tensor=from_dlpack(self.sample_b, assumed_align=16),
-                sfa_tensor=from_dlpack(self.sample_sfa, assumed_align=16),
-                sfb_tensor=from_dlpack(self.sample_sfb, assumed_align=16),
-                c_tensor=from_dlpack(self.sample_c, assumed_align=16),
-                ab12_tensor=from_dlpack(self.sample_ab12, assumed_align=8),
-                amax_tensor=(from_dlpack(self.sample_amax, assumed_align=16) if self.sample_amax is not None else None),
-                sfc_tensor=(from_dlpack(self.sample_sfc, assumed_align=16) if self.sample_sfc is not None else None),
-                norm_const_tensor=(from_dlpack(self.sample_norm_const) if self.sample_norm_const is not None else None),
+                a_tensor=self._make_fake_cute_tensor_from_desc(self.a_desc, assumed_align=16),
+                b_tensor=self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16),
+                sfa_tensor=self._make_fake_cute_tensor_from_desc(self.sfa_desc, assumed_align=16),
+                sfb_tensor=self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16),
+                c_tensor=self._make_fake_cute_tensor_from_desc(self.c_desc, assumed_align=16),
+                ab12_tensor=self._make_fake_cute_tensor_from_desc(self.ab12_desc, assumed_align=8),
+                amax_tensor=self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16),
+                sfc_tensor=self._make_fake_cute_tensor_from_desc(self.sfc_desc, assumed_align=16),
+                norm_const_tensor=self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16),
                 alpha=self.alpha,
                 max_active_clusters=max_active_clusters,
-                stream=current_stream,
+                stream=fake_stream,
+                options="--enable-tvm-ffi",
             )
-        elif self._kernel in (
-            PersistentDenseGemmKernelNoDlpack,
-            Sm100BlockScaledPersistentDenseGemmKernelNoDlpack,
-        ):
-            # Create cute pointers/tensors manually to avoid DLPack requirements
-            # c (output) is always fp16/bf16 and is safe to use directly with dlpack
-            a_ptr, a_shape, a_stride_order = self._make_cute_tensor_descriptor(self.sample_a, name="A")
-            b_ptr, b_shape, b_stride_order = self._make_cute_tensor_descriptor(self.sample_b, name="B")
-            ab12_ptr, ab12_shape, ab12_stride_order = self._make_cute_tensor_descriptor(self.sample_ab12, name="AB12")
 
-            if self._kernel is PersistentDenseGemmKernelNoDlpack:
-                self._compiled_kernel = cute.compile(
-                    gemm_swiglu,
-                    a_ptr=a_ptr,
-                    a_shape=a_shape,
-                    a_order=a_stride_order,
-                    b_ptr=b_ptr,
-                    b_shape=b_shape,
-                    b_order=b_stride_order,
-                    ab12_ptr=ab12_ptr,
-                    ab12_shape=ab12_shape,
-                    ab12_order=ab12_stride_order,
-                    c_cute=from_dlpack(self.sample_c),
-                    alpha=self.alpha,
-                    max_active_clusters=max_active_clusters,
-                    stream=current_stream,
+            def tensor_api(
+                a_tensor: torch.Tensor,
+                b_tensor: torch.Tensor,
+                ab12_tensor: torch.Tensor,
+                c_tensor: torch.Tensor,
+                sfa_tensor: Optional[torch.Tensor],
+                sfb_tensor: Optional[torch.Tensor],
+                amax_tensor: Optional[torch.Tensor],
+                sfc_tensor: Optional[torch.Tensor],
+                norm_const_tensor: Optional[torch.Tensor],
+                alpha: float,
+                stream: cuda.CUstream,
+            ) -> None:
+                amax_tensor = self._unpad_tensor_to_ndim(amax_tensor, 1, "amax")
+                norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
+                _compiled_kernel(
+                    a_tensor,
+                    b_tensor,
+                    sfa_tensor,
+                    sfb_tensor,
+                    c_tensor,
+                    ab12_tensor,
+                    amax_tensor,
+                    sfc_tensor,
+                    norm_const_tensor,
+                    alpha,
+                    stream,
                 )
-            elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernelNoDlpack:
-                c_ptr, c_shape, c_stride_order = self._make_cute_tensor_descriptor(self.sample_c, name="C")
-                sfa_ptr, sfa_shape, sfa_stride_order = self._make_cute_tensor_descriptor(self.sample_sfa, name="SFA")
-                sfb_ptr, sfb_shape, sfb_stride_order = self._make_cute_tensor_descriptor(self.sample_sfb, name="SFB")
-                amax_ptr, amax_shape, amax_stride_order = self._make_cute_tensor_descriptor(self.sample_amax, name="AMAX")
-                sfc_ptr, sfc_shape, sfc_stride_order = self._make_cute_tensor_descriptor(self.sample_sfc, name="SFC")
-                norm_const_ptr, norm_const_shape, norm_const_stride_order = self._make_cute_tensor_descriptor(self.sample_norm_const, name="NORM_CONST")
 
-                self._compiled_kernel = cute.compile(
-                    gemm_swiglu,
-                    a_ptr=a_ptr,
-                    a_shape=a_shape,
-                    a_order=a_stride_order,
-                    b_ptr=b_ptr,
-                    b_shape=b_shape,
-                    b_order=b_stride_order,
-                    sfa_ptr=sfa_ptr,
-                    sfa_shape=sfa_shape,
-                    sfa_order=sfa_stride_order,
-                    sfb_ptr=sfb_ptr,
-                    sfb_shape=sfb_shape,
-                    sfb_order=sfb_stride_order,
-                    c_ptr=c_ptr,
-                    c_shape=c_shape,
-                    c_order=c_stride_order,
-                    ab12_ptr=ab12_ptr,
-                    ab12_shape=ab12_shape,
-                    ab12_order=ab12_stride_order,
-                    amax_ptr=amax_ptr,
-                    amax_shape=amax_shape,
-                    amax_order=amax_stride_order,
-                    sfc_ptr=sfc_ptr,
-                    sfc_shape=sfc_shape,
-                    sfc_order=sfc_stride_order,
-                    norm_const_ptr=norm_const_ptr,
-                    norm_const_shape=norm_const_shape,
-                    norm_const_order=norm_const_stride_order,
-                    alpha=self.alpha,
-                    max_active_clusters=max_active_clusters,
-                    stream=current_stream,
-                )
-            else:
-                raise NotImplementedError(f"Unreachable: invalid kernel type {self._kernel}")
-        else:
-            raise NotImplementedError(f"Unreachable: invalid kernel type {self._kernel}")
+            self._compiled_kernel = tensor_api
+
         self._logger.debug("Kernel compiled successfully")
 
     def execute(
@@ -576,213 +511,43 @@ class GemmSwigluSm100(APIBase):
         norm_const_tensor: Optional[torch.Tensor] = None,
         alpha: float = 1.0,
         current_stream: Optional[cuda.CUstream] = None,
-        skip_compile: bool = False,
     ) -> None:
         self._logger.debug("Entering execute")
         current_stream = self._get_default_stream(current_stream)
 
-        if not skip_compile:
-            self._runtime_error_if(
-                self._compiled_kernel is None,
-                "GemmSwigluSm100 kernel not compiled; call compile() first or use execute(skip_compile=True)",
+        self._runtime_error_if(
+            self._compiled_kernel is None,
+            "GemmSwigluSm100 kernel not compiled; call compile() first",
+        )
+        self._logger.debug("Executing with compiled kernel")
+
+        if self._kernel is PersistentDenseGemmKernel:
+            self._compiled_kernel(
+                a_tensor=a_tensor,
+                b_tensor=b_tensor,
+                ab12_tensor=ab12_tensor,
+                c_tensor=c_tensor,
+                alpha=alpha,
+                stream=current_stream,
             )
-            self._logger.debug("Executing with compiled kernel")
+        elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
+            self._compiled_kernel(
+                a_tensor=a_tensor,
+                b_tensor=b_tensor,
+                ab12_tensor=ab12_tensor,
+                c_tensor=c_tensor,
+                sfa_tensor=sfa_tensor,
+                sfb_tensor=sfb_tensor,
+                amax_tensor=amax_tensor,
+                sfc_tensor=sfc_tensor,
+                norm_const_tensor=norm_const_tensor,
+                alpha=alpha,
+                stream=current_stream,
+            )
+        else:
+            raise NotImplementedError(f"Unreachable: invalid kernel type {self._kernel}")
 
-            if self._kernel is PersistentDenseGemmKernel:
-                self._compiled_kernel(
-                    a=from_dlpack(a_tensor),
-                    b=from_dlpack(b_tensor),
-                    ab12=from_dlpack(ab12_tensor),
-                    c=from_dlpack(c_tensor),
-                    alpha=alpha,
-                    stream=current_stream,
-                )
-            elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
-                amax_tensor = self._unpad_tensor_to_ndim(amax_tensor, 1, "amax")
-                norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-                self._compiled_kernel(
-                    a_tensor=from_dlpack(a_tensor, assumed_align=16),
-                    b_tensor=from_dlpack(b_tensor, assumed_align=16),
-                    sfa_tensor=from_dlpack(sfa_tensor, assumed_align=16),
-                    sfb_tensor=from_dlpack(sfb_tensor, assumed_align=16),
-                    c_tensor=from_dlpack(c_tensor, assumed_align=16),
-                    ab12_tensor=from_dlpack(ab12_tensor, assumed_align=8),
-                    amax_tensor=(from_dlpack(amax_tensor, assumed_align=16) if amax_tensor is not None else None),
-                    sfc_tensor=(from_dlpack(sfc_tensor, assumed_align=16) if sfc_tensor is not None else None),
-                    norm_const_tensor=(from_dlpack(norm_const_tensor) if norm_const_tensor is not None else None),
-                    alpha=alpha,
-                    stream=current_stream,
-                )
-            elif self._kernel in (
-                PersistentDenseGemmKernelNoDlpack,
-                Sm100BlockScaledPersistentDenseGemmKernelNoDlpack,
-            ):
-                a_ptr = self._make_cute_pointer(a_tensor, assumed_align=16)
-                b_ptr = self._make_cute_pointer(b_tensor, assumed_align=16)
-                ab12_ptr = self._make_cute_pointer(ab12_tensor, assumed_align=16)
-
-                if self._kernel is PersistentDenseGemmKernelNoDlpack:
-                    self._compiled_kernel(
-                        a_ptr=a_ptr,
-                        b_ptr=b_ptr,
-                        ab12_ptr=ab12_ptr,
-                        c_cute=from_dlpack(c_tensor),
-                        alpha=alpha,
-                        stream=current_stream,
-                    )
-                elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernelNoDlpack:
-                    amax_tensor = self._unpad_tensor_to_ndim(amax_tensor, 1, "amax")
-                    norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-                    c_ptr = self._make_cute_pointer(c_tensor, assumed_align=16)
-                    sfa_ptr = self._make_cute_pointer(sfa_tensor, assumed_align=16)
-                    sfb_ptr = self._make_cute_pointer(sfb_tensor, assumed_align=16)
-                    amax_ptr = self._make_cute_pointer(amax_tensor, assumed_align=16)
-                    sfc_ptr = self._make_cute_pointer(sfc_tensor, assumed_align=16)
-                    norm_const_ptr = self._make_cute_pointer(norm_const_tensor)
-                    self._compiled_kernel(
-                        a_ptr=a_ptr,
-                        b_ptr=b_ptr,
-                        sfa_ptr=sfa_ptr,
-                        sfb_ptr=sfb_ptr,
-                        c_ptr=c_ptr,
-                        ab12_ptr=ab12_ptr,
-                        amax_ptr=amax_ptr,
-                        sfc_ptr=sfc_ptr,
-                        norm_const_ptr=norm_const_ptr,
-                        alpha=alpha,
-                        stream=current_stream,
-                    )
-                else:
-                    raise NotImplementedError(f"Unreachable: invalid kernel type {type(self._compiled_kernel)}")
-            else:
-                raise NotImplementedError(f"Unreachable: invalid kernel type {type(self._compiled_kernel)}")
-            self._logger.debug("Executed with compiled kernel successfully")
-        else:  # skip_compile
-            self._logger.debug("Executing without compiled kernel (JIT)")
-
-            if self._kernel is PersistentDenseGemmKernel:
-                gemm_swiglu = self._kernel(
-                    acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-                    use_2cta_instrs=(self.mma_tiler_mn[0] == 256),
-                    mma_tiler_mn=self.mma_tiler_mn,
-                    cluster_shape_mn=self.cluster_shape_mn,
-                )
-                gemm_swiglu(
-                    a=from_dlpack(a_tensor),
-                    b=from_dlpack(b_tensor),
-                    ab12=from_dlpack(ab12_tensor),
-                    c=from_dlpack(c_tensor),
-                    alpha=alpha,
-                    max_active_clusters=cutlass.utils.HardwareInfo().get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]),
-                    stream=current_stream,
-                )
-            elif self._kernel is PersistentDenseGemmKernelNoDlpack:
-                gemm_swiglu = self._kernel(
-                    acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-                    use_2cta_instrs=(self.mma_tiler_mn[0] == 256),
-                    mma_tiler_mn=self.mma_tiler_mn,
-                    cluster_shape_mn=self.cluster_shape_mn,
-                )
-
-                a_ptr, a_shape, a_stride_order = self._make_cute_tensor_descriptor(a_tensor, name="A")
-                b_ptr, b_shape, b_stride_order = self._make_cute_tensor_descriptor(b_tensor, name="B")
-                ab12_ptr, ab12_shape, ab12_stride_order = self._make_cute_tensor_descriptor(ab12_tensor, name="AB12")
-
-                gemm_swiglu(
-                    a_ptr=a_ptr,
-                    a_shape=a_shape,
-                    a_order=a_stride_order,
-                    b_ptr=b_ptr,
-                    b_shape=b_shape,
-                    b_order=b_stride_order,
-                    ab12_ptr=ab12_ptr,
-                    ab12_shape=ab12_shape,
-                    ab12_order=ab12_stride_order,
-                    c_cute=from_dlpack(c_tensor),
-                    alpha=alpha,
-                    max_active_clusters=cutlass.utils.HardwareInfo().get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]),
-                    stream=current_stream,
-                )
-            elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
-                gemm_swiglu = self._kernel(
-                    sf_vec_size=self.sf_vec_size,
-                    mma_tiler_mn=self.mma_tiler_mn,
-                    cluster_shape_mn=self.cluster_shape_mn,
-                    vector_f32=self.vector_f32,
-                    ab12_stages=self.ab12_stages,
-                )
-                amax_tensor = self._unpad_tensor_to_ndim(amax_tensor, 1, "amax")
-                norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-                gemm_swiglu(
-                    a_tensor=from_dlpack(a_tensor, assumed_align=16),
-                    b_tensor=from_dlpack(b_tensor, assumed_align=16),
-                    sfa_tensor=from_dlpack(sfa_tensor, assumed_align=16),
-                    sfb_tensor=from_dlpack(sfb_tensor, assumed_align=16),
-                    c_tensor=from_dlpack(c_tensor, assumed_align=16),
-                    ab12_tensor=from_dlpack(ab12_tensor, assumed_align=8),
-                    amax_tensor=(from_dlpack(amax_tensor, assumed_align=16) if amax_tensor is not None else None),
-                    sfc_tensor=(from_dlpack(sfc_tensor, assumed_align=16) if sfc_tensor is not None else None),
-                    norm_const_tensor=(from_dlpack(norm_const_tensor) if norm_const_tensor is not None else None),
-                    alpha=alpha,
-                    max_active_clusters=cutlass.utils.HardwareInfo().get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]),
-                    stream=current_stream,
-                )
-            elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernelNoDlpack:
-                gemm_swiglu = self._kernel(
-                    sf_vec_size=self.sf_vec_size,
-                    mma_tiler_mn=self.mma_tiler_mn,
-                    cluster_shape_mn=self.cluster_shape_mn,
-                    vector_f32=self.vector_f32,
-                    ab12_stages=self.ab12_stages,
-                )
-                amax_tensor = self._unpad_tensor_to_ndim(amax_tensor, 1, "amax")
-                norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-
-                a_ptr, a_shape, a_stride_order = self._make_cute_tensor_descriptor(a_tensor, name="A")
-                b_ptr, b_shape, b_stride_order = self._make_cute_tensor_descriptor(b_tensor, name="B")
-                ab12_ptr, ab12_shape, ab12_stride_order = self._make_cute_tensor_descriptor(ab12_tensor, name="AB12")
-                c_ptr, c_shape, c_stride_order = self._make_cute_tensor_descriptor(c_tensor, name="C")
-                sfa_ptr, sfa_shape, sfa_stride_order = self._make_cute_tensor_descriptor(sfa_tensor, name="SFA")
-                sfb_ptr, sfb_shape, sfb_stride_order = self._make_cute_tensor_descriptor(sfb_tensor, name="SFB")
-                amax_ptr, amax_shape, amax_stride_order = self._make_cute_tensor_descriptor(amax_tensor, name="AMAX")
-                sfc_ptr, sfc_shape, sfc_stride_order = self._make_cute_tensor_descriptor(sfc_tensor, name="SFC")
-                norm_const_ptr, norm_const_shape, norm_const_stride_order = self._make_cute_tensor_descriptor(norm_const_tensor, name="NORM_CONST")
-
-                gemm_swiglu(
-                    a_ptr=a_ptr,
-                    a_shape=a_shape,
-                    a_order=a_stride_order,
-                    b_ptr=b_ptr,
-                    b_shape=b_shape,
-                    b_order=b_stride_order,
-                    sfa_ptr=sfa_ptr,
-                    sfa_shape=sfa_shape,
-                    sfa_order=sfa_stride_order,
-                    sfb_ptr=sfb_ptr,
-                    sfb_shape=sfb_shape,
-                    sfb_order=sfb_stride_order,
-                    c_ptr=c_ptr,
-                    c_shape=c_shape,
-                    c_order=c_stride_order,
-                    ab12_ptr=ab12_ptr,
-                    ab12_shape=ab12_shape,
-                    ab12_order=ab12_stride_order,
-                    amax_ptr=amax_ptr,
-                    amax_shape=amax_shape,
-                    amax_order=amax_stride_order,
-                    sfc_ptr=sfc_ptr,
-                    sfc_shape=sfc_shape,
-                    sfc_order=sfc_stride_order,
-                    norm_const_ptr=norm_const_ptr,
-                    norm_const_shape=norm_const_shape,
-                    norm_const_order=norm_const_stride_order,
-                    alpha=alpha,
-                    max_active_clusters=cutlass.utils.HardwareInfo().get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]),
-                    stream=current_stream,
-                )
-            else:
-                raise NotImplementedError(f"Unreachable: invalid kernel type {type(self._kernel)}")
-            self._logger.debug("Executed without compiled kernel (JIT) successfully")
+        self._logger.debug("Executed with compiled kernel successfully")
 
 
 import logging
@@ -809,7 +574,7 @@ def gemm_swiglu_wrapper_sm100(
     vector_f32: bool = False,
     ab12_stages: int = 4,
     stream: Optional[cuda.CUstream] = None,
-) -> Tuple[torch.Tensor, ...]:
+) -> TupleDict:
 
     _logger.debug("gemm_swiglu_wrapper_sm100: Creating empty output tensors ab12 and c")
     m, k, l = a_tensor.shape
@@ -918,7 +683,7 @@ def gemm_swiglu_wrapper_sm100(
             ab12_stages=ab12_stages,
         )
         assert gemm_swiglu.check_support(), "Unsupported testcase"
-        gemm_swiglu.compile(current_stream=stream)
+        gemm_swiglu.compile()
         gemm_swiglu.execute(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
@@ -934,7 +699,9 @@ def gemm_swiglu_wrapper_sm100(
         )
         _cache_of_GemmSwigluSm100Objects[cache_key] = gemm_swiglu
 
-    if sfa_tensor is not None and sfb_tensor is not None:
-        return ab12_tensor, c_tensor, sfc_tensor, amax_tensor
-    else:
-        return ab12_tensor, c_tensor
+    return TupleDict(
+        ab12_tensor=ab12_tensor,
+        c_tensor=c_tensor,
+        sfc_tensor=sfc_tensor,
+        amax_tensor=amax_tensor,
+    )

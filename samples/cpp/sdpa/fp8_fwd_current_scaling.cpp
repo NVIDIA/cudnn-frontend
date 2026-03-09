@@ -36,6 +36,10 @@ TEST_CASE("sdpa_fp8_fprop_current_scaling", "[graph][sdpa][fp8][forward]") {
     return;
 #endif
 
+    if (get_compute_capability() < 100 || get_compute_capability() >= 110) {
+        SKIP("SDPA current scaling requires Blackwell and up");
+    }
+
     int64_t b = 2;    // batch size
     int64_t h = 2;    // number of heads
     int64_t s = 512;  // q,k,v tensor is padded to this seq length

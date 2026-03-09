@@ -82,6 +82,10 @@ class ExecConfig:
     is_dropout: bool = None
     is_determin: bool = None
 
+    with_score_max: bool = False
+    with_score_sum_exp: bool = False
+    with_sink_token: bool = False
+
     diag_align: cudnn.diagonal_alignment = None
     left_bound: int = None
     right_bound: int = None
@@ -111,6 +115,9 @@ class ExecConfig:
     shape_o: tuple[int, int, int, int] = None
     stride_o: tuple[int, int, int, int] = None
 
+    shape_stats: tuple[int, int, int, int] = None
+    stride_stats: tuple[int, int, int, int] = None
+
     seq_len_q: list[int] = field(default_factory=list)
     seq_len_kv: list[int] = field(default_factory=list)
 
@@ -137,6 +144,8 @@ class ExecConfig:
             self.shape_v = (self.batches, self.h_v, self.s_kv, self.d_v)
         if self.shape_o is None and all(x is not None for x in [self.batches, self.h_q, self.s_q, self.d_v]):
             self.shape_o = (self.batches, self.h_q, self.s_q, self.d_v)
+        if self.shape_stats is None and all(x is not None for x in [self.batches, self.h_q, self.s_q]):
+            self.shape_stats = (self.batches, self.h_q, self.s_q, 1)
 
         # Compute strides if not provided (packed for ragged, default BHSD otherwise)
         stride_fn = compute_packed_strides if self.is_ragged else compute_default_BHSD_strides
@@ -148,6 +157,8 @@ class ExecConfig:
             self.stride_v = stride_fn(self.shape_v)
         if self.stride_o is None and self.shape_o is not None:
             self.stride_o = stride_fn(self.shape_o)
+        if self.stride_stats is None and self.shape_stats is not None:
+            self.stride_stats = stride_fn(self.shape_stats)
 
     def serialize(self) -> dict:
         """Convert config to a serializable dict for repro commands."""
@@ -234,10 +245,10 @@ class RandomizationContext:
         randoms_.d_qk, randoms_.d_v = randoms["d_qk_d_v"]
         randoms_.h_q, randoms_.h_k, randoms_.h_v = randoms["head_count"]
 
-        randoms_.is_ragged = randoms["is_q_ragged_or_padded_or_full"] == "ragged"
-        randoms_.is_padding = randoms["is_q_ragged_or_padded_or_full"] == "padded" or randoms["is_q_ragged_or_padded_or_full"] == "ragged"
+        randoms_.is_ragged = randoms["is_ragged_or_padded_or_full"] == "ragged"
+        randoms_.is_padding = randoms["is_ragged_or_padded_or_full"] == "padded" or randoms["is_ragged_or_padded_or_full"] == "ragged"
 
-        if randoms["is_q_ragged_or_padded_or_full"] != "full":
+        if randoms["is_ragged_or_padded_or_full"] != "full":
             # ~10% chance of 0-length sequence for each batch
             randoms_.seq_len_q = [0 if rng.random() < 0.1 else rng.randint(1, randoms_.s_q) for _ in range(randoms_.batches)]
             # ~10% chance of 0-length sequence for each batch (independent of seq_len_q)
@@ -269,11 +280,12 @@ class RandomizationContext:
         # Decide Q, O, Stats
         randoms_.shape_q = (randoms_.batches, randoms_.h_q, randoms_.s_q, randoms_.d_qk)
         randoms_.shape_o = (randoms_.batches, randoms_.h_q, randoms_.s_q, randoms_.d_v)
+        randoms_.shape_stats = (randoms_.batches, randoms_.h_q, randoms_.s_q, 1)
 
         if randoms_.is_ragged:  # Ideally Q ragged and O ragged
             randoms_.stride_q = get_strides_from_layout(randoms_.shape_q, "bshd")
             randoms_.stride_o = get_strides_from_layout(randoms_.shape_o, "bshd")
-
+            randoms_.stride_stats = get_strides_from_layout(randoms_.shape_stats, "bshd")
         else:
             indices = [0, 1, 2]
             rng.shuffle(indices)
@@ -289,6 +301,7 @@ class RandomizationContext:
 
             randoms_.stride_q = get_strides_from_indices(randoms_.shape_q, indices, gaps_q, rng)
             randoms_.stride_o = get_strides_from_indices(randoms_.shape_o, indices, gaps_o, rng)
+            randoms_.stride_stats = get_strides_from_indices(randoms_.shape_stats, indices, gaps_o, rng)
 
         # Decide K, V
         randoms_.shape_k = (
@@ -534,9 +547,7 @@ def test_randomization_context(seed):
                 cudnn.diagonal_alignment.BOTTOM_RIGHT: 1,
             }
         ),
-        is_q_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 1, "full": 1}),
-        is_kv_ragged_or_paged_or_padded_or_full=RandomChoice({"ragged": 1, "paged": 1, "padded": 1, "full": 1}),
-        stats_layout=RandomChoice({"ragged": 1, "full": 1, "disabled": 2}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 1, "full": 1}),
     ) as ctx:
         return ctx
 

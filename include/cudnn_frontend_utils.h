@@ -617,6 +617,7 @@ enum class HeurMode_t {
     A,
     B,
     FALLBACK,
+    OPENSOURCE,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(HeurMode_t,
@@ -624,6 +625,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(HeurMode_t,
                                  {HeurMode_t::A, "A"},
                                  {HeurMode_t::B, "B"},
                                  {HeurMode_t::FALLBACK, "FALLBACK"},
+                                 {HeurMode_t::OPENSOURCE, "OPENSOURCE"},
                              })
 
 enum class BehaviorNote_t {

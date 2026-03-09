@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../cudnn_frontend_shim.h"
 #include "../cudnn_frontend_utils.h"
 
 namespace cudnn_frontend::detail {
@@ -9,7 +10,7 @@ class Context {
     DataType_t intermediate_data_type = DataType_t::NOT_SET;
     DataType_t io_data_type           = DataType_t::NOT_SET;
     int32_t target_sm_count           = -1;
-    int32_t target_sm_version         = -1;
+    mutable int32_t target_sm_version = -1;
     bool is_dynamic_shape_enabled     = false;
 
     std::string name = "";
@@ -90,6 +91,21 @@ class Context {
     int32_t
     get_sm_version() const {
         return target_sm_version;
+    }
+
+    error_t
+    populate_sm_version_from_device() const {
+        if (target_sm_version > 0) {
+            // Already set by user or previous call
+            return {error_code_t::OK, ""};
+        }
+        cudaDeviceProp prop;
+        int device;
+        _CUDNN_CHECK_CUDA_ERROR(cuda_get_device(&device));
+        _CUDNN_CHECK_CUDA_ERROR(cuda_get_device_properties(&prop, device));
+        target_sm_version = prop.major * 10 + prop.minor;
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Populated SM version from device: " << device << " " << target_sm_version);
+        return {error_code_t::OK, ""};
     }
 
     Context&

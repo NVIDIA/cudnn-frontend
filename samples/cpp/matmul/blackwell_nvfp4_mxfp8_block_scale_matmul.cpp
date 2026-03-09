@@ -751,7 +751,7 @@ TEST_CASE("Blackwell Block Scale Matmul dynamic shape overrides", "[matmul][grap
     SKIP("Dynamic shape with overrides is not supported in cudnn versions prior to 9.18.0");
 #endif
 
-    if (check_device_arch_newer_than("blackwell") == false) {
+    if (get_compute_capability() < 100 || get_compute_capability() >= 110) {
         SKIP("Hardware accelerated NVFP4/MXFP8 block scale matmul requires Blackwell and up");
     }
 

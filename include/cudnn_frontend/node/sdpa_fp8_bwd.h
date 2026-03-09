@@ -10,6 +10,7 @@
 #include "pointwise.h"
 #include "reduction.h"
 #include "softmax.h"
+#include "block_scale_dequantize.h"
 
 namespace cudnn_frontend::graph {
 
@@ -31,6 +32,20 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         return Type::COMPOSITE;
     }
 
+    // Helper function to detect MXFP8 (microscaling FP8) mode
+    // MXFP8 uses block-wise scale factors with E8M0 data type and F8_128x4 reordering
+    // When detected, we use block_scale_dequantize before matmuls instead of pointwise descale after
+    bool
+    is_mxfp8_scaling() const {
+        auto descale_q_it = attributes.inputs.find(input_names::Descale_Q);
+        if (descale_q_it == attributes.inputs.end() || descale_q_it->second == nullptr) {
+            return false;
+        }
+        auto const& descale_q = descale_q_it->second;
+        return (descale_q->get_data_type() == DataType_t::FP8_E8M0 &&
+                descale_q->get_reordering_type() == TensorReordering_t::F8_128x4);
+    }
+
     error_t
     pre_validate_node() const override final {
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating SDPAFP8BackwardNode " << attributes.name);
@@ -40,12 +55,18 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                                        "sdpa fp8 backward operation is only supported starting cudnn 9.1.0. Please "
                                        "consider upgrading your current version.");
 
-        cudaDeviceProp prop;
-        int device;
-        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_get_device(&device));
-        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, device));
+        // Bug workaround for 9.10.0 (TE constraint)
         RETURN_CUDNN_FRONTEND_ERROR_IF(
-            prop.major < 9,
+            detail::get_backend_version() == 91000,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "sdpa fp8 backward operation is not supported on cudnn 9.10.0 due to known bugs. "
+            "Please consider upgrading to 9.10.2 or newer.");
+
+        CHECK_CUDNN_FRONTEND_ERROR(context.populate_sm_version_from_device());
+        int32_t const sm_version = context.get_sm_version();
+        int32_t const prop_major = sm_version / 10;
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            prop_major < 9,
             error_code_t::GRAPH_NOT_SUPPORTED,
             "sdpa fp8 forward operation is only supported on Hopper architecture and newer. Please "
             "consider using a newer architecture.");
@@ -108,7 +129,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         //    - validate stats has valid dims
 
         // validate basic dimension requirements
-        if(prop.major >= 10) {
+        if(prop_major >= 10) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(((d_qk > 128) || (d_qk % 16 != 0)) && !(d_qk == 192 && d_v == 128),
                                             error_code_t::GRAPH_NOT_SUPPORTED,
                                             "hidden_dim d_qk shoud be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128");
@@ -161,32 +182,32 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             error_code_t::ATTRIBUTE_NOT_SET,
             "Dropout probability cannot be 1 as corresponding scale wont be well formed.");
 
-
         // Validate options for causal_mask_bottom_right
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && detail::get_backend_version() < 90700,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && detail::get_backend_version() < 90700,
             error_code_t::GRAPH_NOT_SUPPORTED,
             "For cuDNN version below 9.7.0, bottom right causal masking is not supported.");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && prop.major < 10, 
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && prop_major < 10, 
             error_code_t::GRAPH_NOT_SUPPORTED,
             "sdpa fp8 forward operation is only supported on Blackwell architecture and newer. Please "
             "consider using a newer architecture.");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask && attributes.causal_mask_bottom_right,
-            error_code_t::GRAPH_NOT_SUPPORTED,
-            "Bottom right causal mask and causal mask cannot be both enabled");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && s_q > s_kv,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && s_q > s_kv,
             error_code_t::GRAPH_NOT_SUPPORTED,
             "Bottom right causal mask does not support s_q > s_kv. Please virtually slice the Q tensor and pass it as s_q == s_kv");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && (is_bias || is_dropout),
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (is_bias || is_dropout),
             error_code_t::GRAPH_NOT_SUPPORTED,
             "Bottom right causal mask is only supported with is_bias=False, is_dropout=False.");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.causal_mask_bottom_right && ((s_q % 64 != 0) || (s_kv % 64 != 0)),
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && ((s_q % 64 != 0) || (s_kv % 64 != 0)),
                 error_code_t::GRAPH_NOT_SUPPORTED,
                 "Bottom right causal mask is only supported with s_q multiple of 64, and s_kv multiple of 64");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            attributes.left_bound.has_value() && (!attributes.padding_mask) && s_q > s_kv,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "Sliding window attention is only supported with max_s_q <= max_s_kv.");
 
         // validate that datatype is set for the graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_intermediate_data_type() == DataType_t::NOT_SET,
@@ -194,7 +215,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                                        "Intermediate tensor data type needs to be set as internal tensors require it.");
 
         // validate options for deterministic algorithm
-        if (attributes.is_deterministic_algorithm && (prop.major == 10)) {
+        if (attributes.is_deterministic_algorithm && (prop_major == 10)) {
             RETURN_CUDNN_FRONTEND_ERROR_IF((detail::get_backend_version() < 91900),
                                            error_code_t::GRAPH_NOT_SUPPORTED,
                                            "FP8 deterministic algorithm is not supported on blackwell architecture with cudnn version below 9.19.0");
@@ -212,10 +233,178 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             (dq_data_type == DataType_t::HALF || dq_data_type == DataType_t::BFLOAT16 ||
              dk_data_type == DataType_t::HALF || dk_data_type == DataType_t::BFLOAT16 ||
              dv_data_type == DataType_t::HALF || dv_data_type == DataType_t::BFLOAT16) &&
-                (detail::get_backend_version() < 91300 || prop.major < 10),
+                (detail::get_backend_version() < 91300 || prop_major < 10),
             error_code_t::GRAPH_NOT_SUPPORTED,
-            "sdpa fp8 forward operation is only supported on cuDNN version 9.13.0 and newer. Please "
-            "consider upgrading your current version.");
+            "sdpa fp8 backward with HALF/BFLOAT16 output is only supported on Blackwell architecture "
+            "with cuDNN version 9.13.0 and newer.");
+
+        // Validate MXFP8 scale factors if present
+        if (is_mxfp8_scaling()) {
+            // MXFP8 requires cuDNN 9.21.0 or later
+            RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 92100,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "MXFP8 SDPA requires cuDNN 9.21.0 or later");
+            int64_t const b = attributes.inputs.at(input_names::Q)->get_dim()[0];
+
+            // MXFP8 block size is fixed at 32
+            constexpr int64_t block_size = 32;
+            int64_t const d_qk_scale     = (d_qk + block_size - 1) / block_size;
+            int64_t const d_v_scale      = (d_v + block_size - 1) / block_size;
+            int64_t const s_q_scale      = (s_q + block_size - 1) / block_size;
+            int64_t const s_kv_scale     = (s_kv + block_size - 1) / block_size;
+
+            // Validate Descale_Q
+            auto const& descale_q = attributes.inputs.at(input_names::Descale_Q);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_q->get_data_type() != DataType_t::FP8_E8M0,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_Q to have FP8_E8M0 data type");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_q->get_reordering_type() != TensorReordering_t::F8_128x4,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_Q to have F8_128x4 reordering");
+            
+            // Validate Descale_Q_T
+            auto const& descale_q_T = attributes.inputs.at(input_names::Descale_Q_T);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_q_T->get_data_type() != DataType_t::FP8_E8M0,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_Q_T to have FP8_E8M0 data type");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_q_T->get_reordering_type() != TensorReordering_t::F8_128x4,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_Q_T to have F8_128x4 reordering");
+
+            // Validate Descale_K
+            auto const& descale_k = attributes.inputs.at(input_names::Descale_K);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_k->get_data_type() != DataType_t::FP8_E8M0,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_K to have FP8_E8M0 data type");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_k->get_reordering_type() != TensorReordering_t::F8_128x4,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_K to have F8_128x4 reordering");
+            
+            // Validate Descale_K_T
+            auto const& descale_k_T = attributes.inputs.at(input_names::Descale_K_T);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_k_T->get_data_type() != DataType_t::FP8_E8M0,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_K_T to have FP8_E8M0 data type");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_k_T->get_reordering_type() != TensorReordering_t::F8_128x4,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_K_T to have F8_128x4 reordering");
+
+            // Validate Descale_V
+            auto const& descale_v = attributes.inputs.at(input_names::Descale_V);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_v->get_data_type() != DataType_t::FP8_E8M0,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_V to have FP8_E8M0 data type");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_v->get_reordering_type() != TensorReordering_t::F8_128x4,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_V to have F8_128x4 reordering");
+            
+            // Validate Descale_dO
+            auto const& descale_do = attributes.inputs.at(input_names::Descale_dO);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_do->get_data_type() != DataType_t::FP8_E8M0,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_dO to have FP8_E8M0 data type");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_do->get_reordering_type() != TensorReordering_t::F8_128x4,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_dO to have F8_128x4 reordering");
+            
+            // Validate Descale_dO_T
+            auto const& descale_do_T = attributes.inputs.at(input_names::Descale_dO_T);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_do_T->get_data_type() != DataType_t::FP8_E8M0,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_dO_T to have FP8_E8M0 data type");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_do_T->get_reordering_type() != TensorReordering_t::F8_128x4,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_dO_T to have F8_128x4 reordering");
+
+            // Validate dimension consistency for SF_Q: [b, h_q, s_q_padded, d_scale_padded]
+            auto const& sf_q_dim = descale_q->get_dim();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(sf_q_dim[0] != b || sf_q_dim[1] != h_q,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA: Descale_Q batch/head dimensions must match Q");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                sf_q_dim[3] < d_qk_scale,
+                error_code_t::ATTRIBUTE_NOT_SET,
+                "MXFP8 SDPA: Descale_Q d_scale dimension too small (expected >= " + std::to_string(d_qk_scale) + ")");
+            
+            // Validate dimension consistency for SF_Q_T: [b, h_q, s_q_scale_padded, d_padded]
+            auto const& sf_q_T_dim = descale_q_T->get_dim();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(sf_q_T_dim[0] != b || sf_q_T_dim[1] != h_q,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA: Descale_Q_T batch/head dimensions must match Q");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                sf_q_T_dim[2] < s_q_scale,
+                error_code_t::ATTRIBUTE_NOT_SET,
+                "MXFP8 SDPA: Descale_Q_T s_scale dimension too small (expected >= " + std::to_string(s_q_scale) + ")");
+
+            // Validate dimension consistency for SF_K: [b, h_k, s_kv_padded, d_qk_scale_padded]
+            auto const& sf_k_dim = descale_k->get_dim();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(sf_k_dim[0] != b || sf_k_dim[1] != h_k,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA: Descale_K batch/head dimensions must match K");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                sf_k_dim[3] < d_qk_scale,
+                error_code_t::ATTRIBUTE_NOT_SET,
+                "MXFP8 SDPA: Descale_K d_scale dimension too small (expected >= " + std::to_string(d_qk_scale) + ")");
+            
+            // Validate dimension consistency for SF_K_T: [b, h_k, s_kv_scale_padded, d_qk_padded]
+            auto const& sf_k_T_dim = descale_k_T->get_dim();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(sf_k_T_dim[0] != b || sf_k_T_dim[1] != h_k,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA: Descale_K_T batch/head dimensions must match K");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                sf_k_T_dim[2] < s_kv_scale,
+                error_code_t::ATTRIBUTE_NOT_SET,
+                "MXFP8 SDPA: Descale_K_T s_scale dimension too small (expected >= " + std::to_string(s_kv_scale) + ")");
+
+            // Validate dimension consistency for SF_V: [b, h_v, s_kv_scale_padded, d_v_padded]
+            auto const& sf_v_dim = descale_v->get_dim();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(sf_v_dim[0] != b || sf_v_dim[1] != h_v,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA: Descale_V batch/head dimensions must match V");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                sf_v_dim[2] < s_kv_scale,
+                error_code_t::ATTRIBUTE_NOT_SET,
+                "MXFP8 SDPA: Descale_V s_scale dimension too small (expected >= " + std::to_string(s_kv_scale) + ")");
+            
+            // Validate dimension consistency for SF_dO: [b, h_q, s_q_padded, d_v_scale_padded]
+            auto const& sf_do_dim = descale_do->get_dim();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(sf_do_dim[0] != b || sf_do_dim[1] != h_q,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA: Descale_dO batch/head dimensions must match dO");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                sf_do_dim[3] < d_v_scale,
+                error_code_t::ATTRIBUTE_NOT_SET,
+                "MXFP8 SDPA: Descale_dO d_scale dimension too small (expected >= " + std::to_string(d_v_scale) + ")");
+            
+            // Validate dimension consistency for SF_dO_T: [b, h_q, s_q_scale_padded, d_scale_padded]
+            auto const& sf_do_T_dim = descale_do_T->get_dim();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(sf_do_T_dim[0] != b || sf_do_T_dim[1] != h_q,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA: Descale_dO_T batch/head dimensions must match dO");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                sf_do_T_dim[2] < s_q_scale,
+                error_code_t::ATTRIBUTE_NOT_SET,
+                "MXFP8 SDPA: Descale_dO_T s_scale dimension too small (expected >= " + std::to_string(s_q_scale) + ")");
+
+            // Log MXFP8 configuration for debugging
+            getLogger() << "[cudnn_frontend] INFO: MXFP8 SDPA configuration validated:" << std::endl
+                        << "  SF_Q dims: [" << sf_q_dim[0] << ", " << sf_q_dim[1] << ", " << sf_q_dim[2] << ", "
+                        << sf_q_dim[3] << "]" << std::endl
+                        << "  SF_Q_T dims: [" << sf_q_T_dim[0] << ", " << sf_q_T_dim[1] << ", " << sf_q_T_dim[2] << ", "
+                        << sf_q_T_dim[3] << "]" << std::endl
+                        << "  SF_K dims: [" << sf_k_dim[0] << ", " << sf_k_dim[1] << ", " << sf_k_dim[2] << ", "
+                        << sf_k_dim[3] << "]" << std::endl
+                        << "  SF_K_T dims: [" << sf_k_T_dim[0] << ", " << sf_k_T_dim[1] << ", " << sf_k_T_dim[2] << ", "
+                        << sf_k_T_dim[3] << "]" << std::endl
+                        << "  SF_V dims: [" << sf_v_dim[0] << ", " << sf_v_dim[1] << ", " << sf_v_dim[2] << ", "
+                        << sf_v_dim[3] << "]" << std::endl
+                        << "  SF_dO dims: [" << sf_do_dim[0] << ", " << sf_do_dim[1] << ", " << sf_do_dim[2] << ", "
+                        << sf_do_dim[3] << "]" << std::endl
+                        << "  SF_dO_T dims: [" << sf_do_T_dim[0] << ", " << sf_do_T_dim[1] << ", " << sf_do_T_dim[2] << ", "
+                        << sf_do_T_dim[3] << "]" << std::endl
+                        << "  Expected d_qk_scale: " << d_qk_scale << ", d_v_scale: " << d_v_scale
+                        << ", s_q_scale: " << s_q_scale << ", s_kv_scale: " << s_kv_scale << std::endl;
+        }
         return {error_code_t::OK, ""};
     }
 
@@ -236,13 +425,16 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         auto b            = q_dim[0];
         auto h_q          = q_dim[1];
         auto s_q          = q_dim[2];
-        // auto d_qk         = q_dim[3];
+        auto d_qk         = q_dim[3];
         auto const& k_dim = attributes.inputs[input_names::K]->get_dim();
-        // auto h_k          = k_dim[1];
-        auto s_kv = k_dim[2];
-        // auto const& v_dim = attributes.inputs[input_names::V]->get_dim();
-        // auto h_v          = v_dim[1];
-        // auto d_v          = v_dim[3];
+        auto h_k          = k_dim[1];
+        auto s_kv         = k_dim[2];
+        auto const& v_dim = attributes.inputs[input_names::V]->get_dim();
+        auto h_v          = v_dim[1];
+        auto d_v          = v_dim[3];
+
+        bool const use_mxfp8 = is_mxfp8_scaling();
+        std::shared_ptr<Tensor_attributes> eff_Q, eff_K, eff_V, eff_dO;
 
         // cuDNN frontend API attention requires Q, K, V where
         // Q = {b, h_q, s_q, d_qk}
@@ -253,23 +445,118 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         // KT = {b, h_k, d_qk, s_kv}
         // VT = {b, h_v, d_v, s_kv}
         // So the code below maps the K->KT and V->VT
-        std::vector<int64_t> temp_vec;
+        if (use_mxfp8) {
+            // MXFP8 2-kernel bprop: Each tensor is dequantized separately for each matmul it participates in.
+            // Q, K, dO each need two dequantizations with different scale factors.
+            // O and dO are used directly (as f16) for the dO*O computation without dequantization.
 
-        temp_vec = attributes.inputs[input_names::K]->get_dim();
-        std::swap(temp_vec[2], temp_vec[3]);
-        attributes.inputs[input_names::K]->set_dim(temp_vec);
+            // K for BMM1 (Q@K.T): Transpose K and SF_K, then dequantize
+            std::vector<int64_t> kt_dim    = attributes.inputs[input_names::K]->get_dim();
+            std::vector<int64_t> kt_stride = attributes.inputs[input_names::K]->get_stride();
+            std::swap(kt_dim[2], kt_dim[3]);
+            std::swap(kt_stride[2], kt_stride[3]);
+            attributes.inputs[input_names::K]->set_dim(kt_dim);
+            attributes.inputs[input_names::K]->set_stride(kt_stride);
 
-        temp_vec = attributes.inputs[input_names::K]->get_stride();
-        std::swap(temp_vec[2], temp_vec[3]);
-        attributes.inputs[input_names::K]->set_stride(temp_vec);
+            auto& sf_k                       = attributes.inputs[input_names::Descale_K];
+            std::vector<int64_t> sf_k_dim    = sf_k->get_dim();
+            std::vector<int64_t> sf_k_stride = sf_k->get_stride();
+            std::swap(sf_k_dim[2], sf_k_dim[3]);
+            std::swap(sf_k_stride[2], sf_k_stride[3]);
+            sf_k->set_dim(sf_k_dim);
+            sf_k->set_stride(sf_k_stride);
 
-        temp_vec = attributes.inputs[input_names::V]->get_dim();
-        std::swap(temp_vec[2], temp_vec[3]);
-        attributes.inputs[input_names::V]->set_dim(temp_vec);
+            auto dequant_k_dqk_attrs = Block_scale_dequantize_attributes()
+                                           .set_name("DQ_K_dqk")
+                                           .set_block_size({1, 32});
+            auto k_dqk_dequant = std::make_shared<Tensor_attributes>();
+            k_dqk_dequant->set_is_virtual(true);
+            k_dqk_dequant->set_dim(kt_dim);
+            k_dqk_dequant->set_stride(kt_stride);
+            block_scale_dequantize(attributes.inputs[input_names::K], sf_k, dequant_k_dqk_attrs, k_dqk_dequant);
+            eff_K = k_dqk_dequant;
 
-        temp_vec = attributes.inputs[input_names::V]->get_stride();
-        std::swap(temp_vec[2], temp_vec[3]);
-        attributes.inputs[input_names::V]->set_stride(temp_vec);
+            // V for dO@V.T: Transpose V and SF_V, then dequantize
+            std::vector<int64_t> vt_dim    = attributes.inputs[input_names::V]->get_dim();
+            std::vector<int64_t> vt_stride = attributes.inputs[input_names::V]->get_stride();
+            std::swap(vt_dim[2], vt_dim[3]);
+            std::swap(vt_stride[2], vt_stride[3]);
+            attributes.inputs[input_names::V]->set_dim(vt_dim);
+            attributes.inputs[input_names::V]->set_stride(vt_stride);
+
+            auto& sf_v                       = attributes.inputs[input_names::Descale_V];
+            std::vector<int64_t> sf_v_dim    = sf_v->get_dim();
+            std::vector<int64_t> sf_v_stride = sf_v->get_stride();
+            std::swap(sf_v_dim[2], sf_v_dim[3]);
+            std::swap(sf_v_stride[2], sf_v_stride[3]);
+            sf_v->set_dim(sf_v_dim);
+            sf_v->set_stride(sf_v_stride);
+
+            auto dequant_v_dv_attrs = Block_scale_dequantize_attributes()
+                                          .set_name("DQ_V_dv")
+                                          .set_block_size({1, 32});
+            auto v_dv_dequant = std::make_shared<Tensor_attributes>();
+            v_dv_dequant->set_is_virtual(true);
+            v_dv_dequant->set_dim(vt_dim);
+            v_dv_dequant->set_stride(vt_stride);
+            block_scale_dequantize(attributes.inputs[input_names::V], sf_v, dequant_v_dv_attrs, v_dv_dequant);
+            eff_V = v_dv_dequant;
+
+            // Q for BMM1 (Q@K.T): Dequantize Q with Descale_Q
+            auto dequant_q_dqk_attrs = Block_scale_dequantize_attributes()
+                                           .set_name("DQ_Q_dqk")
+                                           .set_block_size({1, 32});
+            auto q_dqk_dequant = std::make_shared<Tensor_attributes>();
+            q_dqk_dequant->set_is_virtual(true);
+            q_dqk_dequant->set_dim(attributes.inputs[input_names::Q]->get_dim());
+            q_dqk_dequant->set_stride(attributes.inputs[input_names::Q]->get_stride());
+            block_scale_dequantize(attributes.inputs[input_names::Q],
+                                   attributes.inputs[input_names::Descale_Q],
+                                   dequant_q_dqk_attrs,
+                                   q_dqk_dequant);
+            eff_Q = q_dqk_dequant;
+
+            // dO for dO@V.T: Dequantize dO with Descale_dO
+            auto dequant_dO_dv_attrs = Block_scale_dequantize_attributes()
+                                           .set_name("DQ_dO_dv")
+                                           .set_block_size({1, 32});
+            auto dO_dv_dequant = std::make_shared<Tensor_attributes>();
+            dO_dv_dequant->set_is_virtual(true);
+            dO_dv_dequant->set_dim(attributes.inputs[input_names::dO]->get_dim());
+            dO_dv_dequant->set_stride(attributes.inputs[input_names::dO]->get_stride());
+            block_scale_dequantize(attributes.inputs[input_names::dO],
+                                   attributes.inputs[input_names::Descale_dO],
+                                   dequant_dO_dv_attrs,
+                                   dO_dv_dequant);
+            eff_dO = dO_dv_dequant;
+
+            // Note: O and dO for the dO*O computation are used as raw f16 inputs (no MXFP8 dequant).
+            // The separate dequantizations for dO_seq, K_seq, Q_seq are done inline at their usage sites.
+        } else {
+            // Non-MXFP8
+            std::vector<int64_t> temp_vec;
+
+            temp_vec = attributes.inputs[input_names::K]->get_dim();
+            std::swap(temp_vec[2], temp_vec[3]);
+            attributes.inputs[input_names::K]->set_dim(temp_vec);
+
+            temp_vec = attributes.inputs[input_names::K]->get_stride();
+            std::swap(temp_vec[2], temp_vec[3]);
+            attributes.inputs[input_names::K]->set_stride(temp_vec);
+
+            temp_vec = attributes.inputs[input_names::V]->get_dim();
+            std::swap(temp_vec[2], temp_vec[3]);
+            attributes.inputs[input_names::V]->set_dim(temp_vec);
+
+            temp_vec = attributes.inputs[input_names::V]->get_stride();
+            std::swap(temp_vec[2], temp_vec[3]);
+            attributes.inputs[input_names::V]->set_stride(temp_vec);
+
+            eff_Q  = attributes.inputs[input_names::Q];
+            eff_K  = attributes.inputs[input_names::K];
+            eff_V  = attributes.inputs[input_names::V];
+            eff_dO = attributes.inputs[input_names::dO];
+        }
 
         std::shared_ptr<Tensor_attributes> rng_output;
 
@@ -303,23 +590,30 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         }
 
         //// dO * O
+        // For MXFP8: dO_f16 and O (f16) are used directly (no block dequantization needed)
+        // For non-MXFP8 (17-arg API): dO and O (FP8) are used (per-tensor descale applied after reduction)
         mul_attributes.set_name("mul_dO_O");
-        auto last_output =
-            pointwise(attributes.inputs[input_names::dO], attributes.inputs[input_names::O], mul_attributes);
+        auto last_output = use_mxfp8
+                              ? pointwise(attributes.inputs[input_names::dO_f16], attributes.inputs[input_names::O], mul_attributes)
+                              : pointwise(attributes.inputs[input_names::dO], attributes.inputs[input_names::O], mul_attributes);
 
         // reduce(dO)
         last_output =
             reduction(last_output, Reduction_attributes().set_name("reduce_dO").set_mode(ReductionMode_t::ADD));
         last_output->set_dim({b, h_q, s_q, 1}).set_stride({h_q * s_q, s_q, 1, 1});
 
-        // Descale dO
-        mul_attributes.set_name("descale_dO");
-        last_output = pointwise(last_output, attributes.inputs.at(input_names::Descale_dO), mul_attributes);
-        last_output->set_dim({b, h_q, s_q, 1}).set_stride({h_q * s_q, s_q, 1, 1});
+        // Descale dO (only for non-MXFP8 per-tensor scaling)
+        if (!use_mxfp8) {
+            mul_attributes.set_name("descale_dO");
+            last_output = pointwise(last_output, attributes.inputs.at(input_names::Descale_dO), mul_attributes);
+            last_output->set_dim({b, h_q, s_q, 1}).set_stride({h_q * s_q, s_q, 1, 1});
+        }
 
-        // Descale O
-        mul_attributes.set_name("descale_O");
-        last_output = pointwise(last_output, attributes.inputs.at(input_names::Descale_O), mul_attributes);
+        // Descale O (only for non-MXFP8 per-tensor scaling)
+        if (!use_mxfp8) {
+            mul_attributes.set_name("descale_O");
+            last_output = pointwise(last_output, attributes.inputs.at(input_names::Descale_O), mul_attributes);
+        }
 
         // softmax_sum = last_output * dropout_scale
         if(attributes.inputs[input_names::Dropout_scale_inv]) {
@@ -333,7 +627,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         auto bmm_Q_K_attributes = Matmul_attributes().set_name("bmm_Q_K")
                                  .set_m_override(attributes.inputs[input_names::SEQ_LEN_Q])
                                  .set_n_override(attributes.inputs[input_names::SEQ_LEN_KV]);
-        auto last_dV = matmul(attributes.inputs[input_names::Q], attributes.inputs[input_names::K], bmm_Q_K_attributes);
+        auto last_dV = matmul(eff_Q, eff_K, bmm_Q_K_attributes);
 
         //// Optional Attn scale
         // In case user provided a scalar value, do a fused scalar.
@@ -348,14 +642,17 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             last_dV = pointwise(last_dV, attn_scale_it->second, mul_attributes);
         }
 
-        //// Descales
-        // Descale Q
-        mul_attributes.set_name("descale_q");
-        last_dV = pointwise(last_dV, attributes.inputs.at(input_names::Descale_Q), mul_attributes);
+        // Descale Q (only for non-MXFP8 per-tensor scaling)
+        if (!use_mxfp8) {
+            mul_attributes.set_name("descale_q");
+            last_dV = pointwise(last_dV, attributes.inputs.at(input_names::Descale_Q), mul_attributes);
+        }
 
-        // Descale K
-        mul_attributes.set_name("descale_k");
-        last_dV = pointwise(last_dV, attributes.inputs.at(input_names::Descale_K), mul_attributes);
+        // Descale K (only for non-MXFP8 per-tensor scaling)
+        if (!use_mxfp8) {
+            mul_attributes.set_name("descale_k");
+            last_dV = pointwise(last_dV, attributes.inputs.at(input_names::Descale_K), mul_attributes);
+        }
 
         // (optional) last_dV = last_dV + bias
         if (auto bias_it = attributes.inputs.find(input_names::Bias); bias_it != attributes.inputs.end()) {
@@ -418,7 +715,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         }
 
         //// Optional causal masking
-        if (attributes.causal_mask) {
+        if (attributes.has_causal_like_masking()) {
             auto row_index_attributes =
                 Pointwise_attributes().set_name("gen_row_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(2);
             std::shared_ptr<Tensor_attributes> row_index_output = pointwise(last_dV, row_index_attributes);
@@ -429,7 +726,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             auto const& col_index_output = pointwise(last_dV, col_index_attributes);
             col_index_output->set_data_type(DataType_t::INT32);
 
-            if (attributes.causal_mask_bottom_right) {
+            if (attributes.has_causal_mask_bottom_right()) {
                 if (attributes.inputs[input_names::SEQ_LEN_KV]) {
                     row_index_output = pointwise(row_index_output,
                                           attributes.inputs[input_names::SEQ_LEN_KV],
@@ -465,6 +762,19 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                 row_index_output->set_data_type(DataType_t::INT32);
             }
 
+            // For right_bound > 0, shift row index right by right_bound to widen the window
+            if (attributes.right_bound.value() != 0) {
+                auto right_bound_val = std::make_shared<Tensor_attributes>(
+                    static_cast<int32_t>(attributes.right_bound.value()));
+                row_index_output = pointwise(row_index_output,
+                                             right_bound_val,
+                                             Pointwise_attributes()
+                                                 .set_name("row_add_right_bound")
+                                                 .set_mode(PointwiseMode_t::ADD)
+                                                 .set_compute_data_type(DataType_t::INT32));
+                row_index_output->set_data_type(DataType_t::INT32);
+            }
+
             auto greater_than_attributes = Pointwise_attributes()
                                                .set_name("row_greater_than_col")
                                                .set_mode(PointwiseMode_t::CMP_GE)
@@ -479,6 +789,75 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             auto binary_select_attributes =
                 Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT);
             last_dV = pointwise(last_dV, negative_inf_causal, row_greater_than_col_output, binary_select_attributes);
+        }
+
+        //// Optional sliding window mask (left bound)
+        if (attributes.has_sliding_window()) {
+            // Generate row and col indices
+            auto row_idx_swa = pointwise(last_dV,
+                Pointwise_attributes().set_name("gen_row_idx_swa")
+                    .set_mode(PointwiseMode_t::GEN_INDEX).set_axis(2));
+            row_idx_swa->set_data_type(DataType_t::INT32);
+
+            auto col_idx_swa = pointwise(last_dV,
+                Pointwise_attributes().set_name("gen_col_idx_swa")
+                    .set_mode(PointwiseMode_t::GEN_INDEX).set_axis(3));
+            col_idx_swa->set_data_type(DataType_t::INT32);
+
+            // For BOTTOM_RIGHT: adjust row index by (s_kv - s_q)
+            if (attributes.diagonal_alignment == DiagonalAlignment_t::BOTTOM_RIGHT) {
+                if (attributes.inputs[input_names::SEQ_LEN_KV]) {
+                    row_idx_swa = pointwise(row_idx_swa,
+                        attributes.inputs[input_names::SEQ_LEN_KV],
+                        Pointwise_attributes().set_name("swa_row_add_skv")
+                            .set_mode(PointwiseMode_t::ADD)
+                            .set_compute_data_type(DataType_t::INT32));
+                } else {
+                    row_idx_swa = pointwise(row_idx_swa,
+                        std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv)),
+                        Pointwise_attributes().set_name("swa_row_add_skv")
+                            .set_mode(PointwiseMode_t::ADD)
+                            .set_compute_data_type(DataType_t::INT32));
+                }
+                row_idx_swa->set_data_type(DataType_t::INT32);
+
+                if (attributes.inputs[input_names::SEQ_LEN_Q]) {
+                    row_idx_swa = pointwise(row_idx_swa,
+                        attributes.inputs[input_names::SEQ_LEN_Q],
+                        Pointwise_attributes().set_name("swa_row_sub_sq")
+                            .set_mode(PointwiseMode_t::SUB)
+                            .set_compute_data_type(DataType_t::INT32));
+                } else {
+                    row_idx_swa = pointwise(row_idx_swa,
+                        std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q)),
+                        Pointwise_attributes().set_name("swa_row_sub_sq")
+                            .set_mode(PointwiseMode_t::SUB)
+                            .set_compute_data_type(DataType_t::INT32));
+                }
+                row_idx_swa->set_data_type(DataType_t::INT32);
+            }
+
+            // Compute col + left_bound
+            auto left_bound_val = std::make_shared<Tensor_attributes>(
+                static_cast<int32_t>(attributes.left_bound.value()));
+            auto col_plus_lb = pointwise(col_idx_swa, left_bound_val,
+                Pointwise_attributes().set_name("col_add_left_bound")
+                    .set_mode(PointwiseMode_t::ADD)
+                    .set_compute_data_type(DataType_t::INT32));
+            col_plus_lb->set_data_type(DataType_t::INT32);
+
+            // Mask: keep where col + left_bound > row
+            auto swa_mask = pointwise(col_plus_lb, row_idx_swa,
+                Pointwise_attributes().set_name("swa_cmp_gt")
+                    .set_mode(PointwiseMode_t::CMP_GT)
+                    .set_compute_data_type(DataType_t::BOOLEAN));
+            swa_mask->set_data_type(DataType_t::BOOLEAN);
+
+            auto negative_inf_swa = std::make_shared<Tensor_attributes>(
+                attn::score_modifiers::get_negative_inf_value());
+            last_dV = pointwise(last_dV, negative_inf_swa, swa_mask,
+                Pointwise_attributes().set_name("swa_binary_select")
+                    .set_mode(PointwiseMode_t::BINARY_SELECT));
         }
 
         //// Apply Softmax
@@ -507,44 +886,85 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                           Pointwise_attributes().set_name("mul_dS_dropout_scale").set_mode(PointwiseMode_t::MUL));
         }
 
-        // Scale S
-        mul_attributes.set_name("scale_S");
-        last_dV = pointwise(last_dV, attributes.inputs.at(input_names::Scale_S), mul_attributes);
-        last_dV->set_data_type(attributes.inputs.at(input_names::Q)->get_data_type());
+        // Scale S (only for non-MXFP8 per-tensor scaling; MXFP8 keeps P in fp32)
+        if (!use_mxfp8) {
+            mul_attributes.set_name("scale_S");
+            last_dV = pointwise(last_dV, attributes.inputs.at(input_names::Scale_S), mul_attributes);
+            last_dV->set_data_type(attributes.inputs.at(input_names::Q)->get_data_type());
+        }
 
-        // Reshape S
+        // Reshape P
         last_dV = reshape(last_dV, Reshape_attributes().set_name("S_transpose"));
         last_dV->set_name("S_T").set_dim({b, h_q, s_kv, s_q}).set_stride({h_q * s_q * s_kv, s_q * s_kv, 1, s_kv});
-        last_dV->set_data_type(attributes.inputs[input_names::Q]->get_data_type());
+        if (!use_mxfp8) {
+            last_dV->set_data_type(attributes.inputs[input_names::Q]->get_data_type());
+        }
 
-        //// S_T * dO
-        // Special non-functional-style call. Needed because output already created and provided to user.
-        matmul_fp8(last_dV,
-                   attributes.inputs[input_names::dO],
-                   attributes.inputs[input_names::Descale_S],
-                   attributes.inputs[input_names::Descale_dO],
-                   attributes.inputs[input_names::Scale_dV],
-                   Matmul_fp8_attributes().set_name("bmm_S_T_dO")
-                       .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
-                       .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]),
-                   attributes.outputs[output_names::dV],
-                   attributes.outputs[output_names::Amax_dV]);
+        //// P.T @ dO -> dV
+        if (use_mxfp8) {
+            // MXFP8: Dequantize dO_T with Descale_dO_T for P.T@dO
+            auto dequant_dO_seq_attrs = Block_scale_dequantize_attributes()
+                                            .set_name("DQ_dO_seq")
+                                            .set_block_size({1, 32});
+            auto dO_seq_dequant = std::make_shared<Tensor_attributes>();
+            dO_seq_dequant->set_is_virtual(true);
+            dO_seq_dequant->set_dim(attributes.inputs[input_names::dO_T]->get_dim());
+            dO_seq_dequant->set_stride(attributes.inputs[input_names::dO_T]->get_stride());
+            block_scale_dequantize(attributes.inputs[input_names::dO_T],
+                                   attributes.inputs[input_names::Descale_dO_T],
+                                   dequant_dO_seq_attrs,
+                                   dO_seq_dequant);
+
+            auto bmm_S_T_dO_attributes = Matmul_attributes().set_name("bmm_S_T_dO")
+                                             .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
+                                             .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]);
+            if (h_q == h_v) {
+                matmul(last_dV, dO_seq_dequant, bmm_S_T_dO_attributes, attributes.outputs[output_names::dV]);
+            } else {
+                auto dV_fullhead = matmul(last_dV, dO_seq_dequant, bmm_S_T_dO_attributes);
+                dV_fullhead->set_dim({b, h_q, s_kv, d_v});
+                dV_fullhead->set_stride({h_q * s_kv * d_v, s_kv * d_v, d_v, 1});
+                reduction(dV_fullhead,
+                          Reduction_attributes().set_name("red_dV_head").set_mode(ReductionMode_t::ADD),
+                          attributes.outputs[output_names::dV]);
+            }
+
+            auto const& amax_dv = attributes.outputs.at(output_names::Amax_dV);
+            if (amax_dv != nullptr) {
+                auto amax_dv_attributes =
+                    Reduction_attributes().set_name("amax_dV").set_mode(ReductionMode_t::AMAX);
+                reduction(attributes.outputs[output_names::dV], amax_dv_attributes, amax_dv);
+            }
+        } else {
+            matmul_fp8(last_dV,
+                       attributes.inputs[input_names::dO],
+                       attributes.inputs[input_names::Descale_S],
+                       attributes.inputs[input_names::Descale_dO],
+                       attributes.inputs[input_names::Scale_dV],
+                       Matmul_fp8_attributes().set_name("bmm_S_T_dO")
+                           .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
+                           .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]),
+                       attributes.outputs[output_names::dV],
+                       attributes.outputs[output_names::Amax_dV]);
+        }
 
         //// dO * V_T
         auto bmm_dO_V_T_attributes = Matmul_attributes().set_name("bmm_dO_V_T")
                                  .set_m_override(attributes.inputs[input_names::SEQ_LEN_Q])
                                  .set_n_override(attributes.inputs[input_names::SEQ_LEN_KV]);
-        last_output =
-            matmul(attributes.inputs[input_names::dO], attributes.inputs[input_names::V], bmm_dO_V_T_attributes);
+        last_output = matmul(eff_dO, eff_V, bmm_dO_V_T_attributes);
 
-        //// Descales
-        // Descale dO
-        mul_attributes.set_name("descale_dO");
-        last_output = pointwise(last_output, attributes.inputs.at(input_names::Descale_dO), mul_attributes);
+        // Descale dO (only for non-MXFP8 per-tensor scaling)
+        if (!use_mxfp8) {
+            mul_attributes.set_name("descale_dO");
+            last_output = pointwise(last_output, attributes.inputs.at(input_names::Descale_dO), mul_attributes);
+        }
 
-        // Descale V
-        mul_attributes.set_name("descale_V");
-        last_output = pointwise(last_output, attributes.inputs.at(input_names::Descale_V), mul_attributes);
+        // Descale V (only for non-MXFP8 per-tensor scaling)
+        if (!use_mxfp8) {
+            mul_attributes.set_name("descale_V");
+            last_output = pointwise(last_output, attributes.inputs.at(input_names::Descale_V), mul_attributes);
+        }
 
         // dP = last_output - softmax_sum
         auto dP = pointwise(last_output,
@@ -575,55 +995,118 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             dP = pointwise(dP, attn_scale_it->second, mul_attributes);
         }
 
-        // Amax dP
-        auto amax_attributes = Reduction_attributes().set_name("amax_dP").set_mode(ReductionMode_t::AMAX);
-        // Special non-functional-style call. Needed because output already created and provided to user.
-        reduction(dP, amax_attributes, attributes.outputs.at(output_names::Amax_dP));
+        // Amax dP and Scale dP (only for non-MXFP8 per-tensor scaling; MXFP8 keeps dS in fp32)
+        if (!use_mxfp8) {
+            auto amax_attributes = Reduction_attributes().set_name("amax_dP").set_mode(ReductionMode_t::AMAX);
+            reduction(dP, amax_attributes, attributes.outputs.at(output_names::Amax_dP));
 
-        // Scale dP
-        mul_attributes.set_name("scale_dP");
-        dP = pointwise(dP, attributes.inputs.at(input_names::Scale_dP), mul_attributes);
-        dP->set_data_type(attributes.inputs.at(input_names::dO)->get_data_type());
+            mul_attributes.set_name("scale_dP");
+            dP = pointwise(dP, attributes.inputs.at(input_names::Scale_dP), mul_attributes);
+            dP->set_data_type(attributes.inputs.at(input_names::dO)->get_data_type());
+        }
 
-        //// dP * K
-        auto const& kt_dim    = attributes.inputs[input_names::K]->get_dim();
-        auto const& kt_stride = attributes.inputs[input_names::K]->get_stride();
+        //// dS @ K -> dQ
+        if (use_mxfp8) {
+            // MXFP8: Dequantize K_T with Descale_K_T (seq-dimension scaling) for dS@K -> dQ
+            auto dequant_K_seq_attrs = Block_scale_dequantize_attributes()
+                                           .set_name("DQ_K_seq")
+                                           .set_block_size({1, 32});
+            auto K_seq_dequant = std::make_shared<Tensor_attributes>();
+            K_seq_dequant->set_is_virtual(true);
+            K_seq_dequant->set_dim(attributes.inputs[input_names::K_T]->get_dim());
+            K_seq_dequant->set_stride(attributes.inputs[input_names::K_T]->get_stride());
+            block_scale_dequantize(attributes.inputs[input_names::K_T],
+                                   attributes.inputs[input_names::Descale_K_T],
+                                   dequant_K_seq_attrs,
+                                   K_seq_dequant);
 
-        auto K = reshape(attributes.inputs[input_names::K], Reshape_attributes().set_name("reshape_K"));
-        K->set_dim({kt_dim[0], kt_dim[1], kt_dim[3], kt_dim[2]})
-            .set_stride({kt_stride[0], kt_stride[1], kt_stride[3], kt_stride[2]});
+            auto bmm_dS_K_attributes = Matmul_attributes().set_name("bmm_dS_K")
+                       .set_m_override(attributes.inputs[input_names::SEQ_LEN_Q])
+                       .set_k_override(attributes.inputs[input_names::SEQ_LEN_KV]);
+            matmul(dP, K_seq_dequant, bmm_dS_K_attributes, attributes.outputs[output_names::dQ]);
 
-        auto bmm_dP_K_attributes = Matmul_fp8_attributes().set_name("bmm_dP_K")
-                   .set_m_override(attributes.inputs[input_names::SEQ_LEN_Q])
-                   .set_k_override(attributes.inputs[input_names::SEQ_LEN_KV]);
-        // Special non-functional-style call. Needed because output already created and provided to user.
-        matmul_fp8(dP,
-                   K,
-                   attributes.inputs[input_names::Descale_dP],
-                   attributes.inputs[input_names::Descale_K],
-                   attributes.inputs[input_names::Scale_dQ],
-                   bmm_dP_K_attributes,
-                   attributes.outputs[output_names::dQ],
-                   attributes.outputs[output_names::Amax_dQ]);
+            auto const& amax_dq = attributes.outputs.at(output_names::Amax_dQ);
+            if (amax_dq != nullptr) {
+                auto amax_dq_attributes =
+                    Reduction_attributes().set_name("amax_dQ").set_mode(ReductionMode_t::AMAX);
+                reduction(attributes.outputs[output_names::dQ], amax_dq_attributes, amax_dq);
+            }
+        } else {
+            auto const& kt_dim    = attributes.inputs[input_names::K]->get_dim();
+            auto const& kt_stride = attributes.inputs[input_names::K]->get_stride();
 
-        //// dP.T * Q
+            auto K = reshape(attributes.inputs[input_names::K], Reshape_attributes().set_name("reshape_K"));
+            K->set_dim({kt_dim[0], kt_dim[1], kt_dim[3], kt_dim[2]})
+                .set_stride({kt_stride[0], kt_stride[1], kt_stride[3], kt_stride[2]});
+
+            auto bmm_dP_K_attributes = Matmul_fp8_attributes().set_name("bmm_dP_K")
+                       .set_m_override(attributes.inputs[input_names::SEQ_LEN_Q])
+                       .set_k_override(attributes.inputs[input_names::SEQ_LEN_KV]);
+            matmul_fp8(dP,
+                       K,
+                       attributes.inputs[input_names::Descale_dP],
+                       attributes.inputs[input_names::Descale_K],
+                       attributes.inputs[input_names::Scale_dQ],
+                       bmm_dP_K_attributes,
+                       attributes.outputs[output_names::dQ],
+                       attributes.outputs[output_names::Amax_dQ]);
+        }
+
+        //// dS.T * Q (transpose dS -> dS_reshape)
         auto dP_T_attributes = Reshape_attributes().set_name("dP_T");
         auto dP_T            = reshape(dP, dP_T_attributes);
-        dP_T->set_data_type(attributes.inputs.at(input_names::dO)->get_data_type());
+        if (!use_mxfp8) {
+            dP_T->set_data_type(attributes.inputs.at(input_names::dO)->get_data_type());
+        }
         dP_T->set_name("dP_T").set_dim({b, h_q, s_kv, s_q}).set_stride({h_q * s_q * s_kv, s_q * s_kv, 1, s_kv});
 
-        auto bmm_dP_T_Q_attributes = Matmul_fp8_attributes().set_name("bmm_dP_T_Q")
-                       .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
-                       .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]);
-        // Special non-functional-style call. Needed because output already created and provided to user.
-        matmul_fp8(dP_T,
-                   attributes.inputs[input_names::Q],
-                   attributes.inputs[input_names::Descale_dP],
-                   attributes.inputs[input_names::Descale_Q],
-                   attributes.inputs[input_names::Scale_dK],
-                   bmm_dP_T_Q_attributes,
-                   attributes.outputs[output_names::dK],
-                   attributes.outputs[output_names::Amax_dK]);
+        if (use_mxfp8) {
+            // MXFP8: Dequantize Q_T with Descale_Q_T (seq-dimension scaling) for dS.T@Q -> dK
+            auto dequant_Q_seq_attrs = Block_scale_dequantize_attributes()
+                                           .set_name("DQ_Q_seq")
+                                           .set_block_size({1, 32});
+            auto Q_seq_dequant = std::make_shared<Tensor_attributes>();
+            Q_seq_dequant->set_is_virtual(true);
+            Q_seq_dequant->set_dim(attributes.inputs[input_names::Q_T]->get_dim());
+            Q_seq_dequant->set_stride(attributes.inputs[input_names::Q_T]->get_stride());
+            block_scale_dequantize(attributes.inputs[input_names::Q_T],
+                                   attributes.inputs[input_names::Descale_Q_T],
+                                   dequant_Q_seq_attrs,
+                                   Q_seq_dequant);
+
+            auto bmm_dS_T_Q_attributes = Matmul_attributes().set_name("bmm_dS_T_Q")
+                           .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
+                           .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]);
+            if (h_q == h_k) {
+                matmul(dP_T, Q_seq_dequant, bmm_dS_T_Q_attributes, attributes.outputs[output_names::dK]);
+            } else {
+                auto dK_fullhead = matmul(dP_T, Q_seq_dequant, bmm_dS_T_Q_attributes);
+                dK_fullhead->set_dim({b, h_q, s_kv, d_qk});
+                dK_fullhead->set_stride({h_q * s_kv * d_qk, s_kv * d_qk, d_qk, 1});
+                reduction(dK_fullhead,
+                          Reduction_attributes().set_name("red_dK_head").set_mode(ReductionMode_t::ADD),
+                          attributes.outputs[output_names::dK]);
+            }
+
+            auto const& amax_dk = attributes.outputs.at(output_names::Amax_dK);
+            if (amax_dk != nullptr) {
+                auto amax_dk_attributes =
+                    Reduction_attributes().set_name("amax_dK").set_mode(ReductionMode_t::AMAX);
+                reduction(attributes.outputs[output_names::dK], amax_dk_attributes, amax_dk);
+            }
+        } else {
+            auto bmm_dP_T_Q_attributes = Matmul_fp8_attributes().set_name("bmm_dP_T_Q")
+                           .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
+                           .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]);
+            matmul_fp8(dP_T,
+                       attributes.inputs[input_names::Q],
+                       attributes.inputs[input_names::Descale_dP],
+                       attributes.inputs[input_names::Descale_Q],
+                       attributes.inputs[input_names::Scale_dK],
+                       bmm_dP_T_Q_attributes,
+                       attributes.outputs[output_names::dK],
+                       attributes.outputs[output_names::Amax_dK]);
+        }
 
         return {error_code_t::OK, ""};
     }
@@ -631,7 +1114,11 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
     std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const {
         if (is_deterministic_algorithm_supported_on_blackwell) {
-            return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
+            if(detail::get_backend_version() < 92100) {
+                return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
+            } else {
+                return {5, {{KnobType_t::KERNEL_CFG, 1}, {KnobType_t::STAGES, 2}}};
+            }
         } else {
             return {-1, {}};
         }

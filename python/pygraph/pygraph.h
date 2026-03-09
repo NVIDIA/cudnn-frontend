@@ -49,6 +49,7 @@ class PyGraph {
     bool is_handle_owner = false;
 
     std::optional<PyCallback> callback_fn;
+    std::optional<PyCallback> callback_fn_bprop;
 
     PyGraph(Graph_t graph_) : graph(graph_) {};
 
@@ -106,6 +107,16 @@ class PyGraph {
 
         if (callback_fn.has_value()) {
             q_kt = this->callback_fn.value()(*py_graph, q_kt);
+        }
+
+        return q_kt;
+    };
+
+    std::function<Tensor_t(Graph_t, Tensor_t)> wrapper_function_bprop = [this](Graph_t graph, Tensor_t q_kt) {
+        auto py_graph = std::make_shared<PyGraph>(graph);
+
+        if (callback_fn_bprop.has_value()) {
+            q_kt = this->callback_fn_bprop.value()(*py_graph, q_kt);
         }
 
         return q_kt;
@@ -251,8 +262,8 @@ class PyGraph {
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     swish(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
-          cudnn_frontend::DataType_t const& compute_data_type,
           std::optional<float> const& swish_beta,
+          cudnn_frontend::DataType_t const& compute_data_type,
           std::string const& name);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
@@ -387,7 +398,8 @@ class PyGraph {
          py::object const& generate_stats,
          cudnn_frontend::AttentionImplementation_t const& implementation,
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
-         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp);
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token);
 
     // return [dQ, dK, dV]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 3>
@@ -416,7 +428,11 @@ class PyGraph {
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
                   bool const use_deterministic_algorithm,
                   cudnn_frontend::DataType_t const& compute_data_type,
-                  std::string const& name);
+                  std::string const& name,
+                  std::optional<PyCallback> fn,
+                  std::optional<PyCallback> fn_bprop,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token);
 
     // return [o, stats, amax_s, amax_o]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 4>
@@ -454,6 +470,25 @@ class PyGraph {
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp);
 
+    // MXFP8 SDPA forward - uses block-wise scale factors (E8M0 with F8_128x4 reordering)
+    // return [o, stats, amax_o]
+    std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 3>
+    sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_q,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_k,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_v,
+               py::object const& attn_scale,
+               bool const use_causal_mask,
+               bool const use_causal_mask_bottom_right,
+               cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
+               py::object const& left_bound,
+               py::object const& right_bound,
+               cudnn_frontend::DataType_t const& compute_data_type,
+               std::string const& name,
+               py::object const& generate_stats);
+
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 7>
     sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
@@ -480,10 +515,47 @@ class PyGraph {
                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
                       bool const use_causal_mask,
                       bool const use_causal_mask_bottom_right,
+                      cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
+                      py::object const& left_bound,
+                      py::object const& right_bound,
                       bool const use_deterministic_algorithm,
                       py::object const& dropout,
                       cudnn_frontend::DataType_t const& compute_data_type,
                       std::string const& name);
+
+    // MXFP8 SDPA backward - uses block-wise scale factors (E8M0 with F8_128x4 reordering)
+    // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV]
+    std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 6>
+    sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q_T,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k_T,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& o_f16,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO_f16,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO_T,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& stats,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_q,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_q_T,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_k,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_k_T,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_v,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_dO,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_dO_T,
+                        py::object const& attn_scale,
+                        bool const use_padding_mask,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                        bool const use_causal_mask,
+                        bool const use_causal_mask_bottom_right,
+                        cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
+                        py::object const& left_bound,
+                        py::object const& right_bound,
+                        bool const use_deterministic_algorithm,
+                        py::object const& dropout,
+                        cudnn_frontend::DataType_t const& compute_data_type,
+                        std::string const& name);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     moe_grouped_matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token,
@@ -657,6 +729,7 @@ class PyGraph {
                   py::object const& generate_stats,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
                   cudnn_frontend::DataType_t const& mma_core_mode = cudnn_frontend::DataType_t::HALF,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_q = nullptr,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_k = nullptr,
