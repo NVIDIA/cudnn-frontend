@@ -1,6 +1,6 @@
 jupyter
 numpy<2.0.0
-pybind11[global]
+pybind11[global]>=2.13,<3
 pytest
 pytest-xdist
 looseversion
