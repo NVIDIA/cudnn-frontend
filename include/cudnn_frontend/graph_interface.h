@@ -85,6 +85,34 @@ class Graph : public ICudnn, public INode {
     }
 
     error_t
+    log_tensors_to_dump_(cudnnHandle_t handle,
+                         std::unordered_map<int64_t, void *> const &tensor_uid_to_pointer_map) const {
+        if (!isLoggingTensorDumpEnabled()) {
+            return {error_code_t::OK, ""};
+        }
+
+        for (auto const &[uid, ptr] : tensor_uid_to_pointer_map) {
+            CHECK_CUDNN_FRONTEND_ERROR(detail::log_variant_pack_memory_type(uid, ptr));
+        }
+
+        cudaStream_t stream;
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+        for (auto const &[tensor, fmt] : tensors_to_dump) {
+            auto it = tensor_uid_to_pointer_map.find(tensor->get_uid());
+            if (it != tensor_uid_to_pointer_map.end()) {
+                auto const &dims    = tensor->get_dim();
+                size_t num_elements = 1;
+                for (auto d : dims) num_elements *= static_cast<size_t>(d);
+                size_t elem_size = detail::get_data_type_size(tensor->get_data_type());
+                CHECK_CUDNN_FRONTEND_ERROR(detail::log_dump_tensor_content(
+                    it->first, tensor->get_name(), it->second, num_elements, elem_size, fmt, stream));
+            }
+        }
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
     pre_validate_node() const override final {
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             (context.get_dynamic_shape_enabled() || kernel_cache != nullptr) && detail::get_backend_version() < 90400,
@@ -285,21 +313,6 @@ class Graph : public ICudnn, public INode {
                 output_tensor(attributes.name + "::Amax_O");
         }
 
-        auto seq_len_q_it  = attributes.inputs.find(SDPA_attributes::input_names::SEQ_LEN_Q);
-        auto seq_len_kv_it = attributes.inputs.find(SDPA_attributes::input_names::SEQ_LEN_KV);
-        if (seq_len_q_it != attributes.inputs.end() && seq_len_q_it->second != nullptr) {
-            tensors_to_dump.emplace_back(seq_len_q_it->second, 'd');
-        }
-        if (seq_len_kv_it != attributes.inputs.end() && seq_len_kv_it->second != nullptr) {
-            tensors_to_dump.emplace_back(seq_len_kv_it->second, 'd');
-        }
-
-        for (auto t : {q, k, v, sdpa_outputs.O}) {
-            if (auto ragged = t->get_ragged_offset()) {
-                tensors_to_dump.emplace_back(ragged, 'd');
-            }
-        }
-
         if (attributes.implementation == AttentionImplementation_t::AUTO) {
             // Sets attributes.implementation to a supporting implementation,
             // or leaves as AUTO if none found
@@ -429,6 +442,149 @@ class Graph : public ICudnn, public INode {
         }
         plans.set_oss_engine(engine);
         plans.set_oss_engine_context(std::move(ctx));
+
+        return {error_code_t::OK, ""};
+    }
+
+    // Register an OSS NVRTC engine for RmsNorm+SiLU by detecting the fusion pattern:
+    //   RMSNormNode(X, SCALE) → Y → PointwiseNode(SWISH_FWD) → Z
+    // Extracts tensor metadata and instantiates the appropriate arch-specific engine.
+    error_t
+    register_oss_rms_norm_silu_engine_() {
+        // Scan sub_nodes for the RMSNorm → SiLU pattern
+        Rmsnorm_attributes const *rmsnorm_attrs = nullptr;
+        Pointwise_attributes const *swish_attrs = nullptr;
+        std::shared_ptr<Tensor_attributes> swish_output;
+
+        for (size_t i = 0; i + 1 < sub_nodes.size(); ++i) {
+            auto *rmsnorm_node = dynamic_cast<RMSNormNode *>(sub_nodes[i].get());
+            if (!rmsnorm_node) continue;
+
+            auto *pointwise_node = dynamic_cast<PointwiseNode *>(sub_nodes[i + 1].get());
+            if (!pointwise_node) continue;
+
+            if (pointwise_node->attributes.get_mode() != PointwiseMode_t::SWISH_FWD) continue;
+
+            // OSS engine only supports SiLU (Swish with beta=1.0).
+            // Reject if beta is explicitly set to a non-1.0 value.
+            auto beta = pointwise_node->attributes.get_swish_beta().value_or(1.0f);
+            if (beta != 1.0f) continue;
+
+            // Verify the RMSNorm output feeds into the pointwise input
+            auto rmsnorm_y_it = rmsnorm_node->attributes.outputs.find(Rmsnorm_attributes::output_names::Y);
+            if (rmsnorm_y_it == rmsnorm_node->attributes.outputs.end() || !rmsnorm_y_it->second) continue;
+
+            auto swish_in0_it = pointwise_node->attributes.inputs.find(Pointwise_attributes::input_names::IN_0);
+            if (swish_in0_it == pointwise_node->attributes.inputs.end() || !swish_in0_it->second) continue;
+
+            // Check that RMSNorm output Y == SiLU input IN_0 (same tensor)
+            if (rmsnorm_y_it->second->get_uid() != swish_in0_it->second->get_uid()) continue;
+
+            // Pattern matched!
+            rmsnorm_attrs = &rmsnorm_node->attributes;
+            swish_attrs   = &pointwise_node->attributes;
+            swish_output  = pointwise_node->attributes.outputs.at(Pointwise_attributes::output_names::OUT_0);
+            break;
+        }
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(rmsnorm_attrs == nullptr || swish_attrs == nullptr,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "No RMSNorm → SiLU fusion pattern found for OPENSOURCE engine");
+
+        // Only inference is supported (no mean/inv_variance output for training)
+        RETURN_CUDNN_FRONTEND_ERROR_IF(rmsnorm_attrs->forward_phase != NormFwdPhase_t::INFERENCE,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "OSS RmsNorm+SiLU engine only supports INFERENCE phase");
+
+        // Extract tensor metadata
+        graph::Execution_plan_list::OssRmsNormSiluContext ctx;
+
+        // X input tensor
+        auto x_it = rmsnorm_attrs->inputs.find(Rmsnorm_attributes::input_names::X);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(x_it == rmsnorm_attrs->inputs.end() || !x_it->second,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "X tensor not found in RMSNorm node");
+
+        // Input must be bf16 (the kernel always uses ITYPE = nv_bfloat16)
+        auto x_dtype = x_it->second->get_data_type();
+        RETURN_CUDNN_FRONTEND_ERROR_IF(x_dtype != DataType_t::BFLOAT16,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "OSS RmsNorm+SiLU engine requires BFLOAT16 input");
+
+        ctx.x_uid  = x_it->second->get_uid();
+        auto x_dim = x_it->second->get_dim();
+        // X shape in NCHW: [N, C, H, W] where norm operates per-row (N) across columns (C*H*W)
+        // num_tokens = N (first dim), C = product of remaining dims (C*H*W)
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            x_dim.size() < 2, error_code_t::GRAPH_NOT_SUPPORTED, "X tensor must have at least 2 dimensions");
+        ctx.num_tokens = x_dim[0];
+        ctx.C          = 1;
+        for (size_t d = 1; d < x_dim.size(); ++d) {
+            ctx.C *= x_dim[d];
+        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            ctx.num_tokens <= 0 || ctx.C <= 0,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "Invalid problem dimensions: num_tokens=" + std::to_string(ctx.num_tokens) + " C=" + std::to_string(ctx.C));
+
+        // SCALE (gamma) tensor — must be bf16 (kernel uses WTYPE = nv_bfloat16)
+        auto scale_it = rmsnorm_attrs->inputs.find(Rmsnorm_attributes::input_names::SCALE);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(scale_it == rmsnorm_attrs->inputs.end() || !scale_it->second,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "SCALE tensor not found in RMSNorm node");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(scale_it->second->get_data_type() != DataType_t::BFLOAT16,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "OSS RmsNorm+SiLU engine requires BFLOAT16 scale weights");
+        ctx.scale_uid = scale_it->second->get_uid();
+
+        // BIAS (beta) tensor — optional
+        auto bias_it = rmsnorm_attrs->inputs.find(Rmsnorm_attributes::input_names::BIAS);
+        if (bias_it != rmsnorm_attrs->inputs.end() && bias_it->second) {
+            ctx.bias_uid = bias_it->second->get_uid();
+        }
+
+        // EPSILON tensor
+        auto eps_it = rmsnorm_attrs->inputs.find(Rmsnorm_attributes::input_names::EPSILON);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(eps_it == rmsnorm_attrs->inputs.end() || !eps_it->second,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "EPSILON tensor not found in RMSNorm node");
+        ctx.epsilon_uid = eps_it->second->get_uid();
+
+        // Output Z tensor (output of SiLU, not RMSNorm)
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !swish_output, error_code_t::GRAPH_NOT_SUPPORTED, "Output tensor not found in SiLU node");
+        ctx.y_uid = swish_output->get_uid();
+
+        // Determine output dtype from the output tensor
+        auto out_dtype = swish_output->get_data_type();
+        if (out_dtype == DataType_t::BFLOAT16) {
+            ctx.output_dtype = experimental::RmsNormSiluDtype::BF16;
+        } else if (out_dtype == DataType_t::FP8_E4M3) {
+            ctx.output_dtype = experimental::RmsNormSiluDtype::FP8;
+        } else if (out_dtype == DataType_t::FP4_E2M1) {
+            ctx.output_dtype = experimental::RmsNormSiluDtype::NVFP4;
+        } else {
+            return {error_code_t::GRAPH_NOT_SUPPORTED,
+                    "OSS RmsNorm+SiLU engine supports BFLOAT16, FP8_E4M3, or FP4_E2M1 output"};
+        }
+
+        // Detect SM version and instantiate the appropriate OSS engine
+        int oss_device_ordinal = 0;
+        experimental::detail::cuda_get_device(&oss_device_ordinal);
+        cudaDeviceProp oss_dev_prop;
+        experimental::detail::cuda_get_device_properties(&oss_dev_prop, oss_device_ordinal);
+        int oss_sm = oss_dev_prop.major * 10 + oss_dev_prop.minor;
+
+        std::shared_ptr<experimental::IOssNormEngine> engine;
+        if (oss_sm >= 80) {
+            engine = std::make_shared<experimental::Sm100RmsNormSiluEngine>();
+        } else {
+            return {error_code_t::GRAPH_NOT_SUPPORTED,
+                    "RmsNorm+SiLU OSS engine requires SM80+, got SM" + std::to_string(oss_sm)};
+        }
+
+        plans.set_oss_rms_norm_silu_engine(engine);
+        plans.set_oss_rms_norm_silu_context(std::move(ctx));
 
         return {error_code_t::OK, ""};
     }
@@ -784,6 +940,8 @@ class Graph : public ICudnn, public INode {
 
         Tensor_attributes::uid_t start_uid = 1;
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensors_subtree(uid_to_tensors, start_uid, used_uids));
+        tensors_to_dump.clear();
+        CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_to_dump_subtree(tensors_to_dump));
 
         CUDNN_FE_LOG_BANNER("  3/4 CREATE OPERATIONS  ");
         // INode keeps track of all uids that an operation graph uses.
@@ -842,10 +1000,18 @@ class Graph : public ICudnn, public INode {
 
     error_t
     get_workspace_size_plan_at_index(int64_t plan_index, int64_t &cudnn_workspace_size) const {
-        // OSS engine workspace: 16 bytes for tile_id_counter
+        // OSS SDPA engine workspace: 16 bytes for tile_id_counter
         if (plan_index == graph::Execution_plan_list::OSS_ENGINE_CANDIDATE) {
             cudnn_workspace_size = fe_workspace_size + experimental::Sm90SdpaPrefillEngine::get_workspace_size();
-            CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is " << cudnn_workspace_size << " (OSS engine)");
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is " << cudnn_workspace_size << " (OSS SDPA engine)");
+            return {error_code_t::OK, ""};
+        }
+
+        // OSS RmsNorm+SiLU engine workspace
+        if (plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
+            cudnn_workspace_size = fe_workspace_size + plans.get_oss_rms_norm_silu_workspace_size();
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is " << cudnn_workspace_size
+                                                                     << " (OSS RmsNorm+SiLU engine)");
             return {error_code_t::OK, ""};
         }
 
@@ -928,7 +1094,6 @@ class Graph : public ICudnn, public INode {
                           void *workspace,
                           int64_t plan_index) const {
         CUDNN_FE_LOG_BANNER(" EXECUTE PLAN AT INDEX  for plan index (with Tensor keys) " << plan_index << "  ");
-        CUDNN_FE_LOG(*this << std::endl;);
         // First get all the uids from the map
         std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
         for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
@@ -943,7 +1108,6 @@ class Graph : public ICudnn, public INode {
             std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
             void *workspace) const {
         CUDNN_FE_LOG_BANNER(" EXECUTE PLAN (with Tensor keys) ");
-        CUDNN_FE_LOG(*this << std::endl;);
         // First get all the uids from the map
         std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
         for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
@@ -964,7 +1128,6 @@ class Graph : public ICudnn, public INode {
         // Using cached values to avoid repeated tree traversal overhead.
         // Object lifetime is controlled by cached_pass_by_value which persists for the Graph's lifetime.
         CUDNN_FE_LOG_BANNER("  EXECUTE PLAN AT INDEX  for plan index " << plan_index << "  ");
-        CUDNN_FE_LOG(*this << std::endl;);
 
         CHECK_CUDNN_FRONTEND_ERROR(
             extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, cached_pass_by_value));
@@ -980,25 +1143,7 @@ class Graph : public ICudnn, public INode {
         // this is where cudnn backend can start using workspace for its execution plans
         void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
 
-        if (isLoggingTensorDumpEnabled()) {
-            for (auto const &[uid, ptr] : tensor_uid_to_pointer_map) {
-                CHECK_CUDNN_FRONTEND_ERROR(detail::log_variant_pack_memory_type(uid, ptr));
-            }
-
-            cudaStream_t stream;
-            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
-            for (auto const &[tensor, fmt] : tensors_to_dump) {
-                auto it = tensor_uid_to_pointer_map.find(tensor->get_uid());
-                if (it != tensor_uid_to_pointer_map.end()) {
-                    auto const &dims    = tensor->get_dim();
-                    size_t num_elements = 1;
-                    for (auto d : dims) num_elements *= static_cast<size_t>(d);
-                    size_t elem_size = detail::get_data_type_size(tensor->get_data_type());
-                    CHECK_CUDNN_FRONTEND_ERROR(detail::log_dump_tensor_content(
-                        it->first, tensor->get_name(), it->second, num_elements, elem_size, fmt, stream));
-                }
-            }
-        }
+        CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, tensor_uid_to_pointer_map));
 
         CHECK_CUDNN_FRONTEND_ERROR(execute_cudnn_plan_with_uid(handle,
                                                                tensor_uid_to_pointer_map,
@@ -1028,7 +1173,7 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(
             make_variant_pack_replacements(tensor_uid_to_pointer_map, variant_pack_replacements));
 
-        // OSS engine dispatch with dynamic shape overrides
+        // OSS SDPA engine dispatch with dynamic shape overrides
         if (plans.is_oss_candidate()) {
             cudaStream_t stream = nullptr;
             _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
@@ -1047,7 +1192,25 @@ class Graph : public ICudnn, public INode {
                                                                 override_shapes,
                                                                 override_strides));
 
-            CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK (OSS engine, dynamic shapes) ");
+            CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK (OSS SDPA engine, dynamic shapes) ");
+            return {error_code_t::OK, ""};
+        }
+
+        // OSS RmsNorm+SiLU engine dispatch
+        if (plans.is_oss_rms_norm_silu_candidate()) {
+            cudaStream_t stream = nullptr;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+
+            int device_ordinal = 0;
+            detail::cuda_get_device(&device_ordinal);
+            CUdevice cu_device;
+            experimental::detail::cu_device_get(&cu_device, device_ordinal);
+
+            void *oss_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+            CHECK_CUDNN_FRONTEND_ERROR(
+                plans.execute_oss_rms_norm_silu_engine(tensor_uid_to_pointer_map, oss_workspace, cu_device, stream));
+
+            CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK (OSS RmsNorm+SiLU engine) ");
             return {error_code_t::OK, ""};
         }
 
@@ -1059,25 +1222,7 @@ class Graph : public ICudnn, public INode {
         // this is where cudnn backend can start using workspace for its execution plans
         void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
 
-        if (isLoggingTensorDumpEnabled()) {
-            for (auto const &[uid, ptr] : tensor_uid_to_pointer_map) {
-                CHECK_CUDNN_FRONTEND_ERROR(detail::log_variant_pack_memory_type(uid, ptr));
-            }
-
-            cudaStream_t stream;
-            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
-            for (auto const &[tensor, fmt] : tensors_to_dump) {
-                auto it = tensor_uid_to_pointer_map.find(tensor->get_uid());
-                if (it != tensor_uid_to_pointer_map.end()) {
-                    auto const &dims    = tensor->get_dim();
-                    size_t num_elements = 1;
-                    for (auto d : dims) num_elements *= static_cast<size_t>(d);
-                    size_t elem_size = detail::get_data_type_size(tensor->get_data_type());
-                    CHECK_CUDNN_FRONTEND_ERROR(detail::log_dump_tensor_content(
-                        it->first, tensor->get_name(), it->second, num_elements, elem_size, fmt, stream));
-                }
-            }
-        }
+        CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, tensor_uid_to_pointer_map));
 
         CHECK_CUDNN_FRONTEND_ERROR(execute_cudnn_plan_with_uid(handle,
                                                                tensor_uid_to_pointer_map,
@@ -1097,7 +1242,6 @@ class Graph : public ICudnn, public INode {
                           void *workspace,
                           int64_t plan_index) const {
         CUDNN_FE_LOG_BANNER(" EXECUTE PLAN AT INDEX  for plan index " << plan_index << "  ");
-        CUDNN_FE_LOG(*this << std::endl;);
         // Add pass_by_value data pointers to uid_to_pointer map
         // object lifetime is controlled by tensor_to_pass_by_value which means the pointer should stay valid during
         // execute.
@@ -1113,14 +1257,13 @@ class Graph : public ICudnn, public INode {
         // Add pass_by_value data pointers to uid_to_pointer map.
         // Using cached values to avoid repeated tree traversal overhead.
         CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ");
-        CUDNN_FE_LOG(*this << std::endl;);
 
         CHECK_CUDNN_FRONTEND_ERROR(
             extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, cached_pass_by_value));
         CHECK_CUDNN_FRONTEND_ERROR(
             make_variant_pack_replacements(tensor_uid_to_pointer_map, variant_pack_replacements));
 
-        // OSS engine dispatch: bypass cuDNN backend entirely
+        // OSS SDPA engine dispatch: bypass cuDNN backend entirely
         if (plans.is_oss_candidate()) {
             cudaStream_t stream = nullptr;
             _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
@@ -1135,7 +1278,25 @@ class Graph : public ICudnn, public INode {
             CHECK_CUDNN_FRONTEND_ERROR(
                 plans.execute_oss_engine(tensor_uid_to_pointer_map, oss_workspace, cu_device, stream));
 
-            CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK (OSS engine) ");
+            CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK (OSS SDPA engine) ");
+            return {error_code_t::OK, ""};
+        }
+
+        // OSS RmsNorm+SiLU engine dispatch: bypass cuDNN backend entirely
+        if (plans.is_oss_rms_norm_silu_candidate()) {
+            cudaStream_t stream = nullptr;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+
+            int device_ordinal = 0;
+            detail::cuda_get_device(&device_ordinal);
+            CUdevice cu_device;
+            experimental::detail::cu_device_get(&cu_device, device_ordinal);
+
+            void *oss_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+            CHECK_CUDNN_FRONTEND_ERROR(
+                plans.execute_oss_rms_norm_silu_engine(tensor_uid_to_pointer_map, oss_workspace, cu_device, stream));
+
+            CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK (OSS RmsNorm+SiLU engine) ");
             return {error_code_t::OK, ""};
         }
 
@@ -1146,6 +1307,8 @@ class Graph : public ICudnn, public INode {
         // offset workspace by the already used fe graph workspace
         // this is where cudnn backend can start using workspace for its execution plans
         void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+
+        CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, tensor_uid_to_pointer_map));
 
         CHECK_CUDNN_FRONTEND_ERROR(execute_cudnn_plan_with_uid(
             handle, tensor_uid_to_pointer_map, cudnn_workspace, plans.candidate, {}, {}, {}));
@@ -1364,6 +1527,8 @@ class Graph : public ICudnn, public INode {
     set_compute_data_type(DataType_t type);
     Graph &
     set_dynamic_shape_enabled(bool is_enabled);
+    Graph &
+    set_override_shape_enabled(bool is_enabled);
     Graph &
     set_sm_count(int32_t type);
     Graph &
@@ -1614,8 +1779,19 @@ class Graph : public ICudnn, public INode {
 
         CHECK_CUDNN_FRONTEND_ERROR(context.populate_sm_version_from_device());
         auto sm_version = context.get_sm_version();
+
+        // Check OSS SDPA engine
         if (plans.has_oss_engine()) {
             auto oss_status = plans.check_oss_engine_support(sm_version);
+            if (oss_status.is_good()) {
+                return {error_code_t::OK, ""};
+            }
+            // Fall through to check other engines
+        }
+
+        // Check OSS RmsNorm+SiLU engine
+        if (plans.has_oss_rms_norm_silu_engine()) {
+            auto oss_status = plans.check_oss_rms_norm_silu_support(sm_version);
             if (oss_status.is_good()) {
                 return {error_code_t::OK, ""};
             }
@@ -1733,12 +1909,13 @@ class Graph : public ICudnn, public INode {
         // Go over each subnode and serialize them.
         json full_json;
 
-        full_json["context"]["name"]                     = context.get_name();
-        full_json["context"]["compute_data_type"]        = context.get_compute_data_type();
-        full_json["context"]["intermediate_data_type"]   = context.get_intermediate_data_type();
-        full_json["context"]["io_data_type"]             = context.get_io_data_type();
-        full_json["context"]["sm_count"]                 = context.get_target_sm_count();
-        full_json["context"]["is_dynamic_shape_enabled"] = context.get_dynamic_shape_enabled();
+        full_json["context"]["name"]                      = context.get_name();
+        full_json["context"]["compute_data_type"]         = context.get_compute_data_type();
+        full_json["context"]["intermediate_data_type"]    = context.get_intermediate_data_type();
+        full_json["context"]["io_data_type"]              = context.get_io_data_type();
+        full_json["context"]["sm_count"]                  = context.get_target_sm_count();
+        full_json["context"]["is_dynamic_shape_enabled"]  = context.get_dynamic_shape_enabled();
+        full_json["context"]["is_override_shape_enabled"] = context.get_override_shape_enabled();
 
         full_json.update(R"( {"tag": "GRAPH"})"_json);
         full_json["nodes"];
@@ -1884,6 +2061,9 @@ class Graph : public ICudnn, public INode {
             }
             if (j_context.contains("is_dynamic_shape_enabled") && !j_context["is_dynamic_shape_enabled"].is_null()) {
                 context.set_dynamic_shape_enabled(j_context["is_dynamic_shape_enabled"].get<bool>());
+            }
+            if (j_context.contains("is_override_shape_enabled") && !j_context["is_override_shape_enabled"].is_null()) {
+                context.set_override_shape_enabled(j_context["is_override_shape_enabled"].get<bool>());
             }
         }
 
@@ -2134,13 +2314,22 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
         }
     }
 
-    // Register OSS engine if OPENSOURCE mode requested
+    // Register OSS engines if OPENSOURCE mode requested
     if (has_opensource) {
-        auto oss_status = register_oss_engine_();
-        if (oss_status.is_bad()) {
-            CUDNN_FE_LOG_LABEL_ENDL("WARN: Failed to register OSS engine: " << oss_status.get_message());
-        } else {
+        // Try SDPA OSS engine
+        auto oss_sdpa_status = register_oss_engine_();
+        if (oss_sdpa_status.is_good()) {
             CUDNN_FE_LOG_LABEL_ENDL("INFO: Registered OSS SDPA prefill engine");
+        }
+
+        // Try RmsNorm+SiLU OSS engine
+        auto oss_norm_status = register_oss_rms_norm_silu_engine_();
+        if (oss_norm_status.is_good()) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Registered OSS RmsNorm+SiLU engine");
+        }
+
+        if (oss_sdpa_status.is_bad() && oss_norm_status.is_bad()) {
+            CUDNN_FE_LOG_LABEL_ENDL("WARN: No OSS engine matched the graph pattern");
         }
     }
 
@@ -2204,17 +2393,31 @@ Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_b
     CUDNN_FE_LOG_BANNER("  BUILD PLANS  for policy " << static_cast<int>(policy) << "  ");
 #endif
 
-    // Build OSS engine if it passed check_support
+    // Build OSS SDPA engine if it passed check_support
     if (plans.has_oss_engine()) {
         auto oss_status = plans.build_oss_engine();
         if (oss_status.is_good()) {
-            CUDNN_FE_LOG_LABEL_ENDL("INFO: OSS engine built successfully (NVRTC compilation done)");
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: OSS SDPA engine built successfully (NVRTC compilation done)");
             if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE) {
-                CUDNN_FE_LOG_BANNER("  BUILD PLANS ALL OK (OSS engine)  ");
+                CUDNN_FE_LOG_BANNER("  BUILD PLANS ALL OK (OSS SDPA engine)  ");
                 return {error_code_t::OK, ""};
             }
         } else {
-            CUDNN_FE_LOG_LABEL_ENDL("WARN: OSS engine build failed: " << oss_status.get_message());
+            CUDNN_FE_LOG_LABEL_ENDL("WARN: OSS SDPA engine build failed: " << oss_status.get_message());
+        }
+    }
+
+    // Build OSS RmsNorm+SiLU engine if it passed check_support
+    if (plans.has_oss_rms_norm_silu_engine()) {
+        auto oss_status = plans.build_oss_rms_norm_silu_engine();
+        if (oss_status.is_good()) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: OSS RmsNorm+SiLU engine built successfully (NVRTC compilation done)");
+            if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE) {
+                CUDNN_FE_LOG_BANNER("  BUILD PLANS ALL OK (OSS RmsNorm+SiLU engine)  ");
+                return {error_code_t::OK, ""};
+            }
+        } else {
+            CUDNN_FE_LOG_LABEL_ENDL("WARN: OSS RmsNorm+SiLU engine build failed: " << oss_status.get_message());
         }
     }
 
@@ -2280,6 +2483,13 @@ inline Graph &
 Graph::set_dynamic_shape_enabled(bool is_enabled) {
     context.set_dynamic_shape_enabled(is_enabled);
     this->is_dynamic_shape_enabled = is_enabled;
+    return *this;
+}
+
+inline Graph &
+Graph::set_override_shape_enabled(bool is_enabled) {
+    context.set_override_shape_enabled(is_enabled);
+    this->is_override_shape_enabled = is_enabled;
     return *this;
 }
 

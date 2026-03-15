@@ -12,6 +12,7 @@
 #include "backend/plan_helpers.h"
 #include "experimental/sm90_sdpa_prefill_engine.h"
 #include "experimental/sm100_sdpa_prefill_engine.h"
+#include "experimental/sm100_rms_norm_silu_engine.h"
 
 namespace cudnn_frontend {
 
@@ -680,10 +681,17 @@ class Execution_plan_list {
 
     error_t
     is_plan_index_executable(int64_t const index) const {
-        // OSS engine path
+        // OSS SDPA engine path
         if (index == OSS_ENGINE_CANDIDATE) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(
-                !oss_engine_built_, error_code_t::GRAPH_EXECUTION_FAILED, "OSS engine not built.");
+                !oss_engine_built_, error_code_t::GRAPH_EXECUTION_FAILED, "OSS SDPA engine not built.");
+            return {error_code_t::OK, ""};
+        }
+
+        // OSS RmsNorm+SiLU engine path
+        if (index == OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !oss_rms_norm_silu_built_, error_code_t::GRAPH_EXECUTION_FAILED, "OSS RmsNorm+SiLU engine not built.");
             return {error_code_t::OK, ""};
         }
 
@@ -929,11 +937,149 @@ class Execution_plan_list {
                                     oss_ctx_.attn_scale);
     }
 
+    // ================================================================
+    // Open-source NVRTC engine support: RmsNorm + SiLU
+    // ================================================================
+
+    static constexpr int64_t OSS_RMS_NORM_SILU_ENGINE_CANDIDATE = -3;
+
+    // Context cached from the Graph for RmsNorm+SiLU engine execution
+    struct OssRmsNormSiluContext {
+        int64_t num_tokens = 0;
+        int64_t C          = 0;
+
+        // Tensor UIDs for pointer lookup from variant pack
+        int64_t x_uid       = -1;  // input [num_tokens, C]
+        int64_t y_uid       = -1;  // output [num_tokens, C] (after SiLU)
+        int64_t scale_uid   = -1;  // gamma weights [C]
+        int64_t bias_uid    = -1;  // beta bias [C], optional (-1 if absent)
+        int64_t epsilon_uid = -1;  // epsilon scalar
+
+        // FP8 output: optional scale/scale_inv/amax tensor UIDs
+        int64_t fp8_scale_uid     = -1;
+        int64_t fp8_scale_inv_uid = -1;
+        int64_t fp8_amax_uid      = -1;
+
+        // NVFP4 output: row-wise block-scale tensor UID
+        int64_t nvfp4_scale_row_uid = -1;
+
+        experimental::RmsNormSiluDtype output_dtype = experimental::RmsNormSiluDtype::BF16;
+    };
+
+    void
+    set_oss_rms_norm_silu_engine(std::shared_ptr<experimental::IOssNormEngine> engine) {
+        oss_rms_norm_silu_engine_ = std::move(engine);
+    }
+
+    void
+    set_oss_rms_norm_silu_context(OssRmsNormSiluContext ctx) {
+        oss_rms_norm_silu_ctx_ = std::move(ctx);
+    }
+
+    bool
+    has_oss_rms_norm_silu_engine() const {
+        return oss_rms_norm_silu_engine_ != nullptr;
+    }
+
+    bool
+    is_oss_rms_norm_silu_candidate() const {
+        return candidate == OSS_RMS_NORM_SILU_ENGINE_CANDIDATE;
+    }
+
+    error_t
+    check_oss_rms_norm_silu_support(int64_t sm_version) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !oss_rms_norm_silu_engine_, error_code_t::GRAPH_NOT_SUPPORTED, "No RmsNorm+SiLU OSS engine registered");
+        experimental::NormSiluShape_t shape;
+        shape.C            = static_cast<int>(oss_rms_norm_silu_ctx_.C);
+        shape.num_tokens   = static_cast<int>(oss_rms_norm_silu_ctx_.num_tokens);
+        shape.output_dtype = oss_rms_norm_silu_ctx_.output_dtype;
+        auto status        = oss_rms_norm_silu_engine_->check_support(shape, static_cast<int>(sm_version));
+        if (status.is_good()) {
+            oss_rms_norm_silu_supported_ = true;
+            candidate                    = OSS_RMS_NORM_SILU_ENGINE_CANDIDATE;
+        }
+        return status;
+    }
+
+    error_t
+    build_oss_rms_norm_silu_engine() {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !oss_rms_norm_silu_supported_, error_code_t::GRAPH_NOT_SUPPORTED, "RmsNorm+SiLU OSS engine not supported");
+        auto status = oss_rms_norm_silu_engine_->build();
+        if (status.is_good()) {
+            oss_rms_norm_silu_built_ = true;
+            candidate                = OSS_RMS_NORM_SILU_ENGINE_CANDIDATE;
+        }
+        return status;
+    }
+
+    int64_t
+    get_oss_rms_norm_silu_workspace_size() const {
+        if (!oss_rms_norm_silu_engine_) return 0;
+        return oss_rms_norm_silu_engine_->get_workspace_size();
+    }
+
+    error_t
+    execute_oss_rms_norm_silu_engine(std::unordered_map<int64_t, void*> const& tensor_uid_to_pointer_map,
+                                     void* workspace,
+                                     CUdevice device,
+                                     cudaStream_t stream) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !oss_rms_norm_silu_built_, error_code_t::GRAPH_EXECUTION_FAILED, "RmsNorm+SiLU OSS engine not built");
+
+        auto get_ptr = [&](int64_t uid) -> void* {
+            auto it = tensor_uid_to_pointer_map.find(uid);
+            return (it != tensor_uid_to_pointer_map.end()) ? it->second : nullptr;
+        };
+
+        void* x_ptr     = get_ptr(oss_rms_norm_silu_ctx_.x_uid);
+        void* y_ptr     = get_ptr(oss_rms_norm_silu_ctx_.y_uid);
+        void* scale_ptr = get_ptr(oss_rms_norm_silu_ctx_.scale_uid);
+        void* bias_ptr  = (oss_rms_norm_silu_ctx_.bias_uid >= 0) ? get_ptr(oss_rms_norm_silu_ctx_.bias_uid) : nullptr;
+        void* eps_ptr   = get_ptr(oss_rms_norm_silu_ctx_.epsilon_uid);
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!x_ptr || !y_ptr || !scale_ptr,
+                                       error_code_t::INVALID_VARIANT_PACK,
+                                       "Missing X/Y/SCALE pointers in variant pack for RmsNorm+SiLU OSS engine");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!eps_ptr,
+                                       error_code_t::INVALID_VARIANT_PACK,
+                                       "Missing EPSILON pointer in variant pack for RmsNorm+SiLU OSS engine");
+
+        // Read epsilon value from the tensor pointer (it's a scalar tensor)
+        float epsilon = *static_cast<float const*>(eps_ptr);
+
+        // Populate FP8 / NVFP4 extra params from variant pack
+        experimental::RmsNormSiluExtraParams extra;
+        auto opt_ptr          = [&](int64_t uid) -> void* { return (uid >= 0) ? get_ptr(uid) : nullptr; };
+        extra.fp8_scale       = opt_ptr(oss_rms_norm_silu_ctx_.fp8_scale_uid);
+        extra.fp8_scale_inv   = opt_ptr(oss_rms_norm_silu_ctx_.fp8_scale_inv_uid);
+        extra.fp8_amax        = opt_ptr(oss_rms_norm_silu_ctx_.fp8_amax_uid);
+        extra.nvfp4_scale_row = opt_ptr(oss_rms_norm_silu_ctx_.nvfp4_scale_row_uid);
+
+        return oss_rms_norm_silu_engine_->execute(x_ptr,
+                                                  y_ptr,
+                                                  scale_ptr,
+                                                  bias_ptr,
+                                                  static_cast<int>(oss_rms_norm_silu_ctx_.num_tokens),
+                                                  static_cast<int>(oss_rms_norm_silu_ctx_.C),
+                                                  epsilon,
+                                                  workspace,
+                                                  device,
+                                                  stream,
+                                                  extra);
+    }
+
    private:
     std::shared_ptr<experimental::IOssSdpaEngine> oss_engine_;
     bool oss_engine_supported_ = false;
     bool oss_engine_built_     = false;
     OssEngineContext oss_ctx_;
+
+    std::shared_ptr<experimental::IOssNormEngine> oss_rms_norm_silu_engine_;
+    bool oss_rms_norm_silu_supported_ = false;
+    bool oss_rms_norm_silu_built_     = false;
+    OssRmsNormSiluContext oss_rms_norm_silu_ctx_;
 };
 
 }  // namespace graph

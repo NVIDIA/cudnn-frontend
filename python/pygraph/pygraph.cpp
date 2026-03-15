@@ -678,6 +678,7 @@ init_pygraph_submodule(py::module_& m) {
                       py::object,
                       std::shared_ptr<KernelCache>,
                       std::shared_ptr<cudnn_frontend::DeviceProperties>,
+                      bool,
                       bool>(),
              py::arg_v("name", "test_graph"),
              py::arg_v("io_data_type", cudnn_frontend::DataType_t::NOT_SET),
@@ -688,7 +689,8 @@ init_pygraph_submodule(py::module_& m) {
              py::arg_v("sm_version", py::none()),
              py::arg_v("kernel_cache", nullptr),
              py::arg_v("device_property", nullptr),
-             py::arg_v("is_dynamic_shape_enabled", false))
+             py::arg_v("is_dynamic_shape_enabled", false),
+             py::arg_v("is_override_shape_enabled", false))
         .def("tensor_like",
              py::overload_cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const&, std::string const&>(
                  &PyGraph::tensor_like),

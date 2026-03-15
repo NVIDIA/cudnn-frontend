@@ -12,6 +12,7 @@ class Context {
     int32_t target_sm_count           = -1;
     mutable int32_t target_sm_version = -1;
     bool is_dynamic_shape_enabled     = false;
+    bool is_override_shape_enabled    = false;
 
     std::string name = "";
 
@@ -78,9 +79,20 @@ class Context {
         return *this;
     }
 
+    Context&
+    set_override_shape_enabled(bool is_enabled) {
+        is_override_shape_enabled = is_enabled;
+        return *this;
+    }
+
     bool
     get_dynamic_shape_enabled() const {
         return is_dynamic_shape_enabled;
+    }
+
+    bool
+    get_override_shape_enabled() const {
+        return is_override_shape_enabled;
     }
 
     int32_t

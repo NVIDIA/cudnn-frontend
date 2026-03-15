@@ -39,12 +39,20 @@ class TensorDesc:
     shape: Tuple[int, ...]
     stride: Tuple[int, ...]
     stride_order: Tuple[int, ...]
+    device: torch.device
     ndim: int = field(init=False)
+    name: str = ""
 
     def __post_init__(self):
         shape = tuple(self.shape)
         stride = tuple(self.stride)
         stride_order = tuple(self.stride_order)
+        device = self.device
+        if not isinstance(device, torch.device):
+            try:
+                device = torch.device(device)
+            except (TypeError, ValueError, RuntimeError) as exc:
+                raise TypeError(f"Invalid device for TensorDesc: {self.device!r}") from exc
 
         ndim = len(shape)
         if len(stride) != ndim:
@@ -57,6 +65,7 @@ class TensorDesc:
         object.__setattr__(self, "shape", shape)
         object.__setattr__(self, "stride", stride)
         object.__setattr__(self, "stride_order", stride_order)
+        object.__setattr__(self, "device", device)
         object.__setattr__(self, "ndim", ndim)
 
     @staticmethod
@@ -90,6 +99,18 @@ class TensorDesc:
             strides[i] = running
             running *= max(shape[i], 1)
         return tuple(strides)
+
+    @staticmethod
+    def _is_contiguous_with_order(shape: Tuple[int, ...], stride: Tuple[int, ...], order: Tuple[int, ...]) -> bool:
+        expected_stride = 1
+        for dim in order:
+            size = shape[dim]
+            if size == 1:
+                continue
+            if stride[dim] != expected_stride:
+                return False
+            expected_stride *= size
+        return True
 
     @staticmethod
     def _compute_view_stride(
@@ -134,6 +155,8 @@ class TensorDesc:
             shape=shape,
             stride=stride,
             stride_order=self._compute_stride_order(shape, stride),
+            device=self.device,
+            name=self.name,
         )
 
     def __len__(self) -> int:
@@ -203,10 +226,26 @@ class TensorDesc:
         new_stride = self.stride[:dim] + (inserted_stride,) + self.stride[dim:]
         return self._with_layout(new_shape, new_stride)
 
+    def is_contiguous(self, memory_format: torch.memory_format = torch.contiguous_format) -> bool:
+        if memory_format in {torch.contiguous_format, torch.preserve_format}:
+            if self._numel(self.shape) == 0:
+                return True
+            return self._is_contiguous_with_order(self.shape, self.stride, tuple(range(self.ndim - 1, -1, -1)))
+        if memory_format == torch.channels_last:
+            if self.ndim != 4:
+                return False
+            return self._is_contiguous_with_order(self.shape, self.stride, (1, 3, 2, 0))
+        if memory_format == torch.channels_last_3d:
+            if self.ndim != 5:
+                return False
+            return self._is_contiguous_with_order(self.shape, self.stride, (1, 4, 3, 2, 0))
+
+        raise ValueError(f"Unsupported memory format: {memory_format}")
+
     def contiguous(self) -> "TensorDesc":
-        contiguous_stride = self._compute_contiguous_stride(self.shape)
-        if contiguous_stride == self.stride:
+        if self.is_contiguous():
             return self
+        contiguous_stride = self._compute_contiguous_stride(self.shape)
         return self._with_layout(self.shape, contiguous_stride)
 
     def view(self, *shape: int | Tuple[int, ...] | List[int]) -> "TensorDesc":
@@ -835,6 +874,8 @@ class APIBase(ABC):
             shape=tensor_shape,
             stride=tensor_stride,
             stride_order=tensor_stride_order,
+            device=tensor.device,
+            name=name,
         )
 
     def _make_fake_cute_tensor_from_desc(

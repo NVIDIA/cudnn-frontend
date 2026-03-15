@@ -155,8 +155,6 @@ class SelectionAttention(APIBase):
         if compute_capability < 90:
             self._logger.error(f"Requires SM90+ compute capability, but found SM{compute_capability} on device {device}")
             raise RuntimeError(f"Requires SM90+ compute capability, but found SM{compute_capability} on device {device}")
-        if compute_capability == 103:
-            raise RuntimeError("cuteDSL SelectionAttention is not supported on SM103")
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")

@@ -215,14 +215,12 @@ def gemm_swiglu_init(
     compute_capability = major * 10 + minor
     if compute_capability < 100:
         pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
-    if compute_capability == 103:
-        pytest.skip("cuteDSL GemmSwiglu is not supported on SM103")
 
     mnkl_str = request.config.getoption("--gemm-swiglu-mnkl", default=None)
     mma_tiler_str = request.config.getoption("--gemm-swiglu-mma-tiler", default=None)
     cluster_shape_str = request.config.getoption("--gemm-swiglu-cluster-shape", default=None)
     alpha_opt = request.config.getoption("--gemm-swiglu-alpha", default=None)
-    skip_ref = request.config.getoption("--gemm-swiglu-skip-ref", default=False)
+    skip_ref = request.config.getoption("--skip-ref", default=False)
 
     if mnkl_str is not None:
         m, n, k, l = [int(x.strip()) for x in mnkl_str.split(",")]

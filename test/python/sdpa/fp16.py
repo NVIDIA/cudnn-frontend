@@ -39,7 +39,7 @@ class TensorUid(IntEnum):
     k_ragged_offset = 14
     v_ragged_offset = 15
     o_ragged_offset = 16
-    stats_ragged_offset = 17  # Also used for score_max and score_sum_exp
+    stats_ragged_offset = 17
     seed = 18
     offset = 19
     rng_dump = 20
@@ -62,7 +62,6 @@ def validate_config(cfg):
     assert cfg.shape_k == (cfg.batches, cfg.h_k, cfg.s_kv, cfg.d_qk), f"wrong shape_k={cfg.shape_k}"
     assert cfg.shape_v == (cfg.batches, cfg.h_v, cfg.s_kv, cfg.d_v), f"wrong shape_v={cfg.shape_v}"
     assert cfg.shape_o == (cfg.batches, cfg.h_q, cfg.s_q, cfg.d_v), f"wrong shape_o={cfg.shape_o}"
-    assert cfg.shape_stats == (cfg.batches, cfg.h_q, cfg.s_q, 1), f"wrong shape_stats={cfg.shape_stats}"
 
     if cfg.is_train:
         assert cfg.is_paged == False and cfg.block_size == None, "paged attention not allowed in backward pass"
@@ -98,11 +97,6 @@ def validate_config(cfg):
         print("@@@@ Overall result: WAIVED, skipping known issue of s_q == s_kv == 1.")
         pytest.skip("skipping known issue of s_q == s_kv == 1")
 
-    if cudnn_version < "9.20.0" and (cfg.is_train, cfg.with_score_max, cfg.with_score_sum_exp) not in \
-        [(False, False, False), (True, False, False), (False, True, True)]:
-        print("@@@@ Overall result: WAIVED, certain combinations of softmax outputs require cuDNN 9.20.0 or higher.")
-        pytest.skip("certain combinations of softmax outputs require cuDNN 9.20.0 or higher")
-
 
 def allocate_tensors(cfg, rng_data_gen):
     allocs = {}
@@ -115,8 +109,10 @@ def allocate_tensors(cfg, rng_data_gen):
         allocs[TensorUid.v] = alloc_tensor((max_t_kv, cfg.h_v, cfg.d_v), cfg.data_type, rng=rng_data_gen, mean=-0.5, std=1.0)
         allocs[TensorUid.o] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_v), cfg.data_type)
         allocs[TensorUid.stats] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32) if cfg.is_train else (None, None, None)
-        allocs[TensorUid.score_max] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32) if cfg.with_score_max else (None, None, None)
-        allocs[TensorUid.score_sum_exp] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32) if cfg.with_score_sum_exp else (None, None, None)
+        if cfg.with_score_max:
+            allocs[TensorUid.score_max] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32)
+        if cfg.with_score_sum_exp:
+            allocs[TensorUid.score_sum_exp] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32)
         if cfg.is_train:
             allocs[TensorUid.dQ] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_qk), cfg.data_type)
             allocs[TensorUid.dK] = alloc_tensor((max_t_kv, cfg.h_k, cfg.d_qk), cfg.data_type)
@@ -127,9 +123,11 @@ def allocate_tensors(cfg, rng_data_gen):
         allocs[TensorUid.k] = alloc_tensor(cfg.shape_k, cfg.data_type, strides=cfg.stride_k, rng=rng_data_gen, mean=-0.5, std=1.0)
         allocs[TensorUid.v] = alloc_tensor(cfg.shape_v, cfg.data_type, strides=cfg.stride_v, rng=rng_data_gen, mean=-0.5, std=1.0)
         allocs[TensorUid.o] = alloc_tensor(cfg.shape_o, cfg.data_type, strides=cfg.stride_o)
-        allocs[TensorUid.stats] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if cfg.is_train else (None, None, None)
-        allocs[TensorUid.score_max] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if cfg.with_score_max else (None, None, None)
-        allocs[TensorUid.score_sum_exp] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if cfg.with_score_sum_exp else (None, None, None)
+        allocs[TensorUid.stats] = alloc_tensor((cfg.batches, cfg.h_q, cfg.s_q, 1), torch.float32) if cfg.is_train else (None, None, None)
+        if cfg.with_score_max:
+            allocs[TensorUid.score_max] = alloc_tensor((cfg.batches, cfg.h_q, cfg.s_q, 1), torch.float32)
+        if cfg.with_score_sum_exp:
+            allocs[TensorUid.score_sum_exp] = alloc_tensor((cfg.batches, cfg.h_q, cfg.s_q, 1), torch.float32)
         if cfg.is_train:
             allocs[TensorUid.dQ] = alloc_tensor(cfg.shape_q, cfg.data_type, strides=cfg.stride_q)
             allocs[TensorUid.dK] = alloc_tensor(cfg.shape_k, cfg.data_type, strides=cfg.stride_k)
@@ -226,7 +224,7 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
     k_ragged_offset = graph.tensor(uid=int(TensorUid.k_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
     v_ragged_offset = graph.tensor(uid=int(TensorUid.v_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
     o_ragged_offset = graph.tensor(uid=int(TensorUid.o_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
-    stats_ragged_offset = graph.tensor(uid=int(TensorUid.stats_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
+    stats_ragged_offset = graph.tensor(uid=int(TensorUid.stats_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged and cfg.is_train else None
 
     if cfg.is_ragged:
         q.set_ragged_offset(q_ragged_offset)
@@ -236,10 +234,10 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
     # Create graph tensors for score_max and score_sum_exp
     score_max = score_sum_exp = sink_token = None
     if cfg.with_score_max:
-        score_max = graph.tensor(uid=int(TensorUid.score_max), dim=cfg.shape_stats, stride=cfg.stride_stats, data_type=cudnn.data_type.FLOAT)
+        score_max = graph.tensor(uid=int(TensorUid.score_max), dim=(cfg.batches, cfg.h_q, cfg.s_q, 1), stride=(cfg.h_q * cfg.s_q, cfg.s_q, 1, 1), data_type=cudnn.data_type.FLOAT)
         score_max.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     if cfg.with_score_sum_exp:
-        score_sum_exp = graph.tensor(uid=int(TensorUid.score_sum_exp), dim=cfg.shape_stats, stride=cfg.stride_stats, data_type=cudnn.data_type.FLOAT)
+        score_sum_exp = graph.tensor(uid=int(TensorUid.score_sum_exp), dim=(cfg.batches, cfg.h_q, cfg.s_q, 1), stride=(cfg.h_q * cfg.s_q, cfg.s_q, 1, 1), data_type=cudnn.data_type.FLOAT)
         score_sum_exp.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     if cfg.with_sink_token:
         sink_token = graph.tensor(uid=int(TensorUid.sink_token), dim=(1, cfg.h_q, 1, 1), stride=(cfg.h_q, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
@@ -281,7 +279,9 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
             score_sum_exp.set_ragged_offset(stats_ragged_offset)
     
     if cfg.is_train:
-        stats.set_uid(int(TensorUid.stats)).set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim(cfg.shape_stats).set_stride(cfg.stride_stats)
+        dim_stats = (cfg.batches, cfg.h_q, cfg.s_q, 1)
+        stride_stats = (cfg.s_q * cfg.h_q, 1, cfg.h_q, 1) if cfg.is_ragged else (cfg.h_q * cfg.s_q, cfg.s_q, 1, 1)
+        stats.set_uid(int(TensorUid.stats)).set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim(dim_stats).set_stride(stride_stats)
         if cfg.is_ragged:
             stats.set_ragged_offset(stats_ragged_offset)
 
@@ -341,12 +341,15 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         sm_version=sm_version
     )
 
+    dim_stats = (cfg.batches, cfg.h_q, cfg.s_q, 1)
+    stride_stats = (cfg.s_q * cfg.h_q, 1, cfg.h_q, 1) if cfg.is_ragged else (cfg.h_q * cfg.s_q, cfg.s_q, 1, 1)
+
     q = graph.tensor(uid=int(TensorUid.q), dim=cfg.shape_q, stride=cfg.stride_q, data_type=cudnn_dtype)
     k = graph.tensor(uid=int(TensorUid.k), dim=cfg.shape_k, stride=cfg.stride_k, data_type=cudnn_dtype)
     v = graph.tensor(uid=int(TensorUid.v), dim=cfg.shape_v, stride=cfg.stride_v, data_type=cudnn_dtype)
     o = graph.tensor(uid=int(TensorUid.o), dim=cfg.shape_o, stride=cfg.stride_o, data_type=cudnn_dtype)
     dO = graph.tensor(uid=int(TensorUid.dO), dim=cfg.shape_o, stride=cfg.stride_o, data_type=cudnn_dtype)
-    stats = graph.tensor(uid=int(TensorUid.stats), dim=cfg.shape_stats, stride=cfg.stride_stats, data_type=cudnn.data_type.FLOAT)
+    stats = graph.tensor(uid=int(TensorUid.stats), dim=dim_stats, stride=stride_stats, data_type=cudnn.data_type.FLOAT)
 
     bias_dim = (1, cfg.h_q, cfg.s_q, cfg.s_kv)
     bias_stride = (cfg.h_q * cfg.s_q * cfg.s_kv, cfg.s_q * cfg.s_kv, cfg.s_kv, 1)
