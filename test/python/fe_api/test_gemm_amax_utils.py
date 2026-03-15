@@ -120,13 +120,11 @@ def gemm_amax_init(
     compute_capability = major * 10 + minor
     if compute_capability < 100:
         pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
-    if compute_capability == 103:
-        pytest.skip("cuteDSL GemmAmax is not supported on SM103")
 
     mnkl_str = request.config.getoption("--gemm-amax-mnkl", default=None)
     mma_tiler_str = request.config.getoption("--gemm-amax-mma-tiler", default=None)
     cluster_shape_str = request.config.getoption("--gemm-amax-cluster-shape", default=None)
-    skip_ref = request.config.getoption("--gemm-amax-skip-ref", default=False)
+    skip_ref = request.config.getoption("--skip-ref", default=False)
 
     if mnkl_str is not None:
         m, n, k, l = [int(x.strip()) for x in mnkl_str.split(",")]

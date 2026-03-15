@@ -64,6 +64,12 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     diag_align = diag_align_map.get(node.get("diagonal_alignment", "TOP_LEFT"), 0)
 
     dropout_prob = utils.parse_hex_float(node.get("dropout_probability")) or 0.0
+    repro_metadata = payload.get("repro_metadata", {})
+    ragged_tensor_names = set(repro_metadata.get("ragged_tensor_names", []))
+    is_ragged = any(
+        entry is not None and (utils.parse_optional_int(entry.get("ragged_offset_uid")) is not None or entry.get("name") in ragged_tensor_names)
+        for entry in (q_entry, k_entry, v_entry, o_entry)
+    )
 
     cfg = OrderedDict()
     cfg["data_type"] = utils.torch_dtype(payload.get("context", {}).get("io_data_type"))
@@ -74,9 +80,12 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     cfg["is_bias"] = utils.bool_from_inputs(inputs, "BIAS")
     cfg["is_block_mask"] = utils.bool_from_inputs(inputs, "BLOCK_MASK")
     cfg["is_padding"] = node.get("padding_mask") or bool(seq_len_q or seq_len_kv)
-    cfg["is_ragged"] = False
+    cfg["is_ragged"] = is_ragged
     cfg["is_dropout"] = dropout_prob > 0.0
     cfg["is_determin"] = None
+    cfg["with_score_max"] = "Max" in outputs
+    cfg["with_score_sum_exp"] = "Sum_exp" in outputs
+    cfg["with_sink_token"] = "SINK_TOKEN" in inputs
     left_bound = utils.parse_optional_int(node.get("left_bound"))
     right_bound = utils.parse_optional_int(node.get("right_bound"))
     if right_bound is None and node.get("causal_mask", False):
@@ -159,9 +168,10 @@ def extract_seq_and_ragged(payload: dict, seed: int) -> dict:
     }
 
 
-def extract_and_annotate(raw_line: str, payload: dict) -> dict:
+def extract_and_annotate(raw_line: str, payload: dict, full_log_text: Optional[str] = None) -> dict:
     """Phase 1: Extract config and annotate with repro metadata."""
     seed = utils.sha1_seed(raw_line)
     phase1_json = json.loads(json.dumps(payload))
     phase1_json["repro_metadata"] = extract_seq_and_ragged(phase1_json, seed)
+    phase1_json["repro_metadata"]["ragged_tensor_names"] = utils.parse_ragged_tensor_names(full_log_text)
     return phase1_json

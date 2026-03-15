@@ -648,6 +648,8 @@ TEST_CASE("Prefill OSS Engine Dynamic Shapes", "[graph][sdpa][oss][dynamic]") {
 
     // Build OSS graph (kept alive for re-execution with overrides)
     auto oss_graph = create_sdpa_forward_graph(b, h_q, h_kv, s_q, s_kv, d, attn_scale);
+    oss_graph->set_override_shape_enabled(true);
+
     REQUIRE(oss_graph->validate().is_good());
     REQUIRE(oss_graph->build_operation_graph(handle).is_good());
     REQUIRE(oss_graph->create_execution_plans({fe::HeurMode_t::OPENSOURCE}).is_good());

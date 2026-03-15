@@ -123,6 +123,8 @@ class ICudnn {
     bool is_dynamic_shape_enabled             = false;
     std::shared_ptr<KernelCache> kernel_cache = nullptr;
 
+    bool is_override_shape_enabled = false;
+
     std::shared_ptr<const DeviceProperties> device_properties = nullptr;
 
     error_t
@@ -135,7 +137,8 @@ class ICudnn {
         auto&& cudnn_operation_graph_builder = cudnn_frontend::OperationGraphBuilder();
         cudnn_operation_graph_builder.setHandle(handle)
             .setOperationGraph(cudnn_operations.size(), cudnn_operations.data())
-            .setIsDynamicShapeEnabled(is_dynamic_shape_enabled);
+            .setIsDynamicShapeEnabled(is_dynamic_shape_enabled)
+            .setIsOverrideShapeEnabled(is_override_shape_enabled);
         for (auto& op : raw_operations) {
             cudnn_operation_graph_builder.addOperation(op);
         }

@@ -177,7 +177,8 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
             swa_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=s.device).tril(diagonal=-1 * left_bound + (s_kv - s_q))
         s = s.masked_fill(swa_mask.unsqueeze(0), float('-inf'))
 
-    p = s.softmax(dim=-1).nan_to_num()
+    p = s.softmax(dim=-1).nan_to_num().float()
+    p_fp8 = p.to(torch_itype).float()
 
     # Use BF16 inputs for D
     o_f16 = o_f16.float().reshape(b * h_q, s_q, d_vo)
@@ -206,7 +207,7 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
     dS_fp32_t = dS_fp8_t.transpose(-2, -1).contiguous().float().reshape(b * h_q, s_q, s_kv) * sf_dS_t_ref
 
     # P @ dO -> dV
-    dV = torch.einsum("bqk,bqd->bkd", p, dO_t_dq)
+    dV = torch.einsum("bqk,bqd->bkd", p_fp8, dO_t_dq)
 
     # dS @ K -> dQ
     dQ = torch.einsum("bqk,bkd->bqd", dS_fp32, k_t_dq)

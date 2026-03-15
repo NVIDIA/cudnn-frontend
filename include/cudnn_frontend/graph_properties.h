@@ -908,6 +908,11 @@ class Pointwise_attributes : public Attributes<Pointwise_attributes> {
         return *this;
     }
 
+    PointwiseMode_t
+    get_mode() const {
+        return mode;
+    }
+
     std::optional<int64_t>
     get_axis() const {
         return axis;
@@ -941,6 +946,11 @@ class Pointwise_attributes : public Attributes<Pointwise_attributes> {
     set_swish_beta(float const value) {
         this->swish_beta = value;
         return *this;
+    }
+
+    std::optional<float>
+    get_swish_beta() const {
+        return swish_beta;
     }
 
     Pointwise_attributes&

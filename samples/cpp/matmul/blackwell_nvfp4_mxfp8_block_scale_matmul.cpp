@@ -747,8 +747,8 @@ TEST_CASE("Block Scale Matmul Swiglu", "[matmul][graph][FP4]") {
 }
 
 TEST_CASE("Blackwell Block Scale Matmul dynamic shape overrides", "[matmul][graph][dynamic_shape]") {
-#if (CUDNN_VERSION < 91800)
-    SKIP("Dynamic shape with overrides is not supported in cudnn versions prior to 9.18.0");
+#if (CUDNN_VERSION < 92100)
+    SKIP("Dynamic shape with overrides is not supported in cudnn versions prior to 9.21.0");
 #endif
 
     if (get_compute_capability() < 100 || get_compute_capability() >= 110) {
@@ -788,7 +788,7 @@ TEST_CASE("Blackwell Block Scale Matmul dynamic shape overrides", "[matmul][grap
 
     graph->set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT)
-        .set_dynamic_shape_enabled(true);  // must be set true for dynamic shape
+        .set_override_shape_enabled(true);
 
     int64_t block_scale_dim_m_cache =
         div_up(matmul_cache_shape.m, indestructible_128x4_block_m_n) * indestructible_128x4_block_m_n;

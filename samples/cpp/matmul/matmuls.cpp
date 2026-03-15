@@ -615,8 +615,8 @@ TEST_CASE("Matmul with restricted shared memory", "[matmul][graph]") {
 }
 
 TEST_CASE("Matmul dynamic shape overrides", "[matmul][graph][dynamic_shape]") {
-#if (CUDNN_VERSION < 91800)
-    SKIP("Dynamic shape with overrides is not supported in cudnn versions prior to 9.18.0");
+#if (CUDNN_VERSION < 92100)
+    SKIP("Dynamic shape with overrides is not supported in cudnn versions prior to 9.21.0");
 #endif
 
     namespace fe = cudnn_frontend;
@@ -645,7 +645,7 @@ TEST_CASE("Matmul dynamic shape overrides", "[matmul][graph][dynamic_shape]") {
 
     graph->set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT)
-        .set_dynamic_shape_enabled(true);  // must be set true for dynamic shape
+        .set_override_shape_enabled(true);
 
     auto A = graph->tensor(fe::graph::Tensor_attributes()
                                .set_name("A")

@@ -1,9 +1,27 @@
+import os
+import sys
+import traceback
 import pytest
 import cudnn
 import torch
-import argparse
 
 # fmt: off
+
+# =================== CUDA Synchronize Guard =====================
+torch.cuda.synchronize_unsafe = torch.cuda.synchronize
+
+def cuda_synchronize_safe(*args, **kwargs):
+    try:
+        torch.cuda.synchronize_unsafe(*args, **kwargs)
+    except Exception as e:
+        entries = traceback.extract_stack(sys._getframe(1))
+        test_entries = [f for f in entries if "/test/python/" in f.filename]
+        print("Traceback (most recent call last):", flush=True)
+        print(*traceback.format_list(test_entries), end="", flush=True)
+        print(e, flush=True)
+        os._exit(os.EX_SOFTWARE)
+
+torch.cuda.synchronize = cuda_synchronize_safe
 
 # =================== Fixtures =====================
 @pytest.fixture(scope="session", autouse=True)
@@ -74,6 +92,8 @@ def pytest_addoption(parser):
 
     parser.addoption("--implementation", action="store", default=None, type=str, choices=["AUTO", "COMPOSITE", "UNIFIED"], help="[test_mhas_v2.py], overwrites implementation")
 
+    parser.addoption("--skip-ref", action="store_true", help="[NSA, gemm_swiglu, gemm_amax, grouped_gemm_swiglu] Skip reference computation for performance testing")
+
     # NSA (Native Sparse Attention) command line options for test_NSA_selection_attention.py, test_NSA_swa.py
     parser.addoption("--nsa-b", action="store", default=None, type=int, help="[NSA] Batch size")
     parser.addoption("--nsa-s_q", action="store", default=None, type=int, help="[NSA] Query sequence length")
@@ -83,23 +103,19 @@ def pytest_addoption(parser):
     parser.addoption("--nsa-h_q", action="store", default=None, type=int, help="[NSA] Number of query heads")
     parser.addoption("--nsa-h_k", action="store", default=None, type=int, help="[NSA] Number of key heads")
     parser.addoption("--nsa-h_v", action="store", default=None, type=int, help="[NSA] Number of value heads")
-    parser.addoption("--nsa-skip-ref", action="store_true", help="[NSA] Skip reference computation for performance testing")
 
     # GEMM SwiGLU command line options for test_gemm_swiglu.py
     parser.addoption("--gemm-swiglu-mnkl", action="store", default=None, type=str, help="[test_gemm_swiglu.py] M,N,K,L dimensions as comma-separated values (e.g., '256,256,512,1')")
     parser.addoption("--gemm-swiglu-mma-tiler", action="store", default=None, type=str, help="[test_gemm_swiglu.py] MMA tiler (M,N) dimensions as comma-separated values (e.g., '128,128')")
     parser.addoption("--gemm-swiglu-cluster-shape", action="store", default=None, type=str, help="[test_gemm_swiglu.py] Cluster shape (M,N) dimensions as comma-separated values (e.g., '1,1')")
     parser.addoption("--gemm-swiglu-alpha", action="store", default=None, type=float, help="[test_gemm_swiglu.py] Alpha scaling factor")
-    parser.addoption("--gemm-swiglu-skip-ref", action="store_true", help="[test_gemm_swiglu.py] Skip reference computation for performance testing")
 
     # GEMM Amax command line options for test_gemm_amax.py
     parser.addoption("--gemm-amax-mnkl", action="store", default=None, type=str, help="[test_gemm_amax.py] M,N,K,L dimensions as comma-separated values (e.g., '512,256,256,1')")
     parser.addoption("--gemm-amax-mma-tiler", action="store", default=None, type=str, help="[test_gemm_amax.py] MMA tiler (M,N) dimensions as comma-separated values (e.g., '128,128')")
     parser.addoption("--gemm-amax-cluster-shape", action="store", default=None, type=str, help="[test_gemm_amax.py] Cluster shape (M,N) dimensions as comma-separated values (e.g., '1,1')")
-    parser.addoption("--gemm-amax-skip-ref", action="store_true", help="[test_gemm_amax.py] Skip reference computation for performance testing")
 
     # Grouped GEMM SwiGLU command line options for test_grouped_gemm_swiglu.py
     parser.addoption("--grouped-gemm-nkl", action="store", default=None, type=str, help="[test_grouped_gemm_swiglu.py] N,K,L dimensions as comma-separated values (e.g., '512,512,4')")
     parser.addoption("--grouped-gemm-group-m", action="store", default=None, type=str, help="[test_grouped_gemm_swiglu.py] M values per group as comma-separated values (e.g., '256,512,256,256')")
-    parser.addoption("--grouped-gemm-skip-ref", action="store_true", help="[test_grouped_gemm_swiglu.py] Skip reference computation for performance testing")
 # fmt: on

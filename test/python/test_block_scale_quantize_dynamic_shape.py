@@ -108,7 +108,7 @@ class TestBlockScaleQuantizeMatmulDynamicShape:
             intermediate_data_type=cudnn.data_type.FLOAT,
             compute_data_type=cudnn.data_type.FLOAT,
             handle=cudnn_handle,
-            is_dynamic_shape_enabled=True,
+            is_override_shape_enabled=True,
         )
 
         block_scale_dim_m, block_scale_dim_n, block_scale_dim_k = calculate_block_scale_dims(m, n, k, block_size)

@@ -253,10 +253,6 @@ class GemmAmaxSm100(APIBase):
             compute_capability < 100,
             f"GemmAmax requires SM100+ compute capability, but found SM{compute_capability} on device {device}",
         )
-        self._runtime_error_if(
-            compute_capability == 103,
-            "cuteDSL GemmAmax is not supported on SM103",
-        )
 
         self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
 

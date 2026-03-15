@@ -130,7 +130,8 @@ class OperationGraph_v8 : public BackendDescriptor {
     int64_t numOps         = -1;
     std::string opGraphTag = "";
     std::vector<feature_vector_t> feature_vectors;
-    bool is_dynamic_shape_enabled = false;
+    bool is_dynamic_shape_enabled  = false;
+    bool is_override_shape_enabled = false;
 };
 
 ///
@@ -185,6 +186,12 @@ class OperationGraphBuilder_v8 {
     auto
     setIsDynamicShapeEnabled(bool is_enabled) -> OperationGraphBuilder_v8 & {
         m_operationGraph.is_dynamic_shape_enabled = is_enabled;
+        return *this;
+    }
+
+    auto
+    setIsOverrideShapeEnabled(bool is_enabled) -> OperationGraphBuilder_v8 & {
+        m_operationGraph.is_override_shape_enabled = is_enabled;
         return *this;
     }
 
@@ -260,6 +267,10 @@ class OperationGraphBuilder_v8 {
 
 #if (CUDNN_VERSION >= 90400)
         if (m_operationGraph.is_dynamic_shape_enabled) {
+            NV_CUDNN_FE_DYNAMIC_CHECK_BACKEND_DESCRIPTOR(
+                90400,
+                m_operationGraph,
+                "CUDNN_BACKEND_OPERATION_GRAPH: Dynamic shape support requires cudnn 9.4.0 and above");
             status = detail::set_attribute(m_operationGraph.pointer->get_backend_descriptor(),
                                            CUDNN_ATTR_OPERATIONGRAPH_IS_DYNAMIC_SHAPE_ENABLED,
                                            CUDNN_TYPE_BOOLEAN,
@@ -270,6 +281,27 @@ class OperationGraphBuilder_v8 {
                                               status,
                                               "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: SetAttribute "
                                               "CUDNN_ATTR_OPERATIONGRAPH_IS_DYNAMIC_SHAPE_ENABLED Failed");
+                return std::move(m_operationGraph);
+            }
+        }
+#endif
+
+#if (CUDNN_VERSION >= 92100)
+        if (m_operationGraph.is_override_shape_enabled) {
+            NV_CUDNN_FE_DYNAMIC_CHECK_BACKEND_DESCRIPTOR(
+                92100,
+                m_operationGraph,
+                "CUDNN_BACKEND_OPERATION_GRAPH: Override shape support requires cudnn 9.21.0 and above");
+            status = detail::set_attribute(m_operationGraph.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATIONGRAPH_IS_OVERRIDE_SHAPE_ENABLED,
+                                           CUDNN_TYPE_BOOLEAN,
+                                           1,
+                                           &m_operationGraph.is_override_shape_enabled);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(&m_operationGraph,
+                                              status,
+                                              "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: SetAttribute "
+                                              "CUDNN_ATTR_OPERATIONGRAPH_IS_OVERRIDE_SHAPE_ENABLED Failed");
                 return std::move(m_operationGraph);
             }
         }

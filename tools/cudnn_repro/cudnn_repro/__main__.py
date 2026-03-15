@@ -80,7 +80,7 @@ def main() -> None:
             stage2 = stage2_bwd
 
         # Stage 1: Extract and annotate
-        stage1_json = stage1.extract_and_annotate(raw_line, payload)
+        stage1_json = stage1.extract_and_annotate(raw_line, payload, full_log_text)
 
         # Stage 2: Build repro command
         stage2_txt = stage2.build_repro_command(raw_line, stage1_json)
