@@ -358,8 +358,6 @@ class GroupedGemmDswigluSm100(APIBase):
         compute_capability = major * 10 + minor
         if compute_capability < 100:
             raise RuntimeError(f"GroupedGemmDswiglu requires SM100+ compute capability, " f"but found SM{compute_capability} on device {device}")
-        if compute_capability == 103:
-            raise RuntimeError("cuteDSL GroupedGemmDswiglu is not supported on SM103")
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")

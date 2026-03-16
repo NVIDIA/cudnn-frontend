@@ -180,13 +180,11 @@ def grouped_gemm_swiglu_init(
     compute_capability = major * 10 + minor
     if compute_capability < 100:
         pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
-    if compute_capability == 103:
-        pytest.skip("cuteDSL is not supported on SM103")
 
     # Parse CLI options
     nkl_str = request.config.getoption("--grouped-gemm-nkl", default=None)
     group_m_str = request.config.getoption("--grouped-gemm-group-m", default=None)
-    skip_ref = request.config.getoption("--grouped-gemm-skip-ref", default=False)
+    skip_ref = request.config.getoption("--skip-ref", default=False)
 
     # Default values
     if nkl_str is not None:

@@ -460,7 +460,7 @@ def build_cudnn_sdpa_thd_graph(
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
         handle=cudnn_handle,
-        is_dynamic_shape_enabled=True,
+        is_override_shape_enabled=True,
     )
 
     # Q tensor in THD layout with BHSD logical shape

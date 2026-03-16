@@ -138,6 +138,12 @@ using cudnn_frontend::detail::cuda_mem_set_async;
 // Import cuGetErrorString wrapper for human-readable CUresult messages
 using cudnn_frontend::detail::cu_get_error_string;
 
+// cuMemsetD32Async — write a 32-bit pattern to device memory (avoids cudart dependency)
+inline CUresult
+cu_mem_set_d32_async(CUdeviceptr dstDevice, unsigned int ui, size_t N, cudaStream_t stream) {
+    NV_FE_CALL_TO_CU(cu_mem_set_d32_async, cuMemsetD32Async, dstDevice, ui, N, stream);
+}
+
 // Convert CUresult to a descriptive string (e.g., "CUDA_ERROR_INVALID_VALUE")
 inline std::string
 cu_result_to_string(CUresult err) {

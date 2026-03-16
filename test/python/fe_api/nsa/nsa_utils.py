@@ -97,8 +97,6 @@ def nsa_init(
     compute_capability = major * 10 + minor
     if compute_capability < 100:
         pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
-    if compute_capability == 103:
-        pytest.skip("cuteDSL is not supported on SM103")
 
     b = int(request.config.getoption("--nsa-b")) if request.config.getoption("--nsa-b") is not None else 2
     s_q = (
@@ -123,7 +121,7 @@ def nsa_init(
 
     scale_softmax = 1.0 / math.sqrt(d_qk) if scale_softmax is None else scale_softmax
 
-    skip_ref = request.config.getoption("--nsa-skip-ref", default=False)
+    skip_ref = request.config.getoption("--skip-ref", default=False)
 
     return {
         "b": b,

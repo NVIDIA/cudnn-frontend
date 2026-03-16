@@ -114,7 +114,8 @@ def test_sdpa_random_fwd_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
         with_score_max=RandomChoice({True : 1, False : 3}),
         with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
@@ -146,7 +147,8 @@ def test_sdpa_random_fwd_unified_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),  # Modified from non-unified test
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
         # TODO: Test with_score_max, with_score_sum_exp and with_sink_token once unified engine supports these features
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -181,7 +183,8 @@ def test_sdpa_random_bwd_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 4, "full" : 1}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 4, "full" : 1}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
         is_deterministic=RandomChoice({True : 3, False : 1}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
@@ -217,7 +220,8 @@ def test_sdpa_random_sq1_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
         with_score_max=RandomChoice({True : 1, False : 3}),
         with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         # sink_token not supported with s_q==1
@@ -249,7 +253,8 @@ def test_sdpa_random_sq1_unified_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
         # TODO: Test with_score_max, with_score_sum_exp (but not sink_token since s_q==1) once unified engine supports these features
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -284,7 +289,8 @@ def test_sdpa_random_lean_attn_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
         with_score_max=RandomChoice({True : 1, False : 3}),
         with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         # sink_token not supported with s_q==1
@@ -316,7 +322,8 @@ def test_sdpa_random_lean_attn_unified_L0(env_info, test_no, request, cudnn_hand
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
         # TODO: Test with_score_max, with_score_sum_exp (but not sink_token since s_q==1) once unified engine supports these features
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -350,9 +357,10 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 0, "full" : 0}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 0, "full" : 0}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
+        with_score_max=RandomChoice({True : 0, False : 3}),
+        with_score_sum_exp=RandomChoice({True : 0, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -382,7 +390,8 @@ def test_sdpa_random_fwd_ragged_unified_L0(env_info, test_no, request, cudnn_han
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),  # Modified from non-unified test
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 0, "full" : 0}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 0, "full" : 0}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
     test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
@@ -412,7 +421,8 @@ def test_sdpa_random_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 0, "full" : 0}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 0, "full" : 0}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
         is_deterministic=RandomChoice({True : 3, False : 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -449,7 +459,8 @@ def test_sdpa_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 0}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 0}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
         block_size=RandomBlockSize(min=1, max=1024, with_high_probability=[1,32,128]),
         with_score_max=RandomChoice({True : 1, False : 3}),
         with_score_sum_exp=RandomChoice({True : 1, False : 3}),
@@ -483,7 +494,8 @@ def test_sdpa_fwd_paged_unified_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),  # Modified from non-unified test
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 0}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 0}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
         block_size=RandomBlockSize(min=1, max=1024, with_high_probability=[1,32,128]),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -518,7 +530,8 @@ def test_sdpa_random_fwd_unified_block_mask_L0(env_info, test_no, request, cudnn
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
         test.cfg.is_block_mask = True
@@ -552,7 +565,8 @@ def test_sdpa_random_fwd_bias_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=1),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
         is_bias=RandomChoice({True : 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -585,7 +599,8 @@ def test_sdpa_random_bwd_bias_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 4, "full" : 1}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 4, "full" : 1}),
+        stats_layout=RandomChoice({"ragged" : 0, "full" : 0, "disabled" : 1}),
         is_bias=RandomChoice({True : 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -620,7 +635,8 @@ def test_sdpa_fp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 1, "full": 1}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 1, "full": 1}),
+        stats_layout=RandomChoice({"disabled": 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
     test.showConfig(test_no, request)
@@ -654,7 +670,8 @@ def test_sdpa_fp8_bwd_L0(env_info, test_no, request, cudnn_handle):
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float16: 1}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 0, "full": 1}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 0, "full": 1}),
+        stats_layout=RandomChoice({"disabled": 1}),
         is_deterministic=RandomChoice({True: 1, False: 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -691,7 +708,8 @@ def test_sdpa_fp8_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 1}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 1, "full": 0}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 1, "full": 0}),
+        stats_layout=RandomChoice({"disabled": 1}),
         block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16, 32, 64]),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -727,7 +745,8 @@ def test_sdpa_fp8_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 0, "full": 0}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 0, "full": 0}),
+        stats_layout=RandomChoice({"disabled": 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
     test.showConfig(test_no, request)
@@ -761,7 +780,8 @@ def test_sdpa_fp8_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float16: 1}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 0, "full": 0}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 0, "full": 0}),
+        stats_layout=RandomChoice({"disabled": 1}),
         is_deterministic=RandomChoice({True: 1, False: 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -812,12 +832,13 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         batches=RandomBatchSize(min=1, max=4),
         s_q_s_kv=RandomSequenceLength(s_q_min=128, s_q_max=512, s_kv_min=128, s_kv_max=512, s_q_distribution={"s_q=1": 0, "s_q=s_kv": 1, "s_q=random": 1}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=128, d_qk_max=192, d_v_min=128, d_v_max=128, head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0}, with_high_probability=[(128, 128), (192, 128)]),
-        head_count=RandomHeadGenerator(min=2, max=2, head_group_options=(1, 0, 0)),
+        head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float8_e4m3fn: 3, torch.float8_e5m2: 1}),
         output_type=RandomChoice({torch.float16: 2, torch.bfloat16: 1}),  # FP16 more often for tighter tolerance testing
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 1, "full": 3}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 1, "full": 3}),
+        stats_layout=RandomChoice({"disabled": 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
@@ -832,7 +853,7 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
 # # ==================================
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=1002), ids=lambda p: f"test{p[0]}")
-@pytest.mark.L1
+@pytest.mark.L0
 def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -843,15 +864,16 @@ def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
     rng = random.Random(geom_seed)
 
     with RandomizationContext(
-        batches=RandomBatchSize(min=1, max=1),
-        s_q_s_kv=RandomSequenceLength(s_q_min=256, s_q_max=256, s_kv_min=256, s_kv_max=256, s_q_distribution={"s_q=1": 0, "s_q=s_kv": 1, "s_q=random": 0}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=128, d_qk_max=128, d_v_min=128, d_v_max=128, head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0}, with_high_probability=[(128, 128)]),
-        head_count=RandomHeadGenerator(min=1, max=1, head_group_options=(1, 0, 0)),  # MHA only, small head count
+        batches=RandomBatchSize(min=1, max=4),
+        s_q_s_kv=RandomSequenceLength(s_q_min=256, s_q_max=1024, s_kv_min=256, s_kv_max=1024, s_q_distribution={"s_q=1": 0, "s_q=s_kv": 1, "s_q=random": 1}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=128, d_qk_max=192, d_v_min=128, d_v_max=128, head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0}, with_high_probability=[(128, 128), (192, 128)]),
+        head_count=RandomHeadGenerator(min=1, max=4, head_group_options=(1, 1, 0)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 0}),
         output_type=RandomChoice({torch.float16: 2, torch.bfloat16: 1}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 0, "full": 1}),
+        is_q_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 0, "full": 1}),
+        stats_layout=RandomChoice({"disabled": 1}),
         is_deterministic=RandomChoice({True: 1, False: 0}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)

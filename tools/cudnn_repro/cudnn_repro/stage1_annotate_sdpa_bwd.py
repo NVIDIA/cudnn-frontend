@@ -28,7 +28,7 @@ def extract_seq_and_ragged(payload: dict, seed: int) -> dict:
     raise NotImplementedError("SDPA backward support not yet implemented")
 
 
-def extract_and_annotate(raw_line: str, payload: dict) -> dict:
+def extract_and_annotate(raw_line: str, payload: dict, full_log_text: Optional[str] = None) -> dict:
     """Phase 1: Extract config and annotate with repro metadata for backward."""
     seed = utils.sha1_seed(raw_line)
     phase1_json = json.loads(json.dumps(payload))

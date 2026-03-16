@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <unordered_set>
 
 #include "../../cudnn_frontend_Heuristics.h"
 #include "../../cudnn_frontend_Logging.h"
@@ -453,6 +454,56 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
             int64_t alibi_slopes_size_padded = ((alibi_slopes_size + 15) / 16 * 16);
             offset                           = offset + alibi_slopes_size_padded;
         }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    collect_tensors_to_dump_node(
+        std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump) const override final {
+        std::unordered_set<Tensor_attributes::uid_t> seen_uids;
+        auto add_tensor = [&tensors_to_dump, &seen_uids](std::shared_ptr<Tensor_attributes> const& tensor) {
+            if (tensor == nullptr) {
+                return;
+            }
+            if (seen_uids.insert(tensor->get_uid()).second) {
+                tensors_to_dump.emplace_back(tensor, 'd');
+            }
+        };
+
+        auto const seq_len_q_it = attributes.inputs.find(input_names::SEQ_LEN_Q);
+        if (seq_len_q_it != attributes.inputs.end()) {
+            add_tensor(seq_len_q_it->second);
+        }
+
+        auto const seq_len_kv_it = attributes.inputs.find(input_names::SEQ_LEN_KV);
+        if (seq_len_kv_it != attributes.inputs.end()) {
+            add_tensor(seq_len_kv_it->second);
+        }
+
+        for (auto const& tensor : {attributes.inputs.at(input_names::Q),
+                                   attributes.inputs.at(input_names::K),
+                                   attributes.inputs.at(input_names::V),
+                                   attributes.outputs.at(output_names::O)}) {
+            if (tensor != nullptr) {
+                add_tensor(tensor->get_ragged_offset());
+            }
+        }
+
+        auto const stats_it = attributes.outputs.find(output_names::Stats);
+        if (stats_it != attributes.outputs.end() && stats_it->second != nullptr) {
+            add_tensor(stats_it->second->get_ragged_offset());
+        }
+
+        auto const max_it = attributes.outputs.find(output_names::Max);
+        if (max_it != attributes.outputs.end() && max_it->second != nullptr) {
+            add_tensor(max_it->second->get_ragged_offset());
+        }
+
+        auto const sum_exp_it = attributes.outputs.find(output_names::Sum_exp);
+        if (sum_exp_it != attributes.outputs.end() && sum_exp_it->second != nullptr) {
+            add_tensor(sum_exp_it->second->get_ragged_offset());
+        }
+
         return {error_code_t::OK, ""};
     }
 
@@ -1887,11 +1938,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const {
         if (is_deterministic_algorithm_supported_on_blackwell) {
-            if (detail::get_backend_version() < 92100) {
-                return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
-            } else {
-                return {5, {{KnobType_t::KERNEL_CFG, 1}, {KnobType_t::STAGES, 2}}};
-            }
+            return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
         } else {
             return {-1, {}};
         }

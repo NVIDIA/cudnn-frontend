@@ -31,50 +31,62 @@ def _last_payload(log_path):
     return entries[-1]
 
 
-def _target_tests(request):
+def _target_tests():
     raw = os.environ.get("CUDNN_REPRO_TARGETS")
     if raw is None:
-        raw = ",".join(f"test/python/test_mhas_v2.py::test_sdpa_random_fwd_L0[test{i}]" for i in range(1, 11))
+        raw = ",".join(
+            [
+                *(f"test/python/test_mhas_v2.py::test_sdpa_random_fwd_L0[test{i}]" for i in range(1, 11)),
+                *(f"test/python/test_mhas_v2.py::test_sdpa_random_fwd_ragged_L0[test{i}]" for i in range(1, 11)),
+            ]
+        )
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-def test_reproducer_json_matches(tmp_path, request):
+def _target_test_id(target):
+    return target.split("::", 1)[-1]
+
+
+def _assert_reproducer_json_matches_target(tmp_path, target):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required to generate SDPA logs")
 
     env_base = os.environ.copy()
     env_base["CUDNN_FRONTEND_LOG_INFO"] = "1"
+    log_a = tmp_path / "initial.log"
+    log_b = tmp_path / "repro.log"
 
-    for idx, target in enumerate(_target_tests(request)):
-        log_a = tmp_path / f"initial_{idx}.log"
-        log_b = tmp_path / f"repro_{idx}.log"
+    cmd_test = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-vv",
+        "-s",
+        "-rA",
+        target,
+    ]
+    env_first = env_base.copy()
+    env_first["CUDNN_FRONTEND_LOG_FILE"] = str(log_a)
+    _run(cmd_test, env_first)
 
-        cmd_test = [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-vv",
-            "-s",
-            "-rA",
-            target,
-        ]
-        env_first = env_base.copy()
-        env_first["CUDNN_FRONTEND_LOG_FILE"] = str(log_a)
-        _run(cmd_test, env_first)
+    import cudnn_repro as repro
 
-        import cudnn_repro as repro
+    raw_line, payload = _last_payload(log_a)
+    cfg = repro._build_cfg(raw_line, payload)
 
-        raw_line, payload = _last_payload(log_a)
-        cfg = repro._build_cfg(raw_line, payload)
+    repro_cmd = shlex.split(repro._build_command(cfg))
+    env_second = env_base.copy()
+    env_second["CUDNN_FRONTEND_LOG_FILE"] = str(log_b)
+    _run(repro_cmd, env_second)
 
-        repro_cmd = shlex.split(repro._build_command(cfg))
-        env_second = env_base.copy()
-        env_second["CUDNN_FRONTEND_LOG_FILE"] = str(log_b)
-        _run(repro_cmd, env_second)
+    _, repro_payload = _last_payload(log_b)
+    assert payload == repro_payload, f"Payload mismatch for target {target}"
 
-        _, repro_payload = _last_payload(log_b)
-        assert payload == repro_payload, f"Payload mismatch for target {target}"
+
+@pytest.mark.parametrize("target", _target_tests(), ids=_target_test_id)
+def test_reproducer_json_matches(tmp_path, target):
+    _assert_reproducer_json_matches_target(tmp_path, target)
 
 
 def test_build_cfg_maps_causal_without_explicit_right_bound():

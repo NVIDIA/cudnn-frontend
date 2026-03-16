@@ -94,6 +94,11 @@ class INode {
     };
 
     virtual error_t
+    collect_tensors_to_dump_node(std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>&) const {
+        return {error_code_t::OK, ""};
+    };
+
+    virtual error_t
     create_cudnn_tensors_node(
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& uid_to_backend_tensors,
         int64_t& potential_uid,
@@ -312,6 +317,16 @@ class INode {
         CHECK_CUDNN_FRONTEND_ERROR(collect_variant_pack_replacements_node(replacements));
         for (auto const& sub_node : sub_nodes) {
             CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_variant_pack_replacements_subtree(replacements));
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    collect_tensors_to_dump_subtree(
+        std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump) const {
+        CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_to_dump_node(tensors_to_dump));
+        for (auto const& sub_node : sub_nodes) {
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_tensors_to_dump_subtree(tensors_to_dump));
         }
         return {error_code_t::OK, ""};
     }

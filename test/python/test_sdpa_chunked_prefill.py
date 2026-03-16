@@ -212,7 +212,7 @@ def build_cudnn_sdpa_chunk_graph(cudnn_handle, batch_size, h_q, h_k, h_v, d_qk, 
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
         handle=cudnn_handle,
-        is_dynamic_shape_enabled=True,
+        is_override_shape_enabled=True,
     )
 
     q = graph.tensor(dim=(batch_size, h_q, chunk_size, d_qk), stride=(h_q * d_qk, d_qk, h_q * d_qk, 1), data_type=cudnn_dtype, name="Q", uid=UIDs.Q_UID.value)

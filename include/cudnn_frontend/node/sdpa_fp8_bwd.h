@@ -924,6 +924,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                 auto dV_fullhead = matmul(last_dV, dO_seq_dequant, bmm_S_T_dO_attributes);
                 dV_fullhead->set_dim({b, h_q, s_kv, d_v});
                 dV_fullhead->set_stride({h_q * s_kv * d_v, s_kv * d_v, d_v, 1});
+                dV_fullhead->set_data_type(DataType_t::FLOAT);
                 reduction(dV_fullhead,
                           Reduction_attributes().set_name("red_dV_head").set_mode(ReductionMode_t::ADD),
                           attributes.outputs[output_names::dV]);
@@ -1083,6 +1084,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                 auto dK_fullhead = matmul(dP_T, Q_seq_dequant, bmm_dS_T_Q_attributes);
                 dK_fullhead->set_dim({b, h_q, s_kv, d_qk});
                 dK_fullhead->set_stride({h_q * s_kv * d_qk, s_kv * d_qk, d_qk, 1});
+                dK_fullhead->set_data_type(DataType_t::FLOAT);
                 reduction(dK_fullhead,
                           Reduction_attributes().set_name("red_dK_head").set_mode(ReductionMode_t::ADD),
                           attributes.outputs[output_names::dK]);
@@ -1114,11 +1116,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
     std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const {
         if (is_deterministic_algorithm_supported_on_blackwell) {
-            if(detail::get_backend_version() < 92100) {
-                return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
-            } else {
-                return {5, {{KnobType_t::KERNEL_CFG, 1}, {KnobType_t::STAGES, 2}}};
-            }
+            return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
         } else {
             return {-1, {}};
         }

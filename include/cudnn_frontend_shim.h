@@ -73,7 +73,7 @@ load_cuda_so() {
     const char *error = reinterpret_cast<const char *>(dlerror());
     if (!handle || error) {
         // If opening the library fails, throw an exception with the error message
-        throw std::runtime_error("Unable to dlopen libcuda.so : " + std::string(error ? error : "Unknown error"));
+        throw std::runtime_error("Unable to dlopen libcuda.so.1 : " + std::string(error ? error : "Unknown error"));
     }
 
     return handle;

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import struct
 import sys
 from pathlib import Path
@@ -158,6 +159,34 @@ def bool_from_inputs(inputs: dict, target: str) -> Optional[bool]:
     if not inputs:
         return None
     return target in inputs
+
+
+def parse_ragged_tensor_names(log_text: Optional[str]) -> list[str]:
+    """Extract tensor names that have ragged offsets enabled from FE log text."""
+    if not log_text:
+        return []
+
+    uid_to_name = {}
+    current_descriptor_uid = None
+    ragged_tensor_names = []
+
+    for line in log_text.splitlines():
+        match = re.search(r"Backend Tensor named '([^']+)' with UID (\d+)", line)
+        if match:
+            uid_to_name[int(match.group(2))] = match.group(1)
+            continue
+
+        match = re.search(r"Id:\s+(\d+)", line)
+        if match:
+            current_descriptor_uid = int(match.group(1))
+            continue
+
+        if current_descriptor_uid is not None and "raggedOffset: Enabled UID:" in line:
+            tensor_name = uid_to_name.get(current_descriptor_uid)
+            if tensor_name is not None:
+                ragged_tensor_names.append(tensor_name)
+
+    return ragged_tensor_names
 
 
 def json_with_max_indent(value: Any, depth: int = 0, indent: int = 2, max_indent_level: int = 3) -> str:

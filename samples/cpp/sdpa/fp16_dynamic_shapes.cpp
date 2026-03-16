@@ -63,7 +63,7 @@ create_sdpa_forward_graph(int64_t const b,
     graph->set_io_data_type(fe::DataType_t::BFLOAT16)
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT)
-        .set_dynamic_shape_enabled(true);
+        .set_override_shape_enabled(true);
 
     auto Q = graph->tensor(fe::graph::Tensor_attributes()
                                .set_name("Q")
@@ -136,7 +136,7 @@ TEST_CASE("Toy sdpa forward with dynamic shapes", "[graph][sdpa][flash][forward]
     bool causal_mask    = true;
     bool padding_mask   = true;
 
-#if (CUDNN_VERSION < 91900)
+#if (CUDNN_VERSION < 92100)
     SKIP("Test is disabled till backend is updated");
 #endif
 
@@ -149,6 +149,8 @@ TEST_CASE("Toy sdpa forward with dynamic shapes", "[graph][sdpa][flash][forward]
 
     auto graph = create_sdpa_forward_graph(
         b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v, attn_scale, generate_stats, causal_mask, padding_mask);
+
+    graph->set_override_shape_enabled(true);
 
     REQUIRE(graph->build(handle, {fe::HeurMode_t::A}).is_good());
 
