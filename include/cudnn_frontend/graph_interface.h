@@ -756,7 +756,7 @@ class Graph : public ICudnn, public INode {
                         cudaGraph_t cudnn_cuda_graph) {
         // Check if the cuda graph is empty
         size_t numNodes = 0;
-        CHECK_CU_ERROR(detail::cu_graph_get_nodes(cudnn_cuda_graph, nullptr, &numNodes));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_get_nodes(cudnn_cuda_graph, nullptr, &numNodes));
         RETURN_CUDNN_FRONTEND_ERROR_IF(numNodes != 0,
                                        error_code_t::INVALID_VALUE,
                                        "cuda graph provided to populate is not empty. cuDNN requires it to be empty "
@@ -864,7 +864,7 @@ class Graph : public ICudnn, public INode {
         cudaGraph_t backend_cuda_graph;
         // Initialize the cudnn cuda graph.
         // The responsibility to destroy is on the user.
-        detail::cu_graph_create(&backend_cuda_graph, 0);  // 0 is just what the API says to pass
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_create(&backend_cuda_graph, 0));
 
         _CUDNN_CHECK_CUDNN_ERROR(detail::populate_cuda_graph(handle,
                                                              plans.execution_plans[candidate]->get_raw_desc(),
@@ -1180,8 +1180,7 @@ class Graph : public ICudnn, public INode {
 
             int device_ordinal = 0;
             detail::cuda_get_device(&device_ordinal);
-            CUdevice cu_device;
-            experimental::detail::cu_device_get(&cu_device, device_ordinal);
+            int cu_device = device_ordinal;
 
             void *oss_workspace = static_cast<char *>(workspace) + fe_workspace_size;
             CHECK_CUDNN_FRONTEND_ERROR(plans.execute_oss_engine(tensor_uid_to_pointer_map,
@@ -1203,8 +1202,7 @@ class Graph : public ICudnn, public INode {
 
             int device_ordinal = 0;
             detail::cuda_get_device(&device_ordinal);
-            CUdevice cu_device;
-            experimental::detail::cu_device_get(&cu_device, device_ordinal);
+            int cu_device = device_ordinal;
 
             void *oss_workspace = static_cast<char *>(workspace) + fe_workspace_size;
             CHECK_CUDNN_FRONTEND_ERROR(
@@ -1270,8 +1268,7 @@ class Graph : public ICudnn, public INode {
 
             int device_ordinal = 0;
             detail::cuda_get_device(&device_ordinal);
-            CUdevice cu_device;
-            experimental::detail::cu_device_get(&cu_device, device_ordinal);
+            int cu_device = device_ordinal;
 
             // OSS engine workspace starts after FE workspace
             void *oss_workspace = static_cast<char *>(workspace) + fe_workspace_size;
@@ -1289,8 +1286,7 @@ class Graph : public ICudnn, public INode {
 
             int device_ordinal = 0;
             detail::cuda_get_device(&device_ordinal);
-            CUdevice cu_device;
-            experimental::detail::cu_device_get(&cu_device, device_ordinal);
+            int cu_device = device_ordinal;
 
             void *oss_workspace = static_cast<char *>(workspace) + fe_workspace_size;
             CHECK_CUDNN_FRONTEND_ERROR(

@@ -92,7 +92,7 @@ class Sm90SdpaPrefillEngine : public IOssSdpaEngine {
 
     ~Sm90SdpaPrefillEngine() override {
         if (module_) {
-            detail::cu_library_unload(module_);
+            detail::cuda_library_unload(module_);
         }
     }
 
@@ -127,7 +127,7 @@ class Sm90SdpaPrefillEngine : public IOssSdpaEngine {
     operator=(Sm90SdpaPrefillEngine&& other) noexcept {
         if (this != &other) {
             if (module_) {
-                detail::cu_library_unload(module_);
+                detail::cuda_library_unload(module_);
             }
             spec_            = other.spec_;
             d_               = other.d_;
@@ -226,7 +226,7 @@ class Sm90SdpaPrefillEngine : public IOssSdpaEngine {
             void* d_sum_exp,
             std::vector<int64_t> const& se_strides,
             void* workspace,
-            CUdevice device,
+            int device,
             cudaStream_t stream,
             std::optional<float> user_attn_scale = std::nullopt) override {
         RETURN_CUDNN_FRONTEND_ERROR_IF(!built_, error_code_t::INVALID_VALUE, "execute() called before build()");
@@ -398,32 +398,22 @@ class Sm90SdpaPrefillEngine : public IOssSdpaEngine {
         };
 
         // ---- Set shared memory attribute and launch ----
-        CUresult cu_err;
+        cudaError_t cuda_err;
 
-        cu_err = detail::cu_kernel_set_attribute(
-            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smemBytes_, kernelPtr_, device);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(cu_err != CUDA_SUCCESS,
+        cuda_err = detail::cuda_kernel_set_attribute_for_device(
+            kernelPtr_, cudaFuncAttributeMaxDynamicSharedMemorySize, smemBytes_, device);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(cuda_err != cudaSuccess,
                                        error_code_t::CUDA_API_FAILED,
-                                       "cuKernelSetAttribute failed (smem=" + std::to_string(smemBytes_) +
-                                           " bytes, CUresult=" + detail::cu_result_to_string(cu_err) + ")");
+                                       "cudaKernelSetAttributeForDevice failed (smem=" + std::to_string(smemBytes_) +
+                                           " bytes, error=" + detail::cuda_error_to_string(cuda_err) + ")");
 
-        cu_err               = detail::cu_launch_kernel((CUfunction)kernelPtr_,
-                                          grid.x,
-                                          grid.y,
-                                          grid.z,
-                                          block.x,
-                                          block.y,
-                                          block.z,
-                                          smemBytes_,
-                                          stream,
-                                          kernelParams,
-                                          nullptr);
+        cuda_err = detail::cuda_launch_kernel((const void*)kernelPtr_, grid, block, kernelParams, smemBytes_, stream);
         cudaError_t last_err = detail::cuda_get_last_error();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(cu_err != CUDA_SUCCESS,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(cuda_err != cudaSuccess,
                                        error_code_t::CUDA_API_FAILED,
-                                       "cuLaunchKernel failed (grid=" + std::to_string(grid.x) +
+                                       "cudaLaunchKernel failed (grid=" + std::to_string(grid.x) +
                                            ", block=384, smem=" + std::to_string(smemBytes_) +
-                                           ", CUresult=" + detail::cu_result_to_string(cu_err) + ")");
+                                           ", error=" + detail::cuda_error_to_string(cuda_err) + ")");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             last_err != cudaSuccess,
@@ -442,8 +432,8 @@ class Sm90SdpaPrefillEngine : public IOssSdpaEngine {
     bool support_checked_   = false;
 
     // State from build()
-    CUlibrary module_   = nullptr;
-    CUkernel kernelPtr_ = nullptr;
+    cudaLibrary_t module_   = nullptr;
+    cudaKernel_t kernelPtr_ = nullptr;
     std::unique_ptr<char[]> cubin_;
     size_t cubinSize_ = 0;
     int tile_m_ = 0, tile_n_ = 0, tile_k_ = 0;

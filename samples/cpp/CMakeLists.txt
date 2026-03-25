@@ -97,7 +97,6 @@ target_link_libraries(
 
     CUDA::cublasLt
     CUDA::cudart
-    CUDA::cuda_driver # Needed as calls all CUDA calls will eventually move to driver
     CUDA::nvrtc
 )
 

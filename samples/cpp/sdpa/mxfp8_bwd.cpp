@@ -164,7 +164,7 @@ TEST_CASE("sdpa_mxfp8_mha_bprop", "[graph][sdpa][mxfp8][backward]") {
     // SF_Q_T, SF_K_T: [b, h, s_scale_padded, d_qk_padded] (sequence dimension scaled)
     auto SF_QK_T_dims = std::vector<int64_t>({b, h, s_scale_padded, d_qk_padded});
     auto SF_QK_T_strides =
-        std::vector<int64_t>({h * s_scale_padded * d_qk_padded, s_scale_padded * d_qk_padded, 1, s_scale_padded});
+        std::vector<int64_t>({h * s_scale_padded * d_qk_padded, s_scale_padded * d_qk_padded, s_scale_padded, 1});
 
     auto SF_Q_T = mha_graph.tensor(fe::graph::Tensor_attributes()
                                        .set_name("SF_Q_T")
@@ -203,7 +203,7 @@ TEST_CASE("sdpa_mxfp8_mha_bprop", "[graph][sdpa][mxfp8][backward]") {
     // SF_dO_T: [b, h, s_scale_padded, d_v_padded]
     auto SF_dO_T_dims = std::vector<int64_t>({b, h, s_scale_padded, d_v_padded});
     auto SF_dO_T_strides =
-        std::vector<int64_t>({h * s_scale_padded * d_v_padded, s_scale_padded * d_v_padded, 1, s_scale_padded});
+        std::vector<int64_t>({h * s_scale_padded * d_v_padded, s_scale_padded * d_v_padded, s_scale_padded, 1});
     auto SF_dO_T = mha_graph.tensor(fe::graph::Tensor_attributes()
                                         .set_name("SF_dO_T")
                                         .set_dim(SF_dO_T_dims)
@@ -475,10 +475,10 @@ TEST_CASE("sdpa_mxfp8_gqa_bprop", "[graph][sdpa][mxfp8][backward]") {
     // SF_Q_T, SF_K_T: [b, h, s_scale_padded, d_qk_padded] (sequence dimension scaled)
     auto SF_Q_T_dims = std::vector<int64_t>({b, h_q, s_scale_padded, d_qk_padded});
     auto SF_Q_T_strides =
-        std::vector<int64_t>({h_q * s_scale_padded * d_qk_padded, s_scale_padded * d_qk_padded, 1, s_scale_padded});
+        std::vector<int64_t>({h_q * s_scale_padded * d_qk_padded, s_scale_padded * d_qk_padded, s_scale_padded, 1});
     auto SF_K_T_dims = std::vector<int64_t>({b, h_kv, s_scale_padded, d_qk_padded});
     auto SF_K_T_strides =
-        std::vector<int64_t>({h_kv * s_scale_padded * d_qk_padded, s_scale_padded * d_qk_padded, 1, s_scale_padded});
+        std::vector<int64_t>({h_kv * s_scale_padded * d_qk_padded, s_scale_padded * d_qk_padded, s_scale_padded, 1});
 
     auto SF_Q_T = mha_graph.tensor(fe::graph::Tensor_attributes()
                                        .set_name("SF_Q_T")
@@ -518,7 +518,7 @@ TEST_CASE("sdpa_mxfp8_gqa_bprop", "[graph][sdpa][mxfp8][backward]") {
     // SF_dO_T: [b, h, s_scale_padded, d_v_padded]
     auto SF_dO_T_dims = std::vector<int64_t>({b, h_q, s_scale_padded, d_v_padded});
     auto SF_dO_T_strides =
-        std::vector<int64_t>({h_q * s_scale_padded * d_v_padded, s_scale_padded * d_v_padded, 1, s_scale_padded});
+        std::vector<int64_t>({h_q * s_scale_padded * d_v_padded, s_scale_padded * d_v_padded, s_scale_padded, 1});
     auto SF_dO_T = mha_graph.tensor(fe::graph::Tensor_attributes()
                                         .set_name("SF_dO_T")
                                         .set_dim(SF_dO_T_dims)
@@ -795,7 +795,7 @@ TEST_CASE("sdpa_mxfp8_mla_bprop", "[graph][sdpa][mxfp8][backward]") {
     // SF_Q_T, SF_K_T: [b, h, s_scale_padded, d_qk_padded] (sequence dimension scaled)
     auto SF_QK_T_dims = std::vector<int64_t>({b, h, s_scale_padded, d_qk_padded});
     auto SF_QK_T_strides =
-        std::vector<int64_t>({h * s_scale_padded * d_qk_padded, s_scale_padded * d_qk_padded, 1, s_scale_padded});
+        std::vector<int64_t>({h * s_scale_padded * d_qk_padded, s_scale_padded * d_qk_padded, s_scale_padded, 1});
 
     auto SF_Q_T = mha_graph.tensor(fe::graph::Tensor_attributes()
                                        .set_name("SF_Q_T")
@@ -834,7 +834,7 @@ TEST_CASE("sdpa_mxfp8_mla_bprop", "[graph][sdpa][mxfp8][backward]") {
     // SF_dO_T: [b, h, s_scale_padded, d_v_padded]
     auto SF_dO_T_dims = std::vector<int64_t>({b, h, s_scale_padded, d_v_padded});
     auto SF_dO_T_strides =
-        std::vector<int64_t>({h * s_scale_padded * d_v_padded, s_scale_padded * d_v_padded, 1, s_scale_padded});
+        std::vector<int64_t>({h * s_scale_padded * d_v_padded, s_scale_padded * d_v_padded, s_scale_padded, 1});
     auto SF_dO_T = mha_graph.tensor(fe::graph::Tensor_attributes()
                                         .set_name("SF_dO_T")
                                         .set_dim(SF_dO_T_dims)

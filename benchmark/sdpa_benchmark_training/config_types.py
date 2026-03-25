@@ -75,7 +75,7 @@ class BenchmarkConfig:
         seqlens: List of (q_seqlen, kv_seqlen) tuples
         backends: List of backend names (e.g., ["cudnn", "flash_attention_4"])
         data_types: List of data types (e.g., ["bfloat16", "fp8"])
-        attn_masks: List of attention masks (e.g., ["top_left", "no_mask"])
+        attn_masks: List of attention masks (e.g., ["top_left", "bottom_right", "no_mask"])
         profile_pass: Which pass to profile ("fwd", "bwd", or "both")
         batch_size: Batch size for all benchmarks
         num_iterations: Number of iterations per benchmark
@@ -91,7 +91,7 @@ class BenchmarkConfig:
             seqlens=[(4096, 4096), (8192, 8192)],
             backends=["cudnn", "flash_attention_4"],
             data_types=["bfloat16", "fp8"],
-            attn_masks=["top_left", "no_mask"],
+            attn_masks=["top_left", "bottom_right", "no_mask"],
             profile_pass="fwd",
         )
     """

@@ -57,7 +57,6 @@ target_link_libraries(
 
     CUDA::cublasLt
     CUDA::cudart
-    CUDA::cuda_driver
     CUDA::nvrtc
 )
 

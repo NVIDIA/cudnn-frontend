@@ -193,14 +193,14 @@ get_cuda_symbol(CudaLibrary library, const char *function_name) {
 
 #endif
 
-inline CUresult
-cu_graph_create(CUgraph *pGraph, unsigned int flags) {
-    NV_FE_CALL_TO_CU(cu_graph_create, cuGraphCreate, pGraph, flags);
+inline cudaError_t
+cuda_graph_create(cudaGraph_t *pGraph, unsigned int flags) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_create, cudaGraphCreate, pGraph, flags);
 }
 
-inline CUresult
-cu_graph_get_nodes(CUgraph hGraph, CUgraphNode *nodes, size_t *numNodes) {
-    NV_FE_CALL_TO_CU(cu_graph_get_nodes, cuGraphGetNodes, hGraph, nodes, numNodes);
+inline cudaError_t
+cuda_graph_get_nodes(cudaGraph_t hGraph, cudaGraphNode_t *nodes, size_t *numNodes) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_get_nodes, cudaGraphGetNodes, hGraph, nodes, numNodes);
 }
 
 inline cudaError_t
@@ -395,11 +395,6 @@ cuda_pointer_get_attributes(cudaPointerAttributes *attributes, const void *ptr) 
 inline const char *
 cuda_get_error_string(cudaError_t error) {
     NV_FE_CALL_TO_CUDA(cuda_get_error_string, cudaGetErrorString, error);
-}
-
-inline CUresult
-cu_get_error_string(CUresult error, const char **pStr) {
-    NV_FE_CALL_TO_CU(cu_get_error_string, cuGetErrorString, error, pStr);
 }
 
 inline cudaError_t

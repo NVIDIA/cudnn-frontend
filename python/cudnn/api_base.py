@@ -587,6 +587,19 @@ class APIBase(ABC):
         dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, (torch.Tensor, TensorDesc)) else tensor_or_dtype
         return dtype in {torch.float8_e5m2, torch.float8_e4m3fn}
 
+    def _is_f16(self, tensor_or_dtype: torch.Tensor | torch.dtype | TensorDesc) -> bool:
+        """Check if tensor or dtype is an fp16 or bf16 datatype.
+
+        :param tensor_or_dtype: The torch tensor or dtype to check
+        :type tensor_or_dtype: torch.Tensor | torch.dtype
+        :return: True if tensor/dtype is an fp16 or bf16 type
+        :rtype: bool
+        """
+        if tensor_or_dtype is None:
+            return False
+        dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, (torch.Tensor, TensorDesc)) else tensor_or_dtype
+        return dtype in {torch.float16, torch.bfloat16}
+
     def _get_innermost_stride_dim(self, tensor: torch.Tensor, name: str = "") -> int:
         """Return index of innermost contiguous dimension (stride == 1).
 
@@ -917,6 +930,38 @@ class APIBase(ABC):
             dtype=_convert_to_cutlass_data_type(dtype, interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2),
             shape=shape,
             stride=stride,
+            assumed_align=assumed_align,
+        )
+
+    def _make_fake_cute_compact_tensor(
+        self,
+        dtype: torch.dtype,
+        shape: Tuple[int, ...],
+        stride_order: Tuple[int, ...],
+        assumed_align: int = 16,
+        dynamic_mode: Optional[int] = None,
+        divisibility: int = 16,
+    ) -> cute.Pointer:
+        """Make a fake compact tensor.
+        :param dtype: The dtype of the tensor
+        :type dtype: torch.dtype
+        :param shape: The shape of the tensor
+        :type shape: Tuple[int, ...]
+        :param stride_order: The stride order of the tensor
+        :type stride_order: Tuple[int, ...]
+        :param assumed_align: The assumed alignment of the tensor
+        :type assumed_align: int
+        :return: A fake compact tensor
+        :rtype: cute.Pointer
+        """
+        if dynamic_mode is not None:
+            dynamic_dim = cute.sym_int(divisibility=divisibility)
+            shape = shape[:dynamic_mode] + (dynamic_dim,) + shape[dynamic_mode + 1 :]
+
+        return cute.runtime.make_fake_compact_tensor(
+            dtype=_convert_to_cutlass_data_type(dtype, interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2),
+            shape=shape,
+            stride_order=stride_order,
             assumed_align=assumed_align,
         )
 

@@ -121,7 +121,7 @@ class Sm100RmsNormSiluEngine : public IOssNormEngine {
 
     ~Sm100RmsNormSiluEngine() override {
         if (module_) {
-            detail::cu_library_unload(module_);
+            detail::cuda_library_unload(module_);
         }
     }
 
@@ -369,16 +369,16 @@ class Sm100RmsNormSiluEngine : public IOssNormEngine {
         detail::nvrtc_destroy_program(&prog);
 
         // Load module + kernel
-        CUresult cu_err;
-        cu_err = detail::cu_library_load_data(&module_, cubin_.get(), nullptr, nullptr, 0, nullptr, nullptr, 0);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(cu_err != CUDA_SUCCESS,
+        cudaError_t cuda_err;
+        cuda_err = detail::cuda_library_load_data(&module_, cubin_.get(), nullptr, nullptr, 0, nullptr, nullptr, 0);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(cuda_err != cudaSuccess,
                                        error_code_t::CUDA_API_FAILED,
-                                       "cuLibraryLoadData failed: " + detail::cu_result_to_string(cu_err));
+                                       "cudaLibraryLoadData failed: " + detail::cuda_error_to_string(cuda_err));
 
-        cu_err = detail::cu_library_get_kernel(&kernelPtr_, module_, "ln_fwd_kernel");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(cu_err != CUDA_SUCCESS,
+        cuda_err = detail::cuda_library_get_kernel(&kernelPtr_, module_, "ln_fwd_kernel");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(cuda_err != cudaSuccess,
                                        error_code_t::CUDA_API_FAILED,
-                                       "cuLibraryGetKernel failed: " + detail::cu_result_to_string(cu_err));
+                                       "cudaLibraryGetKernel failed: " + detail::cuda_error_to_string(cuda_err));
 
         built_ = true;
         return {error_code_t::OK, ""};
@@ -394,7 +394,7 @@ class Sm100RmsNormSiluEngine : public IOssNormEngine {
             int cols,
             float epsilon,
             void* workspace,
-            CUdevice device,
+            int device,
             cudaStream_t stream,
             RmsNormSiluExtraParams const& extra = {}) override {
         RETURN_CUDNN_FRONTEND_ERROR_IF(!built_, error_code_t::INVALID_VALUE, "execute() called before build()");
@@ -450,12 +450,12 @@ class Sm100RmsNormSiluEngine : public IOssNormEngine {
                 params.scale = static_cast<float*>(extra.fp8_scale);
             } else {
                 // Use default scale = 1.0 from workspace (device memory)
-                // Write 1.0f (IEEE 754: 0x3F800000) via 32-bit memset to avoid cudart dependency
-                float* default_scale = reinterpret_cast<float*>(ws_ptr);
-                CUresult memset_err =
-                    detail::cu_mem_set_d32_async(reinterpret_cast<CUdeviceptr>(default_scale), 0x3F800000u, 1, stream);
-                RETURN_CUDNN_FRONTEND_ERROR_IF(
-                    memset_err != CUDA_SUCCESS, error_code_t::CUDA_API_FAILED, "cuMemsetD32Async failed");
+                // Write 1.0f (IEEE 754: 0x3F800000) asynchronously on stream
+                float* default_scale   = reinterpret_cast<float*>(ws_ptr);
+                cudaError_t memset_err = detail::cuda_mem_set_d32_async(default_scale, 0x3F800000u, 1, stream);
+                RETURN_CUDNN_FRONTEND_ERROR_IF(memset_err != cudaSuccess,
+                                               error_code_t::CUDA_API_FAILED,
+                                               "cudaMemcpyAsync for default scale failed");
                 params.scale = default_scale;
             }
             params.scale_inv = static_cast<float*>(extra.fp8_scale_inv);  // may be nullptr
@@ -519,28 +519,19 @@ class Sm100RmsNormSiluEngine : public IOssNormEngine {
         int smem_bytes = 0;
 
         // Set shared memory attribute
-        CUresult cu_err;
-        cu_err = detail::cu_kernel_set_attribute(
-            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_bytes, kernelPtr_, device);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(cu_err != CUDA_SUCCESS,
-                                       error_code_t::CUDA_API_FAILED,
-                                       "cuKernelSetAttribute failed: " + detail::cu_result_to_string(cu_err));
+        cudaError_t cuda_err;
+        cuda_err = detail::cuda_kernel_set_attribute_for_device(
+            kernelPtr_, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes, device);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            cuda_err != cudaSuccess,
+            error_code_t::CUDA_API_FAILED,
+            "cudaKernelSetAttributeForDevice failed: " + detail::cuda_error_to_string(cuda_err));
 
         // Launch
-        cu_err = detail::cu_launch_kernel((CUfunction)kernelPtr_,
-                                          grid.x,
-                                          grid.y,
-                                          grid.z,
-                                          block.x,
-                                          block.y,
-                                          block.z,
-                                          smem_bytes,
-                                          stream,
-                                          kernelParams,
-                                          nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(cu_err != CUDA_SUCCESS,
+        cuda_err = detail::cuda_launch_kernel((const void*)kernelPtr_, grid, block, kernelParams, smem_bytes, stream);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(cuda_err != cudaSuccess,
                                        error_code_t::CUDA_API_FAILED,
-                                       "cuLaunchKernel failed: " + detail::cu_result_to_string(cu_err) +
+                                       "cudaLaunchKernel failed: " + detail::cuda_error_to_string(cuda_err) +
                                            " (grid=" + std::to_string(grid.x) + " block=" + std::to_string(block.x) +
                                            " smem=" + std::to_string(smem_bytes) + ")");
 
@@ -695,8 +686,8 @@ class Sm100RmsNormSiluEngine : public IOssNormEngine {
     bool support_checked_          = false;
 
     // State from build()
-    CUlibrary module_   = nullptr;
-    CUkernel kernelPtr_ = nullptr;
+    cudaLibrary_t module_   = nullptr;
+    cudaKernel_t kernelPtr_ = nullptr;
     std::unique_ptr<char[]> cubin_;
     size_t cubinSize_ = 0;
     bool built_       = false;

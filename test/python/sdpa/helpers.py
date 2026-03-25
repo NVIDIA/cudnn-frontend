@@ -1,6 +1,7 @@
 import cudnn
 import torch
 import math
+import time
 
 # fmt: off
 
@@ -395,12 +396,15 @@ def approx_equal(alloc, expected, atol, rtol, tag, disp_elems):
 
     return mismatch_cnt
 
-def time_execution(fn, *args, num_warmup: int = 3, num_trials: int = 10) -> torch.Tensor:
-    elapsed_times = torch.zeros(num_trials, dtype=torch.float)
+def time_execution(fn, *args, num_warmup: int = 3, num_trials: int = 10, num_drop: int = 5, flush_l2: bool = True) -> torch.Tensor:
+    l2_flush_buffer = torch.empty(256 * 1024 * 1024, device="cuda", dtype=torch.int8) if flush_l2 else None
     for _ in range(num_warmup):
         fn(*args)
         torch.cuda.synchronize()
+    elapsed_times = torch.zeros(num_trials, dtype=torch.float)
     for i in range(num_trials):
+        if l2_flush_buffer is not None:
+            l2_flush_buffer.zero_()
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
@@ -408,7 +412,33 @@ def time_execution(fn, *args, num_warmup: int = 3, num_trials: int = 10) -> torc
         end_event.record()
         torch.cuda.synchronize()
         elapsed_times[i] = start_event.elapsed_time(end_event)
-    return elapsed_times
+        time.sleep(min(elapsed_times[i].item() / 100_000, 1.0))
+    del l2_flush_buffer
+    return elapsed_times[num_drop:] if num_trials > num_drop else elapsed_times
+
+def time_execution_cupti(fn, *args, num_warmup: int = 3, num_trials: int = 10, num_drop: int = 5, flush_l2: bool = True) -> torch.Tensor:
+    l2_flush_buffer = torch.empty(256 * 1024 * 1024, device="cuda", dtype=torch.int8) if flush_l2 else None
+    for _ in range(num_warmup):
+        fn(*args)
+        torch.cuda.synchronize()
+    elapsed_times = torch.zeros(num_trials, dtype=torch.float)
+    for i in range(num_trials):
+        if l2_flush_buffer is not None:
+            l2_flush_buffer.zero_()
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], record_shapes=True) as prof:
+            fn(*args)
+            torch.cuda.synchronize()
+        matched_kernels = [
+            item for item in prof.key_averages()
+            if "cudnn" in item.key
+            or item.key.startswith("kernel_cutlass")
+            or "cutlass3x" in item.key
+        ]
+        if matched_kernels:
+            elapsed_times[i] = sum(item.device_time for item in matched_kernels) / 1000
+        time.sleep(min(elapsed_times[i].item() / 100_000, 1.0))
+    del l2_flush_buffer
+    return elapsed_times[num_drop:] if num_trials > num_drop else elapsed_times
 
 def profile_execution(fn, *args, trace_dir=None):
     activities = [torch.profiler.ProfilerActivity.CUDA]

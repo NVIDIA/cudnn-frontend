@@ -43,6 +43,7 @@ from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
+import os
 
 
 class GemmSwigluSm100(APIBase):
@@ -92,6 +93,8 @@ class GemmSwigluSm100(APIBase):
         self.sf_vec_size = sf_vec_size
         self.vector_f32 = vector_f32
         self.ab12_stages = ab12_stages
+        self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
+        print(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
 
         # Kernel selection
         if self.sfa_desc is None and self.sfb_desc is None and self.amax_desc is None and self.sfc_desc is None and self.norm_const_desc is None:
@@ -410,6 +413,12 @@ class GemmSwigluSm100(APIBase):
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
+        max_active_clusters -= self.num_cluster_overlap_margin
+        self._value_error_if(
+            max_active_clusters <= 0,
+            "max_active_clusters must be > 0 after applying overlap margin; reduce CUDNNFE_CLUSTER_OVERLAP_MARGIN",
+        )
+
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         if self._kernel is PersistentDenseGemmKernel:

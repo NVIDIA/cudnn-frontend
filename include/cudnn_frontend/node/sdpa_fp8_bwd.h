@@ -6,6 +6,7 @@
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
+#include "diagonal_band_mask.h"
 #include "matmul_fp8.h"
 #include "pointwise.h"
 #include "reduction.h"
@@ -405,6 +406,16 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                         << "  Expected d_qk_scale: " << d_qk_scale << ", d_v_scale: " << d_v_scale
                         << ", s_q_scale: " << s_q_scale << ", s_kv_scale: " << s_kv_scale << std::endl;
         }
+
+        // validate options for sink token
+        auto const& sink_token     = attributes.inputs.find(input_names::SINK_TOKEN);
+        bool const has_sink_token  = (sink_token != attributes.inputs.end()) && (sink_token->second != nullptr);
+        auto const& dsink_token    = attributes.outputs.find(output_names::DSINK_TOKEN);
+        bool const has_dsink_token = (dsink_token != attributes.outputs.end()) && (dsink_token->second != nullptr);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(has_dsink_token && !has_sink_token,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "If dSink_token output is requested, sink_token input must also be set.");
+
         return {error_code_t::OK, ""};
     }
 
@@ -615,11 +626,51 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             last_output = pointwise(last_output, attributes.inputs.at(input_names::Descale_O), mul_attributes);
         }
 
+        // dSink_token computation: dSink = sum(exp(sink - stats) * D) over batch and sequence
+        // Note: The backend kernel applies the negative sign internally.
+        auto const& sink_token_it  = attributes.inputs.find(input_names::SINK_TOKEN);
+        auto const& dsink_token_it = attributes.outputs.find(output_names::DSINK_TOKEN);
+        if (dsink_token_it != attributes.outputs.end() && dsink_token_it->second != nullptr &&
+            sink_token_it != attributes.inputs.end() && sink_token_it->second != nullptr) {
+            // sub_sink = sink - stats
+            auto sub_sink = pointwise(sink_token_it->second,
+                                      attributes.inputs[input_names::Stats],
+                                      Pointwise_attributes().set_name("sub_sink_stats").set_mode(PointwiseMode_t::SUB));
+            sub_sink->set_dim({b, h_q, s_q, 1}).set_stride({h_q * s_q, s_q, 1, 1});
+
+            // exp_sink = exp(sub_sink)
+            auto exp_sink =
+                pointwise(sub_sink, Pointwise_attributes().set_name("exp_sink").set_mode(PointwiseMode_t::EXP));
+            exp_sink->set_dim({b, h_q, s_q, 1}).set_stride({h_q * s_q, s_q, 1, 1});
+
+            // per_token_grad = exp_sink * last_output (D)
+            auto per_token_grad = pointwise(
+                exp_sink, last_output, Pointwise_attributes().set_name("mul_exp_sink_D").set_mode(PointwiseMode_t::MUL));
+            per_token_grad->set_dim({b, h_q, s_q, 1}).set_stride({h_q * s_q, s_q, 1, 1});
+
+            // dSink = reduce(per_token_grad) over batch and sequence dimensions
+            reduction(per_token_grad,
+                      Reduction_attributes().set_name("reduce_dSink").set_mode(ReductionMode_t::ADD),
+                      dsink_token_it->second);
+        }
+
         // softmax_sum = last_output * dropout_scale
-        if(attributes.inputs[input_names::Dropout_scale_inv]) {
+        // Note: When sink_token is enabled and dropout is NOT present, we still need a MUL operation
+        // in the softmax path so the backend pattern matcher (fortAttentionBackwardRuntimeFusionEngine)
+        // can correctly distinguish between the dSink chain (MUL→REDUCE) and the softmax path (MUL→SUB).
+        // Without this, the fallback at lines 3786-3796 incorrectly identifies dSink MUL as the softmax path.
+        bool const has_sink_token = (sink_token_it != attributes.inputs.end() && sink_token_it->second != nullptr);
+        if (attributes.inputs[input_names::Dropout_scale_inv]) {
             last_output = pointwise(last_output,
                                     attributes.inputs[input_names::Dropout_scale_inv],
                                     Pointwise_attributes().set_name("scale_dropout_inv").set_mode(PointwiseMode_t::MUL));
+        } else if (has_sink_token) {
+            // Add identity MUL (multiply by 1) to create MUL→SUB pattern for pattern matcher
+            auto one_tensor = std::make_shared<Tensor_attributes>(1.0f);
+            last_output     = pointwise(last_output,
+                                    one_tensor,
+                                    Pointwise_attributes().set_name("identity_for_sink").set_mode(PointwiseMode_t::MUL));
+            last_output->set_dim({b, h_q, s_q, 1}).set_stride({h_q * s_q, s_q, 1, 1});
         }
         auto softmax_sum = last_output;
 
@@ -714,150 +765,29 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                           Pointwise_attributes().set_name("select_padding").set_mode(PointwiseMode_t::BINARY_SELECT));
         }
 
-        //// Optional causal masking
-        if (attributes.has_causal_like_masking()) {
-            auto row_index_attributes =
-                Pointwise_attributes().set_name("gen_row_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(2);
-            std::shared_ptr<Tensor_attributes> row_index_output = pointwise(last_dV, row_index_attributes);
-            row_index_output->set_data_type(DataType_t::INT32);
+        // Apply (bottom-right) causal masking (with right bound) and/or set the left bound
+        if (attributes.left_bound.has_value() || attributes.right_bound.has_value()) {
+            auto graph_                  = std::make_shared<Graph>();
+            std::shared_ptr<INode> node_ = std::static_pointer_cast<INode>(graph_);
+            node_->context               = this->context;
 
-            auto col_index_attributes =
-                Pointwise_attributes().set_name("gen_col_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(3);
-            auto const& col_index_output = pointwise(last_dV, col_index_attributes);
-            col_index_output->set_data_type(DataType_t::INT32);
+            auto s_kv_ptr = attributes.inputs.find(input_names::SEQ_LEN_KV) != attributes.inputs.end()
+                                ? attributes.inputs[input_names::SEQ_LEN_KV]
+                                : nullptr;
+            auto s_q_ptr  = attributes.inputs.find(input_names::SEQ_LEN_Q) != attributes.inputs.end()
+                                ? attributes.inputs[input_names::SEQ_LEN_Q]
+                                : nullptr;
 
-            if (attributes.has_causal_mask_bottom_right()) {
-                if (attributes.inputs[input_names::SEQ_LEN_KV]) {
-                    row_index_output = pointwise(row_index_output,
-                                          attributes.inputs[input_names::SEQ_LEN_KV],
-                                          Pointwise_attributes()
-                                              .set_name("row_idx_add_skv")
-                                              .set_mode(PointwiseMode_t::ADD)
-                                              .set_compute_data_type(DataType_t::INT32));
-                } else {
-                    row_index_output = pointwise(row_index_output,
-                                          std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv)),
-                                          Pointwise_attributes()
-                                              .set_name("row_idx_add_skv")
-                                              .set_mode(PointwiseMode_t::ADD)
-                                              .set_compute_data_type(DataType_t::INT32));
-                }
-                row_index_output->set_data_type(DataType_t::INT32);
-
-                if (attributes.inputs[input_names::SEQ_LEN_Q]) {
-                    row_index_output = pointwise(row_index_output,
-                                          attributes.inputs[input_names::SEQ_LEN_Q],
-                                          Pointwise_attributes()
-                                              .set_name("row_idx_add_sq_sub_sq")
-                                              .set_mode(PointwiseMode_t::SUB)
-                                              .set_compute_data_type(DataType_t::INT32));
-                } else {
-                    row_index_output = pointwise(row_index_output,
-                                          std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q)),
-                                          Pointwise_attributes()
-                                              .set_name("row_idx_add_sq_sub_sq")
-                                              .set_mode(PointwiseMode_t::SUB)
-                                              .set_compute_data_type(DataType_t::INT32));
-                }
-                row_index_output->set_data_type(DataType_t::INT32);
-            }
-
-            // For right_bound > 0, shift row index right by right_bound to widen the window
-            if (attributes.right_bound.value() != 0) {
-                auto right_bound_val = std::make_shared<Tensor_attributes>(
-                    static_cast<int32_t>(attributes.right_bound.value()));
-                row_index_output = pointwise(row_index_output,
-                                             right_bound_val,
-                                             Pointwise_attributes()
-                                                 .set_name("row_add_right_bound")
-                                                 .set_mode(PointwiseMode_t::ADD)
-                                                 .set_compute_data_type(DataType_t::INT32));
-                row_index_output->set_data_type(DataType_t::INT32);
-            }
-
-            auto greater_than_attributes = Pointwise_attributes()
-                                               .set_name("row_greater_than_col")
-                                               .set_mode(PointwiseMode_t::CMP_GE)
-                                               .set_compute_data_type(DataType_t::BOOLEAN);
-            auto const& row_greater_than_col_output =
-                pointwise(row_index_output, col_index_output, greater_than_attributes);
-            row_greater_than_col_output->set_data_type(DataType_t::BOOLEAN);
-
-            // Lower attributes to binary select attributes
-            auto negative_inf_causal = std::make_shared<Tensor_attributes>(attn::score_modifiers::get_negative_inf_value());
-
-            auto binary_select_attributes =
-                Pointwise_attributes().set_name("binary_select").set_mode(PointwiseMode_t::BINARY_SELECT);
-            last_dV = pointwise(last_dV, negative_inf_causal, row_greater_than_col_output, binary_select_attributes);
-        }
-
-        //// Optional sliding window mask (left bound)
-        if (attributes.has_sliding_window()) {
-            // Generate row and col indices
-            auto row_idx_swa = pointwise(last_dV,
-                Pointwise_attributes().set_name("gen_row_idx_swa")
-                    .set_mode(PointwiseMode_t::GEN_INDEX).set_axis(2));
-            row_idx_swa->set_data_type(DataType_t::INT32);
-
-            auto col_idx_swa = pointwise(last_dV,
-                Pointwise_attributes().set_name("gen_col_idx_swa")
-                    .set_mode(PointwiseMode_t::GEN_INDEX).set_axis(3));
-            col_idx_swa->set_data_type(DataType_t::INT32);
-
-            // For BOTTOM_RIGHT: adjust row index by (s_kv - s_q)
-            if (attributes.diagonal_alignment == DiagonalAlignment_t::BOTTOM_RIGHT) {
-                if (attributes.inputs[input_names::SEQ_LEN_KV]) {
-                    row_idx_swa = pointwise(row_idx_swa,
-                        attributes.inputs[input_names::SEQ_LEN_KV],
-                        Pointwise_attributes().set_name("swa_row_add_skv")
-                            .set_mode(PointwiseMode_t::ADD)
-                            .set_compute_data_type(DataType_t::INT32));
-                } else {
-                    row_idx_swa = pointwise(row_idx_swa,
-                        std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv)),
-                        Pointwise_attributes().set_name("swa_row_add_skv")
-                            .set_mode(PointwiseMode_t::ADD)
-                            .set_compute_data_type(DataType_t::INT32));
-                }
-                row_idx_swa->set_data_type(DataType_t::INT32);
-
-                if (attributes.inputs[input_names::SEQ_LEN_Q]) {
-                    row_idx_swa = pointwise(row_idx_swa,
-                        attributes.inputs[input_names::SEQ_LEN_Q],
-                        Pointwise_attributes().set_name("swa_row_sub_sq")
-                            .set_mode(PointwiseMode_t::SUB)
-                            .set_compute_data_type(DataType_t::INT32));
-                } else {
-                    row_idx_swa = pointwise(row_idx_swa,
-                        std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q)),
-                        Pointwise_attributes().set_name("swa_row_sub_sq")
-                            .set_mode(PointwiseMode_t::SUB)
-                            .set_compute_data_type(DataType_t::INT32));
-                }
-                row_idx_swa->set_data_type(DataType_t::INT32);
-            }
-
-            // Compute col + left_bound
-            auto left_bound_val = std::make_shared<Tensor_attributes>(
-                static_cast<int32_t>(attributes.left_bound.value()));
-            auto col_plus_lb = pointwise(col_idx_swa, left_bound_val,
-                Pointwise_attributes().set_name("col_add_left_bound")
-                    .set_mode(PointwiseMode_t::ADD)
-                    .set_compute_data_type(DataType_t::INT32));
-            col_plus_lb->set_data_type(DataType_t::INT32);
-
-            // Mask: keep where col + left_bound > row
-            auto swa_mask = pointwise(col_plus_lb, row_idx_swa,
-                Pointwise_attributes().set_name("swa_cmp_gt")
-                    .set_mode(PointwiseMode_t::CMP_GT)
-                    .set_compute_data_type(DataType_t::BOOLEAN));
-            swa_mask->set_data_type(DataType_t::BOOLEAN);
-
-            auto negative_inf_swa = std::make_shared<Tensor_attributes>(
-                attn::score_modifiers::get_negative_inf_value());
-            last_dV = pointwise(last_dV, negative_inf_swa, swa_mask,
-                Pointwise_attributes().set_name("swa_binary_select")
-                    .set_mode(PointwiseMode_t::BINARY_SELECT));
+            last_dV = attn::score_modifiers::sliding_window_mask(graph_,
+                                                                 last_dV,
+                                                                 attributes.diagonal_alignment,
+                                                                 attributes.left_bound,
+                                                                 attributes.right_bound,
+                                                                 s_q,
+                                                                 s_kv,
+                                                                 s_q_ptr,
+                                                                 s_kv_ptr);
+            sub_nodes.emplace_back(std::move(node_));
         }
 
         //// Apply Softmax
@@ -1016,6 +946,11 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             K_seq_dequant->set_is_virtual(true);
             K_seq_dequant->set_dim(attributes.inputs[input_names::K_T]->get_dim());
             K_seq_dequant->set_stride(attributes.inputs[input_names::K_T]->get_stride());
+
+            int64_t s_kv_scale_padded = ((s_kv + 127) / 128) * 4;
+            auto& sf_k_T = attributes.inputs[input_names::Descale_K_T];
+            sf_k_T->set_stride({h_k * s_kv_scale_padded * 128, s_kv_scale_padded * 128, b * h_k * s_kv_scale_padded * 128, 1});
+
             block_scale_dequantize(attributes.inputs[input_names::K_T],
                                    attributes.inputs[input_names::Descale_K_T],
                                    dequant_K_seq_attrs,
@@ -1070,6 +1005,11 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             Q_seq_dequant->set_is_virtual(true);
             Q_seq_dequant->set_dim(attributes.inputs[input_names::Q_T]->get_dim());
             Q_seq_dequant->set_stride(attributes.inputs[input_names::Q_T]->get_stride());
+
+            int64_t s_q_scale_padded = ((s_q + 127) / 128) * 4;
+            auto& sf_q_T = attributes.inputs[input_names::Descale_Q_T];
+            sf_q_T->set_stride({h_q * s_q_scale_padded * 128, s_q_scale_padded * 128, b * h_q * s_q_scale_padded * 128, 1});
+
             block_scale_dequantize(attributes.inputs[input_names::Q_T],
                                    attributes.inputs[input_names::Descale_Q_T],
                                    dequant_Q_seq_attrs,
@@ -1115,7 +1055,10 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
     std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const {
-        if (is_deterministic_algorithm_supported_on_blackwell) {
+        int32_t const sm_version = context.get_sm_version();
+        if (sm_version > 103 && is_deterministic_algorithm_supported_on_blackwell) {
+            return {18, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
+        } else if (is_deterministic_algorithm_supported_on_blackwell) {
             return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
         } else {
             return {-1, {}};

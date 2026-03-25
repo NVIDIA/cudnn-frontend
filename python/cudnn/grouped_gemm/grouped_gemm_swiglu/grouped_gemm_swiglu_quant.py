@@ -2328,8 +2328,11 @@ class BlockScaledContiguousGroupedGemmKernel:
                 # Get PROB
                 # Note, it always assumes T2R_M/EPI_M is 1, otherwise it will break the result.
                 #
-                mPosition = tile_info[0] * self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape) + tidx
-                mProb = prob[mPosition, 0, 0]
+                if cutlass.const_expr(prob is not None):
+                    mPosition = tile_info[0] * self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape) + tidx
+                    mProb = prob[mPosition, 0, 0]
+                else:
+                    mProb = cutlass.Float32(1.0)
 
                 #
                 # Wait for accumulator buffer full

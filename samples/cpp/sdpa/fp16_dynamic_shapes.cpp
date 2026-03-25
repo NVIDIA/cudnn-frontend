@@ -30,9 +30,9 @@ namespace fe = cudnn_frontend;
 
 /*
 Run this example by using command:
-bin/samples "Toy sdpa forward"
+bin/samples "Toy sdpa forward with dynamic shapes"
 
-This example shows how to construct a sdpa forward graph.
+This example shows how to construct a sdpa forward graph with dynamic shapes.
 */
 
 // Tensors in forward pass

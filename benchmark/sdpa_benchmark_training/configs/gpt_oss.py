@@ -13,8 +13,8 @@ from ..config_types import ModelPreset, BenchmarkConfig
 
 GPT_OSS = ModelPreset(
     name="gpt_oss",
-    num_q_heads=64,
-    num_kv_heads=8,  # GQA with 8:1 ratio
+    num_q_heads=128,
+    num_kv_heads=128,
     head_dim=64,
 )
 
@@ -32,9 +32,9 @@ CONFIG = BenchmarkConfig(
     data_types=["bfloat16", "fp8", "mxfp8"],
     attn_masks=["top_left"],  # Causal with sliding window
     profile_pass="both",  # Forward and backward
-    deterministic_bwd=[False],
-    sliding_window_size=1024,  # 1024-token sliding window
-    batch_size=2,
+    deterministic_bwd=[True],
+    sliding_window_size=128,
+    batch_size=1,
     num_iterations=10,
     output_dir="results",
 )

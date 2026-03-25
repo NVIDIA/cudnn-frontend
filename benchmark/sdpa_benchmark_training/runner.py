@@ -157,17 +157,10 @@ class BenchmarkRunner:
             if det_bwd and config.profile_pass == "fwd":
                 continue
 
-            # MXFP8 constraints: cudnn-only, forward-only, no sliding window
+            # MXFP8 constraints: cudnn-only
             if data_type == "mxfp8":
                 if backend != "cudnn":
                     continue
-                if config.sliding_window_size is not None:
-                    continue
-
-            # For mxfp8, override profile_pass to fwd-only (bwd not supported)
-            case_profile_pass = config.profile_pass
-            if data_type == "mxfp8" and case_profile_pass in ("bwd", "both"):
-                case_profile_pass = "fwd"
 
             yield {
                 "config_name": config.name,
@@ -177,7 +170,7 @@ class BenchmarkRunner:
                 "backend": backend,
                 "data_type": data_type,
                 "attn_mask": attn_mask,
-                "profile_pass": case_profile_pass,
+                "profile_pass": config.profile_pass,
                 "batch_size": config.batch_size,
                 "num_iterations": config.num_iterations,
                 "num_warmup_iterations": config.num_warmup_iterations,

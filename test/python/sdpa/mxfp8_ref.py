@@ -4,11 +4,16 @@ import cudnn
 # fmt: off
 
 def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, torch_itype=torch.float8_e4m3fn, output_type=torch.bfloat16,
-                left_bound=None, right_bound=None, diag_align=None):
+                left_bound=None, right_bound=None, diag_align=None, sink_token=None):
     """
     Compute reference SDPA with MXFP8 dequantization.
     Takes FP8 inputs and converts to FP32 to match cuDNN behavior.
     Supports GQA/MQA where K and V have fewer heads than Q.
+
+    If sink_token is provided (shape: 1, h_q, 1, 1), it's used as a virtual attention
+    score that competes with Q*K scores in softmax but contributes zero to the output
+    (no V for sink). This is implemented via online softmax initialization:
+    m_old = sink_token, l_old = 1.
     """
     # Convert FP8 to FP32 (matches cuDNN's input handling)
     q_f32 = q_fp8.float()
@@ -62,8 +67,16 @@ def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, t
     block_size = 128
     num_blocks = (s_kv + block_size - 1) // block_size
 
-    m_old = torch.full((b * h_q, s_q, 1), float('-inf'), dtype=torch.float32, device=q.device)
-    l_old = torch.zeros((b * h_q, s_q, 1), dtype=torch.float32, device=q.device)
+    # Initialize online softmax state. If sink_token is present, use it as the
+    # initial m_old with l_old=1, effectively adding a virtual attention score.
+    if sink_token is not None:
+        # sink_token shape: (1, h_q, 1, 1) -> expand to (b * h_q, s_q, 1)
+        sink_expanded = sink_token.float().reshape(1, h_q, 1, 1).expand(b, h_q, s_q, 1)
+        m_old = sink_expanded.reshape(b * h_q, s_q, 1).clone()
+        l_old = torch.ones((b * h_q, s_q, 1), dtype=torch.float32, device=q.device)
+    else:
+        m_old = torch.full((b * h_q, s_q, 1), float('-inf'), dtype=torch.float32, device=q.device)
+        l_old = torch.zeros((b * h_q, s_q, 1), dtype=torch.float32, device=q.device)
     o = torch.zeros((b * h_q, s_q, d_vo), dtype=torch.float32, device=q.device)
 
     for j in range(num_blocks):
@@ -106,7 +119,14 @@ def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, t
 def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, dO_fp8, dO_t_fp8, attn_scale,
                          sf_q_ref, sf_q_t_ref, sf_k_ref, sf_k_t_ref, sf_v_ref, sf_dO_ref, sf_dO_t_ref,
                          torch_itype=torch.float8_e4m3fn, torch_otype=torch.bfloat16,
-                         left_bound=None, right_bound=None, diag_align=None):
+                         left_bound=None, right_bound=None, diag_align=None, sink_token=None):
+    """
+    Compute backward pass reference for MXFP8 SDPA.
+
+    If sink_token is provided, the virtual sink is included in softmax normalization
+    and dSink_token is computed: dS_sink = -p_sink * D (no attn_scale), then summed
+    over batch and query dimensions.
+    """
     # Convert FP8 to FP32
     q_f32 = q_fp8.float()
     q_t_f32 = q_t_fp8.float()
@@ -177,7 +197,18 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
             swa_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=s.device).tril(diagonal=-1 * left_bound + (s_kv - s_q))
         s = s.masked_fill(swa_mask.unsqueeze(0), float('-inf'))
 
-    p = s.softmax(dim=-1).nan_to_num().float()
+    # If sink_token is present, prepend it as a virtual attention score
+    p_sink = None
+    if sink_token is not None:
+        # sink_token shape: (1, h_q, 1, 1) -> expand to (b * h_q, s_q, 1)
+        sink_expanded = sink_token.float().reshape(1, h_q, 1, 1).expand(b, h_q, s_q, 1)
+        sink_3d = sink_expanded.reshape(b * h_q, s_q, 1)
+        s_extended = torch.cat([sink_3d, s], dim=-1)  # (b * h_q, s_q, 1 + s_kv)
+        p_extended = s_extended.softmax(dim=-1).nan_to_num().float()
+        p_sink = p_extended[:, :, 0:1]  # probability for sink (b * h_q, s_q, 1)
+        p = p_extended[:, :, 1:]  # probabilities for actual K positions (b * h_q, s_q, s_kv)
+    else:
+        p = s.softmax(dim=-1).nan_to_num().float()
     p_fp8 = p.to(torch_itype).float()
 
     # Use BF16 inputs for D
@@ -191,20 +222,29 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
     # dS = P * (dP - D) * attn_scale
     dS = p * (dP - D) * attn_scale
 
+    # Compute dSink_token if sink_token was provided
+    # Formula: dSink = -exp(sink - logsumexp) * D summed over batch and sequence
+    # Note: attn_scale is NOT applied because sink_token is added directly to scores,
+    # not multiplied by attn_scale like Q @ K.T
+    dSink_token = None
+    if sink_token is not None:
+        dS_sink = -p_sink * D  # (b * h_q, s_q, 1)
+        # Reshape to (b, h_q, s_q, 1) and sum over batch and query dims
+        dS_sink_4d = dS_sink.reshape(b, h_q, s_q, 1)
+        dSink_token = dS_sink_4d.sum(dim=(0, 2), keepdim=True)  # (1, h_q, 1, 1)
+
     from .mxfp8 import quantize_to_mxfp8
     s_q_padded = ((s_q + 127) // 128) * 128
     dS_4d = dS.reshape(b, h_q, s_q, s_kv)
     dS_fp8, sf_dS_ref, _, dS_fp8_t, sf_dS_t_ref, _ = quantize_to_mxfp8(
-        dS_4d, b, h_q, s_q, s_kv, s_q_padded, block_size=32, fp8_dtype=torch_itype
+        dS_4d, b, h_q, s_q, s_kv, block_size=32, fp8_dtype=torch_itype
     )
 
-    # D-quantized dS (along s_kv): permute sf [s_q_padded, s_kv, B*H_q] -> [B*H_q, s_q, s_kv]
-    sf_dS_ref = sf_dS_ref.permute(2, 0, 1)[:, :s_q, :s_kv]
+    # D-quantized dS (along s_kv)
     dS_fp32 = dS_fp8.float().reshape(b * h_q, s_q, s_kv) * sf_dS_ref
 
-    # S-quantized dS (along s_q): permute sf [s_kv_padded, s_q, B*H_q] -> [B*H_q, s_q, s_kv]
-    sf_dS_t_ref = sf_dS_t_ref.permute(2, 1, 0)[:, :s_q, :s_kv]
-    dS_fp32_t = dS_fp8_t.transpose(-2, -1).contiguous().float().reshape(b * h_q, s_q, s_kv) * sf_dS_t_ref
+    # S-quantized dS (along s_q)
+    dS_fp32_t = dS_fp8_t.float().reshape(b * h_q, s_q, s_kv) * sf_dS_t_ref
 
     # P @ dO -> dV
     dV = torch.einsum("bqk,bqd->bkd", p_fp8, dO_t_dq)
@@ -229,4 +269,4 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
     dK = dK.reshape(b, h_k, s_kv, d_qk).to(torch_otype).float()
     dV = dV.reshape(b, h_v, s_kv, d_vo).to(torch_otype).float()
 
-    return dQ, dK, dV
+    return dQ, dK, dV, dSink_token

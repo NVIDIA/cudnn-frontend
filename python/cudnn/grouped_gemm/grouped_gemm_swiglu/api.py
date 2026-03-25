@@ -37,6 +37,7 @@ from .grouped_gemm_swiglu_quant import (
     BlockScaledContiguousGroupedGemmKernel,
 )
 from cuda.bindings import driver as cuda
+import os
 import torch
 from typing import Tuple, Optional
 
@@ -140,7 +141,11 @@ class GroupedGemmSwigluSm100(APIBase):
         self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row")
         self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col")
         self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax")
-        self.norm_const_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_norm_const, name="sample_norm_const"), 1, "norm_const")
+        self.norm_const_desc = self._unpad_tensor_to_ndim(
+            self._make_tensor_desc(sample_norm_const, name="sample_norm_const"),
+            1,
+            "norm_const",
+        )
         self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob")
 
         # expert_cnt derived from padded_offsets shape
@@ -162,6 +167,8 @@ class GroupedGemmSwigluSm100(APIBase):
         self._interpret_uint8_as_fp4x2 = True
         self._kernel = BlockScaledContiguousGroupedGemmKernel
 
+        self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
+        print(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
         self._logger.debug(f"__init__ completed")
 
     def check_support(self) -> bool:
@@ -199,7 +206,11 @@ class GroupedGemmSwigluSm100(APIBase):
         self._check_tensor_shape(self.sfa_desc, (32, 4, ceil_div(tensor_m, 128), 4, rest_k, 1), "SFA")
         self._check_tensor_shape(self.sfb_desc, (32, 4, ceil_div(n, 128), 4, rest_k, l), "SFB")
         rest_n2 = ceil_div(ceil_div(n // 2, self.sf_vec_size), 4)
-        self._check_tensor_shape(self.sfd_row_desc, (32, 4, ceil_div(tensor_m, 128), 4, rest_n2, 1), "SFD_row")
+        self._check_tensor_shape(
+            self.sfd_row_desc,
+            (32, 4, ceil_div(tensor_m, 128), 4, rest_n2, 1),
+            "SFD_row",
+        )
         rest_m = ceil_div(ceil_div(tensor_m, self.sf_vec_size), 4)
         self._check_tensor_shape(self.sfd_col_desc, (32, 4, ceil_div(n // 2, 128), 4, rest_m, 1), "SFD_col")
 
@@ -209,11 +220,31 @@ class GroupedGemmSwigluSm100(APIBase):
         self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
         self._check_tensor_shape(self.padded_offsets_desc, (l,), "padded_offsets")
 
-        _ = self._check_tensor_stride(self.a_desc, stride=[(k, 1, tensor_m * k)], extra_error_msg="A must have k-major layout")
-        _ = self._check_tensor_stride(self.b_desc, stride=[(k, 1, n * k)], extra_error_msg="B must have k-major layout")
-        _ = self._check_tensor_stride(self.c_desc, stride=[(n, 1, tensor_m * n)], extra_error_msg="C must have n-major layout")
-        _ = self._check_tensor_stride(self.d_desc, stride=[(n_2, 1, tensor_m * n_2)], extra_error_msg="D must have n-major layout")
-        _ = self._check_tensor_stride(self.d_col_desc, stride=[(n_2, 1, tensor_m * n_2)], extra_error_msg="D_col must have n-major layout")
+        _ = self._check_tensor_stride(
+            self.a_desc,
+            stride=[(k, 1, tensor_m * k)],
+            extra_error_msg="A must have k-major layout",
+        )
+        _ = self._check_tensor_stride(
+            self.b_desc,
+            stride=[(k, 1, n * k)],
+            extra_error_msg="B must have k-major layout",
+        )
+        _ = self._check_tensor_stride(
+            self.c_desc,
+            stride=[(n, 1, tensor_m * n)],
+            extra_error_msg="C must have n-major layout",
+        )
+        _ = self._check_tensor_stride(
+            self.d_desc,
+            stride=[(n_2, 1, tensor_m * n_2)],
+            extra_error_msg="D must have n-major layout",
+        )
+        _ = self._check_tensor_stride(
+            self.d_col_desc,
+            stride=[(n_2, 1, tensor_m * n_2)],
+            extra_error_msg="D_col must have n-major layout",
+        )
 
         self._logger.debug("Checking data types")
         self.ab_dtype = self._check_dtype(
@@ -226,30 +257,66 @@ class GroupedGemmSwigluSm100(APIBase):
             ],
             name="A/B",
         )
-        self._check_dtype(self.b_desc, dtype=self.ab_dtype, name="B", extra_error_msg="B must have the same dtype as A")
+        self._check_dtype(
+            self.b_desc,
+            dtype=self.ab_dtype,
+            name="B",
+            extra_error_msg="B must have the same dtype as A",
+        )
 
         self.sf_dtype = self._check_dtype(
             self.sfa_desc,
             dtype=[torch.float8_e8m0fnu, torch.float8_e4m3fn],
             name="SFA/SFB/SFD_row/SFD_col",
         )
-        self._check_dtype(self.sfb_desc, dtype=self.sf_dtype, name="SFB", extra_error_msg="SFB must have the same dtype as SFA")
-        self._check_dtype(self.sfd_row_desc, dtype=self.sf_dtype, name="SFD_row", extra_error_msg="SFD_row must have the same dtype as SFA")
-        self._check_dtype(self.sfd_col_desc, dtype=self.sf_dtype, name="SFD_col", extra_error_msg="SFD_col must have the same dtype as SFA")
+        self._check_dtype(
+            self.sfb_desc,
+            dtype=self.sf_dtype,
+            name="SFB",
+            extra_error_msg="SFB must have the same dtype as SFA",
+        )
+        self._check_dtype(
+            self.sfd_row_desc,
+            dtype=self.sf_dtype,
+            name="SFD_row",
+            extra_error_msg="SFD_row must have the same dtype as SFA",
+        )
+        self._check_dtype(
+            self.sfd_col_desc,
+            dtype=self.sf_dtype,
+            name="SFD_col",
+            extra_error_msg="SFD_col must have the same dtype as SFA",
+        )
 
-        self._value_error_if(self.sf_vec_size not in [16, 32], f"sf_vec_size must be 16 or 32, got {self.sf_vec_size}")
+        self._value_error_if(
+            self.sf_vec_size not in [16, 32],
+            f"sf_vec_size must be 16 or 32, got {self.sf_vec_size}",
+        )
         self._value_error_if(
             self.sf_dtype in [torch.float8_e4m3fn] and self.sf_vec_size == 32,
             f"sf_dtype {self.sf_dtype} and sf_vec_size {self.sf_vec_size} combination is not supported",
         )
         self._value_error_if(
-            self._is_fp8(self.ab_dtype) and self.sf_vec_size == 16, f"ab_dtype {self.ab_dtype} and sf_vec_size {self.sf_vec_size} combination is not supported"
+            self._is_fp8(self.ab_dtype) and self.sf_vec_size == 16,
+            f"ab_dtype {self.ab_dtype} and sf_vec_size {self.sf_vec_size} combination is not supported",
         )
 
-        self._check_dtype(self.acc_dtype, dtype=torch.float32, name="Accumulator", extra_error_msg="Accumulator must be float32")
+        self._check_dtype(
+            self.acc_dtype,
+            dtype=torch.float32,
+            name="Accumulator",
+            extra_error_msg="Accumulator must be float32",
+        )
         self.c_dtype = self._check_dtype(
             self.c_desc,
-            dtype=[torch.float32, torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2, torch.float4_e2m1fn_x2],
+            dtype=[
+                torch.float32,
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+                torch.float4_e2m1fn_x2,
+            ],
             name="C",
         )
 
@@ -272,7 +339,12 @@ class GroupedGemmSwigluSm100(APIBase):
                 ],  # torch.float32 fails non-deterministicly
                 name="D",
             )
-        self._check_dtype(self.d_col_desc, dtype=self.d_dtype, name="D_col", extra_error_msg="D_col must have the same dtype as D")
+        self._check_dtype(
+            self.d_col_desc,
+            dtype=self.d_dtype,
+            name="D_col",
+            extra_error_msg="D_col must have the same dtype as D",
+        )
 
         self._not_implemented_error_if(
             self._is_fp4x2(self.ab_dtype) and self.sf_vec_size == 16 and self.d_dtype == torch.float32,  # Fails to compile
@@ -288,7 +360,10 @@ class GroupedGemmSwigluSm100(APIBase):
             self.use_2cta_instrs and self.mma_tiler_mn[0] not in [128, 256],
             f"MMA tiler M must be 128 or 256 when use_2cta_instrs=True, got {self.mma_tiler_mn[0]}",
         )
-        self._value_error_if(self.mma_tiler_mn[1] not in [128, 256], f"MMA tiler N must be 128 or 256, got {self.mma_tiler_mn[1]}")
+        self._value_error_if(
+            self.mma_tiler_mn[1] not in [128, 256],
+            f"MMA tiler N must be 128 or 256, got {self.mma_tiler_mn[1]}",
+        )
         self._value_error_if(
             self.cluster_shape_mn[0] % (2 if self.use_2cta_instrs else 1) != 0,
             f"cluster_shape_mn[0] must be divisible by 2 when use_2cta_instrs=True, got {self.cluster_shape_mn[0]}",
@@ -310,7 +385,10 @@ class GroupedGemmSwigluSm100(APIBase):
         # The contiguous layout means the aligned data is stored in a contiguous manner.
         # It can't handle runtime oob when alignment is not align with the tile_M,
         # since the problem shape of TMA store can't be changed at runtime.
-        self._value_error_if(cluster_tiler_m not in [128, 256], f"Invalid cluster tiler shape: expected cluster_tiler_m in {{128, 256}}, got {cluster_tiler_m}")
+        self._value_error_if(
+            cluster_tiler_m not in [128, 256],
+            f"Invalid cluster tiler shape: expected cluster_tiler_m in {{128, 256}}, got {cluster_tiler_m}",
+        )
         # Check if m_aligned is a multiple of cluster_tiler_m
         # This ensures that each group's M dimension (which is a multiple of m_aligned)
         # won't be split across tiles, preventing a single tile from loading data
@@ -349,8 +427,8 @@ class GroupedGemmSwigluSm100(APIBase):
         # Disabled configurations
         self._not_implemented_error_if(
             (self._is_fp8(self.ab_dtype)) and (self.mma_tiler_mn[1] == 128) and (self._is_fp8(self.d_dtype)),
-            f"Invalid configuration: fp8 ab_dtype and sf_vec_size 32 with mma_tiler_mn[1] == 128 and fp8 d_dtype is not supported"
-            + f"Please use mma_tiler_mn[1] == 256 instead",
+            "Invalid configuration: fp8 ab_dtype and sf_vec_size 32 with mma_tiler_mn[1] == 128 and fp8 d_dtype is not supported. "
+            "Please use mma_tiler_mn[1] == 256 instead",
         )
         self._not_implemented_error_if(
             self._is_fp4x2(self.ab_dtype) and (self.c_dtype not in [torch.float16, torch.bfloat16]),
@@ -377,6 +455,9 @@ class GroupedGemmSwigluSm100(APIBase):
         if self._compiled_kernel is not None:
             self._logger.debug("Kernel already compiled; skipping recompilation")
             return
+        if self.a_desc.shape[0] == 0:
+            self._logger.debug("sample valid_m is zero, skipping kernel compilation")
+            return
 
         gemm_swiglu = self._kernel(
             sf_vec_size=self.sf_vec_size,
@@ -393,25 +474,190 @@ class GroupedGemmSwigluSm100(APIBase):
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
+        max_active_clusters -= self.num_cluster_overlap_margin
+        self._value_error_if(
+            max_active_clusters <= 0,
+            "max_active_clusters must be > 0 after applying overlap margin; reduce CUDNNFE_CLUSTER_OVERLAP_MARGIN",
+        )
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         self._logger.debug("Compiling grouped_gemm_swiglu kernel")
+        use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL") is not None
+        if not use_full_dynamic:  # only mark the m dimension as dynamic
+            valid_m = cute.sym_int(divisibility=256)
+
+            a_cute_fake = self._make_fake_cute_compact_tensor(
+                dtype=self.a_desc.dtype,
+                shape=(valid_m, *self.a_desc.shape[1:]),
+                stride_order=self.a_desc.stride_order,
+            )
+            b_cute_fake = self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16)
+            c_cute_fake = self._make_fake_cute_compact_tensor(
+                dtype=self.c_desc.dtype,
+                shape=(valid_m, *self.c_desc.shape[1:]),
+                stride_order=self.c_desc.stride_order,
+            )
+            d_cute_fake = self._make_fake_cute_compact_tensor(
+                dtype=self.d_desc.dtype,
+                shape=(valid_m, *self.d_desc.shape[1:]),
+                stride_order=self.d_desc.stride_order,
+            )
+            d_col_cute_fake = self._make_fake_cute_compact_tensor(
+                dtype=self.d_col_desc.dtype,
+                shape=(valid_m, *self.d_col_desc.shape[1:]),
+                stride_order=self.d_col_desc.stride_order,
+            )
+
+            tensor_m_128 = cute.sym_int()
+            stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
+            sfa_cute_fake = self._make_fake_cute_tensor(
+                dtype=self.sfa_desc.dtype,
+                shape=(32, 4, tensor_m_128, 4, self.sfa_desc.shape[4], 1),
+                stride=(16, 4, self.sfa_desc.stride[2], 1, 512, stride_tensor_m_128),
+            )
+
+            sfb_cute_fake = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
+
+            prob_cute_fake = None
+            if self.prob_desc is not None:
+                prob_cute_fake = self._make_fake_cute_compact_tensor(
+                    dtype=self.prob_desc.dtype,
+                    shape=(valid_m, 1, 1),
+                    stride_order=self.prob_desc.stride_order,
+                )
+
+            sfd_row_fake = None
+            sfd_col_fake = None
+            if self.sfd_row_desc is not None:
+                stride_sfd_m = cute.sym_int(divisibility=32 * 4 * 4)
+                sfd_row_fake = self._make_fake_cute_tensor(
+                    dtype=self.sfd_row_desc.dtype,
+                    shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
+                    stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
+                )
+            if self.sfd_col_desc is not None:
+                rest_m = cute.sym_int(divisibility=1)
+                stride_sfd_n = cute.sym_int(divisibility=32 * 4 * 4)
+                stride_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
+                sfd_col_fake = self._make_fake_cute_tensor(
+                    dtype=self.sfd_col_desc.dtype,
+                    shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
+                    stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
+                )
+        else:
+            valid_m = cute.sym_int(divisibility=256)
+            n = cute.sym_int()
+            n_2 = cute.sym_int()
+            k = cute.sym_int()
+            l = cute.sym_int()
+
+            a_cute_fake = self._make_fake_cute_compact_tensor(
+                dtype=self.a_desc.dtype,
+                shape=(valid_m, k, 1),
+                stride_order=self.a_desc.stride_order,
+                dynamic_mode=self.a_desc.stride_order[0],
+                divisibility=32 if self._is_fp4x2(self.ab_dtype) else 16,
+            )
+            b_cute_fake = self._make_fake_cute_compact_tensor(
+                dtype=self.b_desc.dtype,
+                shape=(n, k, l),
+                stride_order=self.b_desc.stride_order,
+                dynamic_mode=self.b_desc.stride_order[0],
+                divisibility=32 if self._is_fp4x2(self.ab_dtype) else 16,
+            )
+            c_cute_fake = self._make_fake_cute_compact_tensor(
+                dtype=self.c_desc.dtype,
+                shape=(valid_m, n_2, 1),
+                stride_order=self.c_desc.stride_order,
+                dynamic_mode=self.c_desc.stride_order[0],
+                divisibility=8 if self._is_f16(self.c_desc.dtype) else 16,
+            )
+            d_cute_fake = self._make_fake_cute_compact_tensor(
+                dtype=self.d_desc.dtype,
+                shape=(valid_m, n_2, 1),
+                stride_order=self.d_desc.stride_order,
+                dynamic_mode=self.d_desc.stride_order[0],
+                divisibility=8 if self._is_f16(self.d_desc.dtype) else 16,
+            )
+            d_col_cute_fake = self._make_fake_cute_compact_tensor(
+                dtype=self.d_col_desc.dtype,
+                shape=(valid_m, n_2, 1),
+                stride_order=self.d_col_desc.stride_order,
+                dynamic_mode=self.d_col_desc.stride_order[0],
+                divisibility=8 if self._is_f16(self.d_col_desc.dtype) else 16,
+            )
+
+            tensor_m_128 = cute.sym_int()
+            rest_k = cute.sym_int()
+            stride_rest_k = cute.sym_int(divisibility=32 * 4 * 4)
+            stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
+            sfa_cute_fake = self._make_fake_cute_tensor(
+                dtype=self.sfa_desc.dtype,
+                shape=(32, 4, tensor_m_128, 4, rest_k, 1),
+                stride=(16, 4, stride_rest_k, 1, 512, stride_tensor_m_128),
+            )
+            tensor_n_128 = cute.sym_int()
+            stride_sfb_rest_k = cute.sym_int(divisibility=32 * 4 * 4)
+            stride_sfb_tensor_n_128 = cute.sym_int(divisibility=32 * 4 * 4)
+            sfb_cute_fake = self._make_fake_cute_tensor(
+                dtype=self.sfb_desc.dtype,
+                shape=(32, 4, tensor_n_128, 4, rest_k, l),
+                stride=(16, 4, stride_sfb_tensor_n_128, 1, 512, stride_sfb_rest_k),
+            )
+
+            prob_cute_fake = None
+            if self.prob_desc is not None:
+                prob_cute_fake = self._make_fake_cute_compact_tensor(
+                    dtype=self.prob_desc.dtype,
+                    shape=(valid_m, 1, 1),
+                    stride_order=self.prob_desc.stride_order,
+                )
+
+            sfd_row_fake = None
+            sfd_col_fake = None
+            if self.sfd_row_desc is not None:
+                rest_n2 = cute.sym_int()
+                stride_sfd_rest_n2 = cute.sym_int(divisibility=32 * 4 * 4)
+                stride_sfd_rest_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
+                sfd_row_fake = self._make_fake_cute_tensor(
+                    dtype=self.sfd_row_desc.dtype,
+                    shape=(32, 4, tensor_m_128, 4, rest_n2, 1),
+                    stride=(
+                        16,
+                        4,
+                        stride_sfd_rest_n2,
+                        1,
+                        512,
+                        stride_sfd_rest_tensor_m_128,
+                    ),
+                )
+            if self.sfd_col_desc is not None:
+                tensor_n2_128 = cute.sym_int()
+                rest_m = cute.sym_int()
+                stride_sfd_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
+                stride_sfd_n2 = cute.sym_int(divisibility=32 * 4 * 4)
+                sfd_col_fake = self._make_fake_cute_tensor(
+                    dtype=self.sfd_col_desc.dtype,
+                    shape=(32, 4, tensor_n2_128, 4, rest_m, 1),
+                    stride=(16, 4, stride_sfd_rest_m, 1, 512, stride_sfd_n2),
+                )
+
         _compiled_kernel = cute.compile(
             gemm_swiglu,
-            a=self._make_fake_cute_tensor_from_desc(self.a_desc, assumed_align=16),
-            b=self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16),
-            c=self._make_fake_cute_tensor_from_desc(self.c_desc, assumed_align=16),
-            d=self._make_fake_cute_tensor_from_desc(self.d_desc, assumed_align=16),
-            d_col=self._make_fake_cute_tensor_from_desc(self.d_col_desc, assumed_align=16),
-            sfa=self._make_fake_cute_tensor_from_desc(self.sfa_desc, assumed_align=16),
-            sfb=self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16),
-            sfd_row_tensor=self._make_fake_cute_tensor_from_desc(self.sfd_row_desc, assumed_align=16),
-            sfd_col_tensor=self._make_fake_cute_tensor_from_desc(self.sfd_col_desc, assumed_align=16),
+            a=a_cute_fake,
+            b=b_cute_fake,
+            c=c_cute_fake,
+            d=d_cute_fake,
+            d_col=d_col_cute_fake,
+            sfa=sfa_cute_fake,
+            sfb=sfb_cute_fake,
+            sfd_row_tensor=sfd_row_fake,
+            sfd_col_tensor=sfd_col_fake,
             amax_tensor=self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16),
             norm_const_tensor=self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16),
             padded_offsets=self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16),
             alpha=self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16),
-            prob=self._make_fake_cute_tensor_from_desc(self.prob_desc, assumed_align=16),
+            prob=prob_cute_fake,
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
             options="--enable-tvm-ffi",
@@ -496,6 +742,9 @@ class GroupedGemmSwigluSm100(APIBase):
         self._logger.debug("Entering execute")
         current_stream = self._get_default_stream(current_stream)
 
+        if a_tensor.shape[0] == 0:
+            self._logger.debug("execute: valid_m is zero, skipping kernel execution")
+            return
         self._runtime_error_if(
             self._compiled_kernel is None,
             "Kernel not compiled; call compile() first",
@@ -604,13 +853,23 @@ def grouped_gemm_swiglu_wrapper_sm100(
     n, _, l = b_tensor.shape
     n_out = n // 2  # After SwiGLU
 
-    _logger.debug(f"grouped_gemm_swiglu_wrapper_sm100: Creating output tensors c_tensor, d_tensor, d_col_tensor")
+    _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Creating output tensors c_tensor, d_tensor, d_col_tensor")
 
     if cd_major == "n":
         # 1, m, n, permute (1, 2, 0) -> (m, n, 1)
         c_tensor = torch.empty_strided((valid_m, n, 1), (n, 1, valid_m * n), dtype=c_dtype, device=a_tensor.device)
-        d_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
-        d_col_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
+        d_tensor = torch.empty_strided(
+            (valid_m, n_out, 1),
+            (n_out, 1, valid_m * n_out),
+            dtype=d_dtype,
+            device=a_tensor.device,
+        )
+        d_col_tensor = torch.empty_strided(
+            (valid_m, n_out, 1),
+            (n_out, 1, valid_m * n_out),
+            dtype=d_dtype,
+            device=a_tensor.device,
+        )
     else:
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
 
@@ -618,7 +877,10 @@ def grouped_gemm_swiglu_wrapper_sm100(
     sfd_col_tensor = None
     amax_tensor = None
 
-    if a_tensor.dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and sfa_tensor.dtype in [torch.float8_e8m0fnu, torch.float8_e4m3fn]:
+    if a_tensor.dtype in [
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ] and sfa_tensor.dtype in [torch.float8_e8m0fnu, torch.float8_e4m3fn]:
         _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Detected fp8 a_dtype and sfa_dtype, constructing sfd_row_tensor and sfd_col_tensor")
 
         sf_dtype = sfa_tensor.dtype
@@ -652,24 +914,38 @@ def grouped_gemm_swiglu_wrapper_sm100(
         _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Detected bf16/float16 d_dtype, constructing amax_tensor")
         amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
 
+    if valid_m == 0:
+        _logger.debug("grouped_gemm_swiglu_wrapper_sm100: valid_m is zero, skipping kernel execution")
+        return TupleDict(
+            c_tensor=c_tensor,
+            d_tensor=d_tensor,
+            d_col_tensor=d_col_tensor,
+            amax_tensor=amax_tensor,
+            sfd_row_tensor=sfd_row_tensor,
+            sfd_col_tensor=sfd_col_tensor,
+        )
+
+    use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL") is not None
+
+    def stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
+        return tuple(i for i, s in sorted(enumerate(tensor.stride()), key=lambda x: x[1]))
+
     cache_key = (
-        a_tensor.shape,
-        b_tensor.shape,
+        use_full_dynamic,
+        a_tensor.shape[1:] if not use_full_dynamic else None,
+        b_tensor.shape if not use_full_dynamic else None,
+        c_tensor.shape[1:] if not use_full_dynamic else None,
         a_tensor.dtype,
         b_tensor.dtype,
-        a_tensor.stride(),
-        b_tensor.stride(),
-        sfa_tensor.shape,
-        sfb_tensor.shape,
-        sfa_tensor.stride(),
-        sfb_tensor.stride(),
-        sfa_tensor.dtype,
-        sfb_tensor.dtype,
+        c_tensor.dtype,
+        stride_order(a_tensor),
+        stride_order(b_tensor),
+        stride_order(c_tensor),
         norm_const_tensor.shape if norm_const_tensor is not None else None,
         norm_const_tensor.stride() if norm_const_tensor is not None else None,
         norm_const_tensor.dtype if norm_const_tensor is not None else None,
-        padded_offsets.shape,
-        padded_offsets.stride(),
+        padded_offsets.shape if not use_full_dynamic else None,
+        padded_offsets.stride() if not use_full_dynamic else None,
         padded_offsets.dtype,
         acc_dtype,
         c_dtype,
@@ -681,6 +957,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
         vector_f32,
         m_aligned,
         discrete_col_sfd,
+        prob_tensor is not None,
     )
 
     if cache_key in _cache_of_GroupedGemmSwigluSm100Objects:

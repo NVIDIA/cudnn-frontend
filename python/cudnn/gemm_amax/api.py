@@ -3,6 +3,7 @@ from .dense_blockscaled_gemm_persistent_amax import (
 )
 
 from cuda.bindings import driver as cuda
+import os
 import torch
 from typing import Tuple, Optional
 
@@ -44,6 +45,9 @@ class GemmAmaxSm100(APIBase):
         self.mma_tiler_mn = mma_tiler_mn
         self.cluster_shape_mn = cluster_shape_mn
         self.sf_vec_size = sf_vec_size
+
+        self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
+        print(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
 
         # used to reshape sfa/sfb tensors to atom layout
         self.atom_m = (32, 4)
@@ -274,6 +278,11 @@ class GemmAmaxSm100(APIBase):
         )
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
+        max_active_clusters -= self.num_cluster_overlap_margin
+        self._value_error_if(
+            max_active_clusters <= 0,
+            "max_active_clusters must be > 0 after applying overlap margin; reduce CUDNNFE_CLUSTER_OVERLAP_MARGIN",
+        )
 
         self._logger.debug("Compiling gemm_amax")
         a_cute = self._make_fake_cute_tensor_from_desc(self.a_desc, assumed_align=16)

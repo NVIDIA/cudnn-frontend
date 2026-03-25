@@ -75,6 +75,7 @@ def pytest_addoption(parser):
     parser.addoption("--seed", action="store", type=int, default=None, help="[fuzzer] random seed for reproducibility")
     parser.addoption("--num-tests", action="store", type=int, default=100, help="[fuzzer] number of random tests to run")
     parser.addoption("--perf", action="store_true", help="enable performance profiling")
+    parser.addoption("--timing_method", action="store", type=str, default="cupti", choices=["events", "cupti"], help="timing method: 'cupti' (torch.profiler device_time, default) or 'events' (CUDA events)")
 
     # MHA command line options to overwrite specific test dimensions in test_mhas.py and test_mhas_v2.py.
     parser.addoption("--b", default=None, type=int, help="[test_mhas.py] batch dimension")

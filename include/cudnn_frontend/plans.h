@@ -777,7 +777,7 @@ class Execution_plan_list {
     error_t
     execute_oss_engine(std::unordered_map<int64_t, void*> const& tensor_uid_to_pointer_map,
                        void* workspace,
-                       CUdevice device,
+                       int device,
                        cudaStream_t stream) const {
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             !oss_engine_built_, error_code_t::GRAPH_EXECUTION_FAILED, "OSS engine not built");
@@ -830,7 +830,7 @@ class Execution_plan_list {
     error_t
     execute_oss_engine(std::unordered_map<int64_t, void*> const& tensor_uid_to_pointer_map,
                        void* workspace,
-                       CUdevice device,
+                       int device,
                        cudaStream_t stream,
                        std::vector<int64_t> const& override_uids,
                        std::vector<std::vector<int64_t>> const& override_shapes,
@@ -1023,7 +1023,7 @@ class Execution_plan_list {
     error_t
     execute_oss_rms_norm_silu_engine(std::unordered_map<int64_t, void*> const& tensor_uid_to_pointer_map,
                                      void* workspace,
-                                     CUdevice device,
+                                     int device,
                                      cudaStream_t stream) const {
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             !oss_rms_norm_silu_built_, error_code_t::GRAPH_EXECUTION_FAILED, "RmsNorm+SiLU OSS engine not built");
