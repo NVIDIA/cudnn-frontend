@@ -527,7 +527,8 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                   std::optional<PyCallback> fn,
                   py::object const& generate_stats,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
-                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp) {
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token) {
     cudnn_frontend::DataType_t mma_core_mode                             = cudnn_frontend::DataType_t::FP8_E4M3;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> block_mask = nullptr;
 
@@ -604,7 +605,7 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          actual_generate_stats,
                                          score_max,
                                          score_sum_exp,
-                                         /*sink_token=*/nullptr,
+                                         sink_token,
                                          mma_core_mode,
                                          descale_q,
                                          descale_k,
@@ -633,7 +634,8 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
                     py::object const& right_bound,
                     cudnn_frontend::DataType_t const& compute_data_type,
                     std::string const& name,
-                    py::object const& generate_stats) {
+                    py::object const& generate_stats,
+                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token) {
     auto attributes =
         cudnn_frontend::graph::SDPA_fp8_attributes().set_name(name).set_compute_data_type(compute_data_type);
 
@@ -708,6 +710,11 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
         }
     }
 
+    // Set sink_token
+    if (sink_token) {
+        attributes.set_sink_token(sink_token);
+    }
+
     // Call the MXFP8 6-parameter overload of sdpa_fp8
     // This uses block scale factors (E8M0 + F8_128x4) instead of regular scalar descales
     auto result_array = graph->sdpa_fp8(q, k, v, descale_q, descale_k, descale_v, attributes);
@@ -747,7 +754,9 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
                            bool const use_deterministic_algorithm,
                            py::object const& dropout,
                            cudnn_frontend::DataType_t const& compute_data_type,
-                           std::string const& name) {
+                           std::string const& name,
+                           std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+                           std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token) {
     cudnn_frontend::DiagonalAlignment_t actual_diagonal_alignment = diagonal_alignment;
     py::object actual_right_bound                                 = right_bound;
 
@@ -847,6 +856,13 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
         }
     }
 
+    if (sink_token) {
+        attributes.set_sink_token(sink_token);
+    }
+    if (dSink_token) {
+        attributes.set_dsink_token(dSink_token);
+    }
+
     auto [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP] = graph->sdpa_fp8_backward(q,
                                                                                      k,
                                                                                      v,
@@ -900,7 +916,9 @@ PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
                              bool const use_deterministic_algorithm,
                              py::object const& dropout,
                              cudnn_frontend::DataType_t const& compute_data_type,
-                             std::string const& name) {
+                             std::string const& name,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token) {
     cudnn_frontend::DiagonalAlignment_t actual_diagonal_alignment = diagonal_alignment;
     py::object actual_right_bound                                 = right_bound;
 
@@ -999,6 +1017,14 @@ PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
                 "dropout must be a tuple of (float probability, a seed tensor"
                 ", and an offset tensor) or (mask tensor, scale tensor)");
         }
+    }
+
+    // Set sink_token and dSink_token
+    if (sink_token) {
+        attributes.set_sink_token(sink_token);
+    }
+    if (dSink_token) {
+        attributes.set_dsink_token(dSink_token);
     }
 
     // Call the MXFP8 backward
@@ -1211,6 +1237,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("generate_stats", py::none()),
           py::arg_v("score_max", nullptr),
           py::arg_v("score_sum_exp", nullptr),
+          py::arg_v("sink_token", nullptr),
           R"pbdoc(
                 Perform scaled dot product attention with fp8 datatype inputs and outputs.
 
@@ -1241,6 +1268,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     generate_stats (Optional[bool]): If true, compute and output softmax stats (useful at training time). Default is None, but one of {generate_stats, is_inference} must be set.
                     score_max (Optional[cudnn_tensor]): The max of attention score.
                     score_sum_exp (Optional[cudnn_tensor]): The numerically stable sum of exponents using normalized values wrt max score.
+                    sink_token (Optional[cudnn_tensor]): Sink token bias for streaming attention. Default is None.
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and right_bound=0. Default is TOP_LEFT.
                     left_bound (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
@@ -1275,6 +1303,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
           py::arg_v("name", ""),
           py::arg("generate_stats"),
+          py::arg_v("sink_token", nullptr),
           R"pbdoc(
                 Perform MXFP8 (Microscaling FP8) scaled dot product attention.
 
@@ -1312,6 +1341,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                     name (Optional[str]): The name of the operation.
                     generate_stats (bool): If true, compute and output softmax stats (required for training).
+                    sink_token (Optional[cudnn_tensor]): Sink token bias for streaming attention. Shape is (1, h_q, 1, 1), type is float32. Default is None.
 
                 Returns:
                     o (cudnn_tensor): The output data.
@@ -1351,6 +1381,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("dropout", py::none()),
           py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
           py::arg_v("name", ""),
+          py::arg_v("sink_token", nullptr),
+          py::arg_v("dSink_token", nullptr),
           R"pbdoc(
                 Compute the key, query, value gradients of scaled dot product attention with fp8 datatype inputs and outputs.
 
@@ -1386,6 +1418,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                     name (Optional[str]): The name of the operation.
+                    sink_token (Optional[cudnn_tensor]): Sink token bias for streaming attention. Default is None.
+                    dSink_token (Optional[cudnn_tensor]): Output tensor for sink token gradient. Default is None.
 
                 Returns:
                     dQ (cudnn_tensor): The query gradient data.
@@ -1395,6 +1429,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     amax_dK (cudnn_tensor): The absolute maximum of key gradient tensor.
                     amax_dV (cudnn_tensor): The absolute maximum of value gradient tensor.
                     amax_dP (cudnn_tensor): The absolute maximum of dP tensor.
+                    dSink_token (Optional[cudnn_tensor]): The sink token gradient if sink_token was provided.
             )pbdoc");
     m.def("sdpa_mxfp8_backward",
           &PyGraph::sdpa_mxfp8_backward,
@@ -1428,6 +1463,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("dropout", py::none()),
           py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
           py::arg_v("name", ""),
+          py::arg_v("sink_token", nullptr),
+          py::arg_v("dSink_token", nullptr),
           R"pbdoc(
                       Compute the key, query, value gradients of scaled dot product attention with mxfp8 (Microscaling FP8) datatype inputs and outputs.
 
@@ -1462,6 +1499,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                           dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
                           compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                           name (Optional[str]): The name of the operation.
+                          sink_token (Optional[cudnn_tensor]): Sink token bias for streaming attention. Shape is (1, h_q, 1, 1), type is float32. Default is None.
+                          dSink_token (Optional[cudnn_tensor]): Output tensor for sink token gradient. Shape is (1, h_q, 1, 1), type is float32. Default is None.
 
                       Returns:
                           dQ (cudnn_tensor): The query gradient data.

@@ -23,7 +23,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include "../utils/helpers.h"
 
-#include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <cuda_fp16.h>
 
@@ -854,12 +853,10 @@ TEST_CASE("SM90 Prefill OSS Engine Direct API", "[graph][sdpa][sm90][oss][direct
 
     auto handle_ptr = create_cudnn_handle();
     auto handle     = *handle_ptr;
-    // ---- Get CUdevice and create stream ----
+    // ---- Get device ordinal and create stream ----
     int device_ordinal = 0;
     CUDA_CHECK(cudaGetDevice(&device_ordinal));
-    CUdevice cu_device;
-    auto cu_err = fe::experimental::detail::cu_device_get(&cu_device, device_ordinal);
-    REQUIRE(cu_err == CUDA_SUCCESS);
+    int cu_device = device_ordinal;
 
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -1158,12 +1155,10 @@ TEST_CASE("SM100 Prefill OSS Engine Direct API", "[graph][sdpa][sm100][oss][dire
 
     auto handle_ptr = create_cudnn_handle();
     auto handle     = *handle_ptr;
-    // ---- Get CUdevice and create stream ----
+    // ---- Get device ordinal and create stream ----
     int device_ordinal = 0;
     CUDA_CHECK(cudaGetDevice(&device_ordinal));
-    CUdevice cu_device;
-    auto cu_err = fe::experimental::detail::cu_device_get(&cu_device, device_ordinal);
-    REQUIRE(cu_err == CUDA_SUCCESS);
+    int cu_device = device_ordinal;
 
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));

@@ -21,7 +21,14 @@ from test_fe_api_utils import (
 # Parameterization Marks
 # =============================================================================
 
-GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP8 = [
+GROUPED_GEMM_SWIGLU_COMMON_MARKS = [
+    pytest.mark.parametrize("cd_major", ["n"]),
+    pytest.mark.parametrize("acc_dtype", [torch.float32]),
+    pytest.mark.parametrize("cluster_shape_mn", [(2, 1), (1, 1)]),
+    pytest.mark.parametrize("vector_f32", [True, False]),
+]
+
+GROUPED_GEMM_SWIGLU_FP8_TYPE_MARKS = [
     pytest.mark.parametrize(
         "ab_dtype",
         [
@@ -47,33 +54,9 @@ GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP8 = [
             # torch.bfloat16,
         ],
     ),
-    pytest.mark.parametrize("cd_major", ["n"]),
-    pytest.mark.parametrize("acc_dtype", [torch.float32]),
-    pytest.mark.parametrize(
-        "mma_tiler_mn",
-        [
-            (256, 256),
-        ],
-    ),
-    pytest.mark.parametrize(
-        "cluster_shape_mn",
-        [
-            (2, 1),
-            (1, 1),
-        ],
-    ),
-    pytest.mark.parametrize("sf_vec_size", [32]),
-    pytest.mark.parametrize(
-        "sf_dtype",
-        [
-            torch.float8_e8m0fnu,
-        ],
-    ),
-    pytest.mark.parametrize("vector_f32", [True, False]),
-    pytest.mark.parametrize("discrete_col_sfd", [True, False]),
 ]
 
-GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4 = [
+GROUPED_GEMM_SWIGLU_FP4_TYPE_MARKS = [
     pytest.mark.parametrize(
         "ab_dtype",
         [
@@ -96,33 +79,62 @@ GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4 = [
             torch.float32,
         ],
     ),
-    pytest.mark.parametrize("cd_major", ["n"]),
-    pytest.mark.parametrize("acc_dtype", [torch.float32]),
-    pytest.mark.parametrize(
-        "mma_tiler_mn",
-        [
-            (256, 256),
-            (128, 128),
-        ],
-    ),
-    pytest.mark.parametrize(
-        "cluster_shape_mn",
-        [
-            (2, 1),
-            (1, 1),
-        ],
-    ),
-    pytest.mark.parametrize("sf_vec_size", [16, 32]),
-    pytest.mark.parametrize(
-        "sf_dtype",
-        [
-            torch.float8_e8m0fnu,
-            torch.float8_e4m3fn,
-        ],
-    ),
-    pytest.mark.parametrize("vector_f32", [True, False]),
-    pytest.mark.parametrize("discrete_col_sfd", [False]),
 ]
+
+GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP8 = (
+    GROUPED_GEMM_SWIGLU_FP8_TYPE_MARKS
+    + GROUPED_GEMM_SWIGLU_COMMON_MARKS
+    + [
+        pytest.mark.parametrize("mma_tiler_mn", [(256, 256)]),
+        pytest.mark.parametrize("sf_vec_size,sf_dtype", [(32, torch.float8_e8m0fnu)]),
+        pytest.mark.parametrize("discrete_col_sfd", [True, False]),
+    ]
+)
+
+GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4 = (
+    GROUPED_GEMM_SWIGLU_FP4_TYPE_MARKS
+    + GROUPED_GEMM_SWIGLU_COMMON_MARKS
+    + [
+        pytest.mark.parametrize("mma_tiler_mn", [(256, 256), (128, 128)]),
+        pytest.mark.parametrize(
+            "sf_vec_size,sf_dtype",
+            [
+                (16, torch.float8_e8m0fnu),
+                (16, torch.float8_e4m3fn),
+                (32, torch.float8_e8m0fnu),
+                (32, torch.float8_e4m3fn),
+            ],
+        ),
+        pytest.mark.parametrize("discrete_col_sfd", [False]),
+    ]
+)
+
+GROUPED_GEMM_SWIGLU_PARAM_MARKS_BIAS_FP8 = (
+    GROUPED_GEMM_SWIGLU_FP8_TYPE_MARKS
+    + GROUPED_GEMM_SWIGLU_COMMON_MARKS
+    + [
+        pytest.mark.parametrize("mma_tiler_mn", [(128, 256), (256, 256)]),
+        pytest.mark.parametrize("sf_vec_size,sf_dtype", [(32, torch.float8_e8m0fnu)]),
+        pytest.mark.parametrize("discrete_col_sfd", [True, False]),
+    ]
+)
+
+GROUPED_GEMM_SWIGLU_PARAM_MARKS_BIAS_FP4 = (
+    GROUPED_GEMM_SWIGLU_FP4_TYPE_MARKS
+    + GROUPED_GEMM_SWIGLU_COMMON_MARKS
+    + [
+        pytest.mark.parametrize("mma_tiler_mn", [(128, 256), (256, 256)]),
+        pytest.mark.parametrize(
+            "sf_vec_size,sf_dtype",
+            [
+                (16, torch.float8_e8m0fnu),
+                (16, torch.float8_e4m3fn),
+                (32, torch.float8_e8m0fnu),
+            ],
+        ),
+        pytest.mark.parametrize("discrete_col_sfd", [True, False]),
+    ]
+)
 
 
 def with_grouped_gemm_swiglu_params_fp4(func):
@@ -135,6 +147,20 @@ def with_grouped_gemm_swiglu_params_fp4(func):
 def with_grouped_gemm_swiglu_params_fp8(func):
     """Decorator to apply grouped GEMM SwiGLU FP8 test parameters."""
     for mark in reversed(GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP8):
+        func = mark(func)
+    return func
+
+
+def with_grouped_gemm_swiglu_params_bias_fp4(func):
+    """Decorator to apply grouped GEMM SwiGLU dense bias FP4 test parameters."""
+    for mark in reversed(GROUPED_GEMM_SWIGLU_PARAM_MARKS_BIAS_FP4):
+        func = mark(func)
+    return func
+
+
+def with_grouped_gemm_swiglu_params_bias_fp8(func):
+    """Decorator to apply grouped GEMM SwiGLU dense bias FP8 test parameters."""
+    for mark in reversed(GROUPED_GEMM_SWIGLU_PARAM_MARKS_BIAS_FP8):
         func = mark(func)
     return func
 
@@ -158,6 +184,7 @@ def grouped_gemm_swiglu_init(
     vector_f32: bool = False,
     discrete_col_sfd: bool = False,
     b_major: str = "k",
+    enable_bias: bool = False,
 ) -> Dict[str, Any]:
     """Initialize configuration for Grouped GEMM SwiGLU tests.
 
@@ -174,6 +201,7 @@ def grouped_gemm_swiglu_init(
     :param vector_f32: Use vectorized f32 operations
     :param discrete_col_sfd: Generate discrete col-major scale factor tensor
     :param b_major: Major dimension for B tensor.
+    :param enable_bias: Allocate dense bias tensor for fused bias tests
     :return: Configuration dictionary
     """
     major, minor = torch.cuda.get_device_capability()
@@ -217,6 +245,7 @@ def grouped_gemm_swiglu_init(
         "vector_f32": vector_f32,
         "skip_ref": skip_ref,
         "discrete_col_sfd": discrete_col_sfd,
+        "enable_bias": enable_bias,
     }
 
     return config
@@ -300,6 +329,7 @@ def allocate_grouped_gemm_input_tensors(
     permuted_m: Optional[int] = None,
     norm_const: float = 0.01,
     b_major: str = "k",
+    enable_bias: bool = False,
     device: str = "cuda",
 ) -> Dict[str, Any]:
     """Allocate input tensors for grouped GEMM SwiGLU.
@@ -339,6 +369,7 @@ def allocate_grouped_gemm_input_tensors(
         "alpha_tensor": alpha_tensor,
         "beta_tensor": beta_tensor,
         "prob_tensor": prob_tensor,
+        "bias_tensor": None,
         "padded_offsets_tensor": padded_offsets_tensor,
         "aligned_group_m_list": aligned_group_m_list,
         "valid_m": valid_m,
@@ -352,6 +383,9 @@ def allocate_grouped_gemm_input_tensors(
         torch.float8_e4m3fn,
     ]:
         result["norm_const_tensor"] = torch.tensor([norm_const], dtype=torch.float32, device=device)
+
+    if enable_bias:
+        result["bias_tensor"] = torch.empty((l, n), dtype=torch.bfloat16, device=device).uniform_(-2.0, 2.0).transpose(0, 1)
 
     return result
 
@@ -418,6 +452,7 @@ def run_grouped_gemm_swiglu_ref(
     prob_tensor: torch.Tensor,
     aligned_group_m_list: List[int],
     valid_m: int,
+    bias_tensor: Optional[torch.Tensor] = None,
     generate_amax: bool = False,
     generate_sfd: bool = False,
     norm_const_tensor: Optional[torch.Tensor] = None,
@@ -469,6 +504,13 @@ def run_grouped_gemm_swiglu_ref(
         end = start + group_m
         ref[start:end, :, 0] = ref[start:end, :, 0] * alpha_tensor[i].item()
         start = end
+
+    if bias_tensor is not None:
+        start = 0
+        for i, group_m in enumerate(aligned_group_m_list):
+            end = start + group_m
+            ref[start:end, :, 0] = ref[start:end, :, 0] + bias_tensor[:, i].unsqueeze(0).to(torch.float32)
+            start = end
 
     ref_tensors["c_ref"] = ref.clone()
 
@@ -665,6 +707,7 @@ def check_ref_grouped_gemm_swiglu(
         prob_tensor=inputs["prob_tensor"],
         aligned_group_m_list=inputs["aligned_group_m_list"],
         valid_m=inputs["valid_m"],
+        bias_tensor=inputs.get("bias_tensor"),
         generate_amax=(outputs.get("amax_tensor") is not None),
         generate_sfd=(outputs.get("sfd_row_tensor") is not None),
         norm_const_tensor=inputs.get("norm_const_tensor"),

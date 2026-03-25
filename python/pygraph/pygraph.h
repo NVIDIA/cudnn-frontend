@@ -473,7 +473,8 @@ class PyGraph {
              std::optional<PyCallback> fn,
              py::object const& generate_stats,
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
-             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp);
+             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
+             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token);
 
     // MXFP8 SDPA forward - uses block-wise scale factors (E8M0 with F8_128x4 reordering)
     // return [o, stats, amax_o]
@@ -492,9 +493,11 @@ class PyGraph {
                py::object const& right_bound,
                cudnn_frontend::DataType_t const& compute_data_type,
                std::string const& name,
-               py::object const& generate_stats);
+               py::object const& generate_stats,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token);
 
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP]
+    // dSink_token is an optional output set via set_dsink_token() attribute
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 7>
     sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
@@ -526,10 +529,13 @@ class PyGraph {
                       bool const use_deterministic_algorithm,
                       py::object const& dropout,
                       cudnn_frontend::DataType_t const& compute_data_type,
-                      std::string const& name);
+                      std::string const& name,
+                      std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+                      std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token);
 
     // MXFP8 SDPA backward - uses block-wise scale factors (E8M0 with F8_128x4 reordering)
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV]
+    // dSink_token is an optional output set via set_dsink_token() attribute
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 6>
     sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q_T,
@@ -560,7 +566,9 @@ class PyGraph {
                         bool const use_deterministic_algorithm,
                         py::object const& dropout,
                         cudnn_frontend::DataType_t const& compute_data_type,
-                        std::string const& name);
+                        std::string const& name,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     moe_grouped_matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token,

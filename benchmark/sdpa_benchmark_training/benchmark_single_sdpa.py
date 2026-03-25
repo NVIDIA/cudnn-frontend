@@ -20,7 +20,6 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 import os
 import numpy as np
 import functools
-import time
 import math
 from typing import Optional, Dict, Any
 
@@ -140,7 +139,7 @@ def parse_args():
         default="no_mask",
         type=str,
         help="Attn mask to use. Can be 'top_left' (causal) or 'no_mask' (bidirectional).",
-        choices=["top_left", "no_mask"],
+        choices=["top_left", "bottom_right", "no_mask"],
     )
     parser.add_argument(
         "--sdpa_backend",
@@ -216,7 +215,7 @@ def run_benchmark(
         head_dim_vo: Head dimension for V/O (optional, for asymmetric)
         data_type: Data type ("bfloat16", "float16", "fp8")
         backend: Backend name ("cudnn", "flash_attention_4", etc.)
-        attn_mask: Attention mask ("no_mask", "top_left")
+        attn_mask: Attention mask ("no_mask", "top_left", "bottom_right")
         profile_pass: Which pass to profile ("fwd", "bwd", "both")
         num_iterations: Number of benchmark iterations
         num_warmup_iterations: Warmup iterations before measurement
@@ -365,8 +364,8 @@ else:
     else:
         raise ValueError(f"Invalid data type: {args.data_type}")
 
-    if args.sliding_window_size is not None and args.attn_mask != "top_left":
-        raise ValueError("Sliding window attention requires attn_mask='top_left' (causal)")
+    if args.sliding_window_size is not None and args.attn_mask not in ("top_left", "bottom_right"):
+        raise ValueError("Sliding window attention requires attn_mask='top_left' or 'bottom_right' (causal)")
 
     # Parse input arguments
     num_iters = args.num_iterations
@@ -397,8 +396,6 @@ else:
         run_bwd = False
     enable_gqa = num_q_heads != num_kv_heads
     if args.data_type == "mxfp8":
-        if run_bwd:
-            raise ValueError("mxfp8 backward pass not yet supported in this benchmark")
         if args.sdpa_backend != "cudnn":
             raise ValueError("mxfp8 is only supported with the 'cudnn' backend")
         if not HAS_CUTLASS:
@@ -485,18 +482,40 @@ else:
             s_q_padded = ceil_div(q_seqlen, 128) * 128
             s_kv_padded = ceil_div(kv_seqlen, 128) * 128
             d_qk_scale_padded = ceil_div(ceil_div(head_dim_qk, block_size), 4) * 4
+            d_vo_scale_padded = ceil_div(ceil_div(head_dim_vo, block_size), 4) * 4
+            d_qk_padded = ceil_div(head_dim_qk, 128) * 128
             d_vo_padded = ceil_div(head_dim_vo, 128) * 128
+            s_q_scale_padded = ceil_div(ceil_div(q_seqlen, block_size), 4) * 4
             s_kv_scale_padded = ceil_div(ceil_div(kv_seqlen, block_size), 4) * 4
             amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
+            # Forward scale factors
             sf_q_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_q_heads, s_q_padded, head_dim_qk, block_size)
             sf_k_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_kv_heads, s_kv_padded, head_dim_qk, block_size)
             sf_v_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_kv_heads, d_vo_padded, kv_seqlen, block_size)
+            # Backward-specific scale factors: transposed views for Q, K, dO
+            # SF_Q_T, SF_K_T: scale along sequence dimension [b, h, s_scale_padded, d_padded]
+            sf_q_t_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_q_heads, d_qk_padded, q_seqlen, block_size)
+            sf_k_t_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_kv_heads, d_qk_padded, kv_seqlen, block_size)
+            # SF_dO: scale along hidden dimension [b, h, s_padded, d_vo_scale_padded]
+            sf_dO_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_q_heads, s_q_padded, head_dim_vo, block_size)
+            # SF_dO_T: scale along sequence dimension [b, h, s_scale_padded, d_vo_padded]
+            sf_dO_t_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_q_heads, d_vo_padded, q_seqlen, block_size)
+            # Amax tensors for backward gradients
+            amax_dQ_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
+            amax_dK_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
+            amax_dV_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
 
-        dQuery = torch.empty_like(query)
-        dKey = torch.empty_like(key)
-        dValue = torch.empty_like(value)
+        if args.data_type == "mxfp8":
+            # MXFP8 backward outputs use the same dtype as forward output
+            dQuery = torch.empty(batch_size, num_q_heads, q_seqlen, head_dim_qk, dtype=output_dtype, device=device)
+            dKey = torch.empty(batch_size, num_kv_heads, kv_seqlen, head_dim_qk, dtype=output_dtype, device=device)
+            dValue = torch.empty(batch_size, num_kv_heads, kv_seqlen, head_dim_vo, dtype=output_dtype, device=device)
+        else:
+            dQuery = torch.empty_like(query)
+            dKey = torch.empty_like(key)
+            dValue = torch.empty_like(value)
         dOutput = torch.randn(output.shape, dtype=randn_dtype, device=device).to(target_dtype)
-        stats = torch.randn(batch_size, q_seqlen, num_q_heads, 1, dtype=torch.float32, device=device).transpose(1, 2)
+        stats = torch.empty(batch_size, q_seqlen, num_q_heads, 1, dtype=torch.float32, device=device).transpose(1, 2)
         if is_dropout:
             dropout_seed = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
             dropout_offset = torch.full((1, 1, 1, 1), 789, dtype=torch.int64, device="cuda")
@@ -516,6 +535,7 @@ else:
         # Compute diagonal band bounds for masking (shared by FP8 and non-FP8)
         right_bound = None if args.attn_mask == "no_mask" else 0
         left_bound = args.sliding_window_size if args.sliding_window_size else None
+        diagonal_align = cudnn.diagonal_alignment.BOTTOM_RIGHT if args.attn_mask == "bottom_right" else cudnn.diagonal_alignment.TOP_LEFT
 
         if args.data_type == "fp8":
             q_fwd = graph_fwd.tensor_like(query).set_data_type(cudnn.data_type.FP8_E4M3)
@@ -542,7 +562,7 @@ else:
                 # generate_stats=not is_infer,
                 is_inference=is_infer,
                 attn_scale=attn_scale,
-                diagonal_alignment=cudnn.diagonal_alignment.TOP_LEFT,
+                diagonal_alignment=diagonal_align,
                 left_bound=left_bound,
                 right_bound=right_bound,
                 # dropout=dropout_tuple if is_dropout else None,
@@ -579,7 +599,9 @@ else:
                 descale_k=sf_k_fwd,
                 descale_v=sf_v_fwd,
                 attn_scale=attn_scale,
-                use_causal_mask=(args.attn_mask == "top_left"),
+                diagonal_alignment=diagonal_align,
+                diagonal_band_left_bound=left_bound,
+                diagonal_band_right_bound=right_bound,
                 generate_stats=True,
             )
         else:
@@ -593,7 +615,7 @@ else:
                 # generate_stats=not is_infer,
                 is_inference=is_infer,
                 attn_scale=attn_scale,
-                diagonal_alignment=cudnn.diagonal_alignment.TOP_LEFT,
+                diagonal_alignment=diagonal_align,
                 diagonal_band_left_bound=left_bound,
                 diagonal_band_right_bound=right_bound,
                 dropout=dropout_tuple if is_dropout else None,
@@ -603,6 +625,9 @@ else:
             if args.data_type == "fp8":
                 o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride()).set_data_type(cudnn.data_type.FP8_E4M3)
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
+            elif args.data_type == "mxfp8":
+                o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride()).set_data_type(convert_to_cudnn_type(output_dtype))
+                stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT)
             else:
                 o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride())
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
@@ -688,9 +713,117 @@ else:
                     scale_dV=scale_dV_bwd,
                     scale_dP=scale_dP_bwd,
                     attn_scale=attn_scale,
-                    use_causal_mask=args.attn_mask == "top_left",
-                    use_causal_mask_bottom_right=False,
+                    use_causal_mask=(args.attn_mask == "top_left"),
+                    use_causal_mask_bottom_right=(args.attn_mask == "bottom_right"),
                     dropout=dropout_tuple if is_dropout else None,
+                    use_deterministic_algorithm=args.deterministic_bwd,
+                )
+            elif args.data_type == "mxfp8":
+                # MXFP8 backward requires transposed tensor views and scale factors
+                # Q, K, V in FP8_E4M3
+                q_bwd = graph_bwd.tensor_like(query)
+                k_bwd = graph_bwd.tensor_like(key)
+                v_bwd = graph_bwd.tensor_like(value)
+
+                # Create transposed tensor views (separate storage with transposed strides)
+                q_t_bwd = graph_bwd.tensor_like(query)
+                k_t_bwd = graph_bwd.tensor_like(key)
+
+                # O in BFLOAT16 (forward output)
+                o_bwd = graph_bwd.tensor(
+                    dim=output.size(),
+                    stride=output.stride(),
+                    data_type=cudnn.data_type.BFLOAT16,
+                )
+                # dO in FP8 and BFLOAT16
+                dO_bwd = graph_bwd.tensor_like(dOutput)
+                dO_t_bwd = graph_bwd.tensor_like(dOutput)
+                dO_f16_bwd = graph_bwd.tensor(
+                    dim=dOutput.size(),
+                    stride=dOutput.stride(),
+                    data_type=cudnn.data_type.BFLOAT16,
+                )
+
+                # Scale factor tensors with E8M0 dtype and F8_128x4 reordering
+                # SF_Q: [b, h_q, s_q_padded, d_qk_scale_padded]
+                sf_q_bwd = graph_bwd.tensor(
+                    dim=(batch_size, num_q_heads, s_q_padded, d_qk_scale_padded),
+                    stride=(num_q_heads * s_q_padded * d_qk_scale_padded, s_q_padded * d_qk_scale_padded, d_qk_scale_padded, 1),
+                    data_type=cudnn.data_type.FP8_E8M0,
+                    reordering_type=cudnn.tensor_reordering.F8_128x4,
+                )
+                # SF_Q_T: [b, h_q, s_q_scale_padded, d_qk_padded]
+                sf_q_t_bwd = graph_bwd.tensor(
+                    dim=(batch_size, num_q_heads, s_q_scale_padded, d_qk_padded),
+                    stride=(num_q_heads * s_q_scale_padded * d_qk_padded, s_q_scale_padded * d_qk_padded, 1, s_q_scale_padded),
+                    data_type=cudnn.data_type.FP8_E8M0,
+                    reordering_type=cudnn.tensor_reordering.F8_128x4,
+                )
+                # SF_K: [b, h_kv, s_kv_padded, d_qk_scale_padded]
+                sf_k_bwd = graph_bwd.tensor(
+                    dim=(batch_size, num_kv_heads, s_kv_padded, d_qk_scale_padded),
+                    stride=(num_kv_heads * s_kv_padded * d_qk_scale_padded, s_kv_padded * d_qk_scale_padded, d_qk_scale_padded, 1),
+                    data_type=cudnn.data_type.FP8_E8M0,
+                    reordering_type=cudnn.tensor_reordering.F8_128x4,
+                )
+                # SF_K_T: [b, h_kv, s_kv_scale_padded, d_qk_padded]
+                sf_k_t_bwd = graph_bwd.tensor(
+                    dim=(batch_size, num_kv_heads, s_kv_scale_padded, d_qk_padded),
+                    stride=(num_kv_heads * s_kv_scale_padded * d_qk_padded, s_kv_scale_padded * d_qk_padded, 1, s_kv_scale_padded),
+                    data_type=cudnn.data_type.FP8_E8M0,
+                    reordering_type=cudnn.tensor_reordering.F8_128x4,
+                )
+                # SF_V: [b, h_kv, s_kv_padded, d_vo_scale_padded]
+                sf_v_bwd = graph_bwd.tensor(
+                    dim=(batch_size, num_kv_heads, s_kv_padded, d_vo_scale_padded),
+                    stride=(num_kv_heads * s_kv_padded * d_vo_scale_padded, s_kv_padded * d_vo_scale_padded, d_vo_scale_padded, 1),
+                    data_type=cudnn.data_type.FP8_E8M0,
+                    reordering_type=cudnn.tensor_reordering.F8_128x4,
+                )
+                # SF_dO: [b, h_q, s_q_padded, d_vo_scale_padded]
+                sf_dO_bwd = graph_bwd.tensor(
+                    dim=(batch_size, num_q_heads, s_q_padded, d_vo_scale_padded),
+                    stride=(num_q_heads * s_q_padded * d_vo_scale_padded, s_q_padded * d_vo_scale_padded, d_vo_scale_padded, 1),
+                    data_type=cudnn.data_type.FP8_E8M0,
+                    reordering_type=cudnn.tensor_reordering.F8_128x4,
+                )
+                # SF_dO_T: [b, h_q, s_q_scale_padded, d_vo_padded]
+                sf_dO_t_bwd = graph_bwd.tensor(
+                    dim=(batch_size, num_q_heads, s_q_scale_padded, d_vo_padded),
+                    stride=(num_q_heads * s_q_scale_padded * d_vo_padded, s_q_scale_padded * d_vo_padded, 1, s_q_scale_padded),
+                    data_type=cudnn.data_type.FP8_E8M0,
+                    reordering_type=cudnn.tensor_reordering.F8_128x4,
+                )
+
+                (
+                    dQ_bwd,
+                    dK_bwd,
+                    dV_bwd,
+                    amax_dQ_bwd,
+                    amax_dK_bwd,
+                    amax_dV_bwd,
+                ) = graph_bwd.sdpa_mxfp8_backward(
+                    q=q_bwd,
+                    q_T=q_t_bwd,
+                    k=k_bwd,
+                    k_T=k_t_bwd,
+                    v=v_bwd,
+                    o_f16=o_bwd,
+                    dO_f16=dO_f16_bwd,
+                    dO=dO_bwd,
+                    dO_T=dO_t_bwd,
+                    stats=stats_bwd,
+                    descale_q=sf_q_bwd,
+                    descale_q_T=sf_q_t_bwd,
+                    descale_k=sf_k_bwd,
+                    descale_k_T=sf_k_t_bwd,
+                    descale_v=sf_v_bwd,
+                    descale_dO=sf_dO_bwd,
+                    descale_dO_T=sf_dO_t_bwd,
+                    attn_scale=attn_scale,
+                    use_causal_mask=(args.attn_mask == "top_left"),
+                    use_causal_mask_bottom_right=(args.attn_mask == "bottom_right"),
+                    diagonal_alignment=diagonal_align,
                     use_deterministic_algorithm=args.deterministic_bwd,
                 )
             else:
@@ -708,7 +841,7 @@ else:
                     dO=dO_bwd,
                     stats=stats_bwd,
                     attn_scale=attn_scale,
-                    diagonal_alignment=cudnn.diagonal_alignment.TOP_LEFT,
+                    diagonal_alignment=diagonal_align,
                     diagonal_band_left_bound=left_bound,
                     diagonal_band_right_bound=right_bound,
                     dropout=dropout_tuple if is_dropout else None,
@@ -723,6 +856,14 @@ else:
                 amax_dK_bwd.set_output(True).set_dim(amax_dK_gpu.size()).set_stride(amax_dK_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
                 amax_dV_bwd.set_output(True).set_dim(amax_dV_gpu.size()).set_stride(amax_dV_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
                 amax_dP_bwd.set_output(True).set_dim(amax_dP_gpu.size()).set_stride(amax_dP_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
+            elif args.data_type == "mxfp8":
+                # MXFP8 backward outputs in BFLOAT16
+                dQ_bwd.set_output(True).set_dim(dQuery.size()).set_stride(dQuery.stride()).set_data_type(cudnn.data_type.BFLOAT16)
+                dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride()).set_data_type(cudnn.data_type.BFLOAT16)
+                dV_bwd.set_output(True).set_dim(dValue.size()).set_stride(dValue.stride()).set_data_type(cudnn.data_type.BFLOAT16)
+                amax_dQ_bwd.set_output(True).set_dim(amax_dQ_gpu.size()).set_stride(amax_dQ_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
+                amax_dK_bwd.set_output(True).set_dim(amax_dK_gpu.size()).set_stride(amax_dK_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
+                amax_dV_bwd.set_output(True).set_dim(amax_dV_gpu.size()).set_stride(amax_dV_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
             else:
                 dQ_bwd.set_output(True).set_dim(dQuery.size()).set_stride(dQuery.stride())
                 dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride())
@@ -779,6 +920,57 @@ else:
                     amax_dP_bwd: amax_dP_gpu,
                 }
 
+                workspace = torch.empty(
+                    max(graph_fwd.get_workspace_size(), graph_bwd.get_workspace_size()),
+                    device="cuda",
+                    dtype=torch.uint8,
+                )
+            elif args.data_type == "mxfp8":
+                # Create additional tensors needed for MXFP8 backward
+                # Output and dOutput in output_dtype format for backward
+                output_f16 = output.to(output_dtype)
+                dOutput_f16 = dOutput.float().to(output_dtype)
+                # Transposed tensors (use same data, just for passing to graph)
+                query_t = query.clone()
+                key_t = key.clone()
+                dOutput_t = dOutput.clone()
+
+                variant_pack_fwd = {
+                    q_fwd: query,
+                    k_fwd: key,
+                    v_fwd: value,
+                    o_fwd: output,
+                    stats_fwd: stats,
+                    sf_q_fwd: sf_q_gpu,
+                    sf_k_fwd: sf_k_gpu,
+                    sf_v_fwd: sf_v_gpu,
+                    amax_o_fwd: amax_o_gpu,
+                }
+                variant_pack_bwd = {
+                    q_bwd: query,
+                    q_t_bwd: query_t,
+                    k_bwd: key,
+                    k_t_bwd: key_t,
+                    v_bwd: value,
+                    o_bwd: output_f16,
+                    dO_bwd: dOutput,
+                    dO_t_bwd: dOutput_t,
+                    dO_f16_bwd: dOutput_f16,
+                    stats_bwd: stats,
+                    sf_q_bwd: sf_q_gpu,
+                    sf_q_t_bwd: sf_q_t_gpu,
+                    sf_k_bwd: sf_k_gpu,
+                    sf_k_t_bwd: sf_k_t_gpu,
+                    sf_v_bwd: sf_v_gpu,
+                    sf_dO_bwd: sf_dO_gpu,
+                    sf_dO_t_bwd: sf_dO_t_gpu,
+                    dQ_bwd: dQuery,
+                    dK_bwd: dKey,
+                    dV_bwd: dValue,
+                    amax_dQ_bwd: amax_dQ_gpu,
+                    amax_dK_bwd: amax_dK_gpu,
+                    amax_dV_bwd: amax_dV_gpu,
+                }
                 workspace = torch.empty(
                     max(graph_fwd.get_workspace_size(), graph_bwd.get_workspace_size()),
                     device="cuda",
@@ -856,6 +1048,9 @@ else:
     ## Done setting up cuDNN graph.
 
     # For backends MATH, EFFICIENT_ATTENTION, CUDNN_ATTENTION, PYTORCH_FLASH_ATTENTION
+    if args.attn_mask == "bottom_right" and args.sdpa_backend.startswith("pyt_"):
+        raise ValueError("bottom_right attention mask is only supported with the 'cudnn' backend, not PyTorch backends")
+
     def pyt_backend_sdpa(query, key, value, backend):
         with sdpa_kernel(backends=[backend]):
             return torch.nn.functional.scaled_dot_product_attention(
@@ -863,7 +1058,7 @@ else:
                 key,
                 value,
                 enable_gqa=enable_gqa,
-                is_causal=args.attn_mask == "top_left",
+                is_causal=args.attn_mask in ("top_left", "bottom_right"),
             )
 
     if args.sdpa_backend == "flash_attention":
@@ -964,7 +1159,7 @@ else:
 
         if attn_mask == "no_mask":
             num_nonmasked_elems = q_seqlen * kv_seqlen
-        elif attn_mask == "top_left":
+        elif attn_mask in ("top_left", "bottom_right"):
             if sliding_window_size is not None:
                 # With sliding window: each query attends to at most W keys
                 # (left_bound is exclusive, right_bound is inclusive)
@@ -1088,12 +1283,16 @@ else:
         if args.sdpa_backend == "cudnn":
             if args.data_type == "mxfp8":
                 output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=output_dtype, device=device).transpose(1, 2)
+                # MXFP8 backward outputs use the same dtype as forward output
+                dQuery = torch.empty(batch_size, num_q_heads, q_seqlen, head_dim_qk, dtype=output_dtype, device=device)
+                dKey = torch.empty(batch_size, num_kv_heads, kv_seqlen, head_dim_qk, dtype=output_dtype, device=device)
+                dValue = torch.empty(batch_size, num_kv_heads, kv_seqlen, head_dim_vo, dtype=output_dtype, device=device)
             else:
                 output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=target_dtype, device=device).transpose(1, 2)
-            dQuery = torch.empty_like(query)
-            dKey = torch.empty_like(key)
-            dValue = torch.empty_like(value)
-            stats = torch.randn(batch_size, q_seqlen, num_q_heads, 1, dtype=torch.float32, device=device).transpose(1, 2)
+                dQuery = torch.empty_like(query)
+                dKey = torch.empty_like(key)
+                dValue = torch.empty_like(value)
+            stats = torch.empty(batch_size, num_q_heads, q_seqlen, 1, dtype=torch.float32, device=device)
             if is_dropout:
                 dropout_seed = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
                 dropout_offset = torch.full((1, 1, 1, 1), 789, dtype=torch.int64, device="cuda")
@@ -1142,6 +1341,50 @@ else:
                         amax_dK_bwd: amax_dK_gpu,
                         amax_dV_bwd: amax_dV_gpu,
                         amax_dP_bwd: amax_dP_gpu,
+                    }
+                elif args.data_type == "mxfp8":
+                    # MXFP8 backward needs additional tensors
+                    output_f16 = output.to(output_dtype)
+                    dOutput_f16 = dOutput.float().to(output_dtype)
+                    query_t = query.clone()
+                    key_t = key.clone()
+                    dOutput_t = dOutput.clone()
+
+                    variant_pack_fwd = {
+                        q_fwd: query,
+                        k_fwd: key,
+                        v_fwd: value,
+                        o_fwd: output,
+                        stats_fwd: stats,
+                        sf_q_fwd: sf_q_gpu,
+                        sf_k_fwd: sf_k_gpu,
+                        sf_v_fwd: sf_v_gpu,
+                        amax_o_fwd: amax_o_gpu,
+                    }
+                    variant_pack_bwd = {
+                        q_bwd: query,
+                        q_t_bwd: query_t,
+                        k_bwd: key,
+                        k_t_bwd: key_t,
+                        v_bwd: value,
+                        o_bwd: output_f16,
+                        dO_bwd: dOutput,
+                        dO_t_bwd: dOutput_t,
+                        dO_f16_bwd: dOutput_f16,
+                        stats_bwd: stats,
+                        sf_q_bwd: sf_q_gpu,
+                        sf_q_t_bwd: sf_q_t_gpu,
+                        sf_k_bwd: sf_k_gpu,
+                        sf_k_t_bwd: sf_k_t_gpu,
+                        sf_v_bwd: sf_v_gpu,
+                        sf_dO_bwd: sf_dO_gpu,
+                        sf_dO_t_bwd: sf_dO_t_gpu,
+                        dQ_bwd: dQuery,
+                        dK_bwd: dKey,
+                        dV_bwd: dValue,
+                        amax_dQ_bwd: amax_dQ_gpu,
+                        amax_dK_bwd: amax_dK_gpu,
+                        amax_dV_bwd: amax_dV_gpu,
                     }
                 else:
                     variant_pack_fwd = {
@@ -1248,10 +1491,6 @@ else:
                 output = sdpa_function(query, key, value)
             torch.cuda.synchronize()
 
-        # Sleep for some time proportional to fwd_time for stable measurements
-        sleep_time = np.min([fwd_time / 100, 1.0]) if run_fwd and len(matched_kernels) >= 1 else 0.0
-        time.sleep(sleep_time)
-
         if run_bwd:
             # Run backward pass
 
@@ -1293,9 +1532,6 @@ else:
                 if i >= dry_run_iters:
                     backward_times.append(bwd_time)
 
-            sleep_time = np.min([bwd_time / 100, 1.0]) if run_bwd and len(matched_kernels) >= 1 else 0.0
-            time.sleep(sleep_time)
-
             dQuery, dKey, dValue, dOutput = postprocess_dqdkdvdo(dQuery, dKey, dValue, dOutput, args.sdpa_backend)
 
         (
@@ -1329,8 +1565,6 @@ else:
                 forward_diffs.append(0.0)
         else:
             forward_diffs.append(0.0)
-
-        time.sleep(sleep_time)
 
         if args.sdpa_backend == "cudnn":
             del query, key, value, output, dQuery, dKey, dValue, dOutput, stats

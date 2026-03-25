@@ -415,6 +415,11 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 allowed_input_msg += ", Page_table_K, Page_table_V, SEQ_LEN_Q, SEQ_LEN_KV";
             }
 
+            if (effective_cudnn_ver >= 92100) {
+                allowed_input_names.insert(input_names::Bias);
+                allowed_input_msg += ", Bias";
+            }
+
             for (const auto& [key, value] : inputs) {
                 if (allowed_input_names.find(key) == allowed_input_names.end() && value != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED, allowed_input_msg};
@@ -428,21 +433,24 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 }
             }
 
-            if (alibi_mask) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support alibi mask"};
+            if (alibi_mask && effective_cudnn_ver < 92100) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Alibi mask for unified SDPA node requires cuDNN 9.21.0 or above"};
             }
 
             if (padding_mask && effective_cudnn_ver < 91500) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED, "Padding mask for unified SDPA node requires cuDNN 9.15.0"};
-            }
-
-            if (left_bound.has_value() || right_bound.has_value()) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA node doesn't yet support left bound or right bound"};
+                        "Padding mask for unified SDPA node requires cuDNN 9.15.0 or above"};
             }
 
-            if (diagonal_alignment != DiagonalAlignment_t::TOP_LEFT) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support diagonal alignment"};
+            if ((left_bound.has_value() || right_bound.has_value()) && effective_cudnn_ver < 92100) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Left bound or right bound for unified SDPA node requires cuDNN 9.21.0 or above"};
+            }
+
+            if (diagonal_alignment != DiagonalAlignment_t::TOP_LEFT && effective_cudnn_ver < 92100) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Diagonal alignment for unified SDPA node requires cuDNN 9.21.0 or above"};
             }
 
             if (dropout_probability.has_value()) {
@@ -456,14 +464,14 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                         "Max sequence length for unified SDPA node cannot be set in cuDNN < 9.15.0"};
             }
 
-            if (attention_score_modifier != nullptr) {
+            if (attention_score_modifier != nullptr && effective_cudnn_ver < 92100) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA node doesn't yet support attention score modifier"};
+                        "Attention score modifier for unified SDPA node requires cuDNN 9.21.0 or above"};
             }
 
             if (mma_core_mode != DataType_t::HALF) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA node doesn't yet support a data type other than fp16"};
+                        "Unified SDPA node doesn't yet support a data type other than fp16/bf16"};
             }
 
             if ((compute_data_type != DataType_t::NOT_SET && compute_data_type != DataType_t::FLOAT) ||

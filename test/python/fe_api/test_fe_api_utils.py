@@ -120,16 +120,17 @@ def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):
     # Create f32 ref torch tensor (cpu)
     ref_f32_torch_tensor_cpu = torch.empty(ref_shape, dtype=torch.float32).uniform_(1, 3).permute(ref_permute_order).to(torch.int8).to(torch.float32)
 
-    # convert ref f32 tensor to cute f32 tensor
-    try:
-        from cutlass.cute.runtime import from_dlpack
+    # Convert ref f32 tensor to cute f32 tensor only when there is payload to move.
+    if ref_f32_torch_tensor_cpu.numel() > 0:
+        try:
+            from cutlass.cute.runtime import from_dlpack
 
-        cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
-            from_dlpack(ref_f32_torch_tensor_cpu),
-            from_dlpack(cute_f32_torch_tensor_cpu),
-        )
-    except Exception:
-        pytest.skip("CUTLASS is not installed; skipping tests due to scale factor tensor creation requiring CUTLASS.")
+            cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
+                from_dlpack(ref_f32_torch_tensor_cpu),
+                from_dlpack(cute_f32_torch_tensor_cpu),
+            )
+        except Exception:
+            pytest.skip("CUTLASS is not installed; skipping tests due to scale factor tensor creation requiring CUTLASS.")
 
     # reshape makes memory contiguous
     ref_f32_torch_tensor_cpu = (

@@ -46,7 +46,7 @@ for symbol_name in symbols_to_import:
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.20.0"
+__version__ = "1.21.0"
 
 
 def _tensor(
@@ -308,7 +308,9 @@ def __getattr__(name: str) -> Any:
 
     elif name == "GroupedGemmDswigluSm100":
         try:
-            from .grouped_gemm import GroupedGemmDswigluSm100 as _GroupedGemmDswigluSm100
+            from .grouped_gemm import (
+                GroupedGemmDswigluSm100 as _GroupedGemmDswigluSm100,
+            )
 
             return _GroupedGemmDswigluSm100
         except Exception as e:
@@ -324,6 +326,125 @@ def __getattr__(name: str) -> Any:
         except Exception as e:
             raise ImportError(
                 f"grouped_gemm_dswiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
+    elif name == "GroupedGemmQuantSm100":
+        try:
+            from .grouped_gemm import GroupedGemmQuantSm100 as _GroupedGemmQuantSm100
+
+            return _GroupedGemmQuantSm100
+        except Exception as e:
+            raise ImportError(f"GroupedGemmQuantSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
+
+    elif name == "grouped_gemm_quant_wrapper_sm100":
+        try:
+            from .grouped_gemm import (
+                grouped_gemm_quant_wrapper_sm100 as _grouped_gemm_quant_wrapper_sm100,
+            )
+
+            return _grouped_gemm_quant_wrapper_sm100
+        except Exception as e:
+            raise ImportError(
+                f"grouped_gemm_quant_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
+    # Unified Grouped GEMM GLU (forward)
+    elif name == "GroupedGemmGluSm100":
+        try:
+            from .grouped_gemm import GroupedGemmGluSm100 as _GroupedGemmGluSm100
+
+            return _GroupedGemmGluSm100
+        except Exception as e:
+            raise ImportError(f"GroupedGemmGluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
+
+    elif name == "grouped_gemm_glu_wrapper_sm100":
+        try:
+            from .grouped_gemm import (
+                grouped_gemm_glu_wrapper_sm100 as _grouped_gemm_glu_wrapper_sm100,
+            )
+
+            return _grouped_gemm_glu_wrapper_sm100
+        except Exception as e:
+            raise ImportError(
+                f"grouped_gemm_glu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
+    # Unified Grouped GEMM dGLU (backward)
+    elif name == "GroupedGemmDgluSm100":
+        try:
+            from .grouped_gemm import GroupedGemmDgluSm100 as _GroupedGemmDgluSm100
+
+            return _GroupedGemmDgluSm100
+        except Exception as e:
+            raise ImportError(f"GroupedGemmDgluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
+
+    elif name == "grouped_gemm_dglu_wrapper_sm100":
+        try:
+            from .grouped_gemm import (
+                grouped_gemm_dglu_wrapper_sm100 as _grouped_gemm_dglu_wrapper_sm100,
+            )
+
+            return _grouped_gemm_dglu_wrapper_sm100
+        except Exception as e:
+            raise ImportError(
+                f"grouped_gemm_dglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
+    # Discrete-weight Grouped GEMM GLU module
+    elif name == "discrete_grouped_gemm":
+        try:
+            from . import discrete_grouped_gemm as _discrete_grouped_gemm
+
+            return _discrete_grouped_gemm
+        except Exception as e:
+            raise ImportError(f"discrete_grouped_gemm requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
+
+    elif name == "DiscreteGroupedGemmSwigluSm100":
+        try:
+            from .discrete_grouped_gemm import (
+                DiscreteGroupedGemmSwigluSm100 as _DiscreteGroupedGemmSwigluSm100,
+            )
+
+            return _DiscreteGroupedGemmSwigluSm100
+        except Exception as e:
+            raise ImportError(
+                f"DiscreteGroupedGemmSwigluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
+    elif name == "discrete_grouped_gemm_swiglu_wrapper_sm100":
+        try:
+            from .discrete_grouped_gemm import (
+                discrete_grouped_gemm_swiglu_wrapper_sm100 as _discrete_grouped_gemm_swiglu_wrapper_sm100,
+            )
+
+            return _discrete_grouped_gemm_swiglu_wrapper_sm100
+        except Exception as e:
+            raise ImportError(
+                f"discrete_grouped_gemm_swiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
+    elif name == "DiscreteGroupedGemmDswigluSm100":
+        try:
+            from .discrete_grouped_gemm import (
+                DiscreteGroupedGemmDswigluSm100 as _DiscreteGroupedGemmDswigluSm100,
+            )
+
+            return _DiscreteGroupedGemmDswigluSm100
+        except Exception as e:
+            raise ImportError(
+                f"DiscreteGroupedGemmDswigluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
+    elif name == "discrete_grouped_gemm_dswiglu_wrapper_sm100":
+        try:
+            from .discrete_grouped_gemm import (
+                discrete_grouped_gemm_dswiglu_wrapper_sm100 as _discrete_grouped_gemm_dswiglu_wrapper_sm100,
+            )
+
+            return _discrete_grouped_gemm_dswiglu_wrapper_sm100
+        except Exception as e:
+            raise ImportError(
+                f"discrete_grouped_gemm_dswiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
             ) from e
 
     else:

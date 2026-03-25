@@ -47,14 +47,111 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, nvvm
+from cutlass._mlir.dialects.nvvm import AtomicOpKind
 from cutlass.cutlass_dsl import T
 from cutlass.cute.typing import Float32, Int32
 import cutlass.cute as cute
 import cutlass
+import torch
+import cutlass.pipeline as pipeline
+from cutlass.pipeline import (
+    Agent,
+    CooperativeGroup,
+    PipelineUserType,
+    make_pipeline_state,
+)
 
 ##############################################################################
 # Helper functions
 ##############################################################################
+
+
+@dsl_user_op
+def atomic_add_i32(
+    ptr,
+    value: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Perform an atomic add on an int32 value in global memory."""
+    old_value = nvvm.atomicrmw(
+        op=AtomicOpKind.ADD,
+        ptr=ptr,
+        a=value.ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(old_value)
+
+
+@dsl_user_op
+def store_i32_to_peer_cluster_smem_async(
+    smem_ptr,
+    value: Int32,
+    mbar_ptr,
+    cta_rank_in_cluster,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Store one int32 to a peer CTA via st.async.shared::cluster."""
+    smem_addr = llvm.ptrtoint(T.i32(), smem_ptr.llvm_ptr, loc=loc, ip=ip)
+    mbar_addr = llvm.ptrtoint(T.i32(), mbar_ptr.llvm_ptr, loc=loc, ip=ip)
+    llvm.inline_asm(
+        res=None,
+        operands_=[
+            smem_addr,
+            value.ir_value(loc=loc, ip=ip),
+            mbar_addr,
+            Int32(cta_rank_in_cluster).ir_value(loc=loc, ip=ip),
+        ],
+        asm_string="""{{
+            .reg .u32 remote_addr;
+            .reg .u32 remote_mbar;
+            mapa.shared::cluster.u32 remote_addr, $0, $3;
+            mapa.shared::cluster.u32 remote_mbar, $2, $3;
+            st.async.shared::cluster.mbarrier::complete_tx::bytes.u32 [remote_addr], $1, [remote_mbar];
+        }}""",
+        constraints="r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def mbarrier_arrive_expect_tx_on_peer(
+    mbar_ptr,
+    tx_count: Int32,
+    cta_rank_in_cluster,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Arrive+expect_tx on a peer CTA mbarrier via inline PTX."""
+    mbar_addr = llvm.ptrtoint(T.i32(), mbar_ptr.llvm_ptr, loc=loc, ip=ip)
+    llvm.inline_asm(
+        res=None,
+        operands_=[
+            mbar_addr,
+            Int32(cta_rank_in_cluster).ir_value(loc=loc, ip=ip),
+            tx_count.ir_value(loc=loc, ip=ip),
+        ],
+        asm_string="""{{
+            .reg .u32 remote_mbar;
+            mapa.shared::cluster.u32 remote_mbar, $0, $1;
+            mbarrier.arrive.expect_tx.shared::cluster.b64 _, [remote_mbar], $2;
+        }}""",
+        constraints="r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 def fmin(
@@ -89,6 +186,21 @@ def fmin(
     )
 
 
+def fmax(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=None) -> Float32:
+    ptx_instr = f"max.NaN.f32 $0, $1, $2;"
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            f"{ptx_instr}",
+            f"=f,f,f",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 def warp_redux_sync_fmax(
     value,
     mask_and_clamp=0xFFFFFFFF,
@@ -112,6 +224,16 @@ def warp_redux_sync_fmax(
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
+
+
+def logical_shape_fp4x2_aware(tensor: torch.Tensor) -> Tuple[int, ...]:
+    """Return correct shapes for NVFP4 tensor."""
+    if tensor.dtype == torch.float4_e2m1fn_x2:
+        innermost_dim_index = next((i for i, s in enumerate(tensor.stride()) if s == 1), None)
+        if innermost_dim_index is None:
+            raise RuntimeError(f"tensor has shape {tuple(tensor.shape)} stride {tuple(tensor.stride())} " "but no contiguous (stride == 1) dimension was found")
+        return tuple(dim * 2 if i == innermost_dim_index else dim for i, dim in enumerate(tensor.shape))
+    return tuple(tensor.shape)
 
 
 def atomic_max_float32(
@@ -185,6 +307,13 @@ def silu_f32(a: Union[float, Float32], fastmath: bool = False) -> Union[float, F
     :return: SiLU of input
     """
     return a * sigmoid_f32(a, fastmath=fastmath)
+
+
+def silu_f32_geglu_scaled(a: Union[float, Float32], fastmath: bool = False) -> Union[float, Float32]:
+    """
+    Compute the scaled silu of the input tensor.
+    """
+    return a * sigmoid_f32(a * 1.702, fastmath=fastmath)
 
 
 @cute.jit
@@ -814,6 +943,281 @@ class StaticPersistentTileScheduler:
     @property
     def num_tiles_executed(self) -> Int32:
         return self._num_tiles_executed
+
+
+class _DynamicSchedState:
+    """Runtime-only state required by DynamicPersistentTileScheduler."""
+
+    def __init__(
+        self,
+        counter_ptr,
+        broadcast_ptr,
+        is_leader_cta: Boolean,
+        producer_state,
+        consumer_state,
+    ):
+        self.counter_ptr = counter_ptr
+        self.broadcast_ptr = broadcast_ptr
+        self.is_leader_cta = is_leader_cta
+        self.producer_state = producer_state
+        self.consumer_state = consumer_state
+
+    def __extract_mlir_values__(self) -> list[ir.Value]:
+        values = []
+        values.extend(extract_mlir_values(self.counter_ptr))
+        values.extend(extract_mlir_values(self.broadcast_ptr))
+        values.extend(extract_mlir_values(self.is_leader_cta))
+        values.extend(extract_mlir_values(self.producer_state))
+        values.extend(extract_mlir_values(self.consumer_state))
+        return values
+
+    def __new_from_mlir_values__(self, values: list[ir.Value]) -> "_DynamicSchedState":
+        idx = 0
+
+        counter_len = len(extract_mlir_values(self.counter_ptr))
+        new_counter_ptr = new_from_mlir_values(self.counter_ptr, values[idx : idx + counter_len])
+        idx += counter_len
+
+        broadcast_len = len(extract_mlir_values(self.broadcast_ptr))
+        new_broadcast_ptr = new_from_mlir_values(self.broadcast_ptr, values[idx : idx + broadcast_len])
+        idx += broadcast_len
+
+        is_leader_len = len(extract_mlir_values(self.is_leader_cta))
+        new_is_leader_cta = new_from_mlir_values(self.is_leader_cta, values[idx : idx + is_leader_len])
+        idx += is_leader_len
+
+        producer_len = len(extract_mlir_values(self.producer_state))
+        new_producer_state = new_from_mlir_values(self.producer_state, values[idx : idx + producer_len])
+        idx += producer_len
+
+        consumer_len = len(extract_mlir_values(self.consumer_state))
+        new_consumer_state = new_from_mlir_values(self.consumer_state, values[idx : idx + consumer_len])
+
+        return _DynamicSchedState(
+            new_counter_ptr,
+            new_broadcast_ptr,
+            new_is_leader_cta,
+            new_producer_state,
+            new_consumer_state,
+        )
+
+
+class DynamicPersistentTileScheduler(StaticPersistentTileScheduler):
+    """Cluster-granular dynamic persistent scheduler using a global atomic counter."""
+
+    @staticmethod
+    def make_storage_struct():
+        """Return the shared-memory storage required by dynamic scheduling."""
+
+        @cute.struct
+        class DynamicSchedulerStorage:
+            cluster_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+            sClusterIdx: cute.struct.MemRange[cutlass.Int32, 1]
+
+        return DynamicSchedulerStorage
+
+    def __init__(
+        self,
+        params: PersistentTileSchedulerParams,
+        num_persistent_clusters: Int32,
+        current_work_linear_idx: Int32,
+        cta_id_in_cluster: cute.Coord,
+        num_tiles_executed: Int32,
+        dynamic_state: _DynamicSchedState,
+        sched_storage=None,
+        cluster_pipeline=None,
+    ):
+        super().__init__(
+            params,
+            num_persistent_clusters,
+            current_work_linear_idx,
+            cta_id_in_cluster,
+            num_tiles_executed,
+        )
+        self._dynamic_state = dynamic_state
+        self._sched_storage = sched_storage
+        self.cluster_pipeline = cluster_pipeline
+
+    def __extract_mlir_values__(self) -> list[ir.Value]:
+        values = super().__extract_mlir_values__()
+        values.extend(extract_mlir_values(self._dynamic_state))
+        return values
+
+    def __new_from_mlir_values__(self, values: list[ir.Value]) -> "DynamicPersistentTileScheduler":
+        assert len(values) >= 6
+        new_num_persistent_clusters = new_from_mlir_values(self.num_persistent_clusters, [values[0]])
+        new_current_work_linear_idx = new_from_mlir_values(self._current_work_linear_idx, [values[1]])
+        new_cta_id_in_cluster = new_from_mlir_values(self.cta_id_in_cluster, values[2:5])
+        new_num_tiles_executed = new_from_mlir_values(self._num_tiles_executed, [values[5]])
+
+        params_len = len(extract_mlir_values(self.params))
+        params_start = 6
+        params_end = params_start + params_len
+        new_params = new_from_mlir_values(self.params, values[params_start:params_end])
+        new_dynamic_state = new_from_mlir_values(self._dynamic_state, values[params_end:])
+
+        return DynamicPersistentTileScheduler(
+            new_params,
+            new_num_persistent_clusters,
+            new_current_work_linear_idx,
+            new_cta_id_in_cluster,
+            new_num_tiles_executed,
+            new_dynamic_state,
+            sched_storage=self._sched_storage,
+            cluster_pipeline=self.cluster_pipeline,
+        )
+
+    @staticmethod
+    @dsl_user_op
+    def create(
+        params: PersistentTileSchedulerParams,
+        block_idx: Tuple[Integer, Integer, Integer],
+        grid_dim: Tuple[Integer, Integer, Integer],
+        counter_ptr,
+        sched_storage,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "DynamicPersistentTileScheduler":
+        """Initialize the dynamic persistent tile scheduler."""
+
+        num_persistent_clusters = cute.size(grid_dim, loc=loc, ip=ip) // cute.size(params.cluster_shape_mn, loc=loc, ip=ip)
+
+        bidx, bidy, _ = block_idx
+
+        cta_id_in_cluster = (
+            Int32(bidx % params.cluster_shape_mn[0]),
+            Int32(bidy % params.cluster_shape_mn[1]),
+            Int32(0),
+        )
+        current_work_linear_idx = Int32(-1)
+        num_tiles_executed = Int32(0)
+
+        dynamic_state = _DynamicSchedState(
+            counter_ptr=counter_ptr,
+            broadcast_ptr=sched_storage.sClusterIdx.data_ptr(),
+            is_leader_cta=Boolean((cta_id_in_cluster[0] + cta_id_in_cluster[1] + cta_id_in_cluster[2]) == Int32(0)),
+            producer_state=make_pipeline_state(PipelineUserType.Producer, 1, loc=loc, ip=ip),
+            consumer_state=make_pipeline_state(PipelineUserType.Consumer, 1, loc=loc, ip=ip),
+        )
+
+        return DynamicPersistentTileScheduler(
+            params,
+            num_persistent_clusters,
+            current_work_linear_idx,
+            cta_id_in_cluster,
+            num_tiles_executed,
+            dynamic_state,
+            sched_storage=sched_storage,
+            cluster_pipeline=None,
+        )
+
+    def internal_init(self):
+        """Create the internal cluster broadcast pipeline before warp specialization."""
+        cluster_size = self.params.cluster_shape_mn[0] * self.params.cluster_shape_mn[1]
+        self.cluster_pipeline = pipeline.PipelineAsync.create(
+            barrier_storage=self._sched_storage.cluster_mbar.data_ptr(),
+            num_stages=1,
+            producer_group=CooperativeGroup(Agent.Thread, 1),
+            consumer_group=CooperativeGroup(Agent.Thread, 32 * cluster_size),
+            defer_sync=True,
+        )
+
+    @dsl_user_op
+    @cute.jit
+    def _fetch_next_cluster_idx(self, *, loc=None, ip=None) -> Int32:
+        """Fetch the next cluster linear index and broadcast it within the cluster."""
+        ds = self._dynamic_state
+        broadcast_tensor = cute.make_tensor(ds.broadcast_ptr, cute.make_layout((1,)))
+        cluster_idx = Int32(0)
+
+        if ds.is_leader_cta:
+            self.cluster_pipeline.producer_acquire(ds.producer_state)
+            full_barrier_ptr = self.cluster_pipeline.sync_object_full.get_barrier(ds.producer_state.index, loc=loc, ip=ip)
+            tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
+            lane_idx = tidx % Int32(32)
+            cluster_size = self.params.cluster_shape_mn[0] * self.params.cluster_shape_mn[1]
+
+            atomic_idx = Int32(0)
+            if lane_idx == 0:
+                atomic_idx = atomic_add_i32(
+                    ds.counter_ptr.llvm_ptr,
+                    Int32(1),
+                    loc=loc,
+                    ip=ip,
+                )
+            atomic_idx = cute.arch.shuffle_sync(
+                atomic_idx,
+                offset=0,
+                mask=0xFFFFFFFF,
+                mask_and_clamp=31,
+            )
+
+            if lane_idx < Int32(cluster_size):
+                store_i32_to_peer_cluster_smem_async(
+                    ds.broadcast_ptr,
+                    atomic_idx,
+                    full_barrier_ptr,
+                    lane_idx,
+                    loc=loc,
+                    ip=ip,
+                )
+
+            self._cluster_producer_commit(loc=loc, ip=ip)
+
+        ds.producer_state.advance()
+        self.cluster_pipeline.consumer_wait(ds.consumer_state)
+        cluster_idx = broadcast_tensor[0]
+        return cluster_idx
+
+    @dsl_user_op
+    @cute.jit
+    def _release_cluster_idx(self, *, loc=None, ip=None) -> None:
+        """Release the cluster broadcast slot after consumption."""
+        ds = self._dynamic_state
+        self._cluster_consumer_release(loc=loc, ip=ip)
+        ds.consumer_state.advance()
+
+    @dsl_user_op
+    @cute.jit
+    def _cluster_producer_commit(self, *, loc=None, ip=None) -> None:
+        """Fan out a single cluster index to the full barrier."""
+        ds = self._dynamic_state
+        tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
+        lane_idx = tidx % Int32(32)
+        cluster_size = self.params.cluster_shape_mn[0] * self.params.cluster_shape_mn[1]
+        if ds.is_leader_cta and lane_idx < Int32(cluster_size):
+            mbarrier_arrive_expect_tx_on_peer(
+                self.cluster_pipeline.sync_object_full.get_barrier(ds.producer_state.index, loc=loc, ip=ip),
+                Int32(4),
+                lane_idx,
+                loc=loc,
+                ip=ip,
+            )
+
+    @dsl_user_op
+    @cute.jit
+    def _cluster_consumer_release(self, *, loc=None, ip=None) -> None:
+        """Release one consumed cluster index from the broadcast pipeline."""
+        ds = self._dynamic_state
+        self.cluster_pipeline.sync_object_empty.arrive(ds.consumer_state.index, Int32(0))
+
+    @dsl_user_op
+    def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkTileInfo:
+        if const_expr(self.cluster_pipeline is None):
+            raise RuntimeError("DynamicPersistentTileScheduler.internal_init() must be called before use.")
+        self._current_work_linear_idx = self._fetch_next_cluster_idx(loc=loc, ip=ip)
+        work_tile = self.get_current_work(loc=loc, ip=ip)
+        self._release_cluster_idx(loc=loc, ip=ip)
+        return work_tile
+
+    @dsl_user_op
+    def advance_to_next_work(self, *, advance_count: int = 1, loc=None, ip=None):
+        if const_expr(advance_count != 1):
+            raise ValueError("DynamicPersistentTileScheduler only supports advance_count == 1")
+        self._current_work_linear_idx = self._fetch_next_cluster_idx(loc=loc, ip=ip)
+        self._release_cluster_idx(loc=loc, ip=ip)
+        self._num_tiles_executed += Int32(1)
 
 
 class StaticPersistentRuntimeTileScheduler(StaticPersistentTileScheduler):

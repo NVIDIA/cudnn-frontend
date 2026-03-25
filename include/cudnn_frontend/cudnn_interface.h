@@ -97,7 +97,13 @@ create_cudnn_tensor(
 }
 }  // namespace detail
 
+namespace graph {
+class UnifiedSDPANode;
+}  // namespace graph
+
 class ICudnn {
+    friend class graph::UnifiedSDPANode;
+
    protected:
     using uid_t = int64_t;
 
@@ -126,6 +132,11 @@ class ICudnn {
     bool is_override_shape_enabled = false;
 
     std::shared_ptr<const DeviceProperties> device_properties = nullptr;
+
+    std::shared_ptr<OperationGraph_v8>
+    get_operation_graph() const {
+        return operation_graph;
+    }
 
     error_t
     create_cudnn_operation_graph(cudnnHandle_t handle) {

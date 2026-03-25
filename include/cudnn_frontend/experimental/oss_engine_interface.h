@@ -27,7 +27,6 @@
 #include "../graph_helpers.h"
 #include "../../cudnn_frontend_shim.h"
 
-#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -74,7 +73,7 @@ class IOssSdpaEngine {
             void* d_sum_exp,
             std::vector<int64_t> const& se_strides,
             void* workspace,
-            CUdevice device,
+            int device,
             cudaStream_t stream,
             std::optional<float> user_attn_scale = std::nullopt) = 0;
 
@@ -146,7 +145,7 @@ class IOssNormEngine {
             int cols,
             float epsilon,
             void* workspace,
-            CUdevice device,
+            int device,
             cudaStream_t stream,
             RmsNormSiluExtraParams const& extra = {}) = 0;
 
@@ -163,8 +162,8 @@ class IOssNormEngine {
 
 inline error_t
 compile_and_load_kernel(const KernelSpec* spec,
-                        CUlibrary& module,
-                        CUkernel& kernelPtr,
+                        cudaLibrary_t& module,
+                        cudaKernel_t& kernelPtr,
                         std::unique_ptr<char[]>& cubin,
                         size_t& cubinSize,
                         std::string& kernelName) {
@@ -239,20 +238,20 @@ compile_and_load_kernel(const KernelSpec* spec,
         nvrtc_err != NVRTC_SUCCESS, error_code_t::CUDA_API_FAILED, "nvrtcDestroyProgram failed");
 
     // Load module + extract kernel function
-    CUresult cu_err;
+    cudaError_t cuda_err;
 
-    cu_err = detail::cu_library_load_data(&module, cubin.get(), nullptr, nullptr, 0, nullptr, nullptr, 0);
-    RETURN_CUDNN_FRONTEND_ERROR_IF(cu_err != CUDA_SUCCESS,
+    cuda_err = detail::cuda_library_load_data(&module, cubin.get(), nullptr, nullptr, 0, nullptr, nullptr, 0);
+    RETURN_CUDNN_FRONTEND_ERROR_IF(cuda_err != cudaSuccess,
                                    error_code_t::CUDA_API_FAILED,
-                                   "cuLibraryLoadData failed (cubin_size=" + std::to_string(cubinSize) +
-                                       ", CUresult=" + detail::cu_result_to_string(cu_err) + ")");
+                                   "cudaLibraryLoadData failed (cubin_size=" + std::to_string(cubinSize) +
+                                       ", error=" + detail::cuda_error_to_string(cuda_err) + ")");
 
     kernelName = spec->kernel_name;
-    cu_err     = detail::cu_library_get_kernel(&kernelPtr, module, kernelName.c_str());
+    cuda_err   = detail::cuda_library_get_kernel(&kernelPtr, module, kernelName.c_str());
     RETURN_CUDNN_FRONTEND_ERROR_IF(
-        cu_err != CUDA_SUCCESS,
+        cuda_err != cudaSuccess,
         error_code_t::CUDA_API_FAILED,
-        "cuLibraryGetKernel failed: " + detail::cu_result_to_string(cu_err) + " (kernel: " + kernelName + ")");
+        "cudaLibraryGetKernel failed: " + detail::cuda_error_to_string(cuda_err) + " (kernel: " + kernelName + ")");
 
     CUDNN_FE_LOG_LABEL_ENDL("INFO: NVRTC compilation successful, kernel: " << kernelName);
     return {error_code_t::OK, ""};

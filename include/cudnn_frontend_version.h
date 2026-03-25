@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -23,7 +23,7 @@
 #pragma once
 
 #define CUDNN_FRONTEND_MAJOR_VERSION 1
-#define CUDNN_FRONTEND_MINOR_VERSION 20
+#define CUDNN_FRONTEND_MINOR_VERSION 21
 #define CUDNN_FRONTEND_PATCH_VERSION 0
 #define CUDNN_FRONTEND_VERSION \
     ((CUDNN_FRONTEND_MAJOR_VERSION * 10000) + (CUDNN_FRONTEND_MINOR_VERSION * 100) + CUDNN_FRONTEND_PATCH_VERSION)

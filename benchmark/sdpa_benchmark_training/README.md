@@ -176,6 +176,64 @@ python benchmark_single_sdpa.py \
 
 Run `python benchmark_single_sdpa.py --help` for all options.
 
+## Comparing With `test_repro --perf`
+
+The benchmark script above is useful for standalone SDPA timing. To compare those numbers against the Python SDPA test harness, use `pytest ...::test_repro --perf`.
+
+`--perf` enables timing-only execution for `test_repro`. In this mode, the test prints the median `graph.execute` time and skips the reference path so the measurement matches the benchmark workflow more closely.
+
+### Timing Methods
+
+- `--timing_method cupti`: Uses `torch.profiler` device time. This is the default and is the closest match to `benchmark_single_sdpa.py`.
+- `--timing_method events`: Uses CUDA events for comparison.
+
+### Example: Causal Training Case
+
+```bash
+# benchmark (CUPTI-style timing)
+python benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py \
+    --batch_size 1 --q_seqlen 8192 --kv_seqlen 8192 \
+    --num_q_heads 64 --num_kv_heads 8 --head_dim 128 \
+    --sdpa_backend cudnn --data_type bfloat16 \
+    --attn_mask top_left --skip_ref --fwd_bwd
+
+# test_repro --perf (CUPTI by default)
+pytest -vv -s test/python/test_mhas_v2.py::test_repro --perf --repro "{
+    'data_type': 'torch.bfloat16',
+    'is_infer': False,
+    'is_padding': False, 'is_alibi': None, 'is_bias': None, 'is_dropout': None,
+    'with_sink_token': False, 'with_score_max': False, 'with_score_sum_exp': False,
+    'batches': 1, 'd_qk': 128, 'd_v': 128,
+    's_q': 8192, 's_kv': 8192,
+    'h_q': 64, 'h_k': 8, 'h_v': 8,
+    'shape_q': (1, 64, 8192, 128), 'stride_q': (67108864, 128, 8192, 1),
+    'shape_k': (1, 8, 8192, 128),  'stride_k': (8388608, 128, 1024, 1),
+    'shape_v': (1, 8, 8192, 128),  'stride_v': (8388608, 128, 1024, 1),
+    'shape_o': (1, 64, 8192, 128), 'stride_o': (67108864, 128, 8192, 1),
+    'diag_align': 'cudnn.diagonal_alignment.TOP_LEFT',
+    'right_bound': 0,
+    'rng_data_seed': 42, 'rng_geom_seed': 42,
+}"
+
+# test_repro --perf with CUDA events instead of CUPTI
+pytest -vv -s test/python/test_mhas_v2.py::test_repro --perf --timing_method events --repro "{
+    'data_type': 'torch.bfloat16',
+    'is_infer': False,
+    'is_padding': False, 'is_alibi': None, 'is_bias': None, 'is_dropout': None,
+    'with_sink_token': False, 'with_score_max': False, 'with_score_sum_exp': False,
+    'batches': 1, 'd_qk': 128, 'd_v': 128,
+    's_q': 8192, 's_kv': 8192,
+    'h_q': 64, 'h_k': 8, 'h_v': 8,
+    'shape_q': (1, 64, 8192, 128), 'stride_q': (67108864, 128, 8192, 1),
+    'shape_k': (1, 8, 8192, 128),  'stride_k': (8388608, 128, 1024, 1),
+    'shape_v': (1, 8, 8192, 128),  'stride_v': (8388608, 128, 1024, 1),
+    'shape_o': (1, 64, 8192, 128), 'stride_o': (67108864, 128, 8192, 1),
+    'diag_align': 'cudnn.diagonal_alignment.TOP_LEFT',
+    'right_bound': 0,
+    'rng_data_seed': 42, 'rng_geom_seed': 42,
+}"
+```
+
 ## Programmatic Usage
 
 ```python

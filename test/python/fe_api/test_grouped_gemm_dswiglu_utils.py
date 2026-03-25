@@ -22,7 +22,15 @@ from test_grouped_gemm_swiglu_utils import (
 # Parameterization Marks
 # =============================================================================
 
-GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP8 = [
+GROUPED_GEMM_DSWIGLU_COMMON_MARKS = [
+    pytest.mark.parametrize("cd_major", ["n"]),
+    pytest.mark.parametrize("acc_dtype", [torch.float32]),
+    pytest.mark.parametrize("mma_tiler_mn", [(256, 256), (128, 128)]),
+    pytest.mark.parametrize("cluster_shape_mn", [(2, 1), (1, 1)]),
+    pytest.mark.parametrize("vector_f32", [True, False]),
+]
+
+GROUPED_GEMM_DSWIGLU_FP8_TYPE_MARKS = [
     pytest.mark.parametrize(
         "ab_dtype",
         [
@@ -48,34 +56,9 @@ GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP8 = [
         ],
     ),
     pytest.mark.parametrize("b_major", ["k", "n"]),
-    pytest.mark.parametrize("cd_major", ["n"]),
-    pytest.mark.parametrize("acc_dtype", [torch.float32]),
-    pytest.mark.parametrize(
-        "mma_tiler_mn",
-        [
-            (256, 256),
-            (128, 128),
-        ],
-    ),
-    pytest.mark.parametrize(
-        "cluster_shape_mn",
-        [
-            (2, 1),
-            (1, 1),
-        ],
-    ),
-    pytest.mark.parametrize("sf_vec_size", [32]),
-    pytest.mark.parametrize(
-        "sf_dtype",
-        [
-            torch.float8_e8m0fnu,
-        ],
-    ),
-    pytest.mark.parametrize("vector_f32", [True, False]),
-    pytest.mark.parametrize("discrete_col_sfd", [True, False]),
 ]
 
-GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4 = [
+GROUPED_GEMM_DSWIGLU_FP4_TYPE_MARKS = [
     pytest.mark.parametrize(
         "ab_dtype",
         [
@@ -99,33 +82,59 @@ GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4 = [
             torch.float32,
         ],
     ),
-    pytest.mark.parametrize("cd_major", ["n"]),
-    pytest.mark.parametrize("acc_dtype", [torch.float32]),
-    pytest.mark.parametrize(
-        "mma_tiler_mn",
-        [
-            (256, 256),
-            (128, 128),
-        ],
-    ),
-    pytest.mark.parametrize(
-        "cluster_shape_mn",
-        [
-            (2, 1),
-            (1, 1),
-        ],
-    ),
-    pytest.mark.parametrize("sf_vec_size", [16, 32]),
-    pytest.mark.parametrize(
-        "sf_dtype",
-        [
-            torch.float8_e8m0fnu,
-            torch.float8_e4m3fn,
-        ],
-    ),
-    pytest.mark.parametrize("vector_f32", [True, False]),
-    pytest.mark.parametrize("discrete_col_sfd", [False]),
+    pytest.mark.parametrize("b_major", ["k"]),
 ]
+
+GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP8 = (
+    GROUPED_GEMM_DSWIGLU_FP8_TYPE_MARKS
+    + GROUPED_GEMM_DSWIGLU_COMMON_MARKS
+    + [
+        pytest.mark.parametrize("sf_vec_size,sf_dtype", [(32, torch.float8_e8m0fnu)]),
+        pytest.mark.parametrize("discrete_col_sfd", [True, False]),
+    ]
+)
+
+GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4 = (
+    GROUPED_GEMM_DSWIGLU_FP4_TYPE_MARKS
+    + GROUPED_GEMM_DSWIGLU_COMMON_MARKS
+    + [
+        pytest.mark.parametrize(
+            "sf_vec_size,sf_dtype",
+            [
+                (16, torch.float8_e8m0fnu),
+                (16, torch.float8_e4m3fn),
+                (32, torch.float8_e8m0fnu),
+                (32, torch.float8_e4m3fn),
+            ],
+        ),
+        pytest.mark.parametrize("discrete_col_sfd", [False]),
+    ]
+)
+
+GROUPED_GEMM_DSWIGLU_PARAM_MARKS_DBIAS_FP8 = (
+    GROUPED_GEMM_DSWIGLU_FP8_TYPE_MARKS
+    + GROUPED_GEMM_DSWIGLU_COMMON_MARKS
+    + [
+        pytest.mark.parametrize("sf_vec_size,sf_dtype", [(32, torch.float8_e8m0fnu)]),
+        pytest.mark.parametrize("discrete_col_sfd", [True, False]),
+    ]
+)
+
+GROUPED_GEMM_DSWIGLU_PARAM_MARKS_DBIAS_FP4 = (
+    GROUPED_GEMM_DSWIGLU_FP4_TYPE_MARKS
+    + GROUPED_GEMM_DSWIGLU_COMMON_MARKS
+    + [
+        pytest.mark.parametrize(
+            "sf_vec_size,sf_dtype",
+            [
+                (16, torch.float8_e8m0fnu),
+                (16, torch.float8_e4m3fn),
+                (32, torch.float8_e8m0fnu),
+            ],
+        ),
+        pytest.mark.parametrize("discrete_col_sfd", [False]),
+    ]
+)
 
 
 def with_grouped_gemm_dswiglu_params_fp4(func):
@@ -138,6 +147,20 @@ def with_grouped_gemm_dswiglu_params_fp4(func):
 def with_grouped_gemm_dswiglu_params_fp8(func):
     """Decorator to apply grouped GEMM dSwiGLU FP8 test parameters."""
     for mark in reversed(GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP8):
+        func = mark(func)
+    return func
+
+
+def with_grouped_gemm_dswiglu_params_dbias_fp4(func):
+    """Decorator to apply grouped GEMM dSwiGLU dense dbias FP4 test parameters."""
+    for mark in reversed(GROUPED_GEMM_DSWIGLU_PARAM_MARKS_DBIAS_FP4):
+        func = mark(func)
+    return func
+
+
+def with_grouped_gemm_dswiglu_params_dbias_fp8(func):
+    """Decorator to apply grouped GEMM dSwiGLU dense dbias FP8 test parameters."""
+    for mark in reversed(GROUPED_GEMM_DSWIGLU_PARAM_MARKS_DBIAS_FP8):
         func = mark(func)
     return func
 
@@ -155,6 +178,7 @@ def allocate_grouped_gemm_dswiglu_tensors(
     cd_major: str,
     sf_dtype: torch.dtype,
     sf_vec_size: int = 16,
+    generate_dbias: bool = False,
     input_tensors: Optional[Dict] = None,
     output_tensors: Optional[Dict] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -178,6 +202,7 @@ def allocate_grouped_gemm_dswiglu_tensors(
         "d_row_tensor": d_row_tensor,
         "d_col_tensor": d_col_tensor,
         "dprob_tensor": dprob_tensor,
+        "dbias_tensor": None,
         "sfd_row_tensor": None,
         "sfd_col_tensor": None,
         "amax_tensor": None,
@@ -186,6 +211,9 @@ def allocate_grouped_gemm_dswiglu_tensors(
     if d_dtype in [torch.bfloat16, torch.float16]:
         # amax shape for dswiglu is (l, 2, 1) - two amax values per expert
         _output_tensors["amax_tensor"] = torch.full((l, 2, 1), float("-inf"), dtype=torch.float32).cuda()
+
+    if generate_dbias:
+        _output_tensors["dbias_tensor"] = torch.zeros((l, n * 2, 1), dtype=torch.bfloat16).cuda()
 
     if ab_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and sf_dtype in [
         torch.float8_e8m0fnu,
@@ -303,6 +331,7 @@ def run_grouped_gemm_dswiglu_ref(
     prob_tensor: torch.Tensor,
     aligned_group_m_list: List[int],
     valid_m: int,
+    generate_dbias: bool = False,
     generate_amax: bool = False,
     generate_sfd: bool = False,
     norm_const_tensor: Optional[torch.Tensor] = None,
@@ -415,6 +444,15 @@ def run_grouped_gemm_dswiglu_ref(
 
     ref_tensors["d_ref"] = ref_d.clone()
 
+    if generate_dbias:
+        ref_dbias = torch.zeros((l, n * 2, 1), dtype=torch.bfloat16, device=a_ref.device)
+        start = 0
+        for i, group_m in enumerate(aligned_group_m_list):
+            end = start + group_m
+            ref_dbias[i, :, 0] = ref_d[start:end, :, 0].sum(dim=0).to(torch.bfloat16)
+            start = end
+        ref_tensors["dbias_ref"] = ref_dbias
+
     # Step 6: Generate amax for FP4/BF16 output
     if generate_amax:
         ref_amax = torch.empty((l, 2, 1), dtype=torch.float32, device=a_ref.device)
@@ -479,6 +517,7 @@ def check_ref_grouped_gemm_dswiglu(
         prob_tensor=inputs["prob_tensor"],
         aligned_group_m_list=inputs["aligned_group_m_list"],
         valid_m=inputs["valid_m"],
+        generate_dbias=(outputs.get("dbias_tensor") is not None),
         generate_amax=(outputs.get("amax_tensor") is not None),
         generate_sfd=(outputs.get("sfd_row_tensor") is not None),
         norm_const_tensor=inputs.get("norm_const_tensor"),
@@ -498,6 +537,21 @@ def check_ref_grouped_gemm_dswiglu(
             dprob_gpu.cpu().float(),
             dprob_ref.cpu().float(),
             atol=atol,
+            rtol=rtol,
+        )
+
+    if ref_tensors.get("dbias_ref") is not None and outputs.get("dbias_tensor") is not None:
+        max_m = max(inputs["aligned_group_m_list"])
+        use_2cta_instrs = cfg["mma_tiler_mn"][0] == 256
+        num_tiles_per_expert = max_m // (cfg["mma_tiler_mn"][0] // (2 if use_2cta_instrs else 1))
+        dbias_ref = ref_tensors["dbias_ref"].cpu().float()
+        # Mirror the standalone kernel's BF16 atomicAdd tolerance scaling.
+        dbias_atol = dbias_ref.abs().max().item() * 0.008 * (num_tiles_per_expert**0.5)
+        dbias_atol = max(dbias_atol, atol)
+        torch.testing.assert_close(
+            outputs["dbias_tensor"].cpu().float(),
+            dbias_ref,
+            atol=dbias_atol,
             rtol=rtol,
         )
 
@@ -525,6 +579,17 @@ def check_ref_grouped_gemm_dswiglu(
             )
 
     elif cfg["d_dtype"] in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        # FP8 outputs can differ by one quantization bucket from the exact
+        # reference because the kernel uses fast approximate sigmoid/reciprocal
+        # math before the final FP8 conversion. Use dtype-aware tolerances for
+        # the quantized D comparisons while keeping stricter checks for SFD.
+        if cfg["d_dtype"] == torch.float8_e4m3fn:
+            fp8_d_atol = max(atol, 0.125)
+            fp8_d_rtol = max(rtol, 0.125)
+        else:
+            fp8_d_atol = max(atol, 0.25)
+            fp8_d_rtol = max(rtol, 0.25)
+
         if ref_tensors.get("sfd_row_ref") is not None:  # generate_sfd
             # Check sfd_row
             sfd_row_gpu = outputs["sfd_row_tensor"]
@@ -542,8 +607,8 @@ def check_ref_grouped_gemm_dswiglu(
             torch.testing.assert_close(
                 d_gpu.cpu().float(),
                 d_ref.cpu().to(cfg["d_dtype"]).to(torch.float32),
-                atol=atol,
-                rtol=rtol,
+                atol=fp8_d_atol,
+                rtol=fp8_d_rtol,
             )
 
             # Check sfd_col
@@ -591,8 +656,8 @@ def check_ref_grouped_gemm_dswiglu(
                 torch.testing.assert_close(
                     d_col_gpu.permute(1, 0, 2).cpu().float(),
                     d_col_ref.to(cfg["d_dtype"]).to(torch.float32).cpu(),
-                    atol=atol,
-                    rtol=rtol,
+                    atol=fp8_d_atol,
+                    rtol=fp8_d_rtol,
                 )
         else:
             # Non-generate_sfd path
@@ -602,8 +667,8 @@ def check_ref_grouped_gemm_dswiglu(
                 torch.testing.assert_close(
                     d_gpu.cpu().float(),
                     d_ref.cpu().to(cfg["d_dtype"]).to(torch.float32),
-                    atol=atol,
-                    rtol=rtol,
+                    atol=fp8_d_atol,
+                    rtol=fp8_d_rtol,
                 )
     else:
         raise NotImplementedError(f"Unsupported dtype: {cfg['d_dtype']}")
