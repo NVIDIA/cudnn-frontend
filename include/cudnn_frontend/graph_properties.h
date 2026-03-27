@@ -1033,6 +1033,13 @@ class Layernorm_attributes : public Attributes<Layernorm_attributes> {
         inputs[Layernorm_attributes::input_names::EPSILON] = value;
         return *this;
     }
+
+    Layernorm_attributes&
+    set_epsilon(float const value) {
+        inputs[Layernorm_attributes::input_names::EPSILON] =
+            std::make_shared<Tensor_attributes>(value);
+        return *this;
+    }
 };
 
 class AdaLayernorm_attributes : public Attributes<AdaLayernorm_attributes> {
