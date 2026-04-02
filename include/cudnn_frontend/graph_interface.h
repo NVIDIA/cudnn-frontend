@@ -353,7 +353,7 @@ class Graph : public ICudnn, public INode {
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             sdpa_attrs == nullptr, error_code_t::GRAPH_NOT_SUPPORTED, "No SDPA node found for OPENSOURCE engine");
 
-        graph::Execution_plan_list::OssEngineContext ctx;
+        graph::Execution_plan_list::OssSdpaEngineContext ctx;
 
         // Q tensor
         auto q_it = sdpa_attrs->inputs.find(SDPA_attributes::input_names::Q);
@@ -440,8 +440,8 @@ class Graph : public ICudnn, public INode {
         } else {
             engine = std::make_shared<experimental::Sm90SdpaPrefillEngine>();
         }
-        plans.set_oss_engine(engine);
-        plans.set_oss_engine_context(std::move(ctx));
+        plans.set_oss_sdpa_engine(engine);
+        plans.set_oss_sdpa_engine_context(std::move(ctx));
 
         return {error_code_t::OK, ""};
     }
@@ -1001,7 +1001,7 @@ class Graph : public ICudnn, public INode {
     error_t
     get_workspace_size_plan_at_index(int64_t plan_index, int64_t &cudnn_workspace_size) const {
         // OSS SDPA engine workspace: 16 bytes for tile_id_counter
-        if (plan_index == graph::Execution_plan_list::OSS_ENGINE_CANDIDATE) {
+        if (plan_index == graph::Execution_plan_list::OSS_SDPA_ENGINE_CANDIDATE) {
             cudnn_workspace_size = fe_workspace_size + experimental::Sm90SdpaPrefillEngine::get_workspace_size();
             CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is " << cudnn_workspace_size << " (OSS SDPA engine)");
             return {error_code_t::OK, ""};
@@ -1053,24 +1053,79 @@ class Graph : public ICudnn, public INode {
              std::unordered_map<int64_t, void *> &tensor_uid_to_pointer_map,
              void *workspace,
              void *user_impl = nullptr) {
-        // Add pass_by_value data pointers to tensor_uid_to_pointer map.
-        // Using cached values to avoid repeated tree traversal overhead.
-        CHECK_CUDNN_FRONTEND_ERROR(
-            extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, cached_pass_by_value));
+        (void)user_impl;  // reserved for future use
 
-        CHECK_CUDNN_FRONTEND_ERROR(
-            make_variant_pack_replacements(tensor_uid_to_pointer_map, variant_pack_replacements));
+        const int maxIterCount = 100;
+        const float threshold  = 0.95f;
 
-        CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
+        auto plan_cmp = [](std::shared_ptr<ExecutionPlan> a, std::shared_ptr<ExecutionPlan> b) {
+            return a->getExecutionTime() < b->getExecutionTime();
+        };
+        std::multiset<std::shared_ptr<ExecutionPlan>, decltype(plan_cmp)> timed_plans(plan_cmp);
 
-        CHECK_CUDNN_FRONTEND_ERROR(extend_tensor_map_with_workspace_tensors_(
-            tensor_uid_to_pointer_map, workspace, cached_workspace_modifications));
+        cudaEvent_t start, stop;
+        detail::cuda_event_create(&start);
+        detail::cuda_event_create(&stop);
+        detail::cuda_device_synchronize();
 
-        // offset workspace by the already used fe graph workspace
-        // this is where cudnn backend can start using workspace for its execution plans
-        void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+        cudaStream_t stream = nullptr;
+        detail::get_stream(handle, &stream);
 
-        CHECK_CUDNN_FRONTEND_ERROR(plans.autotune(handle, tensor_uid_to_pointer_map, cudnn_workspace, user_impl));
+        uint64_t successful_plan_count = 0;
+        for (int64_t i = 0; i < static_cast<int64_t>(plans.execution_plans.size()); i++) {
+            if (plans.execution_plans[i] == nullptr) continue;
+
+            // Warm-up run
+            auto warmup_status = execute_plan_at_index(handle, tensor_uid_to_pointer_map, workspace, i);
+            if (warmup_status.is_bad()) {
+                CUDNN_FE_LOG_LABEL_ENDL("WARN: Plan " << i << " failed warmup, skipping.");
+                continue;
+            }
+            successful_plan_count++;
+            detail::cuda_device_synchronize();
+
+            float min_time_ms = std::numeric_limits<float>::max();
+            for (int iter = 0; iter < maxIterCount; iter++) {
+                detail::cuda_event_record(start, stream);
+                auto iter_status = execute_plan_at_index(handle, tensor_uid_to_pointer_map, workspace, i);
+                detail::cuda_event_record(stop, stream);
+                detail::cuda_event_synchronize(stop);
+
+                if (iter_status.is_bad()) {
+                    CUDNN_FE_LOG_LABEL_ENDL("WARN: Plan " << i << " failed at iter " << iter << ", skipping time.");
+                    continue;
+                }
+
+                float time_ms = 0.0f;
+                detail::cuda_event_elapsed_time(&time_ms, start, stop);
+                float new_min = std::min(min_time_ms, time_ms);
+                if (time_ms / min_time_ms < threshold) {
+                    min_time_ms = new_min;
+                } else {
+                    break;
+                }
+            }
+
+            CUDNN_FE_LOG_LABEL_ENDL("Plan " << plans.execution_plans[i]->getTag() << " took " << std::setw(10)
+                                            << min_time_ms);
+            plans.execution_plans[i]->setExecutionTime(min_time_ms);
+            timed_plans.insert(plans.execution_plans[i]);
+        }
+
+        // Re-order plans by measured time, winner at index 0
+        plans.execution_plans.clear();
+        for (auto sorted_plan : timed_plans) {
+            plans.execution_plans.push_back(sorted_plan);
+        }
+        plans.candidate = 0;
+
+        // Re-prepare the variant pack template to match the new plan ordering
+        CHECK_CUDNN_FRONTEND_ERROR(prepare_variant_pack_template());
+
+        detail::cuda_event_destroy(start);
+        detail::cuda_event_destroy(stop);
+
+        CUDNN_FE_LOG_LABEL_ENDL("Autotuned " << successful_plan_count << " plans.");
         return {error_code_t::OK, ""};
     }
 
@@ -1079,82 +1134,36 @@ class Graph : public ICudnn, public INode {
              std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
              void *workspace,
              void *user_impl = nullptr) {
-        // First get all the uids from the map
-        std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
+        std::unordered_map<int64_t, void *> uid_map;
         for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
-            tensor_uid_to_pointer_map.emplace(tensor->get_uid(), pointer);
+            uid_map.emplace(tensor->get_uid(), pointer);
         }
-
-        return autotune(handle, tensor_uid_to_pointer_map, workspace, user_impl);
+        return autotune(handle, uid_map, workspace, user_impl);
     }
 
-    error_t
-    execute_plan_at_index(cudnnHandle_t handle,
-                          std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
-                          void *workspace,
-                          int64_t plan_index) const {
-        CUDNN_FE_LOG_BANNER(" EXECUTE PLAN AT INDEX  for plan index (with Tensor keys) " << plan_index << "  ");
-        // First get all the uids from the map
-        std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
-        for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
-            tensor_uid_to_pointer_map.emplace(tensor->get_uid(), pointer);
-        }
+    // -----------------------------------------------------------------------
+    // Execute overloads.
+    // All roads lead to execute_plan_at_index(handle, sorted_ptrs, n, ws, plan_index).
+    // -----------------------------------------------------------------------
 
-        return execute_plan_at_index(handle, tensor_uid_to_pointer_map, workspace, plan_index);
-    }
+    // --- Convenience wrappers: convert key types, use default plan index ---
 
     error_t
     execute(cudnnHandle_t handle,
             std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
             void *workspace) const {
-        CUDNN_FE_LOG_BANNER(" EXECUTE PLAN (with Tensor keys) ");
-        // First get all the uids from the map
-        std::unordered_map<int64_t, void *> tensor_uid_to_pointer_map;
+        std::unordered_map<int64_t, void *> uid_map;
         for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
-            tensor_uid_to_pointer_map.emplace(tensor->get_uid(), pointer);
+            uid_map.emplace(tensor->get_uid(), pointer);
         }
-
-        return execute(handle, tensor_uid_to_pointer_map, workspace);
+        return execute(handle, uid_map, workspace);
     }
+
     error_t
-    execute_plan_at_index(cudnnHandle_t handle,
-                          std::unordered_map<int64_t, void *> &tensor_uid_to_pointer_map,
-                          void *workspace,
-                          int64_t plan_index,
-                          std::vector<int64_t> const &override_uids,
-                          std::vector<std::vector<int64_t>> const &override_shapes,
-                          std::vector<std::vector<int64_t>> const &override_strides) const {
-        // Add pass_by_value data pointers to uid_to_pointer map.
-        // Using cached values to avoid repeated tree traversal overhead.
-        // Object lifetime is controlled by cached_pass_by_value which persists for the Graph's lifetime.
-        CUDNN_FE_LOG_BANNER("  EXECUTE PLAN AT INDEX  for plan index " << plan_index << "  ");
-
-        CHECK_CUDNN_FRONTEND_ERROR(
-            extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, cached_pass_by_value));
-
-        CHECK_CUDNN_FRONTEND_ERROR(
-            make_variant_pack_replacements(tensor_uid_to_pointer_map, variant_pack_replacements));
-
-        CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
-
-        CHECK_CUDNN_FRONTEND_ERROR(extend_tensor_map_with_workspace_tensors_(
-            tensor_uid_to_pointer_map, workspace, cached_workspace_modifications));
-        // offset workspace by the already used fe graph workspace
-        // this is where cudnn backend can start using workspace for its execution plans
-        void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
-
-        CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, tensor_uid_to_pointer_map));
-
-        CHECK_CUDNN_FRONTEND_ERROR(execute_cudnn_plan_with_uid(handle,
-                                                               tensor_uid_to_pointer_map,
-                                                               cudnn_workspace,
-                                                               plan_index,
-                                                               override_uids,
-                                                               override_shapes,
-                                                               override_strides));
-
-        CUDNN_FE_LOG_BANNER("  EXECUTE PLAN AT INDEX  ALL OK for plan index " << plan_index << "  ");
-        return {error_code_t::OK, ""};
+    execute(cudnnHandle_t handle,
+            std::unordered_map<int64_t, void *> &tensor_uid_to_pointer_map,
+            void *workspace) const {
+        return execute_plan_at_index(handle, tensor_uid_to_pointer_map, workspace, plans.candidate);
     }
 
     error_t
@@ -1164,152 +1173,168 @@ class Graph : public ICudnn, public INode {
             std::vector<int64_t> const &override_uids,
             std::vector<std::vector<int64_t>> const &override_shapes,
             std::vector<std::vector<int64_t>> const &override_strides) const {
-        // Add pass_by_value data pointers to uid_to_pointer map.
-        // Using cached values to avoid repeated tree traversal overhead.
-        CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ");
-
-        CHECK_CUDNN_FRONTEND_ERROR(
-            extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, cached_pass_by_value));
-        CHECK_CUDNN_FRONTEND_ERROR(
-            make_variant_pack_replacements(tensor_uid_to_pointer_map, variant_pack_replacements));
-
-        // OSS SDPA engine dispatch with dynamic shape overrides
-        if (plans.is_oss_candidate()) {
-            cudaStream_t stream = nullptr;
-            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
-
-            int device_ordinal = 0;
-            detail::cuda_get_device(&device_ordinal);
-            int cu_device = device_ordinal;
-
-            void *oss_workspace = static_cast<char *>(workspace) + fe_workspace_size;
-            CHECK_CUDNN_FRONTEND_ERROR(plans.execute_oss_engine(tensor_uid_to_pointer_map,
-                                                                oss_workspace,
-                                                                cu_device,
-                                                                stream,
-                                                                override_uids,
-                                                                override_shapes,
-                                                                override_strides));
-
-            CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK (OSS SDPA engine, dynamic shapes) ");
-            return {error_code_t::OK, ""};
-        }
-
-        // OSS RmsNorm+SiLU engine dispatch
-        if (plans.is_oss_rms_norm_silu_candidate()) {
-            cudaStream_t stream = nullptr;
-            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
-
-            int device_ordinal = 0;
-            detail::cuda_get_device(&device_ordinal);
-            int cu_device = device_ordinal;
-
-            void *oss_workspace = static_cast<char *>(workspace) + fe_workspace_size;
-            CHECK_CUDNN_FRONTEND_ERROR(
-                plans.execute_oss_rms_norm_silu_engine(tensor_uid_to_pointer_map, oss_workspace, cu_device, stream));
-
-            CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK (OSS RmsNorm+SiLU engine) ");
-            return {error_code_t::OK, ""};
-        }
-
-        CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
-
-        CHECK_CUDNN_FRONTEND_ERROR(extend_tensor_map_with_workspace_tensors_(
-            tensor_uid_to_pointer_map, workspace, cached_workspace_modifications));
-        // offset workspace by the already used fe graph workspace
-        // this is where cudnn backend can start using workspace for its execution plans
-        void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
-
-        CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, tensor_uid_to_pointer_map));
-
-        CHECK_CUDNN_FRONTEND_ERROR(execute_cudnn_plan_with_uid(handle,
-                                                               tensor_uid_to_pointer_map,
-                                                               cudnn_workspace,
-                                                               plans.candidate,
-                                                               override_uids,
-                                                               override_shapes,
-                                                               override_strides));
-
-        CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK ");
-        return {error_code_t::OK, ""};
+        return execute_plan_at_index(handle,
+                                     tensor_uid_to_pointer_map,
+                                     workspace,
+                                     plans.candidate,
+                                     override_uids,
+                                     override_shapes,
+                                     override_strides);
     }
 
+    error_t
+    execute(cudnnHandle_t handle, void **sorted_user_ptrs, int n_user, void *workspace) const {
+        return execute_plan_at_index(handle, sorted_user_ptrs, n_user, workspace, plans.candidate);
+    }
+
+    // --- execute_plan_at_index: convert key types ---
+
+    error_t
+    execute_plan_at_index(cudnnHandle_t handle,
+                          std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
+                          void *workspace,
+                          int64_t plan_index) const {
+        std::unordered_map<int64_t, void *> uid_map;
+        for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
+            uid_map.emplace(tensor->get_uid(), pointer);
+        }
+        return execute_plan_at_index(handle, uid_map, workspace, plan_index);
+    }
+
+    // uid map → extract sorted ptrs, delegate to the sorted_ptrs implementation
     error_t
     execute_plan_at_index(cudnnHandle_t handle,
                           std::unordered_map<int64_t, void *> &tensor_uid_to_pointer_map,
                           void *workspace,
-                          int64_t plan_index) const {
-        CUDNN_FE_LOG_BANNER(" EXECUTE PLAN AT INDEX  for plan index " << plan_index << "  ");
-        // Add pass_by_value data pointers to uid_to_pointer map
-        // object lifetime is controlled by tensor_to_pass_by_value which means the pointer should stay valid during
-        // execute.
-        CHECK_CUDNN_FRONTEND_ERROR(
-            execute_plan_at_index(handle, tensor_uid_to_pointer_map, workspace, plan_index, {}, {}, {}));
-        return {error_code_t::OK, ""};
+                          int64_t plan_index,
+                          std::vector<int64_t> const &override_uids                 = {},
+                          std::vector<std::vector<int64_t>> const &override_shapes  = {},
+                          std::vector<std::vector<int64_t>> const &override_strides = {}) const {
+        if (!varpack_template.prepared) {
+            CHECK_CUDNN_FRONTEND_ERROR(const_cast<Graph *>(this)->prepare_variant_pack_template());
+        }
+        const int n_user        = (int)varpack_template.user_slots.size();
+        constexpr int STACK_MAX = 32;
+        void *stack_ptrs[STACK_MAX];
+        std::vector<void *> heap_ptrs;
+        void **user_ptrs = (n_user <= STACK_MAX) ? stack_ptrs : (heap_ptrs.resize(n_user), heap_ptrs.data());
+        for (int i = 0; i < n_user; i++) {
+            int64_t uid = varpack_template.all_uids[varpack_template.user_slots[i]];
+            auto it     = tensor_uid_to_pointer_map.find(uid);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(it == tensor_uid_to_pointer_map.end(),
+                                           error_code_t::INVALID_VARIANT_PACK,
+                                           "Uid " + std::to_string(uid) + " not found in variant pack.");
+            user_ptrs[i] = it->second;
+        }
+        return execute_plan_at_index(
+            handle, user_ptrs, n_user, workspace, plan_index, override_uids, override_shapes, override_strides);
     }
 
+    // --- THE implementation: sorted pointer array + plan index + optional overrides ---
+    // Thread-safe: copies the pre-built template to stack, patches user pointers, dispatches.
     error_t
-    execute(cudnnHandle_t handle,
-            std::unordered_map<int64_t, void *> &tensor_uid_to_pointer_map,
-            void *workspace) const {
-        // Add pass_by_value data pointers to uid_to_pointer map.
-        // Using cached values to avoid repeated tree traversal overhead.
-        CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ");
-
-        CHECK_CUDNN_FRONTEND_ERROR(
-            extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, cached_pass_by_value));
-        CHECK_CUDNN_FRONTEND_ERROR(
-            make_variant_pack_replacements(tensor_uid_to_pointer_map, variant_pack_replacements));
-
-        // OSS SDPA engine dispatch: bypass cuDNN backend entirely
-        if (plans.is_oss_candidate()) {
-            cudaStream_t stream = nullptr;
-            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
-
-            int device_ordinal = 0;
-            detail::cuda_get_device(&device_ordinal);
-            int cu_device = device_ordinal;
-
-            // OSS engine workspace starts after FE workspace
-            void *oss_workspace = static_cast<char *>(workspace) + fe_workspace_size;
-            CHECK_CUDNN_FRONTEND_ERROR(
-                plans.execute_oss_engine(tensor_uid_to_pointer_map, oss_workspace, cu_device, stream));
-
-            CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK (OSS SDPA engine) ");
-            return {error_code_t::OK, ""};
+    execute_plan_at_index(cudnnHandle_t handle,
+                          void **sorted_user_ptrs,
+                          int n_user,
+                          void *workspace,
+                          int64_t plan_index,
+                          std::vector<int64_t> const &override_uids                 = {},
+                          std::vector<std::vector<int64_t>> const &override_shapes  = {},
+                          std::vector<std::vector<int64_t>> const &override_strides = {}) const {
+        // Lazy init: prepare template if not done (e.g. deserialized graphs, build_plan_at_index)
+        if (!varpack_template.prepared) {
+            CHECK_CUDNN_FRONTEND_ERROR(const_cast<Graph *>(this)->prepare_variant_pack_template());
         }
 
-        // OSS RmsNorm+SiLU engine dispatch: bypass cuDNN backend entirely
-        if (plans.is_oss_rms_norm_silu_candidate()) {
-            cudaStream_t stream = nullptr;
-            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+        CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(plan_index));
 
-            int device_ordinal = 0;
-            detail::cuda_get_device(&device_ordinal);
-            int cu_device = device_ordinal;
+        // Validate n_user matches expected user slot count
+        RETURN_CUDNN_FRONTEND_ERROR_IF(n_user != static_cast<int>(varpack_template.user_slots.size()),
+                                       error_code_t::INVALID_VARIANT_PACK,
+                                       "n_user (" + std::to_string(n_user) +
+                                           ") does not match expected user slot count (" +
+                                           std::to_string(varpack_template.user_slots.size()) + ").");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            n_user > 0 && sorted_user_ptrs == nullptr, error_code_t::INVALID_VARIANT_PACK, "sorted_user_ptrs is null.");
 
-            void *oss_workspace = static_cast<char *>(workspace) + fe_workspace_size;
-            CHECK_CUDNN_FRONTEND_ERROR(
-                plans.execute_oss_rms_norm_silu_engine(tensor_uid_to_pointer_map, oss_workspace, cu_device, stream));
-
-            CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK (OSS RmsNorm+SiLU engine) ");
-            return {error_code_t::OK, ""};
+        // Thread-safe: copy template to local stack, then patch.
+        const int N             = (int)varpack_template.all_uids.size();
+        constexpr int STACK_MAX = 32;
+        void *stack_ptrs[STACK_MAX];
+        std::vector<void *> heap_ptrs;
+        void **ptrs;
+        if (N <= STACK_MAX) {
+            std::memcpy(stack_ptrs, varpack_template.template_ptrs.data(), N * sizeof(void *));
+            ptrs = stack_ptrs;
+        } else {
+            heap_ptrs = varpack_template.template_ptrs;
+            ptrs      = heap_ptrs.data();
         }
 
+        // 1. Patch user pointers
+        for (int i = 0; i < n_user; i++) {
+            ptrs[varpack_template.user_slots[i]] = sorted_user_ptrs[i];
+        }
+
+        // 2. Update workspace-relative pointers (pre-computed slot indices)
+        for (auto const &[slot, offset] : varpack_template.workspace_slots) {
+            ptrs[slot] = static_cast<char *>(workspace) + offset;
+        }
+
+        // 3. Re-apply replacements (currently only Slice nodes)
+        for (auto const &[dst_slot, src_info] : varpack_template.replacement_slots) {
+            ptrs[dst_slot] = static_cast<char *>(ptrs[src_info.first]) + src_info.second;
+        }
+
+        // 4. Run auxiliary kernels (e.g. SDPA reduction accumulator init)
         CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
 
-        CHECK_CUDNN_FRONTEND_ERROR(extend_tensor_map_with_workspace_tensors_(
-            tensor_uid_to_pointer_map, workspace, cached_workspace_modifications));
-        // offset workspace by the already used fe graph workspace
-        // this is where cudnn backend can start using workspace for its execution plans
-        void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+        // 5. Dispatch
+        void *engine_workspace = static_cast<char *>(workspace) + fe_workspace_size;
 
-        CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, tensor_uid_to_pointer_map));
+        if (plan_index == graph::Execution_plan_list::OSS_SDPA_ENGINE_CANDIDATE) {
+            cudaStream_t stream = nullptr;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+            int device_ordinal = 0;
+            detail::cuda_get_device(&device_ordinal);
+            if (override_uids.empty()) {
+                CHECK_CUDNN_FRONTEND_ERROR(
+                    plans.execute_oss_sdpa_engine(ptrs, engine_workspace, device_ordinal, stream));
+            } else {
+                CHECK_CUDNN_FRONTEND_ERROR(plans.execute_oss_sdpa_engine(
+                    ptrs, engine_workspace, device_ordinal, stream, override_uids, override_shapes, override_strides));
+            }
+            return {error_code_t::OK, ""};
+        }
 
-        CHECK_CUDNN_FRONTEND_ERROR(execute_cudnn_plan_with_uid(
-            handle, tensor_uid_to_pointer_map, cudnn_workspace, plans.candidate, {}, {}, {}));
+        if (plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
+            cudaStream_t stream = nullptr;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+            int device_ordinal = 0;
+            detail::cuda_get_device(&device_ordinal);
+            CHECK_CUDNN_FRONTEND_ERROR(
+                plans.execute_oss_rms_norm_silu_engine(ptrs, engine_workspace, device_ordinal, stream));
+            return {error_code_t::OK, ""};
+        }
 
-        CUDNN_FE_LOG_BANNER(" EXECUTE PLAN  ALL OK ");
+        // Backend path
+        std::vector<void *> ptrs_vec(ptrs, ptrs + N);
+        if (override_uids.empty()) {
+            CHECK_CUDNN_FRONTEND_ERROR(detail::execute(handle,
+                                                       plans.execution_plans[plan_index].get(),
+                                                       ptrs_vec,
+                                                       varpack_template.all_uids,
+                                                       engine_workspace));
+        } else {
+            CHECK_CUDNN_FRONTEND_ERROR(detail::execute(handle,
+                                                       plans.execution_plans[plan_index].get(),
+                                                       ptrs_vec,
+                                                       varpack_template.all_uids,
+                                                       engine_workspace,
+                                                       override_uids,
+                                                       override_shapes,
+                                                       override_strides));
+        }
         return {error_code_t::OK, ""};
     }
 
@@ -1777,8 +1802,8 @@ class Graph : public ICudnn, public INode {
         auto sm_version = context.get_sm_version();
 
         // Check OSS SDPA engine
-        if (plans.has_oss_engine()) {
-            auto oss_status = plans.check_oss_engine_support(sm_version);
+        if (plans.has_oss_sdpa_engine()) {
+            auto oss_status = plans.check_oss_sdpa_engine_support(sm_version);
             if (oss_status.is_good()) {
                 return {error_code_t::OK, ""};
             }
@@ -1810,6 +1835,136 @@ class Graph : public ICudnn, public INode {
     build(std::vector<HeurMode_t> const &mode,
           BuildPlanPolicy_t const policy     = BuildPlanPolicy_t::HEURISTICS_CHOICE,
           bool const do_multithreaded_builds = false);
+
+    // -----------------------------------------------------------------------
+    // Variant pack template: pre-indexed flat array built at build_plans() time.
+    // Eliminates per-call map operations in execute().
+    // -----------------------------------------------------------------------
+
+    struct VariantPackTemplate {
+        std::vector<int64_t> all_uids;      // all UIDs in sorted order (user + internal)
+        std::vector<void *> template_ptrs;  // pre-filled: pass_by_value entries, nullptr for user/workspace slots
+        std::vector<int> user_slots;        // indices into template_ptrs that the user fills (sorted UID order)
+
+        // Pre-computed slot indices for per-call updates (avoid linear scans at execute time)
+        std::vector<std::pair<int, int64_t>> workspace_slots;  // (slot, byte_offset)
+        std::vector<std::pair<int, std::pair<int, int64_t>>>
+            replacement_slots;  // (dst_slot, (src_slot, offset)) — only used by Slice nodes
+
+        bool prepared = false;
+    };
+
+    VariantPackTemplate varpack_template;
+
+    // Prepares the variant pack template. Called automatically at the end of build_plans().
+    error_t
+    prepare_variant_pack_template() {
+        varpack_template = VariantPackTemplate{};
+
+        // 1. Start with variant_pack_uids + any replacement source UIDs not already included.
+        //    Replacement sources (e.g. full tensor before slicing) may not be in variant_pack_uids
+        //    because the backend only needs the sliced view, but we need the source to compute it.
+        varpack_template.all_uids.assign(variant_pack_uids.begin(), variant_pack_uids.end());
+        for (auto const &[from_uid, value] : variant_pack_replacements) {
+            if (variant_pack_uids.find(from_uid) == variant_pack_uids.end()) {
+                varpack_template.all_uids.push_back(from_uid);
+            }
+        }
+        std::sort(varpack_template.all_uids.begin(), varpack_template.all_uids.end());
+        varpack_template.template_ptrs.resize(varpack_template.all_uids.size(), nullptr);
+
+        // 2. Build UID → slot index
+        std::unordered_map<int64_t, int> uid_to_slot;
+        for (int i = 0; i < (int)varpack_template.all_uids.size(); i++) {
+            uid_to_slot[varpack_template.all_uids[i]] = i;
+        }
+
+        // 3. Pre-fill pass_by_value entries (scalars like epsilon, alpha, beta)
+        std::unordered_map<int64_t, void *> pbv_ptrs;
+        CHECK_CUDNN_FRONTEND_ERROR(extend_tensor_map_with_pass_by_value_tensors_(pbv_ptrs, cached_pass_by_value));
+        for (auto const &[uid, ptr] : pbv_ptrs) {
+            auto it = uid_to_slot.find(uid);
+            if (it != uid_to_slot.end()) {
+                varpack_template.template_ptrs[it->second] = ptr;
+            } else {
+                int slot = (int)varpack_template.all_uids.size();
+                varpack_template.all_uids.push_back(uid);
+                varpack_template.template_ptrs.push_back(ptr);
+                uid_to_slot[uid] = slot;
+            }
+        }
+
+        // 4. Register workspace entries (slots allocated, pointers filled at execute time)
+        for (auto const &[uid, data] : cached_workspace_modifications) {
+            auto it = uid_to_slot.find(uid);
+            if (it == uid_to_slot.end()) {
+                int slot = (int)varpack_template.all_uids.size();
+                varpack_template.all_uids.push_back(uid);
+                varpack_template.template_ptrs.push_back(nullptr);  // filled at execute time
+                uid_to_slot[uid] = slot;
+            }
+        }
+
+        // 5. Identify user-fillable slots: nullptr entries that are NOT workspace/replacement targets
+        std::unordered_set<int64_t> workspace_uids;
+        for (auto const &[uid, data] : cached_workspace_modifications) {
+            workspace_uids.insert(uid);
+        }
+        std::unordered_set<int64_t> replacement_dst_uids;
+        for (auto const &[from_uid, value] : variant_pack_replacements) {
+            (void)from_uid;
+            replacement_dst_uids.insert(value.first);  // value.first = to_uid (the destination)
+        }
+        for (int i = 0; i < (int)varpack_template.template_ptrs.size(); i++) {
+            int64_t uid = varpack_template.all_uids[i];
+            if (varpack_template.template_ptrs[i] == nullptr && workspace_uids.find(uid) == workspace_uids.end() &&
+                replacement_dst_uids.find(uid) == replacement_dst_uids.end()) {
+                varpack_template.user_slots.push_back(i);
+            }
+        }
+
+        // 6. Pre-compute workspace slot indices
+        for (auto const &[uid, data] : cached_workspace_modifications) {
+            const auto &[operation_type, offset, vec_data] = data;
+            auto it                                        = uid_to_slot.find(uid);
+            if (it != uid_to_slot.end()) {
+                varpack_template.workspace_slots.emplace_back(it->second, offset);
+            }
+        }
+
+        // 7. Pre-compute replacement slot indices
+        // variant_pack_replacements: key = from_uid (source), value = {to_uid (destination), byte_offset}
+        // Meaning: ptr[to_uid] = ptr[from_uid] + byte_offset
+        for (auto const &[from_uid, value] : variant_pack_replacements) {
+            const auto &[to_uid, byte_offset] = value;
+            auto it_src                       = uid_to_slot.find(from_uid);
+            auto it_dst                       = uid_to_slot.find(to_uid);
+            // Replacement: dst_ptr = src_ptr + byte_offset (currently only Slice nodes)
+            if (it_src != uid_to_slot.end() && it_dst != uid_to_slot.end()) {
+                varpack_template.replacement_slots.emplace_back(it_dst->second,
+                                                                std::make_pair(it_src->second, byte_offset));
+            }
+        }
+
+        // 8. Pre-compute OSS engine slot indices (if applicable)
+        plans.set_oss_slot_indices([&](int64_t uid) -> int {
+            if (uid < 0) return -1;
+            auto it = uid_to_slot.find(uid);
+            return (it != uid_to_slot.end()) ? it->second : -1;
+        });
+
+        varpack_template.prepared = true;
+        return {error_code_t::OK, ""};
+    }
+
+    std::vector<int64_t>
+    get_variant_pack_uids_sorted() const {
+        std::vector<int64_t> user_uids;
+        for (int slot : varpack_template.user_slots) {
+            user_uids.push_back(varpack_template.all_uids[slot]);
+        }
+        return user_uids;
+    }
 
     error_t
     build_plans(cudnnHandle_t const &handle,
@@ -2390,8 +2545,8 @@ Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_b
 #endif
 
     // Build OSS SDPA engine if it passed check_support
-    if (plans.has_oss_engine()) {
-        auto oss_status = plans.build_oss_engine();
+    if (plans.has_oss_sdpa_engine()) {
+        auto oss_status = plans.build_oss_sdpa_engine();
         if (oss_status.is_good()) {
             CUDNN_FE_LOG_LABEL_ENDL("INFO: OSS SDPA engine built successfully (NVRTC compilation done)");
             if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE) {
@@ -2418,6 +2573,11 @@ Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_b
     }
 
     CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(policy, do_multithreaded_builds));
+
+    // Prepare the variant pack template for fast execution.
+    // This pre-computes slot indices so execute() can skip map operations.
+    CHECK_CUDNN_FRONTEND_ERROR(prepare_variant_pack_template());
+
     CUDNN_FE_LOG_BANNER("  BUILD PLANS ALL OK  ");
     return {error_code_t::OK, ""};
 }

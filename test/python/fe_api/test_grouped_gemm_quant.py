@@ -9,6 +9,7 @@ Used for FC2 (forward down-projection) and dFC1 (backward FC1 GEMMs).
 import torch
 import pytest
 from test_utils import torch_fork_set_rng
+from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
 from fe_api.test_grouped_gemm_swiglu_utils import (
     allocate_grouped_gemm_input_tensors,
 )
@@ -229,6 +230,53 @@ def test_grouped_gemm_quant_wrapper_fp8(
         use_dynamic_sched=use_dynamic_sched,
         request=request,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize(
+    "ab_dtype",
+    [
+        pytest.param(torch.float4_e2m1fn_x2, id="fp4"),
+        pytest.param(torch.float8_e4m3fn, id="fp8"),
+    ],
+)
+def test_grouped_gemm_quant_wrapper_cache_partial_dynamic_smoke(request, monkeypatch, ab_dtype):
+    compile_count, cache_entries = _test_grouped_gemm_quant_wrapper_dynamic_m_cache_behavior(
+        request=request,
+        monkeypatch=monkeypatch,
+        use_full_dynamic=False,
+        ab_dtype=ab_dtype,
+    )
+
+    assert compile_count == 1
+    assert cache_entries == 1
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=1)
+@pytest.mark.parametrize("ab_dtype", [pytest.param(torch.float4_e2m1fn_x2, id="fp4")])
+def test_grouped_gemm_quant_wrapper_cache_full_dynamic_smoke(request, monkeypatch, ab_dtype):
+    compile_count, cache_entries = _test_grouped_gemm_quant_wrapper_dynamic_nk_cache_behavior(
+        request=request,
+        monkeypatch=monkeypatch,
+        ab_dtype=ab_dtype,
+    )
+
+    assert compile_count == 1
+    assert cache_entries == 1
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=2)
+def test_grouped_gemm_quant_discrete_wrapper_cache_dynamic_m_smoke(request, monkeypatch):
+    compile_count, cache_entries = _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
+        request=request,
+        monkeypatch=monkeypatch,
+    )
+
+    assert compile_count == 1
+    assert cache_entries == 1
 
 
 @pytest.mark.L0
@@ -467,6 +515,349 @@ def test_grouped_gemm_quant_wrapper_requires_norm_const_tensor_for_fp8(request):
             m_aligned=cfg["m_aligned"],
             discrete_col_sfd=cfg["discrete_col_sfd"],
         )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@with_scheduler_modes
+def test_grouped_gemm_quant_wrapper_with_bias_sm100(use_dynamic_sched, request):
+    """Dense grouped GEMM quant with fused bias: D matches ref (alpha * GEMM + bias * prob)."""
+    try:
+        from cudnn import grouped_gemm_quant_wrapper_sm100
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM quant kernel.")
+
+    cfg = grouped_gemm_quant_init(
+        request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=16,
+        sf_dtype=torch.float8_e4m3fn,
+        vector_f32=False,
+        discrete_col_sfd=False,
+    )
+
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        enable_bias=True,
+    )
+    inputs["bias_ref"] = inputs["bias_tensor"]
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    try:
+        outputs = grouped_gemm_quant_wrapper_sm100(
+            a_tensor=inputs["a_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            b_tensor=inputs["b_tensor"],
+            sfb_tensor=inputs["sfb_tensor"],
+            bias_tensor=inputs["bias_tensor"],
+            norm_const_tensor=inputs.get("norm_const_tensor"),
+            prob_tensor=inputs["prob_tensor"],
+            acc_dtype=cfg["acc_dtype"],
+            c_dtype=cfg["c_dtype"],
+            d_dtype=cfg["d_dtype"],
+            cd_major=cfg["cd_major"],
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            cluster_shape_mn=cfg["cluster_shape_mn"],
+            sf_vec_size=cfg["sf_vec_size"],
+            vector_f32=cfg["vector_f32"],
+            m_aligned=cfg["m_aligned"],
+            discrete_col_sfd=cfg["discrete_col_sfd"],
+            use_dynamic_sched=use_dynamic_sched,
+            current_stream=stream,
+        )
+    except (ValueError, NotImplementedError) as exc:
+        pytest.skip(f"Unsupported testcase: {exc}")
+
+    check_ref_grouped_gemm_quant(
+        inputs,
+        outputs,
+        cfg,
+        skip_ref=cfg["skip_ref"],
+    )
+
+
+def _test_grouped_gemm_quant_wrapper_dynamic_m_cache_behavior(
+    request,
+    monkeypatch,
+    use_full_dynamic,
+    ab_dtype,
+):
+    try:
+        from cudnn import grouped_gemm_quant_wrapper_sm100
+        from cudnn.grouped_gemm.grouped_gemm_quant import api as grouped_gemm_quant_api
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    if use_full_dynamic:
+        monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1")
+    else:
+        monkeypatch.delenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", raising=False)
+
+    grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+
+    compile_count = {"value": 0}
+    original_compile = grouped_gemm_quant_api.GroupedGemmQuantSm100.compile
+
+    def counted_compile(self):
+        compile_count["value"] += 1
+        return original_compile(self)
+
+    monkeypatch.setattr(grouped_gemm_quant_api.GroupedGemmQuantSm100, "compile", counted_compile)
+
+    d_dtype = torch.float8_e4m3fn if ab_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] else torch.bfloat16
+    cfg = grouped_gemm_quant_init(
+        request=request,
+        ab_dtype=ab_dtype,
+        c_dtype=torch.bfloat16,
+        d_dtype=d_dtype,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32 if ab_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] else 16,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+    )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    try:
+        for group_m in DYNAMIC_SHAPES_M_VALUES:
+            inputs = allocate_grouped_gemm_input_tensors(
+                n=cfg["n"],
+                k=cfg["k"],
+                l=cfg["l"],
+                group_m_list=[group_m] * cfg["l"],
+                ab_dtype=cfg["ab_dtype"],
+                sf_dtype=cfg["sf_dtype"],
+                sf_vec_size=cfg["sf_vec_size"],
+                m_aligned=cfg["m_aligned"],
+            )
+
+            grouped_gemm_quant_wrapper_sm100(
+                a_tensor=inputs["a_tensor"],
+                b_tensor=inputs["b_tensor"],
+                sfa_tensor=inputs["sfa_tensor"],
+                sfb_tensor=inputs["sfb_tensor"],
+                padded_offsets=inputs["padded_offsets_tensor"],
+                alpha_tensor=inputs["alpha_tensor"],
+                norm_const_tensor=inputs.get("norm_const_tensor"),
+                prob_tensor=inputs["prob_tensor"],
+                acc_dtype=cfg["acc_dtype"],
+                c_dtype=cfg["c_dtype"],
+                d_dtype=cfg["d_dtype"],
+                cd_major=cfg["cd_major"],
+                mma_tiler_mn=cfg["mma_tiler_mn"],
+                cluster_shape_mn=cfg["cluster_shape_mn"],
+                sf_vec_size=cfg["sf_vec_size"],
+                vector_f32=cfg["vector_f32"],
+                m_aligned=cfg["m_aligned"],
+                discrete_col_sfd=cfg["discrete_col_sfd"],
+                current_stream=stream,
+            )
+            torch.cuda.synchronize()
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    finally:
+        cache_entries = len(grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects)
+        grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+
+    return compile_count["value"], cache_entries
+
+
+def _test_grouped_gemm_quant_wrapper_dynamic_nk_cache_behavior(
+    request,
+    monkeypatch,
+    ab_dtype,
+):
+    try:
+        from cudnn import grouped_gemm_quant_wrapper_sm100
+        from cudnn.grouped_gemm.grouped_gemm_quant import api as grouped_gemm_quant_api
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1")
+    grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+
+    compile_count = {"value": 0}
+    original_compile = grouped_gemm_quant_api.GroupedGemmQuantSm100.compile
+
+    def counted_compile(self):
+        compile_count["value"] += 1
+        return original_compile(self)
+
+    monkeypatch.setattr(grouped_gemm_quant_api.GroupedGemmQuantSm100, "compile", counted_compile)
+
+    cfg = grouped_gemm_quant_init(
+        request=request,
+        ab_dtype=ab_dtype,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=16,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+    )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    try:
+        for n, k in [(cfg["n"], cfg["k"]), (cfg["n"] + 256, cfg["k"] + 128)]:
+            inputs = allocate_grouped_gemm_input_tensors(
+                n=n,
+                k=k,
+                l=cfg["l"],
+                group_m_list=cfg["group_m_list"],
+                ab_dtype=cfg["ab_dtype"],
+                sf_dtype=cfg["sf_dtype"],
+                sf_vec_size=cfg["sf_vec_size"],
+                m_aligned=cfg["m_aligned"],
+            )
+
+            grouped_gemm_quant_wrapper_sm100(
+                a_tensor=inputs["a_tensor"],
+                b_tensor=inputs["b_tensor"],
+                sfa_tensor=inputs["sfa_tensor"],
+                sfb_tensor=inputs["sfb_tensor"],
+                padded_offsets=inputs["padded_offsets_tensor"],
+                alpha_tensor=inputs["alpha_tensor"],
+                norm_const_tensor=inputs.get("norm_const_tensor"),
+                prob_tensor=inputs["prob_tensor"],
+                acc_dtype=cfg["acc_dtype"],
+                c_dtype=cfg["c_dtype"],
+                d_dtype=cfg["d_dtype"],
+                cd_major=cfg["cd_major"],
+                mma_tiler_mn=cfg["mma_tiler_mn"],
+                cluster_shape_mn=cfg["cluster_shape_mn"],
+                sf_vec_size=cfg["sf_vec_size"],
+                vector_f32=cfg["vector_f32"],
+                m_aligned=cfg["m_aligned"],
+                discrete_col_sfd=cfg["discrete_col_sfd"],
+                current_stream=stream,
+            )
+            torch.cuda.synchronize()
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    finally:
+        cache_entries = len(grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects)
+        grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+
+    return compile_count["value"], cache_entries
+
+
+def _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
+    request,
+    monkeypatch,
+):
+    try:
+        from cudnn import grouped_gemm_quant_wrapper_sm100
+        from cudnn.grouped_gemm.grouped_gemm_quant import api as grouped_gemm_quant_api
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    monkeypatch.delenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", raising=False)
+    grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+
+    compile_count = {"value": 0}
+    original_compile = grouped_gemm_quant_api.GroupedGemmQuantSm100.compile
+
+    def counted_compile(self):
+        compile_count["value"] += 1
+        return original_compile(self)
+
+    monkeypatch.setattr(grouped_gemm_quant_api.GroupedGemmQuantSm100, "compile", counted_compile)
+
+    cfg = _make_discrete_grouped_gemm_quant_cfg(
+        request=request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=16,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        b_major="k",
+    )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    try:
+        for group_m in DYNAMIC_SHAPES_M_VALUES:
+            inputs = allocate_discrete_input_tensors(
+                n=cfg["n"],
+                k=cfg["k"],
+                num_experts=cfg["l"],
+                group_m_list=[group_m] * cfg["l"],
+                ab_dtype=cfg["ab_dtype"],
+                sf_dtype=cfg["sf_dtype"],
+                sf_vec_size=cfg["sf_vec_size"],
+                m_aligned=cfg["m_aligned"],
+                b_major=cfg["b_major"],
+            )
+
+            grouped_gemm_quant_wrapper_sm100(
+                a_tensor=inputs["a_tensor"],
+                sfa_tensor=inputs["sfa_tensor"],
+                padded_offsets=inputs["padded_offsets_tensor"],
+                alpha_tensor=inputs["alpha_tensor"],
+                b_ptrs=inputs["b_ptrs_tensor"],
+                sfb_ptrs=inputs["sfb_ptrs_tensor"],
+                n=cfg["n"],
+                b_dtype=cfg["ab_dtype"],
+                b_major=cfg["b_major"],
+                norm_const_tensor=inputs.get("norm_const_tensor"),
+                prob_tensor=inputs["prob_tensor"],
+                acc_dtype=cfg["acc_dtype"],
+                c_dtype=cfg["c_dtype"],
+                d_dtype=cfg["d_dtype"],
+                cd_major=cfg["cd_major"],
+                mma_tiler_mn=cfg["mma_tiler_mn"],
+                cluster_shape_mn=cfg["cluster_shape_mn"],
+                sf_vec_size=cfg["sf_vec_size"],
+                vector_f32=cfg["vector_f32"],
+                m_aligned=cfg["m_aligned"],
+                discrete_col_sfd=cfg["discrete_col_sfd"],
+                current_stream=stream,
+            )
+            torch.cuda.synchronize()
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    finally:
+        cache_entries = len(grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects)
+        grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+
+    return compile_count["value"], cache_entries
 
 
 def _test_grouped_gemm_quant_compile_execute(

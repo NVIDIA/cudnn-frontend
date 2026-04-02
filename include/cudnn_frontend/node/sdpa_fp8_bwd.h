@@ -23,7 +23,8 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
     mutable bool is_deterministic_algorithm_supported_on_blackwell = false;  // Will be edited in pre_validate_node()
 
    public:
-    SDPA_fp8_backward_attributes attributes;
+    mutable SDPA_fp8_backward_attributes
+        attributes;  // mutable to allow auto-routing to deterministic in pre_validate_node()
 
     SDPAFP8BackwardNode(SDPA_fp8_backward_attributes&& attributes_, detail::Context const& context)
         : NodeCRTP(context), attributes(std::move(attributes_)) {}
@@ -125,9 +126,23 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         auto const& dropout_mask     = attributes.inputs.find(input_names::Dropout_mask);
         bool const is_dropout_custom = (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
         bool const is_dropout        = attributes.dropout_probability.has_value();
+        bool const is_ragged         =
+            attributes.inputs.at(input_names::Q)->get_ragged_offset() ||
+            attributes.inputs.at(input_names::K)->get_ragged_offset() ||
+            attributes.inputs.at(input_names::V)->get_ragged_offset() ||
+            attributes.inputs.at(input_names::O)->get_ragged_offset() ||
+            attributes.inputs.at(input_names::Stats)->get_ragged_offset() ||
+            attributes.inputs.at(input_names::dO)->get_ragged_offset() ||
+            attributes.outputs.at(output_names::dQ)->get_ragged_offset() ||
+            attributes.outputs.at(output_names::dK)->get_ragged_offset() ||
+            attributes.outputs.at(output_names::dV)->get_ragged_offset();
 
         // validation TODO:
         //    - validate stats has valid dims
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF((prop_major == 9) && is_ragged,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "sdpa fp8 backward with THD is not supported on Hopper architecture.");
 
         // validate basic dimension requirements
         if(prop_major >= 10) {
@@ -215,16 +230,34 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Intermediate tensor data type needs to be set as internal tensors require it.");
 
+        // Auto-route to deterministic algorithm for cases where non-deterministic is not supported on Blackwell:
+        // 1. MXFP8 backward - requires deterministic (STAGES=2)
+        // 2. FP8 backward with d_qk <= 192 and d_v <= 128 - requires deterministic
+        bool const is_mxfp8 = is_mxfp8_scaling();
+        bool const is_supported_dims = (d_qk <= 192) && (d_v <= 128);
+        if ((prop_major == 10) && !attributes.is_deterministic_algorithm) {
+            if (is_mxfp8) {
+                getLogger() << "[cudnn_frontend] INFO: MXFP8 SDPA backward detected on Blackwell - "
+                            << "auto-routing to deterministic algorithm (non-deterministic not supported for MXFP8)"
+                            << std::endl;
+                attributes.is_deterministic_algorithm = true;
+            } else if (is_supported_dims) {
+                getLogger() << "[cudnn_frontend] INFO: FP8 SDPA backward with d_qk=" << d_qk << ", d_v=" << d_v
+                            << " detected on Blackwell - auto-routing to deterministic algorithm"
+                            << std::endl;
+                attributes.is_deterministic_algorithm = true;
+            }
+        }
+
         // validate options for deterministic algorithm
         if (attributes.is_deterministic_algorithm && (prop_major == 10)) {
             RETURN_CUDNN_FRONTEND_ERROR_IF((detail::get_backend_version() < 91900),
                                            error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "FP8 deterministic algorithm is not supported on blackwell architecture with cudnn version below 9.19.0");
+                                           "FP8 deterministic algorithm (required for MXFP8 and d_qk=192/d_v=128) is not supported on Blackwell with cuDNN version below 9.19.0");
 
-            // dbias bias rng/dropout alibi
             RETURN_CUDNN_FRONTEND_ERROR_IF(is_dropout,
                                            error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "FP8 deterministic algorithm is not supported on blackwell architecture when dropout is enabled");
+                                           "FP8 deterministic algorithm (required for MXFP8 and d_qk=192/d_v=128) is not supported on Blackwell when dropout is enabled");
 
             is_deterministic_algorithm_supported_on_blackwell = true;
         }
@@ -1057,7 +1090,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
     override_heuristics_query() const {
         int32_t const sm_version = context.get_sm_version();
         if (sm_version > 103 && is_deterministic_algorithm_supported_on_blackwell) {
-            return {18, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
+            return {17, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
         } else if (is_deterministic_algorithm_supported_on_blackwell) {
             return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
         } else {

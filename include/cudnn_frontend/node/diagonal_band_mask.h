@@ -93,7 +93,7 @@ class DiagonalBandMaskNodeBase : public NodeCRTP<DerivedT> {
 };
 
 // Fallback implementation of diagonal band mask node that represents the mask as a series of pointwise operations.
-// This is used for cuDNN versions before v9.20.0.
+// This is used for cuDNN versions before v9.21.0.
 // Note: the individual masks can be constructed in different ways as well that yield functionally
 // correct results. However, for performance reasons in the cuDNN backend they are organized as they are. Be
 // cautious of performance when editing.
@@ -242,7 +242,7 @@ class CompositeDiagonalBandMaskNode : public DiagonalBandMaskNodeBase<CompositeD
 };
 
 // Newer implementation of diagonal band mask node that represents the mask as a single operation.
-// This is used for cuDNN versions v9.20.0 and later.
+// This is used for cuDNN versions v9.21.0 and later.
 class UnifiedDiagonalBandMaskNode : public DiagonalBandMaskNodeBase<UnifiedDiagonalBandMaskNode> {
    public:
     UnifiedDiagonalBandMaskNode(DiagonalBandMask_attributes&& attributes_, detail::Context const& context)
@@ -262,10 +262,10 @@ class UnifiedDiagonalBandMaskNode : public DiagonalBandMaskNodeBase<UnifiedDiago
         getLogger() << "[cudnn_frontend] INFO: " << "Building UnifiedDiagonalBandMaskNode operations "
                     << attributes.name << std::endl;
         auto cudnn_ver_error =
-            error_t{error_code_t::GRAPH_NOT_SUPPORTED, "UnifiedDiagonalBandMaskNode requires cuDNN v9.20.0"};
+            error_t{error_code_t::GRAPH_NOT_SUPPORTED, "UnifiedDiagonalBandMaskNode requires cuDNN v9.21.0"};
 
-#if (CUDNN_VERSION >= 92000)
-        NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92000, cudnn_ver_error);
+#if (CUDNN_VERSION >= 92100)
+        NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92100, cudnn_ver_error);
         CUDNN_FRONTEND_UNUSED(operations);
         auto diagonal_band_mask_operation = make_shared_backend_pointer(
             (cudnnBackendDescriptorType_t)CUDNN_BACKEND_OPERATION_DIAGONAL_BAND_MASK_DESCRIPTOR);
@@ -358,7 +358,7 @@ class UnifiedDiagonalBandMaskNode : public DiagonalBandMaskNodeBase<UnifiedDiago
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FRONTEND_UNUSED(tensors);
         return cudnn_ver_error;
-#endif  // CUDNN_VERSION >= 92000
+#endif  // CUDNN_VERSION >= 92100
     }
 };
 
@@ -389,7 +389,7 @@ INode::diagonal_band_mask(std::shared_ptr<Tensor_attributes> x,
     auto y = attributes.outputs[DiagonalBandMask_attributes::output_names::Y] = output_tensor(attributes.name + "::Y");
 
     // Newer versions of cuDNN can represent the diagonal band mask as a single operation.
-    if (std::min(detail::get_compiled_version(), detail::get_backend_version()) >= 92000) {
+    if (std::min(detail::get_compiled_version(), detail::get_backend_version()) >= 92100) {
         sub_nodes.emplace_back(std::make_unique<UnifiedDiagonalBandMaskNode>(std::move(attributes), context));
     } else {
         sub_nodes.emplace_back(std::make_unique<CompositeDiagonalBandMaskNode>(std::move(attributes), context));

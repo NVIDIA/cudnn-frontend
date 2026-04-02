@@ -24,7 +24,8 @@
 #include <cudnn_frontend.h>
 #include "./utils/error_util.h"
 
-#if (CUDNN_VERSION >= 8900)
+// Pattern matching for this legacy engine was removed in cuDNN 9.21.0.
+#if (CUDNN_VERSION >= 8900) && (CUDNN_VERSION < 92100)
 std::unordered_map<std::string, int> tensor_name_to_uid = {{"Q", 1},
                                                            {"K", 2},
                                                            {"V", 3},

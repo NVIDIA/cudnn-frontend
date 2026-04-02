@@ -46,7 +46,7 @@ for symbol_name in symbols_to_import:
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.21.0"
+__version__ = "1.22.0"
 
 
 def _tensor(
@@ -327,6 +327,25 @@ def __getattr__(name: str) -> Any:
             raise ImportError(
                 f"grouped_gemm_dswiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
             ) from e
+    elif name == "SdpabwdSm100D256":
+        try:
+            from .sdpa import SdpabwdSm100D256 as _SdpabwdSm100D256
+
+            return _SdpabwdSm100D256
+        except Exception as e:
+            raise ImportError(f"SdpabwdSm100D256 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
+
+    elif name == "sdpa_bwd_wrapper_sm100_d256":
+        try:
+            from .sdpa import (
+                sdpa_bwd_wrapper_sm100_d256 as _sdpa_bwd_wrapper_sm100_d256,
+            )
+
+            return _sdpa_bwd_wrapper_sm100_d256
+        except Exception as e:
+            raise ImportError(
+                f"sdpa_bwd_wrapper_sm100_d256 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
 
     elif name == "GroupedGemmQuantSm100":
         try:
@@ -447,5 +466,10 @@ def __getattr__(name: str) -> Any:
                 f"discrete_grouped_gemm_dswiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
             ) from e
 
+    elif name == "experimental":
+        from . import experimental as _experimental
+
+        globals()["experimental"] = _experimental
+        return _experimental
     else:
         raise AttributeError(name)

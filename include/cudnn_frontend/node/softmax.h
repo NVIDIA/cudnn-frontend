@@ -81,7 +81,7 @@ class SoftmaxNodeBase : public NodeCRTP<DerivedT> {
 };
 
 // Fallback implementation of softmax node that represents the operation as a series of pointwise and reduction
-// operations. This is used for cuDNN versions before v9.20.0.
+// operations. This is used for cuDNN versions before v9.21.0.
 // Only certain combinations of outputs are allowed.
 class CompositeSoftmaxNode : public SoftmaxNodeBase<CompositeSoftmaxNode> {
    public:
@@ -221,7 +221,7 @@ class CompositeSoftmaxNode : public SoftmaxNodeBase<CompositeSoftmaxNode> {
 };
 
 // Newer implementation of softmax node that represents the operation as a single backend operation.
-// This is used for cuDNN versions v9.20.0 and later.
+// This is used for cuDNN versions v9.21.0 and later.
 class UnifiedSoftmaxNode : public SoftmaxNodeBase<UnifiedSoftmaxNode> {
    public:
     UnifiedSoftmaxNode(Softmax_attributes&& attributes_, detail::Context const& context)
@@ -247,10 +247,10 @@ class UnifiedSoftmaxNode : public SoftmaxNodeBase<UnifiedSoftmaxNode> {
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         getLogger() << "[cudnn_frontend] INFO: " << "Building UnifiedSoftmaxNode operations " << attributes.name
                     << std::endl;
-        auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED, "UnifiedSoftmaxNode requires cuDNN v9.20.0"};
+        auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED, "UnifiedSoftmaxNode requires cuDNN v9.21.0"};
 
-#if (CUDNN_VERSION >= 92000)
-        NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92000, cudnn_ver_error);
+#if (CUDNN_VERSION >= 92100)
+        NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92100, cudnn_ver_error);
         CUDNN_FRONTEND_UNUSED(operations);
         auto softmax_operation =
             make_shared_backend_pointer((cudnnBackendDescriptorType_t)CUDNN_BACKEND_OPERATION_SOFTMAX_DESCRIPTOR);
@@ -330,7 +330,7 @@ class UnifiedSoftmaxNode : public SoftmaxNodeBase<UnifiedSoftmaxNode> {
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FRONTEND_UNUSED(tensors);
         return cudnn_ver_error;
-#endif  // CUDNN_VERSION >= 92000
+#endif  // CUDNN_VERSION >= 92100
     }
 };
 
@@ -356,7 +356,7 @@ INode::softmax(std::shared_ptr<Tensor_attributes> p,
     }
 
     // Newer versions of cuDNN can represent the softmax as a single operation.
-    if (std::min(detail::get_compiled_version(), detail::get_backend_version()) >= 92000) {
+    if (std::min(detail::get_compiled_version(), detail::get_backend_version()) >= 92100) {
         sub_nodes.emplace_back(std::make_unique<UnifiedSoftmaxNode>(std::move(attributes), context));
     } else {
         sub_nodes.emplace_back(std::make_unique<CompositeSoftmaxNode>(std::move(attributes), context));

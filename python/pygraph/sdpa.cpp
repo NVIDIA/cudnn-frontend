@@ -46,7 +46,8 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_s,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> scale_s,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> scale_o,
-                       cudnn_frontend::AttentionImplementation_t const& implementation) {
+                       cudnn_frontend::AttentionImplementation_t const& implementation,
+                       bool const unfuse_fma) {
     auto attributes = cudnn_frontend::graph::SDPA_attributes()
                           .set_bias(bias)
                           .set_alibi_mask(use_alibi_mask)
@@ -59,7 +60,8 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                           .set_name(name)
                           .set_implementation(implementation)
                           .set_logit_max(score_max)
-                          .set_score_sum_exp(score_sum_exp);
+                          .set_score_sum_exp(score_sum_exp)
+                          .set_unfuse_fma(unfuse_fma);
 
     if (block_mask) {
         attributes.set_block_mask(block_mask);
@@ -243,7 +245,8 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               cudnn_frontend::AttentionImplementation_t const& implementation,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
-              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token) {
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+              bool const unfuse_fma) {
     cudnn_frontend::DataType_t mma_core_mode                            = cudnn_frontend::DataType_t::HALF;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_q = nullptr;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_k = nullptr;
@@ -333,7 +336,8 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          descale_s,
                                          scale_s,
                                          scale_o,
-                                         implementation);
+                                         implementation,
+                                         unfuse_fma);
 
     // Return {O, Stats} for backward compatibility
     return {internal_result.O, internal_result.Stats};
@@ -1086,6 +1090,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("score_max", nullptr),
           py::arg_v("score_sum_exp", nullptr),
           py::arg_v("sink_token", nullptr),
+          py::arg_v("unfuse_fma", false),
           R"pbdoc(
                 Perform scaled dot product attention.
 
@@ -1111,6 +1116,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     score_max (Optional[cudnn_tensor]): The max of attention score.
                     score_sum_exp (Optional[cudnn_tensor]): The numerically stable sum of exponents using normalized values wrt max score.
                     sink_token (Optional[cudnn_tensor]): The sink attention token tensor. Shape is (1, h_q, 1, 1), type is float32.
+                    unfuse_fma (Optional[bool]): For SM100: use unfused __fmul_rn + __fadd_rn instead of ffma2 in softmax. Default is False.
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and diagonal_band_right_bound=0. Default is TOP_LEFT.
                     diagonal_band_left_bound (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.

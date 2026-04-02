@@ -1,18 +1,13 @@
 """Stage 1 router: Routes to appropriate SDPA annotator based on operation type."""
 
+from . import routing
 from . import stage1_annotate_sdpa_fwd as sdpa_fwd
 from . import stage1_annotate_sdpa_bwd as sdpa_bwd
 
 
 def detect_operation_type(payload: dict) -> str:
     """Detect the operation type from the JSON payload."""
-    for node in payload.get("nodes", []):
-        tag = node.get("tag", "")
-        if tag == "SDPA_FWD":
-            return "fwd"
-        if tag in ("SDPA_BWD", "SDPA_FP8_BWD"):
-            return "bwd"
-    return "fwd"
+    return routing.detect_operation_type(payload)
 
 
 def extract_and_annotate(raw_line: str, payload: dict) -> dict:

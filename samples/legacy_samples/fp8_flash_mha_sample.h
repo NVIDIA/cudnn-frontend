@@ -37,7 +37,7 @@
 #include "./utils/fp16_emu.h"
 #include "./utils/helpers.h"
 
-#if (CUDNN_VERSION >= 8900)
+#if (CUDNN_VERSION >= 8900) && (CUDNN_VERSION < 92100)
 void
 run_fp8_flash_mha_fprop(int64_t b,
                         int64_t h,
@@ -69,7 +69,7 @@ run_fp8_flash_mha_fprop(int64_t b,
 
 #endif
 
-#if (CUDNN_VERSION >= 8900)
+#if (CUDNN_VERSION >= 8900) && (CUDNN_VERSION < 92100)
 void
 run_fp8_flash_mha_bprop(int64_t b,
                         int64_t h,

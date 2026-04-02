@@ -2542,10 +2542,12 @@ class BlockScaledContiguousGroupedGemmKernel:
                         ]
 
                         if subtile_idx == 6:
-                            tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
-                            cute.autovec_copy(tCrSFDRow, tCgSFDRow)
-                            tCrSFDCol.store(tCrSFDCol_pvscale.load().to(self.sf_dtype))
-                            cute.autovec_copy(tCrSFDCol, tCgSFDCol)
+                            if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
+                                tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
+                                cute.autovec_copy(tCrSFDRow, tCgSFDRow)
+                            if sfd_col_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDCol_mnl.layout, mode=[1])):
+                                tCrSFDCol.store(tCrSFDCol_pvscale.load().to(self.sf_dtype))
+                                cute.autovec_copy(tCrSFDCol, tCgSFDCol)
                     else:
                         #
                         # Convert to D type

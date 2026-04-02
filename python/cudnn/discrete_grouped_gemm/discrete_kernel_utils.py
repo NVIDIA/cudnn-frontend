@@ -52,7 +52,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir import ir
-from cutlass._mlir.dialects.nvvm import ReduxKind, AtomicOpKind
+from cutlass._mlir.dialects.nvvm import AtomicOpKind
 from cutlass.cute.typing import Float32, Int32, BFloat16, AddressSpace
 from cutlass._mlir.dialects import math, nvvm, llvm, vector
 from .moe_persistent_scheduler import MoESchedulerParams
@@ -277,6 +277,21 @@ def fmax_bf16x2(
     return (res0, res1)
 
 
+def atomic_add_bf16x2(ptr, val_fp32_lo, val_fp32_hi, *, loc=None, ip=None):
+    """Packed BF16x2 atomic reduction to global memory."""
+    lo_ir = val_fp32_lo.ir_value(loc=loc, ip=ip)
+    hi_ir = val_fp32_hi.ir_value(loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [ptr, hi_ir, lo_ir],
+        "{ .reg .b32 packed; cvt.rn.bf16x2.f32 packed, $1, $2; red.global.add.noftz.bf16x2 [$0], packed; }",
+        "l,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 def warp_redux_sync(
     value,
     kind,
@@ -485,7 +500,7 @@ def compare_and_report_mismatches(
 
 # ---------------------------------------------------------------------------
 # Kernel configuration and validation functions
-# (extracted from BlockScaledDiscreteWeightGroupedGemmKernel @staticmethod)
+# (extracted from BlockScaledDiscreteWeightGroupedGemmBiasKernel @staticmethod)
 # ---------------------------------------------------------------------------
 
 
@@ -591,10 +606,10 @@ def is_valid_mma_tiler_and_cluster_shape(
     """
     is_valid = True
 
-    if not ((not use_2cta_instrs and mma_tiler_mn[0] in [64, 128]) or (use_2cta_instrs and mma_tiler_mn[0] in [128, 256])):
+    if not ((not use_2cta_instrs and mma_tiler_mn[0] in [128]) or (use_2cta_instrs and mma_tiler_mn[0] in [256])):
         is_valid = False
     # Needs to have even iterations with Epi Tile N 64 for swiGeLU fusion
-    if mma_tiler_mn[1] not in (128, 256):
+    if mma_tiler_mn[1] not in [256]:
         is_valid = False
     if cluster_shape_mn[0] % (2 if use_2cta_instrs else 1) != 0:
         is_valid = False
@@ -697,6 +712,9 @@ def can_implement(
     if not (a_major == "k" and b_major == "k"):
         result = False
 
+    if n % 64 != 0 or m % 256 != 0:
+        result = False
+
     return result
 
 
@@ -717,11 +735,13 @@ def compute_stages(
     occupancy: int,
     generate_sfd: bool,
     num_epilog_warps: int = 4,
-) -> Tuple[int, int, int, int, int]:
+    bias_dtype=None,
+) -> Tuple[int, int, int, int, int, int]:
     """Compute the number of pipeline stages for A/B/D operands based on heuristics.
 
     :param num_epilog_warps: Number of epilogue warps (default 4, may differ for DGLU).
-    :return: (num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage)
+    :param bias_dtype: Bias element type (e.g. cutlass.BFloat16) when bias enabled, None otherwise.
+    :return: (num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage, num_bias_stage)
     """
     num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
 
@@ -784,13 +804,22 @@ def compute_stages(
     d_bytes_per_stage = cute.size_in_bytes(d_dtype, d_smem_layout_staged_one)
     d_bytes = d_bytes_per_stage * num_d_stage * (2 if generate_sfd else 1)
     amax_bytes = get_amax_smem_size(num_epilog_warps) if d_dtype == cutlass.BFloat16 else 0
-    epi_bytes = c_bytes + d_bytes + amax_bytes
+    # Bias SMEM stages
+    if bias_dtype is not None:
+        num_bias_stage = 2  # double buffer, each stage = full tile_N
+        bias_epi_tile_n = mma_tiler_mnk[1]
+        bias_bytes = bias_epi_tile_n * num_bias_stage * (bias_dtype.width // 8)
+    else:
+        num_bias_stage = 0
+        bias_bytes = 0
+
+    epi_bytes = c_bytes + d_bytes + amax_bytes + bias_bytes
 
     num_ab_stage = (num_smem_capacity // occupancy - (mbar_helpers_bytes + epi_bytes + sinfo_bytes)) // ab_bytes_per_stage
 
     total_bytes = occupancy * (ab_bytes_per_stage * num_ab_stage + epi_bytes + sinfo_bytes + mbar_helpers_bytes)
 
-    return num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage
+    return num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage, num_bias_stage
 
 
 def compute_grid(

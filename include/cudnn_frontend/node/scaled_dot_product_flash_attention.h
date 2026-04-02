@@ -513,7 +513,11 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
     virtual void
     serialize(json& j) const override final {
         j = attributes;
-        j.update(R"({"tag": "SDPA"})"_json);
+        if (attributes.mma_core_mode == DataType_t::FP8_E4M3 || attributes.mma_core_mode == DataType_t::FP8_E5M2) {
+            j.update(R"({"tag": "SDPA_FP8_FWD"})"_json);
+        } else {
+            j.update(R"({"tag": "SDPA"})"_json);
+        }
     }
 #endif
 };
@@ -1949,7 +1953,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     override_heuristics_query() const {
         int32_t const sm_version = context.get_sm_version();
         if (sm_version > 103 && is_deterministic_algorithm_supported_on_blackwell) {
-            return {18, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
+            return {17, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
         } else if (is_deterministic_algorithm_supported_on_blackwell) {
             return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
         } else {
@@ -2313,6 +2317,23 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
                                                subgraph_cudnn->variant_pack_uids.end());
 #else
             return subgraph_cudnn_ver_error;
+#endif
+        }
+
+        // Set unfuse_fma attribute (for SM100: use __fmul_rn + __fadd_rn instead of ffma2 in softmax)
+        if (attributes.unfuse_fma) {
+            auto unfuse_fma_cudnn_ver_error =
+                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Unfuse FMA in unified SDPA node requires cuDNN 9.21.0"};
+#if CUDNN_VERSION >= 92100
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92100, unfuse_fma_cudnn_ver_error);
+            bool unfuse_fma_value = true;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_UNFUSE_FMA,
+                                                           CUDNN_TYPE_BOOLEAN,
+                                                           1,
+                                                           &unfuse_fma_value));
+#else
+            return unfuse_fma_cudnn_ver_error;
 #endif
         }
 

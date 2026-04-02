@@ -47,6 +47,7 @@ To add a new frontend-only API, follow these steps:
 - `Discrete Grouped Gemm + dSwiglu`
 - `Grouped Gemm + Quant (Legacy, Dense-only)`
 - `Grouped Gemm + Quant (Unified)`
+- `SDPA Backward (SM100, D=256)`
 
 **In progress frontend-only APIs**:
 - GEMM + Dswiglu

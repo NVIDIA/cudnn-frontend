@@ -47,8 +47,19 @@ def torch_dtype(io_type: Optional[str]) -> Optional[str]:
         "FLOAT16": "torch.float16",
         "FLOAT": "torch.float32",
         "FLOAT32": "torch.float32",
+        "FP8_E4M3": "torch.float8_e4m3fn",
+        "FP8_E5M2": "torch.float8_e5m2",
     }
     return mapping.get(io_type.upper(), "torch.float16")
+
+
+def node_by_tag(payload: dict, *tags: str) -> Optional[dict]:
+    """Find the first node whose tag matches one of the requested tags."""
+    requested = set(tags)
+    for candidate in payload.get("nodes", []):
+        if candidate.get("tag") in requested:
+            return candidate
+    return None
 
 
 def parse_optional_int(value: Any) -> Optional[int]:
@@ -106,6 +117,13 @@ def tensor_entry(tensors: dict, node_name: Optional[str], label: str, hint: Opti
     return None
 
 
+def tensor_dtype(entry: Optional[dict]) -> Optional[str]:
+    """Return the torch dtype string for a serialized tensor entry."""
+    if not entry:
+        return None
+    return torch_dtype(entry.get("data_type"))
+
+
 def shape(entry: Optional[dict]) -> Optional[Tuple[int, ...]]:
     """Extract shape tuple from tensor entry."""
     if not entry:
@@ -124,6 +142,15 @@ def stride(entry: Optional[dict]) -> Optional[Tuple[int, ...]]:
     if not strides:
         return None
     return tuple(int(s) for s in strides)
+
+
+def normalize_k_layout(shape_k: Optional[Tuple[int, ...]], stride_k: Optional[Tuple[int, ...]]) -> tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]]]:
+    """Convert logged KT layout [B,H,D,S] into BHSD when detected by stride pattern."""
+    if shape_k and stride_k and len(shape_k) == 4 and len(stride_k) == 4:
+        if int(stride_k[2]) == 1 and int(stride_k[3]) != 1:
+            shape_k = (shape_k[0], shape_k[1], shape_k[3], shape_k[2])
+            stride_k = (stride_k[0], stride_k[1], stride_k[3], stride_k[2])
+    return shape_k, stride_k
 
 
 def flatten_pass_by_value(value: Any) -> list[int]:
@@ -159,6 +186,40 @@ def bool_from_inputs(inputs: dict, target: str) -> Optional[bool]:
     if not inputs:
         return None
     return target in inputs
+
+
+def infer_block_size(page_table_entry: Optional[dict], seq_len_kv: list[int], k_entry: Optional[dict]) -> Optional[int]:
+    """Infer paged-attention block size from serialized tensors."""
+    if page_table_entry is None or k_entry is None:
+        return None
+    page_table_shape = shape(page_table_entry)
+    k_shape = shape(k_entry)
+    if not page_table_shape or len(page_table_shape) < 3 or not k_shape or len(k_shape) < 3:
+        return None
+    blocks_per_batch = page_table_shape[2]
+    if blocks_per_batch <= 0:
+        return None
+    max_seq = max(seq_len_kv) if seq_len_kv else None
+    if max_seq:
+        return max(1, (max_seq + blocks_per_batch - 1) // blocks_per_batch)
+    return k_shape[2]
+
+
+def is_mxfp8_payload(payload: dict, node: dict) -> bool:
+    """Detect MXFP8 payloads from scale-factor tensor metadata."""
+    tensors = payload.get("tensors", {})
+    node_name = node.get("name")
+    for label, hint in node.get("inputs", {}).items():
+        if not label.startswith(("Descale_", "Scale_")):
+            continue
+        entry = tensor_entry(tensors, node_name, label, hint)
+        if entry is None:
+            continue
+        data_type = (entry.get("data_type") or "").upper()
+        reordering = (entry.get("reordering_type") or "").upper()
+        if data_type == "FP8_E8M0" or reordering == "F8_128X4":
+            return True
+    return False
 
 
 def parse_ragged_tensor_names(log_text: Optional[str]) -> list[str]:

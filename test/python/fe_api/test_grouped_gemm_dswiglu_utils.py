@@ -25,7 +25,7 @@ from test_grouped_gemm_swiglu_utils import (
 GROUPED_GEMM_DSWIGLU_COMMON_MARKS = [
     pytest.mark.parametrize("cd_major", ["n"]),
     pytest.mark.parametrize("acc_dtype", [torch.float32]),
-    pytest.mark.parametrize("mma_tiler_mn", [(256, 256), (128, 128)]),
+    pytest.mark.parametrize("mma_tiler_mn", [(256, 256), (128, 256)]),
     pytest.mark.parametrize("cluster_shape_mn", [(2, 1), (1, 1)]),
     pytest.mark.parametrize("vector_f32", [True, False]),
 ]
@@ -268,11 +268,22 @@ def compute_reference_row_quant(src, d_dtype, sf_dtype, vec_size, norm_const) ->
 
     # 1. Compute reference SFD (m, sfn, l) in fp32
     sfn = ceil_div(n, vec_size)
+    n_aligned = ceil_div(n, 128) * 128
+    sfn_aligned = n_aligned // vec_size
     sfm = ceil_div(m, 128) * 128
-    # Reshape ref to (l, m, sfn, vec_size)
-    src_reshaped = src.permute(2, 0, 1).contiguous()  # (l, m, n)
-    # l is involved in valid_m
-    src_reshaped = src_reshaped.view(l, sfm, sfn, vec_size)
+    if sfn_aligned != sfn:
+        zeros = torch.zeros(
+            src.shape[0],
+            n_aligned - n,
+            src.shape[2],
+            dtype=src.dtype,
+            device=src.device,
+        )
+        src_sf = torch.cat([src, zeros], dim=1)
+        src_reshaped = src_sf.permute(2, 0, 1).contiguous()
+    else:
+        src_reshaped = src.permute(2, 0, 1).contiguous()
+    src_reshaped = src_reshaped.view(l, sfm, sfn_aligned, vec_size)
     # Take abs max over vec_size dimension
     src_reshaped, _ = torch.abs(src_reshaped).max(dim=3)  # (l, m, sfn)
     # Multiply by norm_const and rcp_limits
@@ -280,7 +291,7 @@ def compute_reference_row_quant(src, d_dtype, sf_dtype, vec_size, norm_const) ->
     # Permute to (m, sfn, l)
     src_sfd_f32 = src_sfd_f32.permute(1, 2, 0)
     # Convert fp32 -> f8 -> fp32 for src_sfd_f32
-    src_sfd_f8_torch = torch.empty(*(l, sfm, sfn), dtype=torch.uint8, device=src.device).permute(1, 2, 0)
+    src_sfd_f8_torch = torch.empty(*(l, sfm, sfn_aligned), dtype=torch.uint8, device=src.device).permute(1, 2, 0)
     src_sfd_f8 = from_dlpack(src_sfd_f8_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
     src_sfd_f8.element_type = _convert_to_cutlass_data_type(sf_dtype)
     src_sfd_f32_device = src_sfd_f32.to(src.device)
@@ -302,8 +313,8 @@ def compute_reference_row_quant(src, d_dtype, sf_dtype, vec_size, norm_const) ->
     src_sfd_f32_rcp = norm_const * src_sfd_f32.to(src.device).reciprocal()
     # Expand the sfn dimension by repeating each value sf_vec_size times
     # src_sfd_f32_rcp: (m, sfn, l) -> (m, sfn, sf_vec_size, l) -> (m, n, l)
-    src_sfd_f32_rcp_expanded = src_sfd_f32_rcp.unsqueeze(2).expand(sfm, sfn, vec_size, l)
-    src_sfd_f32_rcp_expanded = src_sfd_f32_rcp_expanded.reshape(sfm, sfn * vec_size, l)
+    src_sfd_f32_rcp_expanded = src_sfd_f32_rcp.unsqueeze(2).expand(sfm, sfn_aligned, vec_size, l)
+    src_sfd_f32_rcp_expanded = src_sfd_f32_rcp_expanded.reshape(sfm, sfn_aligned * vec_size, l)
     # Trim to exact n dimension if needed
     src_sfd_f32_rcp_expanded = src_sfd_f32_rcp_expanded[:, :n, :]
     # Apply scale to reference output: ref = ref * src_sfd_f32_rcp

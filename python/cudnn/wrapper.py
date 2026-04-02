@@ -389,6 +389,18 @@ class Graph:
             self.__node_names.add(node_name)
             # process positional arguments for dlpack tensors
             for i, obj in enumerate(args):
+                if isinstance(obj, tuple):
+                    # use case: dropout in sdpa is a tuple of (float, seed tensor, offset tensor)
+                    obj = list(obj)  # convert to list to make it mutable
+                    for j, elem in enumerate(obj):
+                        if hasattr(elem, "__dlpack__"):
+                            obj_id = id(elem)
+                            if obj_id not in self.__tensor_map:
+                                self.__tensor_map[obj_id] = _graph_tensor(self.__graph, elem)
+                            obj[j] = self.__tensor_map[obj_id]
+                        if isinstance(obj[j], cudnn.tensor):
+                            self.__tensor_in[f"{node_name}::{i}::{j}"] = obj[j]
+                    obj = args[i] = tuple(obj)  # convert back to tuple
                 if hasattr(obj, "__dlpack__"):
                     obj_id = id(obj)
                     if obj_id not in self.__tensor_map:
@@ -398,6 +410,18 @@ class Graph:
                     self.__tensor_in[f"{node_name}::{i}"] = obj
             # process keyword arguments for dlpack tensors
             for key, obj in kwargs.items():
+                if isinstance(obj, tuple):
+                    # use case: dropout in sdpa is a tuple of (float, seed tensor, offset tensor)
+                    obj = list(obj)  # convert to list to make it mutable
+                    for j, elem in enumerate(obj):
+                        if hasattr(elem, "__dlpack__"):
+                            obj_id = id(elem)
+                            if obj_id not in self.__tensor_map:
+                                self.__tensor_map[obj_id] = _graph_tensor(self.__graph, elem)
+                            obj[j] = self.__tensor_map[obj_id]
+                        if isinstance(obj[j], cudnn.tensor):
+                            self.__tensor_in[f"{node_name}::{key}::{j}"] = obj[j]
+                    obj = kwargs[key] = tuple(obj)  # convert back to tuple
                 if hasattr(obj, "__dlpack__"):
                     obj_id = id(obj)
                     if obj_id not in self.__tensor_map:

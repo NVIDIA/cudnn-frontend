@@ -144,7 +144,7 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
     if with_sink_token:
         sink_token = graph_fwd.tensor(uid=GraphFwdUid.sink_token, dim=(1, h_q, 1, 1), stride=(h_q, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
 
-    o, stats, amax_s, amax_o = graph_fwd.sdpa_fp8(
+    sdpa_kwargs = dict(
         q=q, k=k, v=v,
         descale_q=q_descale, descale_k=k_descale, descale_v=v_descale,
         scale_s=s_scale, descale_s=s_descale, scale_o=o_scale,
@@ -152,9 +152,13 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
         use_padding_mask=use_padding_mask, seq_len_kv=kv_seq_len, seq_len_q=q_seq_len,
         paged_attention_k_table=k_block_table, paged_attention_v_table=v_block_table,
         paged_attention_max_seq_len_kv=s_kv,
-        left_bound=left_bound, right_bound=right_bound, diagonal_alignment=diag_align,
+        left_bound=left_bound, right_bound=right_bound,
         sink_token=sink_token,
     )
+    # Only pass diagonal_alignment if it's not None (pybind11 doesn't accept None for enum types)
+    if diag_align is not None:
+        sdpa_kwargs['diagonal_alignment'] = diag_align
+    o, stats, amax_s, amax_o = graph_fwd.sdpa_fp8(**sdpa_kwargs)
 
     stride_o = (s_qo * h_q * d_vo, d_vo, h_q * d_vo, 1)
     o.set_uid(GraphFwdUid.o).set_output(True).set_dim((b, h_q, s_qo, d_vo)).set_stride(stride_o).set_data_type(cudnn_otype)

@@ -92,7 +92,7 @@ GROUPED_GEMM_QUANT_PARAM_MARKS_FP4 = [
         "mma_tiler_mn",
         [
             (256, 256),
-            (128, 128),
+            (128, 256),
         ],
     ),
     pytest.mark.parametrize(
@@ -286,11 +286,14 @@ def run_grouped_gemm_quant_ref(
     d_dtype: torch.dtype = torch.float32,
     sf_vec_size: int = 16,
     sf_dtype: torch.dtype = torch.float8_e8m0fnu,
+    bias_ref: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Run reference implementation for grouped GEMM Quant.
 
     Plain GEMM: D = quant(alpha * A * SFA * B * SFB)
     No SwiGLU activation, output uses full N dimension.
+    If ``bias_ref`` is set (shape ``(n, l)``), the pre-quant epilogue matches the
+    fused kernel: ``alpha * GEMM + bias * prob`` per row (no extra ``prob`` multiply on GEMM).
 
     :return: Dictionary of reference tensors
     """
@@ -315,8 +318,20 @@ def run_grouped_gemm_quant_ref(
         ref[start:end, :, 0] = ref[start:end, :, 0] * alpha_tensor[i].item()
         start = end
 
-    # Step 3: Apply prob (no SwiGLU — this is the key difference from SwiGLU reference)
-    ref = ref * prob_tensor.expand(-1, n, -1)
+    # Step 3: prob gating — without bias: multiply full result by prob. With bias: kernel
+    # fuses (acc * alpha + bias * prob), so add bias * prob per row/expert and do not
+    # multiply the GEMM part by prob again.
+    if bias_ref is None:
+        ref = ref * prob_tensor.expand(-1, n, -1)
+    else:
+        bias_f32 = bias_ref.to(torch.float32)
+        start = 0
+        for i, group_m in enumerate(aligned_group_m_list):
+            end = start + group_m
+            prob_slice = prob_tensor[start:end, 0, 0].to(torch.float32).unsqueeze(1)
+            b_slice = bias_f32[:, i].unsqueeze(0)
+            ref[start:end, :, 0] = ref[start:end, :, 0] + prob_slice * b_slice
+            start = end
     ref_tensors["d_ref"] = ref.clone()
 
     if generate_amax:
@@ -339,19 +354,28 @@ def run_grouped_gemm_quant_ref(
         norm_const = norm_const_tensor[0].item()
 
         # Row SFD: compute per-row scale factors
-        sfn = ceil_div(n, sf_vec_size)
-        ref_for_sf = ref.permute(2, 0, 1).contiguous()  # (l, m, n)
-        # Pad n to sfn * sf_vec_size so view() has matching element count
-        pad_n = sfn * sf_vec_size - n
-        if pad_n > 0:
-            ref_for_sf = torch.nn.functional.pad(ref_for_sf, (0, pad_n))
-        ref_for_sf = ref_for_sf.view(1, valid_m, sfn, sf_vec_size)
+        n_aligned = ceil_div(n, 128) * 128
+        valid_m_aligned = ceil_div(valid_m, 128) * 128
+        if n_aligned != n:
+            zeros = torch.zeros(
+                ref.shape[0],
+                n_aligned - n,
+                ref.shape[2],
+                dtype=ref.dtype,
+                device=ref.device,
+            )
+            ref_sf = torch.cat([ref, zeros], dim=1)
+        else:
+            ref_sf = ref
+        sfn = ceil_div(n_aligned, sf_vec_size)
+        ref_for_sf = ref_sf.permute(2, 0, 1).contiguous()  # (l, m, n)
+        ref_for_sf = ref_for_sf.view(1, valid_m_aligned, sfn, sf_vec_size)
         ref_for_sf, _ = torch.abs(ref_for_sf).max(dim=3)  # (l, m, sfn)
         ref_sfd_row_f32 = ref_for_sf * norm_const * get_dtype_rcp_limits(d_dtype)
         ref_sfd_row_f32 = ref_sfd_row_f32.permute(1, 2, 0)
 
         # Convert fp32 -> f8 -> fp32 roundtrip
-        ref_sfd_row_f8_torch = torch.empty(*(1, valid_m, sfn), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
+        ref_sfd_row_f8_torch = torch.empty(*(1, valid_m_aligned, sfn), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
         ref_sfd_row_f8 = from_dlpack(ref_sfd_row_f8_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         ref_sfd_row_f8.element_type = _convert_to_cutlass_data_type(sf_dtype)
         ref_sfd_row_f32_device = ref_sfd_row_f32.cuda()
@@ -360,7 +384,7 @@ def run_grouped_gemm_quant_ref(
         cute.testing.convert(ref_sfd_row_f8, ref_sfd_row_f32_tensor)
         ref_sfd_row_f32 = ref_sfd_row_f32_device.cpu()
 
-        ref_sfd_row_f32_cute_torch_tensor_cpu, _ = create_sf_layout_tensor(1, valid_m, n, sf_vec_size)
+        ref_sfd_row_f32_cute_torch_tensor_cpu, _ = create_sf_layout_tensor(1, valid_m_aligned, n, sf_vec_size)
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
             from_dlpack(ref_sfd_row_f32),
             from_dlpack(ref_sfd_row_f32_cute_torch_tensor_cpu),
@@ -371,7 +395,7 @@ def run_grouped_gemm_quant_ref(
         # Quantized output with row scale factor
         ref_sfd_row_rcp = norm_const * ref_sfd_row_f32.reciprocal()
         ref_sfd_row_rcp = torch.clamp(ref_sfd_row_rcp, max=3.40282346638528859812e38)
-        ref_sfd_row_rcp_expanded = ref_sfd_row_rcp.unsqueeze(2).expand(valid_m, sfn, sf_vec_size, 1)
+        ref_sfd_row_rcp_expanded = ref_sfd_row_rcp[:valid_m, :, :].unsqueeze(2).expand(valid_m, sfn, sf_vec_size, 1)
         ref_sfd_row_rcp_expanded = ref_sfd_row_rcp_expanded.reshape(valid_m, sfn * sf_vec_size, 1)
         ref_sfd_row_rcp_expanded = ref_sfd_row_rcp_expanded[:, :n, :]
 
@@ -380,20 +404,18 @@ def run_grouped_gemm_quant_ref(
 
         # Col SFD
         ref_col = ref.permute(2, 1, 0).contiguous().permute(1, 2, 0)
+        ref_col_sf = ref_sf.permute(2, 1, 0).contiguous().permute(1, 2, 0)
         n_col = ref_col.shape[1]
         sfn_col = ceil_div(n_col, sf_vec_size)
         valid_m_col = ref_col.shape[0]
-        ref_for_sf_col = ref_col.permute(2, 0, 1).contiguous()
-        # Pad n_col to sfn_col * sf_vec_size so view() has matching element count
-        pad_n_col = sfn_col * sf_vec_size - n_col
-        if pad_n_col > 0:
-            ref_for_sf_col = torch.nn.functional.pad(ref_for_sf_col, (0, pad_n_col))
-        ref_for_sf_col = ref_for_sf_col.view(1, valid_m_col, sfn_col, sf_vec_size)
+        valid_m_col_aligned = ceil_div(valid_m_col, 128) * 128
+        ref_for_sf_col = ref_col_sf.permute(2, 0, 1).contiguous()
+        ref_for_sf_col = ref_for_sf_col.view(1, valid_m_col_aligned, sfn_col, sf_vec_size)
         ref_for_sf_col, _ = torch.abs(ref_for_sf_col).max(dim=3)
         ref_sfd_col_f32 = ref_for_sf_col * norm_const * get_dtype_rcp_limits(d_dtype)
         ref_sfd_col_f32 = ref_sfd_col_f32.permute(1, 2, 0)
 
-        ref_sfd_col_f8_torch = torch.empty(*(1, valid_m_col, sfn_col), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
+        ref_sfd_col_f8_torch = torch.empty(*(1, valid_m_col_aligned, sfn_col), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
         ref_sfd_col_f8 = from_dlpack(ref_sfd_col_f8_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         ref_sfd_col_f8.element_type = _convert_to_cutlass_data_type(sf_dtype)
         ref_sfd_col_f32_device = ref_sfd_col_f32.cuda()
@@ -402,7 +424,7 @@ def run_grouped_gemm_quant_ref(
         cute.testing.convert(ref_sfd_col_f8, ref_sfd_col_f32_tensor)
         ref_sfd_col_f32 = ref_sfd_col_f32_device.cpu()
 
-        ref_sfd_col_f32_cute_torch_tensor_cpu, _ = create_sf_layout_tensor(1, valid_m_col, n_col, sf_vec_size)
+        ref_sfd_col_f32_cute_torch_tensor_cpu, _ = create_sf_layout_tensor(1, valid_m_col_aligned, n_col, sf_vec_size)
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
             from_dlpack(ref_sfd_col_f32),
             from_dlpack(ref_sfd_col_f32_cute_torch_tensor_cpu),
@@ -413,7 +435,7 @@ def run_grouped_gemm_quant_ref(
         # Quantized col output
         ref_sfd_col_rcp = norm_const * ref_sfd_col_f32.reciprocal()
         ref_sfd_col_rcp = torch.clamp(ref_sfd_col_rcp, max=3.40282346638528859812e38)
-        ref_sfd_col_rcp_expanded = ref_sfd_col_rcp.unsqueeze(2).expand(valid_m_col, sfn_col, sf_vec_size, 1)
+        ref_sfd_col_rcp_expanded = ref_sfd_col_rcp[:valid_m_col, :, :].unsqueeze(2).expand(valid_m_col, sfn_col, sf_vec_size, 1)
         ref_sfd_col_rcp_expanded = ref_sfd_col_rcp_expanded.reshape(valid_m_col, sfn_col * sf_vec_size, 1)
         ref_sfd_col_rcp_expanded = ref_sfd_col_rcp_expanded[:, :n_col, :]
 
@@ -474,6 +496,7 @@ def check_ref_grouped_gemm_quant(
         d_dtype=cfg["d_dtype"],
         sf_vec_size=cfg["sf_vec_size"],
         sf_dtype=cfg["sf_dtype"],
+        bias_ref=inputs.get("bias_ref"),
     )
 
     torch.cuda.synchronize()

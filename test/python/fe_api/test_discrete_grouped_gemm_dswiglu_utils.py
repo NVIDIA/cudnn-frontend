@@ -4,11 +4,13 @@ Utilities and parameterization for Discrete-weight Grouped GEMM dGLU backward te
 
 import torch
 import pytest
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, Optional
 from test_fe_api_utils import (
+    compute_reference_amax,
     create_and_permute_tensor,
     create_scale_factor_tensor,
 )
+from fe_api.test_grouped_gemm_dswiglu_utils import compute_reference_row_quant
 
 # =============================================================================
 # Parameterization Marks
@@ -238,6 +240,7 @@ def allocate_discrete_dswiglu_output_tensors(
     cd_major: str,
     sf_dtype: torch.dtype,
     sf_vec_size: int = 16,
+    generate_dbias: bool = False,
     device: str = "cuda",
 ) -> Dict[str, Any]:
     """Allocate output tensors for discrete backward.
@@ -252,12 +255,16 @@ def allocate_discrete_dswiglu_output_tensors(
     result = {
         "d_row_tensor": d_row_tensor,
         "d_col_tensor": d_col_tensor,
+        "dbias_tensor": None,
         "sfd_row_tensor": None,
         "sfd_col_tensor": None,
     }
 
     if d_dtype in [torch.bfloat16, torch.float16]:
         result["amax_tensor"] = torch.full((num_experts, 2, 1), float("-inf"), dtype=torch.float32, device=device)
+
+    if generate_dbias:
+        result["dbias_tensor"] = torch.zeros((num_experts, n_out, 1), dtype=torch.bfloat16, device=device)
 
     if ab_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and sf_dtype in [
         torch.float8_e8m0fnu,
@@ -272,6 +279,108 @@ def allocate_discrete_dswiglu_output_tensors(
     return result
 
 
+def run_discrete_dswiglu_ref(
+    a_ref: torch.Tensor,
+    b_ref_list: List[torch.Tensor],
+    c_ref: torch.Tensor,
+    sfa_ref: torch.Tensor,
+    sfb_ref_list: List[torch.Tensor],
+    alpha_tensor: torch.Tensor,
+    beta_tensor: torch.Tensor,
+    prob_tensor: torch.Tensor,
+    aligned_group_m_list: List[int],
+    valid_m: int,
+    generate_dbias: bool = False,
+    generate_amax: bool = False,
+    generate_sfd: bool = False,
+    norm_const_tensor: Optional[torch.Tensor] = None,
+    d_dtype: torch.dtype = torch.float32,
+    sf_vec_size: int = 16,
+    sf_dtype: torch.dtype = torch.float8_e8m0fnu,
+) -> Dict[str, torch.Tensor]:
+    num_experts = len(b_ref_list)
+    n = b_ref_list[0].shape[0]
+    n_out = n * 2
+    ref_tensors = {}
+
+    ref = torch.empty((1, valid_m, n), dtype=torch.float32, device=a_ref.device)
+    start = 0
+    for i, group_m in enumerate(aligned_group_m_list):
+        end = start + group_m
+        res_a = torch.einsum("mk,mk->mk", a_ref[start:end, :, 0], sfa_ref[start:end, :, 0])
+        res_b = torch.einsum("nk,nk->nk", b_ref_list[i][:, :, 0], sfb_ref_list[i][:, :, 0])
+        ref[0, start:end, :] = torch.einsum("mk,nk->mn", res_a * alpha_tensor[i].item(), res_b * alpha_tensor[i].item())
+        start = end
+    ref = ref.permute((1, 2, 0))
+
+    c_full = torch.empty((valid_m, n_out, 1), dtype=torch.float32, device=a_ref.device)
+    start = 0
+    for i, group_m in enumerate(aligned_group_m_list):
+        end = start + group_m
+        c_full[start:end, :, 0] = c_ref[start:end, :, 0] * beta_tensor[i].item()
+        start = end
+
+    group = 32
+    cols_2n = torch.arange(n_out, dtype=torch.long, device=a_ref.device)
+    block_cols_2n = cols_2n.view(n_out // group, group)
+    dest_idx_glu = block_cols_2n[0::2].reshape(-1)
+    dest_idx_ab = block_cols_2n[1::2].reshape(-1)
+
+    cols_n = torch.arange(n, dtype=torch.long, device=a_ref.device)
+    block_cols_n = cols_n.view(n // group, group)
+    src_idx_n = block_cols_n.reshape(-1)
+
+    c_input = c_full.index_select(dim=1, index=dest_idx_ab)
+    c_gate = c_full.index_select(dim=1, index=dest_idx_glu)
+    sig = torch.sigmoid(c_gate)
+    swish = c_gate * sig
+
+    ref_dprob = swish * c_input * ref
+    chunk_sums = [torch.sum(chunk, dim=1, keepdim=True) for chunk in torch.split(ref_dprob, 32, dim=1)]
+    ref_tensors["dprob_ref"] = torch.sum(torch.cat(chunk_sums, dim=1), dim=1, keepdim=True)
+
+    prob = prob_tensor.expand(-1, n, -1)
+    ab = ref * prob * swish
+    dswiglu = ref * prob * c_input * sig * (1 + c_gate * (1 - sig))
+
+    ref_d = torch.empty_like(c_full)
+    ref_d.index_copy_(dim=1, index=dest_idx_ab, source=ab.index_select(dim=1, index=src_idx_n))
+    ref_d.index_copy_(dim=1, index=dest_idx_glu, source=dswiglu.index_select(dim=1, index=src_idx_n))
+    ref_tensors["d_ref"] = ref_d.clone()
+
+    if generate_dbias:
+        ref_dbias = torch.zeros((num_experts, n_out, 1), dtype=torch.bfloat16, device=a_ref.device)
+        start = 0
+        for i, group_m in enumerate(aligned_group_m_list):
+            end = start + group_m
+            ref_dbias[i, :, 0] = ref_d[start:end, :, 0].sum(dim=0).to(torch.bfloat16)
+            start = end
+        ref_tensors["dbias_ref"] = ref_dbias
+
+    if generate_amax:
+        ref_amax = torch.empty((num_experts, 2, 1), dtype=torch.float32, device=a_ref.device)
+        start = 0
+        for i, group_m in enumerate(aligned_group_m_list):
+            end = start + group_m
+            ref_amax[i, 0] = torch.tensor(compute_reference_amax(dswiglu[start:end, :, 0].clone()))
+            ref_amax[i, 1] = torch.tensor(compute_reference_amax(ab[start:end, :, 0].clone()))
+            start = end
+        ref_tensors["amax_ref"] = ref_amax
+
+    if generate_sfd:
+        norm_const = norm_const_tensor[0].item()
+        sfd_row_ref_f32, d_ref_f32 = compute_reference_row_quant(ref_d, d_dtype, sf_dtype, sf_vec_size, norm_const)
+        ref_tensors["sfd_row_ref"] = sfd_row_ref_f32.clone()
+        ref_tensors["d_ref"] = d_ref_f32.clone()
+
+        ref_d_col = ref_d.permute(2, 1, 0).contiguous().permute(1, 2, 0)
+        sfd_col_ref_f32, d_col_ref_f32 = compute_reference_row_quant(ref_d_col, d_dtype, sf_dtype, sf_vec_size, norm_const)
+        ref_tensors["sfd_col_ref"] = sfd_col_ref_f32.clone()
+        ref_tensors["d_col_ref"] = d_col_ref_f32.clone()
+
+    return ref_tensors
+
+
 # =============================================================================
 # Reference Checking
 # =============================================================================
@@ -281,16 +390,101 @@ def check_ref_discrete_dswiglu(
     inputs: Dict[str, Any],
     outputs: Dict[str, Any],
     cfg: Dict[str, Any],
+    atol: float = 1e-1,
+    rtol: float = 1e-2,
     skip_ref: bool = False,
 ) -> None:
-    """Check discrete backward -- kernel execution verification.
-
-    Full numerical reference for the dSwiGLU backward is complex (requires
-    computing SwiGLU derivatives). For now, verify the kernel runs without error.
-    """
+    """Check discrete backward against a CPU reference for dSwiGLU."""
     if skip_ref:
         print("Skipping reference check")
         return
 
+    is_dgeglu = cfg.get("act_func") == "dgeglu"
+    if is_dgeglu:
+        torch.cuda.synchronize()
+        print("dGeGLU activation: execution checked, numerical reference skipped")
+        return
+
+    ref_tensors = run_discrete_dswiglu_ref(
+        a_ref=inputs["a_ref"].to(torch.float32),
+        b_ref_list=[b.to(torch.float32) for b in inputs["b_ref_list"]],
+        c_ref=inputs["c_tensor"].to(torch.float32),
+        sfa_ref=inputs["sfa_ref"].to(torch.float32),
+        sfb_ref_list=[sfb.to(torch.float32) for sfb in inputs["sfb_ref_list"]],
+        alpha_tensor=inputs["alpha_tensor"],
+        beta_tensor=inputs["beta_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        aligned_group_m_list=inputs["aligned_group_m_list"],
+        valid_m=inputs["valid_m"],
+        generate_dbias=(outputs.get("dbias_tensor") is not None),
+        generate_amax=(outputs.get("amax_tensor") is not None),
+        generate_sfd=(outputs.get("sfd_row_tensor") is not None),
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        d_dtype=cfg["d_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        sf_dtype=cfg["sf_dtype"],
+    )
+
     torch.cuda.synchronize()
-    print("Discrete dGLU backward kernel executed successfully")
+
+    if ref_tensors.get("dprob_ref") is not None:
+        dprob_tensor = outputs.get("dprob_tensor", inputs.get("dprob_tensor"))
+        torch.testing.assert_close(
+            dprob_tensor[: inputs["valid_m"]].cpu().float(),
+            ref_tensors["dprob_ref"].cpu().float(),
+            atol=atol,
+            rtol=rtol,
+        )
+
+    if ref_tensors.get("dbias_ref") is not None and outputs.get("dbias_tensor") is not None:
+        max_m = max(inputs["aligned_group_m_list"])
+        use_2cta_instrs = cfg["mma_tiler_mn"][0] == 256
+        num_tiles_per_expert = max_m // (cfg["mma_tiler_mn"][0] // (2 if use_2cta_instrs else 1))
+        dbias_ref = ref_tensors["dbias_ref"].cpu().float()
+        dbias_atol = max(dbias_ref.abs().max().item() * 0.008 * (num_tiles_per_expert**0.5), atol)
+        torch.testing.assert_close(
+            outputs["dbias_tensor"].cpu().float(),
+            dbias_ref,
+            atol=dbias_atol,
+            rtol=rtol,
+        )
+
+    if cfg["d_dtype"] in [torch.float32, torch.float16, torch.bfloat16]:
+        if ref_tensors.get("amax_ref") is not None and outputs.get("amax_tensor") is not None:
+            torch.testing.assert_close(
+                outputs["amax_tensor"].cpu(),
+                ref_tensors["amax_ref"].cpu(),
+                atol=atol,
+                rtol=rtol,
+            )
+
+        torch.testing.assert_close(
+            outputs["d_row_tensor"][: inputs["valid_m"]].cpu().float(),
+            ref_tensors["d_ref"].cpu().to(cfg["d_dtype"]).to(torch.float32),
+            atol=atol,
+            rtol=rtol,
+        )
+    elif cfg["d_dtype"] in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        fp8_d_atol = max(atol, 0.125 if cfg["d_dtype"] == torch.float8_e4m3fn else 0.25)
+        fp8_d_rtol = max(rtol, 0.125 if cfg["d_dtype"] == torch.float8_e4m3fn else 0.25)
+
+        if ref_tensors.get("sfd_row_ref") is not None:
+            torch.testing.assert_close(
+                outputs["sfd_row_tensor"].cpu().float(),
+                ref_tensors["sfd_row_ref"].cpu().to(torch.float32),
+                atol=atol,
+                rtol=rtol,
+            )
+            torch.testing.assert_close(
+                outputs["d_row_tensor"].cpu().float(),
+                ref_tensors["d_ref"].cpu().to(cfg["d_dtype"]).to(torch.float32),
+                atol=fp8_d_atol,
+                rtol=fp8_d_rtol,
+            )
+        else:
+            torch.testing.assert_close(
+                outputs["d_row_tensor"][: inputs["valid_m"]].cpu().float(),
+                ref_tensors["d_ref"][: inputs["valid_m"]].cpu().to(cfg["d_dtype"]).to(torch.float32),
+                atol=fp8_d_atol,
+                rtol=fp8_d_rtol,
+            )
