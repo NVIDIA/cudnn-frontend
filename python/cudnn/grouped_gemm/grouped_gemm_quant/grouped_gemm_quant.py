@@ -2034,7 +2034,10 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                         )
                         # SFD M tile = cta_tile_m = 128; tile_m_idx is CTA-level per-expert
                         global_sfd_m = epi_work_tile_info.tile_m_idx + epi_ext.token_offset // self.cta_tile_shape_mnk[0]
-                        sfd_n = epi_work_tile_info.tile_n_idx * 2 + (real_subtile_idx >> 2)
+                        if cutlass.const_expr(self.mma_tiler[1] == 256):
+                            sfd_n = epi_work_tile_info.tile_n_idx * 2 + (real_subtile_idx >> 2)
+                        else:
+                            sfd_n = epi_work_tile_info.tile_n_idx
                         sfd_row_idx_mn = (global_sfd_m, sfd_n)
                         sfd_col_idx_mn = sfd_row_idx_mn
                         if cutlass.const_expr(self.discrete_col_sfd):
@@ -2045,10 +2048,12 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                         tCgSFDRow = tCgSFDRow_mn[(None, None, None, *sfd_row_idx_mn)]
                         tCgSFDCol = tCgSFDCol_mn[(None, None, None, *sfd_col_idx_mn)]
                         if subtile_idx == 3 or subtile_idx == 7:
-                            tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
-                            cute.autovec_copy(tCrSFDRow, tCgSFDRow)
-                            tCrSFDCol.store(tCrSFDCol_pvscale.load().to(self.sf_dtype))
-                            cute.autovec_copy(tCrSFDCol, tCgSFDCol)
+                            if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
+                                tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
+                                cute.autovec_copy(tCrSFDRow, tCgSFDRow)
+                            if sfd_col_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDCol_mnl.layout, mode=[1])):
+                                tCrSFDCol.store(tCrSFDCol_pvscale.load().to(self.sf_dtype))
+                                cute.autovec_copy(tCrSFDCol, tCgSFDCol)
                     else:
                         acc_vec = tiled_copy_r2s.retile(tCompute).load()
                         tRS_rD.store(acc_vec.to(self.d_dtype))

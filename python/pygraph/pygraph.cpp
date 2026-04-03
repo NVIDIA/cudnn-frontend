@@ -607,6 +607,40 @@ PyGraph::execute(std::unordered_map<int64_t, std::intptr_t> var_pack,
 }
 
 void
+PyGraph::prepare_variant_pack_template() {
+    auto status = graph->prepare_variant_pack_template();
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+void
+PyGraph::execute_with_ptrs(std::vector<std::intptr_t> const& user_ptrs,
+                           std::intptr_t workspace,
+                           std::intptr_t exec_handle) {
+    std::vector<void*> ptrs(user_ptrs.size());
+    for (size_t i = 0; i < user_ptrs.size(); i++) {
+        ptrs[i] = (void*)user_ptrs[i];
+    }
+    cudnnHandle_t h = exec_handle ? static_cast<cudnnHandle_t>((void*)exec_handle) : handle;
+    auto status     = graph->execute(h, ptrs.data(), (int)ptrs.size(), (void*)workspace);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+void
+PyGraph::execute_with_raw_ptrs(std::intptr_t user_ptrs_array,
+                               int64_t n_user,
+                               std::intptr_t workspace,
+                               std::intptr_t exec_handle) {
+    static_assert(sizeof(std::intptr_t) == sizeof(void*), "intptr_t and void* must be the same size");
+    throw_if(n_user < 0, error_code_t::INVALID_VALUE, "n_user must be non-negative");
+    throw_if(n_user > 0 && user_ptrs_array == 0, error_code_t::INVALID_VALUE, "user_ptrs_array is null");
+    // user_ptrs_array points to a contiguous intptr_t[] of device pointers — zero copy
+    void** ptrs     = reinterpret_cast<void**>(user_ptrs_array);
+    cudnnHandle_t h = exec_handle ? static_cast<cudnnHandle_t>((void*)exec_handle) : handle;
+    auto status     = graph->execute(h, ptrs, (int)n_user, (void*)workspace);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+void
 PyGraph::execute_plan_at_index(std::unordered_map<int64_t, std::intptr_t> var_pack,
                                std::intptr_t workspace,
                                int64_t index,
@@ -1085,6 +1119,19 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("override_uids")    = py::none(),
              py::arg("override_shapes")  = py::none(),
              py::arg("override_strides") = py::none())
+        .def("_prepare_variant_pack_template", &PyGraph::prepare_variant_pack_template)
+        .def("_get_variant_pack_uids_sorted", &PyGraph::get_variant_pack_uids_sorted)
+        .def("_execute_with_ptrs",
+             &PyGraph::execute_with_ptrs,
+             py::arg("user_ptrs"),
+             py::arg("workspace"),
+             py::arg("handle"))
+        .def("_execute_with_raw_ptrs",
+             &PyGraph::execute_with_raw_ptrs,
+             py::arg("user_ptrs_array"),
+             py::arg("n_user"),
+             py::arg("workspace"),
+             py::arg("handle"))
         .def("populate_cuda_graph", &PyGraph::populate_cuda_graph)
         .def("update_cuda_graph", &PyGraph::update_cuda_graph)
         .def("serialize", &PyGraph::serialize)

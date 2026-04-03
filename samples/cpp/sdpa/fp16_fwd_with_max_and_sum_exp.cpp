@@ -172,8 +172,8 @@ TEST_CASE("Toy sdpa forward with max and sum exp", "[graph][sdpa][flash][forward
     int64_t s_kv = 1024;  // k and v tensor is padded to this seq length
     int64_t d_qk = 128;   // hidden dim
     int64_t d_v  = 128;   // hidden dim
-    // Only 9.20.0 and above supports generating all 3 outputs (stats, max, sum_exp) simultaneously.
-    bool generate_stats   = (cudnnGetVersion() >= 92000);
+    // Only 9.21.0 and above supports generating all 3 outputs (stats, max, sum_exp) simultaneously.
+    bool generate_stats   = (cudnnGetVersion() >= 92100);
     bool generate_max     = true;
     bool generate_sum_exp = true;
     float attn_scale      = 0.123f;

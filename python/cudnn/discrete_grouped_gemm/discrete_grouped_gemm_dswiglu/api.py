@@ -33,8 +33,8 @@ This module provides the API class for discrete-weight block-scaled grouped GEMM
 backward pass with dGLU (dSwiGLU/dGeGLU) activation gradient for MoE workloads.
 """
 
-from .discrete_B_blockscaled_grouped_gemm_dglu import (
-    BlockScaledDiscreteWeightDgluGroupedGemmKernel,
+from .discrete_B_blockscaled_grouped_gemm_dglu_dbias import (
+    BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel,
 )
 from cuda.bindings import driver as cuda
 import logging
@@ -82,6 +82,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         sample_beta: torch.Tensor,
         sample_prob: torch.Tensor,
         sample_dprob: torch.Tensor,
+        sample_dbias: Optional[torch.Tensor] = None,
         sample_sfd_row: Optional[torch.Tensor] = None,
         sample_sfd_col: Optional[torch.Tensor] = None,
         sample_amax: Optional[torch.Tensor] = None,
@@ -113,6 +114,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         :param sample_beta: Per-group beta scaling factors
         :param sample_prob: Per-row probability tensor (valid_m, 1, 1)
         :param sample_dprob: Gradient of probability tensor (valid_m, 1, 1), must be zero-initialized
+        :param sample_dbias: Optional dbias output tensor (expert_cnt, 2*n, 1)
         :param sample_sfd_row: Optional row scale factor for D
         :param sample_sfd_col: Optional column scale factor for D
         :param sample_amax: Optional amax tensor, shape (expert_cnt, 2, 1)
@@ -146,6 +148,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         self.beta_desc = self._make_tensor_desc(sample_beta, name="sample_beta")
         self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob")
         self.dprob_desc = self._make_tensor_desc(sample_dprob, name="sample_dprob")
+        self.dbias_desc = self._make_tensor_desc(sample_dbias, name="sample_dbias")
 
         self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row")
         self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col")
@@ -190,7 +193,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
             raise ValueError(f"Invalid epilogue operation: {epilogue_op}. Valid: None, 'relu', 'srelu'")
 
         self._interpret_uint8_as_fp4x2 = True
-        self._kernel = BlockScaledDiscreteWeightDgluGroupedGemmKernel
+        self._kernel = BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel
 
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         print(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
@@ -235,6 +238,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         self._check_tensor_shape(self.beta_desc, (self.expert_cnt,), "beta")
         self._check_tensor_shape(self.prob_desc, (tensor_m, 1, 1), "prob")
         self._check_tensor_shape(self.dprob_desc, (tensor_m, 1, 1), "dprob")
+        self._check_tensor_shape(self.dbias_desc, (self.expert_cnt, n_out, 1), "dbias")
         self._check_tensor_shape(self.amax_desc, (self.expert_cnt, 2, 1), "amax")
         self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
         self._check_tensor_shape(self.padded_offsets_desc, (self.expert_cnt,), "padded_offsets")
@@ -321,6 +325,12 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
             name="dprob",
             extra_error_msg="dprob must be float32",
         )
+        self._check_dtype(
+            self.dbias_desc,
+            dtype=torch.bfloat16,
+            name="Dbias",
+            extra_error_msg="dbias must be bfloat16",
+        )
         self.c_dtype = self._check_dtype(self.c_desc, dtype=[torch.float32, torch.float16, torch.bfloat16], name="C")
 
         if self._is_fp4x2(self.ab_dtype):
@@ -376,16 +386,16 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         )
 
         self._value_error_if(
-            not self.use_2cta_instrs and self.mma_tiler_mn[0] not in [64, 128],
-            f"MMA tiler M must be 64 or 128 when use_2cta_instrs=False, got {self.mma_tiler_mn[0]}",
+            not self.use_2cta_instrs and self.mma_tiler_mn[0] != 128,
+            f"MMA tiler M must be 128 when use_2cta_instrs=False, got {self.mma_tiler_mn[0]}",
         )
         self._value_error_if(
-            self.use_2cta_instrs and self.mma_tiler_mn[0] not in [128, 256],
-            f"MMA tiler M must be 128 or 256 when use_2cta_instrs=True, got {self.mma_tiler_mn[0]}",
+            self.use_2cta_instrs and self.mma_tiler_mn[0] != 256,
+            f"MMA tiler M must be 256 when use_2cta_instrs=True, got {self.mma_tiler_mn[0]}",
         )
         self._value_error_if(
-            self.mma_tiler_mn[1] not in [128, 256],
-            f"MMA tiler N must be 128 or 256, got {self.mma_tiler_mn[1]}",
+            self.mma_tiler_mn[1] != 256,
+            f"MMA tiler N must be 256, got {self.mma_tiler_mn[1]}",
         )
         self._value_error_if(
             self.cluster_shape_mn[0] % (2 if self.use_2cta_instrs else 1) != 0,
@@ -413,8 +423,8 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
             f"m_aligned must be divisible by mma_tiler_mn[0], got {self.m_aligned} % {self.mma_tiler_mn[0]} != 0",
         )
         self._value_error_if(
-            self.m_aligned != BlockScaledDiscreteWeightDgluGroupedGemmKernel.FIX_PAD_SIZE,
-            f"m_aligned must be {BlockScaledDiscreteWeightDgluGroupedGemmKernel.FIX_PAD_SIZE}, got {self.m_aligned}",
+            self.m_aligned != BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel.FIX_PAD_SIZE,
+            f"m_aligned must be {BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel.FIX_PAD_SIZE}, got {self.m_aligned}",
         )
         self._logger.debug("Checking tensor alignment")
 
@@ -500,38 +510,79 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         ab_cutlass_dtype = _convert_to_cutlass_data_type(self.a_desc.dtype, interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2)
         align = 32 if ab_cutlass_dtype.width == 4 else 16
 
-        a_tensor = self._make_fake_cute_tensor_from_desc(self.a_desc, assumed_align=align)
-        if a_tensor is not None:
-            a_tensor.mark_layout_dynamic(leading_dim=1)
-        c_tensor = self._make_fake_cute_tensor_from_desc(self.c_desc, assumed_align=16)
-        if c_tensor is not None:
-            c_tensor.mark_layout_dynamic(leading_dim=1)
-        d_row_tensor = self._make_fake_cute_tensor_from_desc(self.d_row_desc, assumed_align=16)
-        if d_row_tensor is not None:
-            d_row_tensor.mark_layout_dynamic(leading_dim=1)
-        d_col_tensor = self._make_fake_cute_tensor_from_desc(self.d_col_desc, assumed_align=16)
-        if d_col_tensor is not None:
-            d_col_tensor.mark_layout_dynamic(leading_dim=1)
-        sfa_tensor = self._make_fake_cute_tensor_from_desc(self.sfa_desc, assumed_align=16)
-        if sfa_tensor is not None:
-            sfa_tensor.mark_layout_dynamic(leading_dim=3)
-        sfd_row_tensor = self._make_fake_cute_tensor_from_desc(self.sfd_row_desc, assumed_align=16)
-        if sfd_row_tensor is not None:
-            sfd_row_tensor.mark_layout_dynamic(leading_dim=3)
-        sfd_col_tensor = self._make_fake_cute_tensor_from_desc(self.sfd_col_desc, assumed_align=16)
-        if sfd_col_tensor is not None:
-            sfd_col_tensor.mark_layout_dynamic(leading_dim=3)
+        valid_m = cute.sym_int(divisibility=256)
+        a_tensor = self._make_fake_cute_compact_tensor(
+            dtype=self.a_desc.dtype,
+            shape=(valid_m, *self.a_desc.shape[1:]),
+            stride_order=self.a_desc.stride_order,
+            assumed_align=align,
+        )
+        c_tensor = self._make_fake_cute_compact_tensor(
+            dtype=self.c_desc.dtype,
+            shape=(valid_m, *self.c_desc.shape[1:]),
+            stride_order=self.c_desc.stride_order,
+        )
+        d_row_tensor = self._make_fake_cute_compact_tensor(
+            dtype=self.d_row_desc.dtype,
+            shape=(valid_m, *self.d_row_desc.shape[1:]),
+            stride_order=self.d_row_desc.stride_order,
+        )
+        d_col_tensor = self._make_fake_cute_compact_tensor(
+            dtype=self.d_col_desc.dtype,
+            shape=(valid_m, *self.d_col_desc.shape[1:]),
+            stride_order=self.d_col_desc.stride_order,
+        )
+
+        tensor_m_128 = cute.sym_int()
+        stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
+        sfa_shape = list(self.sfa_desc.shape)
+        sfa_shape[2] = tensor_m_128
+        sfa_stride = list(self.sfa_desc.stride)
+        sfa_stride[5] = stride_tensor_m_128
+        sfa_tensor = self._make_fake_cute_tensor(
+            dtype=self.sfa_desc.dtype,
+            shape=tuple(sfa_shape),
+            stride=tuple(sfa_stride),
+            assumed_align=16,
+        )
+        sfd_row_tensor = None
+        if self.sfd_row_desc is not None:
+            stride_sfd_m = cute.sym_int(divisibility=32 * 4 * 4)
+            sfd_row_tensor = self._make_fake_cute_tensor(
+                dtype=self.sfd_row_desc.dtype,
+                shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
+                stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
+                assumed_align=16,
+            )
+        sfd_col_tensor = None
+        if self.sfd_col_desc is not None:
+            rest_m = cute.sym_int(divisibility=1)
+            stride_sfd_n = cute.sym_int(divisibility=32 * 4 * 4)
+            stride_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
+            sfd_col_tensor = self._make_fake_cute_tensor(
+                dtype=self.sfd_col_desc.dtype,
+                shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
+                stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
+                assumed_align=16,
+            )
         amax_tensor = self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16)
         norm_const_tensor_cute = self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16)
         padded_offsets_tensor = self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16)
         alpha_tensor = self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16)
         beta_tensor = self._make_fake_cute_tensor_from_desc(self.beta_desc, assumed_align=16)
-        prob_tensor = self._make_fake_cute_tensor_from_desc(self.prob_desc, assumed_align=16)
-        if prob_tensor is not None:
-            prob_tensor.mark_layout_dynamic(leading_dim=1)
-        dprob_tensor = self._make_fake_cute_tensor_from_desc(self.dprob_desc, assumed_align=16)
-        if dprob_tensor is not None:
-            dprob_tensor.mark_layout_dynamic(leading_dim=1)
+        prob_tensor = self._make_fake_cute_tensor(
+            dtype=self.prob_desc.dtype,
+            shape=(valid_m, *self.prob_desc.shape[1:]),
+            stride=self.prob_desc.stride,
+            assumed_align=16,
+        )
+        dprob_tensor = self._make_fake_cute_tensor(
+            dtype=self.dprob_desc.dtype,
+            shape=(valid_m, *self.dprob_desc.shape[1:]),
+            stride=self.dprob_desc.stride,
+            assumed_align=16,
+        )
+        dbias_tensor = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
 
         # Use internal device-resident int64 arrays to provide valid pointer-like
         # compile-time placeholders for b_ptrs/sfb_ptrs (required by kernel __call__).
@@ -566,6 +617,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
             prob_tensor,
             dprob_tensor,
             cutlass.Float32(0.0),
+            dbias_tensor,
             max_active_clusters,
             fake_stream,
             self.epilogue_op,
@@ -602,6 +654,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
             beta_tensor,
             prob_tensor,
             dprob_tensor,
+            dbias_tensor,
             stream,
         ):
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
@@ -630,6 +683,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
                 prob_tensor,
                 dprob_tensor,
                 cached_linear_offset,
+                dbias_tensor,
                 stream,
             )
 
@@ -650,6 +704,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         beta_tensor: torch.Tensor,
         prob_tensor: torch.Tensor,
         dprob_tensor: torch.Tensor,
+        dbias_tensor: Optional[torch.Tensor] = None,
         sfd_row_tensor: Optional[torch.Tensor] = None,
         sfd_col_tensor: Optional[torch.Tensor] = None,
         amax_tensor: Optional[torch.Tensor] = None,
@@ -670,6 +725,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         :param beta_tensor: Per-group beta scaling
         :param prob_tensor: Per-row probability (from forward)
         :param dprob_tensor: Gradient of probability (output, must be zero-initialized)
+        :param dbias_tensor: Optional dbias output tensor (expert_cnt, 2*n, 1)
         :param sfd_row_tensor: Optional row scale factor D
         :param sfd_col_tensor: Optional column scale factor D
         :param amax_tensor: Optional amax tensor
@@ -701,6 +757,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
             beta_tensor=beta_tensor,
             prob_tensor=prob_tensor,
             dprob_tensor=dprob_tensor,
+            dbias_tensor=dbias_tensor,
             stream=current_stream,
         )
         self._logger.debug("Execute completed")
@@ -723,6 +780,7 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
     dprob_tensor: torch.Tensor,
     n: int,
     b_dtype: torch.dtype,
+    generate_dbias: bool = False,
     norm_const_tensor: Optional[torch.Tensor] = None,
     acc_dtype: torch.dtype = torch.float32,
     d_dtype: torch.dtype = torch.bfloat16,
@@ -754,6 +812,7 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
         dprob_tensor: Gradient of probability (output, must be zero-initialized)
         n: B weight N dimension
         b_dtype: B weight data type
+        generate_dbias: Allocate and return dbias output
 
     Returns:
         TupleDict with keys: d_row_tensor, d_col_tensor, dprob_tensor,
@@ -776,6 +835,7 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
     sfd_row_tensor = None
     sfd_col_tensor = None
     amax_tensor = None
+    dbias_tensor = None
 
     if a_tensor.dtype in [
         torch.float8_e4m3fn,
@@ -799,37 +859,50 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
             dtype=torch.float32,
             device=a_tensor.device,
         )
+    if generate_dbias:
+        dbias_tensor = torch.zeros((num_experts, n_out, 1), dtype=torch.bfloat16, device=a_tensor.device)
+
+    def stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
+        return tuple(i for i, s in sorted(enumerate(tensor.stride()), key=lambda x: x[1]))
+
+    def tensor_signature(tensor: Optional[torch.Tensor]) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[torch.dtype]]:
+        if tensor is None:
+            return None, None, None
+        return tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype
+
+    def dynamic_m_tensor_signature(
+        tensor: Optional[torch.Tensor], static_shape_suffix: Optional[Tuple[int, ...]], dynamic_stride_dims: Tuple[int, ...] = ()
+    ) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[torch.dtype]]:
+        if tensor is None:
+            return None, None, None
+        stride_signature = tuple(None if i in dynamic_stride_dims else s for i, s in enumerate(tensor.stride()))
+        return static_shape_suffix, stride_signature, tensor.dtype
 
     cache_key = (
-        a_tensor.shape,
-        b_shape,
-        c_tensor.shape,
+        a_tensor.shape[1:],
+        stride_order(a_tensor),
         a_tensor.dtype,
+        b_shape,
         b_dtype,
+        c_tensor.shape[1:],
+        stride_order(c_tensor),
         c_tensor.dtype,
-        a_tensor.stride(),
-        c_tensor.stride(),
-        b_ptrs.shape,
-        sfb_ptrs.shape,
-        b_ptrs.stride(),
-        sfb_ptrs.stride(),
+        *dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1) if sfa_tensor is not None else None, dynamic_stride_dims=(5,)),
+        *tensor_signature(alpha_tensor),
+        *tensor_signature(beta_tensor),
+        *dynamic_m_tensor_signature(prob_tensor, (1, 1)),
+        *dynamic_m_tensor_signature(dprob_tensor, (1, 1)),
+        *tensor_signature(dbias_tensor),
+        *tensor_signature(norm_const_tensor),
+        tuple(b_ptrs.shape),
+        tuple(b_ptrs.stride()),
         b_ptrs.dtype,
+        tuple(sfb_ptrs.shape),
+        tuple(sfb_ptrs.stride()),
         sfb_ptrs.dtype,
-        sfa_tensor.shape,
-        sfa_tensor.stride(),
-        sfa_tensor.dtype,
-        padded_offsets.shape,
-        padded_offsets.stride(),
+        tuple(padded_offsets.shape),
+        tuple(padded_offsets.stride()),
         padded_offsets.dtype,
-        norm_const_tensor.shape if norm_const_tensor is not None else None,
-        norm_const_tensor.stride() if norm_const_tensor is not None else None,
-        norm_const_tensor.dtype if norm_const_tensor is not None else None,
-        sfd_row_tensor.shape if sfd_row_tensor is not None else None,
-        sfd_row_tensor.stride() if sfd_row_tensor is not None else None,
-        sfd_row_tensor.dtype if sfd_row_tensor is not None else None,
-        sfd_col_tensor.shape if sfd_col_tensor is not None else None,
-        sfd_col_tensor.stride() if sfd_col_tensor is not None else None,
-        sfd_col_tensor.dtype if sfd_col_tensor is not None else None,
         acc_dtype,
         d_dtype,
         cd_major,
@@ -863,6 +936,7 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
             sample_beta=beta_tensor,
             sample_prob=prob_tensor,
             sample_dprob=dprob_tensor,
+            sample_dbias=dbias_tensor,
             sample_amax=amax_tensor,
             sample_sfd_row=sfd_row_tensor,
             sample_sfd_col=sfd_col_tensor,
@@ -897,6 +971,7 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
         beta_tensor=beta_tensor,
         prob_tensor=prob_tensor,
         dprob_tensor=dprob_tensor,
+        dbias_tensor=dbias_tensor,
         sfd_row_tensor=sfd_row_tensor,
         sfd_col_tensor=sfd_col_tensor,
         amax_tensor=amax_tensor,
@@ -908,6 +983,7 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
         d_row_tensor=d_row_tensor,
         d_col_tensor=d_col_tensor,
         dprob_tensor=dprob_tensor,
+        dbias_tensor=dbias_tensor,
         amax_tensor=amax_tensor,
         sfd_row_tensor=sfd_row_tensor,
         sfd_col_tensor=sfd_col_tensor,

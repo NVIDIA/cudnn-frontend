@@ -274,6 +274,7 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         score_max=score_max,
         score_sum_exp=score_sum_exp,
         sink_token=sink_token,
+        unfuse_fma=cfg.with_unfuse_fma,
     )
 
     o.set_uid(int(TensorUid.o)).set_output(True).set_dim(cfg.shape_o).set_stride(cfg.stride_o)

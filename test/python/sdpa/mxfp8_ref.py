@@ -209,7 +209,10 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
         p = p_extended[:, :, 1:]  # probabilities for actual K positions (b * h_q, s_q, s_kv)
     else:
         p = s.softmax(dim=-1).nan_to_num().float()
-    p_fp8 = p.to(torch_itype).float()
+
+    p_fp8 = p * 256.0
+    p_fp8 = p_fp8.to(torch_itype).float()
+    p_fp8 *= 1.0 / 256.0
 
     # Use BF16 inputs for D
     o_f16 = o_f16.float().reshape(b * h_q, s_q, d_vo)

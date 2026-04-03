@@ -9,6 +9,7 @@ import pytest
 import random
 import torch
 import sys
+import os
 from datetime import datetime
 
 from sdpa.random_config import (
@@ -109,7 +110,7 @@ def test_sdpa_random_fwd_L0(env_info, test_no, request, cudnn_handle):
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
         s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1024, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128)]),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
@@ -141,7 +142,7 @@ def test_sdpa_random_fwd_unified_L0(env_info, test_no, request, cudnn_handle):
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
         s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1024, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128)]),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
@@ -150,6 +151,7 @@ def test_sdpa_random_fwd_unified_L0(env_info, test_no, request, cudnn_handle):
         is_alibi=RandomChoice({True : 1, False : 5}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
         # TODO: Test with_score_max, with_score_sum_exp and with_sink_token once unified engine supports these features
+        with_unfuse_fma=RandomChoice({True : 1, False : 1}),  # Randomly enable unfuse_fma for SM100
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
     test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
@@ -347,7 +349,7 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
         s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1024, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128)]),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
@@ -379,7 +381,7 @@ def test_sdpa_random_fwd_ragged_unified_L0(env_info, test_no, request, cudnn_han
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
         s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1024, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(128,128), (192,128)]),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(128,128), (192,128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),  # Modified from non-unified test
@@ -628,9 +630,21 @@ def test_sdpa_fp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
     test.showConfig(test_no, request)
 
+    # Randomly enable unfuse_fma via environment variable for SM100
+    unfuse_fma = rng.choice([True, False])
+    if unfuse_fma:
+        os.environ["CUDNN_UNFUSE_FMA"] = "1"
+    elif "CUDNN_UNFUSE_FMA" in os.environ:
+        del os.environ["CUDNN_UNFUSE_FMA"]
+
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
-    exec_sdpa_fp8(test.cfg, request, cudnn_handle)
+    try:
+        exec_sdpa_fp8(test.cfg, request, cudnn_handle)
+    finally:
+        # Clean up environment variable
+        if "CUDNN_UNFUSE_FMA" in os.environ:
+            del os.environ["CUDNN_UNFUSE_FMA"]
 
 
 # # ==================================
@@ -834,9 +848,21 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
     test.cfg.is_mxfp8 = True
     test.showConfig(test_no, request)
 
+    # Randomly enable unfuse_fma via environment variable for SM100
+    unfuse_fma = rng.choice([True, False])
+    if unfuse_fma:
+        os.environ["CUDNN_UNFUSE_FMA"] = "1"
+    elif "CUDNN_UNFUSE_FMA" in os.environ:
+        del os.environ["CUDNN_UNFUSE_FMA"]
+
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
-    exec_sdpa_mxfp8(test.cfg, request, cudnn_handle)
+    try:
+        exec_sdpa_mxfp8(test.cfg, request, cudnn_handle)
+    finally:
+        # Clean up environment variable
+        if "CUDNN_UNFUSE_FMA" in os.environ:
+            del os.environ["CUDNN_UNFUSE_FMA"]
 
 # # ==================================
 # # L0 MXFP8 bprop tests

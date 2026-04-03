@@ -95,7 +95,7 @@ GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4 = (
     GROUPED_GEMM_SWIGLU_FP4_TYPE_MARKS
     + GROUPED_GEMM_SWIGLU_COMMON_MARKS
     + [
-        pytest.mark.parametrize("mma_tiler_mn", [(256, 256), (128, 128)]),
+        pytest.mark.parametrize("mma_tiler_mn", [(256, 256), (128, 256)]),
         pytest.mark.parametrize(
             "sf_vec_size,sf_dtype",
             [
@@ -276,7 +276,7 @@ def create_mask(
 
     :param group_m_list: List of M values for each group (will be aligned to m_aligned)
     :param m_aligned: Alignment requirement for group M dimension. MUST equal
-                      BlockScaledContiguousGroupedGemmKernel.FIX_PAD_SIZE (256)
+                      the grouped GEMM kernel FIX_PAD_SIZE (256)
     :param permuted_m: Optional padded M dimension for CUDA graph support. If provided,
                      padded_offsets will be padded to include this size.
                      The kernel determines valid tiles from padded_offsets[-1].
@@ -556,10 +556,23 @@ def run_grouped_gemm_swiglu_ref(
 
         norm_const = norm_const_tensor[0].item()
 
+        n_out_aligned = ceil_div(n_out, 128) * 128
+        if n_out_aligned != n_out:
+            zeros = torch.zeros(
+                ref_after_swiglu.shape[0],
+                n_out_aligned - n_out,
+                ref_after_swiglu.shape[2],
+                dtype=ref_after_swiglu.dtype,
+                device=ref_after_swiglu.device,
+            )
+            ref_after_swiglu_sf = torch.cat([ref_after_swiglu, zeros], dim=1)
+        else:
+            ref_after_swiglu_sf = ref_after_swiglu
+
         # 1. Compute reference SFDRow (m, sfn, l) in fp32
-        sfn = ceil_div(n_out, sf_vec_size)
+        sfn = ceil_div(n_out_aligned, sf_vec_size)
         # Resahpe ref to (l, m, sfn, sf_vec_size)
-        ref_for_sf = ref_after_swiglu.permute(2, 0, 1).contiguous()  # (l, m, n)
+        ref_for_sf = ref_after_swiglu_sf.permute(2, 0, 1).contiguous()  # (l, m, n)
         # l is involved in valid_m
         ref_for_sf = ref_for_sf.view(1, valid_m, sfn, sf_vec_size)
         # Take abs max over sf_vec_size dimension
@@ -570,7 +583,8 @@ def run_grouped_gemm_swiglu_ref(
         ref_sfd_row_f32 = ref_sfd_row_f32.permute(1, 2, 0)
 
         # Convert fp32 -> f8 -> fp32 for ref_sfd_row_f32
-        ref_sfd_row_f8_torch = torch.empty(*(1, valid_m, sfn), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
+        valid_m_aligned = ceil_div(valid_m, 128) * 128
+        ref_sfd_row_f8_torch = torch.empty(*(1, valid_m_aligned, sfn), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
         ref_sfd_row_f8 = from_dlpack(ref_sfd_row_f8_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         ref_sfd_row_f8.element_type = _convert_to_cutlass_data_type(sf_dtype)
         ref_sfd_row_f32_device = ref_sfd_row_f32.cuda()
@@ -580,7 +594,7 @@ def run_grouped_gemm_swiglu_ref(
         ref_sfd_row_f32 = ref_sfd_row_f32_device.cpu()
 
         # 2. Convert ref_sfd_row_f32 to scale factor layout and compare with kernel sfd tensor
-        ref_sfd_row_f32_cute_torch_tensor_cpu, _ = create_sf_layout_tensor(1, valid_m, n_out, sf_vec_size)
+        ref_sfd_row_f32_cute_torch_tensor_cpu, _ = create_sf_layout_tensor(1, valid_m_aligned, n_out, sf_vec_size)
 
         # convert ref_after_swiglu f32 tensor to cute f32 tensor
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
@@ -596,7 +610,7 @@ def run_grouped_gemm_swiglu_ref(
         ref_sfd_row_rcp = torch.clamp(ref_sfd_row_rcp, max=3.40282346638528859812e38)
         # Expand the sfn dimension by repeating each value sf_vec_size times
         # ref_sfd_row_rcp: (m, sfn, l) -> (m, sfn, sf_vec_size, l) -> (m, n, l)
-        ref_sfd_row_rcp_expanded = ref_sfd_row_rcp.unsqueeze(2).expand(valid_m, sfn, sf_vec_size, 1)
+        ref_sfd_row_rcp_expanded = ref_sfd_row_rcp[:valid_m, :, :].unsqueeze(2).expand(valid_m, sfn, sf_vec_size, 1)
         ref_sfd_row_rcp_expanded = ref_sfd_row_rcp_expanded.reshape(valid_m, sfn * sf_vec_size, 1)
         # Trim to exact n dimension if needed
         ref_sfd_row_rcp_expanded = ref_sfd_row_rcp_expanded[:, :n_out, :]
@@ -608,13 +622,15 @@ def run_grouped_gemm_swiglu_ref(
         # Col Quantized SFD tensor
         # 1. Compute reference SFDCol (m, sfn, l) in fp32
         ref_after_swiglu = ref_after_swiglu.permute(2, 1, 0).contiguous().permute(1, 2, 0)
+        ref_after_swiglu_sf = ref_after_swiglu_sf.permute(2, 1, 0).contiguous().permute(1, 2, 0)
         n_after_swiglu = ref_after_swiglu.shape[1]
         sfn = ceil_div(n_after_swiglu, sf_vec_size)
         valid_m = ref_after_swiglu.shape[0]
+        valid_m_aligned = ceil_div(valid_m, 128) * 128
         # Reshape ref to (l, m, sfn, sf_vec_size)
-        ref_for_sf = ref_after_swiglu.permute(2, 0, 1).contiguous()  # (l, m, n)
+        ref_for_sf = ref_after_swiglu_sf.permute(2, 0, 1).contiguous()  # (l, m, n)
         # l is involved in valid_m
-        ref_for_sf = ref_for_sf.view(1, valid_m, sfn, sf_vec_size)
+        ref_for_sf = ref_for_sf.view(1, valid_m_aligned, sfn, sf_vec_size)
         # Take abs max over sf_vec_size dimension
         ref_for_sf, _ = torch.abs(ref_for_sf).max(dim=3)  # (l, m, sfn)
         # Multiply by norm_const and rcp_limits
@@ -623,7 +639,7 @@ def run_grouped_gemm_swiglu_ref(
         ref_sfd_row_f32 = ref_sfd_row_f32.permute(1, 2, 0)
 
         # Convert fp32 -> f8 -> fp32 for ref_sfd_row_f32
-        ref_sfd_row_f8_torch = torch.empty(*(1, valid_m, sfn), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
+        ref_sfd_row_f8_torch = torch.empty(*(1, valid_m_aligned, sfn), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
         ref_sfd_row_f8 = from_dlpack(ref_sfd_row_f8_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         ref_sfd_row_f8.element_type = _convert_to_cutlass_data_type(sf_dtype)
         ref_sfd_row_f32_device = ref_sfd_row_f32.cuda()
@@ -633,7 +649,7 @@ def run_grouped_gemm_swiglu_ref(
         ref_sfd_row_f32 = ref_sfd_row_f32_device.cpu()
 
         # 2. Convert ref_sfd_row_f32 to scale factor layout and compare with kernel sfd tensor
-        ref_sfd_row_f32_cute_torch_tensor_cpu, _ = create_sf_layout_tensor(1, valid_m, n_after_swiglu, sf_vec_size)
+        ref_sfd_row_f32_cute_torch_tensor_cpu, _ = create_sf_layout_tensor(1, valid_m_aligned, n_after_swiglu, sf_vec_size)
 
         # convert ref_after_swiglu f32 tensor to cute f32 tensor
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
@@ -649,7 +665,7 @@ def run_grouped_gemm_swiglu_ref(
         ref_sfd_row_rcp = torch.clamp(ref_sfd_row_rcp, max=3.40282346638528859812e38)
         # Expand the sfn dimension by repeating each value sf_vec_size times
         # ref_sfd_row_rcp: (m, sfn, l) -> (m, sfn, sf_vec_size, l) -> (m, n, l)
-        ref_sfd_row_rcp_expanded = ref_sfd_row_rcp.unsqueeze(2).expand(valid_m, sfn, sf_vec_size, 1)
+        ref_sfd_row_rcp_expanded = ref_sfd_row_rcp[:valid_m, :, :].unsqueeze(2).expand(valid_m, sfn, sf_vec_size, 1)
         ref_sfd_row_rcp_expanded = ref_sfd_row_rcp_expanded.reshape(valid_m, sfn * sf_vec_size, 1)
         # Trim to exact n dimension if needed
         ref_sfd_row_rcp_expanded = ref_sfd_row_rcp_expanded[:, :n_after_swiglu, :]

@@ -60,7 +60,13 @@ CUDNN_DEBUG_REPRO=1 cudnn-repro log
 2. **Stage 1**: Annotate with test config (shape, stride, dtype, etc.)
 3. **Stage 2**: Build pytest command
 
-The tool auto-detects forward vs backward operations (SDPA_FWD, SDPA_BWD, SDPA_FP8_BWD) and routes to the appropriate handler.
+The tool auto-detects SDPA operation tags and routes to the appropriate handler:
+- `SDPA_FWD`
+- `SDPA_BWD`
+- `SDPA_FP8_FWD`
+- `SDPA_FP8_BWD`
+
+Non-MXFP8 FP8 forward and backward repro are supported. MXFP8 repro is not yet implemented.
 
 **Debug mode** (`CUDNN_DEBUG_REPRO=1`) writes:
 - `cudnn_repro_stage0.txt` - Raw log

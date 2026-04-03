@@ -1,14 +1,7 @@
-import cudnn
-import pytest
-import torch
-import math
-from enum import IntEnum
+# Try to import TransformerEngine (>= 2.12) for MXFP8 quantization
+# NOTE: TE must be imported BEFORE cudnn to avoid library loading conflicts
 from looseversion import LooseVersion
 
-from .helpers import exact_equal, fill_sparse_small_int, time_execution, profile_execution
-from .mxfp8_ref import compute_ref, compute_ref_backward
-
-# Try to import TransformerEngine (>= 2.12) for MXFP8 quantization
 try:
     import transformer_engine
 
@@ -22,6 +15,15 @@ except Exception:
     HAS_TE = False
     tex = None
     MXFP8Quantizer = None
+
+import cudnn
+import pytest
+import torch
+import math
+from enum import IntEnum
+
+from .helpers import exact_equal, fill_sparse_small_int, time_execution, profile_execution
+from .mxfp8_ref import compute_ref, compute_ref_backward
 
 # fmt: off
 

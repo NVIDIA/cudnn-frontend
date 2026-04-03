@@ -5,7 +5,7 @@ Contains test configuration fixtures, tensor creation, and reference implementat
 
 import torch
 import pytest
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, Optional
 from test_fe_api_utils import (
     compute_reference_amax,
     create_and_permute_tensor,
@@ -228,6 +228,7 @@ def allocate_discrete_input_tensors(
     m_aligned: int,
     norm_const: float = 0.01,
     b_major: str = "k",
+    enable_bias: bool = False,
     device: str = "cuda",
 ) -> Dict[str, Any]:
     """Allocate input tensors for discrete grouped GEMM GLU.
@@ -282,6 +283,7 @@ def allocate_discrete_input_tensors(
         "sfb_ptrs_tensor": sfb_ptrs_tensor,
         "alpha_tensor": alpha_tensor,
         "prob_tensor": prob_tensor,
+        "bias_tensor": None,
         "padded_offsets_tensor": padded_offsets_tensor,
         "aligned_group_m_list": aligned_group_m_list,
         "valid_m": valid_m,
@@ -294,6 +296,9 @@ def allocate_discrete_input_tensors(
         torch.float8_e4m3fn,
     ]:
         result["norm_const_tensor"] = torch.tensor([norm_const], dtype=torch.float32, device=device)
+
+    if enable_bias:
+        result["bias_tensor"] = torch.empty((num_experts, n), dtype=torch.bfloat16, device=device).uniform_(-2.0, 2.0).transpose(0, 1)
 
     return result
 
@@ -355,6 +360,7 @@ def run_discrete_grouped_gemm_ref(
     prob_tensor: torch.Tensor,
     aligned_group_m_list: List[int],
     valid_m: int,
+    bias_tensor: Optional[torch.Tensor] = None,
     generate_amax: bool = False,
     c_dtype: torch.dtype = torch.bfloat16,
     d_dtype: torch.dtype = torch.float32,
@@ -400,6 +406,13 @@ def run_discrete_grouped_gemm_ref(
         end = start + group_m
         ref[start:end, :, 0] = ref[start:end, :, 0] * alpha_tensor[i].item()
         start = end
+
+    if bias_tensor is not None:
+        start = 0
+        for i, group_m in enumerate(aligned_group_m_list):
+            end = start + group_m
+            ref[start:end, :, 0] = ref[start:end, :, 0] + bias_tensor[:, i].unsqueeze(0).to(torch.float32)
+            start = end
 
     ref_tensors["c_ref"] = ref.clone()
 
@@ -476,6 +489,7 @@ def check_ref_discrete_grouped_gemm(
         prob_tensor=inputs["prob_tensor"],
         aligned_group_m_list=inputs["aligned_group_m_list"],
         valid_m=inputs["valid_m"],
+        bias_tensor=inputs.get("bias_tensor"),
         generate_amax=(outputs.get("amax_tensor") is not None),
         c_dtype=cfg["c_dtype"],
         d_dtype=cfg["d_dtype"],

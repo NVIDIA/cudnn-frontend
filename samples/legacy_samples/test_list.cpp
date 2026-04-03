@@ -3280,7 +3280,7 @@ TEST_CASE("BF16 LLM Flash MHA Bprop sample", "[frontend][fusion][BF16LLMBprop]")
 }
 #endif
 
-#if (CUDNN_VERSION >= 8900)
+#if (CUDNN_VERSION >= 8900) && (CUDNN_VERSION < 92100)
 TEST_CASE("FP8 Flash MHA Fprop sample", "[frontend][fusion][fp8flashmhaFprop]") {
     std::cout << "TEST_CASE :: FP8 Flash MHA Fprop with backend API" << std::endl;
     INFO("TEST_CASE :: FP8 Flash MHA Fprop with backend API");

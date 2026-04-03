@@ -2942,8 +2942,10 @@ class BlockScaledContiguousGroupedGemmKernel:
                             else:
                                 self.cvt_f32x4_to_f8x4(tCrSFDRow_pvscale, tCrSFDRow)
                                 self.cvt_f32x4_to_f8x4(tCrSFDCol_pvscale, tCrSFDCol)
-                            cute.autovec_copy(tCrSFDRow, tCgSFDRow)
-                            cute.autovec_copy(tCrSFDCol, tCgSFDCol)
+                            if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
+                                cute.autovec_copy(tCrSFDRow, tCgSFDRow)
+                            if sfd_col_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDCol_mnl.layout, mode=[1])):
+                                cute.autovec_copy(tCrSFDCol, tCgSFDCol)
                     else:
                         #
                         # Convert to D type

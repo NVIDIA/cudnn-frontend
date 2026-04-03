@@ -43,8 +43,7 @@ Discrete mode
     at execution time.
 """
 
-from .moe_blockscaled_grouped_gemm_dglu import BlockScaledMoEGroupedGemmDgluKernel
-from .continugous_blockscaled_grouped_gemm_dglu_quant_dbias_fusion import BlockScaledMoEGroupedGemmDgluDbiasKernel
+from .moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
@@ -67,7 +66,7 @@ class GroupedGemmDgluSm100(APIBase):
     This kernel performs block-scaled grouped GEMM with dGLU activation
     gradient (dSwiGLU or dGeGLU), designed for MoE workloads.  It supports
     both dense (contiguous) and discrete (per-expert pointer) weight layouts
-    through the ``BlockScaledMoEGroupedGemmDgluKernel``.
+    through the ``BlockScaledMoEGroupedGemmDgluDbiasKernel``.
 
     Weight mode is auto-detected from the constructor arguments:
 
@@ -153,7 +152,7 @@ class GroupedGemmDgluSm100(APIBase):
         :param sample_dprob: Gradient of probability tensor (valid_m, 1, 1), must be zero-initialized
         :param sample_b: (Dense) Sample B tensor (n, k, l)
         :param sample_sfb: (Dense) Sample scale factor B tensor
-        :param sample_dbias: (Dense, optional) dbias output tensor (expert_cnt, 2*n, 1)
+        :param sample_dbias: Optional dbias output tensor (expert_cnt, 2*n, 1)
         :param num_experts: (Discrete) Number of experts
         :param b_shape: (Discrete) Shape of a single expert B tensor, e.g. (n, k)
         :param b_dtype: (Discrete) Data type of B tensors
@@ -218,7 +217,6 @@ class GroupedGemmDgluSm100(APIBase):
             self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
             self.expert_cnt = self.padded_offsets_desc.shape[0]
         else:
-            self._value_error_if(sample_dbias is not None, "dbias_tensor is only supported in dense mode")
             self._value_error_if(num_experts == 0, "num_experts must be > 0")
             self.expert_cnt = num_experts
             self.b_shape = b_shape
@@ -258,8 +256,8 @@ class GroupedGemmDgluSm100(APIBase):
         self.use_dynamic_sched = use_dynamic_sched
 
         self._interpret_uint8_as_fp4x2 = True
-        self._uses_dbias_kernel = self.weight_mode == MoEWeightMode.DENSE and self.dbias_desc is not None
-        self._kernel = BlockScaledMoEGroupedGemmDgluDbiasKernel if self._uses_dbias_kernel else BlockScaledMoEGroupedGemmDgluKernel
+        self._has_dbias = self.dbias_desc is not None
+        self._kernel = BlockScaledMoEGroupedGemmDgluDbiasKernel
 
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         print(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
@@ -532,16 +530,16 @@ class GroupedGemmDgluSm100(APIBase):
         # ---- MMA tile / cluster shape ----
         self._logger.debug("Checking MMA tile shape and cluster shape")
         self._value_error_if(
-            not self.use_2cta_instrs and self.mma_tiler_mn[0] not in [64, 128],
-            f"MMA tiler M must be 64 or 128 when use_2cta_instrs=False, got {self.mma_tiler_mn[0]}",
+            not self.use_2cta_instrs and self.mma_tiler_mn[0] != 128,
+            f"MMA tiler M must be 128 when use_2cta_instrs=False, got {self.mma_tiler_mn[0]}",
         )
         self._value_error_if(
-            self.use_2cta_instrs and self.mma_tiler_mn[0] not in [128, 256],
-            f"MMA tiler M must be 128 or 256 when use_2cta_instrs=True, got {self.mma_tiler_mn[0]}",
+            self.use_2cta_instrs and self.mma_tiler_mn[0] != 256,
+            f"MMA tiler M must be 256 when use_2cta_instrs=True, got {self.mma_tiler_mn[0]}",
         )
         self._value_error_if(
-            self.mma_tiler_mn[1] not in [128, 256],
-            f"MMA tiler N must be 128 or 256, got {self.mma_tiler_mn[1]}",
+            self.mma_tiler_mn[1] != 256,
+            f"MMA tiler N must be 256, got {self.mma_tiler_mn[1]}",
         )
         self._value_error_if(
             self.cluster_shape_mn[0] % (2 if self.use_2cta_instrs else 1) != 0,
@@ -569,8 +567,8 @@ class GroupedGemmDgluSm100(APIBase):
             f"m_aligned must be divisible by mma_tiler_mn[0], got {self.m_aligned} % {self.mma_tiler_mn[0]} != 0",
         )
         self._value_error_if(
-            self.m_aligned != BlockScaledMoEGroupedGemmDgluKernel.FIX_PAD_SIZE,
-            f"m_aligned must be {BlockScaledMoEGroupedGemmDgluKernel.FIX_PAD_SIZE} (FIX_PAD_SIZE), got {self.m_aligned}",
+            self.m_aligned != BlockScaledMoEGroupedGemmDgluDbiasKernel.FIX_PAD_SIZE,
+            f"m_aligned must be {BlockScaledMoEGroupedGemmDgluDbiasKernel.FIX_PAD_SIZE} (FIX_PAD_SIZE), got {self.m_aligned}",
         )
 
         # ---- Tensor alignment ----
@@ -640,33 +638,19 @@ class GroupedGemmDgluSm100(APIBase):
             return
 
         # ---- Instantiate the unified kernel ----
-        if self._uses_dbias_kernel:
-            gemm_dglu = self._kernel(
-                sf_vec_size=self.sf_vec_size,
-                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-                use_2cta_instrs=self.use_2cta_instrs,
-                mma_tiler_mn=self.mma_tiler_mn,
-                cluster_shape_mn=self.cluster_shape_mn,
-                vectorized_f32=self.vector_f32,
-                discrete_col_sfd=self.discrete_col_sfd,
-                expert_cnt=self.expert_cnt,
-                act_func=self.act_func,
-                use_dynamic_sched=self.use_dynamic_sched,
-            )
-        else:
-            gemm_dglu = self._kernel(
-                sf_vec_size=self.sf_vec_size,
-                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-                use_2cta_instrs=self.use_2cta_instrs,
-                mma_tiler_mn=self.mma_tiler_mn,
-                cluster_shape_mn=self.cluster_shape_mn,
-                vectorized_f32=self.vector_f32,
-                discrete_col_sfd=self.discrete_col_sfd,
-                expert_cnt=self.expert_cnt,
-                weight_mode=self.weight_mode,
-                act_func=self.act_func,
-                use_dynamic_sched=self.use_dynamic_sched,
-            )
+        gemm_dglu = self._kernel(
+            sf_vec_size=self.sf_vec_size,
+            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+            use_2cta_instrs=self.use_2cta_instrs,
+            mma_tiler_mn=self.mma_tiler_mn,
+            cluster_shape_mn=self.cluster_shape_mn,
+            vectorized_f32=self.vector_f32,
+            discrete_col_sfd=self.discrete_col_sfd,
+            expert_cnt=self.expert_cnt,
+            weight_mode=self.weight_mode,
+            act_func=self.act_func,
+            use_dynamic_sched=self.use_dynamic_sched,
+        )
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
@@ -682,10 +666,7 @@ class GroupedGemmDgluSm100(APIBase):
         self._workspace = torch.empty(max(workspace_bytes, 1), dtype=torch.uint8, device="cuda")
 
         if self.weight_mode == MoEWeightMode.DENSE:
-            if self._uses_dbias_kernel:
-                self._compile_dense_dbias_fused(gemm_dglu, max_active_clusters, fake_stream)
-            else:
-                self._compile_dense(gemm_dglu, max_active_clusters, fake_stream)
+            self._compile_dense(gemm_dglu, max_active_clusters, fake_stream)
         else:
             self._compile_discrete(gemm_dglu, max_active_clusters, fake_stream)
 
@@ -817,10 +798,16 @@ class GroupedGemmDgluSm100(APIBase):
             rest_k = cute.sym_int()
             stride_rest_k = cute.sym_int(divisibility=32 * 4 * 4)
             stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
+            sfa_shape = list(self.sfa_desc.shape)
+            sfa_shape[2] = tensor_m_128
+            sfa_shape[4] = rest_k
+            sfa_stride = list(self.sfa_desc.stride)
+            sfa_stride[2] = stride_rest_k
+            sfa_stride[5] = stride_tensor_m_128
             sfa_cute_fake = self._make_fake_cute_tensor(
                 dtype=self.sfa_desc.dtype,
-                shape=(32, 4, tensor_m_128, 4, rest_k, 1),
-                stride=(16, 4, stride_rest_k, 1, 512, stride_tensor_m_128),
+                shape=tuple(sfa_shape),
+                stride=tuple(sfa_stride),
             )
 
             tensor_n_128 = cute.sym_int()
@@ -833,15 +820,15 @@ class GroupedGemmDgluSm100(APIBase):
             )
 
             beta_cute_fake = self._make_fake_cute_tensor_from_desc(self.beta_desc, assumed_align=16)
-            prob_cute_fake = self._make_fake_cute_compact_tensor(
+            prob_cute_fake = self._make_fake_cute_tensor(
                 dtype=self.prob_desc.dtype,
-                shape=(valid_m, 1, 1),
-                stride_order=self.prob_desc.stride_order,
+                shape=(valid_m, *self.prob_desc.shape[1:]),
+                stride=self.prob_desc.stride,
             )
-            dprob_cute_fake = self._make_fake_cute_compact_tensor(
+            dprob_cute_fake = self._make_fake_cute_tensor(
                 dtype=self.dprob_desc.dtype,
-                shape=(valid_m, 1, 1),
-                stride_order=self.dprob_desc.stride_order,
+                shape=(valid_m, *self.dprob_desc.shape[1:]),
+                stride=self.dprob_desc.stride,
             )
 
             sfd_row_fake = None
@@ -867,6 +854,8 @@ class GroupedGemmDgluSm100(APIBase):
                 )
 
         # Compile with keyword args (dense mode uses the unified __call__ positional order)
+        dbias_fake = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
+
         _compiled_kernel = cute.compile(
             gemm_dglu,
             a=a_cute_fake,
@@ -890,6 +879,7 @@ class GroupedGemmDgluSm100(APIBase):
             beta=beta_cute_fake,
             prob=prob_cute_fake,
             dprob=dprob_cute_fake,
+            dbias_tensor=dbias_fake,
             linear_offset=cutlass.Float32(0.0),
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
@@ -917,6 +907,7 @@ class GroupedGemmDgluSm100(APIBase):
             beta_tensor: torch.Tensor,
             prob_tensor: torch.Tensor,
             dprob_tensor: torch.Tensor,
+            dbias_tensor: Optional[torch.Tensor],
             stream: cuda.CUstream,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
@@ -942,251 +933,7 @@ class GroupedGemmDgluSm100(APIBase):
                 prob_tensor,
                 dprob_tensor,
                 cutlass.Float32(0.0),
-                stream,
-            )
-
-        self._compiled_kernel = tensor_api
-
-    def _compile_dense_dbias_fused(self, gemm_dglu, max_active_clusters, fake_stream) -> None:
-        """Compile the dense fused-dbias dGLU kernel."""
-        use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL") is not None
-
-        fake_workspace_ptr = cute.runtime.nullptr(
-            dtype=cutlass.Uint8,
-            assumed_align=128,
-        )
-
-        if not use_full_dynamic:
-            valid_m = cute.sym_int(divisibility=256)
-
-            a_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.a_desc.dtype,
-                shape=(valid_m, *self.a_desc.shape[1:]),
-                stride_order=self.a_desc.stride_order,
-            )
-            b_cute_fake = self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16)
-            c_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.c_desc.dtype,
-                shape=(valid_m, *self.c_desc.shape[1:]),
-                stride_order=self.c_desc.stride_order,
-            )
-            d_row_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.d_row_desc.dtype,
-                shape=(valid_m, *self.d_row_desc.shape[1:]),
-                stride_order=self.d_row_desc.stride_order,
-            )
-            d_col_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.d_col_desc.dtype,
-                shape=(valid_m, *self.d_col_desc.shape[1:]),
-                stride_order=self.d_col_desc.stride_order,
-            )
-
-            tensor_m_128 = cute.sym_int()
-            stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-            sfa_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.sfa_desc.dtype,
-                shape=(32, 4, tensor_m_128, 4, self.sfa_desc.shape[4], 1),
-                stride=(16, 4, self.sfa_desc.stride[2], 1, 512, stride_tensor_m_128),
-            )
-
-            sfb_cute_fake = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
-            beta_cute_fake = self._make_fake_cute_tensor_from_desc(self.beta_desc, assumed_align=16)
-            prob_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.prob_desc.dtype,
-                shape=(valid_m, 1, 1),
-                stride_order=self.prob_desc.stride_order,
-            )
-            dprob_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.dprob_desc.dtype,
-                shape=(valid_m, 1, 1),
-                stride_order=self.dprob_desc.stride_order,
-            )
-
-            sfd_row_fake = None
-            sfd_col_fake = None
-            if self.sfd_row_desc is not None:
-                stride_sfd_m = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_row_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_row_desc.dtype,
-                    shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
-                    stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
-                )
-            if self.sfd_col_desc is not None:
-                rest_m = cute.sym_int(divisibility=1)
-                stride_sfd_n = cute.sym_int(divisibility=32 * 4 * 4)
-                stride_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_col_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_col_desc.dtype,
-                    shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
-                    stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
-                )
-        else:
-            valid_m = cute.sym_int(divisibility=256)
-            n_sym = cute.sym_int()
-            n_out_sym = cute.sym_int()
-            k_sym = cute.sym_int()
-            l_sym = cute.sym_int()
-
-            a_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.a_desc.dtype,
-                shape=(valid_m, k_sym, 1),
-                stride_order=self.a_desc.stride_order,
-                dynamic_mode=self.a_desc.stride_order[0],
-                divisibility=32 if self._is_fp4x2(self.ab_dtype) else 16,
-            )
-            b_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.b_desc.dtype,
-                shape=(n_sym, k_sym, l_sym),
-                stride_order=self.b_desc.stride_order,
-                dynamic_mode=self.b_desc.stride_order[0],
-                divisibility=32 if self._is_fp4x2(self.ab_dtype) else 16,
-            )
-            c_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.c_desc.dtype,
-                shape=(valid_m, n_out_sym, 1),
-                stride_order=self.c_desc.stride_order,
-                dynamic_mode=self.c_desc.stride_order[0],
-                divisibility=8 if self._is_f16(self.c_desc.dtype) else 16,
-            )
-            d_row_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.d_row_desc.dtype,
-                shape=(valid_m, n_out_sym, 1),
-                stride_order=self.d_row_desc.stride_order,
-                dynamic_mode=self.d_row_desc.stride_order[0],
-                divisibility=8 if self._is_f16(self.d_row_desc.dtype) else 16,
-            )
-            d_col_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.d_col_desc.dtype,
-                shape=(valid_m, n_out_sym, 1),
-                stride_order=self.d_col_desc.stride_order,
-                dynamic_mode=self.d_col_desc.stride_order[0],
-                divisibility=8 if self._is_f16(self.d_col_desc.dtype) else 16,
-            )
-
-            tensor_m_128 = cute.sym_int()
-            rest_k = cute.sym_int()
-            stride_rest_k = cute.sym_int(divisibility=32 * 4 * 4)
-            stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-            sfa_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.sfa_desc.dtype,
-                shape=(32, 4, tensor_m_128, 4, rest_k, 1),
-                stride=(16, 4, stride_rest_k, 1, 512, stride_tensor_m_128),
-            )
-
-            tensor_n_128 = cute.sym_int()
-            stride_sfb_rest_k = cute.sym_int(divisibility=32 * 4 * 4)
-            stride_sfb_tensor_n_128 = cute.sym_int(divisibility=32 * 4 * 4)
-            sfb_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.sfb_desc.dtype,
-                shape=(32, 4, tensor_n_128, 4, rest_k, l_sym),
-                stride=(16, 4, stride_sfb_tensor_n_128, 1, 512, stride_sfb_rest_k),
-            )
-
-            beta_cute_fake = self._make_fake_cute_tensor_from_desc(self.beta_desc, assumed_align=16)
-            prob_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.prob_desc.dtype,
-                shape=(valid_m, 1, 1),
-                stride_order=self.prob_desc.stride_order,
-            )
-            dprob_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.dprob_desc.dtype,
-                shape=(valid_m, 1, 1),
-                stride_order=self.dprob_desc.stride_order,
-            )
-
-            sfd_row_fake = None
-            sfd_col_fake = None
-            if self.sfd_row_desc is not None:
-                rest_n_out = cute.sym_int()
-                stride_sfd_rest_n_out = cute.sym_int(divisibility=32 * 4 * 4)
-                stride_sfd_rest_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_row_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_row_desc.dtype,
-                    shape=(32, 4, tensor_m_128, 4, rest_n_out, 1),
-                    stride=(16, 4, stride_sfd_rest_n_out, 1, 512, stride_sfd_rest_tensor_m_128),
-                )
-            if self.sfd_col_desc is not None:
-                tensor_n_out_128 = cute.sym_int()
-                rest_m_dyn = cute.sym_int()
-                stride_sfd_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
-                stride_sfd_n_out = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_col_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_col_desc.dtype,
-                    shape=(32, 4, tensor_n_out_128, 4, rest_m_dyn, 1),
-                    stride=(16, 4, stride_sfd_rest_m, 1, 512, stride_sfd_n_out),
-                )
-
-        _compiled_kernel = cute.compile(
-            gemm_dglu,
-            a=a_cute_fake,
-            b=b_cute_fake,
-            c=c_cute_fake,
-            d=d_row_cute_fake,
-            d_col=d_col_cute_fake,
-            sfa=sfa_cute_fake,
-            sfb=sfb_cute_fake,
-            sfd_row_tensor=sfd_row_fake,
-            sfd_col_tensor=sfd_col_fake,
-            amax_tensor=self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16),
-            norm_const_tensor=self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16),
-            padded_offsets=self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16),
-            alpha=self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16),
-            beta=beta_cute_fake,
-            prob=prob_cute_fake,
-            dprob=dprob_cute_fake,
-            workspace_ptr=fake_workspace_ptr,
-            dbias_tensor=self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16),
-            linear_offset=cutlass.Float32(0.0),
-            max_active_clusters=max_active_clusters,
-            stream=fake_stream,
-            epilogue_op=self.epilogue_op,
-            options="--enable-tvm-ffi",
-        )
-
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
-        cached_linear_offset = cutlass.Float32(0.0)
-
-        def tensor_api(
-            a_tensor: torch.Tensor,
-            b_tensor: torch.Tensor,
-            c_tensor: torch.Tensor,
-            d_row_tensor: torch.Tensor,
-            d_col_tensor: Optional[torch.Tensor],
-            sfa_tensor: torch.Tensor,
-            sfb_tensor: torch.Tensor,
-            sfd_row_tensor: Optional[torch.Tensor],
-            sfd_col_tensor: Optional[torch.Tensor],
-            amax_tensor: Optional[torch.Tensor],
-            norm_const_tensor: Optional[torch.Tensor],
-            padded_offsets: torch.Tensor,
-            alpha_tensor: torch.Tensor,
-            beta_tensor: torch.Tensor,
-            prob_tensor: torch.Tensor,
-            dprob_tensor: torch.Tensor,
-            dbias_tensor: torch.Tensor,
-            stream: cuda.CUstream,
-        ) -> None:
-            norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-            _compiled_kernel(
-                a_tensor,
-                b_tensor,
-                c_tensor,
-                d_row_tensor,
-                d_col_tensor,
-                sfa_tensor,
-                sfb_tensor,
-                sfd_row_tensor,
-                sfd_col_tensor,
-                amax_tensor,
-                norm_const_tensor,
-                padded_offsets,
-                alpha_tensor,
-                beta_tensor,
-                prob_tensor,
-                dprob_tensor,
-                cached_workspace_ptr,
                 dbias_tensor,
-                cached_linear_offset,
                 stream,
             )
 
@@ -1210,38 +957,79 @@ class GroupedGemmDgluSm100(APIBase):
         ab_cutlass_dtype = _convert_to_cutlass_data_type(self.a_desc.dtype, interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2)
         align = 32 if ab_cutlass_dtype.width == 4 else 16
 
-        a_tensor = self._make_fake_cute_tensor_from_desc(self.a_desc, assumed_align=align)
-        if a_tensor is not None:
-            a_tensor.mark_layout_dynamic(leading_dim=1)
-        c_tensor = self._make_fake_cute_tensor_from_desc(self.c_desc, assumed_align=16)
-        if c_tensor is not None:
-            c_tensor.mark_layout_dynamic(leading_dim=1)
-        d_row_tensor = self._make_fake_cute_tensor_from_desc(self.d_row_desc, assumed_align=16)
-        if d_row_tensor is not None:
-            d_row_tensor.mark_layout_dynamic(leading_dim=1)
-        d_col_tensor = self._make_fake_cute_tensor_from_desc(self.d_col_desc, assumed_align=16)
-        if d_col_tensor is not None:
-            d_col_tensor.mark_layout_dynamic(leading_dim=1)
-        sfa_tensor = self._make_fake_cute_tensor_from_desc(self.sfa_desc, assumed_align=16)
-        if sfa_tensor is not None:
-            sfa_tensor.mark_layout_dynamic(leading_dim=3)
-        sfd_row_tensor = self._make_fake_cute_tensor_from_desc(self.sfd_row_desc, assumed_align=16)
-        if sfd_row_tensor is not None:
-            sfd_row_tensor.mark_layout_dynamic(leading_dim=3)
-        sfd_col_tensor = self._make_fake_cute_tensor_from_desc(self.sfd_col_desc, assumed_align=16)
-        if sfd_col_tensor is not None:
-            sfd_col_tensor.mark_layout_dynamic(leading_dim=3)
+        valid_m = cute.sym_int(divisibility=256)
+        a_tensor = self._make_fake_cute_tensor(
+            dtype=self.a_desc.dtype,
+            shape=(valid_m, *self.a_desc.shape[1:]),
+            stride=(self.a_desc.stride[0], *self.a_desc.stride[1:]),
+            assumed_align=align,
+        )
+        c_tensor = self._make_fake_cute_tensor(
+            dtype=self.c_desc.dtype,
+            shape=(valid_m, *self.c_desc.shape[1:]),
+            stride=(self.c_desc.stride[0], *self.c_desc.stride[1:]),
+        )
+        d_row_tensor = self._make_fake_cute_compact_tensor(
+            dtype=self.d_row_desc.dtype,
+            shape=(valid_m, *self.d_row_desc.shape[1:]),
+            stride_order=self.d_row_desc.stride_order,
+        )
+        d_col_tensor = self._make_fake_cute_compact_tensor(
+            dtype=self.d_col_desc.dtype,
+            shape=(valid_m, *self.d_col_desc.shape[1:]),
+            stride_order=self.d_col_desc.stride_order,
+        )
+
+        tensor_m_128 = cute.sym_int()
+        stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
+        sfa_shape = list(self.sfa_desc.shape)
+        sfa_shape[2] = tensor_m_128
+        sfa_stride = list(self.sfa_desc.stride)
+        sfa_stride[5] = stride_tensor_m_128
+        sfa_tensor = self._make_fake_cute_tensor(
+            dtype=self.sfa_desc.dtype,
+            shape=tuple(sfa_shape),
+            stride=tuple(sfa_stride),
+            assumed_align=16,
+        )
+        sfd_row_tensor = None
+        if self.sfd_row_desc is not None:
+            stride_sfd_m = cute.sym_int(divisibility=32 * 4 * 4)
+            sfd_row_tensor = self._make_fake_cute_tensor(
+                dtype=self.sfd_row_desc.dtype,
+                shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
+                stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
+                assumed_align=16,
+            )
+        sfd_col_tensor = None
+        if self.sfd_col_desc is not None:
+            rest_m = cute.sym_int(divisibility=1)
+            stride_sfd_n = cute.sym_int(divisibility=32 * 4 * 4)
+            stride_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
+            sfd_col_tensor = self._make_fake_cute_tensor(
+                dtype=self.sfd_col_desc.dtype,
+                shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
+                stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
+                assumed_align=16,
+            )
         amax_tensor = self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16)
         norm_const_tensor_cute = self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16)
         padded_offsets_tensor = self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16)
         alpha_tensor = self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16)
         beta_tensor = self._make_fake_cute_tensor_from_desc(self.beta_desc, assumed_align=16)
-        prob_tensor = self._make_fake_cute_tensor_from_desc(self.prob_desc, assumed_align=16)
-        if prob_tensor is not None:
-            prob_tensor.mark_layout_dynamic(leading_dim=1)
-        dprob_tensor = self._make_fake_cute_tensor_from_desc(self.dprob_desc, assumed_align=16)
-        if dprob_tensor is not None:
-            dprob_tensor.mark_layout_dynamic(leading_dim=1)
+        prob_tensor = self._make_fake_cute_tensor(
+            dtype=self.prob_desc.dtype,
+            shape=(valid_m, *self.prob_desc.shape[1:]),
+            stride=self.prob_desc.stride,
+            assumed_align=16,
+        )
+        dprob_tensor = self._make_fake_cute_tensor(
+            dtype=self.dprob_desc.dtype,
+            shape=(valid_m, *self.dprob_desc.shape[1:]),
+            stride=self.dprob_desc.stride,
+            assumed_align=16,
+        )
+        dbias_tensor = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
 
         # Compile-time pointer placeholders
         b_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
@@ -1276,6 +1064,7 @@ class GroupedGemmDgluSm100(APIBase):
             prob_tensor,
             dprob_tensor,
             cutlass.Float32(0.0),
+            dbias_tensor,
             max_active_clusters,
             fake_stream,
             self.epilogue_op,
@@ -1310,6 +1099,7 @@ class GroupedGemmDgluSm100(APIBase):
             beta_tensor: torch.Tensor,
             prob_tensor: torch.Tensor,
             dprob_tensor: torch.Tensor,
+            dbias_tensor: Optional[torch.Tensor],
             stream: cuda.CUstream,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
@@ -1338,6 +1128,7 @@ class GroupedGemmDgluSm100(APIBase):
                 prob_tensor,
                 dprob_tensor,
                 cached_linear_offset,
+                dbias_tensor,
                 stream,
             )
 
@@ -1390,7 +1181,7 @@ class GroupedGemmDgluSm100(APIBase):
         :param dprob_tensor: Gradient of probability (output, must be zero-initialized)
         :param b_tensor: (Dense) Input B tensor (weights)
         :param sfb_tensor: (Dense) Scale factor B
-        :param dbias_tensor: (Dense, optional) dbias output tensor
+        :param dbias_tensor: Optional dbias output tensor.
         :param b_ptrs: (Discrete) 1-D int64 device tensor of per-expert B data pointers
         :param sfb_ptrs: (Discrete) 1-D int64 device tensor of per-expert SFB data pointers
         :param sfd_row_tensor: Optional row scale factor D
@@ -1411,52 +1202,33 @@ class GroupedGemmDgluSm100(APIBase):
         )
 
         self._logger.debug("Executing grouped GEMM dGLU kernel")
+        if self._has_dbias:
+            self._value_error_if(
+                dbias_tensor is None,
+                "dbias_tensor is required when GroupedGemmDgluSm100 is configured with sample_dbias",
+            )
+
         if self.weight_mode == MoEWeightMode.DENSE:
-            if self._uses_dbias_kernel:
-                self._value_error_if(
-                    dbias_tensor is None,
-                    "dbias_tensor is required when GroupedGemmDgluSm100 is configured with sample_dbias",
-                )
-                self._compiled_kernel(
-                    a_tensor=a_tensor,
-                    b_tensor=b_tensor,
-                    c_tensor=c_tensor,
-                    d_row_tensor=d_row_tensor,
-                    d_col_tensor=d_col_tensor,
-                    sfa_tensor=sfa_tensor,
-                    sfb_tensor=sfb_tensor,
-                    sfd_row_tensor=sfd_row_tensor,
-                    sfd_col_tensor=sfd_col_tensor,
-                    amax_tensor=amax_tensor,
-                    norm_const_tensor=norm_const_tensor,
-                    padded_offsets=padded_offsets,
-                    alpha_tensor=alpha_tensor,
-                    beta_tensor=beta_tensor,
-                    prob_tensor=prob_tensor,
-                    dprob_tensor=dprob_tensor,
-                    dbias_tensor=dbias_tensor,
-                    stream=current_stream,
-                )
-            else:
-                self._compiled_kernel(
-                    a_tensor=a_tensor,
-                    b_tensor=b_tensor,
-                    c_tensor=c_tensor,
-                    d_row_tensor=d_row_tensor,
-                    d_col_tensor=d_col_tensor,
-                    sfa_tensor=sfa_tensor,
-                    sfb_tensor=sfb_tensor,
-                    sfd_row_tensor=sfd_row_tensor,
-                    sfd_col_tensor=sfd_col_tensor,
-                    amax_tensor=amax_tensor,
-                    norm_const_tensor=norm_const_tensor,
-                    padded_offsets=padded_offsets,
-                    alpha_tensor=alpha_tensor,
-                    beta_tensor=beta_tensor,
-                    prob_tensor=prob_tensor,
-                    dprob_tensor=dprob_tensor,
-                    stream=current_stream,
-                )
+            self._compiled_kernel(
+                a_tensor=a_tensor,
+                b_tensor=b_tensor,
+                c_tensor=c_tensor,
+                d_row_tensor=d_row_tensor,
+                d_col_tensor=d_col_tensor,
+                sfa_tensor=sfa_tensor,
+                sfb_tensor=sfb_tensor,
+                sfd_row_tensor=sfd_row_tensor,
+                sfd_col_tensor=sfd_col_tensor,
+                amax_tensor=amax_tensor,
+                norm_const_tensor=norm_const_tensor,
+                padded_offsets=padded_offsets,
+                alpha_tensor=alpha_tensor,
+                beta_tensor=beta_tensor,
+                prob_tensor=prob_tensor,
+                dprob_tensor=dprob_tensor,
+                dbias_tensor=dbias_tensor,
+                stream=current_stream,
+            )
         else:
             self._compiled_kernel(
                 a_tensor=a_tensor,
@@ -1475,6 +1247,7 @@ class GroupedGemmDgluSm100(APIBase):
                 beta_tensor=beta_tensor,
                 prob_tensor=prob_tensor,
                 dprob_tensor=dprob_tensor,
+                dbias_tensor=dbias_tensor,
                 stream=current_stream,
             )
 
@@ -1498,7 +1271,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     beta_tensor: torch.Tensor,
     prob_tensor: torch.Tensor,
     dprob_tensor: torch.Tensor,
-    # Dense mode. generate_dbias is optional:
+    # generate_dbias is optional in both modes:
     b_tensor: Optional[torch.Tensor] = None,
     sfb_tensor: Optional[torch.Tensor] = None,
     generate_dbias: bool = False,
@@ -1545,7 +1318,7 @@ def grouped_gemm_dglu_wrapper_sm100(
         dprob_tensor: Gradient of probability (output, must be zero-initialized)
         b_tensor: (Dense) Weight B tensor (n, k, l)
         sfb_tensor: (Dense) Scale factor B
-        generate_dbias: (Dense, optional) Allocate and return dbias output
+        generate_dbias: Optional flag to allocate and return dbias output
         b_ptrs: (Discrete) 1-D int64 device tensor of per-expert B data pointers
         sfb_ptrs: (Discrete) 1-D int64 device tensor of per-expert SFB data pointers
         n: (Discrete) B weight N dimension
@@ -1588,8 +1361,6 @@ def grouped_gemm_dglu_wrapper_sm100(
         n_weight, _, l = b_tensor.shape
     else:
         weight_mode = MoEWeightMode.DISCRETE
-        if generate_dbias:
-            raise ValueError("dbias_tensor is only supported in dense mode")
         _require_pointer_tensor(b_ptrs, "b_ptrs")
         num_experts = b_ptrs.shape[0]
         _require_pointer_tensor(sfb_ptrs, "sfb_ptrs", num_experts)
@@ -1659,7 +1430,20 @@ def grouped_gemm_dglu_wrapper_sm100(
             return None, None, None
         return tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype
 
-    use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL") is not None
+    def dynamic_tensor_signature(tensor: Optional[torch.Tensor]) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[torch.dtype]]:
+        if tensor is None:
+            return None, None, None
+        return None, stride_order(tensor), tensor.dtype
+
+    def dynamic_m_tensor_signature(
+        tensor: Optional[torch.Tensor], static_shape_suffix: Optional[Tuple[int, ...]], dynamic_stride_dims: Tuple[int, ...] = ()
+    ) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[torch.dtype]]:
+        if tensor is None:
+            return None, None, None
+        stride_signature = tuple(None if i in dynamic_stride_dims else s for i, s in enumerate(tensor.stride()))
+        return static_shape_suffix, stride_signature, tensor.dtype
+
+    use_full_dynamic = is_dense and os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL") is not None
 
     if is_dense:
         cache_key = (
@@ -1668,7 +1452,7 @@ def grouped_gemm_dglu_wrapper_sm100(
             epilogue_op,
             use_full_dynamic,
             a_tensor.shape[1:] if not use_full_dynamic else None,
-            b_tensor.shape if not use_full_dynamic else None,
+            b_tensor.shape[2] if use_full_dynamic else tuple(b_tensor.shape),
             c_tensor.shape[1:] if not use_full_dynamic else None,
             a_tensor.dtype,
             b_tensor.dtype,
@@ -1676,18 +1460,22 @@ def grouped_gemm_dglu_wrapper_sm100(
             stride_order(a_tensor),
             stride_order(b_tensor),
             stride_order(c_tensor),
-            *tensor_signature(sfa_tensor),
+            *(
+                dynamic_tensor_signature(sfa_tensor)
+                if use_full_dynamic
+                else dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1) if sfa_tensor is not None else None, dynamic_stride_dims=(5,))
+            ),
             *tensor_signature(alpha_tensor),
             *tensor_signature(beta_tensor),
-            *tensor_signature(prob_tensor),
-            *tensor_signature(dprob_tensor),
-            *tensor_signature(dbias_tensor),
-            *tensor_signature(sfb_tensor),
+            *(dynamic_m_tensor_signature(prob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(prob_tensor)),
+            *(dynamic_m_tensor_signature(dprob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(dprob_tensor)),
+            *(dynamic_tensor_signature(dbias_tensor) if use_full_dynamic else tensor_signature(dbias_tensor)),
+            *(dynamic_tensor_signature(sfb_tensor) if use_full_dynamic else tensor_signature(sfb_tensor)),
             norm_const_tensor.shape if norm_const_tensor is not None else None,
             norm_const_tensor.stride() if norm_const_tensor is not None else None,
             norm_const_tensor.dtype if norm_const_tensor is not None else None,
-            padded_offsets.shape if not use_full_dynamic else None,
-            padded_offsets.stride() if not use_full_dynamic else None,
+            tuple(padded_offsets.shape),
+            tuple(padded_offsets.stride()),
             padded_offsets.dtype,
             acc_dtype,
             d_dtype,
@@ -1705,38 +1493,25 @@ def grouped_gemm_dglu_wrapper_sm100(
             weight_mode,
             act_func,
             epilogue_op,
-            a_tensor.shape,
+            *dynamic_m_tensor_signature(a_tensor, tuple(a_tensor.shape[1:]), dynamic_stride_dims=(2,)),
             b_shape,
-            a_tensor.dtype,
             b_dtype,
-            a_tensor.stride(),
-            c_tensor.shape,
-            c_tensor.stride(),
-            c_tensor.dtype,
-            sfa_tensor.shape,
-            sfa_tensor.stride(),
-            sfa_tensor.dtype,
-            b_ptrs.shape,
-            sfb_ptrs.shape,
-            b_ptrs.stride(),
-            sfb_ptrs.stride(),
-            b_ptrs.dtype,
-            sfb_ptrs.dtype,
-            sfd_row_tensor.shape if sfd_row_tensor is not None else None,
-            sfd_row_tensor.stride() if sfd_row_tensor is not None else None,
-            sfd_row_tensor.dtype if sfd_row_tensor is not None else None,
-            sfd_col_tensor.shape if sfd_col_tensor is not None else None,
-            sfd_col_tensor.stride() if sfd_col_tensor is not None else None,
-            sfd_col_tensor.dtype if sfd_col_tensor is not None else None,
-            norm_const_tensor.shape if norm_const_tensor is not None else None,
-            norm_const_tensor.stride() if norm_const_tensor is not None else None,
-            norm_const_tensor.dtype if norm_const_tensor is not None else None,
+            *dynamic_m_tensor_signature(c_tensor, tuple(c_tensor.shape[1:]), dynamic_stride_dims=(2,)),
+            *dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1) if sfa_tensor is not None else None, dynamic_stride_dims=(5,)),
             *tensor_signature(alpha_tensor),
             *tensor_signature(beta_tensor),
-            *tensor_signature(prob_tensor),
-            *tensor_signature(dprob_tensor),
-            padded_offsets.shape,
-            padded_offsets.stride(),
+            *dynamic_m_tensor_signature(prob_tensor, (1, 1)),
+            *dynamic_m_tensor_signature(dprob_tensor, (1, 1)),
+            *tensor_signature(dbias_tensor),
+            *tensor_signature(norm_const_tensor),
+            tuple(b_ptrs.shape),
+            tuple(b_ptrs.stride()),
+            b_ptrs.dtype,
+            tuple(sfb_ptrs.shape),
+            tuple(sfb_ptrs.stride()),
+            sfb_ptrs.dtype,
+            tuple(padded_offsets.shape),
+            tuple(padded_offsets.stride()),
             padded_offsets.dtype,
             acc_dtype,
             d_dtype,
@@ -1800,6 +1575,7 @@ def grouped_gemm_dglu_wrapper_sm100(
                 sample_beta=beta_tensor,
                 sample_prob=prob_tensor,
                 sample_dprob=dprob_tensor,
+                sample_dbias=dbias_tensor,
                 num_experts=num_experts,
                 b_shape=b_shape,
                 b_dtype=b_dtype,
@@ -1859,6 +1635,7 @@ def grouped_gemm_dglu_wrapper_sm100(
             beta_tensor=beta_tensor,
             prob_tensor=prob_tensor,
             dprob_tensor=dprob_tensor,
+            dbias_tensor=dbias_tensor,
             b_ptrs=b_ptrs,
             sfb_ptrs=sfb_ptrs,
             sfd_row_tensor=sfd_row_tensor,

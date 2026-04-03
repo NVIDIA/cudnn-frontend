@@ -29,6 +29,9 @@ except Exception:
     cvt_sf_MKL_to_M32x4xrm_K4xrk_L = None
 
 
+DYNAMIC_SHAPES_M_VALUES = (64, 320, 576, 832)
+
+
 def ceil_div(a: int, b: int) -> int:
     """Compute ceiling division of a by b."""
     return (a + b - 1) // b
