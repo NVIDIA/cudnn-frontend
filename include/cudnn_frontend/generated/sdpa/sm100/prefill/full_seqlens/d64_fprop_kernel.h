@@ -1,3 +1,5 @@
+// Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: MIT
 #pragma once
 #if defined(__clang__)
 #pragma clang diagnostic push

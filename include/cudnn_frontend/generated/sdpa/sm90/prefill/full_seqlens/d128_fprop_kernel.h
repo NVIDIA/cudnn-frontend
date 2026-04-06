@@ -1,3 +1,5 @@
+// Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: MIT
 #pragma once
 // Suppress clang warning for overlength strings (concatenated result may exceed 65536)
 #if defined(__clang__)
