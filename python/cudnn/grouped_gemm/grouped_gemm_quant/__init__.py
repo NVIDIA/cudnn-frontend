@@ -1,5 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: MIT
 
 """
 Grouped GEMM Quant Kernel Module
