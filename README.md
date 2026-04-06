@@ -27,12 +27,12 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 
 ## 🔥🔥🔥  SOTA Attention Kernels from cudnn backend
 
-#### Llama 3.1 style Forward and Bprop with causal masking
+#### Llama 3.1 style Forward and Bprop with causal masking (GB300)
 <p align="center">
   <img src="benchmark/sdpa_benchmark_training/results/gb300_919_only_cudnn/llama3.1_top_left.png" alt="Llama 3.1 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
 </p>
 
-#### Deepseek v3 style Forward and Bprop with causal masking
+#### Deepseek v3 style Forward and Bprop with causal masking (GB300)
 
 <p align="center">
   <img src="benchmark/sdpa_benchmark_training/results/gb300_919_only_cudnn/dsv3_top_left.png" alt="DSv3 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
