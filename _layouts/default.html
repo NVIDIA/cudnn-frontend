@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ page.title | default: site.title }}</title>
+  <meta name="description" content="{{ page.description | default: site.description }}">
+  <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
+  {% seo %}
+</head>
+<body>
+  <div class="site-container">
+    <!-- Sidebar -->
+    <nav class="sidebar">
+      <div class="sidebar-header">
+        <a href="{{ '/' | relative_url }}" class="site-logo">cuDNN</a>
+        <span class="site-tagline">The Blog</span>
+      </div>
+
+      <div class="sidebar-section">
+        <h3>Installation Guides</h3>
+        <ul>
+          {% assign sorted_guides = site.guides | sort: "order" %}
+          {% for guide in sorted_guides %}
+          <li><a href="{{ guide.url | relative_url }}" {% if page.url == guide.url %}class="active"{% endif %}>{{ guide.sidebar_title | default: guide.title }}</a></li>
+          {% endfor %}
+        </ul>
+      </div>
+
+      <div class="sidebar-section">
+        <h3>Release Notes</h3>
+        <ul>
+          {% for post in site.posts %}
+          <li><a href="{{ post.url | relative_url }}" {% if page.url == post.url %}class="active"{% endif %}>{{ post.sidebar_title | default: post.title }}</a></li>
+          {% endfor %}
+        </ul>
+      </div>
+
+      <div class="sidebar-section sidebar-links">
+        <h3>Links</h3>
+        <ul>
+          <li><a href="https://github.com/NVIDIA/cudnn-frontend">GitHub Repo</a></li>
+          <li><a href="https://docs.nvidia.com/cudnn">Official Docs</a></li>
+          <li><a href="https://developer.nvidia.com/cudnn">NVIDIA Developer</a></li>
+        </ul>
+      </div>
+    </nav>
+
+    <!-- Main content -->
+    <main class="content">
+      {{ content }}
+
+      <footer>
+        <p>&copy; {{ 'now' | date: "%Y" }} NVIDIA Corporation &middot; <a href="https://github.com/NVIDIA/cudnn-frontend">cuDNN Frontend on GitHub</a></p>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

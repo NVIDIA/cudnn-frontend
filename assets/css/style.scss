@@ -1,0 +1,322 @@
+---
+---
+
+/* NVIDIA cuDNN Blog — Full Custom Styles */
+
+:root {
+  --nvidia-green: #76b900;
+  --nvidia-green-dim: #5a8f00;
+  --nvidia-dark: #1a1a2e;
+  --nvidia-darker: #0f0f1a;
+  --nvidia-gray: #2d2d44;
+  --nvidia-light: #d4d4d4;
+  --nvidia-white: #f0f0f0;
+  --sidebar-width: 260px;
+  --code-bg: #0d1117;
+  --code-border: #30363d;
+  --code-text: #e6edf3;
+}
+
+/* Reset */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background-color: var(--nvidia-darker);
+  color: var(--nvidia-light);
+  font-family: -apple-system, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+  line-height: 1.7;
+}
+
+/* ============ Layout ============ */
+.site-container {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* ============ Sidebar ============ */
+.sidebar {
+  width: var(--sidebar-width);
+  min-width: var(--sidebar-width);
+  background: var(--nvidia-dark);
+  border-right: 1px solid #2a2a3e;
+  padding: 0;
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  overflow-y: auto;
+  z-index: 100;
+}
+
+.sidebar-header {
+  padding: 28px 24px 20px;
+  border-bottom: 3px solid var(--nvidia-green);
+  text-align: left;
+}
+
+.site-logo {
+  font-size: 1.8em;
+  font-weight: 700;
+  color: var(--nvidia-green) !important;
+  text-decoration: none !important;
+  letter-spacing: -0.5px;
+}
+
+.site-tagline {
+  display: block;
+  color: #777;
+  font-size: 0.85em;
+  margin-top: 2px;
+}
+
+.sidebar-section {
+  padding: 18px 24px 10px;
+  border-bottom: 1px solid #1f1f33;
+}
+
+.sidebar-section h3 {
+  font-size: 0.7em;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: #666;
+  margin-bottom: 10px;
+  font-weight: 600;
+}
+
+.sidebar-section ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.sidebar-section li {
+  margin-bottom: 2px;
+}
+
+.sidebar-section a {
+  display: block;
+  padding: 6px 12px;
+  border-radius: 5px;
+  color: #aaa;
+  text-decoration: none;
+  font-size: 0.88em;
+  transition: all 0.12s ease;
+}
+
+.sidebar-section a:hover {
+  color: var(--nvidia-white);
+  background: rgba(118, 185, 0, 0.08);
+}
+
+.sidebar-section a.active {
+  color: var(--nvidia-green);
+  background: rgba(118, 185, 0, 0.12);
+  font-weight: 600;
+}
+
+.sidebar-links {
+  border-bottom: none;
+}
+
+/* ============ Main Content ============ */
+.content {
+  flex: 1;
+  margin-left: var(--sidebar-width);
+  padding: 40px 56px 40px 56px;
+  max-width: 920px;
+  min-width: 0;
+}
+
+/* ============ Typography ============ */
+h1 { color: var(--nvidia-white); font-size: 1.9em; font-weight: 700; margin-bottom: 8px; }
+h2 { color: var(--nvidia-green); font-size: 1.35em; font-weight: 600; margin-top: 36px; margin-bottom: 12px; }
+h3 { color: var(--nvidia-green-dim); font-size: 1.1em; font-weight: 600; margin-top: 24px; margin-bottom: 8px; }
+h4 { color: #999; font-size: 1em; font-weight: 600; margin-top: 20px; }
+
+p { margin: 12px 0; }
+
+a { color: var(--nvidia-green); text-decoration: none; }
+a:hover { text-decoration: underline; color: #8fd400; }
+
+strong { color: var(--nvidia-white); }
+em { color: #bbb; }
+
+ul, ol { margin: 10px 0 10px 22px; }
+li { margin-bottom: 5px; }
+
+hr {
+  border: none;
+  border-top: 1px solid #2a2a3e;
+  margin: 36px 0;
+}
+
+/* ============ Code Blocks (Dark Mode Fixed) ============ */
+pre {
+  background-color: var(--code-bg);
+  border: 1px solid var(--code-border);
+  border-radius: 8px;
+  padding: 18px 22px;
+  overflow-x: auto;
+  line-height: 1.55;
+  margin: 16px 0;
+  font-size: 0.88em;
+}
+
+code {
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 0.88em;
+}
+
+/* Inline code */
+p code, li code, td code, h2 code, h3 code {
+  background: rgba(110, 118, 129, 0.15);
+  border: 1px solid rgba(110, 118, 129, 0.25);
+  border-radius: 4px;
+  padding: 2px 7px;
+  color: var(--nvidia-white);
+  font-size: 0.85em;
+}
+
+/* Code inside pre blocks */
+pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--code-text);
+  font-size: 1em;
+}
+
+/* Syntax highlighting overrides for rouge */
+.highlight { background: var(--code-bg); border-radius: 8px; }
+.highlight pre { background: var(--code-bg); border: 1px solid var(--code-border); }
+.highlight .c, .highlight .cm, .highlight .c1, .highlight .cs { color: #8b949e; } /* comments */
+.highlight .k, .highlight .kd, .highlight .kn, .highlight .kp, .highlight .kr { color: #ff7b72; } /* keywords */
+.highlight .s, .highlight .s1, .highlight .s2, .highlight .sb, .highlight .sc { color: #a5d6ff; } /* strings */
+.highlight .nf, .highlight .nb { color: #d2a8ff; } /* functions */
+.highlight .mi, .highlight .mf, .highlight .mh { color: #79c0ff; } /* numbers */
+.highlight .o, .highlight .ow { color: #ff7b72; } /* operators */
+.highlight .nn, .highlight .nc { color: #ffa657; } /* names */
+
+/* ============ Post Header ============ */
+.post-header {
+  margin-bottom: 32px;
+  padding-bottom: 18px;
+  border-bottom: 2px solid var(--nvidia-green);
+}
+
+.post-header h1 {
+  font-size: 2em;
+  margin-bottom: 10px;
+}
+
+.post-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.post-date {
+  color: #777;
+  font-size: 0.88em;
+}
+
+.post-tag {
+  display: inline-block;
+  background: rgba(118, 185, 0, 0.15);
+  color: var(--nvidia-green);
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-size: 0.75em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.guide-tag {
+  background: rgba(79, 139, 255, 0.15);
+  color: #79aaff;
+}
+
+/* ============ Post Content ============ */
+.post-content {
+  font-size: 1.02em;
+}
+
+.post-content h2 {
+  margin-top: 40px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #2a2a3e;
+}
+
+/* ============ Post Cards (Home Page) ============ */
+.post-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.post-card {
+  background: var(--nvidia-dark);
+  border-left: 4px solid var(--nvidia-green);
+  border-radius: 8px;
+  padding: 22px 26px;
+  margin-bottom: 18px;
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+
+.post-card:hover {
+  transform: translateX(4px);
+  background: #1e1e36;
+}
+
+.post-card h2 {
+  margin: 0 0 4px 0;
+  padding: 0;
+  border: none;
+  font-size: 1.2em;
+}
+
+.post-card .card-meta {
+  color: #666;
+  font-size: 0.82em;
+  margin-bottom: 8px;
+}
+
+.post-card p {
+  color: #999;
+  margin: 0;
+  font-size: 0.92em;
+  line-height: 1.5;
+}
+
+/* ============ Footer ============ */
+footer {
+  border-top: 1px solid #2a2a3e;
+  padding-top: 20px;
+  margin-top: 60px;
+  color: #555;
+  font-size: 0.82em;
+}
+
+/* ============ Responsive ============ */
+@media (max-width: 768px) {
+  .sidebar {
+    position: relative;
+    width: 100%;
+    min-width: 100%;
+    border-right: none;
+    border-bottom: 1px solid #2a2a3e;
+  }
+  .site-container {
+    flex-direction: column;
+  }
+  .content {
+    margin-left: 0;
+    padding: 24px 20px;
+  }
+  .sidebar-header {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+}

@@ -1,0 +1,36 @@
+title: "The cuDNN Blog"
+description: "An informal blog about NVIDIA cuDNN — tips, installation guides, and deep learning performance."
+baseurl: "/cudnn-frontend"
+url: "https://nvidia.github.io"
+permalink: /:title/
+
+# Build settings
+markdown: kramdown
+highlighter: rouge
+
+# Plugins
+plugins:
+  - jekyll-seo-tag
+
+# Author
+author:
+  name: "cuDNN Team @ NVIDIA"
+
+# Collections
+collections:
+  guides:
+    output: true
+    permalink: /guides/:title/
+
+# Defaults
+defaults:
+  - scope:
+      path: ""
+      type: "posts"
+    values:
+      layout: "post"
+  - scope:
+      path: ""
+      type: "guides"
+    values:
+      layout: "guide"
