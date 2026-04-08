@@ -7,7 +7,7 @@ title: "The cuDNN Blog"
 
 Hey there, fellow GPU enthusiast! This is the unofficial-feeling, totally-official corner of the internet where we talk about **cuDNN** — NVIDIA's library for accelerating deep learning primitives on GPUs.
 
-Whether you're training a massive transformer, fine-tuning a ResNet, or just trying to get convolutions to go *brrr*, cuDNN is the engine under the hood making it happen. This blog is where we share release notes, installation guides, and the occasional deep-dive into what makes cuDNN tick.
+Whether you're training a massive transformer, fine-tuning a convolutional network, or just trying to get convolutions to go *brrr*, cuDNN is the engine under the hood making it happen. This blog is where we share release notes, installation guides, and the occasional deep-dive into what makes cuDNN tick.
 
 Check out the **Installation Guides** in the sidebar to get started, or read through the latest release notes below.
 
