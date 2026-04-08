@@ -6,7 +6,7 @@ permalink: /in-the-wild/
 
 <div class="wild-header">
   <h1>cuDNN in the Wild</h1>
-  <p class="wild-subtitle">Recent web mentions of cuDNN from the past 24 hours — fetched live in your browser.</p>
+  <p class="wild-subtitle">Recent web mentions of cuDNN (past 24 hours) — fetched live in your browser via Google.</p>
   <div class="wild-controls">
     <button class="wild-refresh" id="refresh-btn" onclick="refreshResults()">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
@@ -17,14 +17,14 @@ permalink: /in-the-wild/
 </div>
 
 <div class="wild-feed" id="results-feed">
-  <div class="wild-loading" id="loading-state">
+  <div class="wild-loading">
     <div class="spinner"></div>
-    <span>Searching the web for cuDNN mentions...</span>
+    <span>Fetching Google results for cuDNN...</span>
   </div>
 </div>
 
 <div class="wild-footer-link">
-  <a href="https://www.google.com/search?q=cuDNN&tbs=qdr:d" target="_blank">View full Google search for cuDNN (past 24h) →</a>
+  <a href="https://www.google.com/search?q=cuDNN&tbs=qdr:d" target="_blank">Open full Google search (past 24h) →</a>
 </div>
 
 <style>
@@ -176,8 +176,14 @@ permalink: /in-the-wild/
 
 <script>
 (function() {
-  var CORS_PROXY = 'https://api.allorigins.win/raw?url=';
-  var TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
+  // Multiple CORS proxies as fallbacks
+  var PROXIES = [
+    function(u) { return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u); },
+    function(u) { return 'https://corsproxy.io/?' + encodeURIComponent(u); },
+    function(u) { return 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u); }
+  ];
+
+  var GOOGLE_URL = 'https://www.google.com/search?q=cuDNN&tbs=qdr:d&num=8&hl=en';
 
   function escapeHtml(text) {
     var div = document.createElement('div');
@@ -185,21 +191,87 @@ permalink: /in-the-wild/
     return div.innerHTML;
   }
 
-  function getTimeAgo(date) {
-    var seconds = Math.floor((new Date() - date) / 1000);
-    if (seconds < 60) return 'just now';
-    var minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return minutes + 'm ago';
-    var hours = Math.floor(minutes / 60);
-    if (hours < 24) return hours + 'h ago';
-    var days = Math.floor(hours / 24);
-    if (days < 7) return days + 'd ago';
-    return date.toLocaleDateString();
+  function getTimeAgo(text) {
+    // Google shows relative times like "5 hours ago", pass through
+    return text || '';
   }
 
   function getDomain(url) {
     try { return new URL(url).hostname.replace('www.', ''); }
     catch(e) { return ''; }
+  }
+
+  function parseGoogleResults(html) {
+    var parser = new DOMParser();
+    var doc = parser.parseFromString(html, 'text/html');
+    var results = [];
+
+    // Google wraps each result in a div with class "g" or data-sokoban attribute
+    // Titles are in h3 tags, links in ancestor <a> tags
+    var h3s = doc.querySelectorAll('h3');
+    h3s.forEach(function(h3) {
+      if (results.length >= 8) return;
+
+      var title = h3.textContent.trim();
+      if (!title) return;
+
+      // Walk up to find the parent <a> tag with the actual URL
+      var link = h3.closest('a');
+      var url = '';
+      if (link) {
+        var href = link.getAttribute('href') || '';
+        // Google uses /url?q=REAL_URL or direct URLs
+        var match = href.match(/\/url\?q=(https?:\/\/[^&]+)/);
+        if (match) {
+          url = decodeURIComponent(match[1]);
+        } else if (href.startsWith('http')) {
+          url = href;
+        }
+      }
+
+      if (!url) return;
+
+      // Find snippet — usually a sibling or nearby div with text
+      var snippet = '';
+      var container = h3.closest('[data-sokoban]') || h3.closest('.g') || h3.parentElement.parentElement.parentElement;
+      if (container) {
+        // Look for spans that contain substantial text (snippet-like)
+        var spans = container.querySelectorAll('span');
+        spans.forEach(function(span) {
+          var text = span.textContent.trim();
+          if (text.length > 60 && text.length < 500 && !snippet) {
+            snippet = text;
+          }
+        });
+        // Also try divs with role or style attributes that indicate snippets
+        if (!snippet) {
+          var divs = container.querySelectorAll('div');
+          divs.forEach(function(div) {
+            var text = div.textContent.trim();
+            if (text.length > 80 && text.length < 400 && text !== title && !snippet) {
+              snippet = text;
+            }
+          });
+        }
+      }
+
+      // Find date/time info if present
+      var timeText = '';
+      if (container) {
+        var timeMatch = container.textContent.match(/(\d+\s+(?:minute|hour|day|week|month)s?\s+ago)/i);
+        if (timeMatch) timeText = timeMatch[1];
+      }
+
+      results.push({
+        title: title,
+        url: url,
+        domain: getDomain(url),
+        snippet: snippet.substring(0, 200),
+        time: timeText
+      });
+    });
+
+    return results;
   }
 
   function renderResults(items) {
@@ -209,12 +281,11 @@ permalink: /in-the-wild/
       return;
     }
     feed.innerHTML = items.map(function(item) {
-      return '<a class="wild-result" href="' + item.url + '" target="_blank">' +
+      return '<a class="wild-result" href="' + escapeHtml(item.url) + '" target="_blank">' +
         '<div class="wild-result-title">' + escapeHtml(item.title) + '</div>' +
         '<div class="wild-result-meta">' +
-          '<span class="wild-result-source">' + escapeHtml(item.source) + '</span>' +
-          '<span class="wild-result-dot">&middot;</span>' +
-          '<span>' + getTimeAgo(item.date) + '</span>' +
+          '<span class="wild-result-source">Google</span>' +
+          (item.time ? '<span class="wild-result-dot">&middot;</span><span>' + escapeHtml(item.time) + '</span>' : '') +
           (item.domain ? '<span class="wild-result-dot">&middot;</span><span>' + escapeHtml(item.domain) + '</span>' : '') +
         '</div>' +
         (item.snippet ? '<div class="wild-result-snippet">' + escapeHtml(item.snippet) + '</div>' : '') +
@@ -222,94 +293,50 @@ permalink: /in-the-wild/
     }).join('');
   }
 
-  // Google News RSS
-  async function fetchGoogleNews() {
-    var url = encodeURIComponent('https://news.google.com/rss/search?q=cuDNN+OR+cudnn-frontend&hl=en-US&gl=US&ceid=US:en');
-    var resp = await fetch(CORS_PROXY + url);
-    if (!resp.ok) throw new Error('fail');
-    var text = await resp.text();
-    var parser = new DOMParser();
-    var xml = parser.parseFromString(text, 'text/xml');
-    var items = xml.querySelectorAll('item');
-    var results = [];
-    var cutoff = Date.now() - TWENTY_FOUR_HOURS;
-    for (var i = 0; i < items.length && results.length < 5; i++) {
-      var titleEl = items[i].querySelector('title');
-      var linkEl = items[i].querySelector('link');
-      var pubDateEl = items[i].querySelector('pubDate');
-      var descEl = items[i].querySelector('description');
-      if (!titleEl || !linkEl) continue;
-      var date = pubDateEl ? new Date(pubDateEl.textContent) : new Date();
-      if (date.getTime() < cutoff) continue;
-      var link = linkEl.textContent || (linkEl.nextSibling ? linkEl.nextSibling.textContent.trim() : '');
-      var snippet = '';
-      if (descEl) {
-        var tmp = document.createElement('div');
-        tmp.innerHTML = descEl.textContent;
-        snippet = tmp.textContent.substring(0, 200);
-      }
-      results.push({
-        title: titleEl.textContent,
-        url: link,
-        date: date,
-        source: 'Google News',
-        domain: getDomain(link),
-        snippet: snippet
-      });
-    }
-    return results;
-  }
-
-  // Hacker News Algolia API (CORS-friendly, no proxy needed)
-  async function fetchHackerNews() {
-    var cutoffSeconds = Math.floor((Date.now() - TWENTY_FOUR_HOURS) / 1000);
-    var resp = await fetch('https://hn.algolia.com/api/v1/search_by_date?query=cuDNN&tags=(story,comment)&numericFilters=created_at_i>' + cutoffSeconds + '&hitsPerPage=5');
-    if (!resp.ok) throw new Error('fail');
-    var data = await resp.json();
-    return data.hits.map(function(h) {
-      return {
-        title: h.title || ('Comment by ' + h.author + ' on "' + (h.story_title || 'Hacker News') + '"'),
-        url: h.url || ('https://news.ycombinator.com/item?id=' + (h.story_id || h.objectID)),
-        date: new Date(h.created_at),
-        source: 'Hacker News',
-        domain: h.url ? getDomain(h.url) : 'news.ycombinator.com',
-        snippet: ''
-      };
+  async function tryProxy(proxyFn) {
+    var url = proxyFn(GOOGLE_URL);
+    var resp = await fetch(url, {
+      headers: { 'Accept': 'text/html' }
     });
+    if (!resp.ok) throw new Error('Proxy returned ' + resp.status);
+    var html = await resp.text();
+    if (html.length < 1000) throw new Error('Response too short');
+    return html;
   }
 
-  // Main: fetch all, merge, sort, render
   async function loadResults() {
     var feed = document.getElementById('results-feed');
     var btn = document.getElementById('refresh-btn');
     var ts = document.getElementById('last-updated');
 
-    feed.innerHTML = '<div class="wild-loading"><div class="spinner"></div><span>Searching the web for cuDNN mentions...</span></div>';
+    feed.innerHTML = '<div class="wild-loading"><div class="spinner"></div><span>Fetching Google results for cuDNN...</span></div>';
     btn.classList.add('loading');
 
-    var allResults = [];
-    var fetches = [
-      fetchGoogleNews().catch(function() { return []; }),
-      fetchHackerNews().catch(function() { return []; })
-    ];
-    var results = await Promise.all(fetches);
-    results.forEach(function(r) { allResults = allResults.concat(r); });
+    var html = null;
 
-    // Sort by date descending
-    allResults.sort(function(a, b) { return b.date - a.date; });
-
-    // Deduplicate by title similarity
-    var seen = {};
-    var deduped = [];
-    allResults.forEach(function(item) {
-      var key = item.title.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 40);
-      if (!seen[key]) {
-        seen[key] = true;
-        deduped.push(item);
+    // Try each CORS proxy in order until one works
+    for (var i = 0; i < PROXIES.length; i++) {
+      try {
+        html = await tryProxy(PROXIES[i]);
+        break;
+      } catch(e) {
+        // Try next proxy
+        continue;
       }
-    });
+    }
 
-    renderResults(deduped.slice(0, 8));
+    if (html) {
+      var results = parseGoogleResults(html);
+      if (results.length > 0) {
+        renderResults(results);
+      } else {
+        // HTML fetched but parsing found nothing — Google might have changed structure
+        feed.innerHTML = '<div class="wild-empty">Fetched Google but could not parse results. Google may have updated their page structure.<br><a href="https://www.google.com/search?q=cuDNN&tbs=qdr:d" target="_blank">View results on Google directly →</a></div>';
+      }
+    } else {
+      feed.innerHTML = '<div class="wild-empty">Could not reach Google through any available proxy.<br><a href="https://www.google.com/search?q=cuDNN&tbs=qdr:d" target="_blank">View results on Google directly →</a></div>';
+    }
+
     btn.classList.remove('loading');
     ts.textContent = 'Updated ' + new Date().toLocaleTimeString();
   }
