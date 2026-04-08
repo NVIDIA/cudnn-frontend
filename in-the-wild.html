@@ -6,303 +6,125 @@ permalink: /in-the-wild/
 
 <div class="wild-header">
   <h1>cuDNN in the Wild</h1>
-  <p class="wild-subtitle">Recent web mentions of cuDNN (past 24 hours) — fetched live in your browser.</p>
-  <div class="wild-controls">
-    <button class="wild-refresh" id="refresh-btn" onclick="refreshResults()">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-      Refresh
-    </button>
-    <span class="wild-timestamp" id="last-updated"></span>
-  </div>
+  <p class="wild-subtitle">Recent web mentions of cuDNN — powered by Google.</p>
 </div>
 
-<div class="wild-feed" id="results-feed">
-  <div class="wild-loading">
-    <div class="spinner"></div>
-    <span>Searching for cuDNN mentions...</span>
-  </div>
+<!--
+  Google Programmable Search Engine widget.
+  To set up: go to https://programmablesearchengine.google.com
+  1. Click "Add" → Search the entire web → Name: "cuDNN Search" → Create
+  2. Copy the cx ID and replace PASTE_YOUR_CX_ID_HERE below
+-->
+<script async src="https://cse.google.com/cse.js?cx=PASTE_YOUR_CX_ID_HERE"></script>
+
+<div class="gcse-wrapper">
+  <div class="gcse-searchresults-only" data-as_q="cuDNN" data-sort="date"></div>
 </div>
 
-<div class="wild-footer-link">
-  <a href="https://www.google.com/search?q=cuDNN&tbs=qdr:d" target="_blank">Open full Google search (past 24h) →</a>
-</div>
+<noscript>
+  <p>JavaScript is required to load search results. <a href="https://www.google.com/search?q=cuDNN&tbs=qdr:d">Search Google directly →</a></p>
+</noscript>
 
 <style>
 .wild-header { margin-bottom: 28px; }
 .wild-header h1 { margin-bottom: 6px; }
-.wild-subtitle { color: #777; font-size: 0.95em; margin: 0 0 16px 0; }
+.wild-subtitle { color: #777; font-size: 0.95em; margin: 0; }
 
-.wild-controls {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
-.wild-refresh {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: rgba(118, 185, 0, 0.1);
-  border: 1px solid rgba(118, 185, 0, 0.25);
-  color: var(--nvidia-green);
-  padding: 6px 14px;
-  border-radius: 6px;
-  font-size: 0.82em;
-  font-weight: 500;
-  cursor: pointer;
-  font-family: inherit;
-  transition: all 0.12s;
-}
-
-.wild-refresh:hover { background: rgba(118, 185, 0, 0.18); }
-.wild-refresh.loading svg { animation: spin 0.8s linear infinite; }
-
-.wild-timestamp { color: #555; font-size: 0.78em; }
-
-.wild-feed {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-height: 200px;
-}
-
-.wild-result {
-  display: block;
-  padding: 18px 20px;
-  border-radius: 8px;
-  text-decoration: none;
-  transition: background 0.1s;
-  border-left: 3px solid transparent;
-}
-
-.wild-result:hover {
-  background: rgba(118, 185, 0, 0.04);
-  border-left-color: var(--nvidia-green);
-  text-decoration: none;
-}
-
-.wild-result-title {
-  color: var(--nvidia-white, #f0f0f0);
-  font-size: 0.95em;
-  font-weight: 500;
-  line-height: 1.4;
-  margin-bottom: 6px;
-}
-
-.wild-result:hover .wild-result-title { color: var(--nvidia-green); }
-
-.wild-result-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 0.78em;
-  color: #666;
-  flex-wrap: wrap;
-}
-
-.wild-result-source {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  background: rgba(255,255,255,0.05);
-  padding: 1px 8px;
-  border-radius: 3px;
-  font-weight: 500;
-  color: #888;
-}
-
-.wild-result-snippet {
-  color: #888;
-  font-size: 0.84em;
-  margin-top: 6px;
-  line-height: 1.45;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.wild-result-dot { color: #444; }
-
-.wild-empty {
-  text-align: center;
-  padding: 40px 20px;
-  color: #666;
-  font-size: 0.9em;
-  line-height: 1.6;
-}
-
-.wild-empty a { color: var(--nvidia-green); }
-
-.wild-footer-link {
+.gcse-wrapper {
   margin-top: 24px;
+  min-height: 300px;
+}
+
+/* Override Google CSE styles to match our dark theme */
+.gsc-control-cse {
+  background-color: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+  font-family: inherit !important;
+}
+
+.gsc-results-wrapper-overlay,
+.gsc-results-wrapper-visible {
+  background: transparent !important;
+}
+
+.gsc-webResult.gsc-result {
+  background: var(--nvidia-dark) !important;
+  border: 1px solid #2a2a3e !important;
+  border-left: 3px solid var(--nvidia-green) !important;
+  border-radius: 8px !important;
+  padding: 16px 20px !important;
+  margin-bottom: 12px !important;
+}
+
+.gsc-webResult.gsc-result:hover {
+  background: #1e1e36 !important;
+}
+
+.gs-title,
+.gs-title a,
+.gs-title a b {
+  color: var(--nvidia-white, #f0f0f0) !important;
+  text-decoration: none !important;
+  font-size: 0.95em !important;
+}
+
+.gs-title a:hover,
+.gs-title a:hover b {
+  color: var(--nvidia-green) !important;
+}
+
+.gs-snippet {
+  color: #888 !important;
+  font-size: 0.84em !important;
+  line-height: 1.45 !important;
+}
+
+.gs-visibleUrl {
+  color: #666 !important;
+  font-size: 0.78em !important;
+}
+
+.gsc-url-top {
+  padding-bottom: 4px !important;
+}
+
+/* Hide Google branding bar and search box (we only want results) */
+.gsc-above-wrapper-area,
+.gsc-search-box,
+.gcsc-find-more-on-google,
+.gsc-orderby-container {
+  display: none !important;
+}
+
+.gsc-cursor-box {
   text-align: center;
+  margin-top: 20px;
 }
 
-.wild-footer-link a {
-  display: inline-block;
-  padding: 10px 20px;
-  border-radius: 6px;
-  background: rgba(118, 185, 0, 0.08);
-  color: var(--nvidia-green);
-  font-size: 0.85em;
-  font-weight: 500;
-  text-decoration: none;
-  transition: background 0.12s;
+.gsc-cursor-page {
+  color: var(--nvidia-green) !important;
+  background: rgba(118, 185, 0, 0.08) !important;
+  border: 1px solid rgba(118, 185, 0, 0.2) !important;
+  border-radius: 4px !important;
+  padding: 4px 10px !important;
+  margin: 0 4px !important;
+  cursor: pointer;
 }
 
-.wild-footer-link a:hover { background: rgba(118, 185, 0, 0.15); text-decoration: none; }
+.gsc-cursor-current-page {
+  background: var(--nvidia-green) !important;
+  color: var(--nvidia-darker, #0f0f1a) !important;
+  font-weight: 600;
+}
 
-.wild-loading {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
+/* Loading state while CSE initializes */
+.gcse-wrapper:empty::after {
+  content: 'Loading Google search results...';
+  display: block;
+  text-align: center;
   padding: 50px 0;
   color: #666;
-  font-size: 0.85em;
+  font-size: 0.9em;
 }
-
-.spinner {
-  width: 18px; height: 18px;
-  border: 2px solid #333;
-  border-top-color: var(--nvidia-green);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-
-@keyframes spin { to { transform: rotate(360deg); } }
 </style>
-
-<script>
-(function() {
-  /*
-   * Uses SearXNG public instances — open-source meta-search engines
-   * that aggregate results from Google, Bing, etc. and return clean JSON.
-   * Multiple instances as fallbacks in case one is down.
-   */
-  var SEARXNG_INSTANCES = [
-    'https://search.ononoki.org',
-    'https://searx.be',
-    'https://search.sapti.me',
-    'https://paulgo.io',
-    'https://search.bus-hit.me',
-    'https://searx.tiekoetter.com'
-  ];
-
-  function escapeHtml(text) {
-    var div = document.createElement('div');
-    div.appendChild(document.createTextNode(text));
-    return div.innerHTML;
-  }
-
-  function getDomain(url) {
-    try { return new URL(url).hostname.replace('www.', ''); }
-    catch(e) { return ''; }
-  }
-
-  function getTimeAgo(dateStr) {
-    if (!dateStr) return '';
-    try {
-      var date = new Date(dateStr);
-      if (isNaN(date.getTime())) return '';
-      var seconds = Math.floor((new Date() - date) / 1000);
-      if (seconds < 60) return 'just now';
-      var minutes = Math.floor(seconds / 60);
-      if (minutes < 60) return minutes + 'm ago';
-      var hours = Math.floor(minutes / 60);
-      if (hours < 24) return hours + 'h ago';
-      var days = Math.floor(hours / 24);
-      return days + 'd ago';
-    } catch(e) { return ''; }
-  }
-
-  // Strip HTML tags that SearXNG sometimes includes in snippets
-  function stripHtml(html) {
-    var tmp = document.createElement('div');
-    tmp.innerHTML = html;
-    return tmp.textContent || tmp.innerText || '';
-  }
-
-  function renderResults(items) {
-    var feed = document.getElementById('results-feed');
-    if (items.length === 0) {
-      feed.innerHTML = '<div class="wild-empty">No cuDNN mentions found in the past 24 hours.<br><a href="https://www.google.com/search?q=cuDNN&tbs=qdr:d" target="_blank">Try searching Google directly →</a></div>';
-      return;
-    }
-    feed.innerHTML = items.map(function(item) {
-      var timeAgo = getTimeAgo(item.publishedDate);
-      var engines = item.engines ? item.engines.join(', ') : 'web';
-      return '<a class="wild-result" href="' + escapeHtml(item.url) + '" target="_blank">' +
-        '<div class="wild-result-title">' + escapeHtml(item.title) + '</div>' +
-        '<div class="wild-result-meta">' +
-          '<span class="wild-result-source">' + escapeHtml(engines) + '</span>' +
-          (timeAgo ? '<span class="wild-result-dot">&middot;</span><span>' + timeAgo + '</span>' : '') +
-          (item.domain ? '<span class="wild-result-dot">&middot;</span><span>' + escapeHtml(item.domain) + '</span>' : '') +
-        '</div>' +
-        (item.snippet ? '<div class="wild-result-snippet">' + escapeHtml(item.snippet) + '</div>' : '') +
-        '</a>';
-    }).join('');
-  }
-
-  async function trySearXNG(instance) {
-    var url = instance + '/search?q=cuDNN+OR+cudnn-frontend&format=json&time_range=day&language=en';
-    var resp = await fetch(url, {
-      headers: { 'Accept': 'application/json' }
-    });
-    if (!resp.ok) throw new Error('Instance returned ' + resp.status);
-    var data = await resp.json();
-    if (!data.results || data.results.length === 0) throw new Error('No results');
-    return data.results;
-  }
-
-  async function loadResults() {
-    var feed = document.getElementById('results-feed');
-    var btn = document.getElementById('refresh-btn');
-    var ts = document.getElementById('last-updated');
-
-    feed.innerHTML = '<div class="wild-loading"><div class="spinner"></div><span>Searching for cuDNN mentions...</span></div>';
-    btn.classList.add('loading');
-
-    var results = null;
-
-    // Try each SearXNG instance until one works
-    for (var i = 0; i < SEARXNG_INSTANCES.length; i++) {
-      try {
-        results = await trySearXNG(SEARXNG_INSTANCES[i]);
-        break;
-      } catch(e) {
-        continue;
-      }
-    }
-
-    if (results && results.length > 0) {
-      // Deduplicate by URL
-      var seen = {};
-      var deduped = [];
-      results.forEach(function(r) {
-        if (!seen[r.url] && deduped.length < 8) {
-          seen[r.url] = true;
-          deduped.push({
-            title: r.title || 'Untitled',
-            url: r.url,
-            domain: getDomain(r.url),
-            snippet: r.content ? stripHtml(r.content).substring(0, 200) : '',
-            publishedDate: r.publishedDate || '',
-            engines: r.engines || []
-          });
-        }
-      });
-      renderResults(deduped);
-    } else {
-      feed.innerHTML = '<div class="wild-empty">Could not fetch results from any search provider.<br><a href="https://www.google.com/search?q=cuDNN&tbs=qdr:d" target="_blank">View results on Google directly →</a></div>';
-    }
-
-    btn.classList.remove('loading');
-    ts.textContent = 'Updated ' + new Date().toLocaleTimeString();
-  }
-
-  window.refreshResults = loadResults;
-  loadResults();
-})();
-</script>
