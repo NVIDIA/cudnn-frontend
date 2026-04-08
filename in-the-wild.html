@@ -6,185 +6,142 @@ permalink: /in-the-wild/
 
 <div class="wild-header">
   <h1>cuDNN in the Wild</h1>
-  <p class="wild-subtitle">Live mentions of cuDNN across the internet — fetched right here in your browser.</p>
+  <p class="wild-subtitle">Recent web mentions of cuDNN from the past 24 hours — fetched live in your browser.</p>
+  <div class="wild-controls">
+    <button class="wild-refresh" id="refresh-btn" onclick="refreshResults()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+      Refresh
+    </button>
+    <span class="wild-timestamp" id="last-updated"></span>
+  </div>
 </div>
 
-<div class="wild-grid">
+<div class="wild-feed" id="results-feed">
+  <div class="wild-loading" id="loading-state">
+    <div class="spinner"></div>
+    <span>Searching the web for cuDNN mentions...</span>
+  </div>
+</div>
 
-  <!-- X / Twitter -->
-  <section class="wild-section">
-    <div class="wild-section-header">
-      <svg class="wild-icon" viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
-      <h2>X (Twitter)</h2>
-      <span class="wild-count" id="x-count"></span>
-    </div>
-    <div class="wild-cards" id="x-cards">
-      <div class="wild-loading">
-        <div class="spinner"></div>
-        <span>Searching X...</span>
-      </div>
-    </div>
-    <a href="https://x.com/search?q=cuDNN%20OR%20cudnn-frontend&f=live" target="_blank" class="wild-view-all">View all on X →</a>
-  </section>
-
-  <!-- Reddit -->
-  <section class="wild-section">
-    <div class="wild-section-header">
-      <svg class="wild-icon" viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12c0 5.302 3.438 9.8 8.205 11.387.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 17.07 3.633 16.7 3.633 16.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 21.795 24 17.295 24 12c0-6.627-5.373-12-12-12"/></svg>
-      <h2>Reddit</h2>
-      <span class="wild-count" id="reddit-count"></span>
-    </div>
-    <div class="wild-cards" id="reddit-cards">
-      <div class="wild-loading">
-        <div class="spinner"></div>
-        <span>Searching Reddit...</span>
-      </div>
-    </div>
-    <a href="https://www.reddit.com/search/?q=cuDNN&sort=new" target="_blank" class="wild-view-all">View all on Reddit →</a>
-  </section>
-
-  <!-- YouTube -->
-  <section class="wild-section">
-    <div class="wild-section-header">
-      <svg class="wild-icon" viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
-      <h2>YouTube</h2>
-      <span class="wild-count" id="youtube-count"></span>
-    </div>
-    <div class="wild-cards" id="youtube-cards">
-      <div class="wild-loading">
-        <div class="spinner"></div>
-        <span>Searching YouTube...</span>
-      </div>
-    </div>
-    <a href="https://www.youtube.com/results?search_query=cuDNN" target="_blank" class="wild-view-all">View all on YouTube →</a>
-  </section>
-
-  <!-- Web -->
-  <section class="wild-section">
-    <div class="wild-section-header">
-      <svg class="wild-icon" viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
-      <h2>Web</h2>
-      <span class="wild-count" id="web-count"></span>
-    </div>
-    <div class="wild-cards" id="web-cards">
-      <div class="wild-loading">
-        <div class="spinner"></div>
-        <span>Searching the web...</span>
-      </div>
-    </div>
-    <a href="https://www.google.com/search?q=cuDNN&tbs=qdr:m" target="_blank" class="wild-view-all">View all on Google →</a>
-  </section>
-
+<div class="wild-footer-link">
+  <a href="https://www.google.com/search?q=cuDNN&tbs=qdr:d" target="_blank">View full Google search for cuDNN (past 24h) →</a>
 </div>
 
 <style>
-/* ============ In the Wild Page ============ */
-.wild-header { margin-bottom: 32px; }
+.wild-header { margin-bottom: 28px; }
 .wild-header h1 { margin-bottom: 6px; }
-.wild-subtitle { color: #777; font-size: 0.95em; margin: 0; }
+.wild-subtitle { color: #777; font-size: 0.95em; margin: 0 0 16px 0; }
 
-.wild-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 28px;
-}
-
-@media (max-width: 900px) {
-  .wild-grid { grid-template-columns: 1fr; }
-}
-
-.wild-section {
-  background: var(--nvidia-dark);
-  border-radius: 10px;
-  padding: 24px;
-  border: 1px solid #2a2a3e;
-  display: flex;
-  flex-direction: column;
-}
-
-.wild-section-header {
+.wild-controls {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 18px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid #2a2a3e;
+  gap: 14px;
 }
 
-.wild-icon { color: var(--nvidia-green); flex-shrink: 0; }
-
-.wild-section-header h2 {
-  font-size: 1.05em;
-  margin: 0;
-  padding: 0;
-  border: none;
-  color: var(--nvidia-white, #f0f0f0);
-  flex: 1;
-}
-
-.wild-count {
-  font-size: 0.75em;
-  color: #666;
+.wild-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   background: rgba(118, 185, 0, 0.1);
-  padding: 2px 8px;
-  border-radius: 10px;
+  border: 1px solid rgba(118, 185, 0, 0.25);
+  color: var(--nvidia-green);
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 0.82em;
+  font-weight: 500;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.12s;
 }
 
-.wild-cards {
-  flex: 1;
+.wild-refresh:hover { background: rgba(118, 185, 0, 0.18); }
+.wild-refresh.loading svg { animation: spin 0.8s linear infinite; }
+
+.wild-timestamp { color: #555; font-size: 0.78em; }
+
+.wild-feed {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  min-height: 120px;
+  gap: 2px;
+  min-height: 200px;
 }
 
-.wild-card {
-  background: rgba(255,255,255,0.03);
-  border-radius: 8px;
-  padding: 14px 16px;
-  border-left: 3px solid var(--nvidia-green);
-  transition: background 0.12s;
-}
-
-.wild-card:hover { background: rgba(118, 185, 0, 0.05); }
-
-.wild-card-title {
+.wild-result {
   display: block;
-  color: var(--nvidia-white, #f0f0f0);
-  font-size: 0.9em;
-  font-weight: 500;
+  padding: 18px 20px;
+  border-radius: 8px;
   text-decoration: none;
+  transition: background 0.1s;
+  border-left: 3px solid transparent;
+}
+
+.wild-result:hover {
+  background: rgba(118, 185, 0, 0.04);
+  border-left-color: var(--nvidia-green);
+  text-decoration: none;
+}
+
+.wild-result-title {
+  color: var(--nvidia-white, #f0f0f0);
+  font-size: 0.95em;
+  font-weight: 500;
+  line-height: 1.4;
   margin-bottom: 6px;
-  line-height: 1.4;
 }
 
-.wild-card-title:hover { color: var(--nvidia-green); text-decoration: none; }
+.wild-result:hover .wild-result-title { color: var(--nvidia-green); }
 
-.wild-card-meta {
+.wild-result-meta {
   display: flex;
-  gap: 12px;
-  font-size: 0.75em;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.78em;
   color: #666;
+  flex-wrap: wrap;
 }
 
-.wild-card-meta span { white-space: nowrap; }
-
-.wild-card-snippet {
+.wild-result-source {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(255,255,255,0.05);
+  padding: 1px 8px;
+  border-radius: 3px;
+  font-weight: 500;
   color: #888;
-  font-size: 0.82em;
+}
+
+.wild-result-snippet {
+  color: #888;
+  font-size: 0.84em;
   margin-top: 6px;
-  line-height: 1.4;
+  line-height: 1.45;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
 
-.wild-view-all {
-  display: block;
+.wild-result-dot { color: #444; }
+
+.wild-empty {
   text-align: center;
-  margin-top: 16px;
-  padding: 10px;
+  padding: 40px 20px;
+  color: #666;
+  font-size: 0.9em;
+  line-height: 1.6;
+}
+
+.wild-empty a { color: var(--nvidia-green); }
+
+.wild-footer-link {
+  margin-top: 24px;
+  text-align: center;
+}
+
+.wild-footer-link a {
+  display: inline-block;
+  padding: 10px 20px;
   border-radius: 6px;
   background: rgba(118, 185, 0, 0.08);
   color: var(--nvidia-green);
@@ -194,28 +151,17 @@ permalink: /in-the-wild/
   transition: background 0.12s;
 }
 
-.wild-view-all:hover { background: rgba(118, 185, 0, 0.15); text-decoration: none; }
+.wild-footer-link a:hover { background: rgba(118, 185, 0, 0.15); text-decoration: none; }
 
-/* Loading / Error states */
 .wild-loading {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 10px;
-  padding: 30px 0;
+  padding: 50px 0;
   color: #666;
   font-size: 0.85em;
 }
-
-.wild-error {
-  text-align: center;
-  padding: 20px 16px;
-  color: #666;
-  font-size: 0.85em;
-  line-height: 1.5;
-}
-
-.wild-error a { color: var(--nvidia-green); }
 
 .spinner {
   width: 18px; height: 18px;
@@ -230,122 +176,9 @@ permalink: /in-the-wild/
 
 <script>
 (function() {
-  const CORS_PROXY = 'https://api.allorigins.win/raw?url=';
+  var CORS_PROXY = 'https://api.allorigins.win/raw?url=';
+  var TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
 
-  // ========== Reddit via JSON API ==========
-  async function fetchReddit() {
-    const container = document.getElementById('reddit-cards');
-    const countEl = document.getElementById('reddit-count');
-    try {
-      const url = encodeURIComponent('https://www.reddit.com/search.json?q=cuDNN+OR+cudnn-frontend&sort=new&limit=3');
-      const resp = await fetch(CORS_PROXY + url);
-      if (!resp.ok) throw new Error('Reddit fetch failed');
-      const data = await resp.json();
-      const posts = data.data.children.slice(0, 3);
-      if (posts.length === 0) throw new Error('No results');
-      countEl.textContent = posts.length + ' found';
-      container.innerHTML = posts.map(function(item) {
-        const p = item.data;
-        const date = new Date(p.created_utc * 1000);
-        const timeAgo = getTimeAgo(date);
-        const sub = 'r/' + p.subreddit;
-        const snippet = p.selftext ? p.selftext.substring(0, 140) : '';
-        return '<a class="wild-card" href="https://reddit.com' + p.permalink + '" target="_blank">' +
-          '<span class="wild-card-title">' + escapeHtml(p.title) + '</span>' +
-          '<div class="wild-card-meta"><span>' + sub + '</span><span>' + timeAgo + '</span><span>↑ ' + p.score + '</span></div>' +
-          (snippet ? '<div class="wild-card-snippet">' + escapeHtml(snippet) + '</div>' : '') +
-          '</a>';
-      }).join('');
-    } catch(e) {
-      container.innerHTML = '<div class="wild-error">Could not fetch live results.<br><a href="https://www.reddit.com/search/?q=cuDNN&sort=new" target="_blank">Search Reddit directly →</a></div>';
-      countEl.textContent = '';
-    }
-  }
-
-  // ========== YouTube via RSS ==========
-  async function fetchYouTube() {
-    const container = document.getElementById('youtube-cards');
-    const countEl = document.getElementById('youtube-count');
-    try {
-      // YouTube search RSS isn't available, so we scrape search results via proxy
-      const url = encodeURIComponent('https://www.youtube.com/results?search_query=cuDNN');
-      const resp = await fetch(CORS_PROXY + url);
-      if (!resp.ok) throw new Error('YouTube fetch failed');
-      const html = await resp.text();
-      // Extract video data from ytInitialData
-      const match = html.match(/var ytInitialData\s*=\s*(\{.+?\});\s*<\/script>/s);
-      if (!match) throw new Error('Parse failed');
-      const data = JSON.parse(match[1]);
-      const contents = data.contents.twoColumnSearchResultsRenderer.primaryContents.sectionListRenderer.contents[0].itemSectionRenderer.contents;
-      const videos = contents.filter(function(c) { return c.videoRenderer; }).slice(0, 3);
-      if (videos.length === 0) throw new Error('No videos');
-      countEl.textContent = videos.length + ' found';
-      container.innerHTML = videos.map(function(item) {
-        const v = item.videoRenderer;
-        const title = v.title.runs[0].text;
-        const videoId = v.videoId;
-        const channel = v.ownerText.runs[0].text;
-        const published = v.publishedTimeText ? v.publishedTimeText.simpleText : '';
-        const views = v.viewCountText ? v.viewCountText.simpleText : '';
-        return '<a class="wild-card" href="https://www.youtube.com/watch?v=' + videoId + '" target="_blank">' +
-          '<span class="wild-card-title">' + escapeHtml(title) + '</span>' +
-          '<div class="wild-card-meta"><span>' + escapeHtml(channel) + '</span>' +
-          (published ? '<span>' + published + '</span>' : '') +
-          (views ? '<span>' + views + '</span>' : '') +
-          '</div></a>';
-      }).join('');
-    } catch(e) {
-      container.innerHTML = '<div class="wild-error">Could not fetch live results.<br><a href="https://www.youtube.com/results?search_query=cuDNN" target="_blank">Search YouTube directly →</a></div>';
-      countEl.textContent = '';
-    }
-  }
-
-  // ========== X (Twitter) — no public API, provide search link ==========
-  async function fetchX() {
-    const container = document.getElementById('x-cards');
-    const countEl = document.getElementById('x-count');
-    // X/Twitter has no public search API accessible client-side
-    // We provide a polished fallback with direct search link
-    container.innerHTML =
-      '<div class="wild-error">' +
-      'X (Twitter) requires authentication for search.<br>' +
-      'Click below to see live cuDNN mentions.' +
-      '</div>';
-    countEl.textContent = 'live link';
-  }
-
-  // ========== Web — use Hacker News API as a proxy for "tech web" ==========
-  async function fetchWeb() {
-    const container = document.getElementById('web-cards');
-    const countEl = document.getElementById('web-count');
-    try {
-      // Use Hacker News Algolia API (CORS-friendly, no auth needed)
-      const resp = await fetch('https://hn.algolia.com/api/v1/search_by_date?query=cuDNN&tags=story&hitsPerPage=3');
-      if (!resp.ok) throw new Error('HN fetch failed');
-      const data = await resp.json();
-      const hits = data.hits.slice(0, 3);
-      if (hits.length === 0) throw new Error('No results');
-      countEl.textContent = hits.length + ' found';
-      container.innerHTML = hits.map(function(h) {
-        const date = new Date(h.created_at);
-        const timeAgo = getTimeAgo(date);
-        const link = h.url || ('https://news.ycombinator.com/item?id=' + h.objectID);
-        const hnLink = 'https://news.ycombinator.com/item?id=' + h.objectID;
-        return '<a class="wild-card" href="' + link + '" target="_blank">' +
-          '<span class="wild-card-title">' + escapeHtml(h.title) + '</span>' +
-          '<div class="wild-card-meta">' +
-          '<span>' + (h.author || 'unknown') + '</span>' +
-          '<span>' + timeAgo + '</span>' +
-          '<span>↑ ' + (h.points || 0) + '</span>' +
-          '</div></a>';
-      }).join('');
-    } catch(e) {
-      container.innerHTML = '<div class="wild-error">Could not fetch live results.<br><a href="https://www.google.com/search?q=cuDNN&tbs=qdr:m" target="_blank">Search Google directly →</a></div>';
-      countEl.textContent = '';
-    }
-  }
-
-  // ========== Helpers ==========
   function escapeHtml(text) {
     var div = document.createElement('div');
     div.appendChild(document.createTextNode(text));
@@ -360,15 +193,128 @@ permalink: /in-the-wild/
     var hours = Math.floor(minutes / 60);
     if (hours < 24) return hours + 'h ago';
     var days = Math.floor(hours / 24);
-    if (days < 30) return days + 'd ago';
-    var months = Math.floor(days / 30);
-    return months + 'mo ago';
+    if (days < 7) return days + 'd ago';
+    return date.toLocaleDateString();
   }
 
-  // ========== Fire all fetches in parallel ==========
-  fetchX();
-  fetchReddit();
-  fetchYouTube();
-  fetchWeb();
+  function getDomain(url) {
+    try { return new URL(url).hostname.replace('www.', ''); }
+    catch(e) { return ''; }
+  }
+
+  function renderResults(items) {
+    var feed = document.getElementById('results-feed');
+    if (items.length === 0) {
+      feed.innerHTML = '<div class="wild-empty">No cuDNN mentions found in the past 24 hours.<br><a href="https://www.google.com/search?q=cuDNN&tbs=qdr:d" target="_blank">Try searching Google directly →</a></div>';
+      return;
+    }
+    feed.innerHTML = items.map(function(item) {
+      return '<a class="wild-result" href="' + item.url + '" target="_blank">' +
+        '<div class="wild-result-title">' + escapeHtml(item.title) + '</div>' +
+        '<div class="wild-result-meta">' +
+          '<span class="wild-result-source">' + escapeHtml(item.source) + '</span>' +
+          '<span class="wild-result-dot">&middot;</span>' +
+          '<span>' + getTimeAgo(item.date) + '</span>' +
+          (item.domain ? '<span class="wild-result-dot">&middot;</span><span>' + escapeHtml(item.domain) + '</span>' : '') +
+        '</div>' +
+        (item.snippet ? '<div class="wild-result-snippet">' + escapeHtml(item.snippet) + '</div>' : '') +
+        '</a>';
+    }).join('');
+  }
+
+  // Google News RSS
+  async function fetchGoogleNews() {
+    var url = encodeURIComponent('https://news.google.com/rss/search?q=cuDNN+OR+cudnn-frontend&hl=en-US&gl=US&ceid=US:en');
+    var resp = await fetch(CORS_PROXY + url);
+    if (!resp.ok) throw new Error('fail');
+    var text = await resp.text();
+    var parser = new DOMParser();
+    var xml = parser.parseFromString(text, 'text/xml');
+    var items = xml.querySelectorAll('item');
+    var results = [];
+    var cutoff = Date.now() - TWENTY_FOUR_HOURS;
+    for (var i = 0; i < items.length && results.length < 5; i++) {
+      var titleEl = items[i].querySelector('title');
+      var linkEl = items[i].querySelector('link');
+      var pubDateEl = items[i].querySelector('pubDate');
+      var descEl = items[i].querySelector('description');
+      if (!titleEl || !linkEl) continue;
+      var date = pubDateEl ? new Date(pubDateEl.textContent) : new Date();
+      if (date.getTime() < cutoff) continue;
+      var link = linkEl.textContent || (linkEl.nextSibling ? linkEl.nextSibling.textContent.trim() : '');
+      var snippet = '';
+      if (descEl) {
+        var tmp = document.createElement('div');
+        tmp.innerHTML = descEl.textContent;
+        snippet = tmp.textContent.substring(0, 200);
+      }
+      results.push({
+        title: titleEl.textContent,
+        url: link,
+        date: date,
+        source: 'Google News',
+        domain: getDomain(link),
+        snippet: snippet
+      });
+    }
+    return results;
+  }
+
+  // Hacker News Algolia API (CORS-friendly, no proxy needed)
+  async function fetchHackerNews() {
+    var cutoffSeconds = Math.floor((Date.now() - TWENTY_FOUR_HOURS) / 1000);
+    var resp = await fetch('https://hn.algolia.com/api/v1/search_by_date?query=cuDNN&tags=(story,comment)&numericFilters=created_at_i>' + cutoffSeconds + '&hitsPerPage=5');
+    if (!resp.ok) throw new Error('fail');
+    var data = await resp.json();
+    return data.hits.map(function(h) {
+      return {
+        title: h.title || ('Comment by ' + h.author + ' on "' + (h.story_title || 'Hacker News') + '"'),
+        url: h.url || ('https://news.ycombinator.com/item?id=' + (h.story_id || h.objectID)),
+        date: new Date(h.created_at),
+        source: 'Hacker News',
+        domain: h.url ? getDomain(h.url) : 'news.ycombinator.com',
+        snippet: ''
+      };
+    });
+  }
+
+  // Main: fetch all, merge, sort, render
+  async function loadResults() {
+    var feed = document.getElementById('results-feed');
+    var btn = document.getElementById('refresh-btn');
+    var ts = document.getElementById('last-updated');
+
+    feed.innerHTML = '<div class="wild-loading"><div class="spinner"></div><span>Searching the web for cuDNN mentions...</span></div>';
+    btn.classList.add('loading');
+
+    var allResults = [];
+    var fetches = [
+      fetchGoogleNews().catch(function() { return []; }),
+      fetchHackerNews().catch(function() { return []; })
+    ];
+    var results = await Promise.all(fetches);
+    results.forEach(function(r) { allResults = allResults.concat(r); });
+
+    // Sort by date descending
+    allResults.sort(function(a, b) { return b.date - a.date; });
+
+    // Deduplicate by title similarity
+    var seen = {};
+    var deduped = [];
+    allResults.forEach(function(item) {
+      var key = item.title.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 40);
+      if (!seen[key]) {
+        seen[key] = true;
+        deduped.push(item);
+      }
+    });
+
+    renderResults(deduped.slice(0, 8));
+    btn.classList.remove('loading');
+    ts.textContent = 'Updated ' + new Date().toLocaleTimeString();
+  }
+
+  window.refreshResults = loadResults;
+  loadResults();
 })();
 </script>
