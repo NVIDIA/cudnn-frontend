@@ -44,7 +44,7 @@ from cutlass.cute.typing import Int32, Int64, Float32
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from .fmha_utils import (
+from ..fmha_utils import (
     compute_grid,
     compute_grid_clc,
     create_fmha_static_tile_scheduler,
@@ -536,7 +536,6 @@ class BlackwellFusedAttentionDQKernel:
         sum_odo_smem_layout: cute.Layout,
         tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
     ):
-
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         #
         # Prefetch tma desc

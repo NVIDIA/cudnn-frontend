@@ -133,12 +133,12 @@ TEST_CASE("Cached sdpa", "[graph][sdpa][flash]") {
     //// Build variant pack
     std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> variant_pack;
     // inputs
-    Surface<half> q_tensor(b * h_q * s_q * d_qk, false);
-    Surface<half> k_tensor(b * h_k * d_qk * s_kv, false);
-    Surface<half> v_tensor(b * h_v * d_v * s_kv, false);
+    Surface<half> q_tensor(b * h_q * s_q * d_qk);
+    Surface<half> k_tensor(b * h_k * d_qk * s_kv);
+    Surface<half> v_tensor(b * h_v * d_v * s_kv);
 
-    Surface<half> o_tensor(b * h_q * s_q * d_qk, false);
-    Surface<float> stats_tensor(b * h_q * s_q * 1, false);
+    Surface<half> o_tensor(b * h_q * s_q * d_qk);
+    Surface<float> stats_tensor(b * h_q * s_q * 1);
 
     variant_pack = {{Q_UID, q_tensor.devPtr},
                     {K_UID, k_tensor.devPtr},
@@ -148,15 +148,15 @@ TEST_CASE("Cached sdpa", "[graph][sdpa][flash]") {
 
     int64_t workspace_size = 0;
     REQUIRE(fwd_graph2->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> fwd_workspace(workspace_size, false);
+    Surface<int8_t> fwd_workspace(workspace_size);
 
     REQUIRE(fwd_graph2->execute(handle, variant_pack, fwd_workspace.devPtr).is_good());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    Surface<half> dO_tensor(b * h_q * s_q * d_qk, false);
-    Surface<half> dQ_tensor(b * h_q * s_q * d_qk, false);
-    Surface<half> dK_tensor(b * h_k * s_kv * d_qk, false);
-    Surface<half> dV_tensor(b * h_v * s_kv * d_v, false);
+    Surface<half> dO_tensor(b * h_q * s_q * d_qk);
+    Surface<half> dQ_tensor(b * h_q * s_q * d_qk);
+    Surface<half> dK_tensor(b * h_k * s_kv * d_qk);
+    Surface<half> dV_tensor(b * h_v * s_kv * d_v);
 
     variant_pack = {// inputs
                     {Q_UID, q_tensor.devPtr},
@@ -171,7 +171,7 @@ TEST_CASE("Cached sdpa", "[graph][sdpa][flash]") {
                     {DV_UID, dV_tensor.devPtr}};
 
     REQUIRE(bwd_graph2->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> bwd_workspace(workspace_size, false);
+    Surface<int8_t> bwd_workspace(workspace_size);
 
     REQUIRE(bwd_graph2->execute(handle, variant_pack, bwd_workspace.devPtr).is_good());
 

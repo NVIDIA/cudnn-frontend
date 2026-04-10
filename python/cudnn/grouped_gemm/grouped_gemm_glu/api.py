@@ -822,6 +822,8 @@ class GroupedGemmGluSm100(APIBase):
                     stride=(1, n_sym),
                 )
 
+        cached_linear_offset = cutlass.Float32(1.0 if self.act_func == "geglu" else 0.0)
+
         # Compile with keyword args (dense mode uses the unified __call__ positional order)
         _compiled_kernel = cute.compile(
             gemm_glu,
@@ -848,7 +850,7 @@ class GroupedGemmGluSm100(APIBase):
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
             epilogue_op=lambda x: x,
-            linear_offset=cutlass.Float32(0.0),
+            linear_offset=cached_linear_offset,
             options="--enable-tvm-ffi",
         )
 
@@ -895,7 +897,7 @@ class GroupedGemmGluSm100(APIBase):
                 prob_tensor,
                 bias_tensor,
                 stream,
-                cutlass.Float32(0.0),  # linear_offset (epilogue_op is Constexpr, baked in)
+                cached_linear_offset,
             )
 
         self._compiled_kernel = tensor_api
@@ -995,6 +997,8 @@ class GroupedGemmGluSm100(APIBase):
 
         workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
 
+        cached_linear_offset = cutlass.Float32(1.0 if self.act_func == "geglu" else 0.0)
+
         self._logger.debug("Compiling discrete grouped GEMM GLU kernel")
         _compiled_kernel = cute.compile(
             gemm_glu,
@@ -1021,7 +1025,7 @@ class GroupedGemmGluSm100(APIBase):
             max_active_clusters,
             fake_stream,
             lambda x: x,  # epilogue_op (Constexpr, baked in)
-            cutlass.Float32(0.0),  # linear_offset
+            cached_linear_offset,
             options="--enable-tvm-ffi",
         )
 
@@ -1078,7 +1082,7 @@ class GroupedGemmGluSm100(APIBase):
                 prob_tensor,
                 bias_tensor,
                 stream,
-                cutlass.Float32(0.0),  # linear_offset (epilogue_op is Constexpr, baked in)
+                cached_linear_offset,
             )
 
         self._compiled_kernel = tensor_api

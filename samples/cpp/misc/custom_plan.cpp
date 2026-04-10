@@ -44,9 +44,9 @@ TEST_CASE("Matmul custom plan", "[matmul][graph][autotuning]") {
     int64_t const k = 128;
 
     // Initialize input tensors
-    Surface<half> A_gpu(b * m * k, false);
-    Surface<half> B_gpu(b * k * n, false);
-    Surface<half> C_gpu(b * m * n, false);
+    Surface<half> A_gpu(b * m * k);
+    Surface<half> B_gpu(b * k * n);
+    Surface<half> C_gpu(b * m * n);
 
     int64_t a_uid = 0, b_uid = 1, c_uid = 2;
 
@@ -123,11 +123,11 @@ TEST_CASE("Matmul custom plan", "[matmul][graph][autotuning]") {
     std::unordered_map<int64_t, void *> variant_pack = {
         {a_uid, A_gpu.devPtr}, {b_uid, B_gpu.devPtr}, {c_uid, C_gpu.devPtr}};
 
-    Surface<int8_t> workspace1(graph.get_workspace_size_plan_at_index(0), false);
+    Surface<int8_t> workspace1(graph.get_workspace_size_plan_at_index(0));
     REQUIRE(graph.execute_plan_at_index(handle, variant_pack, workspace1.devPtr, 0).is_good());
 
     if (plan_count > 1) {
-        Surface<int8_t> workspace2(graph.get_workspace_size_plan_at_index(1), false);
+        Surface<int8_t> workspace2(graph.get_workspace_size_plan_at_index(1));
         REQUIRE(graph.execute_plan_at_index(handle, variant_pack, workspace2.devPtr, 1).is_good());
     }
 }

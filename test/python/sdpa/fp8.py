@@ -316,6 +316,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     right_bound = cfg.right_bound if hasattr(cfg, 'right_bound') else None
     diag_align = cfg.diag_align if hasattr(cfg, 'diag_align') else None
     with_sink_token = cfg.with_sink_token if hasattr(cfg, 'with_sink_token') else False
+    rescale_threshold = cfg.rescale_threshold if hasattr(cfg, 'rescale_threshold') and cfg.rescale_threshold is not None else 4.0
 
     attn_scale = 0.125
 
@@ -389,7 +390,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
                                             s_scale=s_scale_gpu, s_descale=s_descale_gpu, torch_itype=torch_itype,
                                             torch_otype=torch_otype, padding=padding,
                                             left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
-                                            sink_token=sink_token_gpu)
+                                            sink_token=sink_token_gpu, rescale_threshold=rescale_threshold)
 
     o_scale_gpu = torch.tensor([get_fp8_scale_factor(o_amax, torch_otype)], dtype=torch.float, device="cuda")
 

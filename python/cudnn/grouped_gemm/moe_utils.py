@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
 """
@@ -496,3 +496,194 @@ class DiscreteWeightTensormapConstructor(OnlineTensormapDescCreator):
             internal_type=cutlass.Uint64,
         )
         store_tma_desc(tma_atom_sfb, self.get_desc_ptr("sfb", expert_idx))
+
+
+class DiscreteOutputTensormapConstructor(OnlineTensormapDescCreator):
+    """Construct expert-wise output TMA descriptors for grouped GEMM wgrad."""
+
+    def __init__(
+        self,
+        c_dtype,
+        epi_smem_layout,
+        c_tma_op,
+        epi_tile,
+        c_ptrs: cute.Tensor,
+        m: Int32,
+        n: Int32,
+        c_stride_m: Int32,
+        c_stride_n: Int32,
+        workspace_ptr: Pointer,
+    ) -> None:
+        super().__init__()
+        self.c_dtype = c_dtype
+        self.epi_smem_layout = epi_smem_layout
+        self.c_tma_op = c_tma_op
+        self.epi_tile = epi_tile
+        self.c_ptrs = c_ptrs
+        self.m = m
+        self.n = n
+        self.c_stride_m = c_stride_m
+        self.c_stride_n = c_stride_n
+        self.workspace = TensormapWorkspace(workspace_ptr, ["c"])
+
+    @staticmethod
+    def get_workspace_size(expert_cnt: int) -> int:
+        return TensormapWorkspace.size_bytes(1, expert_cnt)
+
+    @cute.jit
+    def get_desc_ptr(self, tensor_name: str, executor_idx: Int32) -> Pointer:
+        return self.workspace.get_ptr(tensor_name, executor_idx)
+
+    @cute.jit
+    def construct_and_write(self, expert_idx: Int32, dependency=None) -> None:
+        from cutlass.cute.nvgpu import cpasync
+
+        c1 = cutlass.Int32(1)
+        c0 = cutlass.Int32(0)
+        c_ptr = cute.make_ptr(self.c_dtype, self.c_ptrs[expert_idx], AddressSpace.gmem)
+        c_layout = cute.make_layout(
+            (self.m, self.n, c1),
+            stride=(self.c_stride_m, self.c_stride_n, c0),
+        )
+        c_tensor = cute.make_tensor(c_ptr, c_layout)
+        tma_atom_c, _ = cpasync.make_tiled_tma_atom(
+            self.c_tma_op,
+            c_tensor,
+            self.epi_smem_layout,
+            self.epi_tile,
+        )
+        store_tma_desc(tma_atom_c, self.get_desc_ptr("c", expert_idx))
+
+
+class WgradSfTensormapConstructor(OnlineTensormapDescCreator):
+    """Construct expert-wise wgrad SFA/SFB descriptors and optional C descriptors."""
+
+    def __init__(
+        self,
+        sf_vec_size: int,
+        weight_mode,
+        sfa_tma_op,
+        sfb_tma_op,
+        sfa_smem_layout,
+        sfb_smem_layout,
+        tiled_mma,
+        tiled_mma_sfb,
+        mma_tiler,
+        mma_tiler_sfb,
+        cluster_layout_vmnk_shape,
+        cluster_layout_sfb_vmnk_shape,
+        sfa_tensor: cute.Tensor,
+        sfb_tensor: cute.Tensor,
+        offs: cute.Tensor,
+        workspace_ptr,
+        c_tma_op=None,
+        epi_smem_layout=None,
+        epi_tile=None,
+        c_ptrs=None,
+        c_single_expert=None,
+        expert_cnt: int = 1,
+    ) -> None:
+        super().__init__()
+        self.sf_vec_size = sf_vec_size
+        self.weight_mode = weight_mode
+        self.sfa_tma_op = sfa_tma_op
+        self.sfb_tma_op = sfb_tma_op
+        self.sfa_smem_layout = sfa_smem_layout
+        self.sfb_smem_layout = sfb_smem_layout
+        self.tiled_mma = tiled_mma
+        self.tiled_mma_sfb = tiled_mma_sfb
+        self.mma_tiler = mma_tiler
+        self.mma_tiler_sfb = mma_tiler_sfb
+        self.cluster_layout_vmnk_shape = cluster_layout_vmnk_shape
+        self.cluster_layout_sfb_vmnk_shape = cluster_layout_sfb_vmnk_shape
+        self.sfa_tensor = sfa_tensor
+        self.sfb_tensor = sfb_tensor
+        self.offs = offs
+        self.c_tma_op = c_tma_op
+        self.epi_smem_layout = epi_smem_layout
+        self.epi_tile = epi_tile
+        self.c_ptrs = c_ptrs
+        self.c_single_expert = c_single_expert
+        self.expert_cnt = expert_cnt
+        self.workspace = TensormapWorkspace(workspace_ptr, self.slot_names(weight_mode))
+
+    @staticmethod
+    def slot_names(weight_mode) -> list:
+        if weight_mode == MoEWeightMode.DENSE:
+            return ["sfa", "sfb"]
+        return ["sfa", "sfb", "c"]
+
+    @staticmethod
+    def get_workspace_size(weight_mode, expert_cnt: int) -> int:
+        return TensormapWorkspace.size_bytes(
+            len(WgradSfTensormapConstructor.slot_names(weight_mode)),
+            expert_cnt,
+        )
+
+    @cute.jit
+    def get_desc_ptr(self, tensor_name: str, executor_idx: Int32) -> Pointer:
+        return self.workspace.get_ptr(tensor_name, executor_idx)
+
+    @cute.jit
+    def construct_and_write(self, expert_idx: Int32, dependency=None) -> None:
+        from cutlass.cute.nvgpu import cpasync
+        import cutlass.utils.blockscaled_layout as blockscaled_utils
+
+        token_offset, tokens_i = compute_expert_token_range(self.offs, expert_idx)
+        c1 = cutlass.Int32(1)
+
+        m_dim = cute.size(self.sfa_tensor, mode=[0])
+        sfa_elem_offset = cutlass.Int64(m_dim) * cutlass.Int64(token_offset) // self.sf_vec_size
+        per_expert_sfa_shape = (self.sfa_tensor.shape[0], tokens_i, c1)
+        sfa_layout_i = blockscaled_utils.tile_atom_to_shape_SF(per_expert_sfa_shape, self.sf_vec_size)
+        sfa_i = cute.make_tensor(self.sfa_tensor.iterator + sfa_elem_offset, sfa_layout_i)
+        tma_atom_sfa, _ = cute.nvgpu.make_tiled_tma_atom_A(
+            self.sfa_tma_op,
+            sfa_i,
+            self.sfa_smem_layout,
+            self.mma_tiler,
+            self.tiled_mma,
+            self.cluster_layout_vmnk_shape,
+            internal_type=cutlass.Uint64,
+        )
+        store_tma_desc(tma_atom_sfa, self.get_desc_ptr("sfa", expert_idx))
+
+        n_dim = cute.size(self.sfb_tensor, mode=[0])
+        sfb_elem_offset = cutlass.Int64(n_dim) * cutlass.Int64(token_offset) // self.sf_vec_size
+        per_expert_sfb_shape = (self.sfb_tensor.shape[0], tokens_i, c1)
+        sfb_layout_i = blockscaled_utils.tile_atom_to_shape_SF(per_expert_sfb_shape, self.sf_vec_size)
+        sfb_i = cute.make_tensor(self.sfb_tensor.iterator + sfb_elem_offset, sfb_layout_i)
+        tma_atom_sfb, _ = cute.nvgpu.make_tiled_tma_atom_B(
+            self.sfb_tma_op,
+            sfb_i,
+            self.sfb_smem_layout,
+            self.mma_tiler_sfb,
+            self.tiled_mma_sfb,
+            self.cluster_layout_sfb_vmnk_shape,
+            internal_type=cutlass.Uint64,
+        )
+        store_tma_desc(tma_atom_sfb, self.get_desc_ptr("sfb", expert_idx))
+
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE):
+            c_ptr_tensor = cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Int64,
+                    self.c_ptrs.toint(),
+                    cute.typing.AddressSpace.gmem,
+                    assumed_align=8,
+                ),
+                cute.make_layout((self.expert_cnt,)),
+            )
+            c_ptr = cute.make_ptr(
+                self.c_single_expert.element_type,
+                c_ptr_tensor[expert_idx],
+                cute.typing.AddressSpace.gmem,
+            )
+            c_tensor_i = cute.make_tensor(c_ptr, self.c_single_expert.layout)
+            tma_atom_c, _ = cpasync.make_tiled_tma_atom(
+                self.c_tma_op,
+                c_tensor_i,
+                self.epi_smem_layout,
+                self.epi_tile,
+            )
+            store_tma_desc(tma_atom_c, self.get_desc_ptr("c", expert_idx))

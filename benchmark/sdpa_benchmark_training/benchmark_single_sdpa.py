@@ -515,7 +515,7 @@ else:
             dKey = torch.empty_like(key)
             dValue = torch.empty_like(value)
         dOutput = torch.randn(output.shape, dtype=randn_dtype, device=device).to(target_dtype)
-        stats = torch.empty(batch_size, q_seqlen, num_q_heads, 1, dtype=torch.float32, device=device).transpose(1, 2)
+        stats = torch.empty(batch_size, num_q_heads, q_seqlen, 1, dtype=torch.float32, device=device)
         if is_dropout:
             dropout_seed = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
             dropout_offset = torch.full((1, 1, 1, 1), 789, dtype=torch.int64, device="cuda")

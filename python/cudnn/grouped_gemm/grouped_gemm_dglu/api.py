@@ -856,6 +856,8 @@ class GroupedGemmDgluSm100(APIBase):
         # Compile with keyword args (dense mode uses the unified __call__ positional order)
         dbias_fake = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
 
+        cached_linear_offset = cutlass.Float32(1.0 if self.act_func == "dgeglu" else 0.0)
+
         _compiled_kernel = cute.compile(
             gemm_dglu,
             a=a_cute_fake,
@@ -880,7 +882,7 @@ class GroupedGemmDgluSm100(APIBase):
             prob=prob_cute_fake,
             dprob=dprob_cute_fake,
             dbias_tensor=dbias_fake,
-            linear_offset=cutlass.Float32(0.0),
+            linear_offset=cached_linear_offset,
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
             epilogue_op=self.epilogue_op,
@@ -932,7 +934,7 @@ class GroupedGemmDgluSm100(APIBase):
                 beta_tensor,
                 prob_tensor,
                 dprob_tensor,
-                cutlass.Float32(0.0),
+                cached_linear_offset,
                 dbias_tensor,
                 stream,
             )
@@ -1039,6 +1041,8 @@ class GroupedGemmDgluSm100(APIBase):
 
         workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
 
+        cached_linear_offset = cutlass.Float32(1.0 if self.act_func == "dgeglu" else 0.0)
+
         self._logger.debug("Compiling discrete grouped GEMM dGLU kernel")
         _compiled_kernel = cute.compile(
             gemm_dglu,
@@ -1063,7 +1067,7 @@ class GroupedGemmDgluSm100(APIBase):
             beta_tensor,
             prob_tensor,
             dprob_tensor,
-            cutlass.Float32(0.0),
+            cached_linear_offset,
             dbias_tensor,
             max_active_clusters,
             fake_stream,
@@ -1080,7 +1084,6 @@ class GroupedGemmDgluSm100(APIBase):
         cached_n = cutlass.Int32(self._n)
         cached_k = cutlass.Int32(self._k)
         cached_b_stride = cutlass.Int64(self._b_stride_size)
-        cached_linear_offset = cutlass.Float32(0.0)
 
         def tensor_api(
             a_tensor: torch.Tensor,

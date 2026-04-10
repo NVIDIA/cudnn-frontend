@@ -44,7 +44,6 @@ import enum
 import math
 
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -54,7 +53,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, Int64, Float32
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from .fmha_utils import (
+from ..fmha_utils import (
     MaskEnum,
     SM100_TMEM_CAPACITY_COLUMNS,
     make_thread_cooperative_group,

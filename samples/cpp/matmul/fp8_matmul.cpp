@@ -45,11 +45,11 @@ TEST_CASE("Matmul fp8 precision", "[matmul][graph]") {
     int64_t const k = 128;
 
     // Initialize input tensors with int8_t as proxy for fp8
-    Surface<int8_t> A_gpu(b * m * k, false);
-    Surface<int8_t> B_gpu(b * k * n, false);
+    Surface<int8_t> A_gpu(b * m * k);
+    Surface<int8_t> B_gpu(b * k * n);
 
-    Surface<float> A_descale_gpu(1, false);
-    Surface<float> B_descale_gpu(1, false);
+    Surface<float> A_descale_gpu(1);
+    Surface<float> B_descale_gpu(1);
 
     fe::graph::Graph graph{};
 
@@ -115,10 +115,10 @@ TEST_CASE("Matmul fp8 precision", "[matmul][graph]") {
 
     REQUIRE(graph.build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
-    Surface<float> C_gpu(b * m * n, false);
+    Surface<float> C_gpu(b * m * n);
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {A, A_gpu.devPtr},

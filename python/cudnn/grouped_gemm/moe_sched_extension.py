@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
 """
@@ -48,6 +48,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 from .moe_utils import (
+    MoEWeightMode,
     OnlineTensormapDescCreator,
     tensormap_ptr_for_copy,
     compute_expert_token_range,
@@ -329,3 +330,72 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
             stride = gmem_tensor_in_moe_view.stride
             real = cute.make_tensor(real.iterator, cute.make_layout(sf_layout.shape, stride=stride))
             return (real, None)
+
+
+class WgradScaledGemmSchedExtension(MoESchedExtension):
+    """Scheduler extension for grouped GEMM wgrad (2Dx2D)."""
+
+    def __init__(
+        self,
+        tensormap_ctor,
+        sf_vec_size: int,
+        weight_mode: MoEWeightMode,
+    ):
+        super().__init__(tensormap_ctor)
+        self.sf_vec_size = sf_vec_size
+        self.weight_mode = weight_mode
+
+    def __extract_mlir_values__(self):
+        return extract_mlir_values(self.tensormap_ctor)
+
+    def __new_from_mlir_values__(self, values):
+        new_ctor = new_from_mlir_values(self.tensormap_ctor, values)
+        return WgradScaledGemmSchedExtension(
+            tensormap_ctor=new_ctor,
+            sf_vec_size=self.sf_vec_size,
+            weight_mode=self.weight_mode,
+        )
+
+    def update_expert_info(self, offs, expert_idx):
+        self.token_offset, self.tokens_i = compute_expert_token_range(offs, expert_idx)
+
+    @cute.jit
+    def get_gmem_tensor(
+        self,
+        tensor_name: str,
+        gmem_tensor_in_moe_view: cute.Tensor,
+        offs: cute.Tensor,
+        work_tile_info: MoEWorkTileInfo,
+    ):
+        expert_idx = work_tile_info.expert_idx
+        if cutlass.const_expr(hasattr(self, "token_offset")):
+            token_offset, tokens_i = self.token_offset, self.tokens_i
+        else:
+            token_offset, tokens_i = compute_expert_token_range(offs, expert_idx)
+
+        shape = gmem_tensor_in_moe_view.shape
+        c1 = cutlass.Int32(1)
+
+        if cutlass.const_expr(tensor_name in ("a", "b")):
+            real = cute.domain_offset((0, token_offset, 0), gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(real, (shape[0], tokens_i, c1))
+            return (real, None)
+
+        if cutlass.const_expr(tensor_name == "c"):
+            if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
+                real = cute.domain_offset((0, 0, expert_idx), gmem_tensor_in_moe_view)
+                real = rewrite_tensor_shape(real, (shape[0], shape[1], c1))
+                return (real, None)
+
+            real = rewrite_tensor_shape(gmem_tensor_in_moe_view, (shape[0], shape[1], c1))
+            desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr("c", expert_idx))
+            return (real, desc)
+
+        if cutlass.const_expr(tensor_name in ("sfa", "sfb")):
+            per_expert_shape = (shape[0], tokens_i, c1)
+            sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
+            real = rewrite_tensor_shape(gmem_tensor_in_moe_view, sf_layout.shape)
+            desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr(tensor_name, expert_idx))
+            return (real, desc)
+
+        raise ValueError(f"WgradScaledGemmSchedExtension: unknown tensor '{tensor_name}'")

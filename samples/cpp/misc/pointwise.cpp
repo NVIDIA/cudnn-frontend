@@ -31,7 +31,7 @@ TEST_CASE("Reduction", "[reduction]") {
     if (cudnnGetVersion() < 8600) {
         SKIP("TEST REQUIRES minimum cudnn version 8.6.0");
     }
-    Surface<float> A_gpu(n * n * n * n, false);
+    Surface<float> A_gpu(n * n * n * n);
     fe::graph::Graph graph{};
     auto A = graph.tensor(fe::graph::Tensor_attributes()
                               .set_dim({n, n, n, n})
@@ -51,12 +51,12 @@ TEST_CASE("Reduction", "[reduction]") {
     REQUIRE(graph.build_operation_graph(handle).is_good());
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
     REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
-    Surface<float> C_gpu(n * n * n * n, false);
+    Surface<float> C_gpu(n * n * n * n);
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {{A, A_gpu.devPtr},
                                                                                              {C, C_gpu.devPtr}};
     int64_t workspace_size                                                                = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 }
@@ -86,14 +86,14 @@ TEST_CASE("Fused scalar", "[scalar][graph]") {
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
     REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
-    Surface<half> C_gpu(n * n * n, false);
-    Surface<half> A_gpu(n * n * n, false);
+    Surface<half> C_gpu(n * n * n);
+    Surface<half> A_gpu(n * n * n);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {{A, A_gpu.devPtr},
                                                                                              {C, C_gpu.devPtr}};
     int64_t workspace_size                                                                = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 }
@@ -143,16 +143,16 @@ TEST_CASE("Fused Amax Reduction and type conversion", "[reduction]") {
     REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
     REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
-    Surface<float> A_gpu(n * n * n * n, false);
-    Surface<float> scale_gpu(1, false);
-    Surface<float> amax_gpu(1, false);
-    Surface<int8_t> C_gpu(n * n * n * n, false);  // Substitute for fp8
+    Surface<float> A_gpu(n * n * n * n);
+    Surface<float> scale_gpu(1);
+    Surface<float> amax_gpu(1);
+    Surface<int8_t> C_gpu(n * n * n * n);  // Substitute for fp8
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {A, A_gpu.devPtr}, {scale, scale_gpu.devPtr}, {amax, amax_gpu.devPtr}, {C, C_gpu.devPtr}};
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 }

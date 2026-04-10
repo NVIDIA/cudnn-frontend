@@ -54,7 +54,7 @@ class NormBenchmarkConfig:
 
     name: str
     norms: List[NormPreset]
-    backends: List[str] = field(default_factory=lambda: ["cudnn", "pytorch", "torch_compile"])
+    backends: List[str] = field(default_factory=lambda: ["cudnn", "quack", "pytorch", "torch_compile"])
     data_types: List[str] = field(default_factory=lambda: ["bfloat16"])
     profile_pass: str = "both"
     num_iterations: int = 20

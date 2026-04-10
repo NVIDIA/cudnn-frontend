@@ -15,7 +15,7 @@ from cudnn.api_base import APIBase, TupleDict
 from cudnn.datatypes import _convert_to_cutlass_data_type
 
 from .fmha_backward_sm100_2kernel import BlackwellFusedMultiHeadAttentionBackward
-from .fmha_utils import MaskEnum
+from ..fmha_utils import MaskEnum
 
 
 class SdpabwdSm100D256(APIBase):
@@ -146,7 +146,7 @@ class SdpabwdSm100D256(APIBase):
                 tensor_desc = getattr(self, desc_name)
                 self._value_error_if(tensor_desc.ndim != 4, f"{tensor_desc.name} must be rank-4 for B,H,S,D layout, got {tensor_desc.ndim}")
                 self._value_error_if(
-                    tensor_desc.stride_order != (3, 1, 2, 0), f"{tensor_desc.name} must have s,h,d,b stride order (3, 1, 2, 0), got {tensor_desc.stride_order}"
+                    tensor_desc.stride_order != (3, 1, 2, 0), f"{tensor_desc.name} must have d,h,s,b stride order (3, 1, 2, 0), got {tensor_desc.stride_order}"
                 )
                 setattr(self, desc_name, tensor_desc.transpose(1, 2))
             self._value_error_if(not self.lse_desc.is_contiguous(), "lse_tensor must be contiguous for B,H,S,D layout")
@@ -253,11 +253,11 @@ class SdpabwdSm100D256(APIBase):
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
-        device = torch.cuda.current_device()
+        device = self.q_desc.device
         major, minor = torch.cuda.get_device_capability(device)
         compute_capability = major * 10 + minor
         if compute_capability < 100:
-            raise RuntimeError(f"SdpabwdSm100D256 requires SM100+, found SM{compute_capability}")
+            raise RuntimeError(f"SdpabwdSm100D256 requires SM100+, found SM{compute_capability} on device {device}")
 
         self.problem_shape = (
             self.s_q_max,
@@ -350,14 +350,14 @@ class SdpabwdSm100D256(APIBase):
                 )
             elif self.input_layout == "T,H,D":
                 q_tensor, k_tensor, v_tensor, o_tensor, dq_tensor, dk_tensor, dv_tensor, do_tensor = (
-                    q_tensor.unsqueeze(0),
-                    k_tensor.unsqueeze(0),
-                    v_tensor.unsqueeze(0),
-                    o_tensor.unsqueeze(0),
-                    dq_tensor.unsqueeze(0),
-                    dk_tensor.unsqueeze(0),
-                    dv_tensor.unsqueeze(0),
-                    do_tensor.unsqueeze(0),
+                    q_tensor.unsqueeze(0) if q_tensor.ndim == 3 else q_tensor,
+                    k_tensor.unsqueeze(0) if k_tensor.ndim == 3 else k_tensor,
+                    v_tensor.unsqueeze(0) if v_tensor.ndim == 3 else v_tensor,
+                    o_tensor.unsqueeze(0) if o_tensor.ndim == 3 else o_tensor,
+                    dq_tensor.unsqueeze(0) if dq_tensor.ndim == 3 else dq_tensor,
+                    dk_tensor.unsqueeze(0) if dk_tensor.ndim == 3 else dk_tensor,
+                    dv_tensor.unsqueeze(0) if dv_tensor.ndim == 3 else dv_tensor,
+                    do_tensor.unsqueeze(0) if do_tensor.ndim == 3 else do_tensor,
                 )
                 lse_tensor = lse_tensor.unsqueeze(0).transpose(1, 2)
                 cumulative_s_q = self._unpad_tensor_to_ndim(cumulative_s_q, 1, "cum_seqlen_q")

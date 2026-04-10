@@ -157,11 +157,11 @@ matmul_dynamic_shapes(bool use_abs = false, bool use_bias = false) {
     for (int idx_shape = 0; idx_shape < matmul_shapes_count; idx_shape++) {
         auto [graph, A, B, C, Bias] = build_new_graph(handle, idx_shape);
         // Initialize input tensors
-        Surface<half> A_gpu(max_a_volume, false);
-        Surface<half> B_gpu(max_b_volume, false);
-        Surface<float> C_gpu(max_c_volume, false);
-        Surface<half> Bias_gpu(max_bias_volume, false);
-        Surface<int8_t> workspace(graph.get_workspace_size(), false);
+        Surface<half> A_gpu(max_a_volume);
+        Surface<half> B_gpu(max_b_volume);
+        Surface<float> C_gpu(max_c_volume);
+        Surface<half> Bias_gpu(max_bias_volume);
+        Surface<int8_t> workspace(graph.get_workspace_size());
 
         std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack;
         if (use_bias) {
@@ -207,8 +207,8 @@ TEST_CASE("Matmul", "[matmul][graph]") {
     int64_t const k = 128;
 
     // Initialize input tensors
-    Surface<half> A_gpu(b * m * k, false);
-    Surface<half> B_gpu(b * k * n, false);
+    Surface<half> A_gpu(b * m * k);
+    Surface<half> B_gpu(b * k * n);
 
     // Make cudnn graph
     fe::graph::Graph graph{};
@@ -248,10 +248,10 @@ TEST_CASE("Matmul", "[matmul][graph]") {
     REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
 
     // Run cudnn graph
-    Surface<float> C_gpu(b * m * n, false);
+    Surface<float> C_gpu(b * m * n);
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {A, A_gpu.devPtr}, {B, B_gpu.devPtr}, {C, C_gpu.devPtr}};
@@ -268,8 +268,8 @@ TEST_CASE("Abs + Matmul", "[matmul][graph]") {
     int64_t const k = 128;
 
     // Initialize input tensors
-    Surface<half> A_gpu(b * m * k, false);
-    Surface<half> B_gpu(b * k * n, false);
+    Surface<half> A_gpu(b * m * k);
+    Surface<half> B_gpu(b * k * n);
 
     // Make cudnn graph
     fe::graph::Graph graph{};
@@ -317,10 +317,10 @@ TEST_CASE("Abs + Matmul", "[matmul][graph]") {
     REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     // Run cudnn graph
-    Surface<float> C_gpu(b * m * n, false);
+    Surface<float> C_gpu(b * m * n);
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {A, A_gpu.devPtr}, {B, B_gpu.devPtr}, {C, C_gpu.devPtr}};
@@ -346,9 +346,9 @@ TEST_CASE("Bias + Matmul", "[matmul][graph]") {
     int64_t const k = 128;
 
     // Initialize input tensors
-    Surface<half> A_gpu(b * m * k, false);
-    Surface<half> B_gpu(b * k * n, false);
-    Surface<half> Bias_gpu(b * m * 1, false);
+    Surface<half> A_gpu(b * m * k);
+    Surface<half> B_gpu(b * k * n);
+    Surface<half> Bias_gpu(b * m * 1);
 
     // Make cudnn graph
     fe::graph::Graph graph{};
@@ -410,7 +410,7 @@ TEST_CASE("Bias + Matmul", "[matmul][graph]") {
     }
 
     // Run cudnn graph
-    Surface<float> C_gpu(b * m * n, false);
+    Surface<float> C_gpu(b * m * n);
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {A, A_gpu.devPtr}, {B, B_gpu.devPtr}, {C, C_gpu.devPtr}, {Bias, Bias_gpu.devPtr}};
 
@@ -432,7 +432,7 @@ TEST_CASE("Bias + Matmul", "[matmul][graph]") {
                 std::back_inserter(random_successful),
                 1,
                 std::mt19937{std::random_device{}()});
-    Surface<int8_t> workspace(graph.get_workspace_size_plan_at_index(random_successful.front()), false);
+    Surface<int8_t> workspace(graph.get_workspace_size_plan_at_index(random_successful.front()));
     REQUIRE(graph.execute_plan_at_index(handle, variant_pack, workspace.devPtr, random_successful.front()).is_good());
 }
 
@@ -512,7 +512,7 @@ TEST_CASE("Matmul SBR Graph", "[matmul][graph]") {
 
             REQUIRE(graph->build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
 
-            Surface<int8_t> autotune_workspace(graph->get_autotune_workspace_size(), false);
+            Surface<int8_t> autotune_workspace(graph->get_autotune_workspace_size());
 
             std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
                 {A, A_ptr}, {B, B_ptr}, {S, scale_ptr}, {bias, bias_ptr}, {O, O_ptr}};
@@ -529,18 +529,18 @@ TEST_CASE("Matmul SBR Graph", "[matmul][graph]") {
     auto handle_ptr = create_cudnn_handle();
     auto handle     = *handle_ptr;
 
-    Surface<half> x_tensor(4 * 16 * 64, false);
-    Surface<half> w_tensor(4 * 64 * 32, false);
-    Surface<half> s_tensor(4 * 16 * 32, false);
-    Surface<half> b_tensor(4 * 16 * 32, false);
-    Surface<half> y_tensor(4 * 16 * 32, false);
+    Surface<half> x_tensor(4 * 16 * 64);
+    Surface<half> w_tensor(4 * 64 * 32);
+    Surface<half> s_tensor(4 * 16 * 32);
+    Surface<half> b_tensor(4 * 16 * 32);
+    Surface<half> y_tensor(4 * 16 * 32);
 
     auto [graph, A, B, bias, scale, O] = lookup_cache_or_build_graph(
         handle, x_tensor.devPtr, w_tensor.devPtr, s_tensor.devPtr, b_tensor.devPtr, y_tensor.devPtr);
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {{A, x_tensor.devPtr},
                                                                                              {B, w_tensor.devPtr},
@@ -563,8 +563,8 @@ TEST_CASE("Matmul with restricted shared memory", "[matmul][graph]") {
     int64_t const k = 32;
 
     // Initialize input tensors
-    Surface<half> A_gpu(b * m * k, false);
-    Surface<half> B_gpu(b * k * n, false);
+    Surface<half> A_gpu(b * m * k);
+    Surface<half> B_gpu(b * k * n);
 
     // Make cudnn graph
     fe::graph::Graph graph{};
@@ -604,10 +604,10 @@ TEST_CASE("Matmul with restricted shared memory", "[matmul][graph]") {
     REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     // Run cudnn graph
-    Surface<float> C_gpu(b * m * n, false);
+    Surface<float> C_gpu(b * m * n);
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {A, A_gpu.devPtr}, {B, B_gpu.devPtr}, {C, C_gpu.devPtr}};
@@ -686,22 +686,19 @@ TEST_CASE("Matmul dynamic shape overrides", "[matmul][graph][dynamic_shape]") {
              matmul_dynamic_shape[idx_shape].n,
              1}};
 
-        Surface<half> A_gpu(
-            matmul_dynamic_shape[idx_shape].b * matmul_dynamic_shape[idx_shape].m * matmul_dynamic_shape[idx_shape].k,
-            false);
-        Surface<half> B_gpu(
-            matmul_dynamic_shape[idx_shape].b * matmul_dynamic_shape[idx_shape].k * matmul_dynamic_shape[idx_shape].n,
-            false);
-        Surface<half> C_gpu(
-            matmul_dynamic_shape[idx_shape].b * matmul_dynamic_shape[idx_shape].m * matmul_dynamic_shape[idx_shape].n,
-            false);
+        Surface<half> A_gpu(matmul_dynamic_shape[idx_shape].b * matmul_dynamic_shape[idx_shape].m *
+                            matmul_dynamic_shape[idx_shape].k);
+        Surface<half> B_gpu(matmul_dynamic_shape[idx_shape].b * matmul_dynamic_shape[idx_shape].k *
+                            matmul_dynamic_shape[idx_shape].n);
+        Surface<half> C_gpu(matmul_dynamic_shape[idx_shape].b * matmul_dynamic_shape[idx_shape].m *
+                            matmul_dynamic_shape[idx_shape].n);
 
         std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> variant_pack = {
             {A_UID, A_gpu.devPtr}, {B_UID, B_gpu.devPtr}, {C_UID, C_gpu.devPtr}};
 
         int64_t workspace_size = 0;
         REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-        Surface<int8_t> workspace(workspace_size, false);
+        Surface<int8_t> workspace(workspace_size);
 
         REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr, override_uids, override_shapes, override_strides)
                     .is_good());

@@ -4,7 +4,7 @@ import cudnn
 # fmt: off
 
 def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, torch_itype=torch.float8_e4m3fn, output_type=torch.bfloat16,
-                left_bound=None, right_bound=None, diag_align=None, sink_token=None):
+                left_bound=None, right_bound=None, diag_align=None, sink_token=None, rescale_threshold=4.0):
     """
     Compute reference SDPA with MXFP8 dequantization.
     Takes FP8 inputs and converts to FP32 to match cuDNN behavior.
@@ -90,9 +90,18 @@ def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, t
         s_block = s_block + bias[:, :, start_idx:end_idx]
 
         m_block = s_block.max(dim=-1, keepdim=True).values
-        m_new = torch.maximum(m_old, m_block)
 
-        correction = torch.exp(m_old - m_new).nan_to_num()
+        NEG_INF = float('-inf')
+        is_first = (m_old == NEG_INF)
+        exceeds_threshold = (m_block - m_old > rescale_threshold)
+        should_update = is_first | exceeds_threshold
+        m_new = torch.where(should_update, m_block, m_old)
+
+        exp_input = m_old - m_new
+        needs_correction = (exp_input < -rescale_threshold)
+        correction = torch.where(needs_correction, torch.exp(exp_input), torch.ones_like(exp_input))
+        correction = correction.nan_to_num()
+
         o = o * correction
         l_old = l_old * correction
 
@@ -100,7 +109,10 @@ def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, t
         l_new = l_old + p_block.sum(dim=-1, keepdim=True)
 
         # P (FP32) -> P (FP8)
-        p_block_quant = p_block.to(torch_itype).float()
+        s_scale = 16.0
+        inv_s_scale = 1.0 / 16.0
+        p_block_quant = (p_block * s_scale).to(torch_itype).float()
+        p_block_quant = p_block_quant * inv_s_scale
 
         o = o + torch.einsum("bqk,bkd->bqd", p_block_quant, v_block)
         m_old = m_new

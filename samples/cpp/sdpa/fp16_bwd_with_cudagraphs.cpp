@@ -88,26 +88,26 @@ class SdpaBwdTestData {
                     bool const padding_mask,
                     bool const has_attn_bias,
                     float const qkv_fill_value)
-        : q_tensor(b * h_q * s_q * d_qk, false, cpu_float2half_rn(qkv_fill_value)),
-          k_tensor(b * h_k * d_qk * s_kv, false, cpu_float2half_rn(qkv_fill_value)),
-          v_tensor(b * h_v * d_v * s_kv, false, cpu_float2half_rn(qkv_fill_value)),
-          o_tensor(b * s_q * h_q * d_qk, false),
-          bias_tensor(b * 1 * s_q * s_kv, false, cpu_float2half_rn(qkv_fill_value)),
-          dq_tensor(b * h_q * s_q * d_qk, false),
-          dk_tensor(b * h_k * d_qk * s_kv, false),
-          dv_tensor(b * h_v * d_v * s_kv, false),
-          do_tensor(b * s_q * h_q * d_qk, false, cpu_float2half_rn(qkv_fill_value)),
-          dbias_tensor(1 * h_q * s_q * s_kv, false),
-          devActualSeqlenQ(b, false, /*fillValue=*/20),
-          devActualSeqlenKV(b, false, /*fillValue=*/20),
-          statsTensor(b * h_q * s_q * 1, false),
-          workspace(workspace_size, false),
+        : q_tensor(b * h_q * s_q * d_qk, cpu_float2half_rn(qkv_fill_value)),
+          k_tensor(b * h_k * d_qk * s_kv, cpu_float2half_rn(qkv_fill_value)),
+          v_tensor(b * h_v * d_v * s_kv, cpu_float2half_rn(qkv_fill_value)),
+          o_tensor(b * s_q * h_q * d_qk),
+          bias_tensor(b * 1 * s_q * s_kv, cpu_float2half_rn(qkv_fill_value)),
+          dq_tensor(b * h_q * s_q * d_qk),
+          dk_tensor(b * h_k * d_qk * s_kv),
+          dv_tensor(b * h_v * d_v * s_kv),
+          do_tensor(b * s_q * h_q * d_qk, cpu_float2half_rn(qkv_fill_value)),
+          dbias_tensor(1 * h_q * s_q * s_kv),
+          devActualSeqlenQ(b, /*fillValue=*/20),
+          devActualSeqlenKV(b, /*fillValue=*/20),
+          statsTensor(b * h_q * s_q * 1),
+          workspace(workspace_size),
           padding_mask_(padding_mask),
           has_attn_bias_(has_attn_bias) {}
 
-    std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *>
+    std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*>
     build_variant_pack() {
-        std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *> variant_pack;
+        std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> variant_pack;
         variant_pack[Q_UID] = q_tensor.devPtr;
         variant_pack[K_UID] = k_tensor.devPtr;
         variant_pack[V_UID] = v_tensor.devPtr;
@@ -132,35 +132,27 @@ class SdpaBwdTestData {
         return variant_pack;
     }
 
-    void *
+    void*
     get_workspace_ptr() {
         return workspace.devPtr;
     }
 
-    void
-    sync_outputs() {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaMemcpy(dq_tensor.hostPtr,
-                              dq_tensor.devPtr,
-                              sizeof(dq_tensor.hostPtr[0]) * dq_tensor.n_elems,
-                              cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(dk_tensor.hostPtr,
-                              dk_tensor.devPtr,
-                              sizeof(dk_tensor.hostPtr[0]) * dk_tensor.n_elems,
-                              cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(dv_tensor.hostPtr,
-                              dv_tensor.devPtr,
-                              sizeof(dv_tensor.hostPtr[0]) * dv_tensor.n_elems,
-                              cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaDeviceSynchronize());
+    template <typename T>
+    std::vector<T>
+    copy_to_host(Surface<T>& tensor) {
+        std::vector<T> host(tensor.size);
+        CUDA_CHECK(cudaMemcpy(host.data(), tensor.devPtr, sizeof(host[0]) * host.size(), cudaMemcpyDeviceToHost));
+        return host;
     }
 
     template <typename T>
     bool
-    equal_tensors(Surface<T> &a, Surface<T> &b) {
-        REQUIRE(a.n_elems == b.n_elems);
-        for (int i = 0; i < a.n_elems; i++) {
-            if (a.hostPtr[i] != b.hostPtr[i]) {
+    equal_tensors(Surface<T>& a, Surface<T>& b) {
+        REQUIRE(a.size == b.size);
+        auto a_host = copy_to_host(a);
+        auto b_host = copy_to_host(b);
+        for (size_t i = 0; i < a.size; i++) {
+            if (a_host[i] != b_host[i]) {
                 return false;
             }
         }
@@ -168,9 +160,8 @@ class SdpaBwdTestData {
     }
 
     bool
-    equal_outputs(SdpaBwdTestData &other) {
-        sync_outputs();
-        other.sync_outputs();
+    equal_outputs(SdpaBwdTestData& other) {
+        CUDA_CHECK(cudaDeviceSynchronize());
         if (!equal_tensors(dq_tensor, other.dq_tensor)) return false;
         if (!equal_tensors(dk_tensor, other.dk_tensor)) return false;
         if (!equal_tensors(dv_tensor, other.dv_tensor)) return false;

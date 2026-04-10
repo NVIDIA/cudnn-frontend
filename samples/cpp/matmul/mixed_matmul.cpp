@@ -41,9 +41,9 @@ TEST_CASE("Mixed Precision Matmul", "[matmul][graph]") {
     int64_t const k = 128;
 
     // Initialize input tensors
-    Surface<int8_t> A_gpu(b * m * k, false);
+    Surface<int8_t> A_gpu(b * m * k);
     // note this is a bf16 tensor, but half is used just for memory allocation
-    Surface<half> B_gpu(b * k * n, false);
+    Surface<half> B_gpu(b * k * n);
 
     // Make cudnn graph
     fe::graph::Graph graph{};
@@ -96,10 +96,10 @@ TEST_CASE("Mixed Precision Matmul", "[matmul][graph]") {
 
     //// Run cudnn graph
     // note this is a bf16 tensor, but half is used just for memory allocation
-    Surface<half> C_gpu(b * m * n, false);
+    Surface<half> C_gpu(b * m * n);
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {A, A_gpu.devPtr}, {B, B_gpu.devPtr}, {C, C_gpu.devPtr}};

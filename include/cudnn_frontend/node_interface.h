@@ -147,6 +147,7 @@ class INode {
         DADALAYERNORM,
         SDPA,
         MOE_GROUPED_MATMUL,
+        MOE_GROUPED_MATMUL_BWD,
         DIAGONAL_BAND_MASK,
         SOFTMAX,
     };
@@ -244,6 +245,13 @@ class INode {
                        std::shared_ptr<Tensor_attributes> token_ks,
                        Moe_grouped_matmul_attributes attributes,
                        std::shared_ptr<Tensor_attributes> output);
+
+    void
+    moe_grouped_matmul_bwd(std::shared_ptr<Tensor_attributes> doutput,
+                           std::shared_ptr<Tensor_attributes> token,
+                           std::shared_ptr<Tensor_attributes> first_token_offset,
+                           Moe_grouped_matmul_bwd_attributes attributes,
+                           std::shared_ptr<Tensor_attributes> dweight);
 
     error_t
     validate_subtree() {

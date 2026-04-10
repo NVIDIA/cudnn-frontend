@@ -79,21 +79,21 @@ class SdpaTestData {
                  bool const generate_stats,
                  bool const padding_mask,
                  float const qkv_fill_value)
-        : q_tensor(b * h_q * s_q * d_qk, false, cpu_float2half_rn(qkv_fill_value)),
-          k_tensor(b * h_k * d_qk * s_kv, false, cpu_float2half_rn(qkv_fill_value)),
-          v_tensor(b * h_v * d_v * s_kv, false, cpu_float2half_rn(qkv_fill_value)),
-          o_tensor(b * s_q * h_q * d_qk, false),
-          bias_tensor(b * 1 * s_q * s_kv, false),
-          devActualSeqlenQ(b, false, /*fillValue=*/20),
-          devActualSeqlenKV(b, false, /*fillValue=*/20),
-          statsTensor(b * h_q * s_q * 1, false),
-          workspace(workspace_size, false),
+        : q_tensor(b * h_q * s_q * d_qk, cpu_float2half_rn(qkv_fill_value)),
+          k_tensor(b * h_k * d_qk * s_kv, cpu_float2half_rn(qkv_fill_value)),
+          v_tensor(b * h_v * d_v * s_kv, cpu_float2half_rn(qkv_fill_value)),
+          o_tensor(b * s_q * h_q * d_qk),
+          bias_tensor(b * 1 * s_q * s_kv),
+          devActualSeqlenQ(b, /*fillValue=*/20),
+          devActualSeqlenKV(b, /*fillValue=*/20),
+          statsTensor(b * h_q * s_q * 1),
+          workspace(workspace_size),
           generate_stats_(generate_stats),
           padding_mask_(padding_mask) {}
 
-    std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *>
+    std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*>
     build_variant_pack() {
-        std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *> variant_pack;
+        std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> variant_pack;
         variant_pack[Q_UID] = q_tensor.devPtr;
         variant_pack[K_UID] = k_tensor.devPtr;
         variant_pack[V_UID] = v_tensor.devPtr;
@@ -108,31 +108,27 @@ class SdpaTestData {
         return variant_pack;
     }
 
-    void *
+    void*
     get_workspace_ptr() {
         return workspace.devPtr;
     }
 
-    void
-    sync_outputs() {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaMemcpy(
-            o_tensor.hostPtr, o_tensor.devPtr, sizeof(o_tensor.hostPtr[0]) * o_tensor.n_elems, cudaMemcpyDeviceToHost));
-        if (generate_stats_ == true) {
-            CUDA_CHECK(cudaMemcpy(statsTensor.hostPtr,
-                                  statsTensor.devPtr,
-                                  sizeof(statsTensor.hostPtr[0]) * statsTensor.n_elems,
-                                  cudaMemcpyDeviceToHost));
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
+    template <typename T>
+    std::vector<T>
+    copy_to_host(Surface<T>& tensor) {
+        std::vector<T> host(tensor.size);
+        CUDA_CHECK(cudaMemcpy(host.data(), tensor.devPtr, sizeof(host[0]) * host.size(), cudaMemcpyDeviceToHost));
+        return host;
     }
 
     template <typename T>
     bool
-    equal_tensors(Surface<T> &a, Surface<T> &b) {
-        REQUIRE(a.n_elems == b.n_elems);
-        for (int i = 0; i < a.n_elems; i++) {
-            if (a.hostPtr[i] != b.hostPtr[i]) {
+    equal_tensors(Surface<T>& a, Surface<T>& b) {
+        REQUIRE(a.size == b.size);
+        auto a_host = copy_to_host(a);
+        auto b_host = copy_to_host(b);
+        for (size_t i = 0; i < a.size; i++) {
+            if (a_host[i] != b_host[i]) {
                 return false;
             }
         }
@@ -140,10 +136,9 @@ class SdpaTestData {
     }
 
     bool
-    equal_outputs(SdpaTestData &other) {
+    equal_outputs(SdpaTestData& other) {
         REQUIRE(generate_stats_ == other.generate_stats_);
-        sync_outputs();
-        other.sync_outputs();
+        CUDA_CHECK(cudaDeviceSynchronize());
         if (!equal_tensors(o_tensor, other.o_tensor)) return false;
         if (generate_stats_ && !equal_tensors(statsTensor, other.statsTensor)) return false;
         return true;

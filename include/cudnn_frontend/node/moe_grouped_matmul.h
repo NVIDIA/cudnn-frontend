@@ -18,6 +18,35 @@ class MoeGroupedMatmulNode : public NodeCRTP<MoeGroupedMatmulNode> {
     }
 
     error_t
+    pre_validate_node() const override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating MoeGroupedMatmulNode " << attributes.name);
+
+        auto const token_it = attributes.inputs.find(Moe_grouped_matmul_attributes::input_names::Token);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(token_it == attributes.inputs.end() || token_it->second == nullptr,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "MoeGroupedMatmul input Token not set.");
+
+        auto const weight_it = attributes.inputs.find(Moe_grouped_matmul_attributes::input_names::Weight);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(weight_it == attributes.inputs.end() || weight_it->second == nullptr,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "MoeGroupedMatmul input Weight not set.");
+
+        auto const first_token_offset_it =
+            attributes.inputs.find(Moe_grouped_matmul_attributes::input_names::FirstTokenOffset);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            first_token_offset_it == attributes.inputs.end() || first_token_offset_it->second == nullptr,
+            error_code_t::ATTRIBUTE_NOT_SET,
+            "MoeGroupedMatmul input FirstTokenOffset not set.");
+
+        auto const output_it = attributes.outputs.find(Moe_grouped_matmul_attributes::output_names::Output);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(output_it == attributes.outputs.end() || output_it->second == nullptr,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "MoeGroupedMatmul output Output not set.");
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
     infer_properties_node() override final {
         CUDNN_FE_LOG_LABEL_ENDL("INFO:     Inferrencing properties for moe grouped matmul node " << attributes.name);
 

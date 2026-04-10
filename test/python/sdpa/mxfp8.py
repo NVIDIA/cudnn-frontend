@@ -513,6 +513,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     right_bound = getattr(cfg, 'right_bound', None)
     diag_align  = getattr(cfg, 'diag_align', None)
     with_sink_token = getattr(cfg, 'with_sink_token', False)
+    rescale_threshold = getattr(cfg, 'rescale_threshold', 4.0)
 
     # Get input/output types from config
     torch_itype = cfg.data_type if hasattr(cfg, 'data_type') and cfg.data_type else torch.float8_e4m3fn
@@ -598,7 +599,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     o_ref, stats_ref = compute_ref(q_fp8_d, k_fp8_d, v_fp8_s, sf_q_d_ref, sf_k_d_ref, sf_v_s_ref, attn_scale,
                                    torch_itype=torch_itype, output_type=torch_otype,
                                    left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
-                                   sink_token=sink_token_gpu)
+                                   sink_token=sink_token_gpu, rescale_threshold=rescale_threshold)
 
     # Compare output
     o_atol, o_rtol = 0.12, 0.20

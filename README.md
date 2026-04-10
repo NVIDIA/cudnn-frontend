@@ -19,10 +19,11 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 *   **[Discrete Grouped GEMM + dSwiGLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/discrete_grouped_gemm/discrete_grouped_gemm_dswiglu):** Per-expert-pointer dSwiGLU backward grouped GEMM for MoE workloads without weight packing.
 *   **[Grouped GEMM + Quant](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/grouped_gemm/grouped_gemm_quant):** Legacy dense-only grouped GEMM quant API for MoE FC2/dFC1 workloads.
 *   **[Grouped GEMM + Quant (Unified)](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/grouped_gemm/grouped_gemm_quant):** Unified grouped GEMM quant API with per-row gating for MoE FC2/dFC1 workloads.
+*   **[Grouped GEMM + Wgrad](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/grouped_gemm/grouped_gemm_wgrad):** Unified grouped GEMM weight-gradient API supporting dense and discrete output layouts for MoE workloads.
 *   **[NSA](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/native_sparse_attention/):** Native Sparse attention as described in the Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention.
 *   **[SDPA Backward: SM100, D=256](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/sdpa):** SDPA Backward pass for D=256 on SM100.
 *   **[cudnn SDPA Fprop](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/sdpa):** Open sourcing the Hopper and Blackwell fprop kernels with stats.
-*   **[Fused RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/rms_norm_silu):** Implementation of a fused kernel of RMS normalization followed by SiLU (Swish) activation. 
+*   **[Fused RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/rms_norm_silu):** Implementation of a fused kernel of RMS normalization followed by SiLU (Swish) activation.
 *   **[SDPA PyTorch Op](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/experimental/ops):** PyTorch custom operator for cuDNN-accelerated Scaled Dot-Product Attention with autograd and `torch.compile` support.
 
 ## 🔥🔥🔥  SOTA Attention Kernels from cudnn backend
@@ -38,7 +39,6 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
   <img src="benchmark/sdpa_benchmark_training/results/gb300_919_only_cudnn/dsv3_top_left.png" alt="DSv3 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
 </p>
 
-
 ## Key Features
 
 *   **Unified Graph API:** Create reusable, persistent `cudnn_frontend::graph::Graph` objects to describe complex subgraphs.
@@ -52,7 +52,7 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 The easiest way to get started is via pip:
 
 ```bash
-pip install nvidia_cudnn_frontend
+pip install nvidia-cudnn-frontend
 ```
 
 **Requirements:**

@@ -2137,6 +2137,59 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
             sub_nodes.emplace_back(subgraph_node);
         }
 
+        // For BE >= 9.21, express softmax as a UnifiedSoftmaxNode whose backend descriptor
+        // will be set via CUDNN_ATTR_OPERATION_SDPA_FWD_SOFTMAX_DESC.
+        // For older versions, stats (if present) is set directly via CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC.
+        auto effective_cudnn_ver = std::min(detail::get_compiled_version(), detail::get_backend_version());
+
+        auto has_output = [&](auto name) {
+            auto it = attributes.outputs.find(name);
+            return it != attributes.outputs.end() && it->second != nullptr;
+        };
+        bool has_softmax_features = has_output(output_names::Stats) || has_output(output_names::Max) ||
+                                    has_output(output_names::Sum_exp) || attributes.has_sink_token();
+
+        if (effective_cudnn_ver >= 92100 && has_softmax_features) {
+            auto b    = attributes.inputs[input_names::Q]->get_dim()[0];
+            auto h_q  = attributes.inputs[input_names::Q]->get_dim()[1];
+            auto s_q  = attributes.inputs[input_names::Q]->get_dim()[2];
+            auto s_kv = infer_s_kv();
+
+            auto softmax_p = std::make_shared<Tensor_attributes>();
+            softmax_p->set_is_virtual(true);
+            softmax_p->set_name(attributes.name + "::softmax_P");
+            softmax_p->set_dim({b, h_q, s_q, s_kv});
+            softmax_p->set_stride({h_q * s_q * s_kv, s_q * s_kv, s_kv, 1});
+
+            auto softmax_s = std::make_shared<Tensor_attributes>();
+            softmax_s->set_is_virtual(true);
+            softmax_s->set_name(attributes.name + "::softmax_S");
+            softmax_s->set_dim({b, h_q, s_q, s_kv});
+            softmax_s->set_stride({h_q * s_q * s_kv, s_q * s_kv, s_kv, 1});
+
+            auto softmax_attrs = Softmax_attributes().set_name(attributes.name + "::softmax");
+            softmax_attrs.inputs[Softmax_attributes::input_names::P]   = softmax_p;
+            softmax_attrs.outputs[Softmax_attributes::output_names::S] = softmax_s;
+
+            if (attributes.has_sink_token()) {
+                softmax_attrs.set_sink(attributes.inputs[input_names::SINK_TOKEN]);
+            }
+            if (has_output(output_names::Stats)) {
+                softmax_attrs.outputs[Softmax_attributes::output_names::Stats] =
+                    attributes.outputs[output_names::Stats];
+            }
+            if (has_output(output_names::Max)) {
+                softmax_attrs.outputs[Softmax_attributes::output_names::Max] = attributes.outputs[output_names::Max];
+            }
+            if (has_output(output_names::Sum_exp)) {
+                softmax_attrs.outputs[Softmax_attributes::output_names::Sum_exp] =
+                    attributes.outputs[output_names::Sum_exp];
+            }
+
+            softmax_node = std::make_shared<UnifiedSoftmaxNode>(std::move(softmax_attrs), context);
+            sub_nodes.emplace_back(softmax_node);
+        }
+
         return {error_code_t::OK, ""};
     }
 
@@ -2187,14 +2240,39 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
                                                        1,
                                                        &backend_o));
 
-        auto stats_it = attributes.outputs.find(SDPA_attributes::output_names::Stats);
-        if (stats_it != attributes.outputs.end()) {
-            auto backend_stats = tensors[stats_it->second->get_uid()]->get_desc()->get_backend_descriptor();
+        if (softmax_node) {
+            auto softmax_ver_error =
+                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "SOFTMAX_DESC in unified SDPA node requires cuDNN 9.21.0"};
+#if (CUDNN_VERSION >= 92100)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92100, softmax_ver_error);
+
+            managed_backend_descriptor_t softmax_raw_ops;
+            std::unordered_set<Tensor_attributes::uid_t> softmax_uids;
+            std::vector<std::shared_ptr<cudnn_frontend::Operation>> softmax_ops;
+            CHECK_CUDNN_FRONTEND_ERROR(
+                softmax_node->create_cudnn_operations(softmax_uids, softmax_ops, softmax_raw_ops, tensors));
+
+            auto backend_softmax = softmax_raw_ops[0]->get_backend_descriptor();
             _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
-                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC,
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_SOFTMAX_DESC,
                                                            CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                                            1,
-                                                           &backend_stats));
+                                                           &backend_softmax));
+
+            uids_involved_in_operations.insert(softmax_uids.begin(), softmax_uids.end());
+#else
+            return softmax_ver_error;
+#endif
+        } else {
+            auto stats_it = attributes.outputs.find(SDPA_attributes::output_names::Stats);
+            if (stats_it != attributes.outputs.end() && stats_it->second) {
+                auto backend_stats = tensors[stats_it->second->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_stats));
+            }
         }
 
         auto attn_scale_it = attributes.inputs.find(SDPA_attributes::input_names::Attn_scale);
@@ -2337,6 +2415,54 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
 #endif
         }
 
+        // Dropout attributes
+        if (attributes.dropout_probability.has_value() && attributes.dropout_probability.value() != 0.0f) {
+            auto dropout_cudnn_ver_error =
+                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Dropout in unified SDPA node requires cuDNN 9.21.0"};
+#if (CUDNN_VERSION >= 92100)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92100, dropout_cudnn_ver_error);
+
+            float dropout_prob = attributes.dropout_probability.value();
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_PROBABILITY,
+                                                           CUDNN_TYPE_FLOAT,
+                                                           1,
+                                                           &dropout_prob));
+
+            auto seed_it = attributes.inputs.find(SDPA_attributes::input_names::Seed);
+            if (seed_it != attributes.inputs.end() && seed_it->second != nullptr) {
+                auto backend_seed = tensors[seed_it->second->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_SEED_DESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_seed));
+            }
+
+            auto offset_it = attributes.inputs.find(SDPA_attributes::input_names::Offset);
+            if (offset_it != attributes.inputs.end() && offset_it->second != nullptr) {
+                auto backend_offset = tensors[offset_it->second->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_OFFSET_DESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_offset));
+            }
+
+            auto rng_dump_it = attributes.outputs.find(SDPA_attributes::output_names::RNG_DUMP);
+            if (rng_dump_it != attributes.outputs.end() && rng_dump_it->second != nullptr) {
+                auto backend_rng_dump = tensors[rng_dump_it->second->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_RNG_DUMP_DESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_rng_dump));
+            }
+#else
+            return dropout_cudnn_ver_error;
+#endif
+        }
+
         _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(unified_sdpa_operation->get_backend_descriptor()));
 
         raw_operations.push_back(unified_sdpa_operation);
@@ -2356,6 +2482,7 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
     std::shared_ptr<Graph> subgraph;  // Pre-softmax subgraph
     std::shared_ptr<Tensor_attributes> subgraph_input;
     std::shared_ptr<Tensor_attributes> subgraph_output;
+    std::shared_ptr<UnifiedSoftmaxNode> softmax_node;  // Softmax descriptor for BE >= 9.21
 
     void
     init_subgraph() {

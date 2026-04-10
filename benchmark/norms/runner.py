@@ -269,7 +269,7 @@ Examples:
         if args.filter_norm:
             cases = [c for c in cases if args.filter_norm in c["norm"].name]
         if args.filter_backend:
-            cases = [c for c in cases if c["backend"] == args.filter_backend]
+            cases = [c for c in cases if c["backend"] in args.filter_backend]
         if args.filter_dtype:
             cases = [c for c in cases if c["data_type"] == args.filter_dtype]
 

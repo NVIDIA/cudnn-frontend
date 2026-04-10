@@ -87,16 +87,16 @@ TEST_CASE("Conv with Int8 datatypes", "[conv][graph][caching]") {
 
     auto [graph, X, W, Y] = build_new_graph(handle);
 
-    Surface<int8_t> x_tensor(n * c * h * w, false);
-    Surface<int8_t> w_tensor(k * c * r * s, false);
-    Surface<int32_t> y_tensor(n * k * h * w, false);  // Should be p, q.
+    Surface<int8_t> x_tensor(n * c * h * w);
+    Surface<int8_t> w_tensor(k * c * r * s);
+    Surface<int32_t> y_tensor(n * k * h * w);  // Should be p, q.
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, x_tensor.devPtr}, {W, w_tensor.devPtr}, {Y, y_tensor.devPtr}};
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 }

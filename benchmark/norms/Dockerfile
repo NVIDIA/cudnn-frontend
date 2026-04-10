@@ -17,4 +17,4 @@ RUN git clone https://github.com/NVIDIA/cudnn-frontend.git
 RUN pip install -v /workspace/cudnn-frontend
 
 # Install additional dependencies for benchmarking
-RUN pip install seaborn
+RUN pip install seaborn quack-kernels

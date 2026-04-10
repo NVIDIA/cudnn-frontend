@@ -125,22 +125,22 @@ TEST_CASE("sdpa_fp8_fprop_current_scaling", "[graph][sdpa][fp8][forward]") {
 
     //// Build variant pack
     assert((input_data_type == fe::DataType_t::FP8_E4M3) || (input_data_type == fe::DataType_t::FP8_E5M2));
-    Surface<int8_t> qkvTensor(b * s * 3 * h * d, false);
+    Surface<int8_t> qkvTensor(b * s * 3 * h * d);
 
     assert((output_data_type == fe::DataType_t::BFLOAT16) || (output_data_type == fe::DataType_t::HALF));
-    Surface<half> oTensor(b * s * h * d, false);
+    Surface<half> oTensor(b * s * h * d);
 
     void* devPtrQ = qkvTensor.devPtr;
     void* devPtrK = (qkvTensor.devPtr + h * d);
     void* devPtrV = (qkvTensor.devPtr + 2 * h * d);
     void* devPtrO = oTensor.devPtr;
 
-    Surface<float> descale_Q_Tensor(1, false);
-    Surface<float> descale_K_Tensor(1, false);
-    Surface<float> descale_V_Tensor(1, false);
-    Surface<float> descale_S_Tensor(1, false);
-    Surface<float> Amax_S_Tensor(1, false);
-    Surface<float> Amax_O_Tensor(1, false);
+    Surface<float> descale_Q_Tensor(1);
+    Surface<float> descale_K_Tensor(1);
+    Surface<float> descale_V_Tensor(1);
+    Surface<float> descale_S_Tensor(1);
+    Surface<float> Amax_S_Tensor(1);
+    Surface<float> Amax_O_Tensor(1);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {Q, devPtrQ},
@@ -154,14 +154,14 @@ TEST_CASE("sdpa_fp8_fprop_current_scaling", "[graph][sdpa][fp8][forward]") {
         {Amax_S, Amax_S_Tensor.devPtr},
         {Amax_O, Amax_O_Tensor.devPtr}};
 
-    Surface<float> stats_tensor(b * h * s * 1, false);
+    Surface<float> stats_tensor(b * h * s * 1);
     if (generate_stats == true) {
         variant_pack[Stats] = stats_tensor.devPtr;
     }
 
     int64_t workspace_size = 0;
     REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(mha_graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 

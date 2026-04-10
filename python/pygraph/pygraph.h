@@ -582,6 +582,13 @@ class PyGraph {
                        int32_t const& top_k,
                        std::string const& name);
 
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    moe_grouped_matmul_bwd(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& doutput,
+                           std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token,
+                           std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& first_token_offset,
+                           cudnn_frontend::DataType_t const& compute_data_type,
+                           std::string const& name);
+
     void
     validate();
 
