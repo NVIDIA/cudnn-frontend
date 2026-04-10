@@ -171,13 +171,13 @@ TEST_CASE("Cuda graphs with matmul add", "[cudagraph][graph]") {
     // The responsibility to destroy is on the user.
     cudaGraphCreate(&cudnn_cuda_graph, 0);  // 0 is just what the API says to pass
 
-    Surface<int8_t> workspace(graph->get_workspace_size(), false);
+    Surface<int8_t> workspace(graph->get_workspace_size());
 
     half starter_value = __float2half(1.f);
     half bias_value    = __float2half(2.f);
-    Surface<half> a_gpu(b * m * k, false, starter_value);
-    Surface<half> b_gpu(b * k * n, false, starter_value);
-    Surface<half> d_gpu(b * m * n, false);
+    Surface<half> a_gpu(b * m * k, starter_value);
+    Surface<half> b_gpu(b * k * n, starter_value);
+    Surface<half> d_gpu(b * m * n);
     std::unordered_map<cudnn_frontend::graph::Tensor_attributes::uid_t, void *> variant_pack = {
         {A_UID, a_gpu.devPtr}, {B_UID, b_gpu.devPtr}, {C_UID, &bias_value}, {D_UID, d_gpu.devPtr}};
 
@@ -202,23 +202,22 @@ TEST_CASE("Cuda graphs with matmul add", "[cudagraph][graph]") {
 
     //// Functional correctness
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(
-        cudaMemcpy(d_gpu.hostPtr, d_gpu.devPtr, sizeof(d_gpu.hostPtr[0]) * d_gpu.n_elems, cudaMemcpyDeviceToHost));
+    std::vector<half> d_host(d_gpu.size);
+    CUDA_CHECK(cudaMemcpy(d_host.data(), d_gpu.devPtr, sizeof(d_host[0]) * d_host.size(), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    for (int i = 0; i < d_gpu.n_elems; i++) {
-        REQUIRE(__half2float(d_gpu.hostPtr[i]) ==
-                scale_value * k * __half2float(starter_value) + __half2float(bias_value));
+    for (size_t i = 0; i < d_gpu.size; i++) {
+        REQUIRE(__half2float(d_host[i]) == scale_value * k * __half2float(starter_value) + __half2float(bias_value));
     }
 
     //// Update the instantiated cuda graph with new device pointers
-    Surface<int8_t> workspace_new(graph->get_workspace_size(), false);
+    Surface<int8_t> workspace_new(graph->get_workspace_size());
 
     half starter_value_new = __float2half(1.f);
     half bias_value_new    = __float2half(1.f);
-    Surface<half> a_gpu_new(b * m * k, false, starter_value_new);
-    Surface<half> b_gpu_new(b * k * n, false, starter_value_new);
-    Surface<half> d_gpu_new(b * m * n, false);
+    Surface<half> a_gpu_new(b * m * k, starter_value_new);
+    Surface<half> b_gpu_new(b * k * n, starter_value_new);
+    Surface<half> d_gpu_new(b * m * n);
     std::unordered_map<cudnn_frontend::graph::Tensor_attributes::uid_t, void *> variant_pack_new = {
         {A_UID, a_gpu_new.devPtr}, {B_UID, b_gpu_new.devPtr}, {C_UID, &bias_value_new}, {D_UID, d_gpu_new.devPtr}};
 
@@ -235,12 +234,13 @@ TEST_CASE("Cuda graphs with matmul add", "[cudagraph][graph]") {
 
     //// Functional correctness
     cudaDeviceSynchronize();
+    std::vector<half> d_host_new(d_gpu_new.size);
     CUDA_CHECK(cudaMemcpy(
-        d_gpu_new.hostPtr, d_gpu_new.devPtr, sizeof(d_gpu_new.hostPtr[0]) * d_gpu_new.n_elems, cudaMemcpyDeviceToHost));
+        d_host_new.data(), d_gpu_new.devPtr, sizeof(d_host_new[0]) * d_host_new.size(), cudaMemcpyDeviceToHost));
     cudaDeviceSynchronize();
 
-    for (int i = 0; i < d_gpu_new.n_elems; i++) {
-        REQUIRE(__half2float(d_gpu_new.hostPtr[i]) ==
+    for (size_t i = 0; i < d_gpu_new.size; i++) {
+        REQUIRE(__half2float(d_host_new[i]) ==
                 (scale_value * k * __half2float(starter_value_new) + __half2float(bias_value_new)));
     }
 

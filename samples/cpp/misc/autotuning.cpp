@@ -38,9 +38,9 @@ TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
     int64_t const k = 128;
 
     // Initialize input tensors
-    Surface<half> A_gpu(b * m * k, false);
-    Surface<half> B_gpu(b * k * n, false);
-    Surface<half> C_gpu(b * m * n, false);
+    Surface<half> A_gpu(b * m * k);
+    Surface<half> B_gpu(b * k * n);
+    Surface<half> C_gpu(b * m * n);
 
     int64_t a_uid = 0, b_uid = 1, c_uid = 2;
 
@@ -117,7 +117,7 @@ TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
             workspace_size = std::max(workspace_size, graph.get_workspace_size_plan_at_index(i));
         }
 
-        Surface<int8_t> workspace(workspace_size, false);
+        Surface<int8_t> workspace(workspace_size);
 
         for (auto i = 0; i < plan_count; i++) {
             float time_ms = 0.0f;
@@ -156,7 +156,7 @@ TEST_CASE("Matmul autotuning", "[matmul][graph][autotuning]") {
 
     REQUIRE(graph.build_plan_at_index(candidate_index).is_good());
 
-    Surface<int8_t> workspace(graph.get_workspace_size_plan_at_index(candidate_index), false);
+    Surface<int8_t> workspace(graph.get_workspace_size_plan_at_index(candidate_index));
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 }

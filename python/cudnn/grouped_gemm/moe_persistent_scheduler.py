@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
 """
@@ -256,6 +256,8 @@ class MoESchedulerParams:
         self.hidden = h if isinstance(h, Int32) else Int32(h)
         self.cta_tile_shape_mnk = cta_tile_shape_mnk
         self.cluster_shape_mn = cluster_shape_mn
+        if scenario == "2Dx2D":
+            use_dynamic_sched = True
         self.use_dynamic_sched = use_dynamic_sched
 
     @property
@@ -303,10 +305,15 @@ class MoESchedulerParams:
         """
         Compute grid shape for kernel launch.
 
-        Since host doesn't know token distribution across experts,
-        we launch max_active_clusters and let device-side scheduler
-        determine which tiles are valid.
+        2Dx3D uses persistent clusters. 2Dx2D uses a full CTA grid with
+        cluster-level cancellation to rebalance uneven expert K lengths.
         """
+        if params.scenario == "2Dx2D":
+            cm, cn = params.cluster_shape_mn
+            tm, tn = params.cta_tile_shape_mnk[0], params.cta_tile_shape_mnk[1]
+            grid_m = ((params.hidden + tm * cm - 1) // (tm * cm)) * cm
+            grid_n = ((params.intermediate + tn * cn - 1) // (tn * cn)) * cn
+            return (grid_m, grid_n, params.expert_cnt)
         return (
             params.cluster_shape_mn[0],
             params.cluster_shape_mn[1],
@@ -324,7 +331,7 @@ class _DynamicSchedState:
 
     def __init__(self, counter_ptr, broadcast_ptr, is_leader_cta, producer_state, consumer_state):
         self.counter_ptr = counter_ptr  # Pointer: gmem atomic counter
-        self.broadcast_ptr = broadcast_ptr  # Pointer: smem sClusterIdx base
+        self.broadcast_ptr = broadcast_ptr  # Pointer: smem broadcast base
         self.is_leader_cta = is_leader_cta  # Boolean
         self.producer_state = producer_state  # PipelineState
         self.consumer_state = consumer_state  # PipelineState
@@ -424,7 +431,7 @@ class MoEPersistentTileScheduler:
         :return: A cute.struct type
         """
         num_cluster_mbar = 2 if use_dynamic_sched else 0
-        num_cluster_broadcast = 1 if use_dynamic_sched else 0
+        num_cluster_broadcast = 4 if use_dynamic_sched else 0
 
         @cute.struct
         class SchedulerStorage:
@@ -434,7 +441,10 @@ class MoEPersistentTileScheduler:
                 16,
             ]
             cluster_mbar: cute.struct.MemRange[cutlass.Int64, num_cluster_mbar]
-            sClusterIdx: cute.struct.MemRange[cutlass.Int32, num_cluster_broadcast]
+            cluster_broadcast: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, num_cluster_broadcast],
+                16,
+            ]
 
         return SchedulerStorage
 
@@ -446,13 +456,24 @@ class MoEPersistentTileScheduler:
         """
         if const_expr(self.use_dynamic_sched):
             cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
-            self.cluster_pipeline = pipeline.PipelineAsync.create(
-                barrier_storage=self._sched_storage.cluster_mbar.data_ptr(),
-                num_stages=1,
-                producer_group=CooperativeGroup(Agent.Thread, 1),
-                consumer_group=CooperativeGroup(Agent.Thread, 32 * cluster_size),
-                defer_sync=True,
-            )
+            if const_expr(self.scenario == "2Dx2D"):
+                self.cluster_pipeline = pipeline.PipelineClcFetchAsync.create(
+                    barrier_storage=self._sched_storage.cluster_mbar.data_ptr(),
+                    num_stages=1,
+                    producer_group=CooperativeGroup(Agent.Thread),
+                    consumer_group=CooperativeGroup(Agent.Thread, 32 * cluster_size),
+                    tx_count=16,
+                    cta_layout_vmnk=cute.make_layout((*self.cluster_shape_mn, 1, 1)),
+                    defer_sync=True,
+                )
+            else:
+                self.cluster_pipeline = pipeline.PipelineAsync.create(
+                    barrier_storage=self._sched_storage.cluster_mbar.data_ptr(),
+                    num_stages=1,
+                    producer_group=CooperativeGroup(Agent.Thread, 1),
+                    consumer_group=CooperativeGroup(Agent.Thread, 32 * cluster_size),
+                    defer_sync=True,
+                )
 
     # =========================================================================
     # Instance
@@ -699,11 +720,16 @@ class MoEPersistentTileScheduler:
         if const_expr(params.use_dynamic_sched):
             current_work_linear_idx = Int32(-1)
             is_leader_cta = (cta_id_in_cluster[0] + cta_id_in_cluster[1] + cta_id_in_cluster[2]) == Int32(0)
+            if const_expr(params.scenario == "2Dx2D"):
+                producer_state_type = PipelineUserType.ProducerConsumer
+            else:
+                producer_state_type = PipelineUserType.Producer
+            broadcast_ptr = sched_storage.cluster_broadcast.data_ptr()
             dynamic_state = _DynamicSchedState(
-                counter_ptr=counter_ptr,
-                broadcast_ptr=sched_storage.sClusterIdx.data_ptr(),
+                counter_ptr=counter_ptr if counter_ptr is not None else broadcast_ptr,
+                broadcast_ptr=broadcast_ptr,
                 is_leader_cta=is_leader_cta,
-                producer_state=make_pipeline_state(PipelineUserType.Producer, 1, loc=loc, ip=ip),
+                producer_state=make_pipeline_state(producer_state_type, 1, loc=loc, ip=ip),
                 consumer_state=make_pipeline_state(PipelineUserType.Consumer, 1, loc=loc, ip=ip),
             )
         else:
@@ -733,6 +759,8 @@ class MoEPersistentTileScheduler:
     @cute.jit
     def initial_work_tile_info(self, *, loc=None, ip=None) -> MoEWorkTileInfo:
         """Get the initial work tile info."""
+        if const_expr(self.scenario == "2Dx2D"):
+            return self._initial_work_from_block_idx(loc=loc, ip=ip)
         if const_expr(self.use_dynamic_sched):
             if const_expr(not hasattr(self, "cluster_pipeline")):
                 raise RuntimeError("Make sure sched.internal_init() is called at the barrier init place before used.")
@@ -746,6 +774,8 @@ class MoEPersistentTileScheduler:
     @cute.jit
     def advance_to_next_work(self, *, loc=None, ip=None) -> MoEWorkTileInfo:
         """Advance to the next work tile and return its info."""
+        if const_expr(self.scenario == "2Dx2D"):
+            return self._fetch_next_clc_work(loc=loc, ip=ip)
         if const_expr(self.use_dynamic_sched):
             self._current_work_linear_idx = self._fetch_next_cluster_idx(loc=loc, ip=ip)
             work_tile_info = self._get_work_tile_for_linear_idx(self._current_work_linear_idx, loc=loc, ip=ip)
@@ -754,6 +784,56 @@ class MoEPersistentTileScheduler:
         else:
             self._current_work_linear_idx += self.num_persistent_clusters
         return self._get_work_tile_for_linear_idx(self._current_work_linear_idx, loc=loc, ip=ip)
+
+    @dsl_user_op
+    @cute.jit
+    def _initial_work_from_block_idx(self, *, loc=None, ip=None) -> MoEWorkTileInfo:
+        bidx, bidy, bidz = cute.arch.block_idx(loc=loc, ip=ip)
+        expert_idx = bidz
+        k_tile_cnt = self._compute_k_tile_cnt(expert_idx, loc=loc, ip=ip)
+        return MoEWorkTileInfo(
+            expert_idx=expert_idx,
+            tile_m_idx=bidx,
+            tile_n_idx=bidy,
+            k_tile_cnt=k_tile_cnt,
+        )
+
+    @dsl_user_op
+    @cute.jit
+    def _fetch_next_clc_work(self, *, loc=None, ip=None) -> MoEWorkTileInfo:
+        ds = self._dynamic_state
+
+        if ds.is_leader_cta:
+            self.cluster_pipeline.producer_acquire(ds.producer_state)
+            mbar_ptr = self.cluster_pipeline.producer_get_barrier(ds.producer_state)
+            with cute.arch.elect_one():
+                cute.arch.issue_clc_query(mbar_ptr, ds.broadcast_ptr, loc=loc, ip=ip)
+        ds.producer_state.advance()
+
+        self.cluster_pipeline.consumer_wait(ds.consumer_state)
+        m_idx, n_idx, l_idx, is_valid = cute.arch.clc_response(ds.broadcast_ptr, loc=loc, ip=ip)
+        cute.arch.fence_acq_rel_cta()
+        self.cluster_pipeline.consumer_release(ds.consumer_state)
+        ds.consumer_state.advance()
+
+        work_tile_info = MoEWorkTileInfo(
+            expert_idx=Int32(-1),
+            tile_m_idx=Int32(0),
+            tile_n_idx=Int32(0),
+            k_tile_cnt=Int32(0),
+        )
+        if is_valid:
+            expert_idx = l_idx
+            tile_m_idx = m_idx + self.cta_id_in_cluster[0]
+            tile_n_idx = n_idx + self.cta_id_in_cluster[1]
+            k_tile_cnt = self._compute_k_tile_cnt(expert_idx, loc=loc, ip=ip)
+            work_tile_info = MoEWorkTileInfo(
+                expert_idx=expert_idx,
+                tile_m_idx=tile_m_idx,
+                tile_n_idx=tile_n_idx,
+                k_tile_cnt=k_tile_cnt,
+            )
+        return work_tile_info
 
     @dsl_user_op
     @cute.jit

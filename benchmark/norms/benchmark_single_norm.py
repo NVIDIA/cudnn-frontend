@@ -34,7 +34,7 @@ def parse_args():
     parser.add_argument("--epsilon", default=1e-5, type=float, help="Epsilon for numerical stability")
     parser.add_argument("--has_bias", action="store_true", help="Whether the norm has a bias term")
     parser.add_argument("--data_type", default="bfloat16", type=str, choices=["bfloat16", "float16"], help="Data type")
-    parser.add_argument("--backend", default="cudnn", type=str, choices=["cudnn", "pytorch", "torch_compile"], help="Backend to use")
+    parser.add_argument("--backend", default="cudnn", type=str, choices=["cudnn", "pytorch", "torch_compile", "quack"], help="Backend to use")
     parser.add_argument("--profile_pass", default="both", type=str, choices=["fwd", "bwd", "both"], help="Which pass to profile")
     parser.add_argument("--num_iterations", default=20, type=int, help="Number of iterations for performance measurement")
     parser.add_argument("--num_warmup_iterations", default=5, type=int, help="Number of warmup iterations before measuring")
@@ -325,6 +325,14 @@ else:
             graph_bwd.check_support()
             graph_bwd.build_plans()
 
+    elif args.backend == "quack":
+        try:
+            from quack.rmsnorm import rmsnorm_fwd, rmsnorm_bwd
+        except ImportError:
+            raise ImportError("quack-kernels is not installed. Install with: pip install quack-kernels")
+
+        assert norm_type == "rms_norm", "Quack backend only supports rms_norm"
+
     elif args.backend in ("pytorch", "torch_compile"):
         # PyTorch / torch.compile backend
         if norm_type == "rms_norm":
@@ -454,6 +462,46 @@ else:
                     bwd_time = sum(item.device_time for item in matched_kernels) / 1000
                     if i >= dry_run_iters:
                         backward_times.append(bwd_time)
+
+        elif args.backend == "quack":
+            # Quack uses 2D tensors (N, C) and weight shape (C,)
+            x_2d = x_gpu.squeeze(-1).squeeze(-1)  # (N, C)
+            w_2d = scale_gpu.squeeze(0).squeeze(-1).squeeze(-1)  # (C,)
+            b_2d = bias_gpu.squeeze(0).squeeze(-1).squeeze(-1) if has_bias else None  # (C,) or None
+
+            if run_fwd:
+                with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
+                    with record_function("norm.forward"):
+                        out, _, rstd = rmsnorm_fwd(x_2d, w_2d, bias=b_2d, eps=epsilon_value, store_rstd=True)
+                    torch.cuda.synchronize()
+
+                cuda_events = [item for item in prof.key_averages() if item.key == "norm.forward"]
+                if cuda_events:
+                    fwd_time = cuda_events[0].device_time / 1000
+                else:
+                    fwd_time = sum(item.device_time for item in prof.key_averages() if item.device_time > 0) / 1000
+                if i >= dry_run_iters:
+                    forward_times.append(fwd_time)
+            else:
+                out, _, rstd = rmsnorm_fwd(x_2d, w_2d, bias=b_2d, eps=epsilon_value, store_rstd=True)
+                torch.cuda.synchronize()
+
+            if run_bwd:
+                l2_flush_buffer.zero_()
+                dy_2d = torch.randn(N, C, dtype=target_dtype, device=device)
+
+                with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
+                    with record_function("norm.backward"):
+                        rmsnorm_bwd(x_2d, w_2d, dy_2d, rstd, has_bias=has_bias)
+                    torch.cuda.synchronize()
+
+                cuda_events = [item for item in prof.key_averages() if item.key == "norm.backward"]
+                if cuda_events:
+                    bwd_time = cuda_events[0].device_time / 1000
+                else:
+                    bwd_time = sum(item.device_time for item in prof.key_averages() if item.device_time > 0) / 1000
+                if i >= dry_run_iters:
+                    backward_times.append(bwd_time)
 
         else:
             # PyTorch / torch.compile forward

@@ -39,6 +39,7 @@ symbols_to_import = [
     "cudnnGraphNotSupportedError",
     "diagonal_alignment",
     "attention_implementation",
+    "moe_grouped_matmul_mode",
 ]
 
 for symbol_name in symbols_to_import:
@@ -46,7 +47,7 @@ for symbol_name in symbols_to_import:
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.22.0"
+__version__ = "1.22.1"
 
 
 def _tensor(
@@ -327,6 +328,26 @@ def __getattr__(name: str) -> Any:
             raise ImportError(
                 f"grouped_gemm_dswiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
             ) from e
+    elif name == "SdpafwdSm100D256":
+        try:
+            from .sdpa import SdpafwdSm100D256 as _SdpafwdSm100D256
+
+            return _SdpafwdSm100D256
+        except Exception as e:
+            raise ImportError(f"SdpafwdSm100D256 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
+
+    elif name == "sdpa_fwd_wrapper_sm100_d256":
+        try:
+            from .sdpa import (
+                sdpa_fwd_wrapper_sm100_d256 as _sdpa_fwd_wrapper_sm100_d256,
+            )
+
+            return _sdpa_fwd_wrapper_sm100_d256
+        except Exception as e:
+            raise ImportError(
+                f"sdpa_fwd_wrapper_sm100_d256 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
     elif name == "SdpabwdSm100D256":
         try:
             from .sdpa import SdpabwdSm100D256 as _SdpabwdSm100D256
@@ -407,6 +428,26 @@ def __getattr__(name: str) -> Any:
         except Exception as e:
             raise ImportError(
                 f"grouped_gemm_dglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
+            ) from e
+
+    elif name == "GroupedGemmWgradSm100":
+        try:
+            from .grouped_gemm import GroupedGemmWgradSm100 as _GroupedGemmWgradSm100
+
+            return _GroupedGemmWgradSm100
+        except Exception as e:
+            raise ImportError(f"GroupedGemmWgradSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
+
+    elif name == "grouped_gemm_wgrad_wrapper_sm100":
+        try:
+            from .grouped_gemm import (
+                grouped_gemm_wgrad_wrapper_sm100 as _grouped_gemm_wgrad_wrapper_sm100,
+            )
+
+            return _grouped_gemm_wgrad_wrapper_sm100
+        except Exception as e:
+            raise ImportError(
+                f"grouped_gemm_wgrad_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
             ) from e
 
     # Discrete-weight Grouped GEMM GLU module

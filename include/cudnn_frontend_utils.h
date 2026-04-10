@@ -478,7 +478,8 @@ enum class DescriptorType_t {
     OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR,
     OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR,
     OPERATION_CONCATENATE_DESCRIPTOR,
-    OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR
+    OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR,
+    OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR,
 };
 
 enum class NormMode_t {
@@ -957,6 +958,9 @@ operator<<(std::ostream& os, const DescriptorType_t& mode) {
             break;
         case DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR:
             os << "OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR";
+            break;
+        case DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
+            os << "OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR";
             break;
         case DescriptorType_t::NOT_SET:
             os << "NOT_SET";
@@ -1672,6 +1676,14 @@ convert_to_cudnn_type(cudnn_frontend::DescriptorType_t const mode, cudnnBackendD
 #else
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
+        case DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
+#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
 
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
@@ -2076,6 +2088,10 @@ convert_from_cudnn_type(cudnnBackendDescriptorType_t const cudnn_mode) {
 #if (CUDNN_VERSION >= 91500)
         case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR:
             return DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR;
+#endif
+#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+        case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
+            return DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR;
 #endif
 
 #ifndef NO_DEFAULT_IN_SWITCH

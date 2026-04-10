@@ -41,7 +41,7 @@ CONFIG = NormBenchmarkConfig(
         QWEN3_30B_131072X128,
         QWEN3_30B_16384X128,
     ],
-    backends=["cudnn", "pytorch", "torch_compile"],
+    backends=["cudnn", "quack", "pytorch", "torch_compile"],
     data_types=["bfloat16"],
     profile_pass="both",
     num_iterations=20,

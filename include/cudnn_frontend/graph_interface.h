@@ -28,6 +28,7 @@
 #include "node/block_scale_dequantize.h"
 #include "node/concatenate.h"
 #include "node/moe_grouped_matmul.h"
+#include "node/moe_grouped_matmul_bwd.h"
 
 #include "backend/backend_descriptor.h"
 #include "plans.h"
@@ -1752,6 +1753,11 @@ class Graph : public ICudnn, public INode {
                                                           std::shared_ptr<Tensor_attributes>,
                                                           Moe_grouped_matmul_attributes);
 
+    std::shared_ptr<Tensor_attributes> moe_grouped_matmul_bwd(std::shared_ptr<Tensor_attributes>,
+                                                              std::shared_ptr<Tensor_attributes>,
+                                                              std::shared_ptr<Tensor_attributes>,
+                                                              Moe_grouped_matmul_bwd_attributes);
+
     [[deprecated]] std::array<std::shared_ptr<Tensor_attributes>, 2>
     scaled_dot_product_flash_attention(std::shared_ptr<Tensor_attributes> q,
                                        std::shared_ptr<Tensor_attributes> k,
@@ -3432,6 +3438,27 @@ Graph::moe_grouped_matmul(std::shared_ptr<Tensor_attributes> token,
     sub_nodes.emplace_back(std::make_unique<MoeGroupedMatmulNode>(std::move(attributes), context));
 
     return output;
+}
+
+inline std::shared_ptr<Tensor_attributes>
+Graph::moe_grouped_matmul_bwd(std::shared_ptr<Tensor_attributes> doutput,
+                              std::shared_ptr<Tensor_attributes> token,
+                              std::shared_ptr<Tensor_attributes> first_token_offset,
+                              Moe_grouped_matmul_bwd_attributes attributes) {
+    if (attributes.name.empty()) {
+        attributes.name += std::to_string(sub_nodes.size());
+    }
+
+    auto dweight = attributes.outputs[Moe_grouped_matmul_bwd_attributes::output_names::DWeight] =
+        output_tensor(attributes.name + "::DWeight");
+
+    attributes.inputs[Moe_grouped_matmul_bwd_attributes::input_names::DOutput]          = doutput;
+    attributes.inputs[Moe_grouped_matmul_bwd_attributes::input_names::Token]            = token;
+    attributes.inputs[Moe_grouped_matmul_bwd_attributes::input_names::FirstTokenOffset] = first_token_offset;
+
+    sub_nodes.emplace_back(std::make_unique<MoeGroupedMatmulBwdNode>(std::move(attributes), context));
+
+    return dweight;
 }
 
 static inline std::ostream &

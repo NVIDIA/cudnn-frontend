@@ -146,6 +146,10 @@ def _skip_if_unsupported_d256(D):
     major, minor = torch.cuda.get_device_capability()
     if major < 10:
         pytest.skip("d=256 backward path requires SM100+")
+    try:
+        import cudnn.sdpa  # noqa: F401
+    except ImportError:
+        pytest.skip("d=256 OSS SDPA path requires optional cutedsl dependencies in this environment")
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +181,33 @@ class TestCudnnSdpa:
         # Reference
         o_ref, dq_ref, dk_ref, dv_ref = sdpa_reference_fwd_bwd(q, k, v)
 
+        torch.testing.assert_close(o.float(), o_ref.float(), atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(q.grad.float(), dq_ref.float(), atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(k.grad.float(), dk_ref.float(), atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(v.grad.float(), dv_ref.float(), atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.L0
+    def test_d256_uses_oss_forward_path(self):
+        _skip_if_unsupported_d256(256)
+        try:
+            import cudnn.sdpa  # noqa: F401
+        except ImportError:
+            pytest.skip("OSS SDPA d=256 optional dependencies are not installed in this environment")
+
+        B, H, S, D = 2, 8, 128, 256
+        _fprop_cache.clear()
+
+        q = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        k = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        v = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
+
+        o = scaled_dot_product_attention(q, k, v)
+        loss = o.sum()
+        loss.backward()
+
+        o_ref, dq_ref, dk_ref, dv_ref = sdpa_reference_fwd_bwd(q, k, v)
+
+        assert len(_fprop_cache) == 0, "D=256 OSS forward path should bypass the cuDNN graph cache"
         torch.testing.assert_close(o.float(), o_ref.float(), atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(q.grad.float(), dq_ref.float(), atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(k.grad.float(), dk_ref.float(), atol=2e-2, rtol=2e-2)

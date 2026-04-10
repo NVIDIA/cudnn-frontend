@@ -416,8 +416,11 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
             }
 
             if (effective_cudnn_ver >= 92100) {
-                allowed_input_names.insert(input_names::Bias);
-                allowed_input_msg += ", Bias";
+                // NOTE: For unified engine, we support dropout via Seed and Offset only.
+                // Custom dropout mask (via Dropout_mask, Dropout_scale) is not supported.
+                allowed_input_names.insert(
+                    {input_names::Bias, input_names::Seed, input_names::Offset, input_names::SINK_TOKEN});
+                allowed_input_msg += ", Bias, Seed, Offset, SINK_TOKEN";
             }
 
             for (const auto& [key, value] : inputs) {
@@ -426,10 +429,18 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 }
             }
 
+            std::unordered_set<SDPA_attributes::output_names> allowed_output_names{output_names::O,
+                                                                                   output_names::Stats};
+            std::string allowed_output_msg = "Unified SDPA node doesn't yet support outputs other than O, Stats";
+
+            if (effective_cudnn_ver >= 92100) {
+                allowed_output_names.insert({output_names::RNG_DUMP, output_names::Max, output_names::Sum_exp});
+                allowed_output_msg += ", RNG_DUMP, Max, Sum_exp";
+            }
+
             for (const auto& [key, value] : outputs) {
-                if (key != output_names::O && key != output_names::Stats && value != nullptr) {
-                    return {error_code_t::GRAPH_NOT_SUPPORTED,
-                            "Unified SDPA node doesn't yet support outputs other than O and Stats"};
+                if (allowed_output_names.find(key) == allowed_output_names.end() && value != nullptr) {
+                    return {error_code_t::GRAPH_NOT_SUPPORTED, allowed_output_msg};
                 }
             }
 
@@ -453,8 +464,8 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                         "Diagonal alignment for unified SDPA node requires cuDNN 9.21.0 or above"};
             }
 
-            if (dropout_probability.has_value()) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA node doesn't yet support dropout"};
+            if (dropout_probability.has_value() && effective_cudnn_ver < 92100) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED, "Dropout for unified SDPA node requires cuDNN 9.21.0"};
             }
 
             // Unified engine in cuDNN < 9.15 can't meaningfully support max sequence length,

@@ -26,6 +26,11 @@ from .grouped_gemm_dglu.api import (
     grouped_gemm_dglu_wrapper_sm100,
 )
 
+from .grouped_gemm_wgrad.api import (
+    GroupedGemmWgradSm100,
+    grouped_gemm_wgrad_wrapper_sm100,
+)
+
 __all__ = [
     "GroupedGemmSwigluSm100",
     "grouped_gemm_swiglu_wrapper_sm100",
@@ -37,4 +42,6 @@ __all__ = [
     "grouped_gemm_glu_wrapper_sm100",
     "GroupedGemmDgluSm100",
     "grouped_gemm_dglu_wrapper_sm100",
+    "GroupedGemmWgradSm100",
+    "grouped_gemm_wgrad_wrapper_sm100",
 ]

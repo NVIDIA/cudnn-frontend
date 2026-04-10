@@ -97,16 +97,16 @@ TEST_CASE("LayerNorm Zero Centered Gamma Training", "[layernorm][graph][zero_cen
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> Mean_tensor(batch_size * seq_length, false);
-    Surface<float> Var_tensor(batch_size * seq_length, false);
-    Surface<float> Scale_tensor(hidden_size, false);
-    Surface<float> Bias_tensor(hidden_size, false);
-    Surface<half> Y_tensor(batch_size * seq_length * hidden_size, false);
+    Surface<half> X_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> Mean_tensor(batch_size * seq_length);
+    Surface<float> Var_tensor(batch_size * seq_length);
+    Surface<float> Scale_tensor(hidden_size);
+    Surface<float> Bias_tensor(hidden_size);
+    Surface<half> Y_tensor(batch_size * seq_length * hidden_size);
 
     int64_t workspace_size;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
@@ -190,14 +190,14 @@ TEST_CASE("LayerNorm Zero Centered Gamma Inference", "[layernorm][graph][zero_ce
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> Scale_tensor(hidden_size, false);
-    Surface<float> Bias_tensor(hidden_size, false);
-    Surface<half> Y_tensor(batch_size * seq_length * hidden_size, false);
+    Surface<half> X_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> Scale_tensor(hidden_size);
+    Surface<float> Bias_tensor(hidden_size);
+    Surface<half> Y_tensor(batch_size * seq_length * hidden_size);
 
     int64_t workspace_size;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
@@ -280,18 +280,18 @@ TEST_CASE("LayerNorm Zero Centered Gamma Backward", "[layernorm][graph][zero_cen
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<half> DY_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> Mean_tensor(batch_size * seq_length, false);
-    Surface<float> Inv_variance_tensor(batch_size * seq_length, false);
-    Surface<float> Scale_tensor(hidden_size, false);
-    Surface<float> Dscale_tensor(hidden_size, false);
-    Surface<float> Dbias_tensor(hidden_size, false);
-    Surface<half> DX_tensor(batch_size * seq_length * hidden_size, false);
+    Surface<half> X_tensor(batch_size * seq_length * hidden_size);
+    Surface<half> DY_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> Mean_tensor(batch_size * seq_length);
+    Surface<float> Inv_variance_tensor(batch_size * seq_length);
+    Surface<float> Scale_tensor(hidden_size);
+    Surface<float> Dscale_tensor(hidden_size);
+    Surface<float> Dbias_tensor(hidden_size);
+    Surface<half> DX_tensor(batch_size * seq_length * hidden_size);
 
     int64_t workspace_size;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},

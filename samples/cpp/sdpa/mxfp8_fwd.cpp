@@ -181,28 +181,28 @@ TEST_CASE("sdpa_mxfp8_fprop", "[graph][sdpa][mxfp8][forward]") {
 
     // Allocate device memory
     // QKV tensor (packed FP8)
-    Surface<int8_t> qkvTensor(b * s * 3 * h * d, false);
+    Surface<int8_t> qkvTensor(b * s * 3 * h * d);
     void* devPtrQ = qkvTensor.devPtr;
     void* devPtrK = (qkvTensor.devPtr + h * d);
     void* devPtrV = (qkvTensor.devPtr + 2 * h * d);
 
     // Output tensor (bfloat16 = 2 bytes per element, allocate as int8_t with 2x size)
-    Surface<int8_t> oTensor(b * s * h * d * 2, false);
+    Surface<int8_t> oTensor(b * s * h * d * 2);
 
     // Scale factor tensors (E8M0 = 1 byte per element)
     // SF_Q and SF_K have dims [b, h, s_padded, d_scale_padded]
     int64_t sf_qk_size = b * h * s_padded * d_scale_padded;
-    Surface<int8_t> SF_Q_Tensor(sf_qk_size, false);
-    Surface<int8_t> SF_K_Tensor(sf_qk_size, false);
+    Surface<int8_t> SF_Q_Tensor(sf_qk_size);
+    Surface<int8_t> SF_K_Tensor(sf_qk_size);
     // SF_V has dims [b, h, s_scale_padded, d_padded] (different scaling axis)
     int64_t sf_v_size = b * h * s_scale_padded * d_padded;
-    Surface<int8_t> SF_V_Tensor(sf_v_size, false);
+    Surface<int8_t> SF_V_Tensor(sf_v_size);
 
     // Amax output tensor
-    Surface<float> Amax_O_Tensor(1, false);
+    Surface<float> Amax_O_Tensor(1);
 
     // Stats tensor (if generating stats)
-    Surface<float> statsTensor(b * h * s, false);
+    Surface<float> statsTensor(b * h * s);
 
     // Build variant pack
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
@@ -222,7 +222,7 @@ TEST_CASE("sdpa_mxfp8_fprop", "[graph][sdpa][mxfp8][forward]") {
     // Get workspace size and allocate
     int64_t workspace_size = 0;
     REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     // Execute the graph
     REQUIRE(mha_graph.execute(handle, variant_pack, workspace.devPtr).is_good());

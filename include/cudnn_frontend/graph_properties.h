@@ -2778,6 +2778,19 @@ class Moe_grouped_matmul_attributes : public Attributes<Moe_grouped_matmul_attri
     }
 };
 
+class Moe_grouped_matmul_bwd_attributes : public Attributes<Moe_grouped_matmul_bwd_attributes> {
+    friend class Attributes<Moe_grouped_matmul_bwd_attributes>;
+    friend class MoeGroupedMatmulBwdNode;
+    friend class Graph;
+
+   public:
+    enum class input_names { DOutput, Token, FirstTokenOffset };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { DWeight };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Moe_grouped_matmul_bwd_attributes, name, inputs, outputs)
+};
+
 }  // namespace graph
 
 }  // namespace cudnn_frontend

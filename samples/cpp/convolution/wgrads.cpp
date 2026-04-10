@@ -61,13 +61,13 @@ TEST_CASE("Convolution Wgrad", "[wgrad][graph][wgrad][Conv_wgrad]") {
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<half> x_tensor(4 * 64 * 16 * 16, false);
-    Surface<half> dy_tensor(4 * 64 * 16 * 16, false);
-    Surface<half> dw_tensor(64 * 64 * 3 * 3, false);
+    Surface<half> x_tensor(4 * 64 * 16 * 16);
+    Surface<half> dy_tensor(4 * 64 * 16 * 16);
+    Surface<half> dw_tensor(64 * 64 * 3 * 3);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, x_tensor.devPtr}, {DY, dy_tensor.devPtr}, {DW, dw_tensor.devPtr}};
@@ -132,15 +132,15 @@ TEST_CASE("scale-bias-relu-wgrad Graph", "[wgrad][graph][scale-bias-relu-wgrad][
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<half> x_tensor(4 * 64 * 16 * 16, false);
-    Surface<half> s_tensor(64, false);
-    Surface<half> b_tensor(64, false);
-    Surface<half> dy_tensor(4 * 64 * 16 * 16, false);
-    Surface<half> dw_tensor(64 * 64 * 3 * 3, false);
+    Surface<half> x_tensor(4 * 64 * 16 * 16);
+    Surface<half> s_tensor(64);
+    Surface<half> b_tensor(64);
+    Surface<half> dy_tensor(4 * 64 * 16 * 16);
+    Surface<half> dw_tensor(64 * 64 * 3 * 3);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {{X, x_tensor.devPtr},
                                                                                              {S, s_tensor.devPtr},

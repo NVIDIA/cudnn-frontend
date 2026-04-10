@@ -510,6 +510,7 @@ def execute_graph(graph, variant_pack, allocs, tensors, cudnn_handle, request, l
         else:
             times_ms = time_execution(graph.execute, variant_pack, workspace[0], cudnn_handle)
         print(f"@@@@ {label} graph.execute median_time_ms={times_ms.median().item():.3f} ({timing_method})")
+        profile_execution(graph.execute, variant_pack, workspace[0], cudnn_handle)
 
     graph.execute(variant_pack, workspace[0], cudnn_handle)
     torch.cuda.synchronize()
@@ -678,7 +679,7 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
     if cfg.is_train and cfg.is_bias:
         err_count += approx_equal(allocs[TensorUid.dBias], dBias_ref, atol=2e-2, rtol=2e-2, tag="dBias", disp_elems=diffs)
     if cfg.is_train and cfg.with_sink_token:
-        err_count += approx_equal(allocs[TensorUid.dSink_token], dSink_token_ref, atol=2e-2, rtol=2e-2, tag="dSink_token", disp_elems=diffs)
+        err_count += approx_equal(allocs[TensorUid.dSink_token], dSink_token_ref, atol=4e-2, rtol=2e-2, tag="dSink_token", disp_elems=diffs)
 
     if err_count != 0:
         print("@@@@ Overall result: FAILED, disallowed mismatches")

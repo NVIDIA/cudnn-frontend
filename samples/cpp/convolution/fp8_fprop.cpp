@@ -108,18 +108,18 @@ TEST_CASE("Convolution fp8 precision", "[conv][graph]") {
     REQUIRE(graph->build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     // Use int8_t as proxy for fp8
-    Surface<int8_t> X_gpu(n * c * h * w, false);
-    Surface<int8_t> W_gpu(k * c * r * s, false);
-    Surface<int8_t> Y_gpu(n * k * h * w, false);
+    Surface<int8_t> X_gpu(n * c * h * w);
+    Surface<int8_t> W_gpu(k * c * r * s);
+    Surface<int8_t> Y_gpu(n * k * h * w);
 
-    Surface<float> X_descale_gpu(1, false);
-    Surface<float> W_descale_gpu(1, false);
-    Surface<float> Y_scale_gpu(1, false);
-    Surface<float> amax_gpu(1, false);
+    Surface<float> X_descale_gpu(1);
+    Surface<float> W_descale_gpu(1);
+    Surface<float> Y_scale_gpu(1);
+    Surface<float> amax_gpu(1);
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_gpu.devPtr},

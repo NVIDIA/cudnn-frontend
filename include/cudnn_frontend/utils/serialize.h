@@ -511,6 +511,18 @@ NLOHMANN_JSON_SERIALIZE_ENUM(Moe_grouped_matmul_attributes::output_names,
                                  {Moe_grouped_matmul_attributes::output_names::Output, "Output"},
                              })
 
+NLOHMANN_JSON_SERIALIZE_ENUM(Moe_grouped_matmul_bwd_attributes::input_names,
+                             {
+                                 {Moe_grouped_matmul_bwd_attributes::input_names::DOutput, "DOutput"},
+                                 {Moe_grouped_matmul_bwd_attributes::input_names::Token, "Token"},
+                                 {Moe_grouped_matmul_bwd_attributes::input_names::FirstTokenOffset, "FirstTokenOffset"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(Moe_grouped_matmul_bwd_attributes::output_names,
+                             {
+                                 {Moe_grouped_matmul_bwd_attributes::output_names::DWeight, "DWeight"},
+                             })
+
 inline void
 to_json(nlohmann::json& j, const Tensor_attributes& ta) {
     j = nlohmann::json{{"name", ta.name},

@@ -167,15 +167,15 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
     auto result = graph->query_tensor_attributes_of_uid(x_tensor, tensor_attr);
     REQUIRE(result.is_good());
 
-    Surface<half> x_device_memory(n * c * h * w, false);
-    Surface<half> w_device_memory(k * c * r * s, false);
-    Surface<half> s_device_memory(k, false);
-    Surface<half> b_device_memory(k, false);
-    Surface<half> y_device_memory(n * k * h * w, false);  // Should be p, q.
+    Surface<half> x_device_memory(n * c * h * w);
+    Surface<half> w_device_memory(k * c * r * s);
+    Surface<half> s_device_memory(k);
+    Surface<half> b_device_memory(k);
+    Surface<half> y_device_memory(n * k * h * w);  // Should be p, q.
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<int64_t, void*> variant_pack = {{x_tensor, x_device_memory.devPtr},
                                                        {w_tensor, w_device_memory.devPtr},
@@ -432,8 +432,8 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
     auto graph = deserialize(handle, serialize_data);
 
     //// Build variant pack
-    Surface<half> qkvTensor(b * s_q * 3 * h * d, false);
-    Surface<half> oTensor(b * s_q * h * d, false);
+    Surface<half> qkvTensor(b * s_q * 3 * h * d);
+    Surface<half> oTensor(b * s_q * h * d);
     void* devPtrQ = qkvTensor.devPtr;
     void* devPtrK = (qkvTensor.devPtr + d);
     void* devPtrV = (qkvTensor.devPtr + 2 * d);
@@ -441,12 +441,12 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
 
     int32_t scaleSize  = 1;
     int32_t seed_value = 123456;
-    Surface<int32_t> dropoutSeed(scaleSize, false, seed_value);
-    Surface<int32_t> dropoutOffset(scaleSize, false, (int32_t)1);
+    Surface<int32_t> dropoutSeed(scaleSize, seed_value);
+    Surface<int32_t> dropoutOffset(scaleSize, (int32_t)1);
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::cout << "Graph requires workspace " << workspace_size << std::endl;
 

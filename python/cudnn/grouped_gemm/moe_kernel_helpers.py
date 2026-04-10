@@ -822,6 +822,46 @@ def compute_grid(
     return sched_params, grid
 
 
+def compute_stages_wgrad(
+    tiled_mma: cute.TiledMma,
+    mma_tiler_mnk: Tuple[int, int, int],
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    epi_tile: cute.Tile,
+    c_dtype: Type[cutlass.Numeric],
+    c_layout: utils.LayoutEnum,
+    sf_dtype: Type[cutlass.Numeric],
+    sf_vec_size: int,
+    num_smem_capacity: int,
+    occupancy: int,
+) -> Tuple[int, int, int]:
+    """Compute pipeline stages for the grouped GEMM wgrad kernel."""
+    num_acc_stage = 2
+    num_c_stage = 2
+    num_tile_stage = 2
+
+    a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler_mnk, a_dtype, 1)
+    b_smem_layout_staged_one = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler_mnk, b_dtype, 1)
+    sfa_smem_layout_staged_one = blockscaled_utils.make_smem_layout_sfa(tiled_mma, mma_tiler_mnk, sf_vec_size, 1)
+    sfb_smem_layout_staged_one = blockscaled_utils.make_smem_layout_sfb(tiled_mma, mma_tiler_mnk, sf_vec_size, 1)
+    c_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(c_dtype, c_layout, epi_tile, 1)
+
+    ab_bytes_per_stage = (
+        cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
+        + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
+        + cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one)
+        + cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
+    )
+    mbar_helpers_bytes = 1024
+    sinfo_bytes = 4 * 4 * num_tile_stage
+    c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
+    c_bytes = c_bytes_per_stage * num_c_stage
+
+    num_ab_stage = (num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes + sinfo_bytes)) // ab_bytes_per_stage
+
+    return num_acc_stage, num_ab_stage, num_c_stage
+
+
 def get_tma_atom_kind(atom_sm_cnt: cutlass.Int32, mcast: cutlass.Boolean) -> Union[cpasync.CopyBulkTensorTileG2SMulticastOp, cpasync.CopyBulkTensorTileG2SOp]:
     """
     Select the appropriate TMA copy atom based on SM count and multicast flag.

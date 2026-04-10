@@ -1,5 +1,6 @@
 #pragma once
 
+#include <vector>
 #include <stdexcept>
 #include <sstream>
 
@@ -236,7 +237,7 @@ cpu_half2float(half h) {
 
 // Generate uniform numbers [0,1)
 static void
-initImage(float* image, int64_t imageSize) {
+initHostImage(float* image, int64_t imageSize) {
     static unsigned seed = 123456789;
     for (int64_t index = 0; index < imageSize; index++) {
         seed         = (1103515245 * seed + 12345) & 0xffffffff;
@@ -245,7 +246,7 @@ initImage(float* image, int64_t imageSize) {
 }
 
 static void
-initImage(half* image, int64_t imageSize) {
+initHostImage(half* image, int64_t imageSize) {
     static unsigned seed = 123456789;
     for (int64_t index = 0; index < imageSize; index++) {
         seed         = (1103515245 * seed + 12345) & 0xffffffff;
@@ -255,7 +256,7 @@ initImage(half* image, int64_t imageSize) {
 
 // Currently set to generate uniform integers [-2, 2] to avoid int8 overflow
 static void
-initImage(int8_t* image, int64_t imageSize) {
+initHostImage(int8_t* image, int64_t imageSize) {
     static unsigned seed = 123456789;
     for (int64_t index = 0; index < imageSize; index++) {
         seed = (1103515245 * seed + 12345) & 0xffffffff;
@@ -266,7 +267,7 @@ initImage(int8_t* image, int64_t imageSize) {
 
 // Currently set to generate random integers [0, 50] to avoid uint8 overflow
 static void
-initImage(uint8_t* image, int64_t imageSize) {
+initHostImage(uint8_t* image, int64_t imageSize) {
     static unsigned seed = 123456789;
     for (int64_t index = 0; index < imageSize; index++) {
         seed = (1103515245 * seed + 12345) & 0xffffffff;
@@ -277,7 +278,7 @@ initImage(uint8_t* image, int64_t imageSize) {
 
 // Currently set to generate uniform integers [0,1]
 static void
-initImage(int32_t* image, int64_t imageSize) {
+initHostImage(int32_t* image, int64_t imageSize) {
     static unsigned seed = 123456789;
     for (int64_t index = 0; index < imageSize; index++) {
         seed = (1103515245 * seed + 12345) & 0xffffffff;
@@ -288,7 +289,7 @@ initImage(int32_t* image, int64_t imageSize) {
 
 // Currently set to generate uniform integers [0,1]
 static void
-initImage(int64_t* image, int64_t imageSize) {
+initHostImage(int64_t* image, int64_t imageSize) {
     static unsigned seed = 123456789;
     for (int64_t index = 0; index < imageSize; index++) {
         seed = (1103515245 * seed + 12345) & 0xffffffff;
@@ -299,7 +300,7 @@ initImage(int64_t* image, int64_t imageSize) {
 
 // Currently set to generate booleans
 static void
-initImage(bool* image, int64_t imageSize) {
+initHostImage(bool* image, int64_t imageSize) {
     static unsigned seed = 123456789;
     for (int64_t index = 0; index < imageSize; index++) {
         seed = (1103515245 * seed + 12345) & 0xffffffff;
@@ -311,53 +312,65 @@ initImage(bool* image, int64_t imageSize) {
     }
 }
 
+template <typename T>
+static void
+initImage(T* devPtr, size_t imageSize) {
+    if (imageSize == 0) {
+        return;
+    }
+
+    std::vector<T> host(imageSize);
+    initHostImage(host.data(), static_cast<int64_t>(imageSize));
+    CUDA_CHECK(cudaMemcpy(devPtr, host.data(), sizeof(host[0]) * imageSize, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+template <typename T>
+static void
+fillImage(T* devPtr, size_t imageSize, T fillValue) {
+    if (imageSize == 0) {
+        return;
+    }
+
+    std::vector<T> host(imageSize, fillValue);
+    CUDA_CHECK(cudaMemcpy(devPtr, host.data(), sizeof(host[0]) * imageSize, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
 template <typename T_ELEM>
 struct Surface {
-    T_ELEM* devPtr  = NULL;
-    T_ELEM* hostPtr = NULL;
-    int64_t n_elems = 0;
+    T_ELEM* devPtr = NULL;
+    size_t size    = 0;
 
    protected:
     explicit Surface() {}
 
    public:
-    explicit Surface(int64_t n_elems, [[maybe_unused]] bool hasRef) : n_elems(n_elems) {
-        CUDA_CHECK(cudaMalloc((void**)&(devPtr), (size_t)((n_elems) * sizeof(devPtr[0]))));
-        hostPtr = (T_ELEM*)calloc((size_t)n_elems, sizeof(hostPtr[0]));
-        initImage(hostPtr, n_elems);
-        CUDA_CHECK(cudaMemcpy(devPtr, hostPtr, size_t(sizeof(hostPtr[0]) * n_elems), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
-
-    explicit Surface(int64_t n_elems, [[maybe_unused]] bool hasRef, bool isInterleaved) {
-        (void)isInterleaved;
-        CUDA_CHECK(cudaMalloc((void**)&(devPtr), (n_elems) * sizeof(devPtr[0])));
-        hostPtr = (T_ELEM*)calloc(n_elems, sizeof(hostPtr[0]));
-        initImage(hostPtr, n_elems);
-        uint32_t* temp = (uint32_t*)hostPtr;
-        for (auto i = 0; i < n_elems; i = i + 2) {
-            temp[i + 1] = 1u;
+    explicit Surface(size_t size) : size(size) {
+        if (size == 0) {
+            return;
         }
 
-        CUDA_CHECK(cudaMemcpy(devPtr, hostPtr, size_t(sizeof(hostPtr[0]) * n_elems), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMalloc(&devPtr, size * sizeof(T_ELEM)));
+        initImage(devPtr, size);
     }
 
-    explicit Surface(int64_t size, [[maybe_unused]] bool hasRef, T_ELEM fillValue) : n_elems(size) {
-        CUDA_CHECK(cudaMalloc((void**)&(devPtr), (size) * sizeof(devPtr[0])));
-        hostPtr = (T_ELEM*)calloc(size, sizeof(hostPtr[0]));
-        for (int i = 0; i < size; i++) {
-            hostPtr[i] = fillValue;
+    explicit Surface(size_t size, T_ELEM fillValue) : size(size) {
+        if (size == 0) {
+            return;
         }
-        CUDA_CHECK(cudaMemcpy(devPtr, hostPtr, sizeof(hostPtr[0]) * n_elems, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaMalloc(&devPtr, size * sizeof(T_ELEM)));
+        fillImage(devPtr, size, fillValue);
     }
 
-    Surface(const Surface& other) : n_elems(other.n_elems) {
-        CUDA_CHECK(cudaMalloc((void**)&(devPtr), (size_t)((n_elems) * sizeof(devPtr[0]))));
-        hostPtr = (T_ELEM*)calloc((size_t)n_elems, sizeof(hostPtr[0]));
-        std::copy(other.hostPtr, other.hostPtr + n_elems, hostPtr);
-        CUDA_CHECK(cudaMemcpy(devPtr, hostPtr, size_t(sizeof(hostPtr[0]) * n_elems), cudaMemcpyHostToDevice));
+    Surface(const Surface& other) : size(other.size) {
+        if (size == 0) {
+            return;
+        }
+
+        CUDA_CHECK(cudaMalloc(&devPtr, size * sizeof(T_ELEM)));
+        CUDA_CHECK(cudaMemcpy(devPtr, other.devPtr, sizeof(devPtr[0]) * size, cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
@@ -371,8 +384,7 @@ struct Surface {
 
     friend void
     swap(Surface& first, Surface& second) {
-        std::swap(first.n_elems, second.n_elems);
-        std::swap(first.hostPtr, second.hostPtr);
+        std::swap(first.size, second.size);
         std::swap(first.devPtr, second.devPtr);
     }
 
@@ -380,10 +392,6 @@ struct Surface {
         if (devPtr) {
             cudaFree(devPtr);
             devPtr = nullptr;
-        }
-        if (hostPtr) {
-            free(hostPtr);
-            hostPtr = nullptr;
         }
     }
 };

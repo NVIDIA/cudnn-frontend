@@ -42,9 +42,9 @@ TEST_CASE("Complex FP32 Matmul", "[matmul][graph]") {
 
     // Initialize input tensors
     // COMPLEX_FP32 datatype is a {float, float} in memory
-    Surface<int8_t> A_gpu(2 * sizeof(float) * b * m * k, false);
+    Surface<int8_t> A_gpu(2 * sizeof(float) * b * m * k);
 
-    Surface<int8_t> B_gpu(2 * sizeof(float) * b * k * n, false);
+    Surface<int8_t> B_gpu(2 * sizeof(float) * b * k * n);
 
     // Make cudnn graph
     fe::graph::Graph graph{};
@@ -92,11 +92,11 @@ TEST_CASE("Complex FP32 Matmul", "[matmul][graph]") {
     REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
     // Run cudnn graph
-    Surface<float> C_gpu(2 * sizeof(float) * b * m * n, false);
+    Surface<float> C_gpu(2 * sizeof(float) * b * m * n);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {A, A_gpu.devPtr}, {B, B_gpu.devPtr}, {C, C_gpu.devPtr}};

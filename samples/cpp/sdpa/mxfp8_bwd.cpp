@@ -266,46 +266,46 @@ TEST_CASE("sdpa_mxfp8_mha_bprop", "[graph][sdpa][mxfp8][backward]") {
     int64_t v_size    = b * s * h * d_v;
     int64_t o_dO_size = b * s * h * d_v;
 
-    Surface<int8_t> Q_Tensor(qk_size, false);
-    Surface<int8_t> K_Tensor(qk_size, false);
-    Surface<int8_t> V_Tensor(v_size, false);
+    Surface<int8_t> Q_Tensor(qk_size);
+    Surface<int8_t> K_Tensor(qk_size);
+    Surface<int8_t> V_Tensor(v_size);
 
-    Surface<half> dQ_Tensor(qk_size, false);
-    Surface<half> dK_Tensor(qk_size, false);
-    Surface<half> dV_Tensor(v_size, false);
+    Surface<half> dQ_Tensor(qk_size);
+    Surface<half> dK_Tensor(qk_size);
+    Surface<half> dV_Tensor(v_size);
 
     // O and dO in bfloat16 (2 bytes per element)
-    Surface<int8_t> O_f16_Tensor(o_dO_size * 2, false);
-    Surface<int8_t> dO_f16_Tensor(o_dO_size * 2, false);
+    Surface<int8_t> O_f16_Tensor(o_dO_size * 2);
+    Surface<int8_t> dO_f16_Tensor(o_dO_size * 2);
     // dO in FP8; dO_T is separate data (transposed layout)
-    Surface<int8_t> dOTensor(o_dO_size, false);
-    Surface<int8_t> dO_T_Tensor(o_dO_size, false);
+    Surface<int8_t> dOTensor(o_dO_size);
+    Surface<int8_t> dO_T_Tensor(o_dO_size);
 
     // Q_T and K_T are separate data (transposed layout)
-    Surface<int8_t> Q_T_Tensor(qk_size, false);
-    Surface<int8_t> K_T_Tensor(qk_size, false);
+    Surface<int8_t> Q_T_Tensor(qk_size);
+    Surface<int8_t> K_T_Tensor(qk_size);
 
-    Surface<float> StatsTensor(b * h * s * 1, false);
+    Surface<float> StatsTensor(b * h * s * 1);
 
     int64_t sf_qk_size = b * h * s_padded * d_qk_scale_padded;
     int64_t sf_dO_size = b * h * s_padded * d_v_scale_padded;
-    Surface<int8_t> SF_Q_Tensor(sf_qk_size, false);
-    Surface<int8_t> SF_K_Tensor(sf_qk_size, false);
-    Surface<int8_t> SF_dO_Tensor(sf_dO_size, false);
+    Surface<int8_t> SF_Q_Tensor(sf_qk_size);
+    Surface<int8_t> SF_K_Tensor(sf_qk_size);
+    Surface<int8_t> SF_dO_Tensor(sf_dO_size);
 
     int64_t sf_qk_t_size = b * h * s_scale_padded * d_qk_padded;
-    Surface<int8_t> SF_Q_T_Tensor(sf_qk_t_size, false);
-    Surface<int8_t> SF_K_T_Tensor(sf_qk_t_size, false);
+    Surface<int8_t> SF_Q_T_Tensor(sf_qk_t_size);
+    Surface<int8_t> SF_K_T_Tensor(sf_qk_t_size);
 
     int64_t sf_dO_t_size = b * h * s_scale_padded * d_v_padded;
-    Surface<int8_t> SF_dO_T_Tensor(sf_dO_t_size, false);
+    Surface<int8_t> SF_dO_T_Tensor(sf_dO_t_size);
 
     int64_t sf_v_size = b * h * s_padded * d_v_scale_padded;
-    Surface<int8_t> SF_V_Tensor(sf_v_size, false);
+    Surface<int8_t> SF_V_Tensor(sf_v_size);
 
-    Surface<float> Amax_dQ_Tensor(1, false);
-    Surface<float> Amax_dK_Tensor(1, false);
-    Surface<float> Amax_dV_Tensor(1, false);
+    Surface<float> Amax_dQ_Tensor(1);
+    Surface<float> Amax_dK_Tensor(1);
+    Surface<float> Amax_dV_Tensor(1);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {Q, Q_Tensor.devPtr},
@@ -334,7 +334,7 @@ TEST_CASE("sdpa_mxfp8_mha_bprop", "[graph][sdpa][mxfp8][backward]") {
 
     int64_t workspace_size = 0;
     REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(mha_graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 
@@ -582,48 +582,48 @@ TEST_CASE("sdpa_mxfp8_gqa_bprop", "[graph][sdpa][mxfp8][backward]") {
     int64_t v_size    = b * s * h_kv * d_v;
     int64_t o_dO_size = b * s * h_q * d_v;
 
-    Surface<int8_t> Q_Tensor(q_size, false);
-    Surface<int8_t> K_Tensor(k_size, false);
-    Surface<int8_t> V_Tensor(v_size, false);
+    Surface<int8_t> Q_Tensor(q_size);
+    Surface<int8_t> K_Tensor(k_size);
+    Surface<int8_t> V_Tensor(v_size);
 
-    Surface<half> dQ_Tensor(q_size, false);
-    Surface<half> dK_Tensor(k_size, false);
-    Surface<half> dV_Tensor(v_size, false);
+    Surface<half> dQ_Tensor(q_size);
+    Surface<half> dK_Tensor(k_size);
+    Surface<half> dV_Tensor(v_size);
 
     // O and dO in bfloat16 (2 bytes per element)
-    Surface<int8_t> O_f16_Tensor(o_dO_size * 2, false);
-    Surface<int8_t> dO_f16_Tensor(o_dO_size * 2, false);
+    Surface<int8_t> O_f16_Tensor(o_dO_size * 2);
+    Surface<int8_t> dO_f16_Tensor(o_dO_size * 2);
     // dO in FP8; dO_T is separate data (transposed layout)
-    Surface<int8_t> dOTensor(o_dO_size, false);
-    Surface<int8_t> dO_T_Tensor(o_dO_size, false);
+    Surface<int8_t> dOTensor(o_dO_size);
+    Surface<int8_t> dO_T_Tensor(o_dO_size);
 
-    Surface<int8_t> Q_T_Tensor(q_size, false);
-    Surface<int8_t> K_T_Tensor(k_size, false);
+    Surface<int8_t> Q_T_Tensor(q_size);
+    Surface<int8_t> K_T_Tensor(k_size);
 
-    Surface<float> StatsTensor(b * h_q * s * 1, false);
+    Surface<float> StatsTensor(b * h_q * s * 1);
 
     int64_t sf_q_size = b * h_q * s_padded * d_qk_scale_padded;
     int64_t sf_k_size = b * h_kv * s_padded * d_qk_scale_padded;
-    Surface<int8_t> SF_Q_Tensor(sf_q_size, false);
-    Surface<int8_t> SF_K_Tensor(sf_k_size, false);
+    Surface<int8_t> SF_Q_Tensor(sf_q_size);
+    Surface<int8_t> SF_K_Tensor(sf_k_size);
 
     int64_t sf_dO_size = b * h_q * s_padded * d_v_scale_padded;
-    Surface<int8_t> SF_dO_Tensor(sf_dO_size, false);
+    Surface<int8_t> SF_dO_Tensor(sf_dO_size);
 
     int64_t sf_q_t_size = b * h_q * s_scale_padded * d_qk_padded;
     int64_t sf_k_t_size = b * h_kv * s_scale_padded * d_qk_padded;
-    Surface<int8_t> SF_Q_T_Tensor(sf_q_t_size, false);
-    Surface<int8_t> SF_K_T_Tensor(sf_k_t_size, false);
+    Surface<int8_t> SF_Q_T_Tensor(sf_q_t_size);
+    Surface<int8_t> SF_K_T_Tensor(sf_k_t_size);
 
     int64_t sf_dO_t_size = b * h_q * s_scale_padded * d_v_padded;
-    Surface<int8_t> SF_dO_T_Tensor(sf_dO_t_size, false);
+    Surface<int8_t> SF_dO_T_Tensor(sf_dO_t_size);
 
     int64_t sf_v_size = b * h_kv * s_padded * d_v_scale_padded;
-    Surface<int8_t> SF_V_Tensor(sf_v_size, false);
+    Surface<int8_t> SF_V_Tensor(sf_v_size);
 
-    Surface<float> Amax_dQ_Tensor(1, false);
-    Surface<float> Amax_dK_Tensor(1, false);
-    Surface<float> Amax_dV_Tensor(1, false);
+    Surface<float> Amax_dQ_Tensor(1);
+    Surface<float> Amax_dK_Tensor(1);
+    Surface<float> Amax_dV_Tensor(1);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {Q, Q_Tensor.devPtr},
@@ -652,7 +652,7 @@ TEST_CASE("sdpa_mxfp8_gqa_bprop", "[graph][sdpa][mxfp8][backward]") {
 
     int64_t workspace_size = 0;
     REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(mha_graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 
@@ -898,46 +898,46 @@ TEST_CASE("sdpa_mxfp8_mla_bprop", "[graph][sdpa][mxfp8][backward]") {
     int64_t v_size    = b * s * h * d_v;
     int64_t o_dO_size = b * s * h * d_v;
 
-    Surface<int8_t> Q_Tensor(qk_size, false);
-    Surface<int8_t> K_Tensor(qk_size, false);
-    Surface<int8_t> V_Tensor(v_size, false);
+    Surface<int8_t> Q_Tensor(qk_size);
+    Surface<int8_t> K_Tensor(qk_size);
+    Surface<int8_t> V_Tensor(v_size);
 
-    Surface<half> dQ_Tensor(qk_size, false);
-    Surface<half> dK_Tensor(qk_size, false);
-    Surface<half> dV_Tensor(v_size, false);
+    Surface<half> dQ_Tensor(qk_size);
+    Surface<half> dK_Tensor(qk_size);
+    Surface<half> dV_Tensor(v_size);
 
     // O and dO in bfloat16 (2 bytes per element)
-    Surface<int8_t> O_f16_Tensor(o_dO_size * 2, false);
-    Surface<int8_t> dO_f16_Tensor(o_dO_size * 2, false);
+    Surface<int8_t> O_f16_Tensor(o_dO_size * 2);
+    Surface<int8_t> dO_f16_Tensor(o_dO_size * 2);
     // dO in FP8; dO_T is separate data (transposed layout)
-    Surface<int8_t> dOTensor(o_dO_size, false);
-    Surface<int8_t> dO_T_Tensor(o_dO_size, false);
+    Surface<int8_t> dOTensor(o_dO_size);
+    Surface<int8_t> dO_T_Tensor(o_dO_size);
 
     // Q_T and K_T are separate data (transposed layout)
-    Surface<int8_t> Q_T_Tensor(qk_size, false);
-    Surface<int8_t> K_T_Tensor(qk_size, false);
+    Surface<int8_t> Q_T_Tensor(qk_size);
+    Surface<int8_t> K_T_Tensor(qk_size);
 
-    Surface<float> StatsTensor(b * h * s * 1, false);
+    Surface<float> StatsTensor(b * h * s * 1);
 
     int64_t sf_qk_size = b * h * s_padded * d_qk_scale_padded;
     int64_t sf_dO_size = b * h * s_padded * d_v_scale_padded;
-    Surface<int8_t> SF_Q_Tensor(sf_qk_size, false);
-    Surface<int8_t> SF_K_Tensor(sf_qk_size, false);
-    Surface<int8_t> SF_dO_Tensor(sf_dO_size, false);
+    Surface<int8_t> SF_Q_Tensor(sf_qk_size);
+    Surface<int8_t> SF_K_Tensor(sf_qk_size);
+    Surface<int8_t> SF_dO_Tensor(sf_dO_size);
 
     int64_t sf_qk_t_size = b * h * s_scale_padded * d_qk_padded;
-    Surface<int8_t> SF_Q_T_Tensor(sf_qk_t_size, false);
-    Surface<int8_t> SF_K_T_Tensor(sf_qk_t_size, false);
+    Surface<int8_t> SF_Q_T_Tensor(sf_qk_t_size);
+    Surface<int8_t> SF_K_T_Tensor(sf_qk_t_size);
 
     int64_t sf_dO_t_size = b * h * s_scale_padded * d_v_padded;
-    Surface<int8_t> SF_dO_T_Tensor(sf_dO_t_size, false);
+    Surface<int8_t> SF_dO_T_Tensor(sf_dO_t_size);
 
     int64_t sf_v_size = b * h * s_padded * d_v_scale_padded;
-    Surface<int8_t> SF_V_Tensor(sf_v_size, false);
+    Surface<int8_t> SF_V_Tensor(sf_v_size);
 
-    Surface<float> Amax_dQ_Tensor(1, false);
-    Surface<float> Amax_dK_Tensor(1, false);
-    Surface<float> Amax_dV_Tensor(1, false);
+    Surface<float> Amax_dQ_Tensor(1);
+    Surface<float> Amax_dK_Tensor(1);
+    Surface<float> Amax_dV_Tensor(1);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {Q, Q_Tensor.devPtr},
@@ -966,7 +966,7 @@ TEST_CASE("sdpa_mxfp8_mla_bprop", "[graph][sdpa][mxfp8][backward]") {
 
     int64_t workspace_size = 0;
     REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(mha_graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 

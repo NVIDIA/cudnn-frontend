@@ -311,10 +311,8 @@ TEST_CASE("Blackwell Block Scale Matmul", "[matmul][graph][FP4]") {
 
     auto datatype_d = test_params.datatype_d;
 
-    Surface<int8_t> tensor_a_gpu(div_up(b * m * k * cudnn_frontend::detail::get_element_size_in_bits(datatype_a), 8),
-                                 false);
-    Surface<int8_t> tensor_b_gpu(div_up(b * k * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_b), 8),
-                                 false);
+    Surface<int8_t> tensor_a_gpu(div_up(b * m * k * cudnn_frontend::detail::get_element_size_in_bits(datatype_a), 8));
+    Surface<int8_t> tensor_b_gpu(div_up(b * k * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_b), 8));
 
     static constexpr int indestructible_128x4_block_m_n = 128;
     static constexpr int indestructible_128x4_block_k   = 4;
@@ -327,16 +325,13 @@ TEST_CASE("Blackwell Block Scale Matmul", "[matmul][graph][FP4]") {
     Surface<int8_t> block_descale_a_gpu(
         div_up(b * block_scale_dim_m * block_scale_dim_k *
                    cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
-               8),
-        false);
+               8));
     Surface<int8_t> block_descale_b_gpu(
         div_up(b * block_scale_dim_n * block_scale_dim_k *
                    cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
-               8),
-        false);
+               8));
 
-    Surface<int8_t> tensor_d_gpu(div_up(b * m * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_d), 8),
-                                 false);
+    Surface<int8_t> tensor_d_gpu(div_up(b * m * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_d), 8));
 
     fe::graph::Graph graph{};
 
@@ -402,7 +397,7 @@ TEST_CASE("Blackwell Block Scale Matmul", "[matmul][graph][FP4]") {
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {tensor_a, tensor_a_gpu.devPtr},
@@ -446,10 +441,8 @@ TEST_CASE("Blackwell Block Scale Matmul Quantize", "[matmul][graph][FP4]") {
 
     auto datatype_d = test_params.datatype_d;
 
-    Surface<int8_t> tensor_a_gpu(div_up(b * m * k * cudnn_frontend::detail::get_element_size_in_bits(datatype_a), 8),
-                                 false);
-    Surface<int8_t> tensor_b_gpu(div_up(b * k * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_b), 8),
-                                 false);
+    Surface<int8_t> tensor_a_gpu(div_up(b * m * k * cudnn_frontend::detail::get_element_size_in_bits(datatype_a), 8));
+    Surface<int8_t> tensor_b_gpu(div_up(b * k * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_b), 8));
 
     static constexpr int indestructible_128x4_block_m_n = 128;
     static constexpr int indestructible_128x4_block_k   = 4;
@@ -465,21 +458,17 @@ TEST_CASE("Blackwell Block Scale Matmul Quantize", "[matmul][graph][FP4]") {
     Surface<int8_t> block_descale_a_gpu(
         div_up(b * block_scale_dim_m * block_scale_dim_k *
                    cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
-               8),
-        false);
+               8));
     Surface<int8_t> block_descale_b_gpu(
         div_up(b * block_scale_dim_n * block_scale_dim_k *
                    cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
-               8),
-        false);
+               8));
 
-    Surface<int8_t> tensor_d_gpu(div_up(b * m * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_d), 8),
-                                 false);
+    Surface<int8_t> tensor_d_gpu(div_up(b * m * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_d), 8));
 
     Surface<int8_t> block_scale_gpu(div_up(b * block_scale_dim_out_m * block_scale_dim_out_n *
                                                cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
-                                           8),
-                                    false);
+                                           8));
 
     fe::graph::Graph graph{};
 
@@ -552,7 +541,7 @@ TEST_CASE("Blackwell Block Scale Matmul Quantize", "[matmul][graph][FP4]") {
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {tensor_a, tensor_a_gpu.devPtr},
@@ -598,12 +587,9 @@ TEST_CASE("Block Scale Matmul Swiglu", "[matmul][graph][FP4]") {
 
     auto datatype_d = test_params.datatype_d;
 
-    Surface<int8_t> tensor_a_gpu(div_up(b * m * k * cudnn_frontend::detail::get_element_size_in_bits(datatype_a), 8),
-                                 false);
-    Surface<int8_t> tensor_b0_gpu(div_up(b * k * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_b), 8),
-                                  false);
-    Surface<int8_t> tensor_b1_gpu(div_up(b * k * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_b), 8),
-                                  false);
+    Surface<int8_t> tensor_a_gpu(div_up(b * m * k * cudnn_frontend::detail::get_element_size_in_bits(datatype_a), 8));
+    Surface<int8_t> tensor_b0_gpu(div_up(b * k * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_b), 8));
+    Surface<int8_t> tensor_b1_gpu(div_up(b * k * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_b), 8));
 
     static constexpr int indestructible_128x4_block_m_n = 128;
     static constexpr int indestructible_128x4_block_k   = 4;
@@ -616,21 +602,17 @@ TEST_CASE("Block Scale Matmul Swiglu", "[matmul][graph][FP4]") {
     Surface<int8_t> block_descale_a_gpu(
         div_up(b * block_scale_dim_m * block_scale_dim_k *
                    cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
-               8),
-        false);
+               8));
     Surface<int8_t> block_descale_b0_gpu(
         div_up(b * block_scale_dim_n * block_scale_dim_k *
                    cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
-               8),
-        false);
+               8));
     Surface<int8_t> block_descale_b1_gpu(
         div_up(b * block_scale_dim_n * block_scale_dim_k *
                    cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale),
-               8),
-        false);
+               8));
 
-    Surface<int8_t> tensor_d_gpu(div_up(b * m * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_d), 8),
-                                 false);
+    Surface<int8_t> tensor_d_gpu(div_up(b * m * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_d), 8));
 
     fe::graph::Graph graph{};
 
@@ -732,7 +714,7 @@ TEST_CASE("Block Scale Matmul Swiglu", "[matmul][graph][FP4]") {
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {tensor_a, tensor_a_gpu.devPtr},
@@ -876,26 +858,21 @@ TEST_CASE("Blackwell Block Scale Matmul dynamic shape overrides", "[matmul][grap
         Surface<int8_t> A_gpu(div_up(matmul_dynamic_shape[idx_shape].b * matmul_dynamic_shape[idx_shape].m *
                                          matmul_dynamic_shape[idx_shape].k *
                                          cudnn_frontend::detail::get_element_size_in_bits(fe::DataType_t::FP4_E2M1),
-                                     8),
-                              false);
+                                     8));
         Surface<int8_t> SF_A_gpu(div_up(matmul_dynamic_shape[idx_shape].b * block_scale_dim_m * block_scale_dim_k *
                                             cudnn_frontend::detail::get_element_size_in_bits(fe::DataType_t::FP8_E4M3),
-                                        8),
-                                 false);
+                                        8));
         Surface<int8_t> B_gpu(div_up(matmul_dynamic_shape[idx_shape].b * matmul_dynamic_shape[idx_shape].k *
                                          matmul_dynamic_shape[idx_shape].n *
                                          cudnn_frontend::detail::get_element_size_in_bits(fe::DataType_t::FP4_E2M1),
-                                     8),
-                              false);
+                                     8));
         Surface<int8_t> SF_B_gpu(div_up(matmul_dynamic_shape[idx_shape].b * block_scale_dim_k * block_scale_dim_n *
                                             cudnn_frontend::detail::get_element_size_in_bits(fe::DataType_t::FP8_E4M3),
-                                        8),
-                                 false);
+                                        8));
         Surface<int8_t> C_gpu(div_up(matmul_dynamic_shape[idx_shape].b * matmul_dynamic_shape[idx_shape].m *
                                          matmul_dynamic_shape[idx_shape].n *
                                          cudnn_frontend::detail::get_element_size_in_bits(fe::DataType_t::BFLOAT16),
-                                     8),
-                              false);
+                                     8));
 
         std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> variant_pack = {{A_UID, A_gpu.devPtr},
                                                                                        {SF_A_UID, SF_A_gpu.devPtr},
@@ -905,7 +882,7 @@ TEST_CASE("Blackwell Block Scale Matmul dynamic shape overrides", "[matmul][grap
 
         int64_t workspace_size = 0;
         REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-        Surface<int8_t> workspace(workspace_size, false);
+        Surface<int8_t> workspace(workspace_size);
 
         REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr, override_uids, override_shapes, override_strides)
                     .is_good());

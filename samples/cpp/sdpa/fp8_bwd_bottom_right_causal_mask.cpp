@@ -156,39 +156,39 @@ TEST_CASE("sdpa_fp8_bprop_brcm", "[graph][sdpa][fp8][backward][brcm]") {
     // Surfaces
     auto Q_K_V_dQ_dK_dV_bulk_dims{b * s * 3 * h * d};
     auto dO_O_dims{b * s * h * d};
-    Surface<int8_t> qkvTensor{Q_K_V_dQ_dK_dV_bulk_dims, false};
+    Surface<int8_t> qkvTensor(Q_K_V_dQ_dK_dV_bulk_dims);
     void* devPtrQ{qkvTensor.devPtr};
     void* devPtrK{qkvTensor.devPtr + h * d};
     void* devPtrV{qkvTensor.devPtr + 2 * h * d};
 
-    Surface<int8_t> dQdKdVTensor{Q_K_V_dQ_dK_dV_bulk_dims, false};
+    Surface<int8_t> dQdKdVTensor(Q_K_V_dQ_dK_dV_bulk_dims);
     void* devPtrdQ{dQdKdVTensor.devPtr};
     void* devPtrdK{dQdKdVTensor.devPtr + h * d};
     void* devPtrdV{dQdKdVTensor.devPtr + 2 * h * d};
 
-    Surface<int8_t> dOTensor{dO_O_dims, false};
-    Surface<int8_t> OTensor{dO_O_dims, false};
+    Surface<int8_t> dOTensor(dO_O_dims);
+    Surface<int8_t> OTensor(dO_O_dims);
 
-    Surface<float> descale_Q_Tensor{1, false};
-    Surface<float> descale_K_Tensor{1, false};
-    Surface<float> descale_V_Tensor{1, false};
-    Surface<float> descale_S_Tensor{1, false};
-    Surface<float> descale_dP_Tensor{1, false};
-    Surface<float> descale_dO_Tensor{1, false};
-    Surface<float> descale_O_Tensor{1, false};
+    Surface<float> descale_Q_Tensor{1};
+    Surface<float> descale_K_Tensor{1};
+    Surface<float> descale_V_Tensor{1};
+    Surface<float> descale_S_Tensor{1};
+    Surface<float> descale_dP_Tensor{1};
+    Surface<float> descale_dO_Tensor{1};
+    Surface<float> descale_O_Tensor{1};
 
-    Surface<float> scale_S_Tensor{1, false};
-    Surface<float> scale_dQ_Tensor{1, false};
-    Surface<float> scale_dK_Tensor{1, false};
-    Surface<float> scale_dV_Tensor{1, false};
-    Surface<float> scale_dP_Tensor{1, false};
+    Surface<float> scale_S_Tensor{1};
+    Surface<float> scale_dQ_Tensor{1};
+    Surface<float> scale_dK_Tensor{1};
+    Surface<float> scale_dV_Tensor{1};
+    Surface<float> scale_dP_Tensor{1};
 
-    Surface<float> AMax_dQ_Tensor{1, false};
-    Surface<float> AMax_dK_Tensor{1, false};
-    Surface<float> AMax_dV_Tensor{1, false};
-    Surface<float> AMax_dP_Tensor{1, false};
+    Surface<float> AMax_dQ_Tensor{1};
+    Surface<float> AMax_dK_Tensor{1};
+    Surface<float> AMax_dV_Tensor{1};
+    Surface<float> AMax_dP_Tensor{1};
 
-    Surface<float> StatsTensor(b * h * s * 1, false);
+    Surface<float> StatsTensor(b * h * s * 1);
 
     // Variant pack
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack{
@@ -220,7 +220,7 @@ TEST_CASE("sdpa_fp8_bprop_brcm", "[graph][sdpa][fp8][backward][brcm]") {
 
     int64_t workspace_size = 0;
     REQUIRE(mha_graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(mha_graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 

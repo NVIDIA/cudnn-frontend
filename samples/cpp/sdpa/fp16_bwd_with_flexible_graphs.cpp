@@ -177,16 +177,16 @@ TEST_CASE("Toy sdpa backward with flexible graph", "[graph][sdpa][flash][backwar
 
     //// Build variant pack
     // inputs
-    Surface<half> q_tensor(b * h_q * s_q * d_qk, false);
-    Surface<half> k_tensor(b * h_k * d_qk * s_kv, false);
-    Surface<half> v_tensor(b * h_v * d_v * s_kv, false);
-    Surface<half> o_tensor(b * h_q * s_q * d_v, false);
-    Surface<half> dO_tensor(b * h_q * s_q * d_v, false);
-    Surface<float> stats_tensor(b * h_q * s_q * 1, false);
+    Surface<half> q_tensor(b * h_q * s_q * d_qk);
+    Surface<half> k_tensor(b * h_k * d_qk * s_kv);
+    Surface<half> v_tensor(b * h_v * d_v * s_kv);
+    Surface<half> o_tensor(b * h_q * s_q * d_v);
+    Surface<half> dO_tensor(b * h_q * s_q * d_v);
+    Surface<float> stats_tensor(b * h_q * s_q * 1);
     // outputs
-    Surface<half> dQ_tensor(b * h_q * s_q * d_qk, false);
-    Surface<half> dK_tensor(b * h_k * s_kv * d_qk, false);
-    Surface<half> dV_tensor(b * h_v * s_kv * d_v, false);
+    Surface<half> dQ_tensor(b * h_q * s_q * d_qk);
+    Surface<half> dK_tensor(b * h_k * s_kv * d_qk);
+    Surface<half> dV_tensor(b * h_v * s_kv * d_v);
 
     // Create variant pack with input and output tensors
     std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> variant_pack = {// inputs
@@ -204,7 +204,7 @@ TEST_CASE("Toy sdpa backward with flexible graph", "[graph][sdpa][flash][backwar
     // Allocate workspace
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 

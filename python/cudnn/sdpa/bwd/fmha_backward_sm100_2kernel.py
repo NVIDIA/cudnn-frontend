@@ -37,18 +37,17 @@ Constraints:
 import math
 
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Int32
-from .utils import warp_reduction_sum
+from ..utils import warp_reduction_sum
 from .fmha_dq_d256_sm100 import (
     BlackwellFusedAttentionDQKernel,
 )
 from .fmha_dkdv_d256_sm100 import (
     BlackwellFusedAttentionDKDVKernel,
 )
-from .fmha_utils import MaskEnum
+from ..fmha_utils import MaskEnum
 
 SM100_TMEM_CAPACITY_COLUMNS = 512
 LAYOUT_RANK_CONSTANT = 3

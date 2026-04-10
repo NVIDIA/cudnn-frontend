@@ -282,16 +282,16 @@ TEST_CASE("Prefill OSS Engine vs cuDNN Graph", "[graph][sdpa][engine][oss]") {
     int64_t const o_elems   = b * h_q * s_q * d;
     int64_t const aux_elems = b * h_q * s_q;  // for max and sum_exp
 
-    Surface<half> q_tensor(q_elems, false);
-    Surface<half> k_tensor(k_elems, false);
-    Surface<half> v_tensor(v_elems, false);
+    Surface<half> q_tensor(q_elems);
+    Surface<half> k_tensor(k_elems);
+    Surface<half> v_tensor(v_elems);
 
     // ================================================================
     // Path 1: cuDNN Graph API (reference)
     // ================================================================
-    Surface<half> o_cudnn(o_elems, false);
-    Surface<float> max_cudnn(aux_elems, false);
-    Surface<float> sum_exp_cudnn(aux_elems, false);
+    Surface<half> o_cudnn(o_elems);
+    Surface<float> max_cudnn(aux_elems);
+    Surface<float> sum_exp_cudnn(aux_elems);
 
     {
         auto graph = create_sdpa_forward_graph(b, h_q, h_kv, s_q, s_kv, d, attn_scale);
@@ -315,7 +315,7 @@ TEST_CASE("Prefill OSS Engine vs cuDNN Graph", "[graph][sdpa][engine][oss]") {
 
         int64_t workspace_size = 0;
         REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-        Surface<int8_t> workspace(workspace_size, false);
+        Surface<int8_t> workspace(workspace_size);
 
         REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -357,9 +357,9 @@ TEST_CASE("Prefill OSS Engine vs cuDNN Graph", "[graph][sdpa][engine][oss]") {
     // Path 2: Same graph structure, but using OPENSOURCE mode
     // (no manual engine instantiation -- everything goes through graph API)
     // ================================================================
-    Surface<half> o_engine(o_elems, false);
-    Surface<float> max_engine(aux_elems, false);
-    Surface<float> sum_exp_engine(aux_elems, false);
+    Surface<half> o_engine(o_elems);
+    Surface<float> max_engine(aux_elems);
+    Surface<float> sum_exp_engine(aux_elems);
 
     {
         auto oss_graph = create_sdpa_forward_graph(b, h_q, h_kv, s_q, s_kv, d, attn_scale);
@@ -384,7 +384,7 @@ TEST_CASE("Prefill OSS Engine vs cuDNN Graph", "[graph][sdpa][engine][oss]") {
 
         int64_t oss_workspace_size = 0;
         REQUIRE(oss_graph->get_workspace_size(oss_workspace_size).is_good());
-        Surface<int8_t> oss_workspace(oss_workspace_size, false);
+        Surface<int8_t> oss_workspace(oss_workspace_size);
 
         auto exec_status = oss_graph->execute(handle, oss_variant_pack, oss_workspace.devPtr);
         if (exec_status.is_bad()) {
@@ -506,14 +506,14 @@ TEST_CASE("Prefill OSS Engine BHSD layout", "[graph][sdpa][oss][bhsd]") {
     int64_t const o_elems   = b * h_q * s_q * d;
     int64_t const aux_elems = b * h_q * s_q;
 
-    Surface<half> q_tensor(q_elems, false);
-    Surface<half> k_tensor(k_elems, false);
-    Surface<half> v_tensor(v_elems, false);
+    Surface<half> q_tensor(q_elems);
+    Surface<half> k_tensor(k_elems);
+    Surface<half> v_tensor(v_elems);
 
     // ---- Path 1: cuDNN reference (BHSD layout) ----
-    Surface<half> o_cudnn(o_elems, false);
-    Surface<float> max_cudnn(aux_elems, false);
-    Surface<float> sum_exp_cudnn(aux_elems, false);
+    Surface<half> o_cudnn(o_elems);
+    Surface<float> max_cudnn(aux_elems);
+    Surface<float> sum_exp_cudnn(aux_elems);
     {
         auto graph = create_sdpa_forward_graph_bhsd(b, h_q, h_kv, s_q, s_kv, d, attn_scale);
         REQUIRE(graph->validate().is_good());
@@ -533,15 +533,15 @@ TEST_CASE("Prefill OSS Engine BHSD layout", "[graph][sdpa][oss][bhsd]") {
         };
         int64_t ws = 0;
         REQUIRE(graph->get_workspace_size(ws).is_good());
-        Surface<int8_t> workspace(ws, false);
+        Surface<int8_t> workspace(ws);
         REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     // ---- Path 2: OPENSOURCE engine (BHSD layout) ----
-    Surface<half> o_oss(o_elems, false);
-    Surface<float> max_oss(aux_elems, false);
-    Surface<float> sum_exp_oss(aux_elems, false);
+    Surface<half> o_oss(o_elems);
+    Surface<float> max_oss(aux_elems);
+    Surface<float> sum_exp_oss(aux_elems);
     {
         auto graph = create_sdpa_forward_graph_bhsd(b, h_q, h_kv, s_q, s_kv, d, attn_scale);
         REQUIRE(graph->validate().is_good());
@@ -561,7 +561,7 @@ TEST_CASE("Prefill OSS Engine BHSD layout", "[graph][sdpa][oss][bhsd]") {
         };
         int64_t ws = 0;
         REQUIRE(graph->get_workspace_size(ws).is_good());
-        Surface<int8_t> workspace(ws, false);
+        Surface<int8_t> workspace(ws);
         auto exec_status = graph->execute(handle, variant_pack, workspace.devPtr);
         if (exec_status.is_bad()) {
             std::printf("OSS execute error (BHSD): %s\n", exec_status.get_message().c_str());
@@ -638,12 +638,12 @@ TEST_CASE("Prefill OSS Engine Dynamic Shapes", "[graph][sdpa][oss][dynamic]") {
     int64_t const o_elems_init   = b * h_q * s_q * d;
     int64_t const aux_elems_init = b * h_q * s_q;
 
-    Surface<half> q_init(q_elems_init, false);
-    Surface<half> k_init(kv_elems_init, false);
-    Surface<half> v_init(kv_elems_init, false);
-    Surface<half> o_oss_init(o_elems_init, false);
-    Surface<float> max_oss_init(aux_elems_init, false);
-    Surface<float> se_oss_init(aux_elems_init, false);
+    Surface<half> q_init(q_elems_init);
+    Surface<half> k_init(kv_elems_init);
+    Surface<half> v_init(kv_elems_init);
+    Surface<half> o_oss_init(o_elems_init);
+    Surface<float> max_oss_init(aux_elems_init);
+    Surface<float> se_oss_init(aux_elems_init);
 
     // Build OSS graph (kept alive for re-execution with overrides)
     auto oss_graph = create_sdpa_forward_graph(b, h_q, h_kv, s_q, s_kv, d, attn_scale);
@@ -666,7 +666,7 @@ TEST_CASE("Prefill OSS Engine Dynamic Shapes", "[graph][sdpa][oss][dynamic]") {
         };
         int64_t ws = 0;
         REQUIRE(oss_graph->get_workspace_size(ws).is_good());
-        Surface<int8_t> workspace(ws, false);
+        Surface<int8_t> workspace(ws);
         auto status = oss_graph->execute(handle, vp, workspace.devPtr);
         if (status.is_bad()) {
             std::printf("OSS initial execute error: %s\n", status.get_message().c_str());
@@ -676,9 +676,9 @@ TEST_CASE("Prefill OSS Engine Dynamic Shapes", "[graph][sdpa][oss][dynamic]") {
     }
 
     // ---- cuDNN reference for initial shapes ----
-    Surface<half> o_ref_init(o_elems_init, false);
-    Surface<float> max_ref_init(aux_elems_init, false);
-    Surface<float> se_ref_init(aux_elems_init, false);
+    Surface<half> o_ref_init(o_elems_init);
+    Surface<float> max_ref_init(aux_elems_init);
+    Surface<float> se_ref_init(aux_elems_init);
 
     {
         auto ref_graph = create_sdpa_forward_graph(b, h_q, h_kv, s_q, s_kv, d, attn_scale);
@@ -698,7 +698,7 @@ TEST_CASE("Prefill OSS Engine Dynamic Shapes", "[graph][sdpa][oss][dynamic]") {
         };
         int64_t ws = 0;
         REQUIRE(ref_graph->get_workspace_size(ws).is_good());
-        Surface<int8_t> workspace(ws, false);
+        Surface<int8_t> workspace(ws);
         REQUIRE(ref_graph->execute(handle, vp, workspace.devPtr).is_good());
         CUDA_CHECK(cudaDeviceSynchronize());
     }
@@ -715,12 +715,12 @@ TEST_CASE("Prefill OSS Engine Dynamic Shapes", "[graph][sdpa][oss][dynamic]") {
     int64_t const o_elems_ov   = new_b * h_q * new_s_q * d;
     int64_t const aux_elems_ov = new_b * h_q * new_s_q;
 
-    Surface<half> q_ov(q_elems_ov, false);
-    Surface<half> k_ov(kv_elems_ov, false);
-    Surface<half> v_ov(kv_elems_ov, false);
-    Surface<half> o_oss_ov(o_elems_ov, false);
-    Surface<float> max_oss_ov(aux_elems_ov, false);
-    Surface<float> se_oss_ov(aux_elems_ov, false);
+    Surface<half> q_ov(q_elems_ov);
+    Surface<half> k_ov(kv_elems_ov);
+    Surface<half> v_ov(kv_elems_ov);
+    Surface<half> o_oss_ov(o_elems_ov);
+    Surface<float> max_oss_ov(aux_elems_ov);
+    Surface<float> se_oss_ov(aux_elems_ov);
 
     {
         std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *> vp = {
@@ -759,7 +759,7 @@ TEST_CASE("Prefill OSS Engine Dynamic Shapes", "[graph][sdpa][oss][dynamic]") {
 
         int64_t ws = 0;
         REQUIRE(oss_graph->get_workspace_size(ws).is_good());
-        Surface<int8_t> workspace(ws, false);
+        Surface<int8_t> workspace(ws);
 
         auto status =
             oss_graph->execute(handle, vp, workspace.devPtr, override_uids, override_shapes, override_strides);
@@ -771,9 +771,9 @@ TEST_CASE("Prefill OSS Engine Dynamic Shapes", "[graph][sdpa][oss][dynamic]") {
     }
 
     // ---- cuDNN reference for override shapes (separate graph) ----
-    Surface<half> o_ref_ov(o_elems_ov, false);
-    Surface<float> max_ref_ov(aux_elems_ov, false);
-    Surface<float> se_ref_ov(aux_elems_ov, false);
+    Surface<half> o_ref_ov(o_elems_ov);
+    Surface<float> max_ref_ov(aux_elems_ov);
+    Surface<float> se_ref_ov(aux_elems_ov);
 
     {
         auto ref_graph = create_sdpa_forward_graph(new_b, h_q, h_kv, new_s_q, new_s_kv, d, attn_scale);
@@ -793,7 +793,7 @@ TEST_CASE("Prefill OSS Engine Dynamic Shapes", "[graph][sdpa][oss][dynamic]") {
         };
         int64_t ws = 0;
         REQUIRE(ref_graph->get_workspace_size(ws).is_good());
-        Surface<int8_t> workspace(ws, false);
+        Surface<int8_t> workspace(ws);
         REQUIRE(ref_graph->execute(handle, vp, workspace.devPtr).is_good());
         CUDA_CHECK(cudaDeviceSynchronize());
     }
@@ -862,7 +862,7 @@ TEST_CASE("SM90 Prefill OSS Engine Direct API", "[graph][sdpa][sm90][oss][direct
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     int64_t const ws_size = fe::experimental::Sm90SdpaPrefillEngine::get_workspace_size();
-    Surface<int8_t> workspace(ws_size, false);
+    Surface<int8_t> workspace(ws_size);
 
     // ================================================================
     // Config 1: b=2, h_q=4, h_kv=2, s_q=1024, s_kv=2048, d=128
@@ -873,12 +873,12 @@ TEST_CASE("SM90 Prefill OSS Engine Direct API", "[graph][sdpa][sm90][oss][direct
         int64_t const o_elems   = b1 * h_q1 * s_q1 * d;
         int64_t const aux_elems = b1 * h_q1 * s_q1;
 
-        Surface<half> q_tensor(q_elems, false);
-        Surface<half> k_tensor(kv_elems, false);
-        Surface<half> v_tensor(kv_elems, false);
-        Surface<half> o_engine(o_elems, false);
-        Surface<float> max_engine(aux_elems, false);
-        Surface<float> se_engine(aux_elems, false);
+        Surface<half> q_tensor(q_elems);
+        Surface<half> k_tensor(kv_elems);
+        Surface<half> v_tensor(kv_elems);
+        Surface<half> o_engine(o_elems);
+        Surface<float> max_engine(aux_elems);
+        Surface<float> se_engine(aux_elems);
 
         auto q_st                   = bshd_strides(h_q1, s_q1, d);
         auto kv_st                  = bshd_strides(h_kv1, s_kv1, d);
@@ -991,9 +991,9 @@ TEST_CASE("SM90 Prefill OSS Engine Direct API", "[graph][sdpa][sm90][oss][direct
         }
 
         // cuDNN reference for config 1
-        Surface<half> o_ref(o_elems, false);
-        Surface<float> max_ref(aux_elems, false);
-        Surface<float> se_ref(aux_elems, false);
+        Surface<half> o_ref(o_elems);
+        Surface<float> max_ref(aux_elems);
+        Surface<float> se_ref(aux_elems);
         {
             auto ref_graph = create_sdpa_forward_graph(b1, h_q1, h_kv1, s_q1, s_kv1, d, attn_scale);
             REQUIRE(ref_graph->validate().is_good());
@@ -1012,7 +1012,7 @@ TEST_CASE("SM90 Prefill OSS Engine Direct API", "[graph][sdpa][sm90][oss][direct
             };
             int64_t ws = 0;
             REQUIRE(ref_graph->get_workspace_size(ws).is_good());
-            Surface<int8_t> ref_ws(ws, false);
+            Surface<int8_t> ref_ws(ws);
             REQUIRE(ref_graph->execute(handle, vp, ref_ws.devPtr).is_good());
             CUDA_CHECK(cudaDeviceSynchronize());
         }
@@ -1030,12 +1030,12 @@ TEST_CASE("SM90 Prefill OSS Engine Direct API", "[graph][sdpa][sm90][oss][direct
         int64_t const o_elems   = b2 * h_q2 * s_q2 * d;
         int64_t const aux_elems = b2 * h_q2 * s_q2;
 
-        Surface<half> q_tensor(q_elems, false);
-        Surface<half> k_tensor(kv_elems, false);
-        Surface<half> v_tensor(kv_elems, false);
-        Surface<half> o_engine(o_elems, false);
-        Surface<float> max_engine(aux_elems, false);
-        Surface<float> se_engine(aux_elems, false);
+        Surface<half> q_tensor(q_elems);
+        Surface<half> k_tensor(kv_elems);
+        Surface<half> v_tensor(kv_elems);
+        Surface<half> o_engine(o_elems);
+        Surface<float> max_engine(aux_elems);
+        Surface<float> se_engine(aux_elems);
 
         auto q_st                   = bshd_strides(h_q2, s_q2, d);
         auto kv_st                  = bshd_strides(h_kv2, s_kv2, d);
@@ -1072,9 +1072,9 @@ TEST_CASE("SM90 Prefill OSS Engine Direct API", "[graph][sdpa][sm90][oss][direct
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // cuDNN reference for config 2
-        Surface<half> o_ref(o_elems, false);
-        Surface<float> max_ref(aux_elems, false);
-        Surface<float> se_ref(aux_elems, false);
+        Surface<half> o_ref(o_elems);
+        Surface<float> max_ref(aux_elems);
+        Surface<float> se_ref(aux_elems);
         {
             auto ref_graph = create_sdpa_forward_graph(b2, h_q2, h_kv2, s_q2, s_kv2, d, attn_scale);
             REQUIRE(ref_graph->validate().is_good());
@@ -1093,7 +1093,7 @@ TEST_CASE("SM90 Prefill OSS Engine Direct API", "[graph][sdpa][sm90][oss][direct
             };
             int64_t ws = 0;
             REQUIRE(ref_graph->get_workspace_size(ws).is_good());
-            Surface<int8_t> ref_ws(ws, false);
+            Surface<int8_t> ref_ws(ws);
             REQUIRE(ref_graph->execute(handle, vp, ref_ws.devPtr).is_good());
             CUDA_CHECK(cudaDeviceSynchronize());
         }
@@ -1164,7 +1164,7 @@ TEST_CASE("SM100 Prefill OSS Engine Direct API", "[graph][sdpa][sm100][oss][dire
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     int64_t const ws_size = fe::experimental::Sm100SdpaPrefillEngine::get_workspace_size();
-    Surface<int8_t> workspace(ws_size, false);
+    Surface<int8_t> workspace(ws_size);
 
     // ================================================================
     // Config 1: b=2, h_q=4, h_kv=2, s_q=1024, s_kv=2048, d=128
@@ -1175,12 +1175,12 @@ TEST_CASE("SM100 Prefill OSS Engine Direct API", "[graph][sdpa][sm100][oss][dire
         int64_t const o_elems   = b1 * h_q1 * s_q1 * d;
         int64_t const aux_elems = b1 * h_q1 * s_q1;
 
-        Surface<half> q_tensor(q_elems, false);
-        Surface<half> k_tensor(kv_elems, false);
-        Surface<half> v_tensor(kv_elems, false);
-        Surface<half> o_engine(o_elems, false);
-        Surface<float> max_engine(aux_elems, false);
-        Surface<float> se_engine(aux_elems, false);
+        Surface<half> q_tensor(q_elems);
+        Surface<half> k_tensor(kv_elems);
+        Surface<half> v_tensor(kv_elems);
+        Surface<half> o_engine(o_elems);
+        Surface<float> max_engine(aux_elems);
+        Surface<float> se_engine(aux_elems);
 
         auto q_st                   = bshd_strides(h_q1, s_q1, d);
         auto kv_st                  = bshd_strides(h_kv1, s_kv1, d);
@@ -1293,9 +1293,9 @@ TEST_CASE("SM100 Prefill OSS Engine Direct API", "[graph][sdpa][sm100][oss][dire
         }
 
         // cuDNN reference for config 1
-        Surface<half> o_ref(o_elems, false);
-        Surface<float> max_ref(aux_elems, false);
-        Surface<float> se_ref(aux_elems, false);
+        Surface<half> o_ref(o_elems);
+        Surface<float> max_ref(aux_elems);
+        Surface<float> se_ref(aux_elems);
         {
             auto ref_graph = create_sdpa_forward_graph(b1, h_q1, h_kv1, s_q1, s_kv1, d, attn_scale);
             REQUIRE(ref_graph->validate().is_good());
@@ -1314,7 +1314,7 @@ TEST_CASE("SM100 Prefill OSS Engine Direct API", "[graph][sdpa][sm100][oss][dire
             };
             int64_t ws = 0;
             REQUIRE(ref_graph->get_workspace_size(ws).is_good());
-            Surface<int8_t> ref_ws(ws, false);
+            Surface<int8_t> ref_ws(ws);
             REQUIRE(ref_graph->execute(handle, vp, ref_ws.devPtr).is_good());
             CUDA_CHECK(cudaDeviceSynchronize());
         }
@@ -1332,12 +1332,12 @@ TEST_CASE("SM100 Prefill OSS Engine Direct API", "[graph][sdpa][sm100][oss][dire
         int64_t const o_elems   = b2 * h_q2 * s_q2 * d;
         int64_t const aux_elems = b2 * h_q2 * s_q2;
 
-        Surface<half> q_tensor(q_elems, false);
-        Surface<half> k_tensor(kv_elems, false);
-        Surface<half> v_tensor(kv_elems, false);
-        Surface<half> o_engine(o_elems, false);
-        Surface<float> max_engine(aux_elems, false);
-        Surface<float> se_engine(aux_elems, false);
+        Surface<half> q_tensor(q_elems);
+        Surface<half> k_tensor(kv_elems);
+        Surface<half> v_tensor(kv_elems);
+        Surface<half> o_engine(o_elems);
+        Surface<float> max_engine(aux_elems);
+        Surface<float> se_engine(aux_elems);
 
         auto q_st                   = bshd_strides(h_q2, s_q2, d);
         auto kv_st                  = bshd_strides(h_kv2, s_kv2, d);
@@ -1374,9 +1374,9 @@ TEST_CASE("SM100 Prefill OSS Engine Direct API", "[graph][sdpa][sm100][oss][dire
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // cuDNN reference for config 2
-        Surface<half> o_ref(o_elems, false);
-        Surface<float> max_ref(aux_elems, false);
-        Surface<float> se_ref(aux_elems, false);
+        Surface<half> o_ref(o_elems);
+        Surface<float> max_ref(aux_elems);
+        Surface<float> se_ref(aux_elems);
         {
             auto ref_graph = create_sdpa_forward_graph(b2, h_q2, h_kv2, s_q2, s_kv2, d, attn_scale);
             REQUIRE(ref_graph->validate().is_good());
@@ -1395,7 +1395,7 @@ TEST_CASE("SM100 Prefill OSS Engine Direct API", "[graph][sdpa][sm100][oss][dire
             };
             int64_t ws = 0;
             REQUIRE(ref_graph->get_workspace_size(ws).is_good());
-            Surface<int8_t> ref_ws(ws, false);
+            Surface<int8_t> ref_ws(ws);
             REQUIRE(ref_graph->execute(handle, vp, ref_ws.devPtr).is_good());
             CUDA_CHECK(cudaDeviceSynchronize());
         }

@@ -377,6 +377,19 @@ PyGraph::moe_grouped_matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attrib
     return output;
 }
 
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::moe_grouped_matmul_bwd(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& doutput,
+                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token,
+                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& first_token_offset,
+                                cudnn_frontend::DataType_t const& compute_data_type,
+                                std::string const& name) {
+    auto attributes = cudnn_frontend::graph::Moe_grouped_matmul_bwd_attributes().set_name(name).set_compute_data_type(
+        compute_data_type);
+
+    auto dweight = graph->moe_grouped_matmul_bwd(doutput, token, first_token_offset, attributes);
+    return dweight;
+}
+
 void
 PyGraph::validate() {
     auto status = graph->validate();
@@ -1035,6 +1048,23 @@ init_pygraph_submodule(py::module_& m) {
                     mode (cudnn.moe_grouped_matmul_mode): The mode of the operation.
                     compute_data_type (cudnn.data_type): The data type for computation.
                     top_k (int): The top k value.
+                    name (str): The name of the operation.
+            )pbdoc")
+        .def("moe_grouped_matmul_bwd",
+             &PyGraph::moe_grouped_matmul_bwd,
+             py::arg("doutput"),
+             py::arg("token"),
+             py::arg("first_token_offset"),
+             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::FLOAT),
+             py::arg_v("name", ""),
+             R"pbdoc(
+                Perform MoE Grouped Matmul Bwd operation.
+
+                Args:
+                    doutput (cudnn_tensor): The doutput tensor.
+                    token (cudnn_tensor): The token tensor.
+                    first_token_offset (cudnn_tensor): The first token offset tensor.
+                    compute_data_type (cudnn.data_type): The data type for computation.
                     name (str): The name of the operation.
             )pbdoc")
         .def("get_behavior_notes", &PyGraph::get_behavior_notes)

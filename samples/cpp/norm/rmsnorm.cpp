@@ -76,14 +76,14 @@ TEST_CASE("RmsNorm Training", "[rmsnorm][graph]") {
 
     REQUIRE(graph.warmup(handle).is_good());
 
-    Surface<float> X_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> Var_tensor(batch_size * seq_length, false);
-    Surface<float> Scale_tensor(hidden_size, false);
-    Surface<float> Y_tensor(batch_size * seq_length * hidden_size, false);
+    Surface<float> X_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> Var_tensor(batch_size * seq_length);
+    Surface<float> Scale_tensor(hidden_size);
+    Surface<float> Y_tensor(batch_size * seq_length * hidden_size);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr}, {inv_variance, Var_tensor.devPtr}, {scale, Scale_tensor.devPtr}, {Y, Y_tensor.devPtr}};
@@ -147,14 +147,14 @@ TEST_CASE("RmsNorm Inference", "[rmsnorm][graph]") {
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<float> X_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> Scale_tensor(hidden_size, false);
-    Surface<float> Bias_tensor(hidden_size, false);
-    Surface<float> Y_tensor(batch_size * seq_length * hidden_size, false);
+    Surface<float> X_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> Scale_tensor(hidden_size);
+    Surface<float> Bias_tensor(hidden_size);
+    Surface<float> Y_tensor(batch_size * seq_length * hidden_size);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr}, {scale, Scale_tensor.devPtr}, {bias, Bias_tensor.devPtr}, {Y, Y_tensor.devPtr}};
@@ -219,18 +219,18 @@ TEST_CASE("RmsNorm Backward", "[rmsnorm][graph]") {
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<float> X_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> DY_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> Mean_tensor(batch_size * seq_length, false);
-    Surface<float> Inv_variance_tensor(batch_size * seq_length, false);
-    Surface<float> Scale_tensor(hidden_size, false);
-    Surface<float> Dscale_tensor(hidden_size, false);
-    Surface<float> Dbias_tensor(hidden_size, false);
-    Surface<float> DX_tensor(batch_size * seq_length * hidden_size, false);
+    Surface<float> X_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> DY_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> Mean_tensor(batch_size * seq_length);
+    Surface<float> Inv_variance_tensor(batch_size * seq_length);
+    Surface<float> Scale_tensor(hidden_size);
+    Surface<float> Dscale_tensor(hidden_size);
+    Surface<float> Dbias_tensor(hidden_size);
+    Surface<float> DX_tensor(batch_size * seq_length * hidden_size);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},

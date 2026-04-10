@@ -98,17 +98,17 @@ TEST_CASE("LayerNorm Training MXFP8 with reshape", "[layernorm][graph][block_sca
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> Mean_tensor(batch_size * seq_length, false);
-    Surface<float> Var_tensor(batch_size * seq_length, false);
-    Surface<float> Scale_tensor(hidden_size, false);
-    Surface<float> Bias_tensor(hidden_size, false);
-    Surface<int8_t> Y_row_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<int8_t> mx_row_tensor(batch_size * seq_length * hidden_size / block_size, false);
-    Surface<int8_t> Y_col_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<int8_t> mx_col_tensor(batch_size * seq_length * hidden_size / block_size, false);
+    Surface<half> X_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> Mean_tensor(batch_size * seq_length);
+    Surface<float> Var_tensor(batch_size * seq_length);
+    Surface<float> Scale_tensor(hidden_size);
+    Surface<float> Bias_tensor(hidden_size);
+    Surface<int8_t> Y_row_tensor(batch_size * seq_length * hidden_size);
+    Surface<int8_t> mx_row_tensor(batch_size * seq_length * hidden_size / block_size);
+    Surface<int8_t> Y_col_tensor(batch_size * seq_length * hidden_size);
+    Surface<int8_t> mx_col_tensor(batch_size * seq_length * hidden_size / block_size);
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    Surface<int8_t> workspace(graph.get_workspace_size());
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
         {mean, Mean_tensor.devPtr},
@@ -186,13 +186,13 @@ TEST_CASE("LayerNorm Inference MXFP8", "[layernorm][graph][block_scale]") {
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<half> X_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> Scale_tensor(hidden_size, false);
-    Surface<float> Bias_tensor(hidden_size, false);
-    Surface<int8_t> Y_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<int8_t> mx_scale_tensor(batch_size * seq_length * hidden_size / block_size, false);
+    Surface<half> X_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> Scale_tensor(hidden_size);
+    Surface<float> Bias_tensor(hidden_size);
+    Surface<int8_t> Y_tensor(batch_size * seq_length * hidden_size);
+    Surface<int8_t> mx_scale_tensor(batch_size * seq_length * hidden_size / block_size);
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    Surface<int8_t> workspace(graph.get_workspace_size());
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
         {scale, Scale_tensor.devPtr},
@@ -266,15 +266,15 @@ TEST_CASE("RmsNorm Training MXFP8", "[rmsnorm][graph][block_scale]") {
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<float> X_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> Var_tensor(batch_size * seq_length, false);
-    Surface<float> Scale_tensor(hidden_size, false);
-    Surface<int8_t> Y_row_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<int8_t> mx_row_tensor(batch_size * seq_length * hidden_size / block_size, false);
-    Surface<int8_t> Y_col_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<int8_t> mx_col_tensor(batch_size * seq_length * hidden_size / block_size, false);
+    Surface<float> X_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> Var_tensor(batch_size * seq_length);
+    Surface<float> Scale_tensor(hidden_size);
+    Surface<int8_t> Y_row_tensor(batch_size * seq_length * hidden_size);
+    Surface<int8_t> mx_row_tensor(batch_size * seq_length * hidden_size / block_size);
+    Surface<int8_t> Y_col_tensor(batch_size * seq_length * hidden_size);
+    Surface<int8_t> mx_col_tensor(batch_size * seq_length * hidden_size / block_size);
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    Surface<int8_t> workspace(graph.get_workspace_size());
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
         {inv_variance, Var_tensor.devPtr},
@@ -351,13 +351,13 @@ TEST_CASE("RmsNorm Inference NVFP4", "[rmsnorm][graph][block_scale]") {
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<float> X_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> Scale_tensor(hidden_size, false);
-    Surface<float> Bias_tensor(hidden_size, false);
-    Surface<int8_t> Y_tensor(batch_size * seq_length * hidden_size / 2, false);
-    Surface<int8_t> mx_scale_tensor(batch_size * seq_length * hidden_size / block_size, false);
+    Surface<float> X_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> Scale_tensor(hidden_size);
+    Surface<float> Bias_tensor(hidden_size);
+    Surface<int8_t> Y_tensor(batch_size * seq_length * hidden_size / 2);
+    Surface<int8_t> mx_scale_tensor(batch_size * seq_length * hidden_size / block_size);
 
-    Surface<int8_t> workspace(graph.get_workspace_size(), false);
+    Surface<int8_t> workspace(graph.get_workspace_size());
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
         {scale, Scale_tensor.devPtr},

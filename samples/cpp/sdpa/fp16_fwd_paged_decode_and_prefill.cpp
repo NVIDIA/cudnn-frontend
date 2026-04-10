@@ -233,14 +233,14 @@ test_case(phase_t phase) {
     REQUIRE(graph->build(handle, {fe::HeurMode_t::A}).is_good());
 
     //// Build variant pack
-    Surface<half> q_tensor(b * h_q * s_q * d_qk, false);
-    Surface<half> k_container_tensor(num_blocks_k * h_k * d_qk * block_size, false);
-    Surface<half> v_container_tensor(num_blocks_v * h_v * d_v * block_size, false);
+    Surface<half> q_tensor(b * h_q * s_q * d_qk);
+    Surface<half> k_container_tensor(num_blocks_k * h_k * d_qk * block_size);
+    Surface<half> v_container_tensor(num_blocks_v * h_v * d_v * block_size);
 
-    Surface<half> o_tensor(b * s_q * h_q * d_qk, false);
+    Surface<half> o_tensor(b * s_q * h_q * d_qk);
 
-    Surface<int32_t> page_table_k_tensor(b * page_table_size, false);
-    Surface<int32_t> page_table_v_tensor(b * page_table_size, false);
+    Surface<int32_t> page_table_k_tensor(b * page_table_size);
+    Surface<int32_t> page_table_v_tensor(b * page_table_size);
 
     std::vector<int32_t> host_page_table_k(b * page_table_size);
     std::vector<int32_t> host_page_table_v(b * page_table_size);
@@ -273,14 +273,14 @@ test_case(phase_t phase) {
                                                        {PAGE_TABLE_K_UID, page_table_k_tensor.devPtr},
                                                        {PAGE_TABLE_V_UID, page_table_v_tensor.devPtr}};
 
-    Surface<half> bias_tensor(b * 1 * s_q * s_kv, false);
+    Surface<half> bias_tensor(b * 1 * s_q * s_kv);
     if (has_attn_bias) {
         variant_pack[BIAS_UID] = bias_tensor.devPtr;
     }
 
     // Create variable sequence lengths
-    Surface<int32_t> devActualSeqlenQ(b, false);
-    Surface<int32_t> devActualSeqlenKV(b, false);
+    Surface<int32_t> devActualSeqlenQ(b);
+    Surface<int32_t> devActualSeqlenKV(b);
 
     std::vector<int32_t> cumulative_SeqlenQ(b + 1, 0);
     std::vector<int32_t> hostActualSeqlenQ(b);
@@ -291,7 +291,7 @@ test_case(phase_t phase) {
         cumulative_SeqlenQ[i + 1] = cumulative_SeqlenQ[i] + hostActualSeqlenQ[i];
     }
 
-    Surface<int32_t> ragged_offset_Q(b + 1, false);
+    Surface<int32_t> ragged_offset_Q(b + 1);
     if (is_ragged) {
         std::vector<int32_t> q_ragged_offsets(b + 1);
         for (auto i = 0; i < b + 1; ++i) {
@@ -313,14 +313,14 @@ test_case(phase_t phase) {
     variant_pack[SEQ_LEN_Q_UID]  = devActualSeqlenQ.devPtr;
     variant_pack[SEQ_LEN_KV_UID] = devActualSeqlenKV.devPtr;
 
-    Surface<float> statsTensor(b * h_q * s_q * 1, false);
+    Surface<float> statsTensor(b * h_q * s_q * 1);
     if (generate_stats == true) {
         variant_pack[STATS_UID] = statsTensor.devPtr;
     }
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     for (auto i = 0u; i < 100; i++) {
         REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());

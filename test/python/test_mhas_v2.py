@@ -147,15 +147,19 @@ def test_sdpa_random_fwd_unified_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_bias=RandomChoice({True : 1, False : 5}),
-        is_alibi=RandomChoice({True : 1, False : 5}),
+        is_bias=RandomChoice({True : 1, False : 3}),
+        is_alibi=RandomChoice({True : 1, False : 3}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
-        # TODO: Test with_score_max, with_score_sum_exp and with_sink_token once unified engine supports these features
         with_unfuse_fma=RandomChoice({True : 1, False : 1}),  # Randomly enable unfuse_fma for SM100
+        with_score_max=RandomChoice({True : 1, False : 3}),
+        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
+        with_sink_token=RandomChoice({True : 1, False : 3}),
+        is_dropout=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
-    test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
 
+    test.cfg.dropout_prob = 0.1 if test.cfg.is_dropout else 0.0
+    test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
     test.showConfig(test_no, request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)
@@ -225,6 +229,7 @@ def test_sdpa_random_sq1_L0(env_info, test_no, request, cudnn_handle):
         with_score_max=RandomChoice({True : 1, False : 3}),
         with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         # sink_token not supported with s_q==1
+        # dropout not supported with s_q==1
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
@@ -254,11 +259,14 @@ def test_sdpa_random_sq1_unified_L0(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
-        # TODO: Test with_score_max, with_score_sum_exp (but not sink_token since s_q==1) once unified engine supports these features
+        with_score_max=RandomChoice({True : 1, False : 3}),
+        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
+        # sink_token not supported with s_q==1
+        # dropout not supported with s_q==1
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
-    test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
 
+    test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
     test.showConfig(test_no, request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)
@@ -292,6 +300,7 @@ def test_sdpa_random_lean_attn_L0(env_info, test_no, request, cudnn_handle):
         with_score_max=RandomChoice({True : 1, False : 3}),
         with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         # sink_token not supported with s_q==1
+        # dropout not supported with s_q==1
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
@@ -321,11 +330,14 @@ def test_sdpa_random_lean_attn_unified_L0(env_info, test_no, request, cudnn_hand
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
-        # TODO: Test with_score_max, with_score_sum_exp (but not sink_token since s_q==1) once unified engine supports these features
+        with_score_max=RandomChoice({True : 1, False : 3}),
+        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
+        # sink_token not supported with s_q==1
+        # dropout not supported with s_q==1
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
-    test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
 
+    test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
     test.showConfig(test_no, request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)
@@ -387,10 +399,15 @@ def test_sdpa_random_fwd_ragged_unified_L0(env_info, test_no, request, cudnn_han
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),  # Modified from non-unified test
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 0, "full" : 0}),
+        with_score_max=RandomChoice({True : 1, False : 3}),
+        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
+        with_sink_token=RandomChoice({True : 1, False : 3}),
+        is_dropout=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
-    test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
 
+    test.cfg.dropout_prob = 0.1 if test.cfg.is_dropout else 0.0
+    test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
     test.showConfig(test_no, request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)
@@ -460,8 +477,8 @@ def test_sdpa_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
         with_sink_token=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
-        test.cfg.is_paged = True
 
+    test.cfg.is_paged = True
     test.showConfig(test_no, request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)
@@ -491,9 +508,9 @@ def test_sdpa_fwd_paged_unified_L0(env_info, test_no, request, cudnn_handle):
         block_size=RandomBlockSize(min=1, max=1024, with_high_probability=[1,32,128]),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
-        test.cfg.is_paged = True
-    test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
 
+    test.cfg.is_paged = True
+    test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
     test.showConfig(test_no, request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)
@@ -525,9 +542,9 @@ def test_sdpa_random_fwd_unified_block_mask_L0(env_info, test_no, request, cudnn
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
-        test.cfg.is_block_mask = True
-    test.cfg.implementation = cudnn.attention_implementation.UNIFIED
 
+    test.cfg.is_block_mask = True
+    test.cfg.implementation = cudnn.attention_implementation.UNIFIED
     test.showConfig(test_no, request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)
@@ -632,19 +649,29 @@ def test_sdpa_fp8_fwd_L0(env_info, test_no, request, cudnn_handle):
 
     # Randomly enable unfuse_fma via environment variable for SM100
     unfuse_fma = rng.choice([True, False])
+    test.cfg.with_unfuse_fma = unfuse_fma
     if unfuse_fma:
         os.environ["CUDNN_UNFUSE_FMA"] = "1"
     elif "CUDNN_UNFUSE_FMA" in os.environ:
         del os.environ["CUDNN_UNFUSE_FMA"]
+
+    compute_capability = torch.cuda.get_device_capability()
+    if compute_capability[0] == 10:
+        rescale_threshold = rng.choice([0.0, 2.0, 4.0])
+    else:
+        rescale_threshold = 0.0
+    test.cfg.rescale_threshold = rescale_threshold
+    os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
 
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
     try:
         exec_sdpa_fp8(test.cfg, request, cudnn_handle)
     finally:
-        # Clean up environment variable
         if "CUDNN_UNFUSE_FMA" in os.environ:
             del os.environ["CUDNN_UNFUSE_FMA"]
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
 
 
 # # ==================================
@@ -680,9 +707,16 @@ def test_sdpa_fp8_bwd_L0(env_info, test_no, request, cudnn_handle):
     test.cfg.is_infer = False
     test.showConfig(test_no, request)
 
+    test.cfg.rescale_threshold = 0.0
+    os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
+
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
-    exec_sdpa_fp8(test.cfg, request, cudnn_handle)
+    try:
+        exec_sdpa_fp8(test.cfg, request, cudnn_handle)
+    finally:
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
 
 
 # # ==================================
@@ -713,12 +747,25 @@ def test_sdpa_fp8_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
         block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16, 32, 64]),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
-        test.cfg.is_paged = True
+
+    test.cfg.is_paged = True
     test.showConfig(test_no, request)
+
+    compute_capability = torch.cuda.get_device_capability()
+    if compute_capability[0] == 10:
+        rescale_threshold = rng.choice([0.0, 2.0, 4.0])
+    else:
+        rescale_threshold = 0.0
+    test.cfg.rescale_threshold = rescale_threshold
+    os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
 
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
-    exec_sdpa_fp8(test.cfg, request, cudnn_handle)
+    try:
+        exec_sdpa_fp8(test.cfg, request, cudnn_handle)
+    finally:
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
 
 
 # # ==================================
@@ -750,15 +797,31 @@ def test_sdpa_fp8_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
     test.showConfig(test_no, request)
 
+    compute_capability = torch.cuda.get_device_capability()
+    if compute_capability[0] == 10:
+        rescale_threshold = rng.choice([0.0, 2.0, 4.0])
+    else:
+        rescale_threshold = 0.0
+    test.cfg.rescale_threshold = rescale_threshold
+    os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
+
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
-    exec_sdpa_fp8(test.cfg, request, cudnn_handle)
+    try:
+        exec_sdpa_fp8(test.cfg, request, cudnn_handle)
+    finally:
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
 
 
 # # ==================================
 # # L0 FP8 THD (ragged) bprop tests
 # # ==================================
 
+@pytest.mark.skipif(
+    cudnn.backend_version() <= 92100,
+    reason="ragged FP8 backward requires cuDNN > 9.21.0",
+)
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=32, rng_seed=995), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L1
 def test_sdpa_fp8_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
@@ -787,9 +850,16 @@ def test_sdpa_fp8_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
     test.cfg.is_infer = False
     test.showConfig(test_no, request)
 
+    test.cfg.rescale_threshold = 0.0
+    os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
+
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
-    exec_sdpa_fp8(test.cfg, request, cudnn_handle)
+    try:
+        exec_sdpa_fp8(test.cfg, request, cudnn_handle)
+    finally:
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
 
 
 # # ===================
@@ -808,12 +878,31 @@ def test_repro(env_info, request, cudnn_handle):
     cfg = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     cfg.cfg = ExecConfig.deserialize(ast.literal_eval(repro_str))
     cfg.showConfig((1,1), request)
-    if cfg.cfg.is_mxfp8:
-        exec_sdpa_mxfp8(cfg.cfg, request, cudnn_handle)
-    elif cfg.cfg.data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
-        exec_sdpa_fp8(cfg.cfg, request, cudnn_handle)
-    else:
-        exec_sdpa(cfg.cfg, request, cudnn_handle)
+
+    # Set environment variables from config
+    if hasattr(cfg.cfg, 'with_unfuse_fma') and cfg.cfg.with_unfuse_fma:
+        os.environ["CUDNN_UNFUSE_FMA"] = "1"
+    elif "CUDNN_UNFUSE_FMA" in os.environ:
+        del os.environ["CUDNN_UNFUSE_FMA"]
+
+    if hasattr(cfg.cfg, 'rescale_threshold') and cfg.cfg.rescale_threshold is not None:
+        os.environ["CUDNN_RESCALE_THRESHOLD"] = str(cfg.cfg.rescale_threshold)
+    elif "CUDNN_RESCALE_THRESHOLD" in os.environ:
+        del os.environ["CUDNN_RESCALE_THRESHOLD"]
+
+    try:
+        if cfg.cfg.is_mxfp8:
+            exec_sdpa_mxfp8(cfg.cfg, request, cudnn_handle)
+        elif cfg.cfg.data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
+            exec_sdpa_fp8(cfg.cfg, request, cudnn_handle)
+        else:
+            exec_sdpa(cfg.cfg, request, cudnn_handle)
+    finally:
+        # Clean up environment variables
+        if "CUDNN_UNFUSE_FMA" in os.environ:
+            del os.environ["CUDNN_UNFUSE_FMA"]
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
 
 
 # # ==================================
@@ -850,19 +939,29 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
 
     # Randomly enable unfuse_fma via environment variable for SM100
     unfuse_fma = rng.choice([True, False])
+    test.cfg.with_unfuse_fma = unfuse_fma
     if unfuse_fma:
         os.environ["CUDNN_UNFUSE_FMA"] = "1"
     elif "CUDNN_UNFUSE_FMA" in os.environ:
         del os.environ["CUDNN_UNFUSE_FMA"]
+
+    compute_capability = torch.cuda.get_device_capability()
+    if compute_capability[0] == 10:
+        rescale_threshold = rng.choice([0.0, 2.0, 4.0])
+    else:
+        rescale_threshold = 0.0
+    test.cfg.rescale_threshold = rescale_threshold
+    os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
 
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
     try:
         exec_sdpa_mxfp8(test.cfg, request, cudnn_handle)
     finally:
-        # Clean up environment variable
         if "CUDNN_UNFUSE_FMA" in os.environ:
             del os.environ["CUDNN_UNFUSE_FMA"]
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
 
 # # ==================================
 # # L0 MXFP8 bprop tests
@@ -899,6 +998,13 @@ def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
     test.cfg.is_infer = False
     test.showConfig(test_no, request)
 
+    test.cfg.rescale_threshold = 0.0
+    os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
+
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
-    exec_sdpa_mxfp8(test.cfg, request, cudnn_handle)
+    try:
+        exec_sdpa_mxfp8(test.cfg, request, cudnn_handle)
+    finally:
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]

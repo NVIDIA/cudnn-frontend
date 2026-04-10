@@ -16,8 +16,9 @@ logger = logging.getLogger(__name__)
 
 BACKEND_CONFIG = {
     "cudnn": {"name": "cuDNN", "color": "#76b900", "order": 0},
-    "pytorch": {"name": "PyTorch", "color": "#EE4C2C", "order": 1},
-    "torch_compile": {"name": "torch.compile", "color": "#6495ED", "order": 2},
+    "quack": {"name": "Quack", "color": "#FF8C00", "order": 1},
+    "pytorch": {"name": "PyTorch", "color": "#EE4C2C", "order": 2},
+    "torch_compile": {"name": "torch.compile", "color": "#6495ED", "order": 3},
 }
 
 LABEL_FONT_SIZE = 10
