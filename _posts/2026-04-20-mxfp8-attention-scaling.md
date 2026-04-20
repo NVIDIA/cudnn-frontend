@@ -68,13 +68,13 @@ graph TD
 
     BMM2 --> O["O [B,H,S_q,D]<br/><i>BF16 output</i>"]
 
-    style Q fill:#1a2e1a,stroke:#76b900
-    style K fill:#1a2e1a,stroke:#76b900
-    style V fill:#1a2e1a,stroke:#76b900
-    style PQ fill:#2e1a1a,stroke:#ff7b72
-    style O fill:#1a1a2e,stroke:#79aaff
-    style BMM1 fill:#0d1117,stroke:#d2a8ff
-    style BMM2 fill:#0d1117,stroke:#d2a8ff
+    style Q fill:#1a2e1a,stroke:#76b900,color:#fff
+    style K fill:#1a2e1a,stroke:#76b900,color:#fff
+    style V fill:#1a2e1a,stroke:#76b900,color:#fff
+    style PQ fill:#2e1a1a,stroke:#ff7b72,color:#fff
+    style O fill:#1a1a2e,stroke:#79aaff,color:#fff
+    style BMM1 fill:#0d1117,stroke:#d2a8ff,color:#fff
+    style BMM2 fill:#0d1117,stroke:#d2a8ff,color:#fff
 ```
 
 ## The Fixed Scale for P
@@ -121,10 +121,10 @@ graph TD
     dS_s --> dK["dK = dS^T × Q"]
     Qr --> dK
 
-    style dS_d fill:#2e1a1a,stroke:#ff7b72
-    style dS_s fill:#2e1a1a,stroke:#ff7b72
-    style dQ fill:#0d1117,stroke:#d2a8ff
-    style dK fill:#0d1117,stroke:#d2a8ff
+    style dS_d fill:#2e1a1a,stroke:#ff7b72,color:#fff
+    style dS_s fill:#2e1a1a,stroke:#ff7b72,color:#fff
+    style dQ fill:#0d1117,stroke:#d2a8ff,color:#fff
+    style dK fill:#0d1117,stroke:#d2a8ff,color:#fff
 ```
 
 The dual quantization of dS works like this:
