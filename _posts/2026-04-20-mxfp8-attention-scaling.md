@@ -171,6 +171,61 @@ Example for Q [B, H, S=500, D=192]:
 
 This reordering enables efficient vectorized dequantization in the fused kernel — the hardware can load a 128-element tile and its 4 corresponding scale factors in a single coalesced transaction, and plumb it as-is all the way to the tensor core.
 
+## Using MXFP8 Attention via TransformerEngine
+
+If you're using [NVIDIA TransformerEngine](https://github.com/NVIDIA/TransformerEngine), you don't need to manage scales manually — TE handles the MXFP8 quantization, dual-orientation scaling, and cuDNN graph construction for you. The key is the `MXFP8BlockScaling` recipe with `fp8_dpa=True`:
+
+```python
+import torch
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import Format, MXFP8BlockScaling
+
+# Create MXFP8 recipe with FP8 attention enabled
+mxfp8_recipe = MXFP8BlockScaling(
+    fp8_format=Format.E4M3,  # E4M3 for both fwd and bwd (block scaling makes E5M2 unnecessary)
+    fp8_dpa=True,             # Enable FP8 dot-product attention (Beta)
+    fp8_mha=True,             # Skip casts at DPA boundaries for full FP8 MHA
+)
+
+# Standard TE attention module
+attn = te.DotProductAttention(
+    num_attention_heads=32,
+    kv_channels=128,
+    attention_dropout=0.0,
+    qkv_format="bshd",
+    attn_mask_type="causal",
+)
+
+q = torch.randn(1, 4096, 32, 128, dtype=torch.bfloat16, device="cuda")
+k = torch.randn(1, 4096, 32, 128, dtype=torch.bfloat16, device="cuda")
+v = torch.randn(1, 4096, 32, 128, dtype=torch.bfloat16, device="cuda")
+
+# The autocast context handles all MXFP8 quantization internally
+with te.autocast(enabled=True, recipe=mxfp8_recipe):
+    out = attn(q, k, v)  # Q,K,V quantized to MXFP8 → cuDNN FusedAttention → BF16 output
+```
+
+A few things to note about what happens under the hood:
+
+- **`fp8_dpa=True`** tells TE to quantize Q, K, V to MXFP8 before calling into cuDNN's FusedAttention backend. TE computes the row-wise and column-wise E8M0 block scales, applies the F8_128x4 layout, and builds the cuDNN graph with all the scale tensors wired up.
+- **`fp8_mha=True`** goes a step further — it keeps the data in FP8 across the entire multi-head attention block. Without it, TE inserts BF16 casts at the DPA boundaries: `LayerNormLinear (BF16) → cast to FP8 → DPA → cast to BF16 → Linear`. With `fp8_mha=True`: `LayerNormLinear (FP8) → DPA → Linear` — no extra cast overhead.
+- **`Format.E4M3`** is recommended over `Format.HYBRID` for MXFP8 because block-wise scaling gives each 32-element group its own dynamic range, eliminating the need for E5M2's wider exponent range in the backward pass.
+- The backward pass FP8 behavior can be controlled with `NVTE_FP8_DPA_BWD=0` (env var) to disable FP8 in the backward pass only, if needed for debugging.
+
+You can check MXFP8 hardware support at runtime:
+
+```python
+from transformer_engine.common.recipe import is_mxfp8_available
+if is_mxfp8_available():
+    recipe = MXFP8BlockScaling(fp8_dpa=True, fp8_mha=True)
+else:
+    # Fall back to per-tensor FP8 on Hopper
+    from transformer_engine.common.recipe import DelayedScaling
+    recipe = DelayedScaling(fp8_format=Format.HYBRID, amax_history_len=16)
+```
+
+**Note:** `fp8_dpa` and `fp8_mha` are Beta features in TE — the API may change in future releases. Requires the FusedAttention backend (not Flash Attention) and cuDNN ≥ 9.3.0.
+
 ## Try It Yourself
 
 The cudnn-frontend repo has complete samples:
@@ -180,4 +235,4 @@ The cudnn-frontend repo has complete samples:
 - **Python tests:** [`test/python/sdpa/mxfp8.py`](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/mxfp8.py)
 - **Python reference:** [`test/python/sdpa/mxfp8_ref.py`](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/mxfp8_ref.py) — emulates the exact recipe used inside the kernel
 
-**Learn more:** [cuDNN Attention API](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html) · [OCP Microscaling Spec](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf) · [GTC 2025: cuDNN on Blackwell](https://www.nvidia.com/en-us/on-demand/session/gtc25-s73071/)
+**Learn more:** [cuDNN Attention API](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html) · [TE FP8 Primer](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html) · [OCP Microscaling Spec](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf) · [GTC 2025: cuDNN on Blackwell](https://www.nvidia.com/en-us/on-demand/session/gtc25-s73071/)
