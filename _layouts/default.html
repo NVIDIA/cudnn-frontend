@@ -6,6 +6,7 @@
   <title>{{ page.title | default: site.title }}</title>
   <meta name="description" content="{{ page.description | default: site.description }}">
   <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
+  <link rel="icon" type="image/x-icon" href="{{ '/assets/favicon.ico' | relative_url }}">
   {% seo %}
 </head>
 <body>
@@ -30,8 +31,20 @@
       <div class="sidebar-section">
         <h3>Release Notes</h3>
         <ul>
-          {% for post in site.posts %}
+          {% assign releases = site.posts | where: "category", "release" %}
+          {% for post in releases %}
           <li><a href="{{ post.url | relative_url }}" {% if page.url == post.url %}class="active"{% endif %}>{{ post.sidebar_title | default: post.title }}</a></li>
+          {% endfor %}
+        </ul>
+      </div>
+
+      <div class="sidebar-section">
+        <h3>All Posts</h3>
+        <ul>
+          {% for post in site.posts %}
+          {% unless post.category == "release" %}
+          <li><a href="{{ post.url | relative_url }}" {% if page.url == post.url %}class="active"{% endif %}>{{ post.sidebar_title | default: post.title }}</a></li>
+          {% endunless %}
           {% endfor %}
         </ul>
       </div>
