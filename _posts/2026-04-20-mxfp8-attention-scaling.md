@@ -79,7 +79,7 @@ graph TD
 
 ## The Fixed Scale for P
 
-After softmax, the attention probability matrix **P** needs to be quantized to FP8 for BMM2. But unlike Q, K, V which use learned/computed per-block scales, P uses a **fixed scale of 16.0**:
+After softmax, the attention probability matrix **P** needs to be quantized to FP8 for BMM2. But unlike Q, K, V which use current/online block scales of 32, P uses a **fixed scale of 16.0**:
 
 ```python
 # From the cuDNN reference implementation
@@ -90,7 +90,7 @@ P_fp8 = quantize_to_fp8(P * s_scale)   # scale up, then quantize
 P_dequant = P_fp8.float() * inv_s_scale  # dequantize and scale back down
 ```
 
-Why fixed? Because softmax outputs are bounded to `[0, 1]`, the dynamic range is known ahead of time. A fixed scale of 16.0 maps the `[0, 1]` range into a region that uses the FP8 E4M3 representable range efficiently. There's no need for the overhead of computing per-block max values when the output distribution is this well-behaved.
+Why fixed? There's no need for the overhead of computing per-block max values when the output distribution is this well-behaved. Because softmax outputs are bounded to `[0, 1]`, the dynamic range is known ahead of time. A fixed scale of 16.0 maps the `[0, 1]` range into a region that uses the FP8 E4M3 representable range efficiently.
 
 ## Backward Pass: Dual-Orientation Scaling
 
@@ -154,22 +154,22 @@ Q, K, and dO need **both row-wise and column-wise** scales because the backward 
 
 ## Memory Layout: F8_128x4 Reordering
 
-cuDNN uses a special memory layout called **F8_128x4** for MXFP8 tensors. Both the data tensor and its scale tensor must follow this layout:
+Blackwell hardware requires a special memory layout called **F8_128x4** for MXFP8 tensors. Scale factors must follow this layout:
 
 ```
-Data tensor:   padded to multiples of 128 along the scaled dimension
-Scale tensor:  padded to multiples of 4 along the scale dimension
+Data tensor:   Can stay in original shape
+Scale tensor:  padded to multiples of 4 along the scale dimension and 128 in the remainder dimension. Plus, needs to be contiguous in memory.
 
-Example for Q [B, H, S=500, D=128]:
+Example for Q [B, H, S=500, D=192]:
   S_padded = ceil(500/128) × 128 = 512
-  D_scale  = ceil(128/32) = 4
-  D_scale_padded = ceil(4/4) × 4 = 4
+  D_scale  = ceil(192/32) = 6
+  D_scale_padded = ceil(6/4) × 4 = 8
 
-  Q data:   [B, H, 512, 128]  (FP8_E4M3)
-  Q scales: [B, H, 512, 4]    (FP8_E8M0)
+  Q data:   [B, H, 500, 192]  (FP8_E4M3)
+  Q scales: [B, H, 512, 8]    (FP8_E8M0)
 ```
 
-This reordering enables efficient vectorized dequantization in the fused kernel — the hardware can load a 128-element tile and its 4 corresponding scale factors in a single coalesced transaction.
+This reordering enables efficient vectorized dequantization in the fused kernel — the hardware can load a 128-element tile and its 4 corresponding scale factors in a single coalesced transaction, and plumb it as-is all the way to the tensor core.
 
 ## Try It Yourself
 
