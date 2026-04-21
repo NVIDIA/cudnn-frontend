@@ -128,8 +128,6 @@ graph LR
     %% ── dO input paths ──
     inp_dO["dO"] --> t_do["T"]:::xpose --> tq_do["Q"]:::quant
     inp_dO --> q_do["Q"]:::quant
-    inp_dO --> dq_do["DQ"]:::dequant
-
     %% ── O input ──
     inp_O["O"]
 
@@ -143,7 +141,8 @@ graph LR
     bmm_dp --> dP["dP"]
 
     %% ── Delta computation ──
-    dq_do --> mul_oo["dO ⊙ O"]:::compute
+    inp_dO --> q_do_delta["Q"]:::quant
+    q_do_delta --> dq_do["DQ"]:::dequant --> mul_oo["dO ⊙ O"]:::compute
     inp_O --> mul_oo
     mul_oo --> delta["delta"]
 
