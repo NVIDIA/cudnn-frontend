@@ -61,7 +61,7 @@ graph TD
     S --> |"× attn_scale"| SOFT["Softmax<br/><i>FP32</i>"]
     SOFT --> P["P [B,H,S_q,S_kv]<br/><i>FP32</i>"]
 
-    P --> |"× 16.0 → FP8 → × 1/16"| PQ["P_quantized<br/><i>fixed scale = 16.0</i>"]
+    P --> |"× 256.0 → FP8 → × 1/256"| PQ["P_quantized<br/><i>fixed scale = 256.0</i>"]
 
     PQ --> BMM2["BMM2: P × V<br/><i>MXFP8 matmul</i>"]
     V --> BMM2
@@ -79,18 +79,18 @@ graph TD
 
 ## The Fixed Scale for P
 
-After softmax, the attention probability matrix **P** needs to be quantized to FP8 for BMM2. But unlike Q, K, V which use current/online block scales of 32, P uses a **fixed scale of 16.0**:
+After softmax, the attention probability matrix **P** needs to be quantized to FP8 for BMM2. But unlike Q, K, V which use current/online block scales of 32, P uses a **fixed scale of 256.0**:
 
 ```python
 # From the cuDNN reference implementation
-s_scale = 16.0
-inv_s_scale = 1.0 / 16.0
+s_scale = 256.0
+inv_s_scale = 1.0 / 256.0
 
 P_fp8 = quantize_to_fp8(P * s_scale)   # scale up, then quantize
 P_dequant = P_fp8.float() * inv_s_scale  # dequantize and scale back down
 ```
 
-Why fixed? There's no need for the overhead of computing per-block max values when the output distribution is this well-behaved. Because softmax outputs are bounded to `[0, 1]`, the dynamic range is known ahead of time. A fixed scale of 16.0 maps the `[0, 1]` range into a region that uses the FP8 E4M3 representable range efficiently.
+Why fixed? There's no need for the overhead of computing per-block max values when the output distribution is this well-behaved. Because softmax outputs are bounded to `[0, 1]`, the dynamic range is known ahead of time. A fixed scale of 256.0 maps the `[0, 1]` range into a region that uses the FP8 E4M3 representable range efficiently.
 
 ## Backward Pass: Full Quantized Data Flow
 
