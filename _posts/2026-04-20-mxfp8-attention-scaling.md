@@ -92,40 +92,104 @@ P_dequant = P_fp8.float() * inv_s_scale  # dequantize and scale back down
 
 Why fixed? There's no need for the overhead of computing per-block max values when the output distribution is this well-behaved. Because softmax outputs are bounded to `[0, 1]`, the dynamic range is known ahead of time. A fixed scale of 16.0 maps the `[0, 1]` range into a region that uses the FP8 E4M3 representable range efficiently.
 
-## Backward Pass: Dual-Orientation Scaling
+## Backward Pass: Full Quantized Data Flow
 
-The backward pass is where MXFP8 scaling gets interesting. The gradient tensor **dS** needs to be used in two different matrix multiplications that contract along different axes — so it gets quantized **twice**, in two orientations:
+The backward pass is where MXFP8 scaling gets really interesting. Every input tensor needs **two quantized copies** — one transposed-then-quantized (**T→Q**) and one quantized directly (**Q**) — because the backward pass uses each tensor in matmuls that contract along different axes. Since transposing MXFP8 data would put the block scales along the wrong dimension, the kernel produces both orientations upfront.
+
+**S is recomputed twice** from Q and K (never stored from the forward pass) — once producing P^T and once producing P. This avoids a costly MXFP8 transpose of the softmax output. Similarly, dP is computed in dual orientations for the same reason.
+
+Node colors: **Q** (blue) = Quantize, **T** (purple) = Transpose, **DQ** (teal) = Dequantize, **BMM/exp** (green) = Compute
 
 ```mermaid
-graph TD
-    subgraph "Backward Inputs"
-        Qr["Q (row-wise + col-wise)<br/>MXFP8"]
-        Kr["K (row-wise + col-wise)<br/>MXFP8"]
-        Vr["V (row-wise)<br/>MXFP8"]
-        dO["dO (row-wise + col-wise)<br/>MXFP8"]
-        Of["O, dO in F16<br/><i>for O·dO computation</i>"]
-    end
+graph LR
+    %% ── Q input paths ──
+    inp_Q["Q"] --> t_q["T"]:::xpose --> tq_q["Q"]:::quant
+    inp_Q --> q_q["Q"]:::quant
 
-    Of --> DOT["D = rowsum(O ⊙ dO)<br/><i>FP32</i>"]
-    dO --> dP["dP = dO × V^T<br/><i>FP32</i>"]
-    Vr --> dP
+    %% ── K input paths ──
+    inp_K["K"] --> t_k["T"]:::xpose --> tq_k["Q"]:::quant
+    inp_K --> q_k["Q"]:::quant
 
-    dP --> dS_compute["dS = P ⊙ (dP − D) × attn_scale<br/><i>FP32</i>"]
-    DOT --> dS_compute
+    %% ── S Recomputation (two orientations) ──
+    q_q --> bmm_pt["BMM"]:::compute
+    tq_k --> bmm_pt
+    bmm_pt --> exp_pt["exp"]:::compute
+    exp_pt --> PT["P^T"]
 
-    dS_compute --> |"online quantize<br/>along S_kv"| dS_d["dS_fp8 + SF_dS<br/><i>for dQ = dS × K</i>"]
-    dS_compute --> |"online quantize<br/>along S_q"| dS_s["dS_fp8_t + SF_dS_t<br/><i>for dK = dS^T × Q</i>"]
+    q_q --> bmm_p["BMM"]:::compute
+    tq_k --> bmm_p
+    bmm_p --> exp_p["exp"]:::compute
+    exp_p --> P["P"]
 
-    dS_d --> dQ["dQ = dS × K"]
-    Kr --> dQ
-    dS_s --> dK["dK = dS^T × Q"]
-    Qr --> dK
+    %% ── V input paths ──
+    inp_V["V"] --> t_v["T"]:::xpose --> tq_v["Q"]:::quant
+    inp_V --> q_v["Q"]:::quant
 
-    style dS_d fill:#2e1a1a,stroke:#ff7b72,color:#fff
-    style dS_s fill:#2e1a1a,stroke:#ff7b72,color:#fff
-    style dQ fill:#0d1117,stroke:#d2a8ff,color:#fff
-    style dK fill:#0d1117,stroke:#d2a8ff,color:#fff
+    %% ── dO input paths ──
+    inp_dO["dO"] --> t_do["T"]:::xpose --> tq_do["Q"]:::quant
+    inp_dO --> q_do["Q"]:::quant
+    inp_dO --> dq_do["DQ"]:::dequant
+
+    %% ── O input ──
+    inp_O["O"]
+
+    %% ── dP computation (two orientations) ──
+    tq_v --> bmm_dpt["BMM"]:::compute
+    tq_do --> bmm_dpt
+    bmm_dpt --> dPT["dP^T"]
+
+    q_v --> bmm_dp["BMM"]:::compute
+    q_do --> bmm_dp
+    bmm_dp --> dP["dP"]
+
+    %% ── Delta computation ──
+    dq_do --> mul_oo["dO ⊙ O"]:::compute
+    inp_O --> mul_oo
+    mul_oo --> delta["delta"]
+
+    %% ── dS^T path ──
+    PT --> comp_dst["P^T ⊙ (dP^T − δ)"]:::compute
+    dPT --> comp_dst
+    delta --> comp_dst
+    comp_dst --> q_dst["Q"]:::quant
+
+    %% ── dS path ──
+    P --> comp_ds["P ⊙ (dP − δ)"]:::compute
+    dP --> comp_ds
+    delta --> comp_ds
+    comp_ds --> q_ds["Q"]:::quant
+
+    %% ── Output: dK = dS^T × Q ──
+    q_dst -->|"dS^T"| bmm_dk["BMM"]:::compute
+    tq_q --> bmm_dk
+    bmm_dk --> out_dk["dK"]:::output
+
+    %% ── Output: dQ = dS × K ──
+    q_ds -->|"dS"| bmm_dq["BMM"]:::compute
+    q_k --> bmm_dq
+    bmm_dq --> out_dq["dQ"]:::output
+
+    %% ── Output: dV = P^T × dO ──
+    P --> q_p["Q"]:::quant
+    q_p --> bmm_dv["BMM"]:::compute
+    q_do --> bmm_dv
+    bmm_dv --> out_dv["dV"]:::output
+
+    %% ── Style Classes ──
+    classDef xpose fill:#7b1fa2,stroke:#4a148c,color:#fff
+    classDef quant fill:#1565c0,stroke:#0d47a1,color:#fff
+    classDef dequant fill:#00897b,stroke:#00695c,color:#fff
+    classDef compute fill:#558b2f,stroke:#33691e,color:#fff
+    classDef output fill:#1a1a2e,stroke:#79aaff,color:#fff
 ```
+
+Key observations from this data flow:
+
+- **Dual S recomputation** — Flash attention never materializes the full S matrix; it recomputes tiles on-the-fly. Two separate BMMs produce P in transposed and normal orientations for their downstream consumers, avoiding an MXFP8 transpose (which would require requantization).
+- **Dual dP computation** — dP = dO × V^T is likewise computed in both orientations. The transposed path uses T→Q versions of V and dO; the normal path uses directly-quantized versions.
+- **Delta uses dequantized dO** — the element-wise dO ⊙ O needs full precision, so dO is dequantized (DQ) back to FP16/BF16. O is kept in FP16/BF16 from the forward pass.
+- **Online dS quantization** — after computing P ⊙ (dP − δ), the result is quantized on-the-fly into dS^T and dS, each scaled along the contraction axis needed by its downstream BMM.
+- **Three output matmuls** — dK = dS^T × Q, dQ = dS × K, dV = P^T × dO. Each uses the appropriately-oriented quantized inputs.
 
 The dual quantization of dS works like this:
 
