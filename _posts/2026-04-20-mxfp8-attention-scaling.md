@@ -79,7 +79,7 @@ graph TD
 
 ## The Fixed Scale for P
 
-After softmax, the attention probability matrix **P** needs to be quantized to FP8 for BMM2. But unlike Q, K, V which use current/online block scales of 32, P uses a **fixed scale of 256.0**:
+After softmax, the attention probability matrix **P** needs to be quantized to FP8 for BMM2. But unlike Q, K, V which use current/online block scales, P uses a **fixed scale of 256.0**:
 
 ```python
 # From the cuDNN reference implementation
@@ -286,8 +286,6 @@ else:
     from transformer_engine.common.recipe import DelayedScaling
     recipe = DelayedScaling(fp8_format=Format.HYBRID, amax_history_len=16)
 ```
-
-**Note:** `fp8_dpa` and `fp8_mha` are Beta features in TE — the API may change in future releases. Requires the FusedAttention backend (not Flash Attention) and cuDNN ≥ 9.3.0.
 
 ## Try It Yourself
 
