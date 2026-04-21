@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "cuDNN Backend Now Has Preview Releases"
-sidebar_title: "Backend Previews"
+sidebar_title: "Backend Preview Builds"
 date: 2026-04-20
 description: "Try upcoming cuDNN backend features early with pip install --pre. Stable releases remain unchanged."
 ---

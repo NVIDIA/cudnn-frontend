@@ -8,6 +8,19 @@
   <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
   <link rel="icon" type="image/x-icon" href="{{ '/assets/favicon.ico' | relative_url }}">
   {% seo %}
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      // Convert Jekyll ```mermaid code blocks into mermaid-renderable divs
+      document.querySelectorAll('pre code.language-mermaid').forEach(function(el) {
+        var div = document.createElement('div');
+        div.className = 'mermaid';
+        div.textContent = el.textContent;
+        el.parentElement.replaceWith(div);
+      });
+      mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+    });
+  </script>
 </head>
 <body>
   <div class="site-container">
