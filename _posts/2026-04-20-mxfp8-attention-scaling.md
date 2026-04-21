@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "How Scales Are Applied in MXFP8 Attention"
-sidebar_title: "MXFP8 Scales"
+sidebar_title: "MXFP8 Attention"
 date: 2026-04-20
 description: "A deep dive into how cuDNN applies block-wise and fixed scaling in microscaling FP8 (MXFP8) attention for Blackwell GPUs."
 ---
