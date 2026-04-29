@@ -38,6 +38,8 @@ class CompositeSoftmaxNode;
 class UnifiedSoftmaxNode;
 class MoeGroupedMatmulNode;
 class UnifiedDiagonalBandMaskNode;
+class TransposeNode;
+class SliceNode;
 
 // Interface for all nodes to follow.
 class INode {
@@ -138,6 +140,7 @@ class INode {
         RMSNORM,
         RNG,
         SLICE,
+        TRANSPOSE,
         WGRAD,
         PAGED_CACHE_LOAD,
         BLOCK_SCALE_QUANTIZE,
@@ -253,6 +256,15 @@ class INode {
                            Moe_grouped_matmul_bwd_attributes attributes,
                            std::shared_ptr<Tensor_attributes> dweight);
 
+    void
+    transpose(std::shared_ptr<Tensor_attributes> input,
+              Transpose_attributes attributes,
+              std::shared_ptr<Tensor_attributes> output);
+
+    void
+    slice(std::shared_ptr<Tensor_attributes> input,
+          Slice_attributes attributes,
+          std::shared_ptr<Tensor_attributes> output);
     error_t
     validate_subtree() {
         // pre validate to catch errors early
@@ -392,6 +404,8 @@ class INode {
     std::shared_ptr<Tensor_attributes> reduction(std::shared_ptr<Tensor_attributes>, Reduction_attributes);
     std::array<std::shared_ptr<Tensor_attributes>, 2> resample(std::shared_ptr<Tensor_attributes>, Resample_attributes);
     std::shared_ptr<Tensor_attributes> reshape(std::shared_ptr<Tensor_attributes>, Reshape_attributes);
+    std::shared_ptr<Tensor_attributes> transpose(std::shared_ptr<Tensor_attributes>, Transpose_attributes);
+    std::shared_ptr<Tensor_attributes> slice(std::shared_ptr<Tensor_attributes>, Slice_attributes);
 
     std::shared_ptr<Tensor_attributes> rng(std::shared_ptr<Tensor_attributes>,
                                            std::shared_ptr<Tensor_attributes>,

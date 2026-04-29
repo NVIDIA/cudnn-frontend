@@ -123,7 +123,7 @@ class GroupedGemmSwigluSm100(APIBase):
         """
         super().__init__()
 
-        self._logger.warning("GroupedGemmSwigluSm100 is an experimental API")
+        self._warn_experimental_api()
         self._logger.debug("Entering __init__")
 
         # Store sample tensor descriptors
@@ -168,7 +168,7 @@ class GroupedGemmSwigluSm100(APIBase):
         self._kernel = BlockScaledContiguousGroupedGemmKernel
 
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-        print(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
+        self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
         self._logger.debug(f"__init__ completed")
 
     def check_support(self) -> bool:
@@ -482,7 +482,7 @@ class GroupedGemmSwigluSm100(APIBase):
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         self._logger.debug("Compiling grouped_gemm_swiglu kernel")
-        use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL") is not None
+        use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
         if not use_full_dynamic:  # only mark the m dimension as dynamic
             valid_m = cute.sym_int(divisibility=256)
 
@@ -910,11 +910,10 @@ def grouped_gemm_swiglu_wrapper_sm100(
         )
         sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
 
-    if d_dtype in [torch.bfloat16, torch.float16]:
-        _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Detected bf16/float16 d_dtype, constructing amax_tensor")
-        amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
-
     if valid_m == 0:
+        if d_dtype in [torch.bfloat16, torch.float16]:
+            amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
+
         _logger.debug("grouped_gemm_swiglu_wrapper_sm100: valid_m is zero, skipping kernel execution")
         return TupleDict(
             c_tensor=c_tensor,
@@ -925,7 +924,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
             sfd_col_tensor=sfd_col_tensor,
         )
 
-    use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL") is not None
+    use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
 
     def stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
         return tuple(i for i, s in sorted(enumerate(tensor.stride()), key=lambda x: x[1]))
@@ -962,7 +961,10 @@ def grouped_gemm_swiglu_wrapper_sm100(
 
     if cache_key in _cache_of_GroupedGemmSwigluSm100Objects:
         _logger.debug("group_gemm_swiglu_wrapper_sm100: Using previously cached GroupedGemmSwigluSm100 object")
-        grouped_gemm_swiglu = _cache_of_GroupedGemmSwigluSm100Objects[cache_key]
+        grouped_gemm_swiglu, amax_tensor = _cache_of_GroupedGemmSwigluSm100Objects[cache_key]
+        # The cuDNN graph API binds data pointers at execute time, not plan-build time.
+        # During CUDA graph capture, padded_offsets is allocated in the graph pool
+        # (stable address across replays), so passing it directly is graph-safe.
         grouped_gemm_swiglu.execute(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
@@ -982,6 +984,10 @@ def grouped_gemm_swiglu_wrapper_sm100(
         )
     else:
         _logger.debug("group_gemm_swiglu_wrapper_sm100: No previously cached GroupedGemmSwigluSm100 object found, creating new GroupedGemmSwigluSm100 object")
+        # Allocate amax_tensor once here; cache-hit calls reuse this buffer so
+        # the FillFunctor (torch.full) only fires during warmup, not every step.
+        if d_dtype in [torch.bfloat16, torch.float16]:
+            amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
         grouped_gemm_swiglu = GroupedGemmSwigluSm100(
             sample_a=a_tensor,
             sample_b=b_tensor,
@@ -1025,7 +1031,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
             prob_tensor=prob_tensor,
             current_stream=current_stream,
         )
-        _cache_of_GroupedGemmSwigluSm100Objects[cache_key] = grouped_gemm_swiglu
+        _cache_of_GroupedGemmSwigluSm100Objects[cache_key] = (grouped_gemm_swiglu, amax_tensor)
 
     return TupleDict(
         c_tensor=c_tensor,

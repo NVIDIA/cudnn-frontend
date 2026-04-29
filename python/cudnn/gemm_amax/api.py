@@ -31,7 +31,7 @@ class GemmAmaxSm100(APIBase):
     ):
         super().__init__()
 
-        self._logger.warning("GemmAmaxSm100 is an experimental API")
+        self._warn_experimental_api()
         self._logger.debug("Entering __init__")
 
         self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
@@ -47,7 +47,7 @@ class GemmAmaxSm100(APIBase):
         self.sf_vec_size = sf_vec_size
 
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-        print(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
+        self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
 
         # used to reshape sfa/sfb tensors to atom layout
         self.atom_m = (32, 4)

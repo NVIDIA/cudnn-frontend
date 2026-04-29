@@ -133,7 +133,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         """
         super().__init__()
 
-        self._logger.warning("DiscreteGroupedGemmDswigluSm100 is an experimental API")
+        self._warn_experimental_api()
         self._logger.debug("Entering __init__")
 
         self._value_error_if(num_experts == 0, "num_experts must be > 0")
@@ -196,7 +196,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         self._kernel = BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel
 
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-        print(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
+        self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
         self._workspace = None
 
         self._logger.debug("__init__ completed")

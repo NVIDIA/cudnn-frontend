@@ -69,6 +69,17 @@ create_cudnn_tensor(
         tensor_builder.setVectorCountAndDimension(props->get_vector_count(), props->get_vector_dimension());
     }
 
+    // Set compile-time constant value before build (if present)
+    if (props->get_has_compile_time_constant()) {
+        auto const_value = props->get_compile_time_constant();
+        if (const_value.has_value()) {
+            std::visit([&tensor_builder](auto&& val) { tensor_builder.setConstValue(val); }, *const_value);
+
+            CUDNN_FE_LOG_LABEL_ENDL("INFO:      Compile-time constant value set for tensor '" << props->get_name()
+                                                                                              << "'");
+        }
+    }
+
     if (auto ragged_offset_props = props->get_ragged_offset()) {
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(ragged_offset_props, tensors, potential_uid, used_uids));
         tensor_builder.setRaggedOffset(tensors.at(ragged_offset_props->get_uid()));

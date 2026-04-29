@@ -8,6 +8,8 @@ import cudnn_repro.stage2_build_repro_sdpa_fp8_fwd as stage2_fp8_fwd
 
 
 def _fp8_fwd_payload(*, tag="SDPA_FP8_FWD", ragged=False, paged=False, output_dtype="HALF", mxfp8=False):
+    if mxfp8 and tag == "SDPA_FP8_FWD":
+        tag = "SDPA_MXFP8_FWD"
     inputs = {
         "Q": 1,
         "K": 2,
@@ -59,6 +61,8 @@ def _fp8_fwd_payload(*, tag="SDPA_FP8_FWD", ragged=False, paged=False, output_dt
             {
                 "tag": tag,
                 "name": "sdpa_fp8_fwd",
+                "is_mxfp8": mxfp8,
+                "unfuse_fma": mxfp8,
                 "inputs": inputs,
                 "outputs": outputs,
                 "generate_stats": True,
@@ -102,8 +106,9 @@ def _fp8_bwd_payload(*, ragged=False, output_dtype="HALF", mxfp8=False):
         "context": {"io_data_type": "FP8_E4M3"},
         "nodes": [
             {
-                "tag": "SDPA_FP8_BWD",
+                "tag": "SDPA_MXFP8_BWD" if mxfp8 else "SDPA_FP8_BWD",
                 "name": "sdpa_fp8_bwd",
+                "is_mxfp8": mxfp8,
                 "inputs": inputs,
                 "outputs": {"dQ": 21, "dK": 22, "dV": 23, "Amax_dQ": 24, "Amax_dK": 25, "Amax_dV": 26, "Amax_d": 27},
                 "padding_mask": ragged,
@@ -156,6 +161,8 @@ def test_routing_distinguishes_fp8_and_non_fp8_tags():
     assert routing.detect_operation_key({"nodes": [{"tag": "SDPA_BWD"}]}) == "sdpa_bwd"
     assert routing.detect_operation_key({"nodes": [{"tag": "SDPA_FP8_FWD"}]}) == "sdpa_fp8_fwd"
     assert routing.detect_operation_key({"nodes": [{"tag": "SDPA_FP8_BWD"}]}) == "sdpa_fp8_bwd"
+    assert routing.detect_operation_key({"nodes": [{"tag": "SDPA_MXFP8_FWD"}]}) == "sdpa_fp8_fwd"
+    assert routing.detect_operation_key({"nodes": [{"tag": "SDPA_MXFP8_BWD"}]}) == "sdpa_fp8_bwd"
 
 
 def test_build_fp8_fwd_cfg_extracts_output_type_and_stats():
@@ -183,9 +190,21 @@ def test_build_fp8_fwd_cfg_infers_paged_block_size():
     assert cfg["stride_v"] is None
 
 
-def test_build_fp8_fwd_cfg_rejects_mxfp8():
-    with pytest.raises(NotImplementedError, match="MXFP8"):
-        stage1_fp8_fwd.build_cfg("{}", _fp8_fwd_payload(mxfp8=True), seed=123)
+def test_build_mxfp8_fwd_cfg_extracts_mxfp8_fields():
+    payload = _fp8_fwd_payload(output_dtype="BFLOAT16", mxfp8=True)
+    payload["nodes"][0]["rescale_threshold"] = 2.0
+    cfg = stage1_fp8_fwd.build_cfg("{}", payload, seed=123)
+    assert cfg["is_mxfp8"] is True
+    assert cfg["output_type"] == "torch.bfloat16"
+    assert cfg["with_unfuse_fma"] is True
+    assert cfg["rescale_threshold"] == 2.0
+
+
+def test_build_mxfp8_fwd_cfg_uses_mxfp8_tag_without_flag():
+    payload = _fp8_fwd_payload(tag="SDPA_MXFP8_FWD", mxfp8=False)
+    payload["nodes"][0].pop("is_mxfp8")
+    cfg = stage1_fp8_fwd.build_cfg("{}", payload, seed=123)
+    assert cfg["is_mxfp8"] is True
 
 
 def test_build_fp8_bwd_cfg_extracts_output_type_and_determinism():
@@ -206,9 +225,21 @@ def test_build_fp8_bwd_cfg_extracts_output_type_and_determinism():
     assert cfg["seq_len_kv"] == [15, 11]
 
 
-def test_build_fp8_bwd_cfg_rejects_mxfp8():
-    with pytest.raises(NotImplementedError, match="MXFP8"):
-        stage1_fp8_bwd.build_cfg("{}", _fp8_bwd_payload(mxfp8=True), seed=123)
+def test_build_mxfp8_bwd_cfg_extracts_mxfp8_fields():
+    payload = _fp8_bwd_payload(output_dtype="BFLOAT16", mxfp8=True)
+    payload["nodes"][0]["rescale_threshold"] = 0.0
+    cfg = stage1_fp8_bwd.build_cfg("{}", payload, seed=123)
+    assert cfg["is_mxfp8"] is True
+    assert cfg["output_type"] == "torch.bfloat16"
+    assert cfg["rescale_threshold"] == 0.0
+
+
+def test_build_mxfp8_bwd_cfg_uses_mxfp8_tag_without_flag():
+    payload = _fp8_bwd_payload(mxfp8=False)
+    payload["nodes"][0]["tag"] = "SDPA_MXFP8_BWD"
+    payload["nodes"][0].pop("is_mxfp8")
+    cfg = stage1_fp8_bwd.build_cfg("{}", payload, seed=123)
+    assert cfg["is_mxfp8"] is True
 
 
 def test_build_fp8_forward_command_preserves_fp8_fields():
@@ -227,3 +258,13 @@ def test_build_fp8_backward_command_preserves_bwd_fields():
     assert "torch.float8_e4m3fn" in command
     assert "'is_mxfp8': False" in command
     assert "cudnn.diagonal_alignment.BOTTOM_RIGHT" in command
+
+
+def test_build_mxfp8_forward_command_preserves_mxfp8_fields():
+    payload = _fp8_fwd_payload(output_dtype="BFLOAT16", mxfp8=True)
+    payload["nodes"][0]["rescale_threshold"] = 4.0
+    command = stage2_fp8_fwd.build_command(stage1_fp8_fwd.build_cfg("{}", payload, seed=7))
+    assert "'is_mxfp8': True" in command
+    assert "'with_unfuse_fma': True" in command
+    assert "'rescale_threshold': 4.0" in command
+    assert "torch.bfloat16" in command

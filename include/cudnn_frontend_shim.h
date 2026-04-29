@@ -427,6 +427,70 @@ destroy_handle(cudnnHandle_t handle) {
     NV_FE_CALL_TO_BACKEND(destroy_handle, cudnnDestroy, handle);
 }
 
+#if CUDNN_VERSION >= 92200
+inline cudnnStatus_t
+causal_conv1d_forward(cudaStream_t stream,
+                      const void *x,
+                      const void *weight,
+                      const void *bias,
+                      void *y,
+                      int batch,
+                      int dim,
+                      int seq_len,
+                      int kernel_size,
+                      cudnnDataType_t data_type,
+                      cudnnCausalConv1dActivation_t activation) {
+    NV_FE_CALL_TO_BACKEND(causal_conv1d_forward,
+                          cudnnCausalConv1dForward,
+                          stream,
+                          x,
+                          weight,
+                          bias,
+                          y,
+                          batch,
+                          dim,
+                          seq_len,
+                          kernel_size,
+                          data_type,
+                          activation);
+}
+
+inline cudnnStatus_t
+causal_conv1d_backward(cudaStream_t stream,
+                       const void *x,
+                       const void *weight,
+                       const void *bias,
+                       const void *dy,
+                       void *dx,
+                       void *dweight,
+                       void *dbias,
+                       int batch,
+                       int dim,
+                       int seq_len,
+                       int kernel_size,
+                       cudnnDataType_t data_type,
+                       cudnnDataType_t dw_data_type,
+                       cudnnCausalConv1dActivation_t activation) {
+    NV_FE_CALL_TO_BACKEND(causal_conv1d_backward,
+                          cudnnCausalConv1dBackward,
+                          stream,
+                          x,
+                          weight,
+                          bias,
+                          dy,
+                          dx,
+                          dweight,
+                          dbias,
+                          batch,
+                          dim,
+                          seq_len,
+                          kernel_size,
+                          data_type,
+                          dw_data_type,
+                          activation);
+}
+#endif
+
 inline size_t
 get_backend_version(void) {
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING

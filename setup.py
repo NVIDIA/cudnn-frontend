@@ -29,15 +29,9 @@ class CMakeBuild(build_ext):
         cfg = "Debug" if debug else "Release"
 
         is_windows = os.name == "nt"
-        # Set Python_EXECUTABLE instead if you use PYBIND11_FINDPYTHON
-        cmake_args = []
-
-        if is_windows == False:
-            cmake_args += [
-                f"-DPython_EXECUTABLE={sys.executable}",
-            ]
-
         cmake_args = [
+            f"-DPython_EXECUTABLE={sys.executable}",
+            f"-DPYBIND11_FINDPYTHON=ON",
             f"-DCMAKE_BUILD_TYPE={cfg}",  # not used on MSVC, but no harm
             f"-DCUDNN_FRONTEND_BUILD_PYTHON_BINDINGS=ON",
             # There's no need to build cpp samples and tests with python

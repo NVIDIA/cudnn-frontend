@@ -33,7 +33,7 @@ class SelectionAttention(APIBase):
         super().__init__()
         self._kernel = HopperSelectAttentionFwd
 
-        self._logger.warning("SelectionAttention is an experimental API")
+        self._warn_experimental_api()
         self._logger.debug("Entering __init__")
 
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")

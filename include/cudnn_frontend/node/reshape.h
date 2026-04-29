@@ -48,6 +48,19 @@ class ReshapeNode : public NodeCRTP<ReshapeNode> {
             return {error_code_t::SHAPE_DEDUCTION_FAILED, "Reshape node output shape deduction failed"};
         }
 
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Reshape_attributes::input_names::X);
+        auto const& input_data_type = X->second->get_data_type();
+        if (y_tensor->get_data_type() == DataType_t::NOT_SET) {
+            y_tensor->set_data_type(input_data_type);
+        } else if (attributes.get_reshape_mode() == ReshapeMode_t::LOGICAL) {
+            // Lexicographic reshape preserves element type; reject inconsistent metadata.
+            // VIEW_ONLY paths (e.g. SDPA backward) may set Y dtype after reshape to match a consumer.
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                y_tensor->get_data_type() != input_data_type,
+                error_code_t::INVALID_VALUE,
+                "Output and input tensor data types must match for LOGICAL reshape operation.");
+        }
+
         return {error_code_t::OK, ""};
     }
 
@@ -75,7 +88,16 @@ class ReshapeNode : public NodeCRTP<ReshapeNode> {
                                                        CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                                        1,
                                                        &x_desc));
-
+#if (CUDNN_VERSION >= 92200)
+        // Set reshape mode
+        cudnnBackendReshapeMode_t cudnn_reshape_mode;
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.get_reshape_mode(), cudnn_reshape_mode));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reshape_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_RESHAPE_MODE,
+                                                       CUDNN_TYPE_RESHAPE_MODE,
+                                                       1,
+                                                       &cudnn_reshape_mode));
+#endif
         // Set output tensor Y
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Reshape_attributes::output_names::Y);
         auto y_desc = tensors.at(Y->second->get_uid())->get_raw_desc();

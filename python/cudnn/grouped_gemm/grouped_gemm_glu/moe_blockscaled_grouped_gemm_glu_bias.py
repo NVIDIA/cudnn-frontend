@@ -2313,6 +2313,19 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                     expert_idx = tile_info[0]
 
                     gBias_tile = gBias_nl[(None, mma_n_coord, expert_idx)]
+
+                    # For dynamic MNKL, cuteDSL drops the 128bit alignment requirement
+                    # but we know that during runtime the alignment is always 16 bytes.
+                    gBias_tile = cute.make_tensor(
+                        cute.make_ptr(
+                            gBias_tile.element_type,
+                            gBias_tile.iterator.toint(),
+                            AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        gBias_tile.layout,
+                    )
+
                     tBs_gBias = thr_bias_g2s.partition_S(gBias_tile)
 
                     # Predicate: check if this thread's chunk is within N

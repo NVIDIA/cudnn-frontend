@@ -96,21 +96,21 @@ struct nlohmann::adl_serializer<nv_bfloat16> {
 };
 
 template <>
-struct nlohmann::adl_serializer<std::variant<int64_t, int32_t, half, float, nv_bfloat16>> {
+struct nlohmann::adl_serializer<std::variant<int64_t, int32_t, half, float, double, nv_bfloat16>> {
     static void
-    to_json(nlohmann::json& j, const std::variant<int64_t, int32_t, half, float, nv_bfloat16>& data) {
+    to_json(nlohmann::json& j, const std::variant<int64_t, int32_t, half, float, double, nv_bfloat16>& data) {
         std::visit([&](const auto& v) { j = {{"index", data.index()}, {"value", v}}; }, data);
     }
 
     static void
-    from_json(const nlohmann::json& j, std::variant<int64_t, int32_t, half, float, nv_bfloat16>& data) {
+    from_json(const nlohmann::json& j, std::variant<int64_t, int32_t, half, float, double, nv_bfloat16>& data) {
         if (!j.is_object() || !j.contains("index") || !j.contains("value")) {
             return;
         }
 
         size_t type_index = j.at("index").get<size_t>();
         if (type_index == 0) {
-            data = j.at("value").get<int32_t>();
+            data = j.at("value").get<int64_t>();
         } else if (type_index == 1) {
             data = j.at("value").get<int32_t>();
         } else if (type_index == 2) {
@@ -118,6 +118,8 @@ struct nlohmann::adl_serializer<std::variant<int64_t, int32_t, half, float, nv_b
         } else if (type_index == 3) {
             data = j.at("value").get<float>();
         } else if (type_index == 4) {
+            data = j.at("value").get<double>();
+        } else if (type_index == 5) {
             data = j.at("value").get<nv_bfloat16>();
         } else {
             return;
@@ -386,6 +388,20 @@ enum class PaddingMode_t {
     ZERO_PAD
 };
 
+enum class ReshapeMode_t {
+    NOT_SET,
+
+    VIEW_ONLY,
+    LOGICAL
+};
+
+NLOHMANN_JSON_SERIALIZE_ENUM(ReshapeMode_t,
+                             {
+                                 {ReshapeMode_t::NOT_SET, nullptr},
+                                 {ReshapeMode_t::VIEW_ONLY, "VIEW_ONLY"},
+                                 {ReshapeMode_t::LOGICAL, "LOGICAL"},
+                             })
+
 enum class ConvolutionMode_t {
     NOT_SET,
 
@@ -480,6 +496,8 @@ enum class DescriptorType_t {
     OPERATION_CONCATENATE_DESCRIPTOR,
     OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR,
     OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR,
+    OPERATION_TRANSPOSE_DESCRIPTOR,
+    OPERATION_SLICE_DESCRIPTOR
 };
 
 enum class NormMode_t {
@@ -961,6 +979,12 @@ operator<<(std::ostream& os, const DescriptorType_t& mode) {
             break;
         case DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
             os << "OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR";
+            break;
+        case DescriptorType_t::OPERATION_TRANSPOSE_DESCRIPTOR:
+            os << "OPERATION_TRANSPOSE_DESCRIPTOR";
+            break;
+        case DescriptorType_t::OPERATION_SLICE_DESCRIPTOR:
+            os << "OPERATION_SLICE_DESCRIPTOR";
             break;
         case DescriptorType_t::NOT_SET:
             os << "NOT_SET";
@@ -1684,6 +1708,22 @@ convert_to_cudnn_type(cudnn_frontend::DescriptorType_t const mode, cudnnBackendD
 #else
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
+        case DescriptorType_t::OPERATION_TRANSPOSE_DESCRIPTOR:
+#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_BACKEND_OPERATION_TRANSPOSE_DESCRIPTOR;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
+        case DescriptorType_t::OPERATION_SLICE_DESCRIPTOR:
+#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
 
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
@@ -1798,6 +1838,26 @@ convert_to_cudnn_type(cudnn_frontend::NormFwdPhase_t const mode, cudnnBackendNor
     }
     return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 }
+
+#if (CUDNN_VERSION >= 92200)
+static inline cudnnStatus_t
+convert_to_cudnn_type(cudnn_frontend::ReshapeMode_t const mode, cudnnBackendReshapeMode_t& cudnn_mode) {
+    switch (mode) {
+        case ReshapeMode_t::VIEW_ONLY:
+            cudnn_mode = CUDNN_RESHAPE_VIEW_ONLY;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case ReshapeMode_t::LOGICAL:
+            cudnn_mode = CUDNN_RESHAPE_LOGICAL;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+
+#ifndef NO_DEFAULT_IN_SWITCH
+        default:
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
+    }
+    return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+}
+#endif
 
 // To be deprecated. Only exists as setResampleMode(cudnnPaddingMode_t) requires it.
 static inline void
@@ -1929,6 +1989,27 @@ convert_from_cudnn_type(cudnnBackendNormFwdPhase_t const cudnn_mode, cudnn_front
 #endif
     }
 }
+
+#if (CUDNN_VERSION >= 92200)
+// To be deprecated. Only exists as setReshapeMode(cudnnBackendReshapeMode_t) requires it.
+static inline void
+convert_from_cudnn_type(cudnnBackendReshapeMode_t const cudnn_mode, cudnn_frontend::ReshapeMode_t& mode) {
+    mode = ReshapeMode_t::NOT_SET;
+    switch (cudnn_mode) {
+        case CUDNN_RESHAPE_VIEW_ONLY:
+            mode = ReshapeMode_t::VIEW_ONLY;
+            break;
+        case CUDNN_RESHAPE_LOGICAL:
+            mode = ReshapeMode_t::LOGICAL;
+            break;
+
+#ifndef NO_DEFAULT_IN_SWITCH
+        default:
+            break;
+#endif
+    }
+}
+#endif
 
 static inline cudnnStatus_t
 convert_to_cudnn_type(cudnn_frontend::TensorReordering_t const mode, cudnnBackendTensorReordering_t& cudnn_mode) {
@@ -2092,6 +2173,13 @@ convert_from_cudnn_type(cudnnBackendDescriptorType_t const cudnn_mode) {
 #if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
         case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
             return DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR;
+#endif
+
+#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+        case CUDNN_BACKEND_OPERATION_TRANSPOSE_DESCRIPTOR:
+            return DescriptorType_t::OPERATION_TRANSPOSE_DESCRIPTOR;
+        case CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR:
+            return DescriptorType_t::OPERATION_SLICE_DESCRIPTOR;
 #endif
 
 #ifndef NO_DEFAULT_IN_SWITCH

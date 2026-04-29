@@ -10,7 +10,7 @@ import pytest
 from test_utils import torch_fork_set_rng
 from fe_api.test_grouped_gemm_swiglu_utils import (
     grouped_gemm_swiglu_init,
-    allocate_grouped_gemm_input_tensors,
+    allocate_grouped_gemm_input_tensors as allocate_grouped_gemm_input_tensors_base,
 )
 from fe_api.test_grouped_gemm_dswiglu_utils import (
     with_grouped_gemm_dswiglu_params_fp4,
@@ -20,6 +20,23 @@ from fe_api.test_grouped_gemm_dswiglu_utils import (
 )
 
 GROUPED_GEMM_DSWIGLU_DYNAMIC_SHAPES_M_VALUES = [64, 320, 576, 832, 1088, 1344, 1600, 1856, 2112, 2368]
+
+
+def allocate_grouped_gemm_input_tensors(*args, **kwargs):
+    """Restore the upstream dSwiGLU test-input range for backward kernels."""
+
+    tensors = allocate_grouped_gemm_input_tensors_base(*args, **kwargs)
+
+    alpha_tensor = tensors["alpha_tensor"]
+    tensors["alpha_tensor"] = torch.randint(1, 2, alpha_tensor.shape, dtype=torch.float32, device=alpha_tensor.device)
+
+    beta_tensor = tensors["beta_tensor"]
+    tensors["beta_tensor"] = torch.randint(1, 2, beta_tensor.shape, dtype=torch.float32, device=beta_tensor.device)
+
+    prob_tensor = tensors["prob_tensor"]
+    tensors["prob_tensor"] = torch.randint(1, 2, prob_tensor.shape, dtype=torch.float32, device=prob_tensor.device)
+
+    return tensors
 
 
 @pytest.mark.L0

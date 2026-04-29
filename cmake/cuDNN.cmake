@@ -110,6 +110,7 @@ elseif(CUDNN_MAJOR_VERSION EQUAL 9)
     find_cudnn_library(cudnn_adv OPTIONAL)
     find_cudnn_library(cudnn_engines_precompiled OPTIONAL)
     find_cudnn_library(cudnn_heuristic OPTIONAL)
+    find_cudnn_library(cudnn_ext OPTIONAL)
 
     target_link_libraries(
         CUDNN::cudnn_all

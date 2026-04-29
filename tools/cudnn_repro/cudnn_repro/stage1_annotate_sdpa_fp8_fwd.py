@@ -8,17 +8,16 @@ from . import utils
 
 
 def _find_node(payload: dict) -> dict:
-    node = utils.node_by_tag(payload, "SDPA_FP8_FWD")
+    node = utils.node_by_tag(payload, "SDPA_MXFP8_FWD", "SDPA_FP8_FWD")
     if node is None:
-        raise ValueError("SDPA FP8 forward node not found in log")
+        raise ValueError("SDPA FP8/MXFP8 forward node not found in log")
     return node
 
 
 def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     """Build FP8 forward test configuration from JSON payload."""
     node = _find_node(payload)
-    if utils.is_mxfp8_payload(payload, node):
-        raise NotImplementedError("MXFP8 repro is not yet implemented")
+    is_mxfp8 = utils.is_mxfp8_payload(payload, node)
 
     tensors = payload.get("tensors", {})
     node_name = node.get("name")
@@ -96,10 +95,14 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     cfg["is_ragged"] = is_ragged
     cfg["is_dropout"] = dropout_prob > 0.0
     cfg["is_determin"] = None
-    cfg["is_mxfp8"] = False
+    cfg["is_mxfp8"] = is_mxfp8
     cfg["with_score_max"] = "Max" in outputs
     cfg["with_score_sum_exp"] = "Sum_exp" in outputs
     cfg["with_sink_token"] = "SINK_TOKEN" in inputs
+    if is_mxfp8:
+        cfg["with_unfuse_fma"] = bool(node.get("unfuse_fma", False))
+    if "rescale_threshold" in node:
+        cfg["rescale_threshold"] = utils.parse_hex_float(node.get("rescale_threshold"))
 
     left_bound = utils.parse_optional_int(node.get("left_bound"))
     right_bound = utils.parse_optional_int(node.get("right_bound"))

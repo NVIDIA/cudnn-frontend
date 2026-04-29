@@ -193,8 +193,6 @@ TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
     int64_t s_kv = 1024;  // k and v tensor is padded to this seq length
     int64_t d    = 128;   // hidden dim
 
-    SKIP("BAN due to seg fault");
-
     // Mode of sdpa operation
     bool generate_stats = false;
 

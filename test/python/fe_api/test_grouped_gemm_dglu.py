@@ -11,7 +11,7 @@ from test_utils import torch_fork_set_rng
 from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
 from fe_api.test_grouped_gemm_swiglu_utils import (
     grouped_gemm_swiglu_init,
-    allocate_grouped_gemm_input_tensors,
+    allocate_grouped_gemm_input_tensors as allocate_grouped_gemm_input_tensors_base,
 )
 from fe_api.test_grouped_gemm_dswiglu_utils import (
     with_grouped_gemm_dswiglu_params_fp4,
@@ -33,6 +33,23 @@ with_scheduler_modes = pytest.mark.parametrize(
     [False, True],
     ids=["static_sched", "dynamic_sched"],
 )
+
+
+def allocate_grouped_gemm_input_tensors(*args, **kwargs):
+    """Restore the upstream dGLU test-input range for backward kernels."""
+
+    tensors = allocate_grouped_gemm_input_tensors_base(*args, **kwargs)
+
+    alpha_tensor = tensors["alpha_tensor"]
+    tensors["alpha_tensor"] = torch.randint(1, 2, alpha_tensor.shape, dtype=torch.float32, device=alpha_tensor.device)
+
+    beta_tensor = tensors["beta_tensor"]
+    tensors["beta_tensor"] = torch.randint(1, 2, beta_tensor.shape, dtype=torch.float32, device=beta_tensor.device)
+
+    prob_tensor = tensors["prob_tensor"]
+    tensors["prob_tensor"] = torch.randint(1, 2, prob_tensor.shape, dtype=torch.float32, device=prob_tensor.device)
+
+    return tensors
 
 
 def _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides=None):

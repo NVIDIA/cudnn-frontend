@@ -1,3 +1,4 @@
+#include <optional>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -185,16 +186,21 @@ PyGraph::slice(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
     auto input_dim = input->get_dim();
 
     std::vector<std::pair<int64_t, int64_t>> start_end_indices;
+    std::vector<int64_t> steps;
+    steps.reserve(slices.size());
     for (size_t i = 0; i < slices.size(); ++i) {
         int64_t start, stop, step, length;
         if (!slices[i].compute(input_dim[i], &start, &stop, &step, &length)) {
             throw std::runtime_error("Invalid slice");
         }
+        CUDNN_FRONTEND_UNUSED(length);
         start_end_indices.push_back({start, stop});
+        steps.push_back(step);
     }
 
     auto attributes = cudnn_frontend::graph::Slice_attributes()
                           .set_slices(start_end_indices)
+                          .set_strides(steps)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
 
@@ -350,11 +356,58 @@ PyGraph::reduction(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& in
 }
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
-PyGraph::reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input, std::string const& name) {
-    auto attributes = cudnn_frontend::graph::Reshape_attributes().set_name(name);
+PyGraph::reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+                 std::string const& name,
+                 cudnn_frontend::ReshapeMode_t reshape_mode) {
+    auto attributes = cudnn_frontend::graph::Reshape_attributes().set_name(name).set_reshape_mode(reshape_mode);
 
     auto OUT_0 = graph->reshape(input, attributes);
     return OUT_0;
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::transpose(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+                   std::vector<int64_t> const& permutation,
+                   cudnn_frontend::DataType_t const& compute_data_type,
+                   std::string const& name) {
+    auto attributes = cudnn_frontend::graph::Transpose_attributes()
+                          .set_name(name)
+                          .set_permutation(permutation)
+                          .set_compute_data_type(compute_data_type);
+
+    return graph->transpose(input, attributes);
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::concatenate(std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>> inputs,
+                     int64_t axis,
+                     std::optional<int64_t> in_place_index,
+                     std::string const& name) {
+    auto attributes = cudnn_frontend::graph::Concatenate_attributes().set_axis(axis).set_name(name);
+    if (in_place_index.has_value()) {
+        attributes.set_in_place_index(in_place_index.value());
+    }
+    return graph->concatenate(std::move(inputs), attributes);
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::tensor_scalar(float const& value, cudnn_frontend::graph::ScalarType scalar_type) {
+    return graph->tensor(value, scalar_type);
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::tensor_scalar(double const& value, cudnn_frontend::graph::ScalarType scalar_type) {
+    return graph->tensor(value, scalar_type);
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::tensor_scalar(int32_t const& value, cudnn_frontend::graph::ScalarType scalar_type) {
+    return graph->tensor(value, scalar_type);
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::tensor_scalar(int64_t const& value, cudnn_frontend::graph::ScalarType scalar_type) {
+    return graph->tensor(value, scalar_type);
 }
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
@@ -772,6 +825,8 @@ init_pygraph_submodule(py::module_& m) {
                 Args:
                     input (cudnn_tensor): The input tensor to be sliced.
                     slices (List[slice]): A list of Python slice objects, one for each dimension.
+                        Per-axis step comes from each slice's ``step`` (default 1), after normalization
+                        for the tensor shape (same semantics as indexing a sequence of that length).
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation.
                         Default is NOT_SET.
                     name (Optional[str]): A name for the slice operation.
@@ -781,7 +836,7 @@ init_pygraph_submodule(py::module_& m) {
 
                 Example:
                     >>> input_tensor = graph.tensor([4, 8, 16])
-                    >>> sliced_tensor = graph.slice(input_tensor, [slice(0, 2), slice(1, 5), slice(0, 16)])
+                    >>> sliced_tensor = graph.slice(input_tensor, [slice(0, 2), slice(1, 8, 2), slice(0, 16)])
             )pbdoc")
         .def(
             "conv_fprop",
@@ -1014,6 +1069,7 @@ init_pygraph_submodule(py::module_& m) {
              &PyGraph::reshape,
              py::arg("input"),
              py::arg_v("name", ""),
+             py::arg_v("reshape_mode", cudnn_frontend::ReshapeMode_t::VIEW_ONLY),
              R"pbdoc(
                 Reshape an input tensor to other dimensions without changing the actual memory layout.
                 These dimensions to reshape to are inferred from output tensor shape.
@@ -1021,10 +1077,73 @@ init_pygraph_submodule(py::module_& m) {
                 Args:
                     input (cudnn_tensor): The input tensor.
                     name (Optional[str]): A name for the operation to be performed.
+                    reshape_mode (cudnn.reshape_mode): VIEW_ONLY (default) or LOGICAL for lexicographic logical reshapes.
 
                 Returns:
                     cudnn_tensor: The result of reshape operation. Please set the dims for the output tensor.
             )pbdoc")
+        .def("transpose",
+             &PyGraph::transpose,
+             py::arg("input"),
+             py::arg("permutation"),
+             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+             py::arg_v("name", ""),
+             R"pbdoc(
+                Permute tensor dimensions using a permutation vector (output axis i reads input axis permutation[i]).
+
+                Args:
+                    input (cudnn_tensor): The input tensor.
+                    permutation (List[int]): Permutation of axis indices.
+                    compute_data_type (Optional[cudnn.data_type]): Optional compute type; default NOT_SET.
+                    name (Optional[str]): Operation name.
+
+                Returns:
+                    cudnn_tensor: Transposed tensor (dims/strides inferred when not set).
+            )pbdoc")
+        .def("concatenate",
+             &PyGraph::concatenate,
+             py::arg("inputs"),
+             py::arg("axis"),
+             py::arg_v("in_place_index", std::optional<int64_t>{}),
+             py::arg_v("name", ""),
+             R"pbdoc(
+                Concatenate tensors along an axis.
+
+                Args:
+                    inputs (List[cudnn_tensor]): Tensors to concatenate.
+                    axis (int): Concatenation axis.
+                    in_place_index (Optional[int]): When set, optional in-place concat per backend semantics.
+                    name (Optional[str]): Operation name.
+
+                Returns:
+                    cudnn_tensor: Concatenated output tensor.
+            )pbdoc")
+        .def("tensor_scalar",
+             py::overload_cast<float const&, cudnn_frontend::graph::ScalarType>(&PyGraph::tensor_scalar),
+             py::arg("value"),
+             py::arg("scalar_type"),
+             R"pbdoc(
+                Create a rank-1 scalar tensor from a Python float, marked runtime or compile-time.
+
+                Args:
+                    value (float): Scalar value.
+                    scalar_type (cudnn.scalar_type): RUNTIME_PARAM or COMPILE_TIME_CONST.
+
+                Returns:
+                    cudnn_tensor: Scalar tensor (set dim/stride/name as needed for your graph).
+            )pbdoc")
+        .def("tensor_scalar",
+             py::overload_cast<double const&, cudnn_frontend::graph::ScalarType>(&PyGraph::tensor_scalar),
+             py::arg("value"),
+             py::arg("scalar_type"))
+        .def("tensor_scalar",
+             py::overload_cast<int32_t const&, cudnn_frontend::graph::ScalarType>(&PyGraph::tensor_scalar),
+             py::arg("value"),
+             py::arg("scalar_type"))
+        .def("tensor_scalar",
+             py::overload_cast<int64_t const&, cudnn_frontend::graph::ScalarType>(&PyGraph::tensor_scalar),
+             py::arg("value"),
+             py::arg("scalar_type"))
         .def("moe_grouped_matmul",
              &PyGraph::moe_grouped_matmul,
              py::arg("token"),

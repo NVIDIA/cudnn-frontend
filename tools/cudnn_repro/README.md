@@ -65,8 +65,8 @@ The tool auto-detects SDPA operation tags and routes to the appropriate handler:
 - `SDPA_BWD`
 - `SDPA_FP8_FWD`
 - `SDPA_FP8_BWD`
-
-Non-MXFP8 FP8 forward and backward repro are supported. MXFP8 repro is not yet implemented.
+- `SDPA_MXFP8_FWD`
+- `SDPA_MXFP8_BWD`
 
 **Debug mode** (`CUDNN_DEBUG_REPRO=1`) writes:
 - `cudnn_repro_stage0.txt` - Raw log

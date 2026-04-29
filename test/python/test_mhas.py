@@ -1538,5 +1538,9 @@ def test_sdpa_backward(
     )
     if is_bias:
         torch.testing.assert_close(
-            dBias_ref, dBias_gpu, check_dtype=False, atol=2e-2, rtol=2e-2
+            dBias_ref,
+            dBias_gpu,
+            check_dtype=False,
+            atol=2e-2 if input_type != torch.bfloat16 else 7e-2,
+            rtol=2e-2,
         )

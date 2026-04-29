@@ -14,9 +14,9 @@ def detect_operation_key(payload: dict) -> str:
     """Detect the operation key from the JSON payload."""
     for node in payload.get("nodes", []):
         tag = node.get("tag", "")
-        if tag == "SDPA_FP8_FWD":
+        if tag in ("SDPA_FP8_FWD", "SDPA_MXFP8_FWD"):
             return "sdpa_fp8_fwd"
-        if tag == "SDPA_FP8_BWD":
+        if tag in ("SDPA_FP8_BWD", "SDPA_MXFP8_BWD"):
             return "sdpa_fp8_bwd"
         if tag == "SDPA_BWD":
             return "sdpa_bwd"

@@ -345,9 +345,35 @@ def allocate_grouped_gemm_input_tensors(
 
     tensor_m = permuted_m if permuted_m is not None else valid_m
 
-    # Note: b tensor can be n-major for mxfp8 dSwiglu; otherwise, a and b tensors are always k-major
-    a_ref, a_tensor = create_and_permute_tensor(1, tensor_m, k, False, ab_dtype)
-    b_ref, b_tensor = create_and_permute_tensor(l, n, k, b_major == "n", ab_dtype)
+    # Standalone grouped kernels use raw-byte tensors for FP4 payloads with the
+    # full logical K still present in the visible tensor shape.
+    if ab_dtype == torch.uint8:
+        try:
+            import cutlass
+            import cutlass.torch as cutlass_torch
+        except ImportError:
+            pytest.skip("CUTLASS is not installed; skipping grouped uint8 raw-FP4 tests.")
+
+        a_ref = cutlass_torch.matrix(1, tensor_m, k, False, cutlass.Float32).cuda()
+        b_ref = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32).cuda()
+        _, a_tensor = cutlass_torch.cute_tensor_like(
+            a_ref,
+            cutlass.Float4E2M1FN,
+            is_dynamic_layout=True,
+            assumed_align=16,
+        )
+        _, b_tensor = cutlass_torch.cute_tensor_like(
+            b_ref,
+            cutlass.Float4E2M1FN,
+            is_dynamic_layout=True,
+            assumed_align=16,
+        )
+        a_tensor = a_tensor.view(torch.uint8)
+        b_tensor = b_tensor.view(torch.uint8)
+    else:
+        # Note: b tensor can be n-major for mxfp8 dSwiglu; otherwise, a and b tensors are always k-major
+        a_ref, a_tensor = create_and_permute_tensor(1, tensor_m, k, False, ab_dtype)
+        b_ref, b_tensor = create_and_permute_tensor(l, n, k, b_major == "n", ab_dtype)
 
     sfa_ref, sfa_tensor = create_scale_factor_tensor(1, tensor_m, k, sf_vec_size, sf_dtype)
     sfb_ref, sfb_tensor = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)

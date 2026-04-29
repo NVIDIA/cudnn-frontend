@@ -935,7 +935,6 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
     test.cfg.is_mxfp8 = True
-    test.showConfig(test_no, request)
 
     # Randomly enable unfuse_fma via environment variable for SM100
     unfuse_fma = rng.choice([True, False])
@@ -952,6 +951,8 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         rescale_threshold = 0.0
     test.cfg.rescale_threshold = rescale_threshold
     os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
+
+    test.showConfig(test_no, request)
 
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
@@ -996,10 +997,11 @@ def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
 
     test.cfg.is_mxfp8 = True
     test.cfg.is_infer = False
-    test.showConfig(test_no, request)
 
     test.cfg.rescale_threshold = 0.0
     os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
+
+    test.showConfig(test_no, request)
 
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")

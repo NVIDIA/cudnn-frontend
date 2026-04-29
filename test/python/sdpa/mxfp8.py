@@ -193,7 +193,8 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
                        cudnn_itype=cudnn.data_type.FP8_E4M3,
                        cudnn_otype=cudnn.data_type.HALF,
                        left_bound=None, right_bound=None, diag_align=None,
-                       with_sink_token=False):
+                       with_sink_token=False,
+                       with_unfuse_fma=False):
     # Compute padded dimensions for F8_128x4 scale factors
     s_q_padded = ceil_div(s_qo, 128) * 128
     s_kv_padded = ceil_div(s_kv, 128) * 128
@@ -278,6 +279,7 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
         diagonal_band_left_bound=left_bound,
         diagonal_band_right_bound=right_bound,
         sink_token=sink_token,
+        unfuse_fma=with_unfuse_fma,
     )
 
     # Set output tensor properties
@@ -513,7 +515,8 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     right_bound = getattr(cfg, 'right_bound', None)
     diag_align  = getattr(cfg, 'diag_align', None)
     with_sink_token = getattr(cfg, 'with_sink_token', False)
-    rescale_threshold = getattr(cfg, 'rescale_threshold', 4.0)
+    with_unfuse_fma = getattr(cfg, 'with_unfuse_fma', False)
+    rescale_threshold = cfg.rescale_threshold if hasattr(cfg, 'rescale_threshold') and cfg.rescale_threshold is not None else 4.0
 
     # Get input/output types from config
     torch_itype = cfg.data_type if hasattr(cfg, 'data_type') and cfg.data_type else torch.float8_e4m3fn
@@ -537,6 +540,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             cudnn_itype, cudnn_otype,
             left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
             with_sink_token=with_sink_token,
+            with_unfuse_fma=with_unfuse_fma,
         )
         graph_fwd.validate()
         graph_fwd.build_operation_graph()

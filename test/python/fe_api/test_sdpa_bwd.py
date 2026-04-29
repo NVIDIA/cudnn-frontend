@@ -1,5 +1,11 @@
 """
 Tests for SDPA backward SM100 API and wrapper.
+
+These tests are marked ``gpu_exclusive`` because the 2-CTA cluster kernel
+uses Blackwell TMEM which produces NaN when GPU kernels from other CUDA
+contexts (i.e. other pytest-xdist workers) execute concurrently on the
+same device.  Run with ``-m gpu_exclusive -n 0`` in CI.
+See: https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/299938128
 """
 
 import pytest
@@ -13,6 +19,8 @@ from fe_api.test_sdpa_bwd_utils import (
     sdpa_bwd_init,
     with_sdpa_bwd_params,
 )
+
+pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
 @pytest.mark.L0

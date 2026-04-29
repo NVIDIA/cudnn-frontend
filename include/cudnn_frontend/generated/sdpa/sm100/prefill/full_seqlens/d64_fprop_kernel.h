@@ -69,8 +69,6 @@ inline __device__ void fastDivMod(const FastDivisor_t &d, uint32_t val,
   mod = val - div * d.val;
 }
 
-__device__ __inline__ void cfence() {}
-
 inline __device__ char *get_smem_loc_epilogue_swizzle_128b(
     char *smem_addr, int local_block_id, int tid, int local_row, int column,
     size_t element_size, int block_size, int row_per_tile) {
@@ -1766,7 +1764,6 @@ __launch_bounds__(512, 1) void cudnn_generated_oss_sdpa_sm100_flash_fprop_f16_kn
 
 #pragma unroll
           for (int i = 0; i < BMM1_TILE_N; i += 2) {
-            cfence();
             if (i - kConvertPipeCount == 32) {
               sttm_32dp32bit_x16(tmem_fp16_S, &reg_12_0[0]);
             }
@@ -1781,12 +1778,10 @@ __launch_bounds__(512, 1) void cudnn_generated_oss_sdpa_sm100_flash_fprop_f16_kn
                   &reg_12_0[((i - kConvertPipeCount) / 2) % 32],
                   reinterpret_cast<r32 *>(&reg_8_0[i - kConvertPipeCount]));
             }
-            cfence();
 
             reinterpret_cast<float &>(reg_8_0[i + 0]) =
                 exp2f(reinterpret_cast<float &>(reg_8_0[i + 0]));
 
-            cfence();
 
             if (i + kFmaPipeCount < BMM1_TILE_N) {
               float2 in = make_float2(
@@ -1842,7 +1837,6 @@ __launch_bounds__(512, 1) void cudnn_generated_oss_sdpa_sm100_flash_fprop_f16_kn
             named_barrier_arrive(SOFTMAX_BARRIER + 1, 256);
             named_barrier_wait(SOFTMAX_BARRIER, 256);
           }
-          cfence();
           named_barrier_wait(SOFTMAX_BARRIER + 2 + softmax_gid, 128);
         }
         bmm_mbar_state ^= 1;
@@ -1948,7 +1942,6 @@ __launch_bounds__(512, 1) void cudnn_generated_oss_sdpa_sm100_flash_fprop_f16_kn
 
 #pragma unroll
           for (int i = 0; i < BMM1_TILE_N; i += 2) {
-            cfence();
             if (i - kConvertPipeCount == 32) {
               sttm_32dp32bit_x16(tmem_fp16_S, &reg_12_0[0]);
             }
@@ -1963,12 +1956,10 @@ __launch_bounds__(512, 1) void cudnn_generated_oss_sdpa_sm100_flash_fprop_f16_kn
                   &reg_12_0[((i - kConvertPipeCount) / 2) % 32],
                   reinterpret_cast<r32 *>(&reg_8_0[i - kConvertPipeCount]));
             }
-            cfence();
 
             reinterpret_cast<float &>(reg_8_0[i + 0]) =
                 exp2f(reinterpret_cast<float &>(reg_8_0[i + 0]));
 
-            cfence();
 
             if (i + kFmaPipeCount < BMM1_TILE_N) {
               float2 in = make_float2(
@@ -2024,7 +2015,6 @@ __launch_bounds__(512, 1) void cudnn_generated_oss_sdpa_sm100_flash_fprop_f16_kn
             named_barrier_arrive(SOFTMAX_BARRIER + 1, 256);
             named_barrier_wait(SOFTMAX_BARRIER, 256);
           }
-          cfence();
           named_barrier_wait(SOFTMAX_BARRIER + 2 + softmax_gid, 128);
         }
         bmm_mbar_state ^= 1;
@@ -2234,12 +2224,10 @@ __launch_bounds__(512, 1) void cudnn_generated_oss_sdpa_sm100_flash_fprop_f16_kn
                                       sttm_step * 8,
                                   &fp32_O[8 * sttm_step]);
               }
-              cfence();
             }
           }
           fence_view_async_tmem_store();
           arrive_barrier(cast_smem_ptr_to_uint(bmm_ready_mbar));
-          cfence();
         }
         stat_mbar_state ^= 1;
         bmm_mbar_state ^= 1;
@@ -2374,7 +2362,6 @@ __launch_bounds__(512, 1) void cudnn_generated_oss_sdpa_sm100_flash_fprop_f16_kn
               sts_128(cast_smem_ptr_to_uint(smem_loc),
                       reinterpret_cast<r32 *>(&reg_O[i * 4]));
             }
-            cfence();
 
             uint64_t *tma_o_full_mbar =
                 sub_tile_id == 0 ? &(shared_storage.tma_o_0_full_mbar[block])
@@ -2382,7 +2369,6 @@ __launch_bounds__(512, 1) void cudnn_generated_oss_sdpa_sm100_flash_fprop_f16_kn
             fence_view_async_shared();
             arrive_barrier(cast_smem_ptr_to_uint(tma_o_full_mbar));
           }
-          cfence();
         }
         stat_mbar_state ^= 1;
         bmm_mbar_state ^= 1;

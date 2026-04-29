@@ -1,3 +1,4 @@
+import json
 import os
 import shlex
 import subprocess
@@ -29,6 +30,49 @@ def _last_payload(log_path):
     entries = list(repro._iter_context_entries(lines))
     assert entries, f"No context entries found in {log_path}"
     return entries[-1]
+
+
+def _normalize_tensor_entry(entry):
+    normalized = {}
+    for key in (
+        "data_type",
+        "dim",
+        "stride",
+        "is_virtual",
+        "is_pass_by_value",
+        "pass_by_value",
+        "reordering_type",
+        "ragged_offset_uid",
+    ):
+        if key in entry:
+            normalized[key] = entry[key]
+    return normalized
+
+
+def _normalize_payload(payload):
+    tensors = payload.get("tensors", {})
+
+    def resolve(uid):
+        return _normalize_tensor_entry(tensors[str(uid)])
+
+    normalized = {
+        "context": payload.get("context"),
+        "nodes": [],
+        "tensors": sorted(
+            json.dumps(_normalize_tensor_entry(entry), sort_keys=True) for entry in tensors.values()
+        ),
+    }
+    for node in payload.get("nodes", []):
+        normalized_node = {}
+        for key, value in node.items():
+            if key == "inputs":
+                normalized_node[key] = {label: resolve(uid) for label, uid in value.items()}
+            elif key == "outputs":
+                normalized_node[key] = {label: resolve(uid) for label, uid in value.items()}
+            else:
+                normalized_node[key] = value
+        normalized["nodes"].append(normalized_node)
+    return normalized
 
 
 def _target_tests():
@@ -72,17 +116,20 @@ def _assert_reproducer_json_matches_target(tmp_path, target):
     _run(cmd_test, env_first)
 
     import cudnn_repro as repro
+    import cudnn_repro.routing as routing
 
     raw_line, payload = _last_payload(log_a)
-    cfg = repro._build_cfg(raw_line, payload)
-
-    repro_cmd = shlex.split(repro._build_command(cfg, payload))
+    stage1, stage2 = routing.select_stage_modules(payload)
+    stage1_json = stage1.extract_and_annotate(raw_line, payload, log_a.read_text())
+    seed = stage1_json.get("repro_metadata", {}).get("rng_data_seed")
+    cfg = stage1.build_cfg(raw_line, stage1_json, seed)
+    repro_cmd = shlex.split(stage2.build_command(cfg))
     env_second = env_base.copy()
     env_second["CUDNN_FRONTEND_LOG_FILE"] = str(log_b)
     _run(repro_cmd, env_second)
 
     _, repro_payload = _last_payload(log_b)
-    assert payload == repro_payload, f"Payload mismatch for target {target}"
+    assert _normalize_payload(payload) == _normalize_payload(repro_payload), f"Payload mismatch for target {target}"
 
 
 @pytest.mark.parametrize("target", _target_tests(), ids=_target_test_id)

@@ -28,7 +28,7 @@ def parse_hex_float(value: Any) -> Optional[float]:
         hex_str = hex_str[2:]
     if len(hex_str) == 8:
         try:
-            return struct.unpack("<f", bytes.fromhex(hex_str))[0]
+            return struct.unpack(">f", bytes.fromhex(hex_str))[0]
         except (ValueError, struct.error):
             pass
     try:
@@ -206,7 +206,13 @@ def infer_block_size(page_table_entry: Optional[dict], seq_len_kv: list[int], k_
 
 
 def is_mxfp8_payload(payload: dict, node: dict) -> bool:
-    """Detect MXFP8 payloads from scale-factor tensor metadata."""
+    """Detect MXFP8 payloads from tags, explicit flags, or scale-factor metadata."""
+    if (node.get("tag") or "").upper().startswith("SDPA_MXFP8_"):
+        return True
+
+    if node.get("is_mxfp8") is True:
+        return True
+
     tensors = payload.get("tensors", {})
     node_name = node.get("name")
     for label, hint in node.get("inputs", {}).items():

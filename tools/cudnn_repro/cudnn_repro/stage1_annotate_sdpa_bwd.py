@@ -12,7 +12,7 @@ def _find_bwd_node(payload: dict) -> dict:
         tag = candidate.get("tag")
         if tag == "SDPA_BWD":
             return candidate
-        if tag == "SDPA_FP8_BWD":
+        if tag in ("SDPA_FP8_BWD", "SDPA_MXFP8_BWD"):
             raise NotImplementedError("SDPA FP8 backward repro is not yet implemented")
     if payload.get("nodes"):
         return payload["nodes"][0]

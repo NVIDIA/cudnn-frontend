@@ -233,13 +233,10 @@ def allocate_grouped_gemm_quant_output_tensors(
 
     :return: Dictionary containing all output tensors
     """
-    # C tensor is internal placeholder (generate_c=False), but needed for kernel compilation
-    _, c_tensor = create_and_permute_tensor(1, tensor_m, n, cd_major == "m", c_dtype)
     _, d_tensor = create_and_permute_tensor(1, tensor_m, n, cd_major == "m", d_dtype)
     _, d_col_tensor = create_and_permute_tensor(1, tensor_m, n, cd_major == "m", d_dtype)
 
     result = {
-        "c_tensor": c_tensor,
         "d_tensor": d_tensor,
         "d_col_tensor": d_col_tensor,
         "sfd_row_tensor": None,

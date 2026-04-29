@@ -1,0 +1,16 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,time_ms,tflops,max_diff,num_iterations,sliding_window_size,success,error_message,gpu_name,cudnn_version,cudnn_backend_version
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,7800,7800,40,40,128,128,fwd,False,0.678,1836.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,7800,7800,40,40,128,128,bwd,False,2.139,1456.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,7800,7800,40,40,128,128,bwd,True,2.631,1184.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,17160,17160,40,40,128,128,fwd,False,3.002,2009.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,17160,17160,40,40,128,128,bwd,False,9.883,1525.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,17160,17160,40,40,128,128,bwd,True,12.048,1251.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,32760,32760,40,40,128,128,fwd,False,11.213,1960.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,32760,32760,40,40,128,128,bwd,False,37.545,1464.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,32760,32760,40,40,128,128,bwd,True,45.146,1217.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,48360,48360,40,40,128,128,fwd,False,25.686,1865.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,48360,48360,40,40,128,128,bwd,False,88.194,1358.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,48360,48360,40,40,128,128,bwd,True,102.918,1163.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,75600,75600,40,40,128,128,fwd,False,64.212,1823.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,75600,75600,40,40,128,128,bwd,False,214.474,1364.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,75600,75600,40,40,128,128,bwd,True,258.728,1131.000,0.000,10,,True,,NVIDIA GB300,1.21.1,92200

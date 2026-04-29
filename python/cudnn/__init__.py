@@ -40,14 +40,20 @@ symbols_to_import = [
     "diagonal_alignment",
     "attention_implementation",
     "moe_grouped_matmul_mode",
+    "scalar_type",
+    "reshape_mode",
 ]
 
 for symbol_name in symbols_to_import:
     globals()[symbol_name] = getattr(_pybind_module, symbol_name)
 
+for _optional_symbol in ["causal_conv1d_forward", "causal_conv1d_backward"]:
+    if hasattr(_pybind_module, _optional_symbol):
+        globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
+
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.22.1"
+__version__ = "1.23.0"
 
 
 def _tensor(
@@ -230,287 +236,83 @@ from .wrapper import Graph
 
 from typing import Any
 
+_OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
+
+_LAZY_OPTIONAL_IMPORTS = {
+    "NSA": (".native_sparse_attention", "NSA"),
+    "GemmSwigluSm100": (".gemm_swiglu", "GemmSwigluSm100"),
+    "gemm_swiglu_wrapper_sm100": (".gemm_swiglu", "gemm_swiglu_wrapper_sm100"),
+    "GemmSreluSm100": (".gemm_srelu", "GemmSreluSm100"),
+    "gemm_srelu_wrapper_sm100": (".gemm_srelu", "gemm_srelu_wrapper_sm100"),
+    "GemmDsreluSm100": (".gemm_dsrelu", "GemmDsreluSm100"),
+    "gemm_dsrelu_wrapper_sm100": (".gemm_dsrelu", "gemm_dsrelu_wrapper_sm100"),
+    "GemmAmaxSm100": (".gemm_amax", "GemmAmaxSm100"),
+    "gemm_amax_wrapper_sm100": (".gemm_amax", "gemm_amax_wrapper_sm100"),
+    "RmsNormRhtAmaxSm100": (".rmsnorm_rht_amax", "RmsNormRhtAmaxSm100"),
+    "rmsnorm_rht_amax_wrapper_sm100": (".rmsnorm_rht_amax", "rmsnorm_rht_amax_wrapper_sm100"),
+    "grouped_gemm": (".grouped_gemm", None),
+    "GroupedGemmSwigluSm100": (".grouped_gemm", "GroupedGemmSwigluSm100"),
+    "grouped_gemm_swiglu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_swiglu_wrapper_sm100"),
+    "GroupedGemmDswigluSm100": (".grouped_gemm", "GroupedGemmDswigluSm100"),
+    "grouped_gemm_dswiglu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_dswiglu_wrapper_sm100"),
+    "GroupedGemmSreluSm100": (".grouped_gemm", "GroupedGemmSreluSm100"),
+    "grouped_gemm_srelu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_srelu_wrapper_sm100"),
+    "GroupedGemmDsreluSm100": (".grouped_gemm", "GroupedGemmDsreluSm100"),
+    "grouped_gemm_dsrelu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_dsrelu_wrapper_sm100"),
+    "SdpafwdSm100D256": (".sdpa", "SdpafwdSm100D256"),
+    "sdpa_fwd_wrapper_sm100_d256": (".sdpa", "sdpa_fwd_wrapper_sm100_d256"),
+    "SdpabwdSm100D256": (".sdpa", "SdpabwdSm100D256"),
+    "sdpa_bwd_wrapper_sm100_d256": (".sdpa", "sdpa_bwd_wrapper_sm100_d256"),
+    "GroupedGemmQuantSm100": (".grouped_gemm", "GroupedGemmQuantSm100"),
+    "grouped_gemm_quant_wrapper_sm100": (".grouped_gemm", "grouped_gemm_quant_wrapper_sm100"),
+    "GroupedGemmGluSm100": (".grouped_gemm", "GroupedGemmGluSm100"),
+    "grouped_gemm_glu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_glu_wrapper_sm100"),
+    "GroupedGemmGluHadamardSm100": (".grouped_gemm", "GroupedGemmGluHadamardSm100"),
+    "grouped_gemm_glu_hadamard_wrapper_sm100": (".grouped_gemm", "grouped_gemm_glu_hadamard_wrapper_sm100"),
+    "GroupedGemmDgluSm100": (".grouped_gemm", "GroupedGemmDgluSm100"),
+    "grouped_gemm_dglu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_dglu_wrapper_sm100"),
+    "GroupedGemmWgradSm100": (".grouped_gemm", "GroupedGemmWgradSm100"),
+    "grouped_gemm_wgrad_wrapper_sm100": (".grouped_gemm", "grouped_gemm_wgrad_wrapper_sm100"),
+    "discrete_grouped_gemm": (".discrete_grouped_gemm", None),
+    "DiscreteGroupedGemmSwigluSm100": (".discrete_grouped_gemm", "DiscreteGroupedGemmSwigluSm100"),
+    "discrete_grouped_gemm_swiglu_wrapper_sm100": (".discrete_grouped_gemm", "discrete_grouped_gemm_swiglu_wrapper_sm100"),
+    "DiscreteGroupedGemmDswigluSm100": (".discrete_grouped_gemm", "DiscreteGroupedGemmDswigluSm100"),
+    "discrete_grouped_gemm_dswiglu_wrapper_sm100": (".discrete_grouped_gemm", "discrete_grouped_gemm_dswiglu_wrapper_sm100"),
+}
+
+
+def _load_optional_symbol(name: str) -> Any:
+    module_name, attr_name = _LAZY_OPTIONAL_IMPORTS[name]
+    try:
+        module = importlib.import_module(module_name, package=__name__)
+        value = module if attr_name is None else getattr(module, attr_name)
+    except Exception as e:
+        raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
+
+    globals()[name] = value
+    return value
+
 
 def __getattr__(name: str) -> Any:
-    if name == "NSA":
-        try:
-            from .native_sparse_attention import NSA as _NSA
+    if name == "ops":
+        # Use importlib rather than "from . import ops" to avoid infinite
+        # recursion. The cycle:
+        #   1. cudnn.ops accessed → __getattr__("ops") fires
+        #   2. "from . import ops" → _handle_fromlist(cudnn, ["ops"], ...)
+        #   3. _handle_fromlist calls hasattr(cudnn, "ops")
+        #   4. "ops" not in __dict__ yet → __getattr__("ops") again → goto 1
+        # importlib.import_module bypasses _handle_fromlist entirely.
+        _ops = importlib.import_module(".ops", __name__)
+        globals()["ops"] = _ops
+        return _ops
 
-            return _NSA
-        except Exception as e:
-            raise ImportError(f"NSA requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    elif name == "GemmSwigluSm100":
-        try:
-            from .gemm_swiglu import GemmSwigluSm100 as _GemmSwigluSm100
-
-            return _GemmSwigluSm100
-        except Exception as e:
-            raise ImportError(f"GemmSwigluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    elif name == "gemm_swiglu_wrapper_sm100":
-        try:
-            from .gemm_swiglu import (
-                gemm_swiglu_wrapper_sm100 as _gemm_swiglu_wrapper_sm100,
-            )
-
-            return _gemm_swiglu_wrapper_sm100
-        except Exception as e:
-            raise ImportError(
-                f"gemm_swiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-
-    elif name == "GemmAmaxSm100":
-        try:
-            from .gemm_amax import GemmAmaxSm100 as _GemmAmaxSm100
-
-            return _GemmAmaxSm100
-        except Exception as e:
-            raise ImportError(f"GemmAmaxSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    elif name == "gemm_amax_wrapper_sm100":
-        try:
-            from .gemm_amax import (
-                gemm_amax_wrapper_sm100 as _gemm_amax_wrapper_sm100,
-            )
-
-            return _gemm_amax_wrapper_sm100
-        except Exception as e:
-            raise ImportError(f"gemm_amax_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    # Grouped GEMM module
-    elif name == "grouped_gemm":
-        try:
-            from . import grouped_gemm as _grouped_gemm
-
-            return _grouped_gemm
-        except Exception as e:
-            raise ImportError(f"grouped_gemm requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    elif name == "GroupedGemmSwigluSm100":
-        try:
-            from .grouped_gemm import GroupedGemmSwigluSm100 as _GroupedGemmSwigluSm100
-
-            return _GroupedGemmSwigluSm100
-        except Exception as e:
-            raise ImportError(f"GroupedGemmSwigluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    elif name == "grouped_gemm_swiglu_wrapper_sm100":
-        try:
-            from .grouped_gemm import (
-                grouped_gemm_swiglu_wrapper_sm100 as _grouped_gemm_swiglu_wrapper_sm100,
-            )
-
-            return _grouped_gemm_swiglu_wrapper_sm100
-        except Exception as e:
-            raise ImportError(
-                f"grouped_gemm_swiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-
-    elif name == "GroupedGemmDswigluSm100":
-        try:
-            from .grouped_gemm import (
-                GroupedGemmDswigluSm100 as _GroupedGemmDswigluSm100,
-            )
-
-            return _GroupedGemmDswigluSm100
-        except Exception as e:
-            raise ImportError(f"GroupedGemmDswigluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    elif name == "grouped_gemm_dswiglu_wrapper_sm100":
-        try:
-            from .grouped_gemm import (
-                grouped_gemm_dswiglu_wrapper_sm100 as _grouped_gemm_dswiglu_wrapper_sm100,
-            )
-
-            return _grouped_gemm_dswiglu_wrapper_sm100
-        except Exception as e:
-            raise ImportError(
-                f"grouped_gemm_dswiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-    elif name == "SdpafwdSm100D256":
-        try:
-            from .sdpa import SdpafwdSm100D256 as _SdpafwdSm100D256
-
-            return _SdpafwdSm100D256
-        except Exception as e:
-            raise ImportError(f"SdpafwdSm100D256 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    elif name == "sdpa_fwd_wrapper_sm100_d256":
-        try:
-            from .sdpa import (
-                sdpa_fwd_wrapper_sm100_d256 as _sdpa_fwd_wrapper_sm100_d256,
-            )
-
-            return _sdpa_fwd_wrapper_sm100_d256
-        except Exception as e:
-            raise ImportError(
-                f"sdpa_fwd_wrapper_sm100_d256 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-
-    elif name == "SdpabwdSm100D256":
-        try:
-            from .sdpa import SdpabwdSm100D256 as _SdpabwdSm100D256
-
-            return _SdpabwdSm100D256
-        except Exception as e:
-            raise ImportError(f"SdpabwdSm100D256 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    elif name == "sdpa_bwd_wrapper_sm100_d256":
-        try:
-            from .sdpa import (
-                sdpa_bwd_wrapper_sm100_d256 as _sdpa_bwd_wrapper_sm100_d256,
-            )
-
-            return _sdpa_bwd_wrapper_sm100_d256
-        except Exception as e:
-            raise ImportError(
-                f"sdpa_bwd_wrapper_sm100_d256 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-
-    elif name == "GroupedGemmQuantSm100":
-        try:
-            from .grouped_gemm import GroupedGemmQuantSm100 as _GroupedGemmQuantSm100
-
-            return _GroupedGemmQuantSm100
-        except Exception as e:
-            raise ImportError(f"GroupedGemmQuantSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    elif name == "grouped_gemm_quant_wrapper_sm100":
-        try:
-            from .grouped_gemm import (
-                grouped_gemm_quant_wrapper_sm100 as _grouped_gemm_quant_wrapper_sm100,
-            )
-
-            return _grouped_gemm_quant_wrapper_sm100
-        except Exception as e:
-            raise ImportError(
-                f"grouped_gemm_quant_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-
-    # Unified Grouped GEMM GLU (forward)
-    elif name == "GroupedGemmGluSm100":
-        try:
-            from .grouped_gemm import GroupedGemmGluSm100 as _GroupedGemmGluSm100
-
-            return _GroupedGemmGluSm100
-        except Exception as e:
-            raise ImportError(f"GroupedGemmGluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    elif name == "grouped_gemm_glu_wrapper_sm100":
-        try:
-            from .grouped_gemm import (
-                grouped_gemm_glu_wrapper_sm100 as _grouped_gemm_glu_wrapper_sm100,
-            )
-
-            return _grouped_gemm_glu_wrapper_sm100
-        except Exception as e:
-            raise ImportError(
-                f"grouped_gemm_glu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-
-    # Unified Grouped GEMM dGLU (backward)
-    elif name == "GroupedGemmDgluSm100":
-        try:
-            from .grouped_gemm import GroupedGemmDgluSm100 as _GroupedGemmDgluSm100
-
-            return _GroupedGemmDgluSm100
-        except Exception as e:
-            raise ImportError(f"GroupedGemmDgluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    elif name == "grouped_gemm_dglu_wrapper_sm100":
-        try:
-            from .grouped_gemm import (
-                grouped_gemm_dglu_wrapper_sm100 as _grouped_gemm_dglu_wrapper_sm100,
-            )
-
-            return _grouped_gemm_dglu_wrapper_sm100
-        except Exception as e:
-            raise ImportError(
-                f"grouped_gemm_dglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-
-    elif name == "GroupedGemmWgradSm100":
-        try:
-            from .grouped_gemm import GroupedGemmWgradSm100 as _GroupedGemmWgradSm100
-
-            return _GroupedGemmWgradSm100
-        except Exception as e:
-            raise ImportError(f"GroupedGemmWgradSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    elif name == "grouped_gemm_wgrad_wrapper_sm100":
-        try:
-            from .grouped_gemm import (
-                grouped_gemm_wgrad_wrapper_sm100 as _grouped_gemm_wgrad_wrapper_sm100,
-            )
-
-            return _grouped_gemm_wgrad_wrapper_sm100
-        except Exception as e:
-            raise ImportError(
-                f"grouped_gemm_wgrad_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-
-    # Discrete-weight Grouped GEMM GLU module
-    elif name == "discrete_grouped_gemm":
-        try:
-            from . import discrete_grouped_gemm as _discrete_grouped_gemm
-
-            return _discrete_grouped_gemm
-        except Exception as e:
-            raise ImportError(f"discrete_grouped_gemm requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}") from e
-
-    elif name == "DiscreteGroupedGemmSwigluSm100":
-        try:
-            from .discrete_grouped_gemm import (
-                DiscreteGroupedGemmSwigluSm100 as _DiscreteGroupedGemmSwigluSm100,
-            )
-
-            return _DiscreteGroupedGemmSwigluSm100
-        except Exception as e:
-            raise ImportError(
-                f"DiscreteGroupedGemmSwigluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-
-    elif name == "discrete_grouped_gemm_swiglu_wrapper_sm100":
-        try:
-            from .discrete_grouped_gemm import (
-                discrete_grouped_gemm_swiglu_wrapper_sm100 as _discrete_grouped_gemm_swiglu_wrapper_sm100,
-            )
-
-            return _discrete_grouped_gemm_swiglu_wrapper_sm100
-        except Exception as e:
-            raise ImportError(
-                f"discrete_grouped_gemm_swiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-
-    elif name == "DiscreteGroupedGemmDswigluSm100":
-        try:
-            from .discrete_grouped_gemm import (
-                DiscreteGroupedGemmDswigluSm100 as _DiscreteGroupedGemmDswigluSm100,
-            )
-
-            return _DiscreteGroupedGemmDswigluSm100
-        except Exception as e:
-            raise ImportError(
-                f"DiscreteGroupedGemmDswigluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-
-    elif name == "discrete_grouped_gemm_dswiglu_wrapper_sm100":
-        try:
-            from .discrete_grouped_gemm import (
-                discrete_grouped_gemm_dswiglu_wrapper_sm100 as _discrete_grouped_gemm_dswiglu_wrapper_sm100,
-            )
-
-            return _discrete_grouped_gemm_dswiglu_wrapper_sm100
-        except Exception as e:
-            raise ImportError(
-                f"discrete_grouped_gemm_dswiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-
-    elif name == "experimental":
+    if name == "experimental":
         from . import experimental as _experimental
 
         globals()["experimental"] = _experimental
         return _experimental
-    else:
-        raise AttributeError(name)
+
+    if name in _LAZY_OPTIONAL_IMPORTS:
+        return _load_optional_symbol(name)
+
+    raise AttributeError(name)

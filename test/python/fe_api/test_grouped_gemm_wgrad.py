@@ -557,9 +557,7 @@ def _make_wgrad_wrapper_cache_inputs(group_k_list, sf_vec_size=16):
     expert_cnt = len(group_k_list)
     tokens_sum = sum(group_k_list)
 
-    scale_cols = 0
-    for group_k in group_k_list:
-        scale_cols += ((group_k + sf_vec_size - 1) // sf_vec_size + 3) // 4 * 4
+    scale_cols = ((tokens_sum + sf_vec_size - 1) // sf_vec_size + 3) // 4 * 4
 
     return {
         "a_tensor": torch.empty((hidden, tokens_sum), dtype=torch.bfloat16),

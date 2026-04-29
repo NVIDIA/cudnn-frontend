@@ -1,0 +1,16 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,time_ms,tflops,max_diff,num_iterations,sliding_window_size,success,error_message,gpu_name,cudnn_version,cudnn_backend_version
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,6144,6144,32,32,128,128,fwd,False,0.437,1415.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,6144,6144,32,32,128,128,bwd,False,1.199,1290.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,6144,6144,32,32,128,128,bwd,True,1.338,1156.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,13376,13376,32,32,128,128,fwd,False,1.844,1589.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,13376,13376,32,32,128,128,bwd,False,5.225,1403.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,13376,13376,32,32,128,128,bwd,True,6.410,1143.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,17556,17556,32,32,128,128,fwd,False,2.959,1706.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,17556,17556,32,32,128,128,bwd,False,8.952,1410.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,17556,17556,32,32,128,128,bwd,True,11.175,1130.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,30240,30240,32,32,128,128,fwd,False,8.657,1731.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,30240,30240,32,32,128,128,bwd,False,28.505,1314.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,30240,30240,32,32,128,128,bwd,True,35.620,1052.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,37632,37632,32,32,128,128,fwd,False,14.403,1611.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,37632,37632,32,32,128,128,bwd,False,43.187,1343.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+ltx2,ltx2,cudnn,bfloat16,no_mask,1,37632,37632,32,32,128,128,bwd,True,53.136,1092.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200

@@ -253,7 +253,7 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
 [[maybe_unused]] inline error_t
 build_operation_subgraph(std::shared_ptr<Graph> graph) {
     return graph->build_operation_graph(/*handle=*/nullptr);
-};
+}
 
 class Softcap {
    private:

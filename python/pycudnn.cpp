@@ -92,6 +92,70 @@ PYBIND11_MODULE(_compiled_module, m) {
     m.def("_set_dlhandle_cudnn", &set_dlhandle_cudnn);
 
     py::register_exception<cudnnGraphNotSupportedException>(m, "cudnnGraphNotSupportedError");
+
+#if CUDNN_VERSION >= 92200
+    m.def("causal_conv1d_forward",
+          [](std::intptr_t stream,
+             std::intptr_t x_ptr,
+             std::intptr_t weight_ptr,
+             std::intptr_t bias_ptr,
+             std::intptr_t out_ptr,
+             int batch,
+             int dim,
+             int seq_len,
+             int kernel_size,
+             int data_type,
+             int activation) {
+              auto status = detail::causal_conv1d_forward(reinterpret_cast<cudaStream_t>(stream),
+                                                          reinterpret_cast<const void *>(x_ptr),
+                                                          reinterpret_cast<const void *>(weight_ptr),
+                                                          reinterpret_cast<const void *>(bias_ptr),
+                                                          reinterpret_cast<void *>(out_ptr),
+                                                          batch,
+                                                          dim,
+                                                          seq_len,
+                                                          kernel_size,
+                                                          static_cast<cudnnDataType_t>(data_type),
+                                                          static_cast<cudnnCausalConv1dActivation_t>(activation));
+              if (status != 0)
+                  throw std::runtime_error("cudnnCausalConv1dForward failed with status " + std::to_string(status));
+          });
+
+    m.def("causal_conv1d_backward",
+          [](std::intptr_t stream,
+             std::intptr_t x_ptr,
+             std::intptr_t weight_ptr,
+             std::intptr_t bias_ptr,
+             std::intptr_t dy_ptr,
+             std::intptr_t dx_ptr,
+             std::intptr_t dweight_ptr,
+             std::intptr_t dbias_ptr,
+             int batch,
+             int dim,
+             int seq_len,
+             int kernel_size,
+             int data_type,
+             int dw_data_type,
+             int activation) {
+              auto status = detail::causal_conv1d_backward(reinterpret_cast<cudaStream_t>(stream),
+                                                           reinterpret_cast<const void *>(x_ptr),
+                                                           reinterpret_cast<const void *>(weight_ptr),
+                                                           reinterpret_cast<const void *>(bias_ptr),
+                                                           reinterpret_cast<const void *>(dy_ptr),
+                                                           reinterpret_cast<void *>(dx_ptr),
+                                                           reinterpret_cast<void *>(dweight_ptr),
+                                                           reinterpret_cast<void *>(dbias_ptr),
+                                                           batch,
+                                                           dim,
+                                                           seq_len,
+                                                           kernel_size,
+                                                           static_cast<cudnnDataType_t>(data_type),
+                                                           static_cast<cudnnDataType_t>(dw_data_type),
+                                                           static_cast<cudnnCausalConv1dActivation_t>(activation));
+              if (status != 0)
+                  throw std::runtime_error("cudnnCausalConv1dBackward failed with status " + std::to_string(status));
+          });
+#endif
 }
 
 }  // namespace python_bindings

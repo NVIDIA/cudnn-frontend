@@ -1,3 +1,4 @@
+#include <optional>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -335,7 +336,33 @@ class PyGraph {
               std::string const& name);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
-    reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input, std::string const& name);
+    reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+            std::string const& name,
+            cudnn_frontend::ReshapeMode_t reshape_mode = cudnn_frontend::ReshapeMode_t::VIEW_ONLY);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    transpose(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+              std::vector<int64_t> const& permutation,
+              cudnn_frontend::DataType_t const& compute_data_type,
+              std::string const& name);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    concatenate(std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>> inputs,
+                int64_t axis,
+                std::optional<int64_t> in_place_index,
+                std::string const& name);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    tensor_scalar(float const& value, cudnn_frontend::graph::ScalarType scalar_type);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    tensor_scalar(double const& value, cudnn_frontend::graph::ScalarType scalar_type);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    tensor_scalar(int32_t const& value, cudnn_frontend::graph::ScalarType scalar_type);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    tensor_scalar(int64_t const& value, cudnn_frontend::graph::ScalarType scalar_type);
 
     std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>
     rmsnorm(cudnn_frontend::NormFwdPhase_t const forward_phase,
@@ -495,7 +522,8 @@ class PyGraph {
                cudnn_frontend::DataType_t const& compute_data_type,
                std::string const& name,
                py::object const& generate_stats,
-               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token);
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+               bool const unfuse_fma);
 
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP]
     // dSink_token is an optional output set via set_dsink_token() attribute

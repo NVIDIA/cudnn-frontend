@@ -1,0 +1,16 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,time_ms,tflops,max_diff,num_iterations,sliding_window_size,success,error_message,gpu_name,cudnn_version,cudnn_backend_version
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,7800,7800,40,40,128,128,fwd,False,0.803,1552.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,7800,7800,40,40,128,128,bwd,False,2.236,1393.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,7800,7800,40,40,128,128,bwd,True,2.785,1118.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,17160,17160,40,40,128,128,fwd,False,3.383,1783.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,17160,17160,40,40,128,128,bwd,False,10.638,1417.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,17160,17160,40,40,128,128,bwd,True,13.730,1098.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,32760,32760,40,40,128,128,fwd,False,13.191,1666.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,32760,32760,40,40,128,128,bwd,False,41.653,1319.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,32760,32760,40,40,128,128,bwd,True,52.261,1051.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,48360,48360,40,40,128,128,fwd,False,28.902,1657.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,48360,48360,40,40,128,128,bwd,False,93.715,1278.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,48360,48360,40,40,128,128,bwd,True,117.248,1021.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,75600,75600,40,40,128,128,fwd,False,76.372,1533.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,75600,75600,40,40,128,128,bwd,False,233.302,1254.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,75600,75600,40,40,128,128,bwd,True,287.864,1017.000,0.000,10,,True,,NVIDIA GB200,1.21.1,92200

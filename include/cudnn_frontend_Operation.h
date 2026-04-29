@@ -236,6 +236,7 @@ class Operation_v8 : public BackendDescriptor {
 
     NormFwdPhase_t norm_fwd_phase;
     NormMode_t norm_mode;
+    ReshapeMode_t reshape_mode = ReshapeMode_t::VIEW_ONLY;
 
     float alpha_s = 1.0f, beta_s = .0f, alpha2_s = 1.0f;
     double alpha_d = 1.0, beta_d = 0.0, alpha2_d = 1.0;
@@ -1790,6 +1791,29 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESHAPE_YDESC Failed");
             return std::move(m_operation);
         }
+
+#if (CUDNN_VERSION >= 92200)
+        // Set reshape mode if it's not NOT_SET
+        if (m_operation.reshape_mode != ReshapeMode_t::NOT_SET) {
+            cudnnBackendReshapeMode_t cudnn_reshape_mode;
+            status = detail::convert_to_cudnn_type(m_operation.reshape_mode, cudnn_reshape_mode);
+            if (status == CUDNN_STATUS_SUCCESS) {
+                status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_OPERATION_RESHAPE_MODE,
+                                               CUDNN_TYPE_RESHAPE_MODE,
+                                               1,
+                                               &cudnn_reshape_mode);
+                if (status != CUDNN_STATUS_SUCCESS) {
+                    set_error_and_throw_exception(
+                        &m_operation,
+                        status,
+                        "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_RESHAPE_MODE Failed");
+                    return std::move(m_operation);
+                }
+            }
+        }
+#endif
+
         status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(&m_operation, status, "CUDNN_BACKEND_OPERATION: cudnnFinalize Failed");
@@ -2560,6 +2584,21 @@ class OperationBuilder_v8 {
         m_operation.norm_fwd_phase = mode;
         return *this;
     }
+
+    auto
+    setReshapeMode(ReshapeMode_t mode) -> OperationBuilder_v8 & {
+        m_operation.reshape_mode = mode;
+        return *this;
+    }
+
+#if (CUDNN_VERSION >= 92200)
+    // To be deprecated. Please use setReshapeMode(cudnn_frontend::ReshapeMode_t mode) instead.
+    auto
+    setReshapeMode(cudnnBackendReshapeMode_t mode) -> OperationBuilder_v8 & {
+        detail::convert_from_cudnn_type(mode, m_operation.reshape_mode);
+        return *this;
+    }
+#endif
 
     auto
     setNormalizationMode(NormMode_t mode) -> OperationBuilder_v8 & {

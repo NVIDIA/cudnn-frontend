@@ -16,9 +16,24 @@ from .grouped_gemm_quant.api import (
     grouped_gemm_quant_wrapper_sm100,
 )
 
+from .grouped_gemm_srelu.api import (
+    GroupedGemmSreluSm100,
+    grouped_gemm_srelu_wrapper_sm100,
+)
+
+from .grouped_gemm_dsrelu.api import (
+    GroupedGemmDsreluSm100,
+    grouped_gemm_dsrelu_wrapper_sm100,
+)
+
 from .grouped_gemm_glu.api import (
     GroupedGemmGluSm100,
     grouped_gemm_glu_wrapper_sm100,
+)
+
+from .grouped_gemm_glu_hadamard.api import (
+    GroupedGemmGluHadamardSm100,
+    grouped_gemm_glu_hadamard_wrapper_sm100,
 )
 
 from .grouped_gemm_dglu.api import (
@@ -38,8 +53,14 @@ __all__ = [
     "grouped_gemm_dswiglu_wrapper_sm100",
     "GroupedGemmQuantSm100",
     "grouped_gemm_quant_wrapper_sm100",
+    "GroupedGemmSreluSm100",
+    "grouped_gemm_srelu_wrapper_sm100",
+    "GroupedGemmDsreluSm100",
+    "grouped_gemm_dsrelu_wrapper_sm100",
     "GroupedGemmGluSm100",
     "grouped_gemm_glu_wrapper_sm100",
+    "GroupedGemmGluHadamardSm100",
+    "grouped_gemm_glu_hadamard_wrapper_sm100",
     "GroupedGemmDgluSm100",
     "grouped_gemm_dglu_wrapper_sm100",
     "GroupedGemmWgradSm100",

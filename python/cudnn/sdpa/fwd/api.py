@@ -44,7 +44,7 @@ class SdpafwdSm100D256(APIBase):
         super().__init__()
         self._kernel = BlackwellFusedMultiHeadAttentionForward
 
-        self._logger.warning("SdpafwdSm100D256 is an experimental API")
+        self._warn_experimental_api()
         self._logger.debug("Entering __init__")
 
         if sample_cum_seqlen_q is not None:

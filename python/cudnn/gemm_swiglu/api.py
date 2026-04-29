@@ -69,7 +69,7 @@ class GemmSwigluSm100(APIBase):
     ):
         super().__init__()
 
-        self._logger.warning("GemmSwigluSm100 is an experimental API")
+        self._warn_experimental_api()
         self._logger.debug("Entering __init__")
 
         self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
@@ -94,7 +94,7 @@ class GemmSwigluSm100(APIBase):
         self.vector_f32 = vector_f32
         self.ab12_stages = ab12_stages
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-        print(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
+        self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
 
         # Kernel selection
         if self.sfa_desc is None and self.sfb_desc is None and self.amax_desc is None and self.sfc_desc is None and self.norm_const_desc is None:

@@ -350,10 +350,6 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
                                            "THD (ragged offset) is only supported in Hopper and above : " +
                                                std::to_string(context.get_sm_version()));
         }
-        // TODO add version check once fixed
-        RETURN_CUDNN_FRONTEND_ERROR_IF(prop_major == 10 && is_rng,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "dropout RNG dump is not supported for Blackwell architecture");
     } else {
         RETURN_CUDNN_FRONTEND_ERROR_IF(true, error_code_t::GRAPH_NOT_SUPPORTED, "Unsupported mma core mode");
     }
@@ -464,8 +460,13 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                         "Diagonal alignment for unified SDPA node requires cuDNN 9.21.0 or above"};
             }
 
-            if (dropout_probability.has_value() && effective_cudnn_ver < 92100) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED, "Dropout for unified SDPA node requires cuDNN 9.21.0"};
+            if (dropout_probability.has_value() && effective_cudnn_ver < 92200) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED, "Dropout for unified SDPA node requires cuDNN 9.22.0"};
+            }
+
+            if (dropout_probability.has_value() && generate_stats.value_or(false)) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Dropout for unified SDPA node with generated stats is not supported"};
             }
 
             // Unified engine in cuDNN < 9.15 can't meaningfully support max sequence length,

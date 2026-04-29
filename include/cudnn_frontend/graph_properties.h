@@ -1,6 +1,8 @@
 
 #pragma once
 
+#include <cerrno>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <numeric>
@@ -17,7 +19,30 @@ namespace cudnn_frontend {
 
 namespace graph {
 
+inline std::optional<float>
+get_rescale_threshold_from_env() {
+    auto const* env_value = std::getenv("CUDNN_RESCALE_THRESHOLD");
+    if (env_value == nullptr || env_value[0] == '\0') {
+        return std::nullopt;
+    }
+
+    errno      = 0;
+    char* end  = nullptr;
+    auto value = std::strtof(env_value, &end);
+    if (env_value == end || (end != nullptr && *end != '\0') || errno == ERANGE) {
+        return std::nullopt;
+    }
+
+    return value;
+}
+
 using managed_backend_descriptor_t = std::vector<ManagedOpaqueDescriptor>;
+
+// Enum to distinguish between runtime parameters and compile-time constants
+enum class ScalarType {
+    RUNTIME_PARAM,      // Value provided at execution time (can change)
+    COMPILE_TIME_CONST  // Value baked into graph (fixed, optimizable)
+};
 
 // simple structure to hold all properties of a tensor.
 // Each property has a getter setter.
@@ -31,7 +56,7 @@ class Tensor_attributes {
     // In approach 1, users provide a value to embed into the graph.
     // In approach 2, users set is_pass_by_value boolean and then pass a pointer to scalar value with execute() API.
     // A closed set of types that are allowed to be passed by value.
-    using pass_by_values_t = std::variant<int64_t, int32_t, half, float, nv_bfloat16>;
+    using pass_by_values_t = std::variant<int64_t, int32_t, half, float, double, nv_bfloat16>;
 
     error_t
     validate() const {
@@ -52,6 +77,22 @@ class Tensor_attributes {
             error_code_t::ATTRIBUTE_NOT_SET,
             "Tensor '" + name + "' can't be a fused scalar and not a pass_by_value tensor at the same time.");
 
+        // Validate compile-time constant constraints
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            has_compile_time_constant && !is_pass_by_value,
+            error_code_t::ATTRIBUTE_NOT_SET,
+            "Tensor '" + name + "' with compile-time constant must have is_pass_by_value=true.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(has_compile_time_constant && is_virtual,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Tensor '" + name + "' can't be both compile-time constant and virtual.");
+
+        // Can't have both compile-time constant and runtime parameter
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            has_compile_time_constant && pass_by_value.has_value(),
+            error_code_t::ATTRIBUTE_NOT_SET,
+            "Tensor '" + name + "' can't have both compile-time constant and runtime pass_by_value.");
+
         return {error_code_t::OK, ""};
     }
 
@@ -67,6 +108,10 @@ class Tensor_attributes {
 
     std::optional<pass_by_values_t> pass_by_value = std::nullopt;
     bool is_pass_by_value                         = false;
+
+    // Compile-time constant support (distinct from pass_by_value, which is for runtime parameters)
+    bool has_compile_time_constant                              = false;
+    std::optional<pass_by_values_t> compile_time_constant_value = std::nullopt;
 
     TensorReordering_t reordering_type = TensorReordering_t::NONE;
     uid_t uid                          = 0;
@@ -133,6 +178,86 @@ class Tensor_attributes {
         is_pass_by_value = true;
         dim = stride = {1};
         data_type    = DataType_t::INT64;
+    }
+
+    Tensor_attributes(double const& scalar) {
+        pass_by_value    = scalar;
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::DOUBLE;
+    }
+
+    // Constructors with ScalarType for compile-time constant or runtime parameter control
+    Tensor_attributes(float const& scalar, ScalarType scalar_type) {
+        if (scalar_type == ScalarType::COMPILE_TIME_CONST) {
+            compile_time_constant_value = scalar;
+            has_compile_time_constant   = true;
+        } else {
+            pass_by_value = scalar;
+        }
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::FLOAT;
+    }
+
+    Tensor_attributes(half const& scalar, ScalarType scalar_type) {
+        if (scalar_type == ScalarType::COMPILE_TIME_CONST) {
+            compile_time_constant_value = scalar;
+            has_compile_time_constant   = true;
+        } else {
+            pass_by_value = scalar;
+        }
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::HALF;
+    }
+
+    Tensor_attributes(nv_bfloat16 const& scalar, ScalarType scalar_type) {
+        if (scalar_type == ScalarType::COMPILE_TIME_CONST) {
+            compile_time_constant_value = scalar;
+            has_compile_time_constant   = true;
+        } else {
+            pass_by_value = scalar;
+        }
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::BFLOAT16;
+    }
+
+    Tensor_attributes(int32_t const& scalar, ScalarType scalar_type) {
+        if (scalar_type == ScalarType::COMPILE_TIME_CONST) {
+            compile_time_constant_value = scalar;
+            has_compile_time_constant   = true;
+        } else {
+            pass_by_value = scalar;
+        }
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::INT32;
+    }
+
+    Tensor_attributes(int64_t const& scalar, ScalarType scalar_type) {
+        if (scalar_type == ScalarType::COMPILE_TIME_CONST) {
+            compile_time_constant_value = scalar;
+            has_compile_time_constant   = true;
+        } else {
+            pass_by_value = scalar;
+        }
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::INT64;
+    }
+
+    Tensor_attributes(double const& scalar, ScalarType scalar_type) {
+        if (scalar_type == ScalarType::COMPILE_TIME_CONST) {
+            compile_time_constant_value = scalar;
+            has_compile_time_constant   = true;
+        } else {
+            pass_by_value = scalar;
+        }
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::DOUBLE;
     }
 
     std::string
@@ -222,6 +347,35 @@ class Tensor_attributes {
     auto
     set_is_pass_by_value(bool const value) -> Tensor_attributes& {
         is_pass_by_value = value;
+        return *this;
+    }
+
+    // Compile-time constant accessors
+    bool
+    get_has_compile_time_constant() const {
+        return has_compile_time_constant;
+    }
+
+    std::optional<pass_by_values_t>
+    get_compile_time_constant() const {
+        return compile_time_constant_value;
+    }
+
+    auto
+    set_compile_time_constant(pass_by_values_t const& value) -> Tensor_attributes& {
+        compile_time_constant_value = value;
+        has_compile_time_constant   = true;
+        if (!is_pass_by_value) {
+            is_pass_by_value = true;
+        }
+        return *this;
+    }
+
+    auto
+    set_as_runtime_parameter() -> Tensor_attributes& {
+        is_pass_by_value            = true;
+        has_compile_time_constant   = false;
+        compile_time_constant_value = std::nullopt;
         return *this;
     }
 
@@ -315,9 +469,15 @@ class Attributes {
     get_non_virtual_uids() const {
         std::vector<int64_t> non_virtual_uids;
         auto derived = static_cast<DerivedT const*>(this);
+
+        // Compile-time constants are excluded from the variant pack
+        auto should_be_in_variant_pack = [](std::shared_ptr<Tensor_attributes> const& tensor) {
+            return tensor && tensor->get_is_virtual() == false && !tensor->get_has_compile_time_constant();
+        };
+
         if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
             for (auto tensor : derived->inputs) {
-                if (tensor && tensor->get_is_virtual() == false) {
+                if (should_be_in_variant_pack(tensor)) {
                     non_virtual_uids.push_back(tensor->get_uid());
                     if (auto ragged_offset = tensor->get_ragged_offset()) {
                         non_virtual_uids.push_back(ragged_offset->get_uid());
@@ -327,7 +487,7 @@ class Attributes {
         } else {
             for (auto& [name, tensor] : derived->inputs) {
                 (void)name;
-                if (tensor && tensor->get_is_virtual() == false) {
+                if (should_be_in_variant_pack(tensor)) {
                     non_virtual_uids.push_back(tensor->get_uid());
                     if (auto ragged_offset = tensor->get_ragged_offset()) {
                         non_virtual_uids.push_back(ragged_offset->get_uid());
@@ -338,7 +498,7 @@ class Attributes {
 
         for (auto& [name, tensor] : derived->outputs) {
             (void)name;
-            if (tensor && tensor->get_is_virtual() == false) {
+            if (should_be_in_variant_pack(tensor)) {
                 non_virtual_uids.push_back(tensor->get_uid());
                 if (auto ragged_offset = tensor->get_ragged_offset()) {
                     non_virtual_uids.push_back(ragged_offset->get_uid());
@@ -350,7 +510,7 @@ class Attributes {
         if constexpr (std::is_same_v<DerivedT, Batchnorm_attributes> ||
                       std::is_same_v<DerivedT, Batchnorm_backward_attributes>) {
             for (auto& tensor : derived->peer_stats) {
-                if (tensor && tensor->get_is_virtual() == false) {
+                if (should_be_in_variant_pack(tensor)) {
                     non_virtual_uids.push_back(tensor->get_uid());
                     if (auto ragged_offset = tensor->get_ragged_offset()) {
                         non_virtual_uids.push_back(ragged_offset->get_uid());
@@ -423,13 +583,16 @@ class Attributes {
             set_compute_data_type(context.get_compute_data_type());
         }
 
-        // Handle shape and stride inferencing for fused scalars.
-        // Pick number of dimensions from anyone of non-fused-scalar input/output tensors
-        // In case, all tensors are fused scalars, just keep them 1D.
+        // Infer shape and stride for fused scalars (runtime params and compile-time constants).
+        // Fused scalars expand to match the dimensionality of non-scalar tensors; if all are scalars, keep 1D.
+        auto is_fused_scalar = [](std::shared_ptr<Tensor_attributes> const& tensor) {
+            return tensor && (tensor->get_pass_by_value().has_value() || tensor->get_has_compile_time_constant());
+        };
+
         int64_t number_of_dims = 1;
         if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
             for (auto tensor : derived->inputs) {
-                if (tensor && (tensor->get_pass_by_value().has_value() == false)) {
+                if (tensor && !is_fused_scalar(tensor)) {
                     number_of_dims = tensor->get_dim().size();
                     break;
                 }
@@ -437,7 +600,7 @@ class Attributes {
         } else {
             for (auto [name, tensor] : derived->inputs) {
                 (void)name;
-                if (tensor && (tensor->get_pass_by_value().has_value() == false)) {
+                if (tensor && !is_fused_scalar(tensor)) {
                     number_of_dims = tensor->get_dim().size();
                     break;
                 }
@@ -448,16 +611,17 @@ class Attributes {
         if (number_of_dims == 1) {
             for (auto [name, tensor] : derived->outputs) {
                 (void)name;
-                if (tensor && (tensor->get_pass_by_value().has_value() == false)) {
+                if (tensor && !is_fused_scalar(tensor)) {
                     number_of_dims = tensor->get_dim().size();
                     break;
                 }
             }
         }
 
+        // Expand fused scalar dimensions to match the number of dims of non-scalar tensors
         if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
             for (auto tensor : derived->inputs) {
-                if (tensor && tensor->get_pass_by_value().has_value()) {
+                if (is_fused_scalar(tensor)) {
                     tensor->set_dim(std::vector<int64_t>(number_of_dims, 1));
                     tensor->set_stride(std::vector<int64_t>(number_of_dims, 1));
                 }
@@ -465,7 +629,7 @@ class Attributes {
         } else {
             for (auto [name, tensor] : derived->inputs) {
                 (void)name;
-                if (tensor && tensor->get_pass_by_value().has_value()) {
+                if (is_fused_scalar(tensor)) {
                     tensor->set_dim(std::vector<int64_t>(number_of_dims, 1));
                     tensor->set_stride(std::vector<int64_t>(number_of_dims, 1));
                 }
@@ -1419,13 +1583,21 @@ class Reshape_attributes : public Attributes<Reshape_attributes> {
 
     std::vector<int64_t> dim    = {};
     std::vector<int64_t> stride = {};
+    ReshapeMode_t reshape_mode  = ReshapeMode_t::VIEW_ONLY;
 
    public:
     enum class input_names { X };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Reshape_attributes, name, compute_data_type, inputs, outputs, dim, stride)
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Reshape_attributes,
+                                   name,
+                                   compute_data_type,
+                                   inputs,
+                                   outputs,
+                                   dim,
+                                   stride,
+                                   reshape_mode)
 
     std::vector<int64_t>
     get_dim() const {
@@ -1446,6 +1618,54 @@ class Reshape_attributes : public Attributes<Reshape_attributes> {
     auto
     set_stride(std::vector<int64_t> const& value) -> Reshape_attributes& {
         stride = value;
+        return *this;
+    }
+
+    ReshapeMode_t
+    get_reshape_mode() const {
+        return reshape_mode;
+    }
+
+    auto
+    set_reshape_mode(ReshapeMode_t const& value) -> Reshape_attributes& {
+        reshape_mode = value;
+        return *this;
+    }
+};
+
+class Transpose_attributes : public Attributes<Transpose_attributes> {
+    friend class Attributes<Transpose_attributes>;
+    friend class TransposeNode;
+    friend class Graph;
+
+    std::vector<int64_t> permutation;
+
+   public:
+    std::string
+    get_name() const {
+        return name;
+    }
+
+    auto
+    set_name(std::string const& value) -> Transpose_attributes& {
+        name = value;
+        return *this;
+    }
+
+    enum class input_names { X };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { Y };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Transpose_attributes, name, compute_data_type, inputs, outputs, permutation)
+
+    std::vector<int64_t>
+    get_permutation() const {
+        return permutation;
+    }
+
+    auto
+    set_permutation(std::vector<int64_t> const& value) -> Transpose_attributes& {
+        permutation = value;
         return *this;
     }
 };
@@ -2562,17 +2782,24 @@ class Slice_attributes : public Attributes<Slice_attributes> {
     friend class INode;
 
     std::vector<std::pair<int64_t, int64_t>> slices;
+    std::vector<int64_t> slice_strides = {1};
 
    public:
     enum class input_names { X };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Slice_attributes, name, compute_data_type, inputs, outputs, slices)
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Slice_attributes, name, compute_data_type, inputs, outputs, slices, slice_strides)
 
     Slice_attributes&
     set_slices(std::vector<std::pair<int64_t, int64_t>> const value) {
         slices = value;
+        return *this;
+    }
+
+    Slice_attributes&
+    set_strides(std::vector<int64_t> const value) {
+        slice_strides = value;
         return *this;
     }
 

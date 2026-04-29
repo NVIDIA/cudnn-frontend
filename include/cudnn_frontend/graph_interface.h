@@ -22,6 +22,8 @@
 #include "node/resample.h"
 #include "node/reshape.h"
 #include "node/slice.h"
+#include "node/transpose.h"
+// #include "node/scaled_dot_product_attention.h"
 #include "node/scaled_dot_product_flash_attention.h"
 #include "node/sdpa_fp8_bwd.h"
 #include "node/block_scale_quantize.h"
@@ -194,6 +196,8 @@ class Graph : public ICudnn, public INode {
                 tensor_to_pointer_map.emplace(uid, int64_t_value_ptr);
             } else if (float *float_value_ptr = std::get_if<float>(&value)) {
                 tensor_to_pointer_map.emplace(uid, float_value_ptr);
+            } else if (double *double_value_ptr = std::get_if<double>(&value)) {
+                tensor_to_pointer_map.emplace(uid, double_value_ptr);
             } else {
                 RETURN_CUDNN_FRONTEND_ERROR_IF(
                     true, error_code_t::INVALID_VARIANT_PACK, "Unexpected type for pass by value tensor.");
@@ -1450,12 +1454,30 @@ class Graph : public ICudnn, public INode {
 
         std::unordered_map<uid_t, pass_by_values_t> tensor_to_pass_by_value;
         CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
-        j["pass_by_values"] = tensor_to_pass_by_value;
+
+        // Convert pass_by_values to JSON (unordered_map with numeric keys needs manual conversion)
+        json pass_by_values_json = json::object();
+        for (const auto &[uid, variant_value] : tensor_to_pass_by_value) {
+            json variant_json;
+            variant_json                             = variant_value;
+            pass_by_values_json[std::to_string(uid)] = variant_json;
+        }
+        j["pass_by_values"] = pass_by_values_json;
 
         std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> workspace_modifications;
         int64_t workspace_offset = 0;
         CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_in_workspace_subtree(workspace_modifications, workspace_offset));
-        j["workspace_modifications"] = workspace_modifications;
+
+        // Convert workspace_modifications to JSON (nlohmann::json doesn't support std::tuple directly)
+        json workspace_modifications_json = json::object();
+        for (const auto &[uid, tuple_value] : workspace_modifications) {
+            json tuple_json = json::array();
+            tuple_json.push_back(std::get<0>(tuple_value));
+            tuple_json.push_back(std::get<1>(tuple_value));
+            tuple_json.push_back(std::get<2>(tuple_value));
+            workspace_modifications_json[std::to_string(uid)] = tuple_json;
+        }
+        j["workspace_modifications"] = workspace_modifications_json;
 
         j["variant_pack_replacements"] = variant_pack_replacements;
 
@@ -1500,9 +1522,28 @@ class Graph : public ICudnn, public INode {
 
         variant_pack_uids = j["variant_pack_uids"].get<std::unordered_set<graph::Tensor_attributes::uid_t>>();
 
-        deserialized_pass_by_value = j["pass_by_values"];
+        // Deserialize pass_by_values from JSON
+        if (j.contains("pass_by_values")) {
+            auto pass_by_values_json = j["pass_by_values"];
+            for (auto it = pass_by_values_json.begin(); it != pass_by_values_json.end(); ++it) {
+                uid_t uid                       = std::stoll(it.key());
+                pass_by_values_t value          = it.value().get<pass_by_values_t>();
+                deserialized_pass_by_value[uid] = value;
+            }
+        }
 
-        deserialized_workspace_modifications = j["workspace_modifications"];
+        // Deserialize workspace_modifications from JSON
+        if (j.contains("workspace_modifications")) {
+            auto workspace_modifications_json = j["workspace_modifications"];
+            for (auto it = workspace_modifications_json.begin(); it != workspace_modifications_json.end(); ++it) {
+                uid_t uid                                 = std::stoll(it.key());
+                auto tuple_json                           = it.value();
+                auto tuple_value                          = std::make_tuple(tuple_json[0].get<int64_t>(),
+                                                   tuple_json[1].get<int64_t>(),
+                                                   tuple_json[2].get<std::vector<float>>());
+                deserialized_workspace_modifications[uid] = tuple_value;
+            }
+        }
 
         variant_pack_replacements = j["variant_pack_replacements"];
 
@@ -1571,6 +1612,25 @@ class Graph : public ICudnn, public INode {
 
     std::shared_ptr<Tensor_attributes>
     tensor(Tensor_attributes const &tensor);
+
+    // Overloaded tensor() methods for compile-time constants
+    std::shared_ptr<Tensor_attributes>
+    tensor(float const &scalar, ScalarType scalar_type);
+
+    std::shared_ptr<Tensor_attributes>
+    tensor(half const &scalar, ScalarType scalar_type);
+
+    std::shared_ptr<Tensor_attributes>
+    tensor(nv_bfloat16 const &scalar, ScalarType scalar_type);
+
+    std::shared_ptr<Tensor_attributes>
+    tensor(int32_t const &scalar, ScalarType scalar_type);
+
+    std::shared_ptr<Tensor_attributes>
+    tensor(int64_t const &scalar, ScalarType scalar_type);
+
+    std::shared_ptr<Tensor_attributes>
+    tensor(double const &scalar, ScalarType scalar_type);
 
     std::shared_ptr<Tensor_attributes>
     tensor_like(std::shared_ptr<Tensor_attributes> const &tensor, std::string const &name = std::string{});
@@ -1735,6 +1795,8 @@ class Graph : public ICudnn, public INode {
                                                                     SDPA_backward_attributes);
 
     std::shared_ptr<Tensor_attributes> slice(std::shared_ptr<Tensor_attributes>, Slice_attributes);
+
+    std::shared_ptr<Tensor_attributes> transpose(std::shared_ptr<Tensor_attributes>, Transpose_attributes);
 
     std::array<std::shared_ptr<Tensor_attributes>, 2> block_scale_quantize(std::shared_ptr<Tensor_attributes>,
                                                                            Block_scale_quantize_attributes);
@@ -2353,6 +2415,12 @@ class Graph : public ICudnn, public INode {
                         CHECK_TENSORS(slice_attributes);
                         FILL_GLOBAL_IO_TENSOR_MAP(slice_attributes);
                         sub_nodes.emplace_back(std::make_unique<SliceNode>(std::move(slice_attributes), context));
+                    } else if (tag == "TRANSPOSE") {
+                        auto transpose_attributes = j_sub_node.get<Transpose_attributes>();
+                        CHECK_TENSORS(transpose_attributes);
+                        FILL_GLOBAL_IO_TENSOR_MAP(transpose_attributes);
+                        sub_nodes.emplace_back(
+                            std::make_unique<TransposeNode>(std::move(transpose_attributes), context));
                     } else if (tag == "RESAMPLE") {
                         auto resample_attributes = j_sub_node.get<Resample_attributes>();
                         CHECK_TENSORS(resample_attributes);
@@ -2682,6 +2750,49 @@ Graph::set_sm_version(int32_t version) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(Tensor_attributes const &tensor) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(tensor);
+    full_graph_inputs.emplace(tensor_ptr);
+    return tensor_ptr;
+}
+
+// Overloaded tensor() methods for compile-time constants
+inline std::shared_ptr<Tensor_attributes>
+Graph::tensor(float const &scalar, ScalarType scalar_type) {
+    auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
+    full_graph_inputs.emplace(tensor_ptr);
+    return tensor_ptr;
+}
+
+inline std::shared_ptr<Tensor_attributes>
+Graph::tensor(half const &scalar, ScalarType scalar_type) {
+    auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
+    full_graph_inputs.emplace(tensor_ptr);
+    return tensor_ptr;
+}
+
+inline std::shared_ptr<Tensor_attributes>
+Graph::tensor(nv_bfloat16 const &scalar, ScalarType scalar_type) {
+    auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
+    full_graph_inputs.emplace(tensor_ptr);
+    return tensor_ptr;
+}
+
+inline std::shared_ptr<Tensor_attributes>
+Graph::tensor(int32_t const &scalar, ScalarType scalar_type) {
+    auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
+    full_graph_inputs.emplace(tensor_ptr);
+    return tensor_ptr;
+}
+
+inline std::shared_ptr<Tensor_attributes>
+Graph::tensor(int64_t const &scalar, ScalarType scalar_type) {
+    auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
+    full_graph_inputs.emplace(tensor_ptr);
+    return tensor_ptr;
+}
+
+inline std::shared_ptr<Tensor_attributes>
+Graph::tensor(double const &scalar, ScalarType scalar_type) {
+    auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3360,6 +3471,15 @@ Graph::slice(std::shared_ptr<Tensor_attributes> input, Slice_attributes attribut
     auto Y = attributes.outputs[Slice_attributes::output_names::Y] = output_tensor(attributes.name + "::Y");
 
     sub_nodes.emplace_back(std::make_unique<SliceNode>(std::move(attributes), context));
+    return Y;
+}
+
+inline std::shared_ptr<Tensor_attributes>
+Graph::transpose(std::shared_ptr<Tensor_attributes> input, Transpose_attributes attributes) {
+    attributes.inputs[Transpose_attributes::input_names::X] = input;
+    auto Y = attributes.outputs[Transpose_attributes::output_names::Y] = output_tensor(attributes.name + "::Y");
+
+    sub_nodes.emplace_back(std::make_unique<TransposeNode>(std::move(attributes), context));
     return Y;
 }
 

@@ -1,7 +1,17 @@
 
-# cuDNN FrontEnd(FE)
+# cuDNN Frontend (FE)
 
-**cuDNN FE** is the modern, open-source entry point to the NVIDIA cuDNN library and high performance open-source kernels. It provides a C++ header-only library and a Python interface to access the powerful cuDNN Graph API and open-source kernels.
+[![PyPI version](https://img.shields.io/pypi/v/nvidia-cudnn-frontend.svg)](https://pypi.org/project/nvidia-cudnn-frontend/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/nvidia-cudnn-frontend.svg)](https://pypi.org/project/nvidia-cudnn-frontend/)
+[![Python versions](https://img.shields.io/pypi/pyversions/nvidia-cudnn-frontend.svg)](https://pypi.org/project/nvidia-cudnn-frontend/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-nvidia.github.io-blue.svg)](https://nvidia.github.io/cudnn-frontend/)
+
+**cuDNN Frontend** is NVIDIA's modern, open-source entry point to the cuDNN library and a growing collection of high-performance open-source kernels — scaled dot-product attention (**SDPA / Flash Attention**), grouped GEMM fusions for **Mixture-of-Experts (MoE)** training, fused normalization + activation, and more.
+
+It provides a **header-only C++ API** and a **Python interface** (with native PyTorch integration) to the cuDNN Graph API, targeting NVIDIA **Hopper** (H100/H200) and **Blackwell** (B200/GB200/GB300) GPUs across FP16, BF16, FP8, and **MXFP8** precision.
+
+**Links:** [Documentation](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/) · [Blog & Deep Dives](https://nvidia.github.io/cudnn-frontend/) · [PyPI](https://pypi.org/project/nvidia-cudnn-frontend/) · [Release Notes](https://github.com/NVIDIA/cudnn-frontend/releases) · [Samples](samples/)
 
 ## 🚀 Latest news:
 
@@ -11,10 +21,15 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 
 *   **[GEMM + Amax](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm_amax):** Optimized FP8 matrix multiplication with absolute maximum calculation.
 *   **[GEMM + SwiGLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm_swiglu):** High-performance implementation of the SwiGLU activation fused with GEMM.
+*   **[GEMM + sReLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm_srelu):** High-performance implementation of squared-ReLU fused with GEMM.
+*   **[GEMM + dsReLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm_dsrelu):** High-performance implementation of dsquared-ReLU fused with GEMM.
 *   **[Grouped GEMM + GLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/grouped_gemm/grouped_gemm_glu):** Unified grouped GEMM GLU API supporting dense and discrete MoE weight layouts.
+*   **[Grouped GEMM + GLU + Hadamard](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/grouped_gemm/grouped_gemm_glu_hadamard):** Dense grouped GEMM GLU forward fusion with a fused Hadamard transform and per-expert AMAX reduction.
 *   **[Grouped GEMM + dGLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/grouped_gemm/grouped_gemm_dglu):** Unified grouped GEMM dGLU backward API supporting dense and discrete MoE weight layouts.
 *   **[Grouped GEMM + SwiGLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/grouped_gemm/grouped_gemm_swiglu):** SwiGLU activation fused with Grouped GEMM.
 *   **[Grouped GEMM + dSwiglu](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/grouped_gemm/grouped_gemm_dswiglu):** dSwiglu activation fused with Grouped GEMM.
+*   **[Grouped GEMM + sReLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/grouped_gemm/grouped_gemm_srelu):** Contiguous grouped squared-ReLU GEMM for MoE workloads.
+*   **[Grouped GEMM + dsReLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/grouped_gemm/grouped_gemm_dsrelu):** Contiguous grouped dsquared-ReLU GEMM for MoE workloads.
 *   **[Discrete Grouped GEMM + SwiGLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/discrete_grouped_gemm/discrete_grouped_gemm_swiglu):** Per-expert-pointer SwiGLU grouped GEMM for MoE workloads without weight packing.
 *   **[Discrete Grouped GEMM + dSwiGLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/discrete_grouped_gemm/discrete_grouped_gemm_dswiglu):** Per-expert-pointer dSwiGLU backward grouped GEMM for MoE workloads without weight packing.
 *   **[Grouped GEMM + Quant](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/grouped_gemm/grouped_gemm_quant):** Legacy dense-only grouped GEMM quant API for MoE FC2/dFC1 workloads.
@@ -30,13 +45,13 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 
 #### Llama 3.1 style Forward and Bprop with causal masking (GB300)
 <p align="center">
-  <img src="benchmark/sdpa_benchmark_training/results/gb300_919_only_cudnn/llama3.1_top_left.png" alt="Llama 3.1 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
+  <img src="https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/gb300_919_only_cudnn/llama3.1_top_left.png" alt="Llama 3.1 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
 </p>
 
 #### Deepseek v3 style Forward and Bprop with causal masking (GB300)
 
 <p align="center">
-  <img src="benchmark/sdpa_benchmark_training/results/gb300_919_only_cudnn/dsv3_top_left.png" alt="DSv3 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
+  <img src="https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/gb300_919_only_cudnn/dsv3_top_left.png" alt="DSv3 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
 </p>
 
 ## Key Features
@@ -56,8 +71,9 @@ pip install nvidia-cudnn-frontend
 ```
 
 **Requirements:**
-*   Python 3.8+
+*   Python 3.9+
 *   NVIDIA driver and CUDA Toolkit
+*   NVIDIA cuDNN (minimum 8.5.0)
 
 ### ⚙️ C++ (Header Only)
 
@@ -93,9 +109,12 @@ cmake --build . -j16
 
 ## Documentation & Examples
 
-*   **Developer Guide:** [Official NVIDIA Documentation](https://docs.nvidia.com/deeplearning/cudnn/frontend/v1.9.0/developer/overview.html)
-*   **C++ Samples:** See `samples/cpp` for comprehensive usage examples.
-*   **Python Samples:** See `samples/python` for pythonic implementations.
+*   **Developer Guide:** [Official NVIDIA Documentation (latest)](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/)
+*   **Blog & Deep Dives:** [nvidia.github.io/cudnn-frontend](https://nvidia.github.io/cudnn-frontend/) — release notes, installation guides, and technical deep-dives (MXFP8 attention, FP8 scale layouts, etc.)
+*   **C++ Samples:** See [`samples/cpp`](samples/cpp) for end-to-end examples covering convolution, matmul, SDPA / Flash Attention, normalization, and more.
+*   **Python Samples:** See [`samples/python`](samples/python) for Jupyter notebooks and PyTorch integration patterns.
+*   **OSS Kernels:** See [`python/cudnn/`](python/cudnn/) for source of SDPA, grouped GEMM + SwiGLU/GLU, RMSNorm + SiLU, Native Sparse Attention, and other open-sourced kernels.
+*   **PyTorch Custom Ops:** See [`python/cudnn/experimental/ops`](python/cudnn/experimental/ops) for `torch.compile`-compatible wrappers around cuDNN kernels.
 
 ## 🤝 Contributing
 

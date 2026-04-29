@@ -5,12 +5,48 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nvidia-cudnn-frontend"
 dynamic = ["version"]
-description = "CUDNN FrontEnd python library"
+description = "NVIDIA cuDNN Frontend — Python and C++ Graph API with SOTA attention (SDPA / Flash Attention), MoE grouped GEMM fusions, and FP8/MXFP8 kernels for Hopper and Blackwell GPUs."
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "NVIDIA Proprietary Software"}
+license = {text = "MIT"}
+keywords = [
+    "cudnn",
+    "cuda",
+    "gpu",
+    "nvidia",
+    "deep-learning",
+    "attention",
+    "sdpa",
+    "flash-attention",
+    "transformer",
+    "moe",
+    "mixture-of-experts",
+    "grouped-gemm",
+    "fp8",
+    "mxfp8",
+    "blackwell",
+    "hopper",
+    "pytorch",
+    "kernel",
+    "graph-api",
+]
 classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: C++",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
 [tool.setuptools]
@@ -19,8 +55,12 @@ package-dir = {"" = "python", "include" = "include"}
 include-package-data = true
 
 [project.urls]
-"Homepage" = "https://github.com/nvidia/cudnn-frontend"
-"Bug Tracker" = "https://github.com/nvidia/cudnn-frontend/issues"
+"Homepage" = "https://github.com/NVIDIA/cudnn-frontend"
+"Documentation" = "https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/"
+"Blog" = "https://nvidia.github.io/cudnn-frontend/"
+"Repository" = "https://github.com/NVIDIA/cudnn-frontend"
+"Bug Tracker" = "https://github.com/NVIDIA/cudnn-frontend/issues"
+"Release Notes" = "https://github.com/NVIDIA/cudnn-frontend/releases"
 
 [tool.setuptools.dynamic]
 version = {attr = "cudnn.__version__"}

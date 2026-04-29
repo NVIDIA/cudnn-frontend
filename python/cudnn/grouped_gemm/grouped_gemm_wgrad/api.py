@@ -44,13 +44,13 @@ class GroupedGemmWgradSm100(APIBase):
         sample_global_scale_a: Optional[torch.Tensor] = None,
         sample_global_scale_b: Optional[torch.Tensor] = None,
         acc_dtype: torch.dtype = torch.float32,
-        mma_tiler_mn: Tuple[int, int] = (128, 128),
+        mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         accumulate_on_output: bool = False,
     ):
         super().__init__()
-        self._logger.warning("GroupedGemmWgradSm100 is an experimental API")
+        self._warn_experimental_api()
 
         if sample_wgrad is not None and num_experts is None:
             self.weight_mode = MoEWeightMode.DENSE
@@ -79,7 +79,7 @@ class GroupedGemmWgradSm100(APIBase):
             f"sample_a and sample_b token dimensions must match, got {tokens_sum_a} and {tokens_sum_b}",
         )
         self._offset_values = self._validate_offsets(sample_offsets, tokens_sum_a, name="sample_offsets")
-        self._scale_cols = self._compute_scale_cols(self._offset_values)
+        self._scale_cols = _round_up(ceil_div(tokens_sum_a, self.sf_vec_size), 4)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self.wgrad_desc = self._make_tensor_desc(sample_wgrad, name="sample_wgrad")
@@ -136,22 +136,13 @@ class GroupedGemmWgradSm100(APIBase):
 
         if offset_values:
             self._value_error_if(
-                offset_values[-1] != tokens_sum,
-                f"{name} last value must equal total tokens {tokens_sum}, got {offset_values[-1]}",
+                offset_values[-1] > tokens_sum,
+                f"{name} last value must not exceed total tokens {tokens_sum}, got {offset_values[-1]}",
             )
         else:
             self._value_error_if(tokens_sum != 0, f"{name} cannot be empty when total tokens is {tokens_sum}")
 
         return offset_values
-
-    def _compute_scale_cols(self, offset_values: Tuple[int, ...]) -> int:
-        prev_offset = 0
-        scale_cols = 0
-        for offset in offset_values:
-            group_k = offset - prev_offset
-            scale_cols += _round_up(ceil_div(group_k, self.sf_vec_size), 4)
-            prev_offset = offset
-        return scale_cols
 
     def check_support(self) -> bool:
         m, tokens_sum = self._tensor_shape(self.a_desc, name="sample_a")
@@ -572,11 +563,13 @@ def grouped_gemm_wgrad_wrapper_sm100(
     sfb_tensor: torch.Tensor,
     offsets_tensor: torch.Tensor,
     output_mode: str = "dense",
+    wgrad_tensor: Optional[torch.Tensor] = None,
+    wgrad_ptrs: Optional[torch.Tensor] = None,
     global_scale_a: Optional[torch.Tensor] = None,
     global_scale_b: Optional[torch.Tensor] = None,
     acc_dtype: torch.dtype = torch.float32,
     wgrad_dtype: torch.dtype = torch.bfloat16,
-    mma_tiler_mn: Tuple[int, int] = (128, 128),
+    mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
     accumulate_on_output: bool = False,
@@ -585,15 +578,18 @@ def grouped_gemm_wgrad_wrapper_sm100(
     """Compile and execute grouped GEMM wgrad in one call."""
     hidden, _ = a_tensor.shape
     _, intermediate = b_tensor.shape
+    wgrad_shape = (hidden, intermediate)
     expert_cnt = offsets_tensor.shape[0]
 
     if output_mode not in {"dense", "discrete"}:
         raise ValueError(f"output_mode must be 'dense' or 'discrete', got {output_mode}")
 
-    if accumulate_on_output:
-        wgrad_tensor = torch.zeros((expert_cnt, hidden, intermediate), dtype=wgrad_dtype, device=a_tensor.device)
-    else:
-        wgrad_tensor = torch.empty((expert_cnt, hidden, intermediate), dtype=wgrad_dtype, device=a_tensor.device)
+    if wgrad_tensor is None and wgrad_ptrs is None:
+        # Backward compatibility: Dense mode.
+        if accumulate_on_output:
+            wgrad_tensor = torch.zeros((expert_cnt, *wgrad_shape), dtype=wgrad_dtype, device=a_tensor.device)
+        else:
+            wgrad_tensor = torch.empty((expert_cnt, *wgrad_shape), dtype=wgrad_dtype, device=a_tensor.device)
 
     cache_key = (
         output_mode,
@@ -604,6 +600,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         tuple(offsets_tensor.shape),
         tuple(offsets_tensor.stride()),
         offsets_tensor.dtype,
+        *_dynamic_dim_tensor_signature(wgrad_tensor, dynamic_dims=()),
         tuple(global_scale_a.shape) if global_scale_a is not None else None,
         global_scale_a.dtype if global_scale_a is not None else None,
         tuple(global_scale_b.shape) if global_scale_b is not None else None,
@@ -636,13 +633,14 @@ def grouped_gemm_wgrad_wrapper_sm100(
                 accumulate_on_output=accumulate_on_output,
             )
         else:
+            sample_expert = torch.empty(wgrad_shape, dtype=wgrad_dtype, device=a_tensor.device)
             op = GroupedGemmWgradSm100(
                 sample_a=a_tensor,
                 sample_b=b_tensor,
                 sample_sfa=sfa_tensor,
                 sample_sfb=sfb_tensor,
                 sample_offsets=offsets_tensor,
-                sample_wgrad_expert=wgrad_tensor[0],
+                sample_wgrad_expert=sample_expert,
                 num_experts=expert_cnt,
                 wgrad_shape=(hidden, intermediate),
                 wgrad_dtype=wgrad_dtype,
@@ -665,6 +663,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         sfb_tensor=sfb_tensor,
         offsets_tensor=offsets_tensor,
         wgrad_tensor=wgrad_tensor,
+        wgrad_ptrs=wgrad_ptrs,
         global_scale_a=global_scale_a,
         global_scale_b=global_scale_b,
         current_stream=current_stream,
