@@ -1,22 +1,9 @@
 # Contributing to cudnn-frontend
 
-If you are interested in contributing to cudnn-frontend, your contributions will fall
-into three categories:
-1. You want to report a bug, feature request, or documentation issue
-    - File an [issue](https://github.com/NVIDIA/cudnn-frontend/issues)
-    describing what you encountered or what you want to see changed.
-    - The cudnn team will evaluate the issues and triage them, scheduling
-    them for a release. If you believe the issue needs priority attention
-    comment on the issue to notify the team.
-2. You want to propose a new Feature and implement it
-    - Post about your intended feature, and we shall discuss the design and
-    implementation.
-    - Once we agree that the plan looks good, go ahead and implement it, using
-    the [code contributions](#code-contributions) guide below.
-3. You want to implement a feature or bug-fix for an outstanding issue
-    - Follow the [code contributions](#code-contributions) guide below.
-    - If you need more context on a particular issue, please ask and we shall
-    provide.
+If you are interested in contributing to cudnn, we encourage you to:
+- Post PRs with your ideas and fixes
+- File issues for bugs you find, things you'd like to see, or questions you have
+
 
 ## Code contributions
 
@@ -29,7 +16,7 @@ into three categories:
 4. When done, [create your pull request](https://github.com/NVIDIA/cudnn-frontend/compare).
 5. Wait for other developers to review your code and update code as needed.
 6. Once reviewed and approved, a cudnn-frontend developer will merge your pull request.
-7. At this time, we are accepting only small fixes, changes. Once merged to main this will be an untagged version. A release tag will be assigned along with future frontend release by cudnn team.
+7. Once merged to main this will be an untagged version. A release tag will be assigned along with future frontend release by cudnn team.
 
 Remember, if you are unsure about anything, don't hesitate to comment on issues and ask for clarifications!
 
