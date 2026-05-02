@@ -248,6 +248,24 @@ pre code {
   border-bottom: 1px solid #2a2a3e;
 }
 
+.post-content img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 24px auto;
+}
+
+.post-content img.video-thumbnail {
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.post-content img.video-thumbnail:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(118, 185, 0, 0.25);
+}
+
 /* ============ Post Cards (Home Page) ============ */
 .post-list {
   list-style: none;
