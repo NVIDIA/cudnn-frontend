@@ -41,6 +41,12 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 *   **[Fused RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/rms_norm_silu):** Implementation of a fused kernel of RMS normalization followed by SiLU (Swish) activation.
 *   **[SDPA PyTorch Op](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/experimental/ops):** PyTorch custom operator for cuDNN-accelerated Scaled Dot-Product Attention with autograd and `torch.compile` support.
 
+## Tech talks
+
+* See our latest talk on GPU-Mode
+  
+   ▶ [Watch on YouTube](https://www.youtube.com/watch?v=kxP-vp1dgFY)
+
 ## 🔥🔥🔥  SOTA Attention Kernels from cudnn backend
 
 #### Llama 3.1 style Forward and Bprop with causal masking (GB300)
