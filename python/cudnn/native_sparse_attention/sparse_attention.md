@@ -158,3 +158,9 @@ Compression Attention and SWA support both T,H,D and B,H,S,D input formats.
 - **O (Output)**: `(B, H_q, S_q, D_v)`
 - **L (LogSumExp)**: `(B, H_q, S_q)`
 - **M (Max)**: `(B, H_q, S_q)`
+
+## Acknowledgements
+The Native Sparse Attention fprop kernels, featuring support for head dim = 128 and optimized for the Blackwell architecture, was implemented using CuteDSL.
+
+These kernels was a collaborative effort jointly developed by:
+Jie Feng, Akash Mehra, Vincent Zhang, Dominik Ernst, Xinbo Zhao, Aditya Vavre, Vedaanta Agarwalla, Mingyang Wang, Anerudhan Gopal, Paul Springer, Yang Xu, and Nima Tajbakhsh.
