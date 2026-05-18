@@ -782,6 +782,9 @@ class PyGraph {
         return graph->get_execution_plan_count();
     }
 
+    std::vector<float>
+    estimate_run_times() const;
+
     int64_t
     get_workspace_size_plan_at_index(int64_t index);
 

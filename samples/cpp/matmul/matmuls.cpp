@@ -22,6 +22,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
+#include <iostream>
 #include <random>
 
 #include "../utils/helpers.h"
@@ -256,6 +258,59 @@ TEST_CASE("Matmul", "[matmul][graph]") {
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {A, A_gpu.devPtr}, {B, B_gpu.devPtr}, {C, C_gpu.devPtr}};
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
+}
+
+TEST_CASE("Matmul estimate_run_times", "[matmul][graph][cost_model]") {
+    if (is_arch_supported_by_cudnn() == false) {
+        SKIP("Architecture is not supported by current cudnn version");
+    }
+    if (cudnnGetVersion() < 92400) {
+        SKIP("estimate_run_times requires cuDNN 9.24.0 or later");
+    }
+    namespace fe = cudnn_frontend;
+
+    int64_t const b = 16;
+    int64_t const m = 32;
+    int64_t const n = 64;
+    int64_t const k = 128;
+
+    fe::graph::Graph graph{};
+
+    auto A = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("A")
+                              .set_dim({b, m, k})
+                              .set_stride({m * k, k, 1})
+                              .set_data_type(fe::DataType_t::BFLOAT16));
+    auto B = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("B")
+                              .set_dim({b, k, n})
+                              .set_stride({k * n, n, 1})
+                              .set_data_type(fe::DataType_t::BFLOAT16));
+    auto C = graph.matmul(A, B, fe::graph::Matmul_attributes().set_compute_data_type(fe::DataType_t::FLOAT));
+    C->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+
+    REQUIRE(graph.validate().is_good());
+
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+
+    REQUIRE(graph.build_operation_graph(handle).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
+
+    std::vector<float> times;
+    auto err = graph.estimate_run_times(times);
+    REQUIRE(err.is_good());
+    REQUIRE(static_cast<int64_t>(times.size()) == graph.get_execution_plan_count());
+
+    int64_t finite_count = 0;
+    for (size_t i = 0; i < times.size(); i++) {
+        if (std::isfinite(times[i])) {
+            REQUIRE(times[i] > 0.0f);
+            finite_count++;
+        }
+        std::cout << "[cost_model] plan " << i << " predicted_time = " << times[i] << " ms\n";
+    }
+    REQUIRE(finite_count > 0);
 }
 
 TEST_CASE("Abs + Matmul", "[matmul][graph]") {

@@ -1981,6 +1981,13 @@ class Graph : public ICudnn, public INode {
     int64_t
     get_execution_plan_count() const;
 
+    // Returns predicted execution time in milliseconds for each engine config produced by
+    // create_execution_plans(). Times are estimates from the cuDNN cost model, not measurements.
+    // Per-config failures are reported as +infinity. Returns HEURISTIC_QUERY_FAILED if no engine
+    // config could be estimated.
+    error_t
+    estimate_run_times(std::vector<float> &times) const;
+
     inline error_t
     get_engine_count(int64_t &count);
 
@@ -2674,6 +2681,11 @@ Graph::get_behavior_notes(std::vector<BehaviorNote_t> &notes) const {
 inline int64_t
 Graph::get_execution_plan_count() const {
     return plans.execution_plans.size();
+}
+
+inline error_t
+Graph::estimate_run_times(std::vector<float> &times) const {
+    return plans.estimate_run_times(times);
 }
 
 inline error_t

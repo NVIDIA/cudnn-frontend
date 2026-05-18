@@ -504,6 +504,14 @@ PyGraph::get_knobs_for_engine(int64_t const engine_id) {
     return knobs;
 }
 
+std::vector<float>
+PyGraph::estimate_run_times() const {
+    std::vector<float> times;
+    auto status = graph->estimate_run_times(times);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+    return times;
+}
+
 void
 PyGraph::build_plans(BuildPlanPolicy_t const policy) {
     // TODO: Add multithreaded support in python
@@ -1279,6 +1287,18 @@ init_pygraph_submodule(py::module_& m) {
              &PyGraph::get_execution_plan_count,
              R"pbdoc(
                 Get the number of execution plan candidates.
+            )pbdoc")
+        .def("estimate_run_times",
+             &PyGraph::estimate_run_times,
+             R"pbdoc(
+                Get predicted execution times (milliseconds) for each engine config
+                produced by create_execution_plans(). Values are estimates from the
+                cuDNN cost model, not measurements. Per-config failures appear as
+                +infinity. Raises cudnn.cudnnGraphNotSupportedError if no engine
+                config could be estimated.
+
+                Returns:
+                    List[float]: predicted run times in milliseconds, one per engine config.
             )pbdoc")
         .def("get_workspace_size", (int64_t (PyGraph::*)())&PyGraph::get_workspace_size)
         .def("get_workspace_size",

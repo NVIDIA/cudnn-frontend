@@ -327,6 +327,51 @@ class Execution_plan_list {
     }
 
     error_t
+    estimate_run_times(std::vector<float>& times) const {
+        // The cost-model attribute (CUDNN_ATTR_ENGINECFG_PREDICTED_TIME) is only available in
+        // cuDNN 9.24.0+. Gate both at compile time (so frontend compiles against older cuDNN
+        // headers) and at runtime (so frontend compiled against 9.24+ but linked against an
+        // older libcudnn does not silently produce all-inf results).
+#if CUDNN_VERSION < 92400
+        (void)times;
+        return {error_code_t::HEURISTIC_QUERY_FAILED,
+                "[cudnn_frontend] Error: estimate_run_times requires cuDNN 9.24.0 or later. "
+                "The cuDNN headers this frontend was compiled against are older than 9.24.0."};
+#else
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            detail::get_backend_version() < 92400,
+            error_code_t::HEURISTIC_QUERY_FAILED,
+            "[cudnn_frontend] Error: estimate_run_times requires the loaded cuDNN backend "
+            "library to be version 9.24.0 or later.");
+
+        times.assign(engine_configs.size(), std::numeric_limits<float>::infinity());
+
+        bool any_supported = false;
+        for (size_t i = 0; i < engine_configs.size(); i++) {
+            float predicted_time        = std::numeric_limits<float>::infinity();
+            int64_t time_pred_elemCount = 0;
+            auto status                 = detail::get_attribute(engine_configs[i]->get_backend_descriptor(),
+                                                CUDNN_ATTR_ENGINECFG_PREDICTED_TIME,
+                                                CUDNN_TYPE_FLOAT,
+                                                1,
+                                                &time_pred_elemCount,
+                                                &predicted_time);
+            if (status == CUDNN_STATUS_SUCCESS) {
+                times[i]      = predicted_time;
+                any_supported = true;
+            }
+        }
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !any_supported,
+            error_code_t::HEURISTIC_QUERY_FAILED,
+            "[cudnn_frontend] Error: the cost model could not estimate a run time for any engine config.");
+
+        return {error_code_t::OK, ""};
+#endif
+    }
+
+    error_t
     query_properties() {
         numeric_notes.reserve(engine_configs.size());
         behavior_notes.reserve(engine_configs.size());
