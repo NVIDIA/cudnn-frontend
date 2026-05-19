@@ -68,6 +68,52 @@ execute(cudnnHandle_t handle,
     return {error_code_t::OK, ""};
 }
 
+// Raw-pointer overloads. Array length is inferred from uids.size().
+
+inline error_t
+execute(cudnnHandle_t handle,
+        ExecutionPlan* plan,
+        void* const* device_ptrs,
+        std::vector<int64_t> const& uids,
+        void* workspace_ptr) {
+    CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing " << plan->getTag() << "...");
+
+    backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
+    RETURN_CUDNN_FRONTEND_ERROR_IF(variant_pack_descriptor.get_status() != CUDNN_STATUS_SUCCESS,
+                                   error_code_t::CUDNN_BACKEND_API_FAILED,
+                                   "Failed to create variant pack's backend descriptor.");
+
+    CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, workspace_ptr));
+    _CUDNN_CHECK_CUDNN_ERROR(execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()));
+
+    CUDNN_FE_LOG_LABEL_ENDL("INFO: Executed " << plan->getTag() << ".");
+    return {error_code_t::OK, ""};
+}
+
+inline error_t
+execute(cudnnHandle_t handle,
+        ExecutionPlan* plan,
+        void* const* device_ptrs,
+        std::vector<int64_t> const& uids,
+        void* workspace_ptr,
+        std::vector<int64_t> const& override_uids,
+        std::vector<std::vector<int64_t>> const& override_shapes,
+        std::vector<std::vector<int64_t>> const& override_strides) {
+    CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing " << plan->getTag() << "...");
+
+    backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
+    RETURN_CUDNN_FRONTEND_ERROR_IF(variant_pack_descriptor.get_status() != CUDNN_STATUS_SUCCESS,
+                                   error_code_t::CUDNN_BACKEND_API_FAILED,
+                                   "Failed to create variant pack's backend descriptor.");
+
+    CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(
+        variant_pack_descriptor, device_ptrs, uids, workspace_ptr, override_uids, override_shapes, override_strides));
+    _CUDNN_CHECK_CUDNN_ERROR(execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()));
+
+    CUDNN_FE_LOG_LABEL_ENDL("INFO: Executed " << plan->getTag() << ".");
+    return {error_code_t::OK, ""};
+}
+
 inline error_t
 query_cudnn_heuristics_impl(std::shared_ptr<OperationGraph_v8> const& operation_graph,
                             cudnn_frontend::EngineConfigList& configs,

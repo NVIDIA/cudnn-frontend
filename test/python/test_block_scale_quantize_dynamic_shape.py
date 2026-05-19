@@ -52,11 +52,7 @@ class TestBlockScaleQuantizeMatmulDynamicShape:
     )
     @pytest.mark.parametrize(
         "b,m,n,k",
-        [
-            (1, 1024, 1024, 1024),
-            (1, 1, 1024, 1024),
-            (2, 1, 1024, 1024),
-        ],
+        [(1, 1024, 1024, 1024), (1, 1, 1024, 1024), (2, 1, 1024, 1024), (2, 128, 128, 16384)],
     )
     @pytest.mark.L0
     @torch_fork_set_rng(seed=999)
@@ -161,7 +157,7 @@ class TestBlockScaleQuantizeMatmulDynamicShape:
 
         graph.validate()
         graph.build_operation_graph()
-        graph.create_execution_plans([cudnn.heur_mode.A])
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
         graph.build_plans()
 
@@ -229,7 +225,10 @@ class TestBlockScaleQuantizeMatmulDynamicShape:
                 C_UID: C_gpu,
             }
 
-            workspace_size = graph.get_workspace_size()
+            if cudnn.backend_version() >= 92300 and cudnn.backend_version() < 99900:
+                workspace_size = graph.get_workspace_size_plan_at_index(0, cudnn_handle, override_uids, override_shapes, override_strides)
+            else:
+                workspace_size = graph.get_workspace_size()
             workspace = torch.empty(workspace_size, dtype=torch.uint8, device="cuda")
 
             graph.execute_plan_at_index(

@@ -217,8 +217,8 @@ check_rule(const json &json_handle,
 
     if (blocked &&
         json_handle.contains("filter_shape")) {  // Check if user wants to block kernel for specific filter shape
-        std::array<ManagedOpaqueDescriptor, 50> ops = opGraph.getOps();
-        std::array<cudnnBackendDescriptor_t, 50> ops_;
+        std::array<ManagedOpaqueDescriptor, MAX_OPGRAPH_OPS> ops = opGraph.getOps();
+        std::array<cudnnBackendDescriptor_t, MAX_OPGRAPH_OPS> ops_;
         for (unsigned int i = 0; i < opGraph.getOpCount(); i++) {
             ops_[i] = ops[i]->get_backend_descriptor();
         }

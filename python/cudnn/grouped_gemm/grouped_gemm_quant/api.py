@@ -50,7 +50,7 @@ from .grouped_gemm_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
 )
 from ..moe_utils import MoEWeightMode
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 
 

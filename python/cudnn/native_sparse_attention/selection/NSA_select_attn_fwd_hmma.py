@@ -175,7 +175,7 @@ class HopperSelectAttentionFwd:
             cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_INTER,
             self.Q_dtype,
         )
-        assert self.Q_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K, "Q_layout should be K-major"
+        assert self.Q_layout.sm90_mma_major_mode() == cute.nvgpu.OperandMajorMode.K, "Q_layout should be K-major"
         Q_smem_layout_staged = cute.tile_to_shape(
             Q_smem_layout_atom,
             cute.append(Q_smem_shape, 1),
@@ -188,7 +188,7 @@ class HopperSelectAttentionFwd:
             # cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_INTER,
             self.K_dtype,
         )
-        assert self.K_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K, "K_layout should be K-major"
+        assert self.K_layout.sm90_mma_major_mode() == cute.nvgpu.OperandMajorMode.K, "K_layout should be K-major"
         K_smem_layout_staged = cute.tile_to_shape(
             K_smem_layout_atom,
             cute.append(K_smem_shape, self.K_stage),
@@ -202,7 +202,7 @@ class HopperSelectAttentionFwd:
             self.V_dtype,
         )
 
-        assert self.V_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K, "V_layout should be K-major"
+        assert self.V_layout.sm90_mma_major_mode() == cute.nvgpu.OperandMajorMode.K, "V_layout should be K-major"
         V_smem_layout_staged = cute.tile_to_shape(
             V_smem_layout_atom,
             cute.append(V_smem_shape, self.V_stage),

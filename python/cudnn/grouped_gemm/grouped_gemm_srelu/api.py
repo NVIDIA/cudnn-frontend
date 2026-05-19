@@ -51,7 +51,7 @@ from .moe_blockscaled_grouped_gemm_srelu_quant import (
     EpilogueType,
 )
 from ..moe_utils import MoEWeightMode
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 
 

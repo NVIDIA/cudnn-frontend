@@ -39,11 +39,11 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: C++",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Environment :: GPU :: NVIDIA CUDA",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
@@ -70,7 +70,7 @@ include = ["**/*"]
 
 [project.optional-dependencies]
 cutedsl = [
-    "nvidia-cutlass-dsl[cu13]==4.4.1",
+    "nvidia-cutlass-dsl[cu13]==4.5.0",
     "cuda-python",
     "torch",
     "apache-tvm-ffi",

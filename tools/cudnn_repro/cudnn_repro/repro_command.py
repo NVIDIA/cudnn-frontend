@@ -29,7 +29,7 @@ def build_pretty_command(cfg: dict) -> str:
     lines = [
         "pytest -vv -s -rA",
         f"{indent}test/python/test_mhas_v2.py::test_repro",
-        f"{indent}--repro \"",
+        f'{indent}--repro "',
         f"{indent}{indent}" + "{",
     ]
     items = list(repro_cfg.items())

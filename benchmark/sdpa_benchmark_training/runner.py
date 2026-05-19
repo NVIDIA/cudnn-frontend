@@ -145,39 +145,48 @@ class BenchmarkRunner:
         Yields:
             Dict containing all parameters for a single benchmark run
         """
-        for model, (q_seqlen, kv_seqlen), backend, data_type, attn_mask, det_bwd in itertools.product(
+        # Resolve the list of passes this config requests. "both" becomes two
+        # independent cases so a bwd failure doesn't lose fwd timing data.
+        if config.profile_pass == "both":
+            passes = ["fwd", "bwd"]
+        else:
+            passes = [config.profile_pass]
+
+        for model, (q_seqlen, kv_seqlen), backend, data_type, attn_mask, profile_pass in itertools.product(
             config.models,
             config.seqlens,
             config.backends,
             config.data_types,
             config.attn_masks,
-            config.deterministic_bwd,
+            passes,
         ):
-            # Skip deterministic mode for forward-only runs
-            if det_bwd and config.profile_pass == "fwd":
-                continue
+            # deterministic_bwd is a backward-only knob. For fwd cases, emit
+            # exactly one row regardless of what deterministic_bwd contains.
+            # For bwd cases, iterate over the configured deterministic_bwd values.
+            det_values = [False] if profile_pass == "fwd" else list(config.deterministic_bwd)
 
-            # MXFP8 constraints: cudnn-only
-            if data_type == "mxfp8":
-                if backend != "cudnn":
-                    continue
+            for det_bwd in det_values:
+                # MXFP8 constraints: cudnn-only
+                if data_type == "mxfp8":
+                    if backend != "cudnn":
+                        continue
 
-            yield {
-                "config_name": config.name,
-                "model": model,
-                "q_seqlen": q_seqlen,
-                "kv_seqlen": kv_seqlen,
-                "backend": backend,
-                "data_type": data_type,
-                "attn_mask": attn_mask,
-                "profile_pass": config.profile_pass,
-                "batch_size": config.batch_size,
-                "num_iterations": config.num_iterations,
-                "num_warmup_iterations": config.num_warmup_iterations,
-                "skip_ref": config.skip_ref,
-                "deterministic_bwd": det_bwd,
-                "sliding_window_size": config.sliding_window_size,
-            }
+                yield {
+                    "config_name": config.name,
+                    "model": model,
+                    "q_seqlen": q_seqlen,
+                    "kv_seqlen": kv_seqlen,
+                    "backend": backend,
+                    "data_type": data_type,
+                    "attn_mask": attn_mask,
+                    "profile_pass": profile_pass,
+                    "batch_size": config.batch_size,
+                    "num_iterations": config.num_iterations,
+                    "num_warmup_iterations": config.num_warmup_iterations,
+                    "skip_ref": config.skip_ref,
+                    "deterministic_bwd": det_bwd,
+                    "sliding_window_size": config.sliding_window_size,
+                }
 
     def run_single(self, case: Dict[str, Any]) -> BenchmarkResult:
         """
@@ -234,10 +243,8 @@ class BenchmarkRunner:
                 profile_pass=case["profile_pass"],
                 deterministic_bwd=case["deterministic_bwd"],
                 sliding_window_size=case["sliding_window_size"],
-                fwd_time_ms=result["fwd_time_ms"],
-                bwd_time_ms=result["bwd_time_ms"],
-                fwd_tflops=result["fwd_tflops"],
-                bwd_tflops=result["bwd_tflops"],
+                time_ms=result["time_ms"],
+                tflops=result["tflops"],
                 max_diff=result["max_diff"],
                 num_iterations=case["num_iterations"],
                 success=True,
@@ -264,10 +271,8 @@ class BenchmarkRunner:
                 profile_pass=case["profile_pass"],
                 deterministic_bwd=case["deterministic_bwd"],
                 sliding_window_size=case["sliding_window_size"],
-                fwd_time_ms=float("inf"),
-                bwd_time_ms=float("inf"),
-                fwd_tflops=0.0,
-                bwd_tflops=0.0,
+                time_ms=float("inf"),
+                tflops=0.0,
                 max_diff=0.0,
                 num_iterations=case["num_iterations"],
                 success=False,
@@ -322,7 +327,7 @@ class BenchmarkRunner:
                 f"[{i}/{len(cases)}] {model.name} | "
                 f"seq={case['q_seqlen']}x{case['kv_seqlen']} | "
                 f"{case['backend']} | {case['data_type']} | "
-                f"{case['attn_mask']} | {det_str}{swa_str}"
+                f"{case['attn_mask']} | {case['profile_pass']} | {det_str}{swa_str}"
             )
 
             result = self.run_single(case)
@@ -330,11 +335,8 @@ class BenchmarkRunner:
 
             if result.success:
                 peak = _get_peak_mma_tflops(case["data_type"])
-                fwd_sol = f", {result.fwd_tflops / peak * 100:.1f}% SOL" if peak and result.fwd_tflops > 0 else ""
-                bwd_sol = f", {result.bwd_tflops / peak * 100:.1f}% SOL" if peak and result.bwd_tflops > 0 else ""
-                fwd_info = f"fwd: {result.fwd_time_ms:.3f}ms ({result.fwd_tflops:.0f} TFLOPS{fwd_sol})"
-                bwd_info = f"bwd: {result.bwd_time_ms:.3f}ms ({result.bwd_tflops:.0f} TFLOPS{bwd_sol})"
-                logger.info(f"  -> {fwd_info}, {bwd_info}")
+                sol = f", {result.tflops / peak * 100:.1f}% SOL" if peak and result.tflops > 0 else ""
+                logger.info(f"  -> {result.profile_pass}: {result.time_ms:.3f}ms ({result.tflops:.0f} TFLOPS{sol})")
             else:
                 logger.warning(f"  -> FAILED: {result.error_message}")
 

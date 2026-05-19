@@ -48,17 +48,18 @@ cat log | cudnn-repro -
 # Process all entries (not just last)
 cudnn-repro --all log
 
-# Debug mode - saves intermediate stages
+# Debug mode - saves parsed payload and command output
 CUDNN_DEBUG_REPRO=1 cudnn-repro log
 ```
 
 ## How it works
 
-**3-stage pipeline:**
+Pipeline:
 
-1. **Stage 0**: Extract JSON context entries from log lines
-2. **Stage 1**: Annotate with test config (shape, stride, dtype, etc.)
-3. **Stage 2**: Build pytest command
+1. Parse log context JSON
+2. Select operation handler
+3. Extract repro config
+4. Render pytest command
 
 The tool auto-detects SDPA operation tags and routes to the appropriate handler:
 - `SDPA_FWD`
@@ -69,9 +70,9 @@ The tool auto-detects SDPA operation tags and routes to the appropriate handler:
 - `SDPA_MXFP8_BWD`
 
 **Debug mode** (`CUDNN_DEBUG_REPRO=1`) writes:
-- `cudnn_repro_stage0.txt` - Raw log
-- `cudnn_repro_stage1.json` - Extracted config
-- `cudnn_repro_stage2.txt` - Final command
+- `cudnn_repro_log.txt` - Raw log
+- `cudnn_repro_payload.json` - Annotated payload
+- `cudnn_repro_command.txt` - Final command
 
 ## Testing
 

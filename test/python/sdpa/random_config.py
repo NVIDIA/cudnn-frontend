@@ -87,6 +87,7 @@ class ExecConfig:
     with_score_sum_exp: bool = False
     with_sink_token: bool = False
     with_unfuse_fma: bool = False
+    with_rope: bool = False
     rescale_threshold: float = None
 
     diag_align: cudnn.diagonal_alignment = None
@@ -482,6 +483,12 @@ class RandomSequenceLength:
         s_kv_max: int,
         s_q_distribution: dict[Any, int],
     ):
+        # Cap sequence lengths at 1024 on SM80 (Ampere) to avoid OOMs for CI/CD.
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 8:
+            s_q_max = min(s_q_max, 1024)
+            s_kv_max = min(s_kv_max, 1024)
+            s_q_min = min(s_q_min, s_q_max)
+            s_kv_min = min(s_kv_min, s_kv_max)
         self.s_q_gen = RandomIntValue(min=s_q_min, max=s_q_max)
         self.s_kv_gen = RandomIntValue(min=s_kv_min, max=s_kv_max)
         self.distribution = RandomChoice(s_q_distribution)

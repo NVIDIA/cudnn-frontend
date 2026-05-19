@@ -629,10 +629,10 @@ TEST_CASE("Matmul dynamic shape overrides", "[matmul][graph][dynamic_shape]") {
         int64_t b, m, n, k;
     };
 
-    matmul_shapes matmul_cache_shape     = {1, 1024, 1024, 1024};
+    matmul_shapes matmul_cache_shape     = {1, 128, 128, 8192};
     matmul_shapes matmul_dynamic_shape[] = {
-        {2, 1024, 1024, 1024},
-        {2, 2048, 2048, 2048},
+        {2, 256, 256, 12288},
+        {1, 1024, 1024, 1024},
     };
 
     constexpr int matmul_dynamic_shape_count = sizeof(matmul_dynamic_shape) / sizeof(matmul_cache_shape);
@@ -666,7 +666,7 @@ TEST_CASE("Matmul dynamic shape overrides", "[matmul][graph][dynamic_shape]") {
 
     // For dynamic shape, recommend to query fallback plan to get a general good performance
     // Heuristics Mode A is recommended if the dynamic problem shapes are similar in size
-    REQUIRE(graph->build(handle, {fe::HeurMode_t::FALLBACK}).is_good());
+    REQUIRE(graph->build(handle, {fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
 
     // run graph with dynamic shapes
     for (int idx_shape = 0; idx_shape < matmul_dynamic_shape_count; ++idx_shape) {
@@ -697,7 +697,13 @@ TEST_CASE("Matmul dynamic shape overrides", "[matmul][graph][dynamic_shape]") {
             {A_UID, A_gpu.devPtr}, {B_UID, B_gpu.devPtr}, {C_UID, C_gpu.devPtr}};
 
         int64_t workspace_size = 0;
-        REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+        if (cudnn_frontend::detail::get_backend_version() >= 92300 &&
+            cudnn_frontend::detail::get_backend_version() < 99900) {
+            REQUIRE(graph->get_workspace_size(handle, workspace_size, override_uids, override_shapes, override_strides)
+                        .is_good());
+        } else {
+            REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+        }
         Surface<int8_t> workspace(workspace_size);
 
         REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr, override_uids, override_shapes, override_strides)

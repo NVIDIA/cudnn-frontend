@@ -46,7 +46,6 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 from cutlass.cutlass_dsl import T, dsl_user_op
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -54,7 +53,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir import ir
 from cutlass._mlir.dialects.nvvm import AtomicOpKind
 from cutlass.cute.typing import Float32, Int32, BFloat16, AddressSpace
-from cutlass._mlir.dialects import math, nvvm, llvm, vector
+from cutlass._mlir.dialects import math, nvvm, llvm, vector, arith
 from .moe_persistent_scheduler import MoESchedulerParams
 
 # ---------------------------------------------------------------------------
@@ -342,6 +341,80 @@ def atomic_add_float32(
     return Float32(llvm.bitcast(T.f32(), old_value, loc=loc, ip=ip))
 
 
+def cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8_type, loc=None, ip=None):
+    fp32x4 = fp32x4.load()
+    src_vec4 = fp32x4.ir_value(loc=loc, ip=ip) if hasattr(fp32x4, "ir_value") else fp32x4
+
+    src0 = Float32(vector.extract(src_vec4, [], [0])).ir_value(loc=loc, ip=ip)
+    src1 = Float32(vector.extract(src_vec4, [], [1])).ir_value(loc=loc, ip=ip)
+    src2 = Float32(vector.extract(src_vec4, [], [2])).ir_value(loc=loc, ip=ip)
+    src3 = Float32(vector.extract(src_vec4, [], [3])).ir_value(loc=loc, ip=ip)
+
+    cvt_instruction = ""
+    if cutlass.const_expr(fp8_type == cutlass.Float8E8M0FNU):
+        cvt_instruction = "cvt.rp.satfinite.ue8m0x2.f32"
+    elif cutlass.const_expr(fp8_type == cutlass.Float8E4M3FN):
+        cvt_instruction = "cvt.rn.satfinite.e4m3x2.f32"
+    else:
+        with cute.arch.elect_one():
+            cute.printf("error: unsupported fp8 element type")
+        return
+
+    asm_tmpl = (
+        "{\n" "  .reg .b16 lo;\n" "  .reg .b16 hi;\n" f"  {cvt_instruction} lo, $2, $1;\n" f"  {cvt_instruction} hi, $4, $3;\n" "  mov.b32 $0, {lo, hi};\n" "}"
+    )
+    packed_i32 = llvm.inline_asm(
+        T.i32(),
+        [src0, src1, src2, src3],
+        asm_tmpl,
+        "=r,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+    return packed_i32
+
+
+def cvt_f32x4_to_f8x4(fp32x4, fp8x4, loc=None, ip=None):
+    packed_i32 = cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8x4.element_type)
+    fp8x4_i32 = cute.recast_tensor(fp8x4, cutlass.Int32)
+    fp8x4_i32[0] = cutlass.Int32(packed_i32)
+
+
+def cvt_f32_to_f8_to_f32(fp32x1, fp8_type, loc=None, ip=None):
+    src_fp32 = Float32(fp32x1).ir_value(loc=loc, ip=ip)
+
+    cvt_instruction_downcast = ""
+    cvt_instruction_upcast = ""
+    if cutlass.const_expr(fp8_type == cutlass.Float8E8M0FNU):
+        cvt_instruction_downcast = "cvt.rp.satfinite.ue8m0x2.f32"
+        cvt_instruction_upcast = "cvt.rn.bf16x2.ue8m0x2"
+    elif cutlass.const_expr(fp8_type == cutlass.Float8E4M3FN):
+        cvt_instruction_downcast = "cvt.rn.satfinite.e4m3x2.f32"
+        cvt_instruction_upcast = "cvt.rn.bf16x2.e4m3x2"
+    else:
+        with cute.arch.elect_one():
+            cute.printf("error: unsupported fp8 element type")
+        return
+
+    asm_tmpl = "{\n" "  .reg .b16 bf_lo;\n" f"  {cvt_instruction_downcast} bf_lo, 0f00000000, $1;\n" f"  {cvt_instruction_upcast}  $0, bf_lo;\n" "}"
+    packed_i32 = llvm.inline_asm(
+        T.i32(),
+        [src_fp32],
+        asm_tmpl,
+        "=r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+    vec_bf16_ty = ir.Type.parse("vector<2xbf16>")
+    bf2_lo = llvm.bitcast(vec_bf16_ty, packed_i32, loc=loc, ip=ip)
+    h0 = vector.extract(bf2_lo, [], [0], loc=loc, ip=ip)
+    return arith.extf(Float32.mlir_type, h0, loc=loc, ip=ip)
+
+
 def ceil_div(a, b):
     return (a + b - 1) // b
 
@@ -361,9 +434,18 @@ def silu_f32(a: Union[float, Float32], fastmath: bool = False) -> Union[float, F
     return a * sigmoid_f32(a, fastmath=fastmath)
 
 
+def silu_f32_scaled(
+    a: Union[float, Float32],
+    alpha: Union[float, Float32] = 1.702,
+    fastmath: bool = False,
+) -> Union[float, Float32]:
+    """Compute the scaled SiLU ``a * sigmoid(alpha * a)`` of the input."""
+    return a * sigmoid_f32(a * alpha, fastmath=fastmath)
+
+
 def silu_f32_geglu_scaled(a: Union[float, Float32], fastmath: bool = False) -> Union[float, Float32]:
-    """Compute the GeGLU-scaled SiLU (scale factor 1.702) of the input value."""
-    return a * sigmoid_f32(a * 1.702, fastmath=fastmath)
+    """Backwards-compatible wrapper for :func:`silu_f32_scaled` with ``alpha=1.702``."""
+    return silu_f32_scaled(a, alpha=1.702, fastmath=fastmath)
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +975,157 @@ def amax_reduction_per_thread(vec_fp32, amax_fp32):
     abs_acc_values = type(vec_fp32_ssa)(abs_acc_values_ir, vec_fp32_ssa.shape, vec_fp32_ssa.dtype)
     subtile_amax = abs_acc_values.reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
     return cute.arch.fmax(amax_fp32, subtile_amax)
+
+
+@cute.jit
+def quant_sfd_row(
+    tile_idx,
+    tiled_copy_r2s,
+    src,
+    pvscale,
+    norm_const,
+    rcp_limit,
+    tRSrD,
+    sf_vec_size,
+    vectorized_f32,
+    sf_dtype,
+    d_dtype,
+    use_fp8_ptx_cvt,
+):
+    tTR_rAcc_frg = cute.logical_divide(src, cute.make_layout(sf_vec_size))
+    acc_frg = tTR_rAcc_frg.load()
+    abs_acc_frg_ir = cutlass._mlir.dialects.math.absf(acc_frg.ir_value())
+    abs_acc_frg = type(acc_frg)(abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype)
+    avg_fp32 = abs_acc_frg[None, 0].reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0) * rcp_limit * norm_const
+    if tile_idx == 0:
+        pvscale[0] = avg_fp32
+    elif tile_idx == 1:
+        pvscale[1] = avg_fp32
+    elif tile_idx == 2:
+        pvscale[2] = avg_fp32
+    elif tile_idx == 3:
+        pvscale[3] = avg_fp32
+    qpvscale_up = cvt_f32_to_f8_to_f32(avg_fp32, sf_dtype)
+    fp32_max = cutlass.Float32(3.40282346638528859812e38)
+    acc_scale = norm_const * cute.arch.rcp_approx(qpvscale_up)
+    acc_scale = fmin(acc_scale, fp32_max, nan=True)
+    if cutlass.const_expr(vectorized_f32):
+        vec = tTR_rAcc_frg[None, 0]
+        for ei in cutlass.range_constexpr(0, sf_vec_size, 2):
+            vec[ei], vec[ei + 1] = cute.arch.mul_packed_f32x2((vec[ei], vec[ei + 1]), (acc_scale, acc_scale), rnd="rn", ftz=False)
+    else:
+        vec = tTR_rAcc_frg[None, 0]
+        for ei in cutlass.range_constexpr(sf_vec_size):
+            vec[ei] = vec[ei] * acc_scale
+    acc_vec = tiled_copy_r2s.retile(src).load()
+    if cutlass.const_expr(not use_fp8_ptx_cvt):
+        tRSrD.store(acc_vec.to(d_dtype))
+    else:
+        tRSrD_i32 = cute.recast_tensor(tRSrD, cutlass.Int32)
+        for ei in cutlass.range_constexpr(0, sf_vec_size, 4):
+            fp32x4 = cute.make_rmem_tensor(4, cutlass.Float32)
+            fp32x4[0] = acc_vec[ei + 0]
+            fp32x4[1] = acc_vec[ei + 1]
+            fp32x4[2] = acc_vec[ei + 2]
+            fp32x4[3] = acc_vec[ei + 3]
+            fp8x4_i32 = cvt_f32x4_to_f8x4_pack_i32(fp32x4, d_dtype)
+            tRSrD_i32[ei // 4] = cutlass.Int32(fp8x4_i32)
+
+
+@cute.jit
+def quant_sfd_col(
+    tile_idx,
+    tiled_copy_r2s,
+    src,
+    pvscale,
+    norm_const,
+    rcp_limit,
+    tRSrD,
+    sf_vec_size,
+    sf_dtype,
+    d_dtype,
+    use_fp8_ptx_cvt,
+):
+    from cutlass._mlir.dialects.nvvm import ReduxKind
+
+    tTR_rAcc_frg = cute.logical_divide(src, cute.make_layout(sf_vec_size))
+    acc_frg = tTR_rAcc_frg.load()
+    abs_acc_frg_ir = cutlass._mlir.dialects.math.absf(acc_frg.ir_value())
+    acc_frg = type(acc_frg)(abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype)
+    avg_fp32 = cutlass.Float32(0.0)
+    fp32_max = cutlass.Float32(3.40282346638528859812e38)
+    tidx, _, _ = cute.arch.thread_idx()
+    for vi in cutlass.range_constexpr(0, acc_frg.shape[0], 4):
+        max_value0 = cutlass.Float32(warp_redux_sync(value=acc_frg[vi, 0], kind=ReduxKind.MAX, mask_and_clamp=0xFFFFFFFF, nan=True))
+        max_value1 = cutlass.Float32(warp_redux_sync(value=acc_frg[vi + 1, 0], kind=ReduxKind.MAX, mask_and_clamp=0xFFFFFFFF, nan=True))
+        max_value2 = cutlass.Float32(warp_redux_sync(value=acc_frg[vi + 2, 0], kind=ReduxKind.MAX, mask_and_clamp=0xFFFFFFFF, nan=True))
+        max_value3 = cutlass.Float32(warp_redux_sync(value=acc_frg[vi + 3, 0], kind=ReduxKind.MAX, mask_and_clamp=0xFFFFFFFF, nan=True))
+
+        scale = rcp_limit * norm_const
+        max_value0, max_value1 = cute.arch.mul_packed_f32x2((max_value0, max_value1), (scale, scale), rnd="rn", ftz=False)
+        max_value2, max_value3 = cute.arch.mul_packed_f32x2((max_value2, max_value3), (scale, scale), rnd="rn", ftz=False)
+
+        if tidx % 32 == vi:
+            avg_fp32 = max_value0
+        if tidx % 32 == vi + 1:
+            avg_fp32 = max_value1
+        if tidx % 32 == vi + 2:
+            avg_fp32 = max_value2
+        if tidx % 32 == vi + 3:
+            avg_fp32 = max_value3
+
+        max_value_tensor = cute.make_rmem_tensor(4, cutlass.Float32)
+        max_value_tensor[0] = max_value0
+        max_value_tensor[1] = max_value1
+        max_value_tensor[2] = max_value2
+        max_value_tensor[3] = max_value3
+
+        if cutlass.const_expr(not use_fp8_ptx_cvt):
+            max_value_vec_f8 = max_value_tensor.load().to(sf_dtype)
+        else:
+            max_value_vec_f8 = cute.make_rmem_tensor(4, sf_dtype)
+            cvt_f32x4_to_f8x4(max_value_tensor, max_value_vec_f8)
+            max_value_vec_f8 = max_value_vec_f8.load()
+        max_value_vec_f32_chunked = max_value_vec_f8.to(cutlass.Float32)
+        max_value0 = max_value_vec_f32_chunked[0]
+        max_value1 = max_value_vec_f32_chunked[1]
+        max_value2 = max_value_vec_f32_chunked[2]
+        max_value3 = max_value_vec_f32_chunked[3]
+
+        max_value_rcp0 = cute.arch.rcp_approx(max_value0)
+        max_value_rcp1 = cute.arch.rcp_approx(max_value1)
+        max_value_rcp2 = cute.arch.rcp_approx(max_value2)
+        max_value_rcp3 = cute.arch.rcp_approx(max_value3)
+
+        max_value_rcp0 = fmin(max_value_rcp0, fp32_max, nan=True)
+        max_value_rcp1 = fmin(max_value_rcp1, fp32_max, nan=True)
+        max_value_rcp2 = fmin(max_value_rcp2, fp32_max, nan=True)
+        max_value_rcp3 = fmin(max_value_rcp3, fp32_max, nan=True)
+
+        acc_scale_col0, acc_scale_col1 = cute.arch.mul_packed_f32x2((norm_const, norm_const), (max_value_rcp0, max_value_rcp1), rnd="rn", ftz=False)
+        acc_scale_col2, acc_scale_col3 = cute.arch.mul_packed_f32x2((norm_const, norm_const), (max_value_rcp2, max_value_rcp3), rnd="rn", ftz=False)
+
+        tTR_rAcc_frg[vi], tTR_rAcc_frg[vi + 1] = cute.arch.mul_packed_f32x2(
+            (tTR_rAcc_frg[vi], tTR_rAcc_frg[vi + 1]), (acc_scale_col0, acc_scale_col1), rnd="rn", ftz=False
+        )
+        tTR_rAcc_frg[vi + 2], tTR_rAcc_frg[vi + 3] = cute.arch.mul_packed_f32x2(
+            (tTR_rAcc_frg[vi + 2], tTR_rAcc_frg[vi + 3]), (acc_scale_col2, acc_scale_col3), rnd="rn", ftz=False
+        )
+
+    pvscale[None, None, tile_idx][0] = avg_fp32
+    acc_vec = tiled_copy_r2s.retile(src).load()
+    if cutlass.const_expr(not use_fp8_ptx_cvt):
+        tRSrD.store(acc_vec.to(d_dtype))
+    else:
+        tRSrD_i32 = cute.recast_tensor(tRSrD, cutlass.Int32)
+        for ei in cutlass.range_constexpr(0, sf_vec_size, 4):
+            fp32x4 = cute.make_rmem_tensor(4, cutlass.Float32)
+            fp32x4[0] = acc_vec[ei + 0]
+            fp32x4[1] = acc_vec[ei + 1]
+            fp32x4[2] = acc_vec[ei + 2]
+            fp32x4[3] = acc_vec[ei + 3]
+            fp8x4_i32 = cvt_f32x4_to_f8x4_pack_i32(fp32x4, d_dtype)
+            tRSrD_i32[ei // 4] = cutlass.Int32(fp8x4_i32)
 
 
 def epilog_gmem_copy_and_partition(

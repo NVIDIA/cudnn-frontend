@@ -46,6 +46,7 @@ from ..moe_persistent_scheduler import (
 )
 from ..moe_utils import (
     MoEWeightMode,
+    WGradInputOrder,
     WgradSfTensormapConstructor,
 )
 from ..moe_sched_extension import (
@@ -79,6 +80,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         accumulate_on_output: bool = False,
         expert_cnt: int = 1,
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
+        input_order: WGradInputOrder = WGradInputOrder.Tensor2D,
     ):
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
@@ -88,6 +90,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         self.mma_tiler = (*mma_tiler_mn, 1)
         self.accumulate_on_output = accumulate_on_output
         self.weight_mode = weight_mode
+        self.input_order = input_order
 
         self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -117,7 +120,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
     # ------------------------------------------------------------------
 
     def get_workspace_bytes(self) -> int:
-        return WgradSfTensormapConstructor.get_workspace_size(self.weight_mode, self.expert_cnt)
+        return WgradSfTensormapConstructor.get_workspace_size(self.input_order, self.weight_mode, self.expert_cnt)
 
     # ------------------------------------------------------------------
     # _setup_attributes
@@ -404,32 +407,14 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         tiled_mma_sfb = self._create_tiled_mma_sfb()
 
         # =================================================================
-        # Step 4: Create TMA ops and build A/B atoms
+        # Step 4: Create TMA ops
         # =================================================================
 
-        # TMA load A
         a_op = sm100_utils.cluster_shape_to_tma_atom_A(self.cluster_shape_mn, tiled_mma.thr_id)
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op,
-            a_gemm,
-            a_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
 
-        # TMA load B
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, tiled_mma.thr_id)
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op,
-            b_gemm,
-            b_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
 
         # TMA ops for SFA/SFB (atoms built after helper kernel)
         sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(self.cluster_shape_mn, tiled_mma.thr_id)
@@ -463,6 +448,20 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
         sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
         epi_smem_layout_helper = cute.select(self.c_smem_layout_staged, mode=[0, 1]) if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else None
+        if cutlass.const_expr(self.input_order == WGradInputOrder.TensorRagged):
+            a_gemm_helper = a_gemm
+            b_gemm_helper = b_gemm
+            a_op_helper = a_op
+            b_op_helper = b_op
+            a_smem_layout_helper = a_smem_layout
+            b_smem_layout_helper = b_smem_layout
+        else:
+            a_gemm_helper = None
+            b_gemm_helper = None
+            a_op_helper = None
+            b_op_helper = None
+            a_smem_layout_helper = None
+            b_smem_layout_helper = None
 
         self.helper_kernel(
             sfa_gemm,
@@ -482,6 +481,12 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             c_tma_op if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else None,
             epi_smem_layout_helper,
             self.epi_tile if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else None,
+            a_gemm_helper,
+            b_gemm_helper,
+            a_op_helper,
+            b_op_helper,
+            a_smem_layout_helper,
+            b_smem_layout_helper,
         ).launch(
             grid=(expert_cnt, 1, 1),
             block=(1, 1, 1),
@@ -489,12 +494,30 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             min_blocks_per_mp=1,
         )
 
-        # Build SFA, SFB, C TMA atoms AFTER the helper kernel launch.
+        # Build A, B, SFA, SFB, C TMA atoms AFTER the helper kernel launch.
         # make_tiled_tma_atom_*() stores smem_layout on the TMA op object.
         # Because the ops are passed as Constexpr to the helper kernel, the
         # helper's own make_tiled_tma_atom_*() calls contaminate them with
         # kernel-region block arguments.  Creating fresh atoms here re-sets
         # the ops' smem_layout to valid host-region values.
+        a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
+        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+            a_op,
+            a_gemm,
+            a_smem_layout,
+            self.mma_tiler,
+            tiled_mma,
+            self.cluster_layout_vmnk.shape,
+        )
+        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
+        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+            b_op,
+            b_gemm,
+            b_smem_layout,
+            self.mma_tiler,
+            tiled_mma,
+            self.cluster_layout_vmnk.shape,
+        )
         sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
         tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
             sfa_op,
@@ -589,6 +612,12 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         c_tma_op: cutlass.Constexpr = None,
         epi_smem_layout=None,
         epi_tile=None,
+        a_tensor=None,
+        b_tensor=None,
+        a_tma_op: cutlass.Constexpr = None,
+        b_tma_op: cutlass.Constexpr = None,
+        a_smem_layout=None,
+        b_smem_layout=None,
     ):
         """Build per-expert TMA descriptors (SFA/SFB for all modes, + C for Discrete).
 
@@ -600,6 +629,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         ctor = WgradSfTensormapConstructor(
             sf_vec_size=self.sf_vec_size,
             weight_mode=self.weight_mode,
+            input_order=self.input_order,
             sfa_tma_op=sfa_tma_op,
             sfb_tma_op=sfb_tma_op,
             sfa_smem_layout=sfa_smem_layout,
@@ -614,6 +644,14 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             sfb_tensor=sfb_gemm,
             offs=offs,
             workspace_ptr=workspace_ptr,
+            a_tma_op=a_tma_op,
+            b_tma_op=b_tma_op,
+            a_smem_layout=a_smem_layout,
+            b_smem_layout=b_smem_layout,
+            a_major_mode=self.a_major_mode,
+            b_major_mode=self.b_major_mode,
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
             c_tma_op=c_tma_op,
             epi_smem_layout=epi_smem_layout,
             epi_tile=epi_tile,
@@ -814,12 +852,13 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # Build extension
         from ..moe_utils import TensormapWorkspace, WgradSfTensormapConstructor
 
-        slot_names = WgradSfTensormapConstructor.slot_names(self.weight_mode)
+        slot_names = WgradSfTensormapConstructor.slot_names(self.input_order, self.weight_mode)
         desc_workspace = TensormapWorkspace(workspace_ptr, slot_names)
         ext = WgradScaledGemmSchedExtension(
             tensormap_ctor=desc_workspace,
             sf_vec_size=self.sf_vec_size,
             weight_mode=self.weight_mode,
+            input_order=self.input_order,
         )
 
         # Cluster wait

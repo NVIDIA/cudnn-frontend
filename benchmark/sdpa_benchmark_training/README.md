@@ -10,7 +10,12 @@ This directory contains benchmarking tools for Scaled Dot Product Attention (SDP
 - `benchmark_single_sdpa.py` - Single SDPA benchmark script
 - `configs/` - Benchmark configuration files
   - `llama.py` - Llama 3.1 GQA benchmarks (causal + non-causal)
-  - `dsv3.py` - DeepSeek V3 MHA benchmarks (causal only)
+  - `dsv3.py` - DeepSeek V3 MLA benchmarks (asymmetric head dims, causal + non-causal)
+  - `kimiK26.py` - Kimi-K2.6 MLA benchmarks (asymmetric head dims, causal + non-causal)
+  - `wan22.py` - Wan 2.2 A14B video DiT self-attention benchmarks (bidirectional, no mask)
+  - `ltx2.py` - LTX-2 video DiT self-attention benchmarks (bidirectional, no mask)
+  - `gpt_oss.py` - GPT-OSS sliding-window-attention GQA benchmarks (causal, SWA=128)
+  - `qwen35.py` - Qwen 3.5 GQA benchmarks (head_dim=256, causal, bf16 fwd-only — Blackwell bwd/fp8/fa4 limits)
 - `runner.py` - Configuration-based benchmark runner
 - `config_types.py` - Data types for benchmark configuration
 - `charts.py` - Chart generation utilities
@@ -35,8 +40,20 @@ python -m benchmark.sdpa_benchmark_training.runner --config llama
 # Run DeepSeek V3 benchmark suite
 python -m benchmark.sdpa_benchmark_training.runner --config dsv3
 
-# Run GPT-OSS benchmark suite
+# Run Kimi-K2.6 benchmark suite
+python -m benchmark.sdpa_benchmark_training.runner --config kimiK26
+
+# Run GPT-OSS benchmark suite (sliding window attention, W=128)
 python -m benchmark.sdpa_benchmark_training.runner --config gpt_oss
+
+# Run Wan 2.2 A14B benchmark suite
+python -m benchmark.sdpa_benchmark_training.runner --config wan22
+
+# Run LTX-2 benchmark suite
+python -m benchmark.sdpa_benchmark_training.runner --config ltx2
+
+# Run Qwen 3.5 benchmark suite (cuDNN bf16 fwd only at head_dim=256)
+python -m benchmark.sdpa_benchmark_training.runner --config qwen35
 
 # Dry run (show what would be executed)
 python -m benchmark.sdpa_benchmark_training.runner --config llama --dry-run
@@ -141,11 +158,13 @@ CONFIG = BenchmarkConfig(
 ### Output
 
 The runner produces (in `benchmark/results/`):
-- **CSV**: `<config>_<timestamp>.csv`
+- **CSV**: `<config>_<timestamp>.csv` — one row per (backend, dtype, mask, seqlen, profile_pass, deterministic_bwd)
 - **Charts**: Separate chart per mask type:
   - `<config>_top_left.png` (causal)
   - `<config>_no_mask.png` (non-causal)
-- Charts show backends side-by-side with distinct colors for BF16 vs FP8
+  - `<config>_<mask>_det_overhead.png` — bwd bf16 only, comparing deterministic vs non-deterministic for cuDNN and FAv4 side-by-side
+- Main charts filter to `deterministic_bwd=False`; the det-overhead chart shows both modes
+- Backend legends include the cuDNN backend version (e.g. `cudnn 9.22.0 (BF16)`)
 
 ## Single Benchmark Script
 
@@ -273,74 +292,49 @@ runner.save_csv(results, config)
 
 ## Benchmark Results
 
-### GB200 - Llama 3.1 Causal (top_left)
-![Llama 3.1 Causal on GB200](results/gb200_919_only_cudnn/llama3.1_top_left.png)
-- SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=True`
-- Sequence lengths shown on x-axis
-- Results obtained on NVIDIA GB200 GPU
+Results are organized by `<config>/<gpu>/`. The plots compare cuDNN against FAv4 across BF16, MXFP8, and FP8 (cuDNN-only for FP8/MXFP8). Per-config layout:
 
-### GB200 - Llama 3.1 Non-Causal (no_mask)
-![Llama 3.1 Non-Causal on GB200](results/gb200_919_only_cudnn/llama3.1_no_mask.png)
-- SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=False`
-- Sequence lengths shown on x-axis
-- Results obtained on NVIDIA GB200 GPU
+```
+results/<config>/<gpu>/
+    <config>_<timestamp>.csv
+    <config>_<mask>.png                  # main fwd+bwd chart, non-deterministic only
+    <config>_<mask>_det_overhead.png     # bwd bf16: det vs non-det comparison
+```
 
-### GB200 - DeepSeek V3 Causal (top_left)
-![DeepSeek V3 Causal on GB200](results/gb200_919_only_cudnn/dsv3_top_left.png)
-- SDPA parameters: `batch=1; num_q_heads=128; num_kv_heads=128; head_dim_qk=192; head_dim_vo=128; is_causal=True`
-- Sequence lengths shown on x-axis
-- Results obtained on NVIDIA GB200 GPU
-
-### GB200 - GPT-OSS Causal (top_left)
-![GPT-OSS Causal on GB200](results/gb200_919_only_cudnn/gpt_oss_top_left.png)
-- SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=64; is_causal=True`
-- Sequence lengths shown on x-axis
-- Results obtained on NVIDIA GB200 GPU
+Runs were captured on Lyris GB200 and GB300 with cuDNN 9.22.0 and FAv4 4.0.0b10.
 
 ### GB300 - Llama 3.1 Causal (top_left)
-![Llama 3.1 Causal on GB300](results/gb300_919_only_cudnn/llama3.1_top_left.png)
-- SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=True`
-- Sequence lengths shown on x-axis
-- Results obtained on NVIDIA GB300 GPU
+![Llama 3.1 Causal on GB300](results/llama3.1/gb300/llama3.1_top_left.png)
+- `batch=2; num_q_heads=64; num_kv_heads=8; head_dim=128`
 
 ### GB300 - Llama 3.1 Non-Causal (no_mask)
-![Llama 3.1 Non-Causal on GB300](results/gb300_919_only_cudnn/llama3.1_no_mask.png)
-- SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=False`
-- Sequence lengths shown on x-axis
-- Results obtained on NVIDIA GB300 GPU
+![Llama 3.1 Non-Causal on GB300](results/llama3.1/gb300/llama3.1_no_mask.png)
+- `batch=2; num_q_heads=64; num_kv_heads=8; head_dim=128`
 
-### GB300 - DeepSeek V3 Causal (top_left)
-![DeepSeek V3 Causal on GB300](results/gb300_919_only_cudnn/dsv3_top_left.png)
-- SDPA parameters: `batch=1; num_q_heads=128; num_kv_heads=128; head_dim_qk=192; head_dim_vo=128; is_causal=True`
-- Sequence lengths shown on x-axis
-- Results obtained on NVIDIA GB300 GPU
+### GB300 - DeepSeek V3 (MLA, asymmetric head dims)
+![DeepSeek V3 Causal on GB300](results/dsv3/gb300/dsv3_top_left.png)
+![DeepSeek V3 Non-Causal on GB300](results/dsv3/gb300/dsv3_no_mask.png)
+- `batch=2; num_q_heads=128; num_kv_heads=128; head_dim_qk=192; head_dim_vo=128`
 
-### GB300 - GPT-OSS Causal (top_left)
-![GPT-OSS Causal on GB300](results/gb300_919_only_cudnn/gpt_oss_top_left.png)
-- SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=64; is_causal=True`
-- Sequence lengths shown on x-axis
-- Results obtained on NVIDIA GB300 GPU
+### GB300 - Kimi-K2.6 (MLA, asymmetric head dims)
+![Kimi-K2.6 Causal on GB300](results/kimiK26/gb300/kimiK26_top_left.png)
+![Kimi-K2.6 Non-Causal on GB300](results/kimiK26/gb300/kimiK26_no_mask.png)
+- `batch=2; num_q_heads=64; num_kv_heads=64; head_dim_qk=192; head_dim_vo=128`
 
-### H200 - Llama 3.1 Causal (top_left)
-![Llama 3.1 Causal on H200](results/h200_919_only_cudnn/llama3.1_top_left.png)
-- SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=True`
-- Sequence lengths shown on x-axis
-- Results obtained on NVIDIA H200 GPU
+### GB300 - Wan 2.2 (video DiT, bidirectional)
+![Wan 2.2 Non-Causal on GB300](results/wan22/gb300/wan22_no_mask.png)
+- `batch=1; num_q_heads=40; num_kv_heads=40; head_dim=128`
 
-### H200 - Llama 3.1 Non-Causal (no_mask)
-![Llama 3.1 Non-Causal on H200](results/h200_919_only_cudnn/llama3.1_no_mask.png)
-- SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=False`
-- Sequence lengths shown on x-axis
-- Results obtained on NVIDIA H200 GPU
+### GB300 - LTX-2 (video DiT, bidirectional)
+![LTX-2 Non-Causal on GB300](results/ltx2/gb300/ltx2_no_mask.png)
+- `batch=1; num_q_heads=32; num_kv_heads=32; head_dim=128`
 
-### H200 - DeepSeek V3 Causal (top_left)
-![DeepSeek V3 Causal on H200](results/h200_919_only_cudnn/dsv3_top_left.png)
-- SDPA parameters: `batch=1; num_q_heads=128; num_kv_heads=128; head_dim_qk=192; head_dim_vo=128; is_causal=True`
-- Sequence lengths shown on x-axis
-- Results obtained on NVIDIA H200 GPU
+### GB300 - GPT-OSS (sliding window attention, W=128)
+![GPT-OSS Causal on GB300](results/gpt_oss/gb300/gpt_oss_top_left.png)
+- `batch=2; num_q_heads=128; num_kv_heads=128; head_dim=64; sliding_window_size=128`
 
-### H200 - GPT-OSS Causal (top_left)
-![GPT-OSS Causal on H200](results/h200_919_only_cudnn/gpt_oss_top_left.png)
-- SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=64; is_causal=True`
-- Sequence lengths shown on x-axis
-- Results obtained on NVIDIA H200 GPU
+### GB300 - Qwen 3.5 (head_dim=256, fwd only)
+![Qwen 3.5 Causal on GB300](results/qwen35/gb300/qwen35_top_left.png)
+- `batch=2; num_q_heads=32; num_kv_heads=2; head_dim=256` — cuDNN BF16 fwd only at head_dim=256 on Blackwell
+
+GB200 results are available under the same layout at `results/<config>/gb200/`.

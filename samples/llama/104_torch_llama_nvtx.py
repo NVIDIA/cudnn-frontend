@@ -19,7 +19,6 @@ import torch.nn.functional as F
 from torch.nn import Linear, RMSNorm
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-
 # For type annotations
 Tensor = torch.Tensor
 

@@ -1370,3 +1370,575 @@ def _test_grouped_gemm_dglu_discrete_wrapper_dynamic_m_cache_behavior(request, m
         grouped_gemm_dglu_api._cache_of_GroupedGemmDgluSm100Objects.clear()
 
     return compile_count["value"], cache_entries
+
+
+# ---------------------------------------------------------------------------
+#  Linear-offset plumbing tests (act_func="dgeglu")
+# ---------------------------------------------------------------------------
+#
+# The backward kernel computes
+#     dx_gate = x_gate_filter * g * sigmoid_out * (1 + 1.702 * y_gate * (1 - sigmoid_out)) * (y_up + linear_offset)
+#     dx_up   = x_up_filter   * g * y_gate * sigmoid_out
+#     prob_grad += y_gate * sigmoid_out * (y_up + linear_offset) * fc2_dgrad
+# with y_gate / y_up taken from interleaved 32-column blocks of the forward
+# activation tensor C (and clamped to [-7.0, 7.0] / [..., 7.0] inside the
+# kernel). Because dx_up is independent of ``linear_offset``, varying
+# ``linear_offset`` while keeping every other input fixed must leave the
+# "up" 32-column blocks of d_row / d_col exactly unchanged. The "gate"
+# blocks must change, and ``dprob_tensor`` must also change.
+
+
+def _interleaved_block_indices(n_out: int, device) -> "tuple[torch.Tensor, torch.Tensor]":
+    group = 32
+    assert n_out % group == 0 and (n_out // group) % 2 == 0
+    cols = torch.arange(n_out, device=device)
+    block_cols = cols.view(n_out // group, group)
+    return block_cols[0::2].reshape(-1), block_cols[1::2].reshape(-1)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("linear_offset", [0.5, 1.0])
+def test_grouped_gemm_dglu_discrete_wrapper_linear_offset_dgeglu(linear_offset, request):
+    """Verify ``linear_offset`` correctly reaches the backward kernel.
+
+    Plumbing checks performed:
+
+    * ``dx_up`` (odd 32-column blocks of ``d_row_tensor``) is independent of
+      ``linear_offset`` and must be bit-identical between a run with
+      ``linear_offset=0.0`` and a run with the parameterized value.
+    * ``dx_gate`` (even 32-column blocks) and ``dprob_tensor`` must differ
+      between the two runs (otherwise the kernel ignored the new value).
+    """
+    try:
+        from cudnn import grouped_gemm_dglu_wrapper_sm100
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("cudnn optional dependencies not installed")
+
+    cfg = discrete_dswiglu_init(
+        request=request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float32,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="dgeglu",
+        b_major="k",
+    )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    inputs = allocate_discrete_dswiglu_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        num_experts=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        c_dtype=cfg["c_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+    )
+
+    common_kwargs = dict(
+        a_tensor=inputs["a_tensor"],
+        c_tensor=inputs["c_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        beta_tensor=inputs["beta_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        b_ptrs=inputs["b_ptrs_tensor"],
+        sfb_ptrs=inputs["sfb_ptrs_tensor"],
+        n=cfg["n"],
+        b_dtype=inputs["b_list"][0].dtype,
+        b_major=cfg["b_major"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        act_func="dgeglu",
+        current_stream=stream,
+    )
+
+    try:
+        # First run: linear_offset = 0.0
+        inputs["dprob_tensor"].zero_()
+        dprob_zero_in = inputs["dprob_tensor"]
+        out_zero = grouped_gemm_dglu_wrapper_sm100(
+            dprob_tensor=dprob_zero_in,
+            linear_offset=0.0,
+            **common_kwargs,
+        )
+        torch.cuda.synchronize()
+        d_row_zero = out_zero["d_row_tensor"].clone()
+        dprob_zero = out_zero["dprob_tensor"].clone()
+
+        # Second run: linear_offset = parameterized value, with a freshly zeroed dprob
+        inputs["dprob_tensor"].zero_()
+        out_offset = grouped_gemm_dglu_wrapper_sm100(
+            dprob_tensor=inputs["dprob_tensor"],
+            linear_offset=linear_offset,
+            **common_kwargs,
+        )
+        torch.cuda.synchronize()
+        d_row_offset = out_offset["d_row_tensor"].clone()
+        dprob_offset = out_offset["dprob_tensor"].clone()
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+
+    valid_m = inputs["valid_m"]
+    n_out = 2 * cfg["n"]
+    gate_idx, up_idx = _interleaved_block_indices(n_out, d_row_zero.device)
+
+    # dx_up does not depend on linear_offset -> must be bit-identical
+    torch.testing.assert_close(
+        d_row_zero[:valid_m].index_select(1, up_idx).cpu(),
+        d_row_offset[:valid_m].index_select(1, up_idx).cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    # dx_gate must move with linear_offset (otherwise the kernel ignored it).
+    gate_zero = d_row_zero[:valid_m].index_select(1, gate_idx).float()
+    gate_offset = d_row_offset[:valid_m].index_select(1, gate_idx).float()
+    assert not torch.equal(gate_zero, gate_offset), "dx_gate did not change when linear_offset was varied"
+
+    # dprob also picks up linear_offset (it must differ unless prob_tensor or
+    # forward activations happen to be identically zero, which would be a
+    # degenerate test setup).
+    assert not torch.equal(dprob_zero, dprob_offset), "dprob did not change when linear_offset was varied"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_dglu_discrete_wrapper_linear_offset_default_dgeglu_is_one(request):
+    """Default ``linear_offset=None`` must reproduce ``linear_offset=1.0`` for dgeglu.
+
+    Mirrors the forward-side default test to guard the documented backwards-
+    compatibility behavior.
+    """
+    try:
+        from cudnn import grouped_gemm_dglu_wrapper_sm100
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("cudnn optional dependencies not installed")
+
+    cfg = discrete_dswiglu_init(
+        request=request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float32,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="dgeglu",
+        b_major="k",
+    )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    inputs = allocate_discrete_dswiglu_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        num_experts=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        c_dtype=cfg["c_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+    )
+
+    common_kwargs = dict(
+        a_tensor=inputs["a_tensor"],
+        c_tensor=inputs["c_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        beta_tensor=inputs["beta_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        b_ptrs=inputs["b_ptrs_tensor"],
+        sfb_ptrs=inputs["sfb_ptrs_tensor"],
+        n=cfg["n"],
+        b_dtype=inputs["b_list"][0].dtype,
+        b_major=cfg["b_major"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        act_func="dgeglu",
+        current_stream=stream,
+    )
+
+    try:
+        inputs["dprob_tensor"].zero_()
+        out_default = grouped_gemm_dglu_wrapper_sm100(
+            dprob_tensor=inputs["dprob_tensor"],
+            **common_kwargs,
+        )
+        torch.cuda.synchronize()
+        d_row_default = out_default["d_row_tensor"].clone()
+        dprob_default = out_default["dprob_tensor"].clone()
+
+        inputs["dprob_tensor"].zero_()
+        out_one = grouped_gemm_dglu_wrapper_sm100(
+            dprob_tensor=inputs["dprob_tensor"],
+            linear_offset=1.0,
+            **common_kwargs,
+        )
+        torch.cuda.synchronize()
+        d_row_one = out_one["d_row_tensor"].clone()
+        dprob_one = out_one["dprob_tensor"].clone()
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+
+    valid_m = inputs["valid_m"]
+    torch.testing.assert_close(
+        d_row_default[:valid_m].cpu(),
+        d_row_one[:valid_m].cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        dprob_default[:valid_m].cpu(),
+        dprob_one[:valid_m].cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+#  Alpha + clamp plumbing tests (act_func="dgeglu")
+# ---------------------------------------------------------------------------
+
+
+def _run_dgeglu_wrapper(request, *, alpha, glu_clamp_max, glu_clamp_min, linear_offset, cfg=None, inputs=None):
+    """Helper: run grouped_gemm_dglu_wrapper_sm100 with act_func="dgeglu" once.
+
+    If *cfg* and *inputs* are supplied they are reused (no fresh allocation),
+    allowing callers to compare runs that differ only in runtime knobs.
+    """
+
+    from cudnn import grouped_gemm_dglu_wrapper_sm100
+    from cuda.bindings import driver as cuda
+
+    if cfg is None:
+        cfg = discrete_dswiglu_init(
+            request=request,
+            ab_dtype=torch.float4_e2m1fn_x2,
+            c_dtype=torch.bfloat16,
+            d_dtype=torch.float32,
+            cd_major="n",
+            acc_dtype=torch.float32,
+            mma_tiler_mn=(256, 256),
+            cluster_shape_mn=(2, 1),
+            sf_vec_size=32,
+            sf_dtype=torch.float8_e8m0fnu,
+            vector_f32=False,
+            discrete_col_sfd=False,
+            act_func="dgeglu",
+            b_major="k",
+        )
+
+    if inputs is None:
+        inputs = allocate_discrete_dswiglu_input_tensors(
+            n=cfg["n"],
+            k=cfg["k"],
+            num_experts=cfg["l"],
+            group_m_list=cfg["group_m_list"],
+            ab_dtype=cfg["ab_dtype"],
+            c_dtype=cfg["c_dtype"],
+            sf_dtype=cfg["sf_dtype"],
+            sf_vec_size=cfg["sf_vec_size"],
+            m_aligned=cfg["m_aligned"],
+            b_major=cfg["b_major"],
+        )
+
+    inputs["dprob_tensor"].zero_()
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    out = grouped_gemm_dglu_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        c_tensor=inputs["c_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        beta_tensor=inputs["beta_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        dprob_tensor=inputs["dprob_tensor"],
+        b_ptrs=inputs["b_ptrs_tensor"],
+        sfb_ptrs=inputs["sfb_ptrs_tensor"],
+        n=cfg["n"],
+        b_dtype=inputs["b_list"][0].dtype,
+        b_major=cfg["b_major"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        act_func="dgeglu",
+        linear_offset=linear_offset,
+        geglu_alpha=alpha,
+        glu_clamp_max=glu_clamp_max,
+        glu_clamp_min=glu_clamp_min,
+        current_stream=stream,
+    )
+    torch.cuda.synchronize()
+    return cfg, inputs, out
+
+
+def _make_dgeglu_clamp_sensitive_inputs(inputs, n):
+    n_out = 2 * n
+    gate_idx, up_idx = _interleaved_block_indices(n_out, inputs["c_tensor"].device)
+
+    with torch.no_grad():
+        inputs["alpha_tensor"].fill_(1.0)
+        inputs["beta_tensor"].fill_(1.0)
+        inputs["prob_tensor"].fill_(1.0)
+
+        inputs["c_tensor"][:, gate_idx, :] = 3.0
+        inputs["c_tensor"][:, up_idx, :] = 1.0
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("alpha", [1.0, 1.702, 2.0])
+def test_grouped_gemm_dglu_discrete_wrapper_alpha_dgeglu(alpha, request):
+    """Verify that varying ``geglu_alpha`` reaches the backward kernel.
+
+    ``dx_up = g * y_gate * sigmoid(alpha * y_gate)`` depends on ``alpha`` only
+    through ``sigmoid(alpha * y_gate)``, while ``dx_gate`` and ``dprob``
+    additionally pick up the ``(1 + alpha * y_gate * (1 - sigmoid))`` factor.
+    Two runs differing only in ``alpha`` must produce different ``d_row``
+    tensors and different ``dprob`` outputs (otherwise ``alpha`` was ignored).
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("cudnn optional dependencies not installed")
+
+    try:
+        cfg, inputs, out_a = _run_dgeglu_wrapper(
+            request,
+            alpha=alpha,
+            glu_clamp_max=7.0,
+            glu_clamp_min=-7.0,
+            linear_offset=1.0,
+        )
+        d_row_a = out_a["d_row_tensor"].clone()
+        dprob_a = out_a["dprob_tensor"].clone()
+
+        _, _, out_b = _run_dgeglu_wrapper(
+            request,
+            alpha=1.0 if alpha != 1.0 else 2.5,
+            glu_clamp_max=7.0,
+            glu_clamp_min=-7.0,
+            linear_offset=1.0,
+            cfg=cfg,
+            inputs=inputs,
+        )
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+
+    valid_m = inputs["valid_m"]
+    assert not torch.equal(
+        d_row_a[:valid_m].float().cpu(),
+        out_b["d_row_tensor"][:valid_m].float().cpu(),
+    ), "d_row did not change when alpha was varied"
+    assert not torch.equal(
+        dprob_a[:valid_m].float().cpu(),
+        out_b["dprob_tensor"][:valid_m].float().cpu(),
+    ), "dprob did not change when alpha was varied"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("glu_clamp_max", [3.5, 7.0, 1.0e6])
+def test_grouped_gemm_dglu_discrete_wrapper_clamp_max_dgeglu(glu_clamp_max, request):
+    """Verify that varying ``glu_clamp_max`` reaches the backward kernel.
+
+    Two runs differing only in ``glu_clamp_max`` must produce different
+    gradient outputs (otherwise the clamp/mask was ignored). The very-large
+    ``1.0e6`` value exercises the "effectively no clamp" path; ``3.5``
+    saturates a meaningful fraction of the inputs.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("cudnn optional dependencies not installed")
+
+    try:
+        cfg, inputs, _ = _run_dgeglu_wrapper(
+            request,
+            alpha=1.702,
+            glu_clamp_max=7.0,
+            glu_clamp_min=-7.0,
+            linear_offset=1.0,
+        )
+        _make_dgeglu_clamp_sensitive_inputs(inputs, cfg["n"])
+
+        _, _, out_a = _run_dgeglu_wrapper(
+            request,
+            alpha=1.702,
+            glu_clamp_max=glu_clamp_max,
+            glu_clamp_min=-glu_clamp_max,
+            linear_offset=1.0,
+            cfg=cfg,
+            inputs=inputs,
+        )
+        d_row_a = out_a["d_row_tensor"].clone()
+
+        _, _, out_b = _run_dgeglu_wrapper(
+            request,
+            alpha=1.702,
+            glu_clamp_max=2.0 if glu_clamp_max != 2.0 else 5.0,
+            glu_clamp_min=-(2.0 if glu_clamp_max != 2.0 else 5.0),
+            linear_offset=1.0,
+            cfg=cfg,
+            inputs=inputs,
+        )
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+
+    valid_m = inputs["valid_m"]
+    assert not torch.equal(
+        d_row_a[:valid_m].float().cpu(),
+        out_b["d_row_tensor"][:valid_m].float().cpu(),
+    ), "d_row did not change when glu_clamp_max was varied"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_dglu_discrete_wrapper_alpha_default_is_1702(request):
+    """Default ``geglu_alpha`` / clamp values must reproduce the explicit defaults."""
+    try:
+        from cudnn import grouped_gemm_dglu_wrapper_sm100
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("cudnn optional dependencies not installed")
+
+    cfg = discrete_dswiglu_init(
+        request=request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float32,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="dgeglu",
+        b_major="k",
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    inputs = allocate_discrete_dswiglu_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        num_experts=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        c_dtype=cfg["c_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+    )
+
+    common_kwargs = dict(
+        a_tensor=inputs["a_tensor"],
+        c_tensor=inputs["c_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        beta_tensor=inputs["beta_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        b_ptrs=inputs["b_ptrs_tensor"],
+        sfb_ptrs=inputs["sfb_ptrs_tensor"],
+        n=cfg["n"],
+        b_dtype=inputs["b_list"][0].dtype,
+        b_major=cfg["b_major"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        act_func="dgeglu",
+        linear_offset=1.0,
+        current_stream=stream,
+    )
+
+    try:
+        inputs["dprob_tensor"].zero_()
+        out_default = grouped_gemm_dglu_wrapper_sm100(
+            dprob_tensor=inputs["dprob_tensor"],
+            **common_kwargs,
+        )
+        torch.cuda.synchronize()
+        d_row_default = out_default["d_row_tensor"].clone()
+        dprob_default = out_default["dprob_tensor"].clone()
+
+        inputs["dprob_tensor"].zero_()
+        out_explicit = grouped_gemm_dglu_wrapper_sm100(
+            dprob_tensor=inputs["dprob_tensor"],
+            geglu_alpha=1.702,
+            glu_clamp_max=7.0,
+            glu_clamp_min=-7.0,
+            **common_kwargs,
+        )
+        torch.cuda.synchronize()
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+
+    valid_m = inputs["valid_m"]
+    torch.testing.assert_close(
+        d_row_default[:valid_m].cpu(),
+        out_explicit["d_row_tensor"][:valid_m].cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        dprob_default[:valid_m].cpu(),
+        out_explicit["dprob_tensor"][:valid_m].cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )

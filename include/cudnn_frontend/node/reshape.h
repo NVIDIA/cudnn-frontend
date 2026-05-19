@@ -33,13 +33,31 @@ class ReshapeNode : public NodeCRTP<ReshapeNode> {
             y_tensor->set_dim(attributes.dim);
         }
 
+        // Graph producers may represent scalar reshape outputs
+        // as rank-0 tensors (dim={}).  Without promotion, stride inference below
+        // would call generate_NHWC_stride_order(0), which is UB, and the cuDNN
+        // backend rejects rank-0 descriptors regardless.  Promote to canonical
+        // rank-1 length-1 -- value-preserving because a scalar has volume 1 --
+        // while keeping the normalization node-local so downstream broadcast/shape
+        // inference remains intact.
+        if (y_tensor->get_dim().empty()) {
+            y_tensor->set_dim({1});
+            if (y_tensor->get_stride().empty()) {
+                y_tensor->set_stride({1});
+            }
+        }
+
         if (y_tensor->get_stride().empty()) {
             if (attributes.get_stride().size()) {
                 y_tensor->set_stride(attributes.get_stride());
             } else {
                 auto const& y_dim = y_tensor->get_dim();
-                // Default to NHWC
-                auto const& stride_order = detail::generate_NHWC_stride_order(y_dim.size());
+                // Default to NHWC for multi-axis tensors. generate_NHWC_stride_order
+                // indexes stride_order[1] and assumes num_dims >= 2; use row-major
+                // for scalars (0-D) and vectors (1-D).
+                const int64_t rank = static_cast<int64_t>(y_dim.size());
+                std::vector<int64_t> const stride_order =
+                    rank < 2 ? detail::generate_row_major_stride_order(rank) : detail::generate_NHWC_stride_order(rank);
                 y_tensor->set_stride(detail::generate_stride(y_dim, stride_order));
             }
         }

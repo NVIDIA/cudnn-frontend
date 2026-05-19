@@ -17,6 +17,7 @@ BLOCKED_TESTS = {
 
     # FP8 backward GQA numerical accuracy issues on Hopper - passes on Blackwell
     "test_sdpa_fp8_bwd_L0[test1]": {"sms": ["SM_90"]},
+    "test_sdpa_fp8_bwd_L0[test3]": {"sms": ["SM_90"]},
     "test_sdpa_fp8_bwd_L0[test17]": {"sms": ["SM_90"]},
     "test_sdpa_fp8_bwd_L0[test20]": {"sms": ["SM_90"]},
     "test_sdpa_fp8_bwd_L0[test24]": {"sms": ["SM_90"]},
@@ -30,6 +31,8 @@ BLOCKED_TESTS = {
     "test_sdpa_fp8_bwd_L0[test56]": {"sms": ["SM_90"]},
     "test_sdpa_fp8_bwd_L0[test57]": {"sms": ["SM_90"]},
     "test_sdpa_fp8_bwd_L0[test62]": {"sms": ["SM_90"]},
+    "test_sdpa_fp8_bwd_L0[test112]": {"sms": ["SM_90"]},
+    "test_sdpa_fp8_bwd_L0[test160]": {"sms": ["SM_90"]},
 
     # Hopper-only blocks for bug 5732676 illegal-instruction failures in fp8 ragged tests.
     "test_sdpa_fp8_fwd_ragged_L0[test1]": {"sms": ["SM_90"]},

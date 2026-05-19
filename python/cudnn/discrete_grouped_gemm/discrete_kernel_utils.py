@@ -46,7 +46,6 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 from cutlass.cutlass_dsl import T, dsl_user_op
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -379,9 +378,18 @@ def silu_f32(a: Union[float, Float32], fastmath: bool = False) -> Union[float, F
     return a * sigmoid_f32(a, fastmath=fastmath)
 
 
+def silu_f32_scaled(
+    a: Union[float, Float32],
+    alpha: Union[float, Float32] = 1.702,
+    fastmath: bool = False,
+) -> Union[float, Float32]:
+    """Compute the scaled SiLU ``a * sigmoid(alpha * a)`` of the input."""
+    return a * sigmoid_f32(a * alpha, fastmath=fastmath)
+
+
 def silu_f32_geglu_scaled(a: Union[float, Float32], fastmath: bool = False) -> Union[float, Float32]:
-    """Compute the GeGLU-scaled SiLU (scale factor 1.702) of the input value."""
-    return a * sigmoid_f32(a * 1.702, fastmath=fastmath)
+    """Backwards-compatible wrapper for :func:`silu_f32_scaled` with ``alpha=1.702``."""
+    return silu_f32_scaled(a, alpha=1.702, fastmath=fastmath)
 
 
 # ---------------------------------------------------------------------------

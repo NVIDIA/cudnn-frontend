@@ -251,6 +251,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -261,6 +262,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -428,6 +430,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -439,6 +442,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # For 2CTA blockscaled kernels, SFB needs to be replicated across peer CTAs.
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -693,8 +697,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
 
         # TMEM dealloc barrier + holding buffer setup
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
-        tmem_holding_buf = storage.tmem_holding_buf
+        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.ptr
+        tmem_holding_buf = storage.tmem_holding_buf.ptr
 
         # Initialize TMEM cross-CTA dealloc mbarrier when using 2-CTA instructions
         if use_2cta_instrs:

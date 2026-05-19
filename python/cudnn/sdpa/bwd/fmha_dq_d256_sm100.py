@@ -39,7 +39,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
-from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.nvgpu import cpasync, OperandMajorMode
 from cutlass.cute.typing import Int32, Int64, Float32
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
@@ -270,13 +270,13 @@ class BlackwellFusedAttentionDQKernel:
         self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
         self.dq_layout = utils.LayoutEnum.from_tensor(dq)
 
-        if cutlass.const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.q_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
-        if cutlass.const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.k_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of k is not supported")
-        if cutlass.const_expr(self.v_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.v_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of v is not supported")
-        if cutlass.const_expr(self.do_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.do_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of v is not supported")
 
         # check type consistency
@@ -292,9 +292,10 @@ class BlackwellFusedAttentionDQKernel:
         cta_group = tcgen05.CtaGroup.TWO
         # the intermediate tensor p is from tmem & k-major
         ds_source = tcgen05.OperandSource.TMEM
-        ds_major_mode = tcgen05.OperandMajorMode.K
-        k_trans_major_mode = tcgen05.OperandMajorMode.MN
+        ds_major_mode = OperandMajorMode.K
+        k_trans_major_mode = OperandMajorMode.MN
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
@@ -304,6 +305,7 @@ class BlackwellFusedAttentionDQKernel:
         )
         dov_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.do_dtype,
+            self.do_dtype,
             self.do_major_mode,
             self.v_major_mode,
             self.acc_dtype,
@@ -311,6 +313,7 @@ class BlackwellFusedAttentionDQKernel:
             self.dov_mma_tiler[:2],
         )
         dsk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             ds_major_mode,
             k_trans_major_mode,
@@ -658,11 +661,11 @@ class BlackwellFusedAttentionDQKernel:
 
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_ids[0],
             is_two_cta=True,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
         tmem.allocate(self.tmem_alloc_cols)
         tmem.wait_for_alloc()
@@ -921,7 +924,7 @@ class BlackwellFusedAttentionDQKernel:
                     thread_idx = tidx % self.threads_per_warp
                     async_copy_num_elts = sLSE.shape[0] // self.threads_per_warp
                     atom_async_copy = cute.make_copy_atom(
-                        cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS),
+                        cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.ALWAYS),
                         self.acc_dtype,
                         num_bits_per_copy=self.acc_dtype.width,
                     )

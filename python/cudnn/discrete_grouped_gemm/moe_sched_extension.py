@@ -34,7 +34,7 @@ from cutlass.cutlass_dsl import Int32, extract_mlir_values, new_from_mlir_values
 
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 from .moe_utils import (
     OnlineTensormapDescCreator,
     tensormap_ptr_for_copy,

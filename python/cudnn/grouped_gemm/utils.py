@@ -309,11 +309,25 @@ def silu_f32(a: Union[float, Float32], fastmath: bool = False) -> Union[float, F
     return a * sigmoid_f32(a, fastmath=fastmath)
 
 
+def silu_f32_scaled(
+    a: Union[float, Float32],
+    alpha: Union[float, Float32] = 1.702,
+    fastmath: bool = False,
+) -> Union[float, Float32]:
+    """Compute the scaled SiLU ``a * sigmoid(alpha * a)`` of the input.
+
+    :param a: Input value.
+    :param alpha: Pre-sigmoid scaling factor. Defaults to the GeGLU/GPT-OSS
+        constant ``1.702`` for backwards compatibility with the previous
+        ``silu_f32_geglu_scaled`` helper.
+    :param fastmath: Whether to use fast math approximations.
+    """
+    return a * sigmoid_f32(a * alpha, fastmath=fastmath)
+
+
 def silu_f32_geglu_scaled(a: Union[float, Float32], fastmath: bool = False) -> Union[float, Float32]:
-    """
-    Compute the scaled silu of the input tensor.
-    """
-    return a * sigmoid_f32(a * 1.702, fastmath=fastmath)
+    """Backwards-compatible wrapper for :func:`silu_f32_scaled` with ``alpha=1.702``."""
+    return silu_f32_scaled(a, alpha=1.702, fastmath=fastmath)
 
 
 @cute.jit

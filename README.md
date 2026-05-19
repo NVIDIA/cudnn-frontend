@@ -40,6 +40,7 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 *   **[cudnn SDPA Fprop](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/sdpa):** Open sourcing the Hopper and Blackwell fprop kernels with stats.
 *   **[Fused RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/rms_norm_silu):** Implementation of a fused kernel of RMS normalization followed by SiLU (Swish) activation.
 *   **[SDPA PyTorch Op](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/experimental/ops):** PyTorch custom operator for cuDNN-accelerated Scaled Dot-Product Attention with autograd and `torch.compile` support.
+*   **[DSA](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/native_sparse_attention):** DSA/CSA kernels for DSv4 and DSv3.2 for fprop and bprop.
 
 ## Tech talks
 

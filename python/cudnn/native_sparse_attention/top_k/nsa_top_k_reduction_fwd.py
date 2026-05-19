@@ -183,6 +183,7 @@ class FineGrainedReductionQK:
 
         QK_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
+            self.element_dtype,
             self.q_major_mode,
             self.k_major_mode,
             self.acc_dtype,
@@ -500,7 +501,7 @@ class FineGrainedReductionQK:
 
                         async_copy_num_elts = sLSE.shape[0] // self.threads_per_warp
                         atom_async_copy = cute.make_copy_atom(
-                            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS),
+                            cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.ALWAYS),
                             self.acc_dtype,
                             num_bits_per_copy=self.acc_dtype.width,
                         )
@@ -559,7 +560,7 @@ class FineGrainedReductionQK:
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
 
                 num_tmem_cols = 512
-                cute.arch.alloc_tmem(num_tmem_cols, storage.tmem_holding_buf)
+                cute.arch.alloc_tmem(num_tmem_cols, storage.tmem_holding_buf.ptr)
                 cute.arch.barrier(
                     barrier_id=self.tmem_alloc_sync_bar_id,
                     number_of_threads=self.threads_per_warp,
@@ -875,7 +876,7 @@ class FineGrainedReductionQK:
                     tmem_ptr = cute.arch.retrieve_tmem_ptr(
                         self.acc_dtype,
                         alignment=16,
-                        ptr_to_buffer_holding_addr=storage.tmem_holding_buf,
+                        ptr_to_buffer_holding_addr=storage.tmem_holding_buf.ptr,
                     )
                     cute.arch.dealloc_tmem(tmem_ptr, 512)
 

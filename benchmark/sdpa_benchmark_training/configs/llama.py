@@ -13,8 +13,8 @@ from ..config_types import ModelPreset, BenchmarkConfig
 
 LLAMA3_1 = ModelPreset(
     name="llama3.1",
-    num_q_heads=32,
-    num_kv_heads=4,
+    num_q_heads=64,
+    num_kv_heads=8,
     head_dim=128,
 )
 
@@ -32,8 +32,8 @@ CONFIG = BenchmarkConfig(
     data_types=["bfloat16", "fp8", "mxfp8"],
     attn_masks=["top_left", "no_mask"],  # Both causal and non-causal
     profile_pass="both",  # Forward and backward
-    deterministic_bwd=[True],
-    batch_size=1,
+    deterministic_bwd=[False, True],
+    batch_size=2,
     num_iterations=10,
     output_dir="results",
 )

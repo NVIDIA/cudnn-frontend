@@ -549,10 +549,57 @@ PyGraph::get_workspace_size() {
 }
 
 int64_t
+PyGraph::get_workspace_size(std::optional<std::intptr_t> exec_handle,
+                            py::object override_uids,
+                            py::object override_shapes,
+                            py::object override_strides) {
+    std::vector<int64_t> override_uids_vec =
+        override_uids.is_none() ? std::vector<int64_t>() : override_uids.cast<std::vector<int64_t>>();
+    std::vector<std::vector<int64_t>> override_shapes_vec =
+        override_shapes.is_none() ? std::vector<std::vector<int64_t>>()
+                                  : override_shapes.cast<std::vector<std::vector<int64_t>>>();
+    std::vector<std::vector<int64_t>> override_strides_vec =
+        override_strides.is_none() ? std::vector<std::vector<int64_t>>()
+                                   : override_strides.cast<std::vector<std::vector<int64_t>>>();
+
+    int64_t workspace     = 0;
+    cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
+    auto status =
+        graph->get_workspace_size(handle_, workspace, override_uids_vec, override_shapes_vec, override_strides_vec);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+
+    return workspace;
+}
+
+int64_t
 PyGraph::get_workspace_size_plan_at_index(int64_t index) {
     int64_t workspace;
 
     auto status = graph->get_workspace_size_plan_at_index(index, workspace);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+
+    return workspace;
+}
+
+int64_t
+PyGraph::get_workspace_size_plan_at_index(int64_t index,
+                                          std::optional<std::intptr_t> exec_handle,
+                                          py::object override_uids,
+                                          py::object override_shapes,
+                                          py::object override_strides) {
+    std::vector<int64_t> override_uids_vec =
+        override_uids.is_none() ? std::vector<int64_t>() : override_uids.cast<std::vector<int64_t>>();
+    std::vector<std::vector<int64_t>> override_shapes_vec =
+        override_shapes.is_none() ? std::vector<std::vector<int64_t>>()
+                                  : override_shapes.cast<std::vector<std::vector<int64_t>>>();
+    std::vector<std::vector<int64_t>> override_strides_vec =
+        override_strides.is_none() ? std::vector<std::vector<int64_t>>()
+                                   : override_strides.cast<std::vector<std::vector<int64_t>>>();
+
+    int64_t workspace     = 0;
+    cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
+    auto status           = graph->get_workspace_size_plan_at_index(
+        handle_, index, workspace, override_uids_vec, override_shapes_vec, override_strides_vec);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     return workspace;
@@ -1233,9 +1280,16 @@ init_pygraph_submodule(py::module_& m) {
              R"pbdoc(
                 Get the number of execution plan candidates.
             )pbdoc")
-        .def("get_workspace_size", &PyGraph::get_workspace_size)
+        .def("get_workspace_size", (int64_t (PyGraph::*)())&PyGraph::get_workspace_size)
+        .def("get_workspace_size",
+             (int64_t (PyGraph::*)(
+                 std::optional<std::intptr_t>, py::object, py::object, py::object))&PyGraph::get_workspace_size,
+             py::arg("handle")           = std::nullopt,
+             py::arg("override_uids")    = py::none(),
+             py::arg("override_shapes")  = py::none(),
+             py::arg("override_strides") = py::none())
         .def("get_workspace_size_plan_at_index",
-             &PyGraph::get_workspace_size_plan_at_index,
+             (int64_t (PyGraph::*)(int64_t))&PyGraph::get_workspace_size_plan_at_index,
              py::arg("index"),
              R"pbdoc(
                 Get workspace for a plan at the given index.
@@ -1243,6 +1297,17 @@ init_pygraph_submodule(py::module_& m) {
                     index (int): The index of the plan to get workspace from.
                     If the graph is not built at the index, this will return 0.
             )pbdoc")
+        .def("get_workspace_size_plan_at_index",
+             (int64_t (PyGraph::*)(int64_t,
+                                   std::optional<std::intptr_t>,
+                                   py::object,
+                                   py::object,
+                                   py::object))&PyGraph::get_workspace_size_plan_at_index,
+             py::arg("index"),
+             py::arg("handle")           = std::nullopt,
+             py::arg("override_uids")    = py::none(),
+             py::arg("override_shapes")  = py::none(),
+             py::arg("override_strides") = py::none())
         .def("query_tensor_attributes_of_uid",
              &PyGraph::query_tensor_attributes_of_uid,
              py::arg("uid"),

@@ -86,22 +86,17 @@ class SliceNode : public NodeCRTP<SliceNode> {
         auto const input  = attributes.inputs.at(Slice_attributes::input_names::X);
         auto const output = attributes.outputs.at(Slice_attributes::output_names::Y);
 
-#if (CUDNN_VERSION >= 92200)
-        // For cuDNN >= 9.22.0: Use native slice operation, create both input and output tensors
-        CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(input, tensors, potential_uid, used_uids));
-        output->set_is_virtual(false);
-        CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(output, tensors, potential_uid, used_uids));
-#else
-        // For cuDNN < 9.22.0: Fallback to pointer arithmetic approach
-        // Only assign UID to input, don't create backend tensor
+        if (detail::get_backend_version() >= 92200 && detail::get_compiled_version() >= 92200) {
+            CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(input, tensors, potential_uid, used_uids));
+            CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(output, tensors, potential_uid, used_uids));
+            return {error_code_t::OK, ""};
+        }
+
         if (input->has_uid() == false) {
             detail::assign_uid(input.get(), potential_uid, used_uids);
         }
-
-        // Create output tensor
         output->set_is_virtual(false);
         CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(output, tensors, potential_uid, used_uids));
-#endif
 
         return {error_code_t::OK, ""};
     }
@@ -116,75 +111,74 @@ class SliceNode : public NodeCRTP<SliceNode> {
 
 #if (CUDNN_VERSION >= 92200)
         // cuDNN >= 9.22.0: Use native backend slice operation
-        auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Slice requires cuDNN v9.22.0"};
+        auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Slice backend operation requires 9.22.0"};
         NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnn_ver_error);
-        CUDNN_FRONTEND_UNUSED(operations);
 
-        auto slice_operation = make_shared_backend_pointer(CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR);
+        if (detail::get_backend_version() >= 92200) {
+            CUDNN_FRONTEND_UNUSED(operations);
 
-        // Set input tensor
-        auto X         = attributes.inputs.at(Slice_attributes::input_names::X);
-        auto backend_x = tensors[X->get_uid()]->get_desc()->get_backend_descriptor();
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(slice_operation->get_backend_descriptor(),
-                                                       CUDNN_ATTR_OPERATION_SLICE_XDESC,
-                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                       1,
-                                                       &backend_x));
+            auto slice_operation = make_shared_backend_pointer(CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR);
 
-        // Set output tensor
-        auto Y         = attributes.outputs.at(Slice_attributes::output_names::Y);
-        auto backend_y = tensors[Y->get_uid()]->get_desc()->get_backend_descriptor();
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(slice_operation->get_backend_descriptor(),
-                                                       CUDNN_ATTR_OPERATION_SLICE_YDESC,
-                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                       1,
-                                                       &backend_y));
+            // Set input tensor
+            auto X         = attributes.inputs.at(Slice_attributes::input_names::X);
+            auto backend_x = tensors[X->get_uid()]->get_desc()->get_backend_descriptor();
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(slice_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SLICE_XDESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &backend_x));
 
-        // Extract start and limit indices from slices
-        std::vector<int64_t> start_indices;
-        std::vector<int64_t> limit_indices;
+            // Set output tensor
+            auto Y         = attributes.outputs.at(Slice_attributes::output_names::Y);
+            auto backend_y = tensors[Y->get_uid()]->get_desc()->get_backend_descriptor();
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(slice_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SLICE_YDESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &backend_y));
 
-        for (const auto& slice : attributes.slices) {
-            start_indices.push_back(slice.first);
-            limit_indices.push_back(slice.second);
+            // Extract start and limit indices from slices
+            std::vector<int64_t> start_indices;
+            std::vector<int64_t> limit_indices;
+
+            for (const auto& slice : attributes.slices) {
+                start_indices.push_back(slice.first);
+                limit_indices.push_back(slice.second);
+            }
+
+            // Per-dimension strides: use user slice_strides[i] when set, else 1 (preserves partial configuration)
+            std::vector<int64_t> strides(attributes.slices.size());
+            for (size_t i = 0; i < strides.size(); ++i) {
+                strides[i] = (i < attributes.slice_strides.size()) ? attributes.slice_strides[i] : 1;
+            }
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(slice_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SLICE_START_INDICES,
+                                                           CUDNN_TYPE_INT64,
+                                                           start_indices.size(),
+                                                           start_indices.data()));
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(slice_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SLICE_LIMIT_INDICES,
+                                                           CUDNN_TYPE_INT64,
+                                                           limit_indices.size(),
+                                                           limit_indices.data()));
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(slice_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SLICE_STRIDES,
+                                                           CUDNN_TYPE_INT64,
+                                                           strides.size(),
+                                                           strides.data()));
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(slice_operation->get_backend_descriptor()));
+
+            raw_operations.push_back(slice_operation);
+
+            auto const& non_virtual_uids = attributes.get_non_virtual_uids();
+            uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
+            return {error_code_t::OK, ""};
         }
-
-        // Per-dimension strides: use user slice_strides[i] when set, else 1 (preserves partial configuration)
-        std::vector<int64_t> strides(attributes.slices.size());
-        for (size_t i = 0; i < strides.size(); ++i) {
-            strides[i] = (i < attributes.slice_strides.size()) ? attributes.slice_strides[i] : 1;
-        }
-
-        // Set start indices
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(slice_operation->get_backend_descriptor(),
-                                                       CUDNN_ATTR_OPERATION_SLICE_START_INDICES,
-                                                       CUDNN_TYPE_INT64,
-                                                       start_indices.size(),
-                                                       start_indices.data()));
-
-        // Set limit indices
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(slice_operation->get_backend_descriptor(),
-                                                       CUDNN_ATTR_OPERATION_SLICE_LIMIT_INDICES,
-                                                       CUDNN_TYPE_INT64,
-                                                       limit_indices.size(),
-                                                       limit_indices.data()));
-
-        // Set strides
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(slice_operation->get_backend_descriptor(),
-                                                       CUDNN_ATTR_OPERATION_SLICE_STRIDES,
-                                                       CUDNN_TYPE_INT64,
-                                                       strides.size(),
-                                                       strides.data()));
-
-        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(slice_operation->get_backend_descriptor()));
-
-        raw_operations.push_back(slice_operation);
-
-        auto const& non_virtual_uids = attributes.get_non_virtual_uids();
-        uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
-#else
-        // cuDNN < 9.22.0: Fallback to pointer arithmetic (no backend operation needed)
-        // The collect_variant_pack_replacements_node method handles the pointer offset mapping
+#endif
         CUDNN_FRONTEND_UNUSED(operations);
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FRONTEND_UNUSED(tensors);
@@ -192,7 +186,6 @@ class SliceNode : public NodeCRTP<SliceNode> {
         getLogger() << "[cudnn_frontend] INFO: " << "Using pointer arithmetic fallback for slice on cuDNN < 9.22.0"
                     << std::endl;
 
-        // Register the output tensor as involved (input is handled via variant pack replacement)
         auto const output = attributes.outputs.at(Slice_attributes::output_names::Y);
         if (output && output->get_is_virtual() == false) {
             uids_involved_in_operations.insert(output->get_uid());
@@ -200,7 +193,6 @@ class SliceNode : public NodeCRTP<SliceNode> {
                 uids_involved_in_operations.insert(ragged_offset->get_uid());
             }
         }
-#endif
         return {error_code_t::OK, ""};
     }
 
@@ -208,6 +200,10 @@ class SliceNode : public NodeCRTP<SliceNode> {
     collect_variant_pack_replacements_node(
         std::unordered_map<Tensor_attributes::uid_t, std::pair<Tensor_attributes::uid_t, int64_t>>&
             variant_pack_replacements) const override final {
+        if (detail::get_backend_version() >= 92200 && detail::get_compiled_version() >= 92200) {
+            CUDNN_FRONTEND_UNUSED(variant_pack_replacements);
+            return {error_code_t::OK, ""};
+        }
         auto const input  = attributes.inputs.at(Slice_attributes::input_names::X);
         auto const output = attributes.outputs.at(Slice_attributes::output_names::Y);
 

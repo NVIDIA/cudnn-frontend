@@ -115,6 +115,50 @@ def _wgrad_assemble_scales_2d2d(raw_scales: list, non_k_size: int) -> torch.Tens
     return all_flat.reshape(_wgrad_round_up(non_k_size, 128), -1)
 
 
+def wgrad_to_ragged_layout(mat_2d: torch.Tensor, group_k_list: list, k_dim: int) -> torch.Tensor:
+    """Repack a Tensor2D input into expert-major physical layout."""
+    ndim = mat_2d.dim()
+    k_dim = k_dim % ndim
+    k_is_packed_axis = mat_2d.dtype == torch.float4_e2m1fn_x2 and mat_2d.stride()[k_dim] == 1
+    expected_storage = sum(group_k_list) // 2 if k_is_packed_axis else sum(group_k_list)
+    assert expected_storage == mat_2d.shape[k_dim]
+
+    if mat_2d.stride()[k_dim] != 1:
+        return mat_2d
+
+    if k_dim != ndim - 1:
+        perm = list(range(ndim))
+        perm[k_dim], perm[-1] = perm[-1], perm[k_dim]
+        mat_perm = mat_2d.permute(perm).contiguous()
+    else:
+        mat_perm = mat_2d.contiguous()
+
+    if mat_perm.dtype == torch.float4_e2m1fn_x2:
+        view = mat_perm.view(torch.uint8)
+        parts = []
+        offset = 0
+        for k in group_k_list:
+            assert k % 2 == 0
+            k_bytes = k // 2
+            parts.append(view[..., offset : offset + k_bytes].contiguous().reshape(-1))
+            offset += k_bytes
+        ragged = torch.cat(parts, dim=0).view(view.shape).view(torch.float4_e2m1fn_x2)
+    else:
+        parts = []
+        offset = 0
+        for k in group_k_list:
+            parts.append(mat_perm[..., offset : offset + k].contiguous().reshape(-1))
+            offset += k
+        ragged = torch.cat(parts, dim=0).view(mat_perm.shape)
+
+    if k_dim != ndim - 1:
+        inv_perm = list(range(ndim))
+        inv_perm[k_dim], inv_perm[-1] = inv_perm[-1], inv_perm[k_dim]
+        ragged = ragged.permute(inv_perm)
+
+    return ragged
+
+
 def grouped_gemm_wgrad_init(
     ab_dtype: torch.dtype,
     wgrad_dtype: torch.dtype,

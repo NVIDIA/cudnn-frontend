@@ -552,3 +552,43 @@ TEST_CASE("sdpa backward graph serialization", "[graph][serialize]") {
 
     REQUIRE(graph_deserialized.validate().is_good());
 }
+
+// Round-trips a plan through binary serialize/deserialize and confirms the variant
+// pack template is populated on the deserialized graph. The check verifies that
+// deserialize(handle, ...) eagerly prepares the template (instead of waiting for
+// first execute).
+TEST_CASE("Plan deserialize prepares variant pack template", "[graph][serialize][deserialize]") {
+    namespace fe = cudnn_frontend;
+
+    constexpr int64_t a_uid = 1, b_uid = 2, c_uid = 3;
+
+    fe::graph::Graph graph;
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto A = graph.tensor(
+        fe::graph::Tensor_attributes().set_name("A").set_dim({4, 16, 64}).set_stride({16 * 64, 64, 1}).set_uid(a_uid));
+    auto B = graph.tensor(
+        fe::graph::Tensor_attributes().set_name("B").set_dim({4, 64, 32}).set_stride({64 * 32, 32, 1}).set_uid(b_uid));
+
+    auto C = graph.matmul(A, B, fe::graph::Matmul_attributes().set_name("matmul"));
+    C->set_output(true).set_uid(c_uid);
+
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+
+    REQUIRE(graph.build(handle, {fe::HeurMode_t::A}).is_good());
+
+    std::vector<uint8_t> serialized_data;
+    REQUIRE(graph.serialize(serialized_data).is_good());
+
+    fe::graph::Graph graph_deserialized;
+    REQUIRE(graph_deserialized.deserialize(handle, serialized_data).is_good());
+
+    // Variant pack template should already be populated; no execute needed.
+    auto const user_uids = graph_deserialized.get_variant_pack_uids_sorted();
+    REQUIRE(user_uids == std::vector<int64_t>{a_uid, b_uid, c_uid});
+
+    cudnnDestroy(handle);
+}

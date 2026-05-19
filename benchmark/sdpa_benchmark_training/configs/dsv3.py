@@ -34,8 +34,8 @@ CONFIG = BenchmarkConfig(
     data_types=["bfloat16", "fp8", "mxfp8"],
     attn_masks=["top_left", "no_mask"],  # Causal only
     profile_pass="both",  # Forward and backward
-    deterministic_bwd=[True],
-    batch_size=1,
+    deterministic_bwd=[False, True],
+    batch_size=2,
     num_iterations=10,
     output_dir="results",
 )
