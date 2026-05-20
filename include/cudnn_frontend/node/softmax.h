@@ -101,7 +101,7 @@ class CompositeSoftmaxNode : public SoftmaxNodeBase<CompositeSoftmaxNode> {
             !((!has_stats() && !has_max() && !has_sum_exp()) ||  //
               (has_stats() && !has_max() && !has_sum_exp()) ||   //
               (!has_stats() && has_max() && has_sum_exp())),
-            error_code_t::INVALID_VALUE,
+            error_code_t::GRAPH_NOT_SUPPORTED,
             "CompositeSoftmaxNode can only output certain combinations of stats, max and sum_exp: "
             "stats only, max and sum_exp only, or none of the above.");
 

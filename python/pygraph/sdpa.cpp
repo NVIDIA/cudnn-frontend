@@ -24,6 +24,8 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        bool const use_padding_mask,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
                        cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
                        py::object const& left_bound,
                        py::object const& right_bound,
@@ -65,6 +67,14 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 
     if (block_mask) {
         attributes.set_block_mask(block_mask);
+    }
+
+    if (cu_seq_len_q) {
+        attributes.set_cu_seq_len_q(cu_seq_len_q);
+    }
+
+    if (cu_seq_len_kv) {
+        attributes.set_cu_seq_len_kv(cu_seq_len_kv);
     }
 
     if (sink_token) {
@@ -227,6 +237,8 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               bool const use_padding_mask,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
               bool const use_causal_mask,
               bool const use_causal_mask_bottom_right,
               py::object const& sliding_window,
@@ -314,6 +326,8 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          use_padding_mask,
                                          seq_len_q,
                                          seq_len_kv,
+                                         cu_seq_len_q,
+                                         cu_seq_len_kv,
                                          actual_diagonal_alignment,
                                          actual_left_bound,
                                          actual_right_bound,
@@ -535,6 +549,9 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token) {
     cudnn_frontend::DataType_t mma_core_mode                             = cudnn_frontend::DataType_t::FP8_E4M3;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> block_mask = nullptr;
+    // cu_seq_len_q/cu_seq_len_kv are not exposed via the fp8 path.
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> cu_seq_len_q  = nullptr;
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> cu_seq_len_kv = nullptr;
 
     // Handle sliding_window to left_bound mapping for backward compatibility
     py::object actual_left_bound = left_bound;
@@ -595,6 +612,8 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          use_padding_mask,
                                          seq_len_q,
                                          seq_len_kv,
+                                         cu_seq_len_q,
+                                         cu_seq_len_kv,
                                          actual_diagonal_alignment,
                                          actual_left_bound,
                                          actual_right_bound,
@@ -1073,6 +1092,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("use_padding_mask", false),
           py::arg_v("seq_len_q", nullptr),
           py::arg_v("seq_len_kv", nullptr),
+          py::arg_v("cu_seq_len_q", nullptr),
+          py::arg_v("cu_seq_len_kv", nullptr),
           py::arg_v("use_causal_mask", false),
           py::arg_v("use_causal_mask_bottom_right", false),
           py::arg_v("sliding_window_length", py::none()),
@@ -1106,6 +1127,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     use_padding_mask (Optional[bool]): Whether to use padding mask. Default is False.
                     seq_len_q (Optional[cudnn_tensor]): The sequence length of the query.
                     seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key.
+                    cu_seq_len_q (Optional[cudnn_tensor]): Cumulative sequence length of the query, shape (b+1, 1, 1, 1), int32 or int64. Mutually exclusive with seq_len_q. Requires cuDNN 9.24.0 or newer and the UNIFIED implementation.
+                    cu_seq_len_kv (Optional[cudnn_tensor]): Cumulative sequence length of the key, shape (b+1, 1, 1, 1), int32 or int64. Mutually exclusive with seq_len_kv. Requires cuDNN 9.24.0 or newer and the UNIFIED implementation.
                     dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
                     rng_dump (Optional[cudnn_tensor]): Debug tensor to dump the Philox RNG dropout mask. Default is None.
                     paged_attention_k_table (Optional[cudnn_tensor]): The page table to look up offsets into 'k'

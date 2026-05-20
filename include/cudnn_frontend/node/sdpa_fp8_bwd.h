@@ -819,7 +819,9 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                                                                  s_q,
                                                                  s_kv,
                                                                  s_q_ptr,
-                                                                 s_kv_ptr);
+                                                                 s_kv_ptr,
+                                                                 /*cu_s_q_ptr=*/nullptr,
+                                                                 /*cu_s_kv_ptr=*/nullptr);
             sub_nodes.emplace_back(std::move(node_));
         }
 
