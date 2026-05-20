@@ -1,4 +1,14 @@
 import os
+
+# Caps peak GPU memory across long pytest-xdist runs (e.g. test_mhas_v2 ~2.5k
+# configs in one worker). Must precede any torch import (including the
+# transitive one via transformer_engine below) -- PyTorch reads this env var
+# once when its CUDA allocator initializes.
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True,garbage_collection_threshold:0.6",
+)
+
 import sys
 import traceback
 import pytest
