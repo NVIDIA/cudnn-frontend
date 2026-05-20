@@ -46,9 +46,10 @@ from cutlass.cutlass_dsl import Int32, extract_mlir_values, new_from_mlir_values
 
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 from .moe_utils import (
     MoEWeightMode,
+    WGradInputOrder,
     OnlineTensormapDescCreator,
     tensormap_ptr_for_copy,
     compute_expert_token_range,
@@ -179,7 +180,7 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
             real = rewrite_tensor_shape(real, (shape[0], c1))
             return (real, None)
 
-        elif cutlass.const_expr(tensor_name in ("c", "d", "d_col", "prob", "dprob")):
+        elif cutlass.const_expr(tensor_name in ("c", "d", "d_col", "d_srelu", "prob", "dprob")):
             # C/D/D_col/prob: contiguous M, offset by token_offset, global desc
             real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
@@ -196,7 +197,7 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
             real = cute.make_tensor(real.iterator, cute.make_layout(sf_layout.shape, stride=stride))
             return (real, None)
 
-        elif cutlass.const_expr(tensor_name == "sfd_col"):
+        elif cutlass.const_expr(tensor_name in ("sfd_col", "sfd_col_d_srelu")):
             # SFD Col with BlockScaledBasicChunk layout (non-atom):
             # domain_offset + rebuild with tile_to_shape using per-expert M
             real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
@@ -297,7 +298,7 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
             real = rewrite_tensor_shape(real, (shape[0], c1))
             return (real, None)
 
-        elif cutlass.const_expr(tensor_name in ("c", "d", "d_col", "prob", "dprob")):
+        elif cutlass.const_expr(tensor_name in ("c", "d", "d_col", "d_srelu", "prob", "dprob")):
             real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
             return (real, None)
@@ -310,7 +311,7 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
             real = cute.make_tensor(real.iterator, cute.make_layout(sf_layout.shape, stride=stride))
             return (real, None)
 
-        elif cutlass.const_expr(tensor_name == "sfd_col"):
+        elif cutlass.const_expr(tensor_name in ("sfd_col", "sfd_col_d_srelu")):
             real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
             per_expert_shape = (tokens_i, shape[1], c1)
             sfd_col_layout = cute.tile_to_shape(
@@ -340,10 +341,12 @@ class WgradScaledGemmSchedExtension(MoESchedExtension):
         tensormap_ctor,
         sf_vec_size: int,
         weight_mode: MoEWeightMode,
+        input_order: WGradInputOrder = WGradInputOrder.Tensor2D,
     ):
         super().__init__(tensormap_ctor)
         self.sf_vec_size = sf_vec_size
         self.weight_mode = weight_mode
+        self.input_order = input_order
 
     def __extract_mlir_values__(self):
         return extract_mlir_values(self.tensormap_ctor)
@@ -354,6 +357,7 @@ class WgradScaledGemmSchedExtension(MoESchedExtension):
             tensormap_ctor=new_ctor,
             sf_vec_size=self.sf_vec_size,
             weight_mode=self.weight_mode,
+            input_order=self.input_order,
         )
 
     def update_expert_info(self, offs, expert_idx):
@@ -377,6 +381,10 @@ class WgradScaledGemmSchedExtension(MoESchedExtension):
         c1 = cutlass.Int32(1)
 
         if cutlass.const_expr(tensor_name in ("a", "b")):
+            if cutlass.const_expr(self.input_order == WGradInputOrder.TensorRagged):
+                real = rewrite_tensor_shape(gmem_tensor_in_moe_view, (shape[0], tokens_i, c1))
+                desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr(tensor_name, expert_idx))
+                return (real, desc)
             real = cute.domain_offset((0, token_offset, 0), gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (shape[0], tokens_i, c1))
             return (real, None)

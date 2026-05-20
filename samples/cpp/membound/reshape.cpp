@@ -33,6 +33,11 @@ TEST_CASE("Membound reshape (3,4,5) to (6,10) lexicographic / LOGICAL mode",
           "[membound][reshape][graph][lexicographic]") {
     namespace fe = cudnn_frontend;
 
+#if CUDART_VERSION < 13010
+    SKIP("Test requires cuda toolkit 13.1 or above");
+    return;
+#endif
+
     if (!check_device_arch_newer_than("blackwell")) {
         SKIP("TEST requires device blackwell or newer");
     }

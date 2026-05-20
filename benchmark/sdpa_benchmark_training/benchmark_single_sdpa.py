@@ -132,7 +132,7 @@ def parse_args():
     parser.add_argument(
         "--deterministic_bwd",
         action="store_true",
-        help="Use deterministic algorithm for backward pass where supported (cudnn FP16/BF16/FP8)",
+        help="Use deterministic algorithm for backward pass where supported (cudnn FP16/BF16/FP8, flash_attention, flash_attention_3, flash_attention_4)",
     )
     parser.add_argument(
         "--attn_mask",
@@ -226,17 +226,18 @@ def run_benchmark(
 
     Returns:
         Dict with keys:
-            - fwd_time_ms: Median forward time in milliseconds
-            - bwd_time_ms: Median backward time in milliseconds (0 if not run)
-            - fwd_tflops: Forward TFLOPS
-            - bwd_tflops: Backward TFLOPS
+            - time_ms: Median time of the requested pass in milliseconds
+            - tflops: TFLOPS for the requested pass
             - max_diff: Maximum difference vs reference
             - gpu_name: GPU name string
             - cudnn_version: cuDNN version (if available)
 
     Raises:
-        RuntimeError: If the benchmark subprocess fails
+        RuntimeError: If the benchmark subprocess fails or profile_pass=="both"
+            (callers must invoke once per pass so each has independent success)
     """
+    if profile_pass == "both":
+        raise RuntimeError("run_benchmark no longer accepts profile_pass='both'. Call once " "per pass ('fwd' or 'bwd') so failures remain independent.")
     import subprocess
     import sys
 
@@ -275,11 +276,8 @@ def run_benchmark(
     else:
         cmd.extend(["--head_dim", str(head_dim)])
 
-    # Handle profile pass
-    if profile_pass == "both":
-        cmd.append("--fwd_bwd")
-    elif profile_pass in ("fwd", "bwd"):
-        cmd.extend(["--profile_pass", profile_pass])
+    # Handle profile pass (single pass only)
+    cmd.extend(["--profile_pass", profile_pass])
 
     # Handle flags
     if skip_ref:
@@ -324,11 +322,18 @@ def run_benchmark(
     except ImportError:
         pass
 
+    # Subprocess CSV layout keeps both fwd and bwd columns; pick the one
+    # corresponding to the requested pass. The unused pass is 0 when not run.
+    if profile_pass == "fwd":
+        time_ms = float(parts[8])
+        tflops = float(parts[10])
+    else:  # "bwd"
+        time_ms = float(parts[9])
+        tflops = float(parts[11])
+
     return {
-        "fwd_time_ms": float(parts[8]),
-        "bwd_time_ms": float(parts[9]),
-        "fwd_tflops": float(parts[10]),
-        "bwd_tflops": float(parts[11]),
+        "time_ms": time_ms,
+        "tflops": tflops,
         "max_diff": float(parts[12]) if len(parts) > 12 else 0.0,
         "gpu_name": gpu_name,
         "cudnn_version": cudnn_version,
@@ -1068,14 +1073,28 @@ else:
         # Flash Attention Native
         def flash_attention_sdpa(query, key, value):
             window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
-            return flash_attn_func(query, key, value, causal=args.attn_mask != "no_mask", window_size=window_size)
+            return flash_attn_func(
+                query,
+                key,
+                value,
+                causal=args.attn_mask != "no_mask",
+                window_size=window_size,
+                deterministic=args.deterministic_bwd,
+            )
 
     if args.sdpa_backend == "flash_attention_3":
         import flash_attn_interface
 
         def flash_attention_3_sdpa(query, key, value):
             window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
-            output, _ = flash_attn_interface.flash_attn_func(query, key, value, causal=args.attn_mask != "no_mask", window_size=window_size)
+            output, _ = flash_attn_interface.flash_attn_func(
+                query,
+                key,
+                value,
+                causal=args.attn_mask != "no_mask",
+                window_size=window_size,
+                deterministic=args.deterministic_bwd,
+            )
             return output
 
     if args.sdpa_backend == "flash_attention_4" or (not args.skip_ref):
@@ -1083,7 +1102,14 @@ else:
 
         def flash_attention_4_sdpa(query, key, value):
             window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
-            output, _ = flash_attn_interface.flash_attn_func(query, key, value, causal=args.attn_mask != "no_mask", window_size=window_size)
+            output, _ = flash_attn_interface.flash_attn_func(
+                query,
+                key,
+                value,
+                causal=args.attn_mask != "no_mask",
+                window_size=window_size,
+                deterministic=args.deterministic_bwd,
+            )
             return output
 
     def get_sdpa_function(backend):
@@ -1278,7 +1304,7 @@ else:
             amax_dP_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
 
         query, key, value = preprocess_qkv(query, key, value, args.sdpa_backend)
-        dOutput = torch.randn(query.shape, dtype=randn_dtype, device=device).to(target_dtype)
+        dOutput = torch.randn(*query.shape[:-1], head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype)
 
         if args.sdpa_backend == "cudnn":
             if args.data_type == "mxfp8":

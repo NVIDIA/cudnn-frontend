@@ -188,6 +188,7 @@ def allocate_grouped_gemm_dsrelu_tensors(
     )  # Note: c_tensor is an input tensor rather than an output tensor but is being kept as an output tensor to eventually merge with the forward allocation
     _, d_row_tensor = create_and_permute_tensor(1, tensor_m, n, cd_major == "m", d_dtype)
     _, d_col_tensor = create_and_permute_tensor(1, tensor_m, n, cd_major == "m", d_dtype)
+    _, d_srelu_tensor = create_and_permute_tensor(1, tensor_m, n, cd_major == "m", d_dtype)
     dprob_tensor = torch.zeros((tensor_m, 1, 1), dtype=torch.float32).cuda()
 
     _input_tensors = {
@@ -197,10 +198,12 @@ def allocate_grouped_gemm_dsrelu_tensors(
     _output_tensors = {
         "d_row_tensor": d_row_tensor,
         "d_col_tensor": d_col_tensor,
+        "d_srelu_tensor": d_srelu_tensor,
         "dprob_tensor": dprob_tensor,
         "dbias_tensor": None,
         "sfd_row_tensor": None,
         "sfd_col_tensor": None,
+        "sfd_col_d_srelu_tensor": None,
         "amax_tensor": None,
     }
 
@@ -221,6 +224,10 @@ def allocate_grouped_gemm_dsrelu_tensors(
         sfd_col_ref, sfd_col_tensor = create_scale_factor_tensor(1, n, tensor_m, sf_vec_size, sf_dtype)
         _output_tensors["sfd_col_tensor"] = sfd_col_tensor
         _output_tensors["sfd_col_ref"] = sfd_col_ref
+
+        sfd_col_d_srelu_ref, sfd_col_d_srelu_tensor = create_scale_factor_tensor(1, n, tensor_m, sf_vec_size, sf_dtype)
+        _output_tensors["sfd_col_d_srelu_tensor"] = sfd_col_d_srelu_tensor
+        _output_tensors["sfd_col_d_srelu_ref"] = sfd_col_d_srelu_ref
 
     if input_tensors is not None:
         input_tensors.update(_input_tensors)
@@ -350,9 +357,9 @@ def run_grouped_gemm_dsrelu_ref(
     Based on the reference in contiguous_blockscaled_grouped_gemm_dsrelu_quant_fusion.py
 
     The dSReLU backward pass computes:
-    1. GEMM: ref = alpha^2 * (SFA * A) @ (SFB * B)^T per group
-    2. dprob = sum over N of (relu(ref)^2 * C)
-    3. D = 2 * relu(ref) * C * prob
+    1. GEMM: ref = alpha * (SFA * A) @ (SFB * B)^T per group
+    2. dprob = sum over N of (relu(C)^2 * ref)
+    3. D = 2 * relu(C) * ref * prob
 
     :param a_ref: A tensor (tensor_m, k, 1) in float32
     :param b_ref: B tensor (n, k, l) in float32
@@ -386,23 +393,25 @@ def run_grouped_gemm_dsrelu_ref(
             sfa_ref[start:end, :, 0],
         )
         res_b = torch.einsum("nk,nk->nk", b_ref[:, :, i], sfb_ref[:, :, i])
-        ref[0, start:end, :] = torch.einsum("mk,nk->mn", res_a * alpha_tensor[i].item(), res_b * alpha_tensor[i].item())
+        ref[0, start:end, :] = torch.einsum("mk,nk->mn", res_a, res_b) * alpha_tensor[i].item()
         start = end
     ref = ref.permute((1, 2, 0))  # shape [M, N, 1]
 
     # Step 2: Apply dsquared-ReLU backward elementwise
     c_full = c_ref.clone()
-    relu_ref = torch.relu(ref)
-    ref_dprob = relu_ref**2 * c_full
+    c_relu = torch.relu(c_full)
+    ref_dprob = c_relu**2 * ref
     chunk_sums = [torch.sum(chunk, dim=1, keepdim=True) for chunk in torch.split(ref_dprob, 32, dim=1)]
     ref_dprob = torch.sum(torch.cat(chunk_sums, dim=1), dim=1, keepdim=True)
     ref_tensors["dprob_ref"] = ref_dprob
 
     # Step 3: Compute dSReLU formula
     prob = prob_tensor.expand(-1, n, -1)
-    ref_d = 2 * relu_ref * c_full * prob
+    ref_d = 2 * c_relu * ref * prob
 
     ref_tensors["d_ref"] = ref_d.clone()
+    ref_d_srelu = (c_relu**2 * prob).to(d_dtype).to(torch.float32)
+    ref_tensors["d_srelu_ref"] = ref_d_srelu.clone()
 
     if generate_dbias:
         ref_dbias = torch.zeros((l, n, 1), dtype=torch.bfloat16, device=a_ref.device)
@@ -434,6 +443,11 @@ def run_grouped_gemm_dsrelu_ref(
         sfd_col_ref_f32, d_col_ref_f32 = compute_reference_row_quant(ref_d_col, d_dtype, sf_dtype, sf_vec_size, norm_const)
         ref_tensors["sfd_col_ref"] = sfd_col_ref_f32.clone()
         ref_tensors["d_col_ref"] = d_col_ref_f32.clone()
+
+        ref_d_srelu_col = (c_relu**2 * prob).permute(2, 1, 0).contiguous().permute(1, 2, 0)
+        sfd_col_d_srelu_ref_f32, d_srelu_col_ref_f32 = compute_reference_row_quant(ref_d_srelu_col, d_dtype, sf_dtype, sf_vec_size, norm_const)
+        ref_tensors["sfd_col_d_srelu_ref"] = sfd_col_d_srelu_ref_f32.clone()
+        ref_tensors["d_srelu_col_ref"] = d_srelu_col_ref_f32.clone()
 
     return ref_tensors
 
@@ -486,6 +500,17 @@ def check_ref_grouped_gemm_dsrelu(
             rtol=rtol,
         )
 
+    if outputs.get("d_srelu_tensor") is not None:
+        if "d_srelu_col_ref" in ref_tensors:
+            torch.testing.assert_close(
+                outputs["d_srelu_tensor"].float().permute(1, 0, 2),
+                ref_tensors["d_srelu_col_ref"].float(),
+                atol=atol,
+                rtol=rtol,
+            )
+        else:
+            torch.testing.assert_close(outputs["d_srelu_tensor"].float(), ref_tensors["d_srelu_ref"].float(), atol=atol, rtol=rtol)
+
     if outputs.get("amax_tensor") is not None and "amax_ref" in ref_tensors:
         torch.testing.assert_close(outputs["amax_tensor"].float(), ref_tensors["amax_ref"].float(), atol=atol, rtol=rtol)
 
@@ -501,6 +526,14 @@ def check_ref_grouped_gemm_dsrelu(
         torch.testing.assert_close(
             outputs["sfd_col_tensor"].float(),
             ref_tensors["sfd_col_ref"].to(outputs["sfd_col_tensor"].device).float(),
+            atol=atol,
+            rtol=rtol,
+        )
+
+    if outputs.get("sfd_col_d_srelu_tensor") is not None and "sfd_col_d_srelu_ref" in ref_tensors:
+        torch.testing.assert_close(
+            outputs["sfd_col_d_srelu_tensor"].float(),
+            ref_tensors["sfd_col_d_srelu_ref"].to(outputs["sfd_col_d_srelu_tensor"].device).float(),
             atol=atol,
             rtol=rtol,
         )

@@ -15,7 +15,7 @@ namespace cudnn_frontend::detail {
  * IDs, and a workspace pointer.
  *
  * @param[out] variant_pack The created `backend_descriptor` object representing the variant pack.
- * @param device_ptrs A vector of device pointers to be associated with the variant pack.
+ * @param device_ptrs A pointer to an array of device pointers to be associated with the variant pack.
  * @param uids A vector of unique IDs to be associated with the variant pack.
  * @param workspace_ptr A pointer to the workspace memory to be associated with the variant pack.
  * @return `error_t` A tuple containing the error code and an optional error message.
@@ -23,17 +23,14 @@ namespace cudnn_frontend::detail {
  */
 inline error_t
 create_variant_pack(backend_descriptor& variant_pack,
-                    std::vector<void*>& device_ptrs,
+                    void* const* device_ptrs,
                     std::vector<int64_t> const& uids,
                     void* workspace_ptr) {
     _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
         variant_pack.get_ptr(), CUDNN_ATTR_VARIANT_PACK_WORKSPACE, CUDNN_TYPE_VOID_PTR, 1, &workspace_ptr));
 
-    _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(variant_pack.get_ptr(),
-                                                   CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS,
-                                                   CUDNN_TYPE_VOID_PTR,
-                                                   device_ptrs.size(),
-                                                   device_ptrs.data()));
+    _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
+        variant_pack.get_ptr(), CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS, CUDNN_TYPE_VOID_PTR, uids.size(), device_ptrs));
 
     _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
         variant_pack.get_ptr(), CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS, CUDNN_TYPE_INT64, uids.size(), uids.data()));
@@ -46,6 +43,17 @@ create_variant_pack(backend_descriptor& variant_pack,
 inline error_t
 create_variant_pack(backend_descriptor& variant_pack,
                     std::vector<void*>& device_ptrs,
+                    std::vector<int64_t> const& uids,
+                    void* workspace_ptr) {
+    RETURN_CUDNN_FRONTEND_ERROR_IF(device_ptrs.size() != uids.size(),
+                                   error_code_t::INVALID_VARIANT_PACK,
+                                   "device_ptrs and uids must have the same length.");
+    return create_variant_pack(variant_pack, device_ptrs.data(), uids, workspace_ptr);
+}
+
+inline error_t
+create_variant_pack(backend_descriptor& variant_pack,
+                    void* const* device_ptrs,
                     std::vector<int64_t> const& uids,
                     void* workspace_ptr,
                     std::vector<int64_t> const& override_uids,
@@ -62,11 +70,8 @@ create_variant_pack(backend_descriptor& variant_pack,
     _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
         variant_pack.get_ptr(), CUDNN_ATTR_VARIANT_PACK_WORKSPACE, CUDNN_TYPE_VOID_PTR, 1, &workspace_ptr));
 
-    _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(variant_pack.get_ptr(),
-                                                   CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS,
-                                                   CUDNN_TYPE_VOID_PTR,
-                                                   device_ptrs.size(),
-                                                   device_ptrs.data()));
+    _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
+        variant_pack.get_ptr(), CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS, CUDNN_TYPE_VOID_PTR, uids.size(), device_ptrs));
 
     _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
         variant_pack.get_ptr(), CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS, CUDNN_TYPE_INT64, uids.size(), uids.data()));
@@ -94,6 +99,21 @@ create_variant_pack(backend_descriptor& variant_pack,
     _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(variant_pack.get_ptr()));
 
     return {error_code_t::OK, ""};
+}
+
+inline error_t
+create_variant_pack(backend_descriptor& variant_pack,
+                    std::vector<void*>& device_ptrs,
+                    std::vector<int64_t> const& uids,
+                    void* workspace_ptr,
+                    std::vector<int64_t> const& override_uids,
+                    std::vector<std::vector<int64_t>> const& override_shapes,
+                    std::vector<std::vector<int64_t>> const& override_strides) {
+    RETURN_CUDNN_FRONTEND_ERROR_IF(device_ptrs.size() != uids.size(),
+                                   error_code_t::INVALID_VARIANT_PACK,
+                                   "device_ptrs and uids must have the same length.");
+    return create_variant_pack(
+        variant_pack, device_ptrs.data(), uids, workspace_ptr, override_uids, override_shapes, override_strides);
 }
 
 }  // namespace cudnn_frontend::detail

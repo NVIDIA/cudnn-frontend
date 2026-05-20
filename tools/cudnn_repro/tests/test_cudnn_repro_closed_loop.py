@@ -24,10 +24,10 @@ def _run(cmd, env):
 
 
 def _last_payload(log_path):
-    import cudnn_repro as repro
+    import cudnn_repro.log_parser as log_parser
 
     lines = log_path.read_text().splitlines()
-    entries = list(repro._iter_context_entries(lines))
+    entries = list(log_parser.iter_context_entries(lines))
     assert entries, f"No context entries found in {log_path}"
     return entries[-1]
 
@@ -58,9 +58,7 @@ def _normalize_payload(payload):
     normalized = {
         "context": payload.get("context"),
         "nodes": [],
-        "tensors": sorted(
-            json.dumps(_normalize_tensor_entry(entry), sort_keys=True) for entry in tensors.values()
-        ),
+        "tensors": sorted(json.dumps(_normalize_tensor_entry(entry), sort_keys=True) for entry in tensors.values()),
     }
     for node in payload.get("nodes", []):
         normalized_node = {}
@@ -113,17 +111,21 @@ def _assert_reproducer_json_matches_target(tmp_path, target):
     ]
     env_first = env_base.copy()
     env_first["CUDNN_FRONTEND_LOG_FILE"] = str(log_a)
-    _run(cmd_test, env_first)
+    first_proc = _run(cmd_test, env_first)
+    if not log_a.exists():
+        if "SKIPPED" in first_proc.stdout:
+            pytest.skip("target skipped before emitting cuDNN frontend log")
+        raise AssertionError(f"Target did not emit cuDNN frontend log: {target}\nstdout:\n{first_proc.stdout}\nstderr:\n{first_proc.stderr}")
 
-    import cudnn_repro as repro
-    import cudnn_repro.routing as routing
+    import cudnn_repro.operations as operations
+    import cudnn_repro.repro_command as repro_command
 
     raw_line, payload = _last_payload(log_a)
-    stage1, stage2 = routing.select_stage_modules(payload)
-    stage1_json = stage1.extract_and_annotate(raw_line, payload, log_a.read_text())
-    seed = stage1_json.get("repro_metadata", {}).get("rng_data_seed")
-    cfg = stage1.build_cfg(raw_line, stage1_json, seed)
-    repro_cmd = shlex.split(stage2.build_command(cfg))
+    operation = operations.select_operation(payload)
+    annotated_payload = operation.extract_and_annotate(raw_line, payload, log_a.read_text())
+    seed = annotated_payload.get("repro_metadata", {}).get("rng_data_seed")
+    cfg = operation.build_cfg(raw_line, annotated_payload, seed)
+    repro_cmd = shlex.split(repro_command.build_command(cfg))
     env_second = env_base.copy()
     env_second["CUDNN_FRONTEND_LOG_FILE"] = str(log_b)
     _run(repro_cmd, env_second)

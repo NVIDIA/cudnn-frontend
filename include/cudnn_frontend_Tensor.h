@@ -526,11 +526,12 @@ class TensorBuilder_v8 {
 
         // Set compile-time constant value (if present); CUDNN_ATTR_TENSOR_CONSTANT_VALUE is cuDNN 9.22.0+
 #if (CUDNN_VERSION >= 92200)
-        NV_CUDNN_FE_DYNAMIC_CHECK_BACKEND_DESCRIPTOR(92200,
-                                                     m_tensor,
-                                                     "CUDNN_BACKEND_TENSOR_DESCRIPTOR: SetAttribute "
-                                                     "CUDNN_ATTR_TENSOR_CONSTANT_VALUE requires cudnn version 9.22.0");
         if (m_tensor.hasConstValue) {
+            NV_CUDNN_FE_DYNAMIC_CHECK_BACKEND_DESCRIPTOR(
+                92200,
+                m_tensor,
+                "CUDNN_BACKEND_TENSOR_DESCRIPTOR: SetAttribute "
+                "CUDNN_ATTR_TENSOR_CONSTANT_VALUE requires cudnn version 9.22.0");
             void *value_ptr = m_tensor.constValueBytes.data();
             status          = detail::set_attribute(m_tensor.pointer->get_backend_descriptor(),
                                            CUDNN_ATTR_TENSOR_CONSTANT_VALUE,

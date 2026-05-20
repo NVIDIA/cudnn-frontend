@@ -95,7 +95,7 @@ implementation_names   = ['cudnn.attention_implementation.AUTO', 'cudnn.attentio
 # # ==================================
 # # L0 fprop tests
 # # ==================================
-@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=256, rng_seed=888), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_random_fwd_L0(env_info, test_no, request, cudnn_handle):
 
@@ -109,7 +109,7 @@ def test_sdpa_random_fwd_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1024, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -128,7 +128,7 @@ def test_sdpa_random_fwd_L0(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
-@pytest.mark.L0
+@pytest.mark.L1
 def test_sdpa_random_fwd_unified_L0(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -141,7 +141,7 @@ def test_sdpa_random_fwd_unified_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1024, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -155,12 +155,17 @@ def test_sdpa_random_fwd_unified_L0(env_info, test_no, request, cudnn_handle):
         with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
         is_dropout=RandomChoice({True : 1, False : 3}),
+        with_rope=RandomChoice({True : 1, False : 3}),  # RoPE at end to preserve existing test distributions
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
     test.cfg.dropout_prob = 0.1 if test.cfg.is_dropout else 0.0
     test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
     test.showConfig(test_no, request)
+
+    # RoPE backend op was added in cuDNN 9.24. Skip configs that need it on older backends.
+    if getattr(test.cfg, "with_rope", False) and cudnn.backend_version() < 92400:
+        pytest.skip("RoPE requires cuDNN >= 9.24")
 
     exec_sdpa(test.cfg, request, cudnn_handle)
 
@@ -183,8 +188,8 @@ def test_sdpa_random_bwd_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=8, max=16),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1024, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=192, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128)]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=192, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256,256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
@@ -192,11 +197,15 @@ def test_sdpa_random_bwd_L0(env_info, test_no, request, cudnn_handle):
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 4, "full" : 1}),
         is_deterministic=RandomChoice({True : 3, False : 1}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
+        with_rope=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
     test.cfg.is_infer = False
     test.showConfig(test_no, request)
+
+    if getattr(test.cfg, "with_rope", False) and cudnn.backend_version() < 92400:
+        pytest.skip("RoPE requires cuDNN >= 9.24")
 
     exec_sdpa(test.cfg, request, cudnn_handle)
 
@@ -219,7 +228,7 @@ def test_sdpa_random_sq1_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=32),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":100, "s_q=s_kv":1, "s_q=random":0}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":100, "s_q=s_kv":1, "s_q=random":0}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(128,128), (192,128)]),
         head_count=RandomHeadGenerator(min=1, max=32, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -239,7 +248,7 @@ def test_sdpa_random_sq1_L0(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=32, rng_seed=111), ids=lambda p: f"test{p[0]}")
-@pytest.mark.L0
+@pytest.mark.L1
 def test_sdpa_random_sq1_unified_L0(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -252,7 +261,7 @@ def test_sdpa_random_sq1_unified_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=32),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":100, "s_q=s_kv":1, "s_q=random":0}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":100, "s_q=s_kv":1, "s_q=random":0}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128)]),
         head_count=RandomHeadGenerator(min=1, max=32, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -273,7 +282,7 @@ def test_sdpa_random_sq1_unified_L0(env_info, test_no, request, cudnn_handle):
 
 
 # # =====================================================
-# # L0 lean attention, s_kv=513..2048
+# # L0 lean attention, s_kv=513..4096
 # # =====================================================
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=222), ids=lambda p: f"test{p[0]}")
@@ -290,7 +299,7 @@ def test_sdpa_random_lean_attn_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=32),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1, s_kv_min=513, s_kv_max=2048, s_q_distribution={"s_q=1":100, "s_q=s_kv":0, "s_q=random":0}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1, s_kv_min=513, s_kv_max=4096, s_q_distribution={"s_q=1":100, "s_q=s_kv":0, "s_q=random":0}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128)]),
         head_count=RandomHeadGenerator(min=1, max=32, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -310,7 +319,7 @@ def test_sdpa_random_lean_attn_L0(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=222), ids=lambda p: f"test{p[0]}")
-@pytest.mark.L0
+@pytest.mark.L1
 def test_sdpa_random_lean_attn_unified_L0(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -323,7 +332,7 @@ def test_sdpa_random_lean_attn_unified_L0(env_info, test_no, request, cudnn_hand
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=32),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1, s_kv_min=513, s_kv_max=2048, s_q_distribution={"s_q=1":100, "s_q=s_kv":0, "s_q=random":0}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1, s_kv_min=513, s_kv_max=4096, s_q_distribution={"s_q=1":100, "s_q=s_kv":0, "s_q=random":0}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(128,128), (192,128)]),
         head_count=RandomHeadGenerator(min=1, max=32, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -360,7 +369,7 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1024, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -379,7 +388,7 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
-@pytest.mark.L0
+@pytest.mark.L1
 def test_sdpa_random_fwd_ragged_unified_L0(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -392,7 +401,7 @@ def test_sdpa_random_fwd_ragged_unified_L0(env_info, test_no, request, cudnn_han
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1024, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(128,128), (192,128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -427,7 +436,7 @@ def test_sdpa_random_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=8, max=16),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1024, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=192, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -450,7 +459,7 @@ def test_sdpa_random_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
 # # L0 paged tests
 # # ==================================
 
-@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=256, rng_seed=888), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
 
@@ -464,7 +473,7 @@ def test_sdpa_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=64, s_kv_min=1, s_kv_max=512, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=64, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -485,7 +494,7 @@ def test_sdpa_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
-@pytest.mark.L0
+@pytest.mark.L1
 def test_sdpa_fwd_paged_unified_L0(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -533,7 +542,7 @@ def test_sdpa_random_fwd_unified_block_mask_L0(env_info, test_no, request, cudnn
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1024, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(128,128), (192,128)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -567,7 +576,7 @@ def test_sdpa_random_fwd_bias_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1024, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -600,8 +609,8 @@ def test_sdpa_random_bwd_bias_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=8, max=16),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1024, s_kv_min=1, s_kv_max=1024, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=192, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128)]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=192, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256,256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
@@ -621,7 +630,7 @@ def test_sdpa_random_bwd_bias_L0(env_info, test_no, request, cudnn_handle):
 # # L0 FP8 fprop tests
 # # ==================================
 
-@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=999), ids=lambda p: f"test{p[0]}")
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=256, rng_seed=999), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_fp8_fwd_L0(env_info, test_no, request, cudnn_handle):
 
@@ -634,7 +643,7 @@ def test_sdpa_fp8_fwd_L0(env_info, test_no, request, cudnn_handle):
 
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[4]),
-        s_q_s_kv=RandomSequenceLength(s_q_min=1, s_q_max=2048, s_kv_min=1, s_kv_max=2048, s_q_distribution={"s_q=1": 2, "s_q=s_kv": 5, "s_q=random": 2}),
+        s_q_s_kv=RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1": 2, "s_q=s_kv": 5, "s_q=random": 2}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=192, d_v_min=64, d_v_max=128, head_dim_distribution={"d_qk=d_v": 2, "d_qk=random": 1}, with_high_probability=[(64, 64), (128, 128), (192, 128)]),
         head_count=RandomHeadGenerator(min=1, max=16, head_group_options=(1, 5, 2)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
@@ -678,7 +687,7 @@ def test_sdpa_fp8_fwd_L0(env_info, test_no, request, cudnn_handle):
 # # L0 FP8 bprop tests
 # # ==================================
 
-@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=64, rng_seed=998), ids=lambda p: f"test{p[0]}")
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=256, rng_seed=998), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_fp8_bwd_L0(env_info, test_no, request, cudnn_handle):
 
@@ -691,7 +700,7 @@ def test_sdpa_fp8_bwd_L0(env_info, test_no, request, cudnn_handle):
 
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=4, with_high_probability=[1, 2]),
-        s_q_s_kv=RandomSequenceLength(s_q_min=64, s_q_max=1024, s_kv_min=64, s_kv_max=1024, s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 5}),
+        s_q_s_kv=RandomSequenceLength(s_q_min=64, s_q_max=4096, s_kv_min=64, s_kv_max=4096, s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 5}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=192, d_v_min=64, d_v_max=128, head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0}, with_high_probability=[(64, 64), (128, 128), (192, 128)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float8_e4m3fn: 1}),
@@ -835,7 +844,7 @@ def test_sdpa_fp8_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
 
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=4, with_high_probability=[1, 2]),
-        s_q_s_kv=RandomSequenceLength(s_q_min=64, s_q_max=256, s_kv_min=64, s_kv_max=256, s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 5}),
+        s_q_s_kv=RandomSequenceLength(s_q_min=64, s_q_max=4096, s_kv_min=64, s_kv_max=4096, s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 5}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=128, d_v_min=64, d_v_max=128, head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0}, with_high_probability=[(64, 64), (128, 128)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float8_e4m3fn: 1}),
@@ -862,54 +871,11 @@ def test_sdpa_fp8_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
             del os.environ["CUDNN_RESCALE_THRESHOLD"]
 
 
-# # ===================
-# # Single repro test
-# # ===================
-
-@pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
-@pytest.mark.L0
-@pytest.mark.L1
-@pytest.mark.L2
-@pytest.mark.L3
-@pytest.mark.L4
-def test_repro(env_info, request, cudnn_handle):
-    import ast
-    repro_str = request.config.getoption("--repro")
-    cfg = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
-    cfg.cfg = ExecConfig.deserialize(ast.literal_eval(repro_str))
-    cfg.showConfig((1,1), request)
-
-    # Set environment variables from config
-    if hasattr(cfg.cfg, 'with_unfuse_fma') and cfg.cfg.with_unfuse_fma:
-        os.environ["CUDNN_UNFUSE_FMA"] = "1"
-    elif "CUDNN_UNFUSE_FMA" in os.environ:
-        del os.environ["CUDNN_UNFUSE_FMA"]
-
-    if hasattr(cfg.cfg, 'rescale_threshold') and cfg.cfg.rescale_threshold is not None:
-        os.environ["CUDNN_RESCALE_THRESHOLD"] = str(cfg.cfg.rescale_threshold)
-    elif "CUDNN_RESCALE_THRESHOLD" in os.environ:
-        del os.environ["CUDNN_RESCALE_THRESHOLD"]
-
-    try:
-        if cfg.cfg.is_mxfp8:
-            exec_sdpa_mxfp8(cfg.cfg, request, cudnn_handle)
-        elif cfg.cfg.data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
-            exec_sdpa_fp8(cfg.cfg, request, cudnn_handle)
-        else:
-            exec_sdpa(cfg.cfg, request, cudnn_handle)
-    finally:
-        # Clean up environment variables
-        if "CUDNN_UNFUSE_FMA" in os.environ:
-            del os.environ["CUDNN_UNFUSE_FMA"]
-        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
-            del os.environ["CUDNN_RESCALE_THRESHOLD"]
-
-
 # # ==================================
 # # L0 MXFP8 fprop tests
 # # ==================================
 
-@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=1001), ids=lambda p: f"test{p[0]}")
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=256, rng_seed=1001), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
 
@@ -922,7 +888,7 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
 
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=4),
-        s_q_s_kv=RandomSequenceLength(s_q_min=128, s_q_max=512, s_kv_min=128, s_kv_max=512, s_q_distribution={"s_q=1": 0, "s_q=s_kv": 1, "s_q=random": 1}),
+        s_q_s_kv=RandomSequenceLength(s_q_min=128, s_q_max=4096, s_kv_min=128, s_kv_max=4096, s_q_distribution={"s_q=1": 0, "s_q=s_kv": 1, "s_q=random": 1}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=192, d_v_min=64, d_v_max=128, head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0}, with_high_probability=[(64, 64), (128, 128), (192, 128)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float8_e4m3fn: 3, torch.float8_e5m2: 1}),
@@ -968,7 +934,7 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
 # # L0 MXFP8 bprop tests
 # # ==================================
 
-@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=1002), ids=lambda p: f"test{p[0]}")
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=256, rng_seed=1002), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
 
@@ -981,7 +947,7 @@ def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
 
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=4),
-        s_q_s_kv=RandomSequenceLength(s_q_min=256, s_q_max=1024, s_kv_min=256, s_kv_max=1024, s_q_distribution={"s_q=1": 0, "s_q=s_kv": 1, "s_q=random": 1}),
+        s_q_s_kv=RandomSequenceLength(s_q_min=256, s_q_max=4096, s_kv_min=256, s_kv_max=4096, s_q_distribution={"s_q=1": 0, "s_q=s_kv": 1, "s_q=random": 1}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=192, d_v_min=64, d_v_max=128, head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0}, with_high_probability=[(64, 64), (128, 128), (192, 128)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 0}),
@@ -1008,5 +974,47 @@ def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
     try:
         exec_sdpa_mxfp8(test.cfg, request, cudnn_handle)
     finally:
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
+
+# # ===================
+# # Single repro test
+# # ===================
+
+@pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
+@pytest.mark.L0
+@pytest.mark.L1
+@pytest.mark.L2
+@pytest.mark.L3
+@pytest.mark.L4
+def test_repro(env_info, request, cudnn_handle):
+    import ast
+    repro_str = request.config.getoption("--repro")
+    cfg = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    cfg.cfg = ExecConfig.deserialize(ast.literal_eval(repro_str))
+    cfg.showConfig((1,1), request)
+
+    # Set environment variables from config
+    if hasattr(cfg.cfg, 'with_unfuse_fma') and cfg.cfg.with_unfuse_fma:
+        os.environ["CUDNN_UNFUSE_FMA"] = "1"
+    elif "CUDNN_UNFUSE_FMA" in os.environ:
+        del os.environ["CUDNN_UNFUSE_FMA"]
+
+    if hasattr(cfg.cfg, 'rescale_threshold') and cfg.cfg.rescale_threshold is not None:
+        os.environ["CUDNN_RESCALE_THRESHOLD"] = str(cfg.cfg.rescale_threshold)
+    elif "CUDNN_RESCALE_THRESHOLD" in os.environ:
+        del os.environ["CUDNN_RESCALE_THRESHOLD"]
+
+    try:
+        if cfg.cfg.is_mxfp8:
+            exec_sdpa_mxfp8(cfg.cfg, request, cudnn_handle)
+        elif cfg.cfg.data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
+            exec_sdpa_fp8(cfg.cfg, request, cudnn_handle)
+        else:
+            exec_sdpa(cfg.cfg, request, cudnn_handle)
+    finally:
+        # Clean up environment variables
+        if "CUDNN_UNFUSE_FMA" in os.environ:
+            del os.environ["CUDNN_UNFUSE_FMA"]
         if "CUDNN_RESCALE_THRESHOLD" in os.environ:
             del os.environ["CUDNN_RESCALE_THRESHOLD"]

@@ -46,7 +46,7 @@ import math
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu import cpasync, tcgen05, OperandMajorMode
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -355,15 +355,15 @@ class BlackwellFusedAttentionDKDVKernel:
         self.O_major_mode = utils.LayoutEnum.from_tensor(O).mma_major_mode()
         self.dO_major_mode = utils.LayoutEnum.from_tensor(dO).mma_major_mode()
 
-        if cutlass.const_expr(self.Q_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.Q_major_mode != OperandMajorMode.K):
             raise RuntimeError(f"The layout of q is not supported: {self.Q_major_mode}")
-        if cutlass.const_expr(self.K_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.K_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of k is not supported")
-        if cutlass.const_expr(self.dK_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.dK_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of dk is not supported")
-        if cutlass.const_expr(self.V_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.V_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of v is not supported")
-        if cutlass.const_expr(self.dV_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.dV_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of dv is not supported")
 
         self._setup_attributes()
@@ -374,8 +374,9 @@ class BlackwellFusedAttentionDKDVKernel:
         # compute S
         KQ_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.element_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.KQ_mma_tiler[:2],
@@ -383,8 +384,9 @@ class BlackwellFusedAttentionDKDVKernel:
         # compute dP
         VdO_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.element_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.VdO_mma_tiler[:2],
@@ -392,8 +394,9 @@ class BlackwellFusedAttentionDKDVKernel:
         # compute dV
         PdO_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            self.element_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.PdO_mma_tiler[:2],
@@ -402,8 +405,9 @@ class BlackwellFusedAttentionDKDVKernel:
         # compute dK
         dSQ_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            self.element_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.dSQ_mma_tiler[:2],
@@ -412,8 +416,9 @@ class BlackwellFusedAttentionDKDVKernel:
         # dishengbin, need to remove, but used in dS_mem_layout_staged
         dSK_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.MN,
+            self.element_dtype,
+            OperandMajorMode.MN,
+            OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.dSK_mma_tiler[:2],
@@ -464,8 +469,8 @@ class BlackwellFusedAttentionDKDVKernel:
             self.compute_mma_dS_stage,
         )
         tiled_mma = dSQ_tiled_mma
-        is_k_major = tiled_mma.op.a_major_mode == tcgen05.OperandMajorMode.K
-        a_major_mode = tcgen05.OperandMajorMode.K if is_k_major else tcgen05.OperandMajorMode.MN
+        is_k_major = tiled_mma.op.a_major_mode == OperandMajorMode.K
+        a_major_mode = OperandMajorMode.K if is_k_major else OperandMajorMode.MN
         tmp = cute.dice(self.dSQ_mma_tiler, (1, None, 1))
         a_smem_shape = tiled_mma.partition_shape_A(
             cute.dice(self.dSQ_mma_tiler, (1, None, 1)),
@@ -904,7 +909,7 @@ class BlackwellFusedAttentionDKDVKernel:
         sdO = storage.sdO.get_tensor(dO_smem_layout_staged.outer, swizzle=dO_smem_layout_staged.inner)
         sLSE = storage.sLSE.get_tensor(LSE_smem_layout)
         sSum_OdO = storage.sSum_OdO.get_tensor(sum_OdO_smem_layout)
-        tmem_holding_buf = storage.tmem_holding_buf
+        tmem_holding_buf = storage.tmem_holding_buf.ptr
         # for 2cta, QT use different mem from Q
 
         sQT = storage.sQT.get_tensor(QT_smem_layout_staged.outer, swizzle=QT_smem_layout_staged.inner)
@@ -937,11 +942,11 @@ class BlackwellFusedAttentionDKDVKernel:
         )
 
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.load_warp_id,
             is_two_cta=True,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
 
         tmem.allocate(self.tmem_alloc_cols)
@@ -1734,7 +1739,7 @@ class BlackwellFusedAttentionDKDVKernel:
         thread_idx = tidx % self.threads_per_warp
         async_copy_num_elts = sLSE.shape[0] // self.threads_per_warp
         atom_async_copy = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS),
+            cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.ALWAYS),
             self.acc_dtype,
             num_bits_per_copy=self.acc_dtype.width,
         )

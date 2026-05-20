@@ -28,6 +28,11 @@
 TEST_CASE("Boolean CMP_GT and LOGICAL_AND fusion", "[membound][boolean][pointwise][graph]") {
     namespace fe = cudnn_frontend;
 
+#if CUDART_VERSION < 13010
+    SKIP("Test requires cuda toolkit 13.1 or above");
+    return;
+#endif
+
 #if (CUDNN_VERSION < 92200)
     SKIP("Boolean fusion sample requires cuDNN 9.22.0 or newer.");
 #endif

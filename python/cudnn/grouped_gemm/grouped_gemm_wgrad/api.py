@@ -19,11 +19,17 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.discrete_grouped_gemm.discrete_kernel_utils import _require_pointer_tensor
 
 from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
-from ..moe_utils import MoEWeightMode
+from ..moe_utils import MoEWeightMode, WGradInputOrder
 
 
 def _round_up(a: int, b: int) -> int:
     return ceil_div(a, b) * b
+
+
+def _normalize_input_order(input_order: WGradInputOrder | str) -> WGradInputOrder:
+    if isinstance(input_order, WGradInputOrder):
+        return input_order
+    return WGradInputOrder(input_order)
 
 
 class GroupedGemmWgradSm100(APIBase):
@@ -48,9 +54,11 @@ class GroupedGemmWgradSm100(APIBase):
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         accumulate_on_output: bool = False,
+        input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
     ):
         super().__init__()
         self._warn_experimental_api()
+        self.input_order = _normalize_input_order(input_order)
 
         if sample_wgrad is not None and num_experts is None:
             self.weight_mode = MoEWeightMode.DENSE
@@ -246,6 +254,7 @@ class GroupedGemmWgradSm100(APIBase):
             accumulate_on_output=self.accumulate_on_output,
             expert_cnt=self.expert_cnt,
             weight_mode=self.weight_mode,
+            input_order=self.input_order,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -573,9 +582,11 @@ def grouped_gemm_wgrad_wrapper_sm100(
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
     accumulate_on_output: bool = False,
+    input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """Compile and execute grouped GEMM wgrad in one call."""
+    input_order = _normalize_input_order(input_order)
     hidden, _ = a_tensor.shape
     _, intermediate = b_tensor.shape
     wgrad_shape = (hidden, intermediate)
@@ -611,6 +622,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         cluster_shape_mn,
         sf_vec_size,
         accumulate_on_output,
+        input_order,
     )
 
     if cache_key in _cache_of_GroupedGemmWgradSm100Objects:
@@ -631,6 +643,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
                 cluster_shape_mn=cluster_shape_mn,
                 sf_vec_size=sf_vec_size,
                 accumulate_on_output=accumulate_on_output,
+                input_order=input_order,
             )
         else:
             sample_expert = torch.empty(wgrad_shape, dtype=wgrad_dtype, device=a_tensor.device)
@@ -651,6 +664,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
                 cluster_shape_mn=cluster_shape_mn,
                 sf_vec_size=sf_vec_size,
                 accumulate_on_output=accumulate_on_output,
+                input_order=input_order,
             )
         assert op.check_support(), "Unsupported configuration"
         op.compile()

@@ -28,6 +28,11 @@
 TEST_CASE("Membound slice window with step", "[membound][slice][graph]") {
     namespace fe = cudnn_frontend;
 
+#if CUDART_VERSION < 13010
+    SKIP("Test requires cuda toolkit 13.1 or above");
+    return;
+#endif
+
     if (!check_device_arch_newer_than("blackwell")) {
         SKIP("TEST requires device blackwell or newer");
     }

@@ -373,6 +373,22 @@ class PyGraph {
             cudnn_frontend::DataType_t const& compute_data_type,
             std::string const& name);
 
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    rope(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& freqs,
+         float output_scale,
+         int64_t rope_dim,
+         cudnn_frontend::DataType_t const& compute_data_type,
+         std::string const& name);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    rope_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dy,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& freqs,
+                  float output_scale,
+                  int64_t rope_dim,
+                  cudnn_frontend::DataType_t const& compute_data_type,
+                  std::string const& name);
+
     std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>
     rmsnorm_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& dy,
                      std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& x,
@@ -656,6 +672,12 @@ class PyGraph {
     int64_t
     get_workspace_size();
 
+    int64_t
+    get_workspace_size(std::optional<std::intptr_t>,
+                       py::object override_uids    = py::none(),
+                       py::object override_shapes  = py::none(),
+                       py::object override_strides = py::none());
+
     void
     populate_cuda_graph(std::intptr_t handle,
                         std::unordered_map<cudnn_frontend::graph::Tensor_attributes::uid_t, int64_t> var_pack,
@@ -762,6 +784,13 @@ class PyGraph {
 
     int64_t
     get_workspace_size_plan_at_index(int64_t index);
+
+    int64_t
+    get_workspace_size_plan_at_index(int64_t index,
+                                     std::optional<std::intptr_t>,
+                                     py::object override_uids    = py::none(),
+                                     py::object override_shapes  = py::none(),
+                                     py::object override_strides = py::none());
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     query_tensor_attributes_of_uid(int64_t const uid) const;

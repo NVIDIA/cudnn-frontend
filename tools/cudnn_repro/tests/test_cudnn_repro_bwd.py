@@ -1,7 +1,7 @@
 import pytest
 
-import cudnn_repro.stage1_annotate_sdpa_bwd as stage1_bwd
-import cudnn_repro.stage2_build_repro_sdpa_bwd as stage2_bwd
+import cudnn_repro.repro_command as repro_command
+import cudnn_repro.sdpa_bwd as sdpa_bwd
 
 
 def test_build_bwd_cfg_simple_case():
@@ -33,7 +33,7 @@ def test_build_bwd_cfg_simple_case():
         },
     }
 
-    cfg = stage1_bwd.build_cfg("{}", payload, seed=123)
+    cfg = sdpa_bwd.build_cfg("{}", payload, seed=123)
     assert cfg["data_type"] == "torch.bfloat16"
     assert cfg["rng_data_seed"] == 123
     assert cfg["is_infer"] is False
@@ -45,6 +45,40 @@ def test_build_bwd_cfg_simple_case():
     assert cfg["stride_stats"] == (64, 16, 1, 1)
     assert cfg["seq_len_q"] == []
     assert cfg["seq_len_kv"] == []
+
+
+def test_build_bwd_cfg_preserves_rope():
+    payload = {
+        "context": {"io_data_type": "BFLOAT16"},
+        "nodes": [
+            {
+                "tag": "SDPA_BWD",
+                "name": "sdpa_backward",
+                "inputs": {"Q": 0, "K": 1, "V": 2, "O": 3, "Stats": 4, "dO": 5},
+                "outputs": {"dQ": 6, "dK": 7, "dV": 8},
+                "diagonal_alignment": "TOP_LEFT",
+                "padding_mask": False,
+            },
+            {"tag": "ROPE_BWD", "name": "RoPE_BWD_Q"},
+        ],
+        "tensors": {
+            "0": {"uid": 0, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+            "1": {"uid": 1, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+            "2": {"uid": 2, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+            "3": {"uid": 3, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+            "4": {"uid": 4, "dim": [2, 4, 16, 1], "stride": [64, 16, 1, 1]},
+            "5": {"uid": 5, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+            "6": {"uid": 6, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+            "7": {"uid": 7, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+            "8": {"uid": 8, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+        },
+    }
+
+    cfg = sdpa_bwd.build_cfg("{}", payload, seed=123)
+    command = repro_command.build_command(cfg)
+
+    assert cfg["with_rope"] is True
+    assert "'with_rope': True" in command
 
 
 def test_build_bwd_cfg_rejects_padding():
@@ -76,7 +110,7 @@ def test_build_bwd_cfg_rejects_padding():
     }
 
     with pytest.raises(NotImplementedError, match="ragged"):
-        stage1_bwd.build_cfg("{}", payload, seed=123)
+        sdpa_bwd.build_cfg("{}", payload, seed=123)
 
 
 def test_build_bwd_cfg_supports_padding_sink_and_sliding_window():
@@ -122,7 +156,7 @@ def test_build_bwd_cfg_supports_padding_sink_and_sliding_window():
         },
     }
 
-    cfg = stage1_bwd.build_cfg("{}", payload, seed=123)
+    cfg = sdpa_bwd.build_cfg("{}", payload, seed=123)
     assert cfg["is_infer"] is False
     assert cfg["is_padding"] is True
     assert cfg["seq_len_q"] == [16, 16]
@@ -166,7 +200,7 @@ def test_build_bwd_command_uses_test_repro():
         "implementation": "AUTO",
     }
 
-    command = stage2_bwd.build_command(cfg)
+    command = repro_command.build_command(cfg)
     assert "test/python/test_mhas_v2.py::test_repro" in command
     assert "'is_infer': False" in command
     assert "cudnn.diagonal_alignment.TOP_LEFT" in command

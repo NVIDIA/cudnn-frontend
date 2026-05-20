@@ -29,6 +29,11 @@ TEST_CASE("Compile-time constant scalar multiply and add", "[compile_time_const]
     namespace fe = cudnn_frontend;
     using fe::graph::ScalarType;
 
+#if CUDART_VERSION < 13010
+    SKIP("Test requires cuda toolkit 13.1 or above");
+    return;
+#endif
+
     if (!check_device_arch_newer_than("blackwell")) {
         SKIP("TEST requires device blackwell or newer");
     }

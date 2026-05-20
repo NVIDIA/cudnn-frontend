@@ -32,9 +32,9 @@ CONFIG = BenchmarkConfig(
     data_types=["bfloat16", "fp8", "mxfp8"],
     attn_masks=["top_left"],  # Causal with sliding window
     profile_pass="both",  # Forward and backward
-    deterministic_bwd=[True],
+    deterministic_bwd=[False, True],
     sliding_window_size=128,
-    batch_size=1,
+    batch_size=2,
     num_iterations=10,
     output_dir="results",
 )

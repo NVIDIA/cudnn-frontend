@@ -23,6 +23,7 @@ from typing import Literal, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.typing import AddressSpace, Pointer
 from cutlass.cutlass_dsl import dsl_user_op, Int32, extract_mlir_values, new_from_mlir_values
 from cutlass._mlir import ir
@@ -46,6 +47,13 @@ class MoEWeightMode(Enum):
 
     DENSE = "dense"
     DISCRETE = "discrete"
+
+
+class WGradInputOrder(Enum):
+    """Physical layout of the grouped wgrad activation inputs A/B."""
+
+    Tensor2D = "tensor2d"
+    TensorRagged = "tensor_ragged"
 
 
 @dsl_user_op
@@ -556,12 +564,13 @@ class DiscreteOutputTensormapConstructor(OnlineTensormapDescCreator):
 
 
 class WgradSfTensormapConstructor(OnlineTensormapDescCreator):
-    """Construct expert-wise wgrad SFA/SFB descriptors and optional C descriptors."""
+    """Construct expert-wise wgrad A/B/SFA/SFB descriptors and optional C descriptors."""
 
     def __init__(
         self,
         sf_vec_size: int,
         weight_mode,
+        input_order,
         sfa_tma_op,
         sfb_tma_op,
         sfa_smem_layout,
@@ -576,6 +585,14 @@ class WgradSfTensormapConstructor(OnlineTensormapDescCreator):
         sfb_tensor: cute.Tensor,
         offs: cute.Tensor,
         workspace_ptr,
+        a_tma_op=None,
+        b_tma_op=None,
+        a_smem_layout=None,
+        b_smem_layout=None,
+        a_major_mode=None,
+        b_major_mode=None,
+        a_tensor: cute.Tensor = None,
+        b_tensor: cute.Tensor = None,
         c_tma_op=None,
         epi_smem_layout=None,
         epi_tile=None,
@@ -586,6 +603,7 @@ class WgradSfTensormapConstructor(OnlineTensormapDescCreator):
         super().__init__()
         self.sf_vec_size = sf_vec_size
         self.weight_mode = weight_mode
+        self.input_order = input_order
         self.sfa_tma_op = sfa_tma_op
         self.sfb_tma_op = sfb_tma_op
         self.sfa_smem_layout = sfa_smem_layout
@@ -599,24 +617,37 @@ class WgradSfTensormapConstructor(OnlineTensormapDescCreator):
         self.sfa_tensor = sfa_tensor
         self.sfb_tensor = sfb_tensor
         self.offs = offs
+        self.a_tma_op = a_tma_op
+        self.b_tma_op = b_tma_op
+        self.a_smem_layout = a_smem_layout
+        self.b_smem_layout = b_smem_layout
+        self.a_major_mode = a_major_mode
+        self.b_major_mode = b_major_mode
+        self.a_tensor = a_tensor
+        self.b_tensor = b_tensor
         self.c_tma_op = c_tma_op
         self.epi_smem_layout = epi_smem_layout
         self.epi_tile = epi_tile
         self.c_ptrs = c_ptrs
         self.c_single_expert = c_single_expert
         self.expert_cnt = expert_cnt
-        self.workspace = TensormapWorkspace(workspace_ptr, self.slot_names(weight_mode))
+        self.workspace = TensormapWorkspace(workspace_ptr, self.slot_names(input_order, weight_mode))
 
     @staticmethod
-    def slot_names(weight_mode) -> list:
+    def slot_names(input_order, weight_mode) -> list:
+        names = []
+        if input_order == WGradInputOrder.TensorRagged:
+            names.extend(["a", "b"])
+        names.extend(["sfa", "sfb"])
         if weight_mode == MoEWeightMode.DENSE:
-            return ["sfa", "sfb"]
-        return ["sfa", "sfb", "c"]
+            return names
+        names.append("c")
+        return names
 
     @staticmethod
-    def get_workspace_size(weight_mode, expert_cnt: int) -> int:
+    def get_workspace_size(input_order, weight_mode, expert_cnt: int) -> int:
         return TensormapWorkspace.size_bytes(
-            len(WgradSfTensormapConstructor.slot_names(weight_mode)),
+            len(WgradSfTensormapConstructor.slot_names(input_order, weight_mode)),
             expert_cnt,
         )
 
@@ -631,6 +662,56 @@ class WgradSfTensormapConstructor(OnlineTensormapDescCreator):
 
         token_offset, tokens_i = compute_expert_token_range(self.offs, expert_idx)
         c1 = cutlass.Int32(1)
+        c0 = cutlass.Int32(0)
+
+        if cutlass.const_expr(self.input_order == WGradInputOrder.TensorRagged):
+            a_dtype = self.a_tensor.element_type
+            a_m_dim = cute.size(self.a_tensor, mode=[0])
+            a_elem_offset = cutlass.Int64(a_m_dim) * cutlass.Int64(token_offset)
+            a_byte_offset = (a_elem_offset * a_dtype.width) // 8
+            a_iter_u8 = cute.recast_ptr(self.a_tensor.iterator, dtype=cutlass.Uint8)
+            a_iter_e = cute.recast_ptr(a_iter_u8 + a_byte_offset, dtype=a_dtype)
+            if cutlass.const_expr(self.a_major_mode == OperandMajorMode.K):
+                a_stride_e = (tokens_i, c1, c0)
+            else:
+                a_stride_e = (c1, a_m_dim, c0)
+            a_tensor_e = cute.make_tensor(
+                a_iter_e,
+                cute.make_layout((a_m_dim, tokens_i, c1), stride=a_stride_e),
+            )
+            tma_atom_a, _ = cute.nvgpu.make_tiled_tma_atom_A(
+                self.a_tma_op,
+                a_tensor_e,
+                self.a_smem_layout,
+                self.mma_tiler,
+                self.tiled_mma,
+                self.cluster_layout_vmnk_shape,
+            )
+            store_tma_desc(tma_atom_a, self.get_desc_ptr("a", expert_idx))
+
+            b_dtype = self.b_tensor.element_type
+            b_n_dim = cute.size(self.b_tensor, mode=[0])
+            b_elem_offset = cutlass.Int64(b_n_dim) * cutlass.Int64(token_offset)
+            b_byte_offset = (b_elem_offset * b_dtype.width) // 8
+            b_iter_u8 = cute.recast_ptr(self.b_tensor.iterator, dtype=cutlass.Uint8)
+            b_iter_e = cute.recast_ptr(b_iter_u8 + b_byte_offset, dtype=b_dtype)
+            if cutlass.const_expr(self.b_major_mode == OperandMajorMode.K):
+                b_stride_e = (tokens_i, c1, c0)
+            else:
+                b_stride_e = (c1, b_n_dim, c0)
+            b_tensor_e = cute.make_tensor(
+                b_iter_e,
+                cute.make_layout((b_n_dim, tokens_i, c1), stride=b_stride_e),
+            )
+            tma_atom_b, _ = cute.nvgpu.make_tiled_tma_atom_B(
+                self.b_tma_op,
+                b_tensor_e,
+                self.b_smem_layout,
+                self.mma_tiler,
+                self.tiled_mma,
+                self.cluster_layout_vmnk_shape,
+            )
+            store_tma_desc(tma_atom_b, self.get_desc_ptr("b", expert_idx))
 
         m_dim = cute.size(self.sfa_tensor, mode=[0])
         sfa_elem_offset = cutlass.Int64(m_dim) * cutlass.Int64(token_offset) // self.sf_vec_size

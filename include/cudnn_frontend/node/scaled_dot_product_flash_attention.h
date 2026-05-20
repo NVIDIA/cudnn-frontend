@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include <cstdlib>
@@ -1025,6 +1026,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         workaround_padding_mask_seq_len_kv;                                  // Will be edited in pre_validate_node()
     mutable int64_t batch_size_for_workaround_padding_mask         = 0;      // Will be edited in pre_validate_node()
     mutable bool is_deterministic_algorithm_supported_on_blackwell = false;  // Will be edited in pre_validate_node()
+    mutable bool is_d256_on_blackwell                              = false;  // Will be edited in pre_validate_node()
 
    public:
     mutable SDPA_backward_attributes attributes;  // Will be edited in pre_validate_node() for workaround padding mask
@@ -1150,6 +1152,9 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                 RETURN_CUDNN_FRONTEND_ERROR_IF( (d_v != 128),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Num hidden_dim d_v should be equal to 128 if d_qk is 192");
+            } else if (detail::get_backend_version() >= 92300 && d_qk == 256 && d_v == 256) {
+                is_d256_on_blackwell = true;
+                attributes.is_deterministic_algorithm = true;
             } else {
                 RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
                                             error_code_t::GRAPH_NOT_SUPPORTED,
@@ -1957,7 +1962,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         int32_t const sm_version = context.get_sm_version();
         bool const use_new_knobs = detail::get_backend_version() >= 92300;
         // {128,128} bprop: tileM=3, tileN=2, kernelCfg=2(bprop warp), streamK=0, cgaM=0
-        if (sm_version > 103 && is_deterministic_algorithm_supported_on_blackwell) {
+        if (sm_version > 103 && (is_deterministic_algorithm_supported_on_blackwell)) {
             if (use_new_knobs) {
                 return {17,
                         {{KnobType_t::TILE_M, 3},
@@ -1965,9 +1970,9 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                          {KnobType_t::KERNEL_CFG, 2},
                          {KnobType_t::STREAM_K, 0},
                          {KnobType_t::TILE_CGA_M, 0},
-                         {KnobType_t::STAGES, 2}}};
+                         {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
             } else {
-                return {17, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
+                return {17, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
             }
         } else if (is_deterministic_algorithm_supported_on_blackwell) {
             if (use_new_knobs) {
@@ -1977,9 +1982,9 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                          {KnobType_t::KERNEL_CFG, 2},
                          {KnobType_t::STREAM_K, 0},
                          {KnobType_t::TILE_CGA_M, 0},
-                         {KnobType_t::STAGES, 2}}};
+                         {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
             } else {
-                return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
+                return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
             }
         } else {
             return {-1, {}};

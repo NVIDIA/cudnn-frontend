@@ -43,10 +43,11 @@ def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, t
     v = v_f32.reshape(b * h_q, s_kv, d_vo)
 
     # Dequantize Q and K (scale factors apply to d_qk dimension)
-    q_dq = q * sf_q_ref
-    k_dq = k * sf_k_ref
+    # nan_to_num for all zero blocks
+    q_dq = (q * sf_q_ref).nan_to_num()
+    k_dq = (k * sf_k_ref).nan_to_num()
     # Dequantize V (scale factors apply to s_kv dimension)
-    v_dq = v * sf_v_ref
+    v_dq = (v * sf_v_ref).nan_to_num()
 
     bias = torch.zeros((b * h_q, s_q, s_kv), dtype=torch.float32, device=q.device)
     if right_bound is not None and diag_align is not None:
@@ -111,7 +112,7 @@ def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, t
         # P (FP32) -> P (FP8)
         s_scale = 16.0
         inv_s_scale = 1.0 / 16.0
-        p_block_quant = (p_block * s_scale).to(torch_itype).float()
+        p_block_quant = (p_block * s_scale).to(torch_itype).float().nan_to_num()
         p_block_quant = p_block_quant * inv_s_scale
 
         o = o + torch.einsum("bqk,bkd->bqd", p_block_quant, v_block)
@@ -178,21 +179,21 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
     dO_t = dO_t_f32.reshape(b * h_q, s_q, d_vo)
 
     # Dequantize for BMM1 (Q @ K^T): D-dimension scale factors
-    q_dq = q * sf_q_ref
-    k_dq = k * sf_k_ref
+    q_dq = (q * sf_q_ref).nan_to_num()
+    k_dq = (k * sf_k_ref).nan_to_num()
 
     # Dequantize for dO @ V^T: D-scale for dO, S-scale for V
-    dO_dq = dO * sf_dO_ref
-    v_dq = v * sf_v_ref
+    dO_dq = (dO * sf_dO_ref).nan_to_num()
+    v_dq = (v * sf_v_ref).nan_to_num()
 
     # Dequantize for P^T @ dO_T -> dV: S-scale for dO_T
-    dO_t_dq = dO_t * sf_dO_t_ref
+    dO_t_dq = (dO_t * sf_dO_t_ref).nan_to_num()
 
     # Dequantize for dS @ K_T -> dQ: S-scale for K_T
-    k_t_dq = k_t * sf_k_t_ref
+    k_t_dq = (k_t * sf_k_t_ref).nan_to_num()
 
     # Dequantize for dS^T @ Q_T -> dK: S-scale for Q_T
-    q_t_dq = q_t * sf_q_t_ref
+    q_t_dq = (q_t * sf_q_t_ref).nan_to_num()
 
     s = torch.einsum("bqd,bkd->bqk", q_dq, k_dq) * attn_scale
 

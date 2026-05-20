@@ -31,7 +31,6 @@ import torch.nn.functional as F
 # from torch.nn import Linear, RMSNorm   # Commented out. Using custom class as drop-in replacement
 from torch.autograd.function import Function
 
-
 # For type annotations
 Tensor = torch.Tensor
 

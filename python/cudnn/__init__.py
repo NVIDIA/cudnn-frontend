@@ -53,7 +53,7 @@ for _optional_symbol in ["causal_conv1d_forward", "causal_conv1d_backward"]:
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.23.0"
+__version__ = "1.24.0"
 
 
 def _tensor(
@@ -144,7 +144,14 @@ def _execute(
     }
 
     workspace_pointer = _library_device_pointer(workspace)
-    self._execute(uid_to_tensor_pointer, workspace_pointer, handle)
+    self._execute(
+        uid_to_tensor_pointer,
+        workspace_pointer,
+        handle,
+        override_uids,
+        override_shapes,
+        override_strides,
+    )
 
 
 def _execute_plan_at_index(
@@ -203,7 +210,21 @@ def load_cudnn():
 
 
 def _dlopen_cudnn():
-    # First look at python site packages
+    # Honor the dynamic linker search path before packaged cuDNN so local backend
+    # builds can override the wheel dependency during development.
+    for library_dir in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
+        if not library_dir:
+            continue
+        for library_name in ("libcudnn.so.9", "libcudnn.so"):
+            library_path = os.path.join(library_dir, library_name)
+            if not os.path.exists(library_path):
+                continue
+            lib = ctypes.CDLL(library_path)
+            handle = ctypes.cast(lib._handle, ctypes.c_void_p).value
+            _pybind_module._set_dlhandle_cudnn(handle)
+            return
+
+    # Then look at python site packages
     lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/lib/libcudnn.so.*[0-9]"))
 
     if not lib_path:
@@ -239,6 +260,7 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "DSA": (".deepseek_sparse_attention", "DSA"),
     "NSA": (".native_sparse_attention", "NSA"),
     "GemmSwigluSm100": (".gemm_swiglu", "GemmSwigluSm100"),
     "gemm_swiglu_wrapper_sm100": (".gemm_swiglu", "gemm_swiglu_wrapper_sm100"),

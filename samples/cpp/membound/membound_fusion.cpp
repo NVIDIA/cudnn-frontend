@@ -28,6 +28,11 @@
 TEST_CASE("Fusion reshape then ReLU", "[membound][fusion][reshape][graph]") {
     namespace fe = cudnn_frontend;
 
+#if CUDART_VERSION < 13010
+    SKIP("Test requires cuda toolkit 13.1 or above");
+    return;
+#endif
+
     if (!check_device_arch_newer_than("blackwell")) {
         SKIP("TEST requires device blackwell or newer");
     }
@@ -75,6 +80,11 @@ TEST_CASE("Fusion reshape then ReLU", "[membound][fusion][reshape][graph]") {
 
 TEST_CASE("Fusion transpose then add bias tensor", "[membound][fusion][transpose][graph]") {
     namespace fe = cudnn_frontend;
+
+#if CUDART_VERSION < 13010
+    SKIP("Test requires cuda toolkit 13.1 or above");
+    return;
+#endif
 
     if (!check_device_arch_newer_than("blackwell")) {
         SKIP("TEST requires device blackwell or newer");

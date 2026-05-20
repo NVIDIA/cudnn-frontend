@@ -11,7 +11,7 @@ from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
@@ -31,20 +31,25 @@ def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
 
 
 class GroupedGemmGluHadamardSm100(APIBase):
-    """Dense grouped GEMM GLU forward kernel with fused Hadamard transform."""
+    """Grouped GEMM GLU forward kernel with fused Hadamard transform."""
 
     def __init__(
         self,
         sample_a: torch.Tensor,
-        sample_b: torch.Tensor,
         sample_c: torch.Tensor,
         sample_d: torch.Tensor,
         sample_sfa: torch.Tensor,
-        sample_sfb: torch.Tensor,
         sample_padded_offsets: torch.Tensor,
         sample_alpha: torch.Tensor,
         sample_prob: torch.Tensor,
+        sample_b: Optional[torch.Tensor] = None,
+        sample_sfb: Optional[torch.Tensor] = None,
+        num_experts: Optional[int] = None,
+        b_shape: Optional[Tuple[int, ...]] = None,
+        b_dtype: Optional[torch.dtype] = None,
+        b_major: str = "k",
         sample_amax: Optional[torch.Tensor] = None,
+        sample_post_rht_amax: Optional[torch.Tensor] = None,
         sample_bias: Optional[torch.Tensor] = None,
         sample_hadamard: Optional[torch.Tensor] = None,
         acc_dtype: torch.dtype = torch.float32,
@@ -55,6 +60,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
         m_aligned: int = 256,
         act_func: str = "swiglu",
         use_dynamic_sched: bool = False,
+        use_tmem_post_rht_amax: bool = False,
     ):
         super().__init__()
 
@@ -63,20 +69,49 @@ class GroupedGemmGluHadamardSm100(APIBase):
         self._sample_a_tensor = sample_a
         self._sample_b_tensor = sample_b
 
+        if sample_b is not None and num_experts is None:
+            self.weight_mode = MoEWeightMode.DENSE
+            if sample_sfb is None:
+                raise ValueError("sample_sfb is required when sample_b is provided")
+        elif num_experts is not None and sample_b is None:
+            self.weight_mode = MoEWeightMode.DISCRETE
+            if b_shape is None or b_dtype is None:
+                raise ValueError("b_shape and b_dtype are required in discrete mode")
+        else:
+            raise ValueError("Provide either (sample_b, sample_sfb) or (num_experts, b_shape, b_dtype)")
+
         self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", interpret_uint8_as_fp4x2=False)
-        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", interpret_uint8_as_fp4x2=False)
         self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
         self.d_desc = self._make_tensor_desc(sample_d, name="sample_d")
         self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
-        self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
         self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets")
         self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha")
         self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob")
         self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias")
-        self.expert_cnt = self.padded_offsets_desc.shape[0]
+        if self.weight_mode == MoEWeightMode.DENSE:
+            self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", interpret_uint8_as_fp4x2=False)
+            self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
+            self.expert_cnt = self.padded_offsets_desc.shape[0]
+            self.b_shape = None
+            self.b_dtype = None
+            self.b_major = b_major
+        else:
+            self.b_desc = None
+            self.sfb_desc = None
+            self.expert_cnt = num_experts
+            self.b_shape = b_shape
+            self.b_dtype = b_dtype
+            self.b_major = b_major
+            self._value_error_if(
+                self.padded_offsets_desc.shape[0] != self.expert_cnt,
+                f"padded_offsets length ({self.padded_offsets_desc.shape[0]}) must equal num_experts ({self.expert_cnt})",
+            )
         if sample_amax is None:
             sample_amax = torch.empty((self.expert_cnt, 1), dtype=torch.float32, device=sample_a.device)
         self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax")
+        if sample_post_rht_amax is None:
+            sample_post_rht_amax = torch.empty((self.expert_cnt, 1), dtype=torch.float32, device=sample_a.device)
+        self.post_rht_amax_desc = self._make_tensor_desc(sample_post_rht_amax, name="sample_post_rht_amax")
         if sample_hadamard is None:
             self.hadamard_tensor = self._make_hadamard_tensor(sample_a.device)
         else:
@@ -95,7 +130,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
         self.m_aligned = m_aligned
         self.act_func = act_func
         self.use_dynamic_sched = use_dynamic_sched
-        self.weight_mode = MoEWeightMode.DENSE
+        self.use_tmem_post_rht_amax = use_tmem_post_rht_amax
         self._kernel = BlockScaledMoEGroupedGemmGluHadamardKernel
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self._workspace = None
@@ -123,7 +158,15 @@ class GroupedGemmGluHadamardSm100(APIBase):
 
     def check_support(self) -> bool:
         tensor_m, k, _ = self._tensor_shape(self.a_desc, name="sample_a")
-        n, _, l = self._tensor_shape(self.b_desc, name="sample_b")
+        if self.weight_mode == MoEWeightMode.DENSE:
+            n, _, l = self._tensor_shape(self.b_desc, name="sample_b")
+        else:
+            if len(self.b_shape) == 2:
+                n, b_k = self.b_shape
+            else:
+                n, b_k, _ = self.b_shape
+            self._value_error_if(b_k != k, f"B K dimension ({b_k}) must match A K dimension ({k})")
+            l = self.expert_cnt
         _, n_c, _ = self._tensor_shape(self.c_desc, name="sample_c")
         _, n_d, _ = self._tensor_shape(self.d_desc, name="sample_d")
 
@@ -132,20 +175,24 @@ class GroupedGemmGluHadamardSm100(APIBase):
         self._value_error_if((n // 2) % HADAMARD_SIZE != 0, f"N/2 must be divisible by {HADAMARD_SIZE}, got {n // 2}")
 
         self._check_tensor_shape(self.a_desc, (tensor_m, k, 1), "A")
-        self._check_tensor_shape(self.b_desc, (n, k, l), "B")
+        if self.weight_mode == MoEWeightMode.DENSE:
+            self._check_tensor_shape(self.b_desc, (n, k, l), "B")
         self._check_tensor_shape(self.c_desc, (tensor_m, n, 1), "C")
         self._check_tensor_shape(self.d_desc, (tensor_m, n // 2, 1), "D")
         self._check_tensor_shape(self.sfa_desc, (32, 4, ceil_div(tensor_m, 128), 4, ceil_div(ceil_div(k, self.sf_vec_size), 4), 1), "SFA")
-        self._check_tensor_shape(self.sfb_desc, (32, 4, ceil_div(n, 128), 4, ceil_div(ceil_div(k, self.sf_vec_size), 4), l), "SFB")
+        if self.weight_mode == MoEWeightMode.DENSE:
+            self._check_tensor_shape(self.sfb_desc, (32, 4, ceil_div(n, 128), 4, ceil_div(ceil_div(k, self.sf_vec_size), 4), l), "SFB")
         self._check_tensor_shape(self.padded_offsets_desc, (l,), "padded_offsets")
         self._check_tensor_shape(self.alpha_desc, (l,), "alpha")
         self._check_tensor_shape(self.prob_desc, (tensor_m, 1, 1), "prob")
         self._check_tensor_shape(self.bias_desc, (n, l), "bias")
         self._check_tensor_shape(self.amax_desc, (l, 1), "amax")
+        self._check_tensor_shape(self.post_rht_amax_desc, (l, 1), "post_rht_amax")
         self._check_tensor_shape(self.hadamard_tensor, (HADAMARD_SIZE, HADAMARD_SIZE), "hadamard")
 
         self._check_tensor_stride(self.a_desc, stride=[(k, 1, tensor_m * k)], name="A", extra_error_msg="A must have k-major layout")
-        self._check_tensor_stride(self.b_desc, stride=[(k, 1, n * k)], name="B", extra_error_msg="B must have k-major layout")
+        if self.weight_mode == MoEWeightMode.DENSE:
+            self._check_tensor_stride(self.b_desc, stride=[(k, 1, n * k)], name="B", extra_error_msg="B must have k-major layout")
         self._check_tensor_stride(self.c_desc, stride=[(n_c, 1, tensor_m * n_c)], name="C", extra_error_msg="C must have n-major layout")
         self._check_tensor_stride(self.d_desc, stride=[(n_d, 1, tensor_m * n_d)], name="D", extra_error_msg="D must have n-major layout")
         self._check_tensor_stride(self.bias_desc, stride=[(1, n)], name="bias")
@@ -155,15 +202,22 @@ class GroupedGemmGluHadamardSm100(APIBase):
             dtype=[torch.float4_e2m1fn_x2, torch.uint8],
             name="A",
         )
-        self._check_dtype(self.b_desc, dtype=self.ab_dtype, name="B", extra_error_msg="B must match A dtype")
+        if self.weight_mode == MoEWeightMode.DENSE:
+            self._check_dtype(self.b_desc, dtype=self.ab_dtype, name="B", extra_error_msg="B must match A dtype")
+        else:
+            self._value_error_if(self.b_dtype != self.ab_dtype, f"b_dtype ({self.b_dtype}) must match A dtype ({self.ab_dtype})")
+            self._value_error_if(self.b_major not in ["k", "n"], f"b_major must be 'k' or 'n', got {self.b_major}")
+            self._value_error_if(self._is_fp4x2(self.ab_dtype) and self.b_major != "k", "b_major must be 'k' when ab_dtype is fp4")
         self.sf_dtype = self._check_dtype(self.sfa_desc, dtype=[torch.float8_e8m0fnu, torch.float8_e4m3fn], name="SFA")
-        self._check_dtype(self.sfb_desc, dtype=self.sf_dtype, name="SFB", extra_error_msg="SFB must match SFA dtype")
+        if self.weight_mode == MoEWeightMode.DENSE:
+            self._check_dtype(self.sfb_desc, dtype=self.sf_dtype, name="SFB", extra_error_msg="SFB must match SFA dtype")
         self.c_dtype = self._check_dtype(self.c_desc, dtype=[torch.float16, torch.bfloat16], name="C")
         self.d_dtype = self._check_dtype(self.d_desc, dtype=[torch.float16, torch.bfloat16], name="D")
         self._check_dtype(self.alpha_desc, dtype=torch.float32, name="alpha")
         self._check_dtype(self.prob_desc, dtype=torch.float32, name="prob")
         self._check_dtype(self.bias_desc, dtype=[torch.float16, torch.bfloat16, torch.float32], name="bias")
         self._check_dtype(self.amax_desc, dtype=torch.float32, name="amax")
+        self._check_dtype(self.post_rht_amax_desc, dtype=torch.float32, name="post_rht_amax")
         self._check_dtype(self.hadamard_tensor, dtype=torch.bfloat16, name="hadamard")
         self._check_dtype(self.acc_dtype, dtype=torch.float32, name="acc_dtype")
 
@@ -212,7 +266,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
             k,
             l,
             "k",
-            "k",
+            self.b_major,
             "n",
             self.m_aligned,
         ):
@@ -236,10 +290,11 @@ class GroupedGemmGluHadamardSm100(APIBase):
             cluster_shape_mn=self.cluster_shape_mn,
             vectorized_f32=self.vector_f32,
             expert_cnt=self.expert_cnt,
-            weight_mode=MoEWeightMode.DENSE,
+            weight_mode=self.weight_mode,
             use_dynamic_sched=self.use_dynamic_sched,
             act_func=self.act_func,
             enable_bias=self.bias_desc is not None,
+            use_tmem_post_rht_amax=self.use_tmem_post_rht_amax,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -249,6 +304,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
         self._workspace = torch.empty(max(kernel.get_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
         fake_workspace_ptr = cute.runtime.nullptr(dtype=cutlass.Uint8, assumed_align=128)
+        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
 
         valid_m = cute.sym_int(divisibility=self.m_aligned)
         tensor_m_128 = cute.sym_int()
@@ -285,11 +341,40 @@ class GroupedGemmGluHadamardSm100(APIBase):
             shape=(32, 4, tensor_m_128, 4, self.sfa_desc.shape[4], 1),
             stride=(16, 4, self.sfa_desc.stride[2], 1, 512, stride_tensor_m_128),
         )
-        b_cute_fake = self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16)
-        sfb_cute_fake = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
+        if self.weight_mode == MoEWeightMode.DENSE:
+            b_cute_arg = (
+                _reinterpret_raw_grouped_fp4_tensor(self._sample_b_tensor)
+                if self.b_desc.dtype == torch.uint8
+                else self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16)
+            )
+            sfb_cute_arg = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
+            n_arg = cutlass.Int32(0)
+            k_arg = cutlass.Int32(0)
+            b_stride_arg = cutlass.Int64(0)
+            b_major_arg = OperandMajorMode.K
+            workspace_arg = fake_workspace_ptr
+        else:
+            if len(self.b_shape) == 2:
+                n_compile, k_compile = self.b_shape
+            else:
+                n_compile, k_compile, _ = self.b_shape
+            b_major_arg = OperandMajorMode.K if self.b_major == "k" else OperandMajorMode.MN
+            b_stride_size = k_compile if self.b_major == "k" else n_compile
+            b_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
+            sfb_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
+            b_cute_arg = from_dlpack(b_ptrs_placeholder, assumed_align=8).iterator
+            sfb_cute_arg = from_dlpack(sfb_ptrs_placeholder, assumed_align=8).iterator
+            n_arg = cutlass.Int32(n_compile)
+            k_arg = cutlass.Int32(k_compile)
+            b_stride_arg = cutlass.Int64(b_stride_size)
+            workspace_arg = cached_workspace_ptr
+            self._n = n_compile
+            self._k = k_compile
+            self._b_stride_size = b_stride_size
         alpha_cute_fake = self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16)
         padded_offsets_cute_fake = self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16)
         amax_cute_fake = self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16)
+        post_rht_amax_cute_fake = self._make_fake_cute_tensor_from_desc(self.post_rht_amax_desc, assumed_align=16)
         bias_cute_fake = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
         hadamard_cute_fake = self._make_fake_cute_tensor_like(self.hadamard_tensor, assumed_align=16, name="sample_hadamard")
         cached_linear_offset = cutlass.Float32(1.0 if self.act_func == "geglu" else 0.0)
@@ -297,17 +382,18 @@ class GroupedGemmGluHadamardSm100(APIBase):
         compiled_kernel = cute.compile(
             kernel,
             _reinterpret_raw_grouped_fp4_tensor(self._sample_a_tensor) if self.a_desc.dtype == torch.uint8 else a_cute_fake,
-            _reinterpret_raw_grouped_fp4_tensor(self._sample_b_tensor) if self.b_desc.dtype == torch.uint8 else b_cute_fake,
+            b_cute_arg,
             sfa_cute_fake,
-            sfb_cute_fake,
-            cutlass.Int32(0),
-            cutlass.Int32(0),
-            cutlass.Int64(0),
-            OperandMajorMode.K,
-            fake_workspace_ptr,
+            sfb_cute_arg,
+            n_arg,
+            k_arg,
+            b_stride_arg,
+            b_major_arg,
+            workspace_arg,
             c_cute_fake,
             d_cute_fake,
             amax_cute_fake,
+            post_rht_amax_cute_fake,
             padded_offsets_cute_fake,
             alpha_cute_fake,
             prob_cute_fake,
@@ -319,59 +405,108 @@ class GroupedGemmGluHadamardSm100(APIBase):
             options="--enable-tvm-ffi",
         )
 
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
+        if self.weight_mode == MoEWeightMode.DENSE:
 
-        def tensor_api(
-            a_tensor: torch.Tensor,
-            b_tensor: torch.Tensor,
-            c_tensor: torch.Tensor,
-            d_tensor: torch.Tensor,
-            sfa_tensor: torch.Tensor,
-            sfb_tensor: torch.Tensor,
-            padded_offsets: torch.Tensor,
-            alpha_tensor: torch.Tensor,
-            prob_tensor: torch.Tensor,
-            hadamard_tensor: torch.Tensor,
-            amax_tensor: Optional[torch.Tensor],
-            bias_tensor: Optional[torch.Tensor],
-            stream: cuda.CUstream,
-        ) -> None:
-            compiled_kernel(
-                a_tensor,
-                b_tensor,
-                sfa_tensor,
-                sfb_tensor,
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int64(0),
-                cached_workspace_ptr,
-                c_tensor,
-                d_tensor,
-                amax_tensor,
-                padded_offsets,
-                alpha_tensor,
-                prob_tensor,
-                hadamard_tensor,
-                bias_tensor,
-                stream,
-                cached_linear_offset,
-            )
+            def tensor_api(
+                a_tensor: torch.Tensor,
+                b_tensor: torch.Tensor,
+                c_tensor: torch.Tensor,
+                d_tensor: torch.Tensor,
+                sfa_tensor: torch.Tensor,
+                sfb_tensor: torch.Tensor,
+                padded_offsets: torch.Tensor,
+                alpha_tensor: torch.Tensor,
+                prob_tensor: torch.Tensor,
+                hadamard_tensor: torch.Tensor,
+                amax_tensor: Optional[torch.Tensor],
+                post_rht_amax_tensor: Optional[torch.Tensor],
+                bias_tensor: Optional[torch.Tensor],
+                stream: cuda.CUstream,
+            ) -> None:
+                compiled_kernel(
+                    a_tensor,
+                    b_tensor,
+                    sfa_tensor,
+                    sfb_tensor,
+                    cutlass.Int32(0),
+                    cutlass.Int32(0),
+                    cutlass.Int64(0),
+                    cached_workspace_ptr,
+                    c_tensor,
+                    d_tensor,
+                    amax_tensor,
+                    post_rht_amax_tensor,
+                    padded_offsets,
+                    alpha_tensor,
+                    prob_tensor,
+                    hadamard_tensor,
+                    bias_tensor,
+                    stream,
+                    cached_linear_offset,
+                )
 
-        self._compiled_kernel = tensor_api
+            self._compiled_kernel = tensor_api
+        else:
+            cached_n = cutlass.Int32(self._n)
+            cached_k = cutlass.Int32(self._k)
+            cached_b_stride = cutlass.Int64(self._b_stride_size)
+
+            def tensor_api(
+                a_tensor: torch.Tensor,
+                b_ptrs_device: torch.Tensor,
+                sfb_ptrs_device: torch.Tensor,
+                c_tensor: torch.Tensor,
+                d_tensor: torch.Tensor,
+                sfa_tensor: torch.Tensor,
+                padded_offsets: torch.Tensor,
+                alpha_tensor: torch.Tensor,
+                prob_tensor: torch.Tensor,
+                hadamard_tensor: torch.Tensor,
+                amax_tensor: Optional[torch.Tensor],
+                post_rht_amax_tensor: Optional[torch.Tensor],
+                bias_tensor: Optional[torch.Tensor],
+                stream: cuda.CUstream,
+            ) -> None:
+                compiled_kernel(
+                    a_tensor,
+                    int(b_ptrs_device.data_ptr()),
+                    sfa_tensor,
+                    int(sfb_ptrs_device.data_ptr()),
+                    cached_n,
+                    cached_k,
+                    cached_b_stride,
+                    cached_workspace_ptr,
+                    c_tensor,
+                    d_tensor,
+                    amax_tensor,
+                    post_rht_amax_tensor,
+                    padded_offsets,
+                    alpha_tensor,
+                    prob_tensor,
+                    hadamard_tensor,
+                    bias_tensor,
+                    stream,
+                    cached_linear_offset,
+                )
+
+            self._compiled_kernel = tensor_api
 
     def execute(
         self,
         a_tensor: torch.Tensor,
-        b_tensor: torch.Tensor,
         c_tensor: torch.Tensor,
         d_tensor: torch.Tensor,
         sfa_tensor: torch.Tensor,
-        sfb_tensor: torch.Tensor,
         padded_offsets: torch.Tensor,
         alpha_tensor: torch.Tensor,
         prob_tensor: torch.Tensor,
+        b_tensor: Optional[torch.Tensor] = None,
+        sfb_tensor: Optional[torch.Tensor] = None,
+        b_ptrs: Optional[torch.Tensor] = None,
+        sfb_ptrs: Optional[torch.Tensor] = None,
         hadamard_tensor: Optional[torch.Tensor] = None,
         amax_tensor: Optional[torch.Tensor] = None,
+        post_rht_amax_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
@@ -391,21 +526,44 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 name="hadamard",
             )
 
-        self._compiled_kernel(
-            _reinterpret_raw_grouped_fp4_tensor(a_tensor),
-            _reinterpret_raw_grouped_fp4_tensor(b_tensor),
-            c_tensor,
-            d_tensor,
-            sfa_tensor,
-            sfb_tensor,
-            padded_offsets,
-            alpha_tensor,
-            prob_tensor,
-            hadamard_tensor,
-            amax_tensor,
-            bias_tensor,
-            current_stream,
-        )
+        if self.weight_mode == MoEWeightMode.DENSE:
+            if b_tensor is None or sfb_tensor is None:
+                raise ValueError("b_tensor and sfb_tensor must be provided in dense mode")
+            self._compiled_kernel(
+                _reinterpret_raw_grouped_fp4_tensor(a_tensor),
+                _reinterpret_raw_grouped_fp4_tensor(b_tensor),
+                c_tensor,
+                d_tensor,
+                sfa_tensor,
+                sfb_tensor,
+                padded_offsets,
+                alpha_tensor,
+                prob_tensor,
+                hadamard_tensor,
+                amax_tensor,
+                post_rht_amax_tensor,
+                bias_tensor,
+                current_stream,
+            )
+        else:
+            if b_ptrs is None or sfb_ptrs is None:
+                raise ValueError("b_ptrs and sfb_ptrs must be provided in discrete mode")
+            self._compiled_kernel(
+                _reinterpret_raw_grouped_fp4_tensor(a_tensor),
+                b_ptrs,
+                sfb_ptrs,
+                c_tensor,
+                d_tensor,
+                sfa_tensor,
+                padded_offsets,
+                alpha_tensor,
+                prob_tensor,
+                hadamard_tensor,
+                amax_tensor,
+                post_rht_amax_tensor,
+                bias_tensor,
+                current_stream,
+            )
 
 
 _logger = logging.getLogger(__name__)
@@ -414,12 +572,17 @@ _cache_of_GroupedGemmGluHadamardSm100Objects = {}
 
 def grouped_gemm_glu_hadamard_wrapper_sm100(
     a_tensor: torch.Tensor,
-    b_tensor: torch.Tensor,
     sfa_tensor: torch.Tensor,
-    sfb_tensor: torch.Tensor,
     padded_offsets: torch.Tensor,
     alpha_tensor: torch.Tensor,
     prob_tensor: torch.Tensor,
+    b_tensor: Optional[torch.Tensor] = None,
+    sfb_tensor: Optional[torch.Tensor] = None,
+    b_ptrs: Optional[torch.Tensor] = None,
+    sfb_ptrs: Optional[torch.Tensor] = None,
+    n: Optional[int] = None,
+    b_dtype: Optional[torch.dtype] = None,
+    b_major: str = "k",
     bias_tensor: Optional[torch.Tensor] = None,
     acc_dtype: torch.dtype = torch.float32,
     c_dtype: torch.dtype = torch.bfloat16,
@@ -432,12 +595,36 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     m_aligned: int = 256,
     act_func: str = "swiglu",
     use_dynamic_sched: bool = False,
+    use_tmem_post_rht_amax: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """High-level wrapper for grouped GEMM GLU + Hadamard forward fusion."""
+    from cudnn.discrete_grouped_gemm.discrete_kernel_utils import _require_pointer_tensor
 
     valid_m = a_tensor.shape[0]
-    n_full, _, l = b_tensor.shape
+    is_dense = b_tensor is not None
+    is_discrete = b_ptrs is not None
+    if is_dense and is_discrete:
+        raise ValueError("Provide either (b_tensor, sfb_tensor) or (b_ptrs, sfb_ptrs), not both")
+    if not is_dense and not is_discrete:
+        raise ValueError("Must provide either (b_tensor, sfb_tensor) or (b_ptrs, sfb_ptrs)")
+
+    _, k_physical, _ = a_tensor.shape
+    if is_dense:
+        weight_mode = MoEWeightMode.DENSE
+        n_full, _, l = b_tensor.shape
+        if sfb_tensor is None:
+            raise ValueError("sfb_tensor is required in dense mode")
+    else:
+        weight_mode = MoEWeightMode.DISCRETE
+        _require_pointer_tensor(b_ptrs, "b_ptrs")
+        l = b_ptrs.shape[0]
+        _require_pointer_tensor(sfb_ptrs, "sfb_ptrs", l)
+        if n is None or b_dtype is None:
+            raise ValueError("n and b_dtype are required for discrete mode")
+        n_full = n
+        k_logical = k_physical * 2 if b_dtype in (torch.float4_e2m1fn_x2, torch.uint8) else k_physical
+        b_shape = (n_full, k_logical)
     n_out = n_full // 2
 
     if cd_major != "n":
@@ -446,11 +633,15 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     c_tensor = torch.empty_strided((valid_m, n_full, 1), (n_full, 1, valid_m * n_full), dtype=c_dtype, device=a_tensor.device)
     d_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
     amax_tensor = None
+    post_rht_amax_tensor = None
     if d_dtype in [torch.bfloat16, torch.float16]:
-        amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
+        # Empty groups launch no CTAs, so initialize to the mathematically
+        # correct empty amax value instead of leaving them at -inf.
+        amax_tensor = torch.zeros((l, 1), dtype=torch.float32, device=a_tensor.device)
+        post_rht_amax_tensor = torch.zeros((l, 1), dtype=torch.float32, device=a_tensor.device)
 
     if valid_m == 0:
-        return TupleDict(c_tensor=c_tensor, d_tensor=d_tensor, amax_tensor=amax_tensor)
+        return TupleDict(c_tensor=c_tensor, d_tensor=d_tensor, amax_tensor=amax_tensor, post_rht_amax_tensor=post_rht_amax_tensor)
 
     def stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
         return tuple(i for i, _ in sorted(enumerate(tensor.stride()), key=lambda item: item[1]))
@@ -469,19 +660,20 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         return static_shape_suffix, stride_signature, tensor.dtype
 
     cache_key = (
+        weight_mode,
         act_func,
         a_tensor.shape[1:],
-        tuple(b_tensor.shape),
+        tuple(b_tensor.shape) if is_dense else b_shape,
         c_tensor.shape[1:],
         a_tensor.dtype,
-        b_tensor.dtype,
+        b_tensor.dtype if is_dense else b_dtype,
         c_tensor.dtype,
         d_tensor.dtype,
         stride_order(a_tensor),
-        stride_order(b_tensor),
+        stride_order(b_tensor) if is_dense else b_major,
         stride_order(c_tensor),
         *dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1), dynamic_stride_dims=(5,)),
-        *tensor_signature(sfb_tensor),
+        *(tensor_signature(sfb_tensor) if is_dense else (tuple(sfb_ptrs.shape), tuple(sfb_ptrs.stride()), sfb_ptrs.dtype)),
         *tensor_signature(alpha_tensor),
         *dynamic_m_tensor_signature(prob_tensor, (1, 1)),
         *tensor_signature(bias_tensor),
@@ -493,22 +685,23 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         vector_f32,
         m_aligned,
         use_dynamic_sched,
+        use_tmem_post_rht_amax,
+        *((tuple(b_ptrs.shape), tuple(b_ptrs.stride()), b_ptrs.dtype, l) if is_discrete else ()),
     )
 
     if cache_key in _cache_of_GroupedGemmGluHadamardSm100Objects:
         api = _cache_of_GroupedGemmGluHadamardSm100Objects[cache_key]
     else:
-        api = GroupedGemmGluHadamardSm100(
+        common_kwargs = dict(
             sample_a=a_tensor,
-            sample_b=b_tensor,
             sample_c=c_tensor,
             sample_d=d_tensor,
             sample_sfa=sfa_tensor,
-            sample_sfb=sfb_tensor,
             sample_padded_offsets=padded_offsets,
             sample_alpha=alpha_tensor,
             sample_prob=prob_tensor,
             sample_amax=amax_tensor,
+            sample_post_rht_amax=post_rht_amax_tensor,
             sample_bias=bias_tensor,
             acc_dtype=acc_dtype,
             mma_tiler_mn=mma_tiler_mn,
@@ -518,23 +711,52 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
             m_aligned=m_aligned,
             act_func=act_func,
             use_dynamic_sched=use_dynamic_sched,
+            use_tmem_post_rht_amax=use_tmem_post_rht_amax,
         )
+        if is_dense:
+            api = GroupedGemmGluHadamardSm100(sample_b=b_tensor, sample_sfb=sfb_tensor, **common_kwargs)
+        else:
+            api = GroupedGemmGluHadamardSm100(
+                num_experts=l,
+                b_shape=b_shape,
+                b_dtype=b_dtype,
+                b_major=b_major,
+                **common_kwargs,
+            )
         api.check_support()
         api.compile()
         _cache_of_GroupedGemmGluHadamardSm100Objects[cache_key] = api
 
-    api.execute(
-        a_tensor=a_tensor,
-        b_tensor=b_tensor,
-        c_tensor=c_tensor,
-        d_tensor=d_tensor,
-        sfa_tensor=sfa_tensor,
-        sfb_tensor=sfb_tensor,
-        padded_offsets=padded_offsets,
-        alpha_tensor=alpha_tensor,
-        prob_tensor=prob_tensor,
-        amax_tensor=amax_tensor,
-        bias_tensor=bias_tensor,
-        current_stream=current_stream,
-    )
-    return TupleDict(c_tensor=c_tensor, d_tensor=d_tensor, amax_tensor=amax_tensor)
+    if is_dense:
+        api.execute(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            c_tensor=c_tensor,
+            d_tensor=d_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            prob_tensor=prob_tensor,
+            amax_tensor=amax_tensor,
+            post_rht_amax_tensor=post_rht_amax_tensor,
+            bias_tensor=bias_tensor,
+            current_stream=current_stream,
+        )
+    else:
+        api.execute(
+            a_tensor=a_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            c_tensor=c_tensor,
+            d_tensor=d_tensor,
+            sfa_tensor=sfa_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            prob_tensor=prob_tensor,
+            amax_tensor=amax_tensor,
+            post_rht_amax_tensor=post_rht_amax_tensor,
+            bias_tensor=bias_tensor,
+            current_stream=current_stream,
+        )
+    return TupleDict(c_tensor=c_tensor, d_tensor=d_tensor, amax_tensor=amax_tensor, post_rht_amax_tensor=post_rht_amax_tensor)

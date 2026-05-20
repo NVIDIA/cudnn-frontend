@@ -827,7 +827,7 @@ TEST_CASE("Blackwell Block Scale Matmul dynamic shape overrides", "[matmul][grap
 
     // For dynamic shape, recommend to query fallback plan to get a general good performance
     // Heuristics Mode A is recommended if the dynamic problem shapes are similar in size
-    REQUIRE(graph->build(handle, {fe::HeurMode_t::FALLBACK}).is_good());
+    REQUIRE(graph->build(handle, {fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
 
     // run graph with dynamic shapes
     for (int idx_shape = 0; idx_shape < matmul_dynamic_shape_count; ++idx_shape) {
@@ -885,7 +885,13 @@ TEST_CASE("Blackwell Block Scale Matmul dynamic shape overrides", "[matmul][grap
                                                                                        {C_UID, C_gpu.devPtr}};
 
         int64_t workspace_size = 0;
-        REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+        if (cudnn_frontend::detail::get_backend_version() >= 92300 &&
+            cudnn_frontend::detail::get_backend_version() < 99900) {
+            REQUIRE(graph->get_workspace_size(handle, workspace_size, override_uids, override_shapes, override_strides)
+                        .is_good());
+        } else {
+            REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+        }
         Surface<int8_t> workspace(workspace_size);
 
         REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr, override_uids, override_shapes, override_strides)

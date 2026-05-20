@@ -40,18 +40,25 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 *   **[cudnn SDPA Fprop](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/sdpa):** Open sourcing the Hopper and Blackwell fprop kernels with stats.
 *   **[Fused RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/rms_norm_silu):** Implementation of a fused kernel of RMS normalization followed by SiLU (Swish) activation.
 *   **[SDPA PyTorch Op](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/experimental/ops):** PyTorch custom operator for cuDNN-accelerated Scaled Dot-Product Attention with autograd and `torch.compile` support.
+*   **[DSA](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/native_sparse_attention):** DSA/CSA kernels for DSv4 and DSv3.2 for fprop and bprop.
+
+## Tech talks
+
+* See our latest talk on GPU-Mode
+  
+   ▶ [Watch on YouTube](https://www.youtube.com/watch?v=kxP-vp1dgFY)
 
 ## 🔥🔥🔥  SOTA Attention Kernels from cudnn backend
 
 #### Llama 3.1 style Forward and Bprop with causal masking (GB300)
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/gb300_919_only_cudnn/llama3.1_top_left.png" alt="Llama 3.1 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/sdpa_benchmark_training/results/llama3.1/gb300/llama3.1_top_left.png" alt="Llama 3.1 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
 </p>
 
 #### Deepseek v3 style Forward and Bprop with causal masking (GB300)
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/gb300_919_only_cudnn/dsv3_top_left.png" alt="DSv3 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/sdpa_benchmark_training/results/dsv3/gb300/dsv3_top_left.png" alt="DSv3 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
 </p>
 
 ## Key Features

@@ -29,6 +29,23 @@ class ConvolutionNode : public NodeCRTP<ConvolutionNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             attributes.get_dilation().empty(), error_code_t::ATTRIBUTE_NOT_SET, "Conv dilation not set.");
 
+        // Implicit GEMM kernels compute B_offset as int32. When the product of all filter
+        // dimensions (K * C * spatial...) exceeds INT32_MAX the offset overflows, causing IMA or
+        // silent NaN. Conservative upper bound — exact check requires kernel tiling params not
+        // available at graph-validate time. Applies to 2D (4D filter) and 3D (5D filter) fprop.
+        auto W_it = attributes.inputs.find(Conv_fprop_attributes::input_names::W);
+        if (W_it != attributes.inputs.end() && W_it->second) {
+            auto const& w_dim = W_it->second->get_dim();
+            if (w_dim.size() == 4 || w_dim.size() == 5) {
+                int64_t filter_elements = 1;
+                for (auto d : w_dim) filter_elements *= d;
+                RETURN_CUDNN_FRONTEND_ERROR_IF(
+                    filter_elements > static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
+                    error_code_t::GRAPH_NOT_SUPPORTED,
+                    "Conv filter total elements exceed INT32_MAX.");
+            }
+        }
+
         return {error_code_t::OK, ""};
     }
 

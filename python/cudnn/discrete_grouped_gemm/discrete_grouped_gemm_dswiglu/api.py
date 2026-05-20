@@ -44,7 +44,7 @@ from typing import Tuple, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
@@ -592,6 +592,10 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         sfb_ptrs_cute = from_dlpack(sfb_ptrs_placeholder, assumed_align=8).iterator
         workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
 
+        # linear_offset, geglu_alpha, glu_clamp_max, and glu_clamp_min are runtime
+        # cutlass.Float32 (not Constexpr), so the placeholders below are irrelevant
+        # -- the values passed through tensor_api() at execute() time are what the
+        # kernel actually uses.
         self._logger.debug("Compiling discrete grouped GEMM dGLU kernel")
         _compiled_kernel = cute.compile(
             gemm_dglu,
@@ -621,6 +625,9 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
             max_active_clusters,
             fake_stream,
             self.epilogue_op,
+            cutlass.Float32(1.702),
+            cutlass.Float32(7.0),
+            cutlass.Float32(-7.0),
             options="--enable-tvm-ffi",
         )
 
@@ -635,7 +642,6 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         cached_n = cutlass.Int32(self._n)
         cached_k = cutlass.Int32(self._k)
         cached_b_stride = cutlass.Int64(self._b_stride_size)
-        cached_linear_offset = cutlass.Float32(0.0)
 
         def tensor_api(
             a_tensor,
@@ -656,6 +662,10 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
             dprob_tensor,
             dbias_tensor,
             stream,
+            linear_offset: float = 0.0,
+            geglu_alpha: float = 1.702,
+            glu_clamp_max: float = 7.0,
+            glu_clamp_min: float = -7.0,
         ):
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             b_ptrs_addr = int(b_ptrs_device.data_ptr())
@@ -682,9 +692,12 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
                 beta_tensor,
                 prob_tensor,
                 dprob_tensor,
-                cached_linear_offset,
+                cutlass.Float32(linear_offset),
                 dbias_tensor,
                 stream,
+                cutlass.Float32(geglu_alpha),
+                cutlass.Float32(glu_clamp_max),
+                cutlass.Float32(glu_clamp_min),
             )
 
         self._compiled_kernel = tensor_api
@@ -709,6 +722,10 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         sfd_col_tensor: Optional[torch.Tensor] = None,
         amax_tensor: Optional[torch.Tensor] = None,
         norm_const_tensor: Optional[torch.Tensor] = None,
+        linear_offset: Optional[float] = None,
+        geglu_alpha: float = 1.702,
+        glu_clamp_max: float = 7.0,
+        glu_clamp_min: float = -7.0,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         """Execute the compiled backward kernel (CUDA-graph-safe).
@@ -730,6 +747,11 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         :param sfd_col_tensor: Optional column scale factor D
         :param amax_tensor: Optional amax tensor
         :param norm_const_tensor: Optional normalization constant
+        :param linear_offset: Linear offset matching the forward GeGLU activation.
+            Affects ``act_func == "dgeglu"``; ignored when
+            ``act_func == "dswiglu"``. When ``None`` (default), the offset is
+            chosen based on ``act_func`` for backwards compatibility:
+            ``1.0`` for ``"dgeglu"`` and ``0.0`` for ``"dswiglu"``.
         :param current_stream: CUDA stream
         """
         self._logger.debug("Entering execute")
@@ -739,6 +761,12 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
             self._logger.debug("execute: valid_m is zero, skipping")
             return
         self._runtime_error_if(self._compiled_kernel is None, "Kernel not compiled; call compile() first")
+
+        # Resolve linear_offset default: None -> activation-derived legacy value
+        # (1.0 for dgeglu, 0.0 for dswiglu) for backwards compatibility with
+        # callers that pre-date the explicit linear_offset kwarg.
+        if linear_offset is None:
+            linear_offset = 1.0 if self.act_func == "dgeglu" else 0.0
 
         self._compiled_kernel(
             a_tensor=a_tensor,
@@ -759,6 +787,10 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
             dprob_tensor=dprob_tensor,
             dbias_tensor=dbias_tensor,
             stream=current_stream,
+            linear_offset=linear_offset,
+            geglu_alpha=geglu_alpha,
+            glu_clamp_max=glu_clamp_max,
+            glu_clamp_min=glu_clamp_min,
         )
         self._logger.debug("Execute completed")
 
@@ -794,6 +826,10 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
     act_func: str = "dswiglu",
     b_major: str = "k",
     epilogue_op: Optional[str] = None,
+    linear_offset: Optional[float] = None,
+    geglu_alpha: float = 1.702,
+    glu_clamp_max: float = 7.0,
+    glu_clamp_min: float = -7.0,
     use_dynamic_sched: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
@@ -813,11 +849,34 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
         n: B weight N dimension
         b_dtype: B weight data type
         generate_dbias: Allocate and return dbias output
+        linear_offset: Linear offset matching the forward GeGLU activation. Affects
+            ``act_func == "dgeglu"``; ignored when ``act_func == "dswiglu"``. When
+            ``None`` (default), the offset is chosen based on ``act_func`` for
+            backwards compatibility: ``1.0`` for ``"dgeglu"`` and ``0.0`` for
+            ``"dswiglu"``. Runtime parameter -- a single compiled kernel serves
+            any value, and ``linear_offset`` is intentionally not part of the
+            cache key.
+        geglu_alpha: Pre-sigmoid scaling factor for the GeGLU activation being
+            differentiated. Must match the value used in the forward.
+            Default ``1.702``. Runtime parameter, not part of the cache key.
+            Ignored when ``act_func == "dswiglu"``.
+        glu_clamp_max: Upper clamp limit for ``up`` and ``gate`` in the forward
+            GeGLU; the same limit drives the gradient mask here. Default
+            ``7.0``. Runtime parameter, not part of the cache key. Ignored
+            when ``act_func == "dswiglu"``.
+        glu_clamp_min: Lower clamp limit applied to ``up`` only in the forward
+            GeGLU; the same limit drives the gradient mask here. Default
+            ``-7.0``. Runtime parameter, not part of the cache key. Ignored
+            when ``act_func == "dswiglu"``.
 
     Returns:
         TupleDict with keys: d_row_tensor, d_col_tensor, dprob_tensor,
             amax_tensor, sfd_row_tensor, sfd_col_tensor
     """
+    # Resolve linear_offset default: None means "use the activation-derived legacy
+    # default" (1.0 for dgeglu, 0.0 for dswiglu) for backwards compatibility.
+    if linear_offset is None:
+        linear_offset = 1.0 if act_func == "dgeglu" else 0.0
     valid_m, k_physical, _ = a_tensor.shape
     _require_pointer_tensor(b_ptrs, "b_ptrs")
     num_experts = b_ptrs.shape[0]
@@ -976,6 +1035,10 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
         sfd_col_tensor=sfd_col_tensor,
         amax_tensor=amax_tensor,
         norm_const_tensor=norm_const_tensor,
+        linear_offset=linear_offset,
+        geglu_alpha=geglu_alpha,
+        glu_clamp_max=glu_clamp_max,
+        glu_clamp_min=glu_clamp_min,
         current_stream=current_stream,
     )
 

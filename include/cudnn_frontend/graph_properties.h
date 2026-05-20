@@ -1703,6 +1703,80 @@ class Rmsnorm_attributes : public Attributes<Rmsnorm_attributes> {
     }
 };
 
+class RoPE_attributes : public Attributes<RoPE_attributes> {
+    friend class Attributes<RoPE_attributes>;
+    friend class RoPENode;
+    friend class Graph;
+
+   public:
+    enum class input_names { INPUT, FREQS };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { OUTPUT };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+
+    // Host-side scalar multiplied into cos/sin. Default 1.0 (identity).
+    // Use this to fold YARN mscale and/or attn_scale into RoPE so SDPA can skip its scale multiply.
+    float output_scale = 1.0f;
+
+    // Rotation width (last K dims). 0 = use input's head_dim (full rotation).
+    // When < head_dim, the kernel rotates the last rope_dim dims and scaled-pass-through
+    // copies the first (head_dim - rope_dim) dims. The freqs tensor's last dim must equal
+    // rope_dim (not head_dim). Used for DSv3-style MLA (rope_dim=64, head_dim=192).
+    int64_t rope_dim = 0;
+
+    RoPE_attributes&
+    set_output_scale(float scale) {
+        output_scale = scale;
+        return *this;
+    }
+
+    RoPE_attributes&
+    set_rope_dim(int64_t dim) {
+        rope_dim = dim;
+        return *this;
+    }
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(RoPE_attributes, name, compute_data_type, inputs, outputs, output_scale, rope_dim)
+};
+
+class RoPE_backward_attributes : public Attributes<RoPE_backward_attributes> {
+    friend class Attributes<RoPE_backward_attributes>;
+    friend class RoPEBackwardNode;
+    friend class Graph;
+
+   public:
+    enum class input_names { DY, FREQS };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { DX };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+
+    // Same semantics as fwd: cos/sin pre-multiplied by output_scale, and the nope
+    // segment (head_dim - rope_dim) is scaled-pass-through. Should match the fwd's
+    // values for correct gradient flow.
+    float output_scale = 1.0f;
+    int64_t rope_dim   = 0;
+
+    RoPE_backward_attributes&
+    set_output_scale(float scale) {
+        output_scale = scale;
+        return *this;
+    }
+
+    RoPE_backward_attributes&
+    set_rope_dim(int64_t dim) {
+        rope_dim = dim;
+        return *this;
+    }
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(RoPE_backward_attributes,
+                                   name,
+                                   compute_data_type,
+                                   inputs,
+                                   outputs,
+                                   output_scale,
+                                   rope_dim)
+};
+
 class Rmsnorm_backward_attributes : public Attributes<Rmsnorm_backward_attributes> {
     friend class Attributes<Rmsnorm_backward_attributes>;
     friend class DRMSNormNode;

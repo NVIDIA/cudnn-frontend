@@ -3,7 +3,6 @@ import bisect
 import sqlite3
 from typing import Optional
 
-
 SQL = {
     # CUDA kernel
     "kernel": """
@@ -143,9 +142,7 @@ def analyze_cuda_profile(sqlite_file: str, top_event: str = ":fwd") -> list[dict
     # and keep only the events that start with ":" prefix (those we want to analyze).
     try:
         event = [e for e in events if e["text"] == top_event][0]
-        events = [
-            e for e in events if e["start"] >= event["start"] and e["end"] <= event["end"] and e["text"].startswith(":")
-        ]
+        events = [e for e in events if e["start"] >= event["start"] and e["end"] <= event["end"] and e["text"].startswith(":")]
     except IndexError:
         print(f"Error: Could not find event '{top_event}'")
         return []

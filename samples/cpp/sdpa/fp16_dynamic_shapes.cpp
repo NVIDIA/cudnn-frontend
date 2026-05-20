@@ -251,7 +251,22 @@ TEST_CASE("Toy sdpa forward with dynamic shapes", "[graph][sdpa][flash][forward]
                                                           {1, 1, 1, 1},
                                                           {1, 1, 1, 1},
                                                           {h_q * d_v, d_v, override_b * h_q * d_v, 1}};
-    REQUIRE(graph->execute(handle, variant_pack_2, workspace.devPtr, override_uids, override_shapes, override_strides)
+
+    int64_t override_workspace_size = 0;
+    if (cudnn_frontend::detail::get_backend_version() >= 92300 &&
+        cudnn_frontend::detail::get_backend_version() < 99900) {
+        REQUIRE(graph
+                    ->get_workspace_size_plan_at_index(
+                        handle, 0, override_workspace_size, override_uids, override_shapes, override_strides)
+                    .is_good());
+    } else {
+        REQUIRE(graph->get_workspace_size_plan_at_index(0, override_workspace_size).is_good());
+    }
+    Surface<int8_t> override_workspace(override_workspace_size);
+
+    REQUIRE(graph
+                ->execute(
+                    handle, variant_pack_2, override_workspace.devPtr, override_uids, override_shapes, override_strides)
                 .is_good());
 
     CUDA_CHECK(cudaDeviceSynchronize());

@@ -33,7 +33,7 @@
 #include "cudnn_frontend_Operation.h"
 #include "cudnn_frontend_utils.h"
 // Compile time constant for max ops in a op graph
-constexpr int64_t MAX_OPGRAPH_OPS = 50;
+constexpr int64_t MAX_OPGRAPH_OPS = 250;
 
 namespace cudnn_frontend {
 
@@ -152,6 +152,12 @@ class OperationGraphBuilder_v8 {
     //! Set numoperations and the operations
     auto
     setOperationGraph(int64_t numOps_, Operation_v8 const **ops_) -> OperationGraphBuilder_v8 & {
+        if (numOps_ > MAX_OPGRAPH_OPS) {
+            set_error_and_throw_exception(&m_operationGraph,
+                                          CUDNN_STATUS_BAD_PARAM,
+                                          "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: numOps exceeds MAX_OPGRAPH_OPS");
+            return *this;
+        }
         m_operationGraph.numOps = numOps_;
         m_operationGraph.feature_vectors.resize(static_cast<size_t>(numOps_));
         for (auto i = 0u; i < numOps_; i++) {
@@ -165,6 +171,12 @@ class OperationGraphBuilder_v8 {
     //! Set numoperations and the operations
     auto
     setOperationGraph(std::vector<Operation> const &ops_) -> OperationGraphBuilder_v8 & {
+        if (ops_.size() > static_cast<size_t>(MAX_OPGRAPH_OPS)) {
+            set_error_and_throw_exception(&m_operationGraph,
+                                          CUDNN_STATUS_BAD_PARAM,
+                                          "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: numOps exceeds MAX_OPGRAPH_OPS");
+            return *this;
+        }
         m_operationGraph.numOps = ops_.size();
         m_operationGraph.feature_vectors.resize(ops_.size());
         for (auto i = 0u; i < ops_.size(); i++) {
@@ -177,6 +189,12 @@ class OperationGraphBuilder_v8 {
 
     auto
     addOperation(ManagedOpaqueDescriptor desc) -> OperationGraphBuilder_v8 & {
+        if (m_operationGraph.numOps >= MAX_OPGRAPH_OPS) {
+            set_error_and_throw_exception(&m_operationGraph,
+                                          CUDNN_STATUS_BAD_PARAM,
+                                          "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: numOps exceeds MAX_OPGRAPH_OPS");
+            return *this;
+        }
         m_operationGraph.ops[m_operationGraph.numOps] = desc;
         ++m_operationGraph.numOps;
         return *this;
@@ -206,6 +224,12 @@ class OperationGraphBuilder_v8 {
                 "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: Check and Set the CUDNN_ATTR_OPERATIONGRAPH_OPS Count field");
             return std::move(m_operationGraph);
         }
+        if (m_operationGraph.numOps > MAX_OPGRAPH_OPS) {
+            set_error_and_throw_exception(&m_operationGraph,
+                                          CUDNN_STATUS_BAD_PARAM,
+                                          "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: numOps exceeds MAX_OPGRAPH_OPS");
+            return std::move(m_operationGraph);
+        }
         if (m_operationGraph.ops[0] == nullptr) {
             set_error_and_throw_exception(
                 &m_operationGraph,
@@ -232,7 +256,7 @@ class OperationGraphBuilder_v8 {
             return std::move(m_operationGraph);
         }
 
-        std::array<cudnnBackendDescriptor_t, 50> ops_raw{nullptr};
+        std::array<cudnnBackendDescriptor_t, MAX_OPGRAPH_OPS> ops_raw{nullptr};
         for (auto i = 0u; i < m_operationGraph.numOps; i++) {
             ops_raw[i] = m_operationGraph.ops[i]->get_backend_descriptor();
         }

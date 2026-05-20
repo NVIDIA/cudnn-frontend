@@ -2,7 +2,7 @@ import logging
 
 import pytest
 
-from cudnn.api_base import _reset_experimental_api_warning_registry, warn_experimental_api_once
+from cudnn._experimental_warnings import _reset_experimental_api_warning_registry, warn_experimental_api_once
 
 
 @pytest.mark.L0

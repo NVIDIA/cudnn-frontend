@@ -276,6 +276,85 @@ def test_grouped_gemm_srelu_wrapper_uint8_raw_fp4_smoke(request):
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=19)
+@pytest.mark.parametrize("vector_f32", [False, True], ids=["scalar_f32", "vector_f32"])
+def test_grouped_gemm_srelu_wrapper_uint8_raw_fp4_bias_ref(request, vector_f32):
+    try:
+        from cudnn import grouped_gemm_srelu_wrapper_sm100
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    cfg = grouped_gemm_srelu_init(
+        request=request,
+        ab_dtype=torch.uint8,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float32,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=vector_f32,
+        discrete_col_sfd=False,
+        enable_bias=True,
+    )
+    cfg.update(
+        {
+            "n": 256,
+            "k": 256,
+            "l": 2,
+            "group_m_list": [256, 256],
+        }
+    )
+
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        enable_bias=cfg["enable_bias"],
+    )
+    inputs["alpha_tensor"].copy_(torch.tensor([1.0, -1.25], dtype=torch.float32, device=inputs["alpha_tensor"].device))
+    inputs["prob_tensor"].uniform_(0.5, 1.5)
+
+    outputs = grouped_gemm_srelu_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        b_tensor=inputs["b_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        bias_tensor=inputs["bias_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        acc_dtype=cfg["acc_dtype"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+    torch.cuda.synchronize()
+    check_ref_grouped_gemm_srelu(
+        inputs,
+        outputs,
+        cfg,
+        skip_ref=cfg["skip_ref"],
+    )
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=11)
 @pytest.mark.parametrize("ab_dtype,c_dtype,d_dtype,b_major", DISCRETE_GROUPED_GEMM_SRELU_SUPPORTED_CONFIGS)
 def test_grouped_gemm_srelu_discrete_compile_execute(request, ab_dtype, c_dtype, d_dtype, b_major):

@@ -56,7 +56,7 @@ from typing import Tuple, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
@@ -119,6 +119,7 @@ class GroupedGemmDsreluSm100(APIBase):
         sample_c: Optional[torch.Tensor] = None,
         sample_d_row: Optional[torch.Tensor] = None,
         sample_d_col: Optional[torch.Tensor] = None,
+        sample_d_srelu: Optional[torch.Tensor] = None,
         sample_sfa: Optional[torch.Tensor] = None,
         sample_sfb: Optional[torch.Tensor] = None,
         sample_padded_offsets: Optional[torch.Tensor] = None,
@@ -133,6 +134,7 @@ class GroupedGemmDsreluSm100(APIBase):
         # Optional quantization output arguments
         sample_sfd_row: Optional[torch.Tensor] = None,
         sample_sfd_col: Optional[torch.Tensor] = None,
+        sample_sfd_col_d_srelu: Optional[torch.Tensor] = None,
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
         # Configuration
@@ -145,6 +147,7 @@ class GroupedGemmDsreluSm100(APIBase):
         discrete_col_sfd: bool = False,
         b_major: str = "k",
         use_dynamic_sched: bool = False,
+        use_dsrelu_reuse: bool = False,
     ):
         """Initialize the GroupedGemmDsreluSm100 API.
 
@@ -176,6 +179,7 @@ class GroupedGemmDsreluSm100(APIBase):
         :param discrete_col_sfd: Generate discrete col-major scale factor tensor
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
+        :param use_dsrelu_reuse: Reuse relu(C)^2 between d_srelu and dprob
         """
         super().__init__()
 
@@ -202,6 +206,7 @@ class GroupedGemmDsreluSm100(APIBase):
         self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
         self.d_row_desc = self._make_tensor_desc(sample_d_row, name="sample_d_row")
         self.d_col_desc = self._make_tensor_desc(sample_d_col, name="sample_d_col")
+        self.d_srelu_desc = self._make_tensor_desc(sample_d_srelu, name="sample_d_srelu")
         self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
         self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets")
         self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha")
@@ -211,6 +216,7 @@ class GroupedGemmDsreluSm100(APIBase):
 
         self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row")
         self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col")
+        self.sfd_col_d_srelu_desc = self._make_tensor_desc(sample_sfd_col_d_srelu, name="sample_sfd_col_d_srelu")
         self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax")
         self.norm_const_desc = self._unpad_tensor_to_ndim(
             self._make_tensor_desc(sample_norm_const, name="sample_norm_const"),
@@ -250,9 +256,11 @@ class GroupedGemmDsreluSm100(APIBase):
             self.b_major = b_major  # stored for both modes
 
         self.use_dynamic_sched = use_dynamic_sched
+        self.use_dsrelu_reuse = use_dsrelu_reuse
 
         self._interpret_uint8_as_fp4x2 = True
         self._has_dbias = self.dbias_desc is not None
+        self._generate_d_srelu = self.d_srelu_desc is not None
         self._kernel = BlockScaledMoEGroupedGemmQuantBwdKernel
 
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
@@ -301,6 +309,7 @@ class GroupedGemmDsreluSm100(APIBase):
         self._check_tensor_shape(self.c_desc, (tensor_m, n_out, 1), "C")
         self._check_tensor_shape(self.d_row_desc, (tensor_m, n_out, 1), "D_row")
         self._check_tensor_shape(self.d_col_desc, (tensor_m, n_out, 1), "D_col")
+        self._check_tensor_shape(self.d_srelu_desc, (tensor_m, n_out, 1), "D_srelu")
 
         rest_k = ceil_div(ceil_div(k, self.sf_vec_size), 4)
         self._check_tensor_shape(self.sfa_desc, (32, 4, ceil_div(tensor_m, 128), 4, rest_k, 1), "SFA")
@@ -315,6 +324,7 @@ class GroupedGemmDsreluSm100(APIBase):
         )
         rest_m = ceil_div(ceil_div(tensor_m, self.sf_vec_size), 4)
         self._check_tensor_shape(self.sfd_col_desc, (32, 4, ceil_div(n_out, 128), 4, rest_m, 1), "SFD_col")
+        self._check_tensor_shape(self.sfd_col_d_srelu_desc, (32, 4, ceil_div(n_out, 128), 4, rest_m, 1), "SFD_col_d_srelu")
 
         self._check_tensor_shape(self.alpha_desc, (self.expert_cnt,), "alpha")
         self._check_tensor_shape(self.prob_desc, (tensor_m, 1, 1), "prob")
@@ -479,6 +489,12 @@ class GroupedGemmDsreluSm100(APIBase):
             name="D_col",
             extra_error_msg="D_col must have the same dtype as D_row",
         )
+        self._check_dtype(
+            self.d_srelu_desc,
+            dtype=self.d_dtype,
+            name="D_srelu",
+            extra_error_msg="D_srelu must have the same dtype as D_row",
+        )
 
         # ---- SFD generation logic ----
         kernel_generate_sfd = self._is_fp8(self.ab_dtype) and self.sf_dtype == torch.float8_e8m0fnu and self._is_fp8(self.d_dtype)
@@ -491,6 +507,16 @@ class GroupedGemmDsreluSm100(APIBase):
                 "sfd_row/sfd_col/norm_const were provided, but this configuration does not generate SFD outputs; " "the tensors will be ignored by the kernel",
             )
         self.generate_sfd = kernel_generate_sfd
+        self._value_error_if(
+            self._generate_d_srelu and self.generate_sfd and self.sfd_col_d_srelu_desc is None,
+            "sfd_col_d_srelu is required when d_srelu is generated for FP8 output",
+        )
+        self._check_dtype(
+            self.sfd_col_d_srelu_desc,
+            dtype=self.sf_dtype,
+            name="SFD_col_d_srelu",
+            extra_error_msg="SFD_col_d_srelu must have the same dtype as SFA",
+        )
         if self.discrete_col_sfd and not self.generate_sfd:
             self._logger.warning("discrete_col_sfd is True but generate_sfd is False, discrete_col_sfd will be ignored")
             self.discrete_col_sfd = False
@@ -627,6 +653,8 @@ class GroupedGemmDsreluSm100(APIBase):
             use_dynamic_sched=self.use_dynamic_sched,
             epilogue_type=EpilogueType.DSRELU.value,
             generate_dbias=self._has_dbias,
+            generate_d_srelu=self._generate_d_srelu,
+            use_dsrelu_reuse=self.use_dsrelu_reuse,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -684,6 +712,13 @@ class GroupedGemmDsreluSm100(APIBase):
                 shape=(valid_m, *self.d_col_desc.shape[1:]),
                 stride_order=self.d_col_desc.stride_order,
             )
+            d_srelu_cute_fake = None
+            if self.d_srelu_desc is not None:
+                d_srelu_cute_fake = self._make_fake_cute_compact_tensor(
+                    dtype=self.d_srelu_desc.dtype,
+                    shape=(valid_m, *self.d_srelu_desc.shape[1:]),
+                    stride_order=self.d_srelu_desc.stride_order,
+                )
 
             tensor_m_128 = cute.sym_int()
             stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
@@ -708,6 +743,7 @@ class GroupedGemmDsreluSm100(APIBase):
 
             sfd_row_fake = None
             sfd_col_fake = None
+            sfd_col_d_srelu_fake = None
             if self.sfd_row_desc is not None:
                 stride_sfd_m = cute.sym_int(divisibility=32 * 4 * 4)
                 sfd_row_fake = self._make_fake_cute_tensor(
@@ -724,6 +760,12 @@ class GroupedGemmDsreluSm100(APIBase):
                     shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
                     stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
                 )
+                if self.sfd_col_d_srelu_desc is not None:
+                    sfd_col_d_srelu_fake = self._make_fake_cute_tensor(
+                        dtype=self.sfd_col_d_srelu_desc.dtype,
+                        shape=(32, 4, self.sfd_col_d_srelu_desc.shape[2], 4, rest_m, 1),
+                        stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
+                    )
         else:
             valid_m = cute.sym_int(divisibility=256)
             n_sym = cute.sym_int()
@@ -769,6 +811,15 @@ class GroupedGemmDsreluSm100(APIBase):
                 dynamic_mode=self.d_col_desc.stride_order[0],
                 divisibility=8 if self._is_f16(self.d_col_desc.dtype) else 16,
             )
+            d_srelu_cute_fake = None
+            if self.d_srelu_desc is not None:
+                d_srelu_cute_fake = self._make_fake_cute_compact_tensor(
+                    dtype=self.d_srelu_desc.dtype,
+                    shape=(valid_m, n_out_sym, 1),
+                    stride_order=self.d_srelu_desc.stride_order,
+                    dynamic_mode=self.d_srelu_desc.stride_order[0],
+                    divisibility=8 if self._is_f16(self.d_srelu_desc.dtype) else 16,
+                )
 
             tensor_m_128 = cute.sym_int()
             rest_k = cute.sym_int()
@@ -808,6 +859,7 @@ class GroupedGemmDsreluSm100(APIBase):
 
             sfd_row_fake = None
             sfd_col_fake = None
+            sfd_col_d_srelu_fake = None
             if self.sfd_row_desc is not None:
                 rest_n_out = cute.sym_int()
                 stride_sfd_rest_n_out = cute.sym_int(divisibility=32 * 4 * 4)
@@ -827,6 +879,12 @@ class GroupedGemmDsreluSm100(APIBase):
                     shape=(32, 4, tensor_n_out_128, 4, rest_m_dyn, 1),
                     stride=(16, 4, stride_sfd_rest_m, 1, 512, stride_sfd_n_out),
                 )
+                if self.sfd_col_d_srelu_desc is not None:
+                    sfd_col_d_srelu_fake = self._make_fake_cute_tensor(
+                        dtype=self.sfd_col_d_srelu_desc.dtype,
+                        shape=(32, 4, tensor_n_out_128, 4, rest_m_dyn, 1),
+                        stride=(16, 4, stride_sfd_rest_m, 1, 512, stride_sfd_n_out),
+                    )
 
         dbias_fake = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
 
@@ -853,6 +911,8 @@ class GroupedGemmDsreluSm100(APIBase):
             prob=prob_cute_fake,
             dprob=dprob_cute_fake,
             dbias_tensor=dbias_fake,
+            d_srelu=d_srelu_cute_fake,
+            sfd_col_d_srelu_tensor=sfd_col_d_srelu_fake,
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
             options="--enable-tvm-ffi",
@@ -866,10 +926,12 @@ class GroupedGemmDsreluSm100(APIBase):
             c_tensor: torch.Tensor,
             d_row_tensor: torch.Tensor,
             d_col_tensor: Optional[torch.Tensor],
+            d_srelu_tensor: Optional[torch.Tensor],
             sfa_tensor: torch.Tensor,
             sfb_tensor: torch.Tensor,
             sfd_row_tensor: Optional[torch.Tensor],
             sfd_col_tensor: Optional[torch.Tensor],
+            sfd_col_d_srelu_tensor: Optional[torch.Tensor],
             amax_tensor: Optional[torch.Tensor],
             norm_const_tensor: Optional[torch.Tensor],
             padded_offsets: torch.Tensor,
@@ -901,6 +963,8 @@ class GroupedGemmDsreluSm100(APIBase):
                 prob_tensor,
                 dprob_tensor,
                 dbias_tensor,
+                d_srelu_tensor,
+                sfd_col_d_srelu_tensor,
                 stream,
             )
 
@@ -944,6 +1008,13 @@ class GroupedGemmDsreluSm100(APIBase):
             shape=(valid_m, *self.d_col_desc.shape[1:]),
             stride_order=self.d_col_desc.stride_order,
         )
+        d_srelu_tensor = None
+        if self.d_srelu_desc is not None:
+            d_srelu_tensor = self._make_fake_cute_compact_tensor(
+                dtype=self.d_srelu_desc.dtype,
+                shape=(valid_m, *self.d_srelu_desc.shape[1:]),
+                stride_order=self.d_srelu_desc.stride_order,
+            )
 
         tensor_m_128 = cute.sym_int()
         stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
@@ -967,6 +1038,7 @@ class GroupedGemmDsreluSm100(APIBase):
                 assumed_align=16,
             )
         sfd_col_tensor = None
+        sfd_col_d_srelu_tensor = None
         if self.sfd_col_desc is not None:
             rest_m = cute.sym_int(divisibility=1)
             stride_sfd_n = cute.sym_int(divisibility=32 * 4 * 4)
@@ -977,6 +1049,13 @@ class GroupedGemmDsreluSm100(APIBase):
                 stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
                 assumed_align=16,
             )
+            if self.sfd_col_d_srelu_desc is not None:
+                sfd_col_d_srelu_tensor = self._make_fake_cute_tensor(
+                    dtype=self.sfd_col_d_srelu_desc.dtype,
+                    shape=(32, 4, self.sfd_col_d_srelu_desc.shape[2], 4, rest_m, 1),
+                    stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
+                    assumed_align=16,
+                )
         amax_tensor = self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16)
         norm_const_tensor_cute = self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16)
         padded_offsets_tensor = self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16)
@@ -1026,6 +1105,8 @@ class GroupedGemmDsreluSm100(APIBase):
             prob_tensor,
             dprob_tensor,
             dbias_tensor,
+            d_srelu_tensor,
+            sfd_col_d_srelu_tensor,
             max_active_clusters,
             fake_stream,
             options="--enable-tvm-ffi",
@@ -1047,9 +1128,11 @@ class GroupedGemmDsreluSm100(APIBase):
             c_tensor: torch.Tensor,
             d_row_tensor: torch.Tensor,
             d_col_tensor: Optional[torch.Tensor],
+            d_srelu_tensor: Optional[torch.Tensor],
             sfa_tensor: torch.Tensor,
             sfd_row_tensor: Optional[torch.Tensor],
             sfd_col_tensor: Optional[torch.Tensor],
+            sfd_col_d_srelu_tensor: Optional[torch.Tensor],
             amax_tensor: Optional[torch.Tensor],
             norm_const_tensor: Optional[torch.Tensor],
             padded_offsets: torch.Tensor,
@@ -1084,6 +1167,8 @@ class GroupedGemmDsreluSm100(APIBase):
                 prob_tensor,
                 dprob_tensor,
                 dbias_tensor,
+                d_srelu_tensor,
+                sfd_col_d_srelu_tensor,
                 stream,
             )
 
@@ -1110,6 +1195,8 @@ class GroupedGemmDsreluSm100(APIBase):
         # Optional:
         sfd_row_tensor: Optional[torch.Tensor] = None,
         sfd_col_tensor: Optional[torch.Tensor] = None,
+        d_srelu_tensor: Optional[torch.Tensor] = None,
+        sfd_col_d_srelu_tensor: Optional[torch.Tensor] = None,
         amax_tensor: Optional[torch.Tensor] = None,
         norm_const_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
@@ -1164,10 +1251,12 @@ class GroupedGemmDsreluSm100(APIBase):
                 c_tensor=c_tensor,
                 d_row_tensor=d_row_tensor,
                 d_col_tensor=d_col_tensor,
+                d_srelu_tensor=d_srelu_tensor,
                 sfa_tensor=sfa_tensor,
                 sfb_tensor=sfb_tensor,
                 sfd_row_tensor=sfd_row_tensor,
                 sfd_col_tensor=sfd_col_tensor,
+                sfd_col_d_srelu_tensor=sfd_col_d_srelu_tensor,
                 amax_tensor=amax_tensor,
                 norm_const_tensor=norm_const_tensor,
                 padded_offsets=padded_offsets,
@@ -1185,9 +1274,11 @@ class GroupedGemmDsreluSm100(APIBase):
                 c_tensor=c_tensor,
                 d_row_tensor=d_row_tensor,
                 d_col_tensor=d_col_tensor,
+                d_srelu_tensor=d_srelu_tensor,
                 sfa_tensor=sfa_tensor,
                 sfd_row_tensor=sfd_row_tensor,
                 sfd_col_tensor=sfd_col_tensor,
+                sfd_col_d_srelu_tensor=sfd_col_d_srelu_tensor,
                 amax_tensor=amax_tensor,
                 norm_const_tensor=norm_const_tensor,
                 padded_offsets=padded_offsets,
@@ -1235,6 +1326,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
     m_aligned: int = 256,
     discrete_col_sfd: bool = False,
     use_dynamic_sched: bool = False,
+    use_dsrelu_reuse: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """Convenience wrapper for grouped GEMM dSReLU backward operation.
@@ -1274,6 +1366,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         m_aligned: M alignment (must be 256)
         discrete_col_sfd: Generate discrete col-major scale factor tensor
         use_dynamic_sched: Enable dynamic tile scheduling for load balancing
+        use_dsrelu_reuse: Reuse relu(C)^2 between d_srelu and dprob
         current_stream: CUDA stream
 
     Returns:
@@ -1314,11 +1407,13 @@ def grouped_gemm_dsrelu_wrapper_sm100(
     if cd_major == "n":
         d_row_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
         d_col_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
+        d_srelu_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
     else:
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
 
     sfd_row_tensor = None
     sfd_col_tensor = None
+    sfd_col_d_srelu_tensor = None
     amax_tensor = None
     dbias_tensor = None
 
@@ -1341,6 +1436,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         sf_k_col = ceil_div(valid_m, sf_vec_size)
         mma_shape_col = (1, ceil_div(n_out, 128), ceil_div(sf_k_col, 4), 32, 4, 4)
         sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
+        sfd_col_d_srelu_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
 
     if d_dtype in [torch.bfloat16, torch.float16]:
         _logger.debug("grouped_gemm_dsrelu_wrapper_sm100: Constructing amax_tensor")
@@ -1353,11 +1449,13 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         return TupleDict(
             d_row_tensor=d_row_tensor,
             d_col_tensor=d_col_tensor,
+            d_srelu_tensor=d_srelu_tensor,
             dprob_tensor=dprob_tensor,
             dbias_tensor=dbias_tensor,
             amax_tensor=amax_tensor,
             sfd_row_tensor=sfd_row_tensor,
             sfd_col_tensor=sfd_col_tensor,
+            sfd_col_d_srelu_tensor=sfd_col_d_srelu_tensor,
         )
 
     # ---- Build cache key ----
@@ -1406,7 +1504,9 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             *(dynamic_m_tensor_signature(prob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(prob_tensor)),
             *(dynamic_m_tensor_signature(dprob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(dprob_tensor)),
             *(dynamic_tensor_signature(dbias_tensor) if use_full_dynamic else tensor_signature(dbias_tensor)),
+            *(dynamic_m_tensor_signature(d_srelu_tensor, (n_out, 1)) if not use_full_dynamic else dynamic_tensor_signature(d_srelu_tensor)),
             *(dynamic_tensor_signature(sfb_tensor) if use_full_dynamic else tensor_signature(sfb_tensor)),
+            *(dynamic_tensor_signature(sfd_col_d_srelu_tensor) if use_full_dynamic else tensor_signature(sfd_col_d_srelu_tensor)),
             norm_const_tensor.shape if norm_const_tensor is not None else None,
             norm_const_tensor.stride() if norm_const_tensor is not None else None,
             norm_const_tensor.dtype if norm_const_tensor is not None else None,
@@ -1423,6 +1523,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             m_aligned,
             discrete_col_sfd,
             use_dynamic_sched,
+            use_dsrelu_reuse,
         )
     else:
         cache_key = (
@@ -1436,6 +1537,8 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             *dynamic_m_tensor_signature(prob_tensor, (1, 1)),
             *dynamic_m_tensor_signature(dprob_tensor, (1, 1)),
             *tensor_signature(dbias_tensor),
+            *dynamic_m_tensor_signature(d_srelu_tensor, (n_out, 1)),
+            *tensor_signature(sfd_col_d_srelu_tensor),
             *tensor_signature(norm_const_tensor),
             tuple(b_ptrs.shape),
             tuple(b_ptrs.stride()),
@@ -1456,6 +1559,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             m_aligned,
             discrete_col_sfd,
             use_dynamic_sched,
+            use_dsrelu_reuse,
             b_major,
             num_experts,
         )
@@ -1472,6 +1576,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
                 sample_c=c_tensor,
                 sample_d_row=d_row_tensor,
                 sample_d_col=d_col_tensor,
+                sample_d_srelu=d_srelu_tensor,
                 sample_sfa=sfa_tensor,
                 sample_padded_offsets=padded_offsets,
                 sample_alpha=alpha_tensor,
@@ -1482,6 +1587,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
                 sample_sfb=sfb_tensor,
                 sample_sfd_row=sfd_row_tensor,
                 sample_sfd_col=sfd_col_tensor,
+                sample_sfd_col_d_srelu=sfd_col_d_srelu_tensor,
                 sample_amax=amax_tensor,
                 sample_norm_const=norm_const_tensor,
                 acc_dtype=acc_dtype,
@@ -1492,6 +1598,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
                 m_aligned=m_aligned,
                 discrete_col_sfd=discrete_col_sfd,
                 use_dynamic_sched=use_dynamic_sched,
+                use_dsrelu_reuse=use_dsrelu_reuse,
             )
         else:
             api = GroupedGemmDsreluSm100(
@@ -1499,6 +1606,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
                 sample_c=c_tensor,
                 sample_d_row=d_row_tensor,
                 sample_d_col=d_col_tensor,
+                sample_d_srelu=d_srelu_tensor,
                 sample_sfa=sfa_tensor,
                 sample_padded_offsets=padded_offsets,
                 sample_alpha=alpha_tensor,
@@ -1510,6 +1618,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
                 b_dtype=b_dtype,
                 sample_sfd_row=sfd_row_tensor,
                 sample_sfd_col=sfd_col_tensor,
+                sample_sfd_col_d_srelu=sfd_col_d_srelu_tensor,
                 sample_amax=amax_tensor,
                 sample_norm_const=norm_const_tensor,
                 acc_dtype=acc_dtype,
@@ -1521,6 +1630,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
                 discrete_col_sfd=discrete_col_sfd,
                 b_major=b_major,
                 use_dynamic_sched=use_dynamic_sched,
+                use_dsrelu_reuse=use_dsrelu_reuse,
             )
 
         if not api.check_support():
@@ -1535,6 +1645,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             c_tensor=c_tensor,
             d_row_tensor=d_row_tensor,
             d_col_tensor=d_col_tensor,
+            d_srelu_tensor=d_srelu_tensor,
             sfa_tensor=sfa_tensor,
             padded_offsets=padded_offsets,
             alpha_tensor=alpha_tensor,
@@ -1545,6 +1656,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             sfb_tensor=sfb_tensor,
             sfd_row_tensor=sfd_row_tensor,
             sfd_col_tensor=sfd_col_tensor,
+            sfd_col_d_srelu_tensor=sfd_col_d_srelu_tensor,
             amax_tensor=amax_tensor,
             norm_const_tensor=norm_const_tensor,
             current_stream=current_stream,
@@ -1555,6 +1667,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             c_tensor=c_tensor,
             d_row_tensor=d_row_tensor,
             d_col_tensor=d_col_tensor,
+            d_srelu_tensor=d_srelu_tensor,
             sfa_tensor=sfa_tensor,
             padded_offsets=padded_offsets,
             alpha_tensor=alpha_tensor,
@@ -1565,6 +1678,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             sfb_ptrs=sfb_ptrs,
             sfd_row_tensor=sfd_row_tensor,
             sfd_col_tensor=sfd_col_tensor,
+            sfd_col_d_srelu_tensor=sfd_col_d_srelu_tensor,
             amax_tensor=amax_tensor,
             norm_const_tensor=norm_const_tensor,
             current_stream=current_stream,
@@ -1573,9 +1687,11 @@ def grouped_gemm_dsrelu_wrapper_sm100(
     return TupleDict(
         d_row_tensor=d_row_tensor,
         d_col_tensor=d_col_tensor,
+        d_srelu_tensor=d_srelu_tensor,
         dprob_tensor=dprob_tensor,
         dbias_tensor=dbias_tensor,
         amax_tensor=amax_tensor,
         sfd_row_tensor=sfd_row_tensor,
         sfd_col_tensor=sfd_col_tensor,
+        sfd_col_d_srelu_tensor=sfd_col_d_srelu_tensor,
     )
