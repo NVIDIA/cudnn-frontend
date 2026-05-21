@@ -1676,6 +1676,11 @@ class Graph : public ICudnn, public INode {
         cached_pass_by_value           = deserialized_pass_by_value;
         cached_workspace_modifications = deserialized_workspace_modifications;
 
+        // Reset prep state in case this Graph is being re-deserialized; otherwise the
+        // eager prep below would early-return with the old slot layout.
+        varpack_prep_state->prepared.store(false, std::memory_order_release);
+        varpack_template = {};
+
         // Eager prep, matching what build_plans() does for fresh-build graphs.
         CHECK_CUDNN_FRONTEND_ERROR(prepare_variant_pack_template());
 
@@ -2069,16 +2074,14 @@ class Graph : public ICudnn, public INode {
         VarpackPrepStateBox(VarpackPrepStateBox &&) noexcept = default;
         VarpackPrepStateBox &
         operator=(VarpackPrepStateBox &&) noexcept = default;
-        VarpackPrepStateBox(VarpackPrepStateBox const &other) : ptr(std::make_unique<VarpackPrepState>()) {
-            if (other.ptr) {
-                ptr->prepared.store(other.ptr->prepared.load(std::memory_order_acquire), std::memory_order_release);
-            }
-        }
+        // Copy semantics: never copy the prepared flag. The cached template_ptrs
+        // store raw addresses into the source Graph's pass-by-value storage; a
+        // copied Graph must rebuild its own template on first use.
+        VarpackPrepStateBox(VarpackPrepStateBox const & /*other*/) : ptr(std::make_unique<VarpackPrepState>()) {}
         VarpackPrepStateBox &
         operator=(VarpackPrepStateBox const &other) {
             if (this != &other) {
-                VarpackPrepStateBox tmp(other);
-                ptr.swap(tmp.ptr);
+                ptr = std::make_unique<VarpackPrepState>();
             }
             return *this;
         }
