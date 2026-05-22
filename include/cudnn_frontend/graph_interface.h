@@ -1624,6 +1624,14 @@ class Graph : public ICudnn, public INode {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j = json::from_ubjson(data);
 
+        // Clear deserialize-owned containers so a re-deserialize on the same Graph
+        // does not feed prepare_variant_pack_template() with stale entries from a
+        // prior deserialize(handle, old_data).
+        deserialized_tensor_properties.clear();
+        deserialized_pass_by_value.clear();
+        deserialized_workspace_modifications.clear();
+        tensors_to_dump.clear();
+
         if (j.contains("graph_uid") && !j["graph_uid"].is_null()) {
             graph_uid = j["graph_uid"].get<uint64_t>();
         }
