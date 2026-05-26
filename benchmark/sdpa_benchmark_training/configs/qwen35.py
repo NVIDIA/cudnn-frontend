@@ -36,7 +36,7 @@ CONFIG = BenchmarkConfig(
     # fa4 rows are kept (they fail) to document the sm100 kernel limitation.
     data_types=["bfloat16"],
     attn_masks=["top_left"],  # Causal only
-    profile_pass="fwd",  # Forward-only (bwd blocked at head_dim=256)
+    profile_pass="both",
     deterministic_bwd=[False, True],
     batch_size=1,
     num_iterations=10,
