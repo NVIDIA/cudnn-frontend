@@ -94,6 +94,15 @@ def _add_row_scale(inputs):
         dtype=torch.float32,
         device=inputs["a_tensor"].device,
     ).uniform_(0.25, 1.75)
+    inputs["alpha_tensor"].copy_(
+        torch.linspace(
+            -1.5,
+            1.5,
+            inputs["alpha_tensor"].numel(),
+            dtype=torch.float32,
+            device=inputs["alpha_tensor"].device,
+        )
+    )
 
 
 @pytest.mark.L0
@@ -465,6 +474,27 @@ def test_grouped_gemm_quant_wrapper_fp4_row_scale_with_bias(request):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=5)
+def test_grouped_gemm_quant_discrete_compile_execute_fp4_row_scale(request):
+    _test_grouped_gemm_quant_discrete_compile_execute(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        b_major="k",
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=16,
+        sf_dtype=torch.float8_e4m3fn,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        row_scale=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=6)
 def test_grouped_gemm_quant_discrete_wrapper_fp4_row_scale(request):
     _test_grouped_gemm_quant_discrete_wrapper(
         ab_dtype=torch.float4_e2m1fn_x2,
@@ -1173,6 +1203,7 @@ def _test_grouped_gemm_quant_discrete_compile_execute(
     discrete_col_sfd,
     request,
     use_dynamic_sched=False,
+    row_scale=False,
 ):
     try:
         from cudnn import GroupedGemmQuantSm100
@@ -1209,6 +1240,8 @@ def _test_grouped_gemm_quant_discrete_compile_execute(
         m_aligned=cfg["m_aligned"],
         b_major=cfg["b_major"],
     )
+    if row_scale:
+        _add_row_scale(inputs)
 
     outputs = allocate_grouped_gemm_quant_output_tensors(
         tensor_m=inputs["tensor_m"],
