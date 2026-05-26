@@ -88,6 +88,14 @@ def _check_ref_grouped_gemm_quant_discrete(inputs, outputs, cfg, skip_ref=False)
     )
 
 
+def _add_row_scale(inputs):
+    inputs["row_scale_tensor"] = torch.empty(
+        inputs["tensor_m"],
+        dtype=torch.float32,
+        device=inputs["a_tensor"].device,
+    ).uniform_(0.25, 1.75)
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_scheduler_modes
@@ -399,6 +407,81 @@ def test_grouped_gemm_quant_compile_execute_rectangular_zero_alpha(request):
 
     assert torch.count_nonzero(outputs["d_tensor"][: inputs["valid_m"]]).item() == 0
     assert torch.count_nonzero(outputs["amax_tensor"]).item() == 0
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=3)
+@pytest.mark.parametrize("vector_f32", [False, True])
+def test_grouped_gemm_quant_compile_execute_fp4_row_scale(vector_f32, request):
+    def input_mutator(inputs, _cfg):
+        _add_row_scale(inputs)
+        inputs["prob_tensor"].fill_(1.0)
+
+    _test_grouped_gemm_quant_compile_execute(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=16,
+        sf_dtype=torch.float8_e4m3fn,
+        vector_f32=vector_f32,
+        discrete_col_sfd=False,
+        request=request,
+        input_mutator=input_mutator,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=4)
+def test_grouped_gemm_quant_wrapper_fp4_row_scale_with_bias(request):
+    def input_mutator(inputs, _cfg):
+        _add_row_scale(inputs)
+        inputs["prob_tensor"].uniform_(0.25, 1.25)
+        inputs["bias_ref"] = inputs["bias_tensor"]
+
+    _test_grouped_gemm_quant_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=16,
+        sf_dtype=torch.float8_e4m3fn,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        input_mutator=input_mutator,
+        cfg_overrides={
+            "group_m_list": [256, 128, 384, 256],
+        },
+        enable_bias=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=5)
+def test_grouped_gemm_quant_discrete_wrapper_fp4_row_scale(request):
+    _test_grouped_gemm_quant_discrete_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        b_major="k",
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=16,
+        sf_dtype=torch.float8_e4m3fn,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        row_scale=True,
+    )
 
 
 @pytest.mark.L0
@@ -936,6 +1019,7 @@ def _test_grouped_gemm_quant_compile_execute(
         sample_amax=outputs.get("amax_tensor"),
         sample_norm_const=inputs.get("norm_const_tensor"),
         sample_prob=inputs["prob_tensor"],
+        sample_row_scale=inputs.get("row_scale_tensor"),
         acc_dtype=cfg["acc_dtype"],
         mma_tiler_mn=cfg["mma_tiler_mn"],
         cluster_shape_mn=cfg["cluster_shape_mn"],
@@ -965,6 +1049,7 @@ def _test_grouped_gemm_quant_compile_execute(
         sfd_col_tensor=outputs.get("sfd_col_tensor"),
         norm_const_tensor=inputs.get("norm_const_tensor"),
         prob_tensor=inputs["prob_tensor"],
+        row_scale_tensor=inputs.get("row_scale_tensor"),
         amax_tensor=outputs.get("amax_tensor"),
         current_stream=stream,
     )
@@ -994,6 +1079,7 @@ def _test_grouped_gemm_quant_wrapper(
     cfg_overrides=None,
     input_mutator=None,
     use_dynamic_sched=False,
+    enable_bias=False,
 ):
     """Test GroupedGemmQuant API via the wrapper function (with caching)."""
     try:
@@ -1029,6 +1115,7 @@ def _test_grouped_gemm_quant_wrapper(
         sf_dtype=cfg["sf_dtype"],
         sf_vec_size=cfg["sf_vec_size"],
         m_aligned=cfg["m_aligned"],
+        enable_bias=enable_bias,
     )
 
     if input_mutator is not None:
@@ -1041,10 +1128,12 @@ def _test_grouped_gemm_quant_wrapper(
                 b_tensor=inputs["b_tensor"],
                 sfa_tensor=inputs["sfa_tensor"],
                 sfb_tensor=inputs["sfb_tensor"],
+                bias_tensor=inputs["bias_tensor"],
                 padded_offsets=inputs["padded_offsets_tensor"],
                 alpha_tensor=inputs["alpha_tensor"],
                 norm_const_tensor=inputs.get("norm_const_tensor"),
                 prob_tensor=inputs["prob_tensor"],
+                row_scale_tensor=inputs.get("row_scale_tensor"),
                 acc_dtype=cfg["acc_dtype"],
                 d_dtype=cfg["d_dtype"],
                 cd_major=cfg["cd_major"],
@@ -1148,6 +1237,7 @@ def _test_grouped_gemm_quant_discrete_compile_execute(
         sample_amax=outputs.get("amax_tensor"),
         sample_norm_const=inputs.get("norm_const_tensor"),
         sample_prob=inputs["prob_tensor"],
+        sample_row_scale=inputs.get("row_scale_tensor"),
         acc_dtype=cfg["acc_dtype"],
         mma_tiler_mn=cfg["mma_tiler_mn"],
         cluster_shape_mn=cfg["cluster_shape_mn"],
@@ -1179,6 +1269,7 @@ def _test_grouped_gemm_quant_discrete_compile_execute(
         amax_tensor=outputs.get("amax_tensor"),
         norm_const_tensor=inputs.get("norm_const_tensor"),
         prob_tensor=inputs["prob_tensor"],
+        row_scale_tensor=inputs.get("row_scale_tensor"),
         current_stream=stream,
     )
 
@@ -1206,6 +1297,7 @@ def _test_grouped_gemm_quant_discrete_wrapper(
     discrete_col_sfd,
     request,
     use_dynamic_sched=False,
+    row_scale=False,
 ):
     try:
         from cudnn import grouped_gemm_quant_wrapper_sm100
@@ -1242,6 +1334,8 @@ def _test_grouped_gemm_quant_discrete_wrapper(
         m_aligned=cfg["m_aligned"],
         b_major=cfg["b_major"],
     )
+    if row_scale:
+        _add_row_scale(inputs)
 
     try:
         for _ in range(2):
@@ -1257,6 +1351,7 @@ def _test_grouped_gemm_quant_discrete_wrapper(
                 b_major=cfg["b_major"],
                 norm_const_tensor=inputs.get("norm_const_tensor"),
                 prob_tensor=inputs["prob_tensor"],
+                row_scale_tensor=inputs.get("row_scale_tensor"),
                 acc_dtype=cfg["acc_dtype"],
                 d_dtype=cfg["d_dtype"],
                 cd_major=cfg["cd_major"],
