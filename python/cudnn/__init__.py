@@ -53,7 +53,7 @@ for _optional_symbol in ["causal_conv1d_forward", "causal_conv1d_backward"]:
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.24.0"
+__version__ = "1.25.0"
 
 
 def _tensor(
