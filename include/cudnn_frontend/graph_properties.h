@@ -1339,7 +1339,7 @@ class Reduction_attributes : public Attributes<Reduction_attributes> {
     bool is_deterministic = false;
 
    public:
-    enum class input_names { X };
+    enum class input_names { X, Group_offset };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
@@ -1370,6 +1370,12 @@ class Reduction_attributes : public Attributes<Reduction_attributes> {
     Reduction_attributes&
     set_is_deterministic(bool value) {
         is_deterministic = value;
+        return *this;
+    }
+
+    Reduction_attributes&
+    set_group_offset(std::shared_ptr<Tensor_attributes> value) {
+        inputs[input_names::Group_offset] = std::move(value);
         return *this;
     }
 };

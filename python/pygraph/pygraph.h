@@ -333,7 +333,8 @@ class PyGraph {
     reduction(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
               cudnn_frontend::ReductionMode_t const mode,
               cudnn_frontend::DataType_t const& compute_data_type,
-              std::string const& name);
+              std::string const& name,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> group_offset = nullptr);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,

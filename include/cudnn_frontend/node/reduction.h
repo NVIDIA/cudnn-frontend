@@ -115,6 +115,7 @@ class ReductionNode : public NodeCRTP<ReductionNode> {
 
         // Validate input tensors are set
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Reduction_attributes::input_names::X);
+        auto Group_offset = attributes.inputs.find(Reduction_attributes::input_names::Group_offset);
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Reduction_attributes::output_names::Y);
 
         // 1. Create the backend operation descriptor
@@ -149,7 +150,27 @@ class ReductionNode : public NodeCRTP<ReductionNode> {
                                                        1,
                                                        &y_backend_desc));
 
-        // 5. Finalize the operation descriptor
+        // 5. Set the optional group offset tensor descriptor
+        if (Group_offset != attributes.inputs.end() && Group_offset->second != nullptr) {
+#if (CUDNN_VERSION >= 92400) && (CUDNN_VERSION < 99900)
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                detail::get_backend_version() < 92400 || detail::get_backend_version() >= 99900,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "Reduction group_offset is not supported in cudnn version < 9.24.0");
+            auto group_offset_backend_desc = tensors.at(Group_offset->second->get_uid())->get_raw_desc();
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reduction_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_REDUCTION_GROUP_OFFSET_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &group_offset_backend_desc));
+#else
+            return {error_code_t::GRAPH_NOT_SUPPORTED,
+                    "Reduction group_offset is not supported in cudnn version < 9.24.0"};
+#endif
+        }
+
+        // 6. Finalize the operation descriptor
 
         _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(reduction_operation.get_raw_desc()));
 
@@ -178,9 +199,32 @@ INode::reduction(std::shared_ptr<Tensor_attributes> a,
     sub_nodes.emplace_back(std::make_unique<ReductionNode>(std::move(attributes), context));
 }
 
+inline void
+INode::reduction(std::shared_ptr<Tensor_attributes> a,
+                 std::shared_ptr<Tensor_attributes> group_offset,
+                 Reduction_attributes attributes,
+                 std::shared_ptr<Tensor_attributes> c) {
+    attributes.inputs[Reduction_attributes::input_names::X]            = a;
+    attributes.inputs[Reduction_attributes::input_names::Group_offset] = group_offset;
+    attributes.outputs[Reduction_attributes::output_names::Y]          = c;
+    sub_nodes.emplace_back(std::make_unique<ReductionNode>(std::move(attributes), context));
+}
+
 inline std::shared_ptr<Tensor_attributes>
 INode::reduction(std::shared_ptr<Tensor_attributes> input, Reduction_attributes attributes) {
     attributes.inputs[Reduction_attributes::input_names::X] = input;
+    auto Y = attributes.outputs[Reduction_attributes::output_names::Y] = output_tensor(attributes.name + "::Y");
+
+    sub_nodes.emplace_back(std::make_unique<ReductionNode>(std::move(attributes), context));
+    return Y;
+}
+
+inline std::shared_ptr<Tensor_attributes>
+INode::reduction(std::shared_ptr<Tensor_attributes> input,
+                 std::shared_ptr<Tensor_attributes> group_offset,
+                 Reduction_attributes attributes) {
+    attributes.inputs[Reduction_attributes::input_names::X]            = input;
+    attributes.inputs[Reduction_attributes::input_names::Group_offset] = group_offset;
     auto Y = attributes.outputs[Reduction_attributes::output_names::Y] = output_tensor(attributes.name + "::Y");
 
     sub_nodes.emplace_back(std::make_unique<ReductionNode>(std::move(attributes), context));

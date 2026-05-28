@@ -203,6 +203,7 @@ class Operation_v8 : public BackendDescriptor {
     ManagedOpaqueDescriptor pwdesc             = nullptr;
     ManagedOpaqueDescriptor matmuldesc         = nullptr;
     ManagedOpaqueDescriptor reductiondesc      = nullptr;
+    ManagedOpaqueDescriptor groupoffsetdesc    = nullptr;
     ManagedOpaqueDescriptor sumdesc            = nullptr;
     ManagedOpaqueDescriptor sqsumdesc          = nullptr;
     ManagedOpaqueDescriptor scaledesc          = nullptr;
@@ -333,6 +334,35 @@ class OperationBuilder_v8 {
                 status,
                 "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_REDUCTION_YDESC Failed");
             return std::move(m_operation);
+        }
+        if (m_operation.groupoffsetdesc != nullptr) {
+#if (CUDNN_VERSION >= 92400) && (CUDNN_VERSION < 99900)
+            if (detail::get_backend_version() < 92400 || detail::get_backend_version() >= 99900) {
+                set_error_and_throw_exception(&m_operation,
+                                              CUDNN_STATUS_NOT_SUPPORTED,
+                                              "CUDNN_BACKEND_OPERATION: Reduction group offset is not supported in "
+                                              "cudnn version < 9.24.0");
+                return std::move(m_operation);
+            }
+            status = detail::set_attribute(m_operation.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATION_REDUCTION_GROUP_OFFSET_DESC,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &(m_operation.groupoffsetdesc->get_backend_descriptor()));
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_operation,
+                    status,
+                    "CUDNN_BACKEND_OPERATION: SetAttribute CUDNN_ATTR_OPERATION_REDUCTION_GROUP_OFFSET_DESC Failed");
+                return std::move(m_operation);
+            }
+#else
+            set_error_and_throw_exception(&m_operation,
+                                          CUDNN_STATUS_NOT_SUPPORTED,
+                                          "CUDNN_BACKEND_OPERATION: Reduction group offset is not supported in cudnn "
+                                          "version < 9.24.0");
+            return std::move(m_operation);
+#endif
         }
         status = detail::finalize(m_operation.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
@@ -2843,6 +2873,28 @@ class OperationBuilder_v8 {
                 "CUDNN_BACKEND_OPERATION_*_DESCRIPTOR: Non Reduction operation does not need REDUCTION DESCRIPTOR");
         }
         m_operation.reductiondesc = reductionDesc.get_desc();
+        return *this;
+    }
+    auto
+    setGroupOffsetDesc(Tensor_v8 const &tensor) -> OperationBuilder_v8 & {
+        if (is_reduction_op == false) {
+            set_error_and_throw_exception(
+                &m_operation,
+                CUDNN_STATUS_BAD_PARAM,
+                "CUDNN_BACKEND_OPERATION_*_DESCRIPTOR: Non Reduction operation does not need GROUP OFFSET DESCRIPTOR");
+        }
+        m_operation.groupoffsetdesc = tensor.get_desc();
+        return *this;
+    }
+    auto
+    setGroupOffsetDesc(ManagedOpaqueDescriptor const &raw_tensor) -> OperationBuilder_v8 & {
+        if (is_reduction_op == false) {
+            set_error_and_throw_exception(
+                &m_operation,
+                CUDNN_STATUS_BAD_PARAM,
+                "CUDNN_BACKEND_OPERATION_*_DESCRIPTOR: Non Reduction operation does not need GROUP OFFSET DESCRIPTOR");
+        }
+        m_operation.groupoffsetdesc = raw_tensor;
         return *this;
     }
     auto

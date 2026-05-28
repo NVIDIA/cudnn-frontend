@@ -345,11 +345,15 @@ std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::reduction(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
                    cudnn_frontend::ReductionMode_t const mode,
                    cudnn_frontend::DataType_t const& compute_data_type,
-                   std::string const& name) {
+                   std::string const& name,
+                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> group_offset) {
     auto attributes = cudnn_frontend::graph::Reduction_attributes()
                           .set_mode(mode)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
+    if (group_offset != nullptr) {
+        attributes.set_group_offset(std::move(group_offset));
+    }
 
     auto OUT_0 = graph->reduction(input, attributes);
     return OUT_0;
@@ -1065,6 +1069,7 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("mode"),
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("name", ""),
+             py::arg_v("group_offset", nullptr),
              R"pbdoc(
                 Reduce an input tensor along certain dimensions. These dimensions to reduce on are inferred from output tensor shape.
 
@@ -1073,6 +1078,7 @@ init_pygraph_submodule(py::module_& m) {
                     mode (cudnn.reduction_mode): The mode to use to reduce along a dimension.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                     name (Optional[str]): A name for the operation to be performed.
+                    group_offset (Optional[cudnn_tensor]): The group offset tensor for grouped reduction.
 
                 Returns:
                     cudnn_tensor: The result of reduction operation.

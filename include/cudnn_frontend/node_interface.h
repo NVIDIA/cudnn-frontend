@@ -213,6 +213,12 @@ class INode {
               std::shared_ptr<Tensor_attributes> c);
 
     void
+    reduction(std::shared_ptr<Tensor_attributes> a,
+              std::shared_ptr<Tensor_attributes> group_offset,
+              Reduction_attributes attributes,
+              std::shared_ptr<Tensor_attributes> c);
+
+    void
     rng(std::shared_ptr<Tensor_attributes> seed,
         std::shared_ptr<Tensor_attributes> offset,
         Rng_attributes attributes,
@@ -404,6 +410,9 @@ class INode {
                                                  Pointwise_attributes);
 
     std::shared_ptr<Tensor_attributes> reduction(std::shared_ptr<Tensor_attributes>, Reduction_attributes);
+    std::shared_ptr<Tensor_attributes> reduction(std::shared_ptr<Tensor_attributes>,
+                                                 std::shared_ptr<Tensor_attributes>,
+                                                 Reduction_attributes);
     std::array<std::shared_ptr<Tensor_attributes>, 2> resample(std::shared_ptr<Tensor_attributes>, Resample_attributes);
     std::shared_ptr<Tensor_attributes> reshape(std::shared_ptr<Tensor_attributes>, Reshape_attributes);
     std::shared_ptr<Tensor_attributes> transpose(std::shared_ptr<Tensor_attributes>, Transpose_attributes);
