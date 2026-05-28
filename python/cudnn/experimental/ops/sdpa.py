@@ -89,6 +89,16 @@ def _device_supports_d256_oss(device: torch.device) -> bool:
     return major * 10 + minor >= 100
 
 
+# cuDNN 9.23.0 added native d=256 SDPA fprop and bprop support in the graph
+# backend. From this version on the OSS (cuteDSL) kernels are no longer needed.
+_CUDNN_NATIVE_D256_VERSION = 92300
+
+
+def _cudnn_supports_native_d256() -> bool:
+    """Return True when the linked cuDNN handles d=256 SDPA natively in the graph backend."""
+    return cudnn.backend_version() >= _CUDNN_NATIVE_D256_VERSION
+
+
 def _torch_dtype_to_cudnn(dtype: torch.dtype):
     """Map a PyTorch dtype to a cuDNN data_type enum."""
     return _TORCH_DTYPE_TO_CUDNN[dtype]
@@ -638,9 +648,13 @@ def _sdpa_impl(
         cumulative_seq_len_q,
         cumulative_seq_len_kv,
     )
-    use_d256_oss_fwd = can_use_d256_oss_fwd and _device_supports_d256_oss(q.device)
+    use_d256_oss_fwd = can_use_d256_oss_fwd and _device_supports_d256_oss(q.device) and not _cudnn_supports_native_d256()
     if can_use_d256_oss_fwd and not use_d256_oss_fwd:
-        _logger.debug("Falling back to cuDNN graph d=256 forward path because OSS kernel requires SM100+, got device %s", q.device)
+        _logger.debug(
+            "Falling back to cuDNN graph d=256 forward path " "(cuDNN backend version %d, requires SM100+ device, got %s)",
+            cudnn.backend_version(),
+            q.device,
+        )
     if use_d256_oss_fwd:
         try:
             return sdpa_fwd_d256(
@@ -1132,7 +1146,7 @@ def _sdpa_backward(ctx, dO, dStats):
         cum_q,
         cum_kv,
     )
-    use_d256_oss_bwd = can_use_d256_oss_bwd and _device_supports_d256_oss(q.device)
+    use_d256_oss_bwd = can_use_d256_oss_bwd and _device_supports_d256_oss(q.device) and not _cudnn_supports_native_d256()
 
     if is_d256:
         if use_d256_oss_bwd:
