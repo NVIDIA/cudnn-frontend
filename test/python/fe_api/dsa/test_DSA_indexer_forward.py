@@ -48,6 +48,7 @@ def test_DSA_indexer_forward_wrapper(
         ratio=ratio,
         s_q_default=256,
         s_kv_default=512,
+        min_compute_capability=90,
     )
     q, k, w = _allocate_inputs(cfg)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)

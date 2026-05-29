@@ -1390,7 +1390,10 @@ class SparseScoreRecomputeSm100:
             cute.arch.mbarrier_wait(S_mbar_ptr + 2 * _slot, s_full_phase)
             if const_expr(_ri == 0):
                 cute.autovec_copy(sLSE_1d, rLSE_all)
-            if const_expr(not self.have_topk_length) or n_blk < n_block_max_epi:
+            should_copy_tmem = const_expr(True)
+            if const_expr(self.have_topk_length):
+                should_copy_tmem = n_blk < n_block_max_epi
+            if should_copy_tmem:
                 tmem_ptr_cur = cute.make_ptr(
                     Float32,
                     _slot * self.tmem_s_stride,
@@ -1405,7 +1408,10 @@ class SparseScoreRecomputeSm100:
             cute.arch.mbarrier_arrive(S_mbar_ptr + 2 * _slot + 1)
             if const_expr(_slot == 0):
                 s_full_phase ^= 1
-            if const_expr(not self.have_topk_length) or n_blk < n_block_max_epi:
+            should_accumulate_score = const_expr(True)
+            if const_expr(self.have_topk_length):
+                should_accumulate_score = n_blk < n_block_max_epi
+            if should_accumulate_score:
                 local_sum = (Float32(0.0), Float32(0.0))
                 for ho in cutlass.range_constexpr(qhpkv // 2 // LSE_ILP):
                     for ci in cutlass.range_constexpr(LSE_ILP):
@@ -1561,7 +1567,10 @@ class SparseScoreRecomputeSm100:
             cute.arch.mbarrier_wait(S_mbar_ptr + 2 * _slot, s_full_phase)
             if const_expr(_ri == 0):
                 cute.autovec_copy(tSsLSE, tSrLSE)
-            if const_expr(not self.have_topk_length) or n_blk < n_block_max_epi:
+            should_copy_tmem = const_expr(True)
+            if const_expr(self.have_topk_length):
+                should_copy_tmem = n_blk < n_block_max_epi
+            if should_copy_tmem:
                 tmem_ptr_cur = cute.make_ptr(
                     Float32,
                     _slot * self.tmem_s_stride,
@@ -1576,7 +1585,10 @@ class SparseScoreRecomputeSm100:
             cute.arch.mbarrier_arrive(S_mbar_ptr + 2 * _slot + 1)
             if const_expr(_slot == 0):
                 s_full_phase ^= 1
-            if const_expr(not self.have_topk_length) or n_blk < n_block_max_epi:
+            should_accumulate_score = const_expr(True)
+            if const_expr(self.have_topk_length):
+                should_accumulate_score = n_blk < n_block_max_epi
+            if should_accumulate_score:
                 local_sum = (Float32(0.0), Float32(0.0))
                 for ho in cutlass.range_constexpr(num_heads_per_thr // 2 // LSE_ILP):
                     for ci in cutlass.range_constexpr(LSE_ILP):

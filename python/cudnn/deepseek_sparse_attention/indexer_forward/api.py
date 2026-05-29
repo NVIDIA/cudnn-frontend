@@ -1,4 +1,4 @@
-"""APIBase wrapper for IndexerForwardSm100 (CuTe DSL score kernel).
+"""APIBase wrapper and dispatcher for indexer forward CuTe DSL score kernels.
 
 Produces dense indexer scores Q @ K^T with per-head ReLU, weighted head
 reduction, and a ratio causal mask. Does NOT fuse top-K — pair with
@@ -24,12 +24,18 @@ from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import device_major, resolve_stream
 
 from .indexer_fwd_sm100 import IndexerForwardSm100
-from ._interface import indexer_fwd
+from ._interface import indexer_fwd as indexer_fwd_sm100
+from ._interface_sm90 import indexer_fwd as indexer_fwd_sm90
 
 TMA_ALIGN_ELEMS = 4  # FP32 output => seqlen_k padded to multiples of 4 (16 B)
 
 
 class IndexerForward(APIBase):
+    """SM100+ APIBase implementation used by ``indexer_forward_wrapper``.
+
+    Hopper dispatch uses the direct SM90 wrapper in ``_interface_sm90.py``.
+    """
+
     def __init__(
         self,
         sample_q: torch.Tensor,  # (B, S_q, H_q, D) BF16
@@ -232,8 +238,25 @@ def indexer_forward_wrapper(
     Returns ``{'scores': (B, S_q, S_k) FP32}``. The ratio causal mask marks
     positions outside the valid KV range with -inf.
     """
+    if device_major() == 9:
+        # The APIBase class below owns the SM100 TMA-padded path. Hopper uses a
+        # direct CuTe DSL wrapper so the public wrapper can cover both arches.
+        scores = indexer_fwd_sm90(
+            q,
+            k,
+            w,
+            ratio=ratio,
+            qhead_per_kv_head=qhead_per_kv_head,
+            sm_scale=sm_scale,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+        )
+        return TupleDict(scores=scores)
+
     if cu_seqlens_q is not None or cu_seqlens_k is not None:
-        scores = indexer_fwd(
+        scores = indexer_fwd_sm100(
             q,
             k,
             w,

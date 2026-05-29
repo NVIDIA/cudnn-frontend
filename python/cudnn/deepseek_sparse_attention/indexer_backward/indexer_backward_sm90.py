@@ -101,12 +101,14 @@ class IndexerBackwardSm90:
     COMPUTE_WG_B = 1  # warps 4-7
     KLOAD_WG = 2  # warps 8-11
 
-    def __init__(self, head_dim, heads=64, block_I=128, topk=512, is_dense=False, topk_indices_global: bool = True):
+    def __init__(self, head_dim, heads=64, block_I=128, topk=512, is_dense=False, topk_indices_global: bool = True, ratio: int = 1):
         self.head_dim = head_dim
         self.heads = heads
         self.block_I = block_I
         self.topk = topk
         self.is_dense = is_dense
+        assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
+        self.ratio = ratio
         # Public forward/topk returns global KV ids by default. Sparse mode
         # decodes them to local per-batch ids before indexing K/dK views.
         self.topk_indices_global = topk_indices_global
@@ -152,6 +154,16 @@ class IndexerBackwardSm90:
         # Ping-pong scheduler barriers (WG0 syncs on 4, WG1 syncs on 5)
         self.SCHED_BARRIER_WG0 = 4
         self.SCHED_BARRIER_WG1 = 5
+
+    @cute.jit
+    def _dense_num_k_blocks(self, q_token, seqlen_q, seqlen_k):
+        """Return dense K blocks that can contain valid ratio-causal columns."""
+        ratio = Int32(self.ratio)
+        q_global_start = seqlen_k * ratio - seqlen_q
+        col_limit = (q_global_start + q_token + Int32(1)) // ratio
+        col_limit = col_limit if col_limit > Int32(0) else Int32(0)
+        col_limit = col_limit if col_limit < seqlen_k else seqlen_k
+        return cute.ceil_div(col_limit, self.block_I)
 
     @cute.jit
     def __call__(
@@ -523,6 +535,7 @@ class IndexerBackwardSm90:
                     sm_scale,
                     seq_idx,
                     batch_idx,
+                    seqlen_q_b,
                     seqlen_k_b,
                     tidx,
                     warp_idx,
@@ -561,6 +574,7 @@ class IndexerBackwardSm90:
                     sm_scale,
                     seq_idx,
                     batch_idx,
+                    seqlen_q_b,
                     seqlen_k_b,
                     tidx,
                     warp_idx,
@@ -577,6 +591,7 @@ class IndexerBackwardSm90:
                         sK,
                         batch_idx,
                         seq_idx,
+                        seqlen_q_b,
                         seqlen_k_b,
                         tidx,
                         mbar,
@@ -631,6 +646,7 @@ class IndexerBackwardSm90:
         sm_scale: Float32 | float,
         seq_idx,
         batch_idx,
+        seqlen_q,
         seqlen_k,
         tidx,
         warp_idx,
@@ -760,8 +776,13 @@ class IndexerBackwardSm90:
         if compute_wg_idx == 1:
             cute.arch.barrier_arrive(barrier_id=self.SCHED_BARRIER_WG0, number_of_threads=self.TOTAL_COMPUTE_THREADS)
 
+        if const_expr(self.is_dense):
+            num_topk_blocks_cur = self._dense_num_k_blocks(seq_idx, seqlen_q, seqlen_k)
+        else:
+            num_topk_blocks_cur = Int32(self.num_topk_blocks)
+
         # ---- Step 3: Main loop over topk blocks ----
-        for bi in cutlass.range(0, self.num_topk_blocks, unroll=1):
+        for bi in cutlass.range(0, num_topk_blocks_cur, unroll=1):
             i_st = bi * self.block_I
             stage = bi % NUM_K_STAGES
 
@@ -1142,15 +1163,8 @@ class IndexerBackwardSm90:
     @cute.jit
     def _k_load_warpgroup_dense_inline(
         self,
-        mK,
-        mKScalar,
-        sK,
-        batch_idx,
-        seq_idx,
-        seqlen_k,
-        tidx,
-        mbar,
-        tma_atom_K,
+        mK, mKScalar, sK, batch_idx, seq_idx, seqlen_q, seqlen_k, tidx,
+        mbar, tma_atom_K,
     ):
         """Dense mode K loading via TMA (sequential blocks, no scatter-gather)."""
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -1175,13 +1189,10 @@ class IndexerBackwardSm90:
 
         async_copy_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            self.k_dtype,
-            num_bits_per_copy=128,
+            self.k_dtype, num_bits_per_copy=128,
         )
         async_thr_copy = cute.make_tiled_copy_tv(
-            async_copy_atom,
-            cute.make_layout((1,)),
-            cute.make_layout((8,)),
+            async_copy_atom, cute.make_layout((1,)), cute.make_layout((8,)),
         ).get_slice(0)
         GROUP_SIZE = const_expr(8)
         NUM_GROUPS = const_expr(self.WARPGROUP_SIZE // 8)
@@ -1189,78 +1200,75 @@ class IndexerBackwardSm90:
         idx_in_group = wg_tidx % GROUP_SIZE
         group_idx_local = wg_tidx // GROUP_SIZE
 
+        num_k_blocks = self._dense_num_k_blocks(seq_idx, seqlen_q, seqlen_k)
         for bi in cutlass.range_constexpr(self.num_topk_blocks):
-            stage = bi % NUM_K_STAGES
-            n_block = bi
+            if bi < num_k_blocks:
+                stage = bi % NUM_K_STAGES
+                n_block = bi
 
-            if bi >= NUM_K_STAGES:
-                if stage == 0:
-                    cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_0, k_consumed_0_phase)
-                    k_consumed_0_phase ^= 1
-                elif stage == 1:
-                    cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_1, k_consumed_1_phase)
-                    k_consumed_1_phase ^= 1
-                else:
-                    cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_2, k_consumed_2_phase)
-                    k_consumed_2_phase ^= 1
-
-            sK_slice = sK_slice_0 if stage == 0 else (sK_slice_1 if stage == 1 else sK_slice_2)
-            mbar_k = (mbar + MBAR_K_LOADED_0) if stage == 0 else ((mbar + MBAR_K_LOADED_1) if stage == 1 else (mbar + MBAR_K_LOADED_2))
-
-            block_end = (n_block + 1) * self.block_I
-            if block_end <= seqlen_k:
-                gK_tile = cute.local_tile(
-                    mK,
-                    (self.block_I, self.head_dim_padded),
-                    (n_block, 0),
-                )
-                load_fn, _, _ = copy_ops.tma_get_copy_fn(
-                    tma_atom_K,
-                    0,
-                    cute.make_layout(1),
-                    gK_tile,
-                    sK_slice,
-                    single_stage=True,
-                )
-
-                if warp_idx_in_wg == 0:
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            mbar_k,
-                            self.tma_copy_K_bytes,
-                        )
-                    load_fn(tma_bar_ptr=mbar_k)
-            else:
-                for r in cutlass.range_constexpr(ROWS_PER_GROUP):
-                    row = r * NUM_GROUPS + group_idx_local
-                    k_pos = n_block * self.block_I + row
-                    if k_pos < seqlen_k:
-                        gK_raw = mKScalar[k_pos, None]
-                        gK = cute.make_tensor(
-                            cute.make_ptr(self.k_dtype, gK_raw.iterator.llvm_ptr, cute.AddressSpace.gmem, assumed_align=16),
-                            gK_raw.layout,
-                        )
-                        gChunks = cute.flat_divide(gK, (8,))
-                        sRow = sK_slice[row, None]
-                        sChunks = cute.flat_divide(sRow, (8,))
-                        for tile in cutlass.range_constexpr(self.head_dim_padded // 64):
-                            chunk_idx = tile * 8 + idx_in_group
-                            tSg = async_thr_copy.partition_S(gChunks[None, chunk_idx])
-                            tSs = async_thr_copy.partition_D(sChunks[None, chunk_idx])
-                            cute.copy(async_copy_atom, tSg, tSs)
+                if bi >= NUM_K_STAGES:
+                    if stage == 0:
+                        cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_0, k_consumed_0_phase)
+                        k_consumed_0_phase ^= 1
+                    elif stage == 1:
+                        cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_1, k_consumed_1_phase)
+                        k_consumed_1_phase ^= 1
                     else:
-                        sRow = sK_slice[row, None]
-                        sChunks = cute.flat_divide(sRow, (8,))
-                        for tile in cutlass.range_constexpr(self.head_dim_padded // 64):
-                            chunk_idx = tile * 8 + idx_in_group
-                            sChunks[None, chunk_idx].fill(0)
+                        cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_2, k_consumed_2_phase)
+                        k_consumed_2_phase ^= 1
 
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
-                cute.arch.fence_view_async_shared()
-                if warp_idx_in_wg == 0:
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(mbar_k)
+                sK_slice = sK_slice_0 if stage == 0 else (sK_slice_1 if stage == 1 else sK_slice_2)
+                mbar_k = (mbar + MBAR_K_LOADED_0) if stage == 0 else (
+                    (mbar + MBAR_K_LOADED_1) if stage == 1 else (mbar + MBAR_K_LOADED_2))
+
+                block_end = (n_block + 1) * self.block_I
+                if block_end <= seqlen_k:
+                    gK_tile = cute.local_tile(
+                        mK, (self.block_I, self.head_dim_padded), (n_block, 0),
+                    )
+                    load_fn, _, _ = copy_ops.tma_get_copy_fn(
+                        tma_atom_K, 0, cute.make_layout(1),
+                        gK_tile, sK_slice, single_stage=True,
+                    )
+
+                    if warp_idx_in_wg == 0:
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                mbar_k, self.tma_copy_K_bytes,
+                            )
+                        load_fn(tma_bar_ptr=mbar_k)
+                else:
+                    for r in cutlass.range_constexpr(ROWS_PER_GROUP):
+                        row = r * NUM_GROUPS + group_idx_local
+                        k_pos = n_block * self.block_I + row
+                        if k_pos < seqlen_k:
+                            gK_raw = mKScalar[k_pos, None]
+                            gK = cute.make_tensor(
+                                cute.make_ptr(self.k_dtype, gK_raw.iterator.llvm_ptr,
+                                              cute.AddressSpace.gmem, assumed_align=16),
+                                gK_raw.layout,
+                            )
+                            gChunks = cute.flat_divide(gK, (8,))
+                            sRow = sK_slice[row, None]
+                            sChunks = cute.flat_divide(sRow, (8,))
+                            for tile in cutlass.range_constexpr(self.head_dim_padded // 64):
+                                chunk_idx = tile * 8 + idx_in_group
+                                tSg = async_thr_copy.partition_S(gChunks[None, chunk_idx])
+                                tSs = async_thr_copy.partition_D(sChunks[None, chunk_idx])
+                                cute.copy(async_copy_atom, tSg, tSs)
+                        else:
+                            sRow = sK_slice[row, None]
+                            sChunks = cute.flat_divide(sRow, (8,))
+                            for tile in cutlass.range_constexpr(self.head_dim_padded // 64):
+                                chunk_idx = tile * 8 + idx_in_group
+                                sChunks[None, chunk_idx].fill(0)
+
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.fence_view_async_shared()
+                    if warp_idx_in_wg == 0:
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(mbar_k)
 
 
 # =============================================================================

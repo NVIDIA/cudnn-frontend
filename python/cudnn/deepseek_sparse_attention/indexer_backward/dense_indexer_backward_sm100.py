@@ -352,10 +352,12 @@ class DenseIndexerBackward2QGemmSm100:
     compute_warp_id = (4, 5, 6, 7)
     reduce_warp_id = (8, 9, 10, 11)
 
-    def __init__(self, head_dim, heads=64, block_I=128):
+    def __init__(self, head_dim, heads=64, block_I=128, ratio=1):
+        assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
         self.head_dim = head_dim
         self.heads = heads
         self.block_I = block_I
+        self.ratio = ratio
         assert heads >= 64
 
         self.head_dim_padded = int(math.ceil(head_dim / 16) * 16)
@@ -662,13 +664,17 @@ class DenseIndexerBackward2QGemmSm100:
             seqlen_k_static,
         )
 
-        # 2Q pair indices are batch-local. Per-batch tensor views are built
-        # below so the rest of the kernel uses q0_local / q1_local uniformly
-        # (no q_global needed — domain_offset / batch slice handles it).
-        q0_local = Int32(seq_idx) * Int32(2)
-        q1_local = q0_local + Int32(1)
-        has_q0 = q0_local < seqlen_q_b
-        has_q1 = q1_local < seqlen_q_b
+        # 2Q pair indices are batch-local and scheduled from largest q to
+        # smallest q. For odd seqlen_q_b this puts the singleton CTA at the
+        # earliest q, so causal block rounding wastes at most one K tile
+        # instead of an almost-full K sequence.
+        q_pair_offset = Int32(seq_idx) * Int32(2)
+        q0_local = seqlen_q_b - Int32(1) - q_pair_offset
+        q1_local = q0_local - Int32(1)
+        has_q0 = q0_local >= Int32(0)
+        has_q1 = q1_local >= Int32(0)
+        q0_tile_local = q0_local if has_q0 else Int32(0)
+        q1_tile_local = q1_local if has_q1 else q0_tile_local
 
         # Per-batch views — collapse BSHD batch dim and THD T-offset into a
         # single batch-local indexing scheme. After this, mQ_q0_b/mQ_q1_b have
@@ -695,7 +701,22 @@ class DenseIndexerBackward2QGemmSm100:
             mdW_b = mdW[None, None, batch_idx]
             mGS_b = mGradSignal[None, None, batch_idx]
 
-        num_kv_blocks = (seqlen_k_b + self.block_I - 1) // self.block_I
+        # Causal-aware K-block bound for this 2Q CTA. GradSignal has already
+        # been zeroed past each q token's bottom-right causal column limit, but
+        # using that limit here avoids TMA/MMA work for wholly future K blocks.
+        ratio = Int32(self.ratio)
+        q_start_b = seqlen_k_b * ratio - seqlen_q_b
+        max_kv_needed_raw = (q_start_b + q0_local + Int32(1)) // ratio
+        max_kv_needed = max_kv_needed_raw if max_kv_needed_raw > Int32(0) else Int32(0)
+        max_kv_needed = max_kv_needed if max_kv_needed < seqlen_k_b else seqlen_k_b
+        num_kv_blocks = (max_kv_needed + self.block_I - 1) // self.block_I
+
+        # If the 2Q pair has no causal KV columns (possible for small q when
+        # ratio > 1), run one all-zero GradSignal block so dQ/dW TMEM
+        # accumulators are initialized before their epilogues store to empty
+        # output tensors.
+        min_kv_blocks = Int32(1) if seqlen_k_b > Int32(0) else Int32(0)
+        num_kv_blocks = min_kv_blocks if num_kv_blocks < min_kv_blocks else num_kv_blocks
 
         # TMA descriptor prefetch (load warp only)
         if warp_idx == self.load_warp_id:
@@ -803,7 +824,7 @@ class DenseIndexerBackward2QGemmSm100:
         gQ_q0 = cute.local_tile(
             mQ_q0_b,
             cute.select(self.gemm1_tiler, mode=[0, 2]),
-            (None, None, q0_local),
+            (None, None, q0_tile_local),
         )
         tAgQ_q0 = gemm1_thr_mma.partition_A(gQ_q0)
         tQsQ_q0, tQgQ_q0_mkl = cpasync.tma_partition(
@@ -817,7 +838,7 @@ class DenseIndexerBackward2QGemmSm100:
         gQ_q1 = cute.local_tile(
             mQ_q1_b,
             cute.select(self.gemm1_tiler, mode=[0, 2]),
-            (None, None, q1_local),
+            (None, None, q1_tile_local),
         )
         tAgQ_q1 = gemm1_thr_mma.partition_A(gQ_q1)
         tQsQ_q1, tQgQ_q1_mkl = cpasync.tma_partition(
@@ -872,7 +893,7 @@ class DenseIndexerBackward2QGemmSm100:
         gdQ_q0 = cute.local_tile(
             mdQ_q0_b,
             (self.heads_padded, self.head_dim_padded),
-            (0, 0, q0_local),
+            (0, 0, q0_tile_local),
         )
         sdQ_epi_slice = sdQ_epi[None, None, 0]
         tdQsdQ_q0, tdQgdQ_q0_mkl = cpasync.tma_partition(
@@ -886,7 +907,7 @@ class DenseIndexerBackward2QGemmSm100:
         gdQ_q1 = cute.local_tile(
             mdQ_q1_b,
             (self.heads_padded, self.head_dim_padded),
-            (0, 0, q1_local),
+            (0, 0, q1_tile_local),
         )
         tdQsdQ_q1, tdQgdQ_q1_mkl = cpasync.tma_partition(
             tma_atom_dQ_q1,
@@ -1360,9 +1381,12 @@ class DenseIndexerBackward2QGemmSm100:
     # Helper: dS/dW computation for one block (same as 1Q)
     # =========================================================================
     @cute.jit
-    def _compute_ds_dw_block(self, tSrS, dw_accum, sGS, sW, tCcS, sm_scale: Float32 | float):
+    def _compute_ds_dw_block(
+        self, tSrS, dw_accum, sGS, tCcS, sm_scale: Float32 | float,
+        my_first_h, w_reg_h0: Float32, w_reg_h1: Float32,
+    ):
         """Compute dS and accumulate dW for one block using grad_signal from sGS."""
-        for ei in cutlass.range(0, cute.size(tSrS), 2):
+        for ei in cutlass.range(0, cute.size(tSrS), 2, unroll_full=True):
             h0 = cute.get(tCcS[ei], mode=[0, 0])
             n0 = cute.get(tCcS[ei], mode=[0, 1])
             h1 = cute.get(tCcS[ei + 1], mode=[0, 0])
@@ -1375,8 +1399,8 @@ class DenseIndexerBackward2QGemmSm100:
             s0 = tSrS[ei]
             s1 = tSrS[ei + 1]
 
-            w0 = Float32(sW[h0])
-            w1 = Float32(sW[h1])
+            w0 = w_reg_h0 if h0 == my_first_h else w_reg_h1
+            w1 = w_reg_h0 if h1 == my_first_h else w_reg_h1
             gs0 = sGS[n0]
             gs1 = sGS[n1]
 
@@ -1391,8 +1415,12 @@ class DenseIndexerBackward2QGemmSm100:
                 (dw_accum[ei], dw_accum[ei + 1]),
             )
 
-            tSrS[ei] = gs0 * w0 if s_pos_0 else Float32(0.0)
-            tSrS[ei + 1] = gs1 * w1 if s_pos_1 else Float32(0.0)
+            w0_masked = w0 if s_pos_0 else Float32(0.0)
+            w1_masked = w1 if s_pos_1 else Float32(0.0)
+            tSrS[ei], tSrS[ei + 1] = mul_packed_f32x2(
+                (gs0, gs1),
+                (w0_masked, w1_masked),
+            )
 
     # =========================================================================
     # Compute warpgroup (2Q): Per K block Phase A + Phase B, then epilogue
@@ -1461,6 +1489,12 @@ class DenseIndexerBackward2QGemmSm100:
         cS = cute.make_identity_tensor(s_acc_shape)
         tCcS = thr_tmem_load_s.partition_D(cS)
         tSrS_shape = tCcS.shape
+        my_first_h = cute.get(tCcS[0], mode=[0, 0])
+        my_second_h = my_first_h
+        for ei in cutlass.range(cute.size(tCcS), unroll_full=True):
+            h_check = cute.get(tCcS[ei], mode=[0, 0])
+            if h_check != my_first_h:
+                my_second_h = h_check
 
         # --- TMEM readback (dQ_q0 and dQ_q1) ---
         tiled_tmem_load_dq0 = tcgen05.make_tmem_copy(tmem_load_atom, tDqDq_0)
@@ -1477,9 +1511,13 @@ class DenseIndexerBackward2QGemmSm100:
         # Wait for W loaded
         cute.arch.mbarrier_wait(mbar + MBAR_2Q_W_LOADED, Int32(0))
 
-        # Create sW views for q0 and q1 from sW_full
-        sW_q0 = sW_full  # sW_full[0..heads-1] via direct indexing in _compute_ds_dw_block
-        # For q1, we use offset heads in the sW_full buffer
+        w_q0_h0 = Float32(sW_full[my_first_h]) if my_first_h < self.heads else Float32(0.0)
+        w_q0_h1 = Float32(sW_full[my_second_h]) if my_second_h < self.heads else Float32(0.0)
+        w_q1_h0 = Float32(0.0)
+        w_q1_h1 = Float32(0.0)
+        if has_q1:
+            w_q1_h0 = Float32(sW_full[self.heads + my_first_h]) if my_first_h < self.heads else Float32(0.0)
+            w_q1_h1 = Float32(sW_full[self.heads + my_second_h]) if my_second_h < self.heads else Float32(0.0)
 
         s_full_phase = Int32(0)
         gs_0_phase = Int32(0)
@@ -1517,18 +1555,18 @@ class DenseIndexerBackward2QGemmSm100:
                     tSrS,
                     dw_accum_q0,
                     sGradSignal_q0_0,
-                    sW_q0,
                     tCcS,
                     sm_scale,
+                    my_first_h, w_q0_h0, w_q0_h1,
                 )
             else:
                 self._compute_ds_dw_block(
                     tSrS,
                     dw_accum_q0,
                     sGradSignal_q0_1,
-                    sW_q0,
                     tCcS,
                     sm_scale,
+                    my_first_h, w_q0_h0, w_q0_h1,
                 )
 
             cute.arch.fence_view_async_tmem_load()
@@ -1561,22 +1599,22 @@ class DenseIndexerBackward2QGemmSm100:
 
                 # Compute dS_q1 + accumulate dW_q1, using sW_full offset by heads
                 if bi % 2 == 0:
-                    self._compute_ds_dw_block_q1(
+                    self._compute_ds_dw_block(
                         tSrS,
                         dw_accum_q1,
                         sGradSignal_q1_0,
-                        sW_full,
                         tCcS,
                         sm_scale,
+                        my_first_h, w_q1_h0, w_q1_h1,
                     )
                 else:
-                    self._compute_ds_dw_block_q1(
+                    self._compute_ds_dw_block(
                         tSrS,
                         dw_accum_q1,
                         sGradSignal_q1_1,
-                        sW_full,
                         tCcS,
                         sm_scale,
+                        my_first_h, w_q1_h0, w_q1_h1,
                     )
 
                 cute.arch.fence_view_async_tmem_load()
@@ -1683,45 +1721,6 @@ class DenseIndexerBackward2QGemmSm100:
                 total = cute.arch.warp_reduction_sum(my_partial)
                 if lane_id == 0:
                     mdW_b[q1_local, h] = self.q_dtype(total)
-
-    # =========================================================================
-    # Helper: dS/dW for Q token 1 (reads W from sW_full[heads+h])
-    # =========================================================================
-    @cute.jit
-    def _compute_ds_dw_block_q1(self, tSrS, dw_accum, sGS, sW_full, tCcS, sm_scale: Float32 | float):
-        """Compute dS and accumulate dW for Q token 1, using W offset by heads in sW_full."""
-        for ei in cutlass.range(0, cute.size(tSrS), 2):
-            h0 = cute.get(tCcS[ei], mode=[0, 0])
-            n0 = cute.get(tCcS[ei], mode=[0, 1])
-            h1 = cute.get(tCcS[ei + 1], mode=[0, 0])
-            n1 = cute.get(tCcS[ei + 1], mode=[0, 1])
-
-            tSrS[ei], tSrS[ei + 1] = mul_packed_f32x2(
-                (tSrS[ei], tSrS[ei + 1]),
-                (Float32(sm_scale), Float32(sm_scale)),
-            )
-            s0 = tSrS[ei]
-            s1 = tSrS[ei + 1]
-
-            # Q1 W offset: heads + h
-            w0 = Float32(sW_full[self.heads + h0])
-            w1 = Float32(sW_full[self.heads + h1])
-            gs0 = sGS[n0]
-            gs1 = sGS[n1]
-
-            s_pos_0 = s0 > Float32(0.0)
-            s_pos_1 = s1 > Float32(0.0)
-            relu_s0 = s0 if s_pos_0 else Float32(0.0)
-            relu_s1 = s1 if s_pos_1 else Float32(0.0)
-
-            dw_accum[ei], dw_accum[ei + 1] = fma_packed_f32x2(
-                (gs0, gs1),
-                (relu_s0, relu_s1),
-                (dw_accum[ei], dw_accum[ei + 1]),
-            )
-
-            tSrS[ei] = gs0 * w0 if s_pos_0 else Float32(0.0)
-            tSrS[ei + 1] = gs1 * w1 if s_pos_1 else Float32(0.0)
 
     # =========================================================================
     # Reduce warpgroup (2Q): Single-buffered dK
@@ -1897,7 +1896,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
 
     # Kernel 2: 2Q GEMM kernel (reads pre-computed grad_signal, 2 Q tokens per CTA).
     # is_varlen branches at compile time on whether CuSeqlens* are None.
-    gemm_obj = DenseIndexerBackward2QGemmSm100(head_dim=dim, heads=heads, block_I=block_I)
+    gemm_obj = DenseIndexerBackward2QGemmSm100(head_dim=dim, heads=heads, block_I=block_I, ratio=ratio)
 
     compiled_score_grad = [None]
     compiled_gemm = [None]

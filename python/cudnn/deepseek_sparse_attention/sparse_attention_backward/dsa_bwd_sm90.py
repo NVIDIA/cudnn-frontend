@@ -1403,7 +1403,10 @@ class FlashAttentionDSABackwardSm90:
             global_topk_row = n_block * self.tile_n + local_row
             if global_topk_row < topK:
                 global_kv_row = mTopkIdxs_cur[global_topk_row]
-                if const_expr(self.have_topk_length) or global_kv_row >= 0:
+                should_accumulate_dkv = const_expr(True)
+                if const_expr(not self.have_topk_length):
+                    should_accumulate_dkv = global_kv_row >= 0
+                if should_accumulate_dkv:
                     row_base = global_kv_row * self.tile_hdim + chunk_idx * self.hdim_chunk
 
                     # Each group of 4 MN-view cols maps to one N-tile.

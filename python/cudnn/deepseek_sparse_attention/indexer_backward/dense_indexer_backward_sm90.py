@@ -154,6 +154,7 @@ def _build_cute_dsl_dense_kernel(
         block_I=block_I,
         topk=topk,
         is_dense=True,
+        ratio=ratio,
     )
 
     compiled_holder = [None]
