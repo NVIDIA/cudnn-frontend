@@ -1007,6 +1007,15 @@ class Graph : public ICudnn, public INode {
         return ret_val;
     }
 
+    // Structured counterpart of get_plan_name_at_index(): engine index + knob
+    // choices, for replay via create_execution_plan().
+    error_t
+    get_engine_and_knobs_at_index(int64_t plan_index,
+                                  int64_t &engine_id,
+                                  std::unordered_map<KnobType_t, int64_t> &knobs) const {
+        return plans.get_engine_and_knobs_at_index(plan_index, engine_id, knobs);
+    }
+
     error_t
     get_workspace_size(int64_t &cudnn_workspace_size) const {
         return get_workspace_size_plan_at_index(plans.candidate, cudnn_workspace_size);

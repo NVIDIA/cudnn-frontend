@@ -798,6 +798,9 @@ class PyGraph {
     std::string
     get_plan_name_at_index(int64_t index);
 
+    std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
+    get_engine_and_knobs_at_index(int64_t index);
+
    private:
     // Internal SDPA implementation - delegates to sdpa() or sdpa_fp8() based on mma_core_mode
     // return SDPA_outputs struct: {O, Stats, RNG_DUMP, Amax_S, Amax_O}
