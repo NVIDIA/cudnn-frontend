@@ -134,7 +134,6 @@ def generate_charts_by_mask(
     import seaborn as sns
 
     df = df[df["success"] == True].copy()
-    df = df[df["backend"] != "flash_attention_4"].copy()
 
     # Main charts show only non-deterministic mode; det-vs-nondet comparison
     # is in generate_det_overhead_charts. Fwd rows always carry det=False, so

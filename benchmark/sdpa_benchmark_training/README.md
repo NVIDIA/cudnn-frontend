@@ -15,7 +15,7 @@ This directory contains benchmarking tools for Scaled Dot Product Attention (SDP
   - `wan22.py` - Wan 2.2 A14B video DiT self-attention benchmarks (bidirectional, no mask)
   - `ltx2.py` - LTX-2 video DiT self-attention benchmarks (bidirectional, no mask)
   - `gpt_oss.py` - GPT-OSS sliding-window-attention GQA benchmarks (causal, SWA=128)
-  - `qwen35.py` - Qwen 3.5 GQA benchmarks (head_dim=256, causal, bf16 fwd-only — Blackwell bwd/fp8/fa4 limits)
+  - `qwen35.py` - Qwen 3.5 GQA benchmarks (head_dim=256, causal, bf16 bidirectional — Blackwell fp8/fa4 limits)
 - `runner.py` - Configuration-based benchmark runner
 - `config_types.py` - Data types for benchmark configuration
 - `charts.py` - Chart generation utilities
@@ -52,7 +52,7 @@ python -m benchmark.sdpa_benchmark_training.runner --config wan22
 # Run LTX-2 benchmark suite
 python -m benchmark.sdpa_benchmark_training.runner --config ltx2
 
-# Run Qwen 3.5 benchmark suite (cuDNN bf16 fwd only at head_dim=256)
+# Run Qwen 3.5 benchmark suite (cuDNN bf16 at head_dim=256)
 python -m benchmark.sdpa_benchmark_training.runner --config qwen35
 
 # Dry run (show what would be executed)
@@ -301,7 +301,7 @@ results/<config>/<gpu>/
     <config>_<mask>_det_overhead.png     # bwd bf16: det vs non-det comparison
 ```
 
-Runs were captured on Lyris GB200 and GB300 with cuDNN 9.22.0 and FAv4 4.0.0b10.
+Runs were captured on GB200 and GB300 with cuDNN 9.23.0 and FAv4 4.0.0b15.
 
 ### GB300 - Llama 3.1 Causal (top_left)
 ![Llama 3.1 Causal on GB300](results/llama3.1/gb300/llama3.1_top_left.png)
@@ -333,8 +333,8 @@ Runs were captured on Lyris GB200 and GB300 with cuDNN 9.22.0 and FAv4 4.0.0b10.
 ![GPT-OSS Causal on GB300](results/gpt_oss/gb300/gpt_oss_top_left.png)
 - `batch=2; num_q_heads=128; num_kv_heads=128; head_dim=64; sliding_window_size=128`
 
-### GB300 - Qwen 3.5 (head_dim=256, fwd only)
+### GB300 - Qwen 3.5 (head_dim=256)
 ![Qwen 3.5 Causal on GB300](results/qwen35/gb300/qwen35_top_left.png)
-- `batch=2; num_q_heads=32; num_kv_heads=2; head_dim=256` — cuDNN BF16 fwd only at head_dim=256 on Blackwell
+- `batch=2; num_q_heads=32; num_kv_heads=2; head_dim=256` — cuDNN BF16 at head_dim=256 on Blackwell
 
 GB200 results are available under the same layout at `results/<config>/gb200/`.
