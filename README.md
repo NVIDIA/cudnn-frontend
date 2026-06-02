@@ -152,6 +152,24 @@ export CUDNN_FRONTEND_LOG_FILE=execution_log.txt
 
 Alternatively, you can control logging programmatically via `cudnn_frontend::isLoggingEnabled()`.
 
+### Overriding the CUDA runtime library
+
+When the frontend is built with dynamic loading enabled, it locates the CUDA runtime
+(`libcudart.so.*`) at runtime by searching for the supported major versions. In some
+environments (for example, containers such as GKE where the TCPXO NCCL plugin mounts a
+different `libcudart` major version from the host) multiple versions of `libcudart` may be
+visible on the library search path, and the automatic detection aborts with a
+`Multiple libcudart libraries found` error.
+
+To resolve this, set the `CUDNN_FRONTEND_CUDART_LIB_NAME` environment variable to the
+library name (or full path) that should be loaded. This bypasses the automatic detection:
+
+```bash
+export CUDNN_FRONTEND_CUDART_LIB_NAME=libcudart.so.13
+# or an absolute path
+export CUDNN_FRONTEND_CUDART_LIB_NAME=/usr/local/cuda/lib64/libcudart.so.13
+```
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
