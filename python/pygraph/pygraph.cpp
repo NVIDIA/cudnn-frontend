@@ -807,6 +807,15 @@ PyGraph::get_plan_name_at_index(int64_t index) {
     return plan_name;
 }
 
+std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
+PyGraph::get_engine_and_knobs_at_index(int64_t index) {
+    int64_t engine_id = -1;
+    std::unordered_map<KnobType_t, int64_t> knobs;
+    auto status = graph->get_engine_and_knobs_at_index(index, engine_id, knobs);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+    return {engine_id, knobs};
+}
+
 std::vector<int64_t>
 default_vector(void) {
     return {};
@@ -1324,6 +1333,16 @@ init_pygraph_submodule(py::module_& m) {
                     Get the name for a plan at the given index.
                     Args:
                     index (int): The index of the plan to get workspace from.
+                )pbdoc")
+        .def("get_engine_and_knobs_at_index",
+             &PyGraph::get_engine_and_knobs_at_index,
+             py::arg("index"),
+             R"pbdoc(
+                    Get the engine id and knob choices for a plan at the given index.
+                    Structured counterpart of get_plan_name_at_index; the result can be
+                    passed to create_execution_plan() to rebuild the same kernel.
+                    Args:
+                    index (int): The index of the plan to query.
                 )pbdoc")
         .def("_execute",
              &PyGraph::execute,
