@@ -59,6 +59,7 @@ def test_DSA_indexer_top_k_compile_execute(
         top_k=top_k,
         next_n=next_n,
         return_val=return_val,
+        min_compute_capability=90,
     )
     input_values, seq_lens = _allocate_inputs(cfg, next_n=next_n)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -74,7 +75,7 @@ def test_DSA_indexer_top_k_compile_execute(
         assert op.check_support()
         op.compile()
         indices, values = op.execute(input_values, seq_lens, current_stream=stream)
-    except (ValueError, NotImplementedError, RuntimeError) as e:
+    except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
 
     if not cfg["skip_ref"]:
@@ -113,6 +114,7 @@ def test_DSA_indexer_top_k_wrapper(
         top_k=top_k,
         next_n=next_n,
         return_val=return_val,
+        min_compute_capability=90,
     )
     input_values, seq_lens = _allocate_inputs(cfg, next_n=next_n)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -126,7 +128,7 @@ def test_DSA_indexer_top_k_wrapper(
             return_val=return_val,
             stream=stream,
         )
-    except (ValueError, NotImplementedError, RuntimeError) as e:
+    except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
 
     indices = result["indices"]
