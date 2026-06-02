@@ -91,7 +91,7 @@ class MoeGroupedMatmulBwdNode : public NodeCRTP<MoeGroupedMatmulBwdNode> {
         auto cudnn_ver_error =
             error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Moe grouped matmul bwd requires cuDNN v9.22.0"};
 
-#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+#if (CUDNN_VERSION >= 92200)
         NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnn_ver_error);
         CUDNN_FRONTEND_UNUSED(operations);
 

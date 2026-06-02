@@ -607,7 +607,7 @@ get_execution_plan_workspace_size(cudnnHandle_t handle,
                                   cudnnBackendDescriptor_t executionPlan,
                                   cudnnBackendDescriptor_t variantPack,
                                   size_t *workspaceSizeInBytes) {
-#if CUDNN_VERSION >= 92300 && CUDNN_VERSION < 99900
+#if CUDNN_VERSION >= 92300
     NV_FE_CALL_TO_BACKEND(get_execution_plan_workspace_size,
                           cudnnGetExecutionPlanWorkspaceSize,
                           handle,

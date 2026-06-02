@@ -1703,7 +1703,7 @@ convert_to_cudnn_type(cudnn_frontend::DescriptorType_t const mode, cudnnBackendD
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
         case DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
-#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+#if (CUDNN_VERSION >= 92200)
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
             cudnn_mode = CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
@@ -1711,7 +1711,7 @@ convert_to_cudnn_type(cudnn_frontend::DescriptorType_t const mode, cudnnBackendD
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
         case DescriptorType_t::OPERATION_TRANSPOSE_DESCRIPTOR:
-#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+#if (CUDNN_VERSION >= 92200)
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
             cudnn_mode = CUDNN_BACKEND_OPERATION_TRANSPOSE_DESCRIPTOR;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
@@ -1719,7 +1719,7 @@ convert_to_cudnn_type(cudnn_frontend::DescriptorType_t const mode, cudnnBackendD
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
         case DescriptorType_t::OPERATION_SLICE_DESCRIPTOR:
-#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+#if (CUDNN_VERSION >= 92200)
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
             cudnn_mode = CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
@@ -2172,12 +2172,12 @@ convert_from_cudnn_type(cudnnBackendDescriptorType_t const cudnn_mode) {
         case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR:
             return DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR;
 #endif
-#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+#if (CUDNN_VERSION >= 92200)
         case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
             return DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR;
 #endif
 
-#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+#if (CUDNN_VERSION >= 92200)
         case CUDNN_BACKEND_OPERATION_TRANSPOSE_DESCRIPTOR:
             return DescriptorType_t::OPERATION_TRANSPOSE_DESCRIPTOR;
         case CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR:
