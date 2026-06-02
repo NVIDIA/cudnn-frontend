@@ -225,7 +225,7 @@ class TestBlockScaleQuantizeMatmulDynamicShape:
                 C_UID: C_gpu,
             }
 
-            if cudnn.backend_version() >= 92300 and cudnn.backend_version() < 99900:
+            if cudnn.backend_version() >= 92300:
                 workspace_size = graph.get_workspace_size_plan_at_index(0, cudnn_handle, override_uids, override_shapes, override_strides)
             else:
                 workspace_size = graph.get_workspace_size()

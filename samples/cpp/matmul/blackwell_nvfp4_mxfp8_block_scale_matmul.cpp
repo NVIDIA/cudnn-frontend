@@ -885,8 +885,7 @@ TEST_CASE("Blackwell Block Scale Matmul dynamic shape overrides", "[matmul][grap
                                                                                        {C_UID, C_gpu.devPtr}};
 
         int64_t workspace_size = 0;
-        if (cudnn_frontend::detail::get_backend_version() >= 92300 &&
-            cudnn_frontend::detail::get_backend_version() < 99900) {
+        if (cudnn_frontend::detail::get_backend_version() >= 92300) {
             REQUIRE(graph->get_workspace_size(handle, workspace_size, override_uids, override_shapes, override_strides)
                         .is_good());
         } else {
