@@ -38,6 +38,8 @@
 #endif
 #include <mutex>
 #include <stdexcept>
+#include <cstdlib>
+#include <string>
 #endif
 
 namespace cudnn_frontend {
@@ -83,6 +85,26 @@ inline HMODULE
 load_cudart_so() {
     // Clear any existing error
     dlerror();
+
+    // Allow the user to override the libcudart selection via an environment variable.
+    // This is useful in environments (e.g. containers such as GKE with the TCPXO NCCL
+    // plugin) where multiple major versions of libcudart are present in the library
+    // search path. In such cases the automatic detection below would otherwise abort
+    // with a "Multiple libcudart libraries found" error. Setting
+    // CUDNN_FRONTEND_CUDART_LIB_NAME to the desired library name (or path), e.g.
+    // "libcudart.so.13", bypasses the detection and loads exactly that library.
+    if (const char *user_lib = std::getenv("CUDNN_FRONTEND_CUDART_LIB_NAME")) {
+        if (user_lib[0] != '\0') {
+            HMODULE handle    = dlopen(user_lib, RTLD_NOW);
+            const char *error = reinterpret_cast<const char *>(dlerror());
+            if (!handle || error) {
+                throw std::runtime_error(
+                    "Unable to load libcudart library specified by CUDNN_FRONTEND_CUDART_LIB_NAME (" +
+                    std::string(user_lib) + "): " + std::string(error ? error : "Unknown error"));
+            }
+            return handle;
+        }
+    }
 
     // List of potential libcudart libraries (Adding major version to support python package)
     constexpr const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
