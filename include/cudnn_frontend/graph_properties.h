@@ -21,7 +21,7 @@ namespace graph {
 
 inline std::optional<float>
 get_rescale_threshold_from_env() {
-    auto const* env_value = std::getenv("CUDNN_RESCALE_THRESHOLD");
+    auto const* env_value = get_environment("CUDNN_RESCALE_THRESHOLD");
     if (env_value == nullptr || env_value[0] == '\0') {
         return std::nullopt;
     }

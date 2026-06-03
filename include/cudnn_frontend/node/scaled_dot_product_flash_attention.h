@@ -1457,7 +1457,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                 int64_t max_dp_workspace_bytes = 256 * 1024 * 1024;
 
                 // allow setting the upper limit with envvars
-                char* env_dp_workspace_limit_char = std::getenv("CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT");
+                const char* env_dp_workspace_limit_char = get_environment("CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT");
                 if (env_dp_workspace_limit_char) {
                     char* end_ptr          = nullptr;
                     max_dp_workspace_bytes = std::strtoll(env_dp_workspace_limit_char, &end_ptr, 10);
