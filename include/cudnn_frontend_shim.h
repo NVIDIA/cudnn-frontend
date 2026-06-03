@@ -40,6 +40,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <cstdio>
 #endif
 
 namespace cudnn_frontend {
@@ -105,10 +106,10 @@ load_cudart_so() {
     // Allow the user to override the libcudart selection via an environment variable.
     // This is useful in environments (e.g. containers such as GKE with the TCPXO NCCL
     // plugin) where multiple major versions of libcudart are present in the library
-    // search path. In such cases the automatic detection below would otherwise abort
-    // with a "Multiple libcudart libraries found" error. Setting
-    // CUDNN_FRONTEND_CUDART_LIB_NAME to the desired library name (or path), e.g.
-    // "libcudart.so.13", bypasses the detection and loads exactly that library.
+    // search path. In such cases the automatic detection below warns about the ambiguity
+    // (see below) and falls back to the first match. Setting CUDNN_FRONTEND_CUDART_LIB_NAME
+    // to the desired library name (or path), e.g. "libcudart.so.13", bypasses the detection
+    // and loads exactly that library.
     const char *user_lib = get_environment("CUDNN_FRONTEND_CUDART_LIB_NAME");
     if (user_lib) {
         if (user_lib[0] != '\0') {
@@ -136,13 +137,19 @@ load_cudart_so() {
 
         if (handle && !error) {
             if (lib_handle) {
-                // Already loaded one -> multiple found
+                // Already loaded one -> multiple found. This is not fatal: warn on stderr and keep
+                // the first one found. Set CUDNN_FRONTEND_CUDART_LIB_NAME to select one explicitly.
                 dlclose(handle);
-                throw std::runtime_error("Multiple libcudart libraries found: " + std::string(libs[loaded_index]) +
-                                         " and " + std::string(libs[i]));
+                std::fprintf(stderr,
+                             "cuDNN Frontend warning: Multiple libcudart libraries found: %s and %s. "
+                             "Using %s. Set CUDNN_FRONTEND_CUDART_LIB_NAME to select one explicitly.\n",
+                             libs[loaded_index],
+                             libs[i],
+                             libs[loaded_index]);
+            } else {
+                lib_handle   = handle;
+                loaded_index = static_cast<int>(i);
             }
-            lib_handle   = handle;
-            loaded_index = static_cast<int>(i);
         }
     }
 
