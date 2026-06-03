@@ -159,7 +159,7 @@ elseif(CUDNN_MAJOR_VERSION EQUAL 9)
         CUDNN::cudnn_all
         INTERFACE
         # Ref: https://docs.nvidia.com/deeplearning/cudnn/installation/latest/build-run-cudnn.html#running-a-cudnn-dependent-program
-        $<$<BOOL:CUDNN_STATIC>:-Wl,--whole-archive>
+        $<$<BOOL:${CUDNN_STATIC}>:-Wl,--whole-archive>
         CUDNN::cudnn_graph
         CUDNN::cudnn_engines_runtime_compiled
         CUDNN::cudnn_ops
@@ -167,7 +167,7 @@ elseif(CUDNN_MAJOR_VERSION EQUAL 9)
         CUDNN::cudnn_adv
         $<$<NOT:$<BOOL:${CUDNN_SKIP_PRECOMPILED_LINK}>>:CUDNN::cudnn_engines_precompiled>
         CUDNN::cudnn_heuristic
-        $<$<BOOL:CUDNN_STATIC>:-Wl,--no-whole-archive>
-        $<$<BOOL:CUDNN_STATIC>:CUDA::cublasLt_static $<IF:$<TARGET_EXISTS:CUDA::nvrtc_static>,CUDA::nvrtc_static,CUDA::nvrtc> ZLIB::ZLIB>
+        $<$<BOOL:${CUDNN_STATIC}>:-Wl,--no-whole-archive>
+        $<$<BOOL:${CUDNN_STATIC}>:CUDA::cublasLt_static $<IF:$<TARGET_EXISTS:CUDA::nvrtc_static>,CUDA::nvrtc_static,CUDA::nvrtc> ZLIB::ZLIB>
     )
 endif()
