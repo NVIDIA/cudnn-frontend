@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cuda.h>
+#include <cstdlib>
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
 #ifdef _WIN32
@@ -38,11 +39,26 @@
 #endif
 #include <mutex>
 #include <stdexcept>
-#include <cstdlib>
 #include <string>
 #endif
 
 namespace cudnn_frontend {
+
+// Portable environment-variable accessor. Wraps std::getenv and locally silences MSVC's C4996
+// ("getenv is unsafe") warning, which is treated as an error under /WX. Safe here because the
+// returned value is only read. Defined in this low-level header so every layer (including
+// Logging) can share a single definition without inverting include dependencies.
+inline const char *
+get_environment(const char *name) {
+#ifdef _WIN32
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+    return std::getenv(name);
+#ifdef _WIN32
+#pragma warning(pop)
+#endif
+}
 
 // cudnn package initialization set this global handle
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
@@ -93,7 +109,8 @@ load_cudart_so() {
     // with a "Multiple libcudart libraries found" error. Setting
     // CUDNN_FRONTEND_CUDART_LIB_NAME to the desired library name (or path), e.g.
     // "libcudart.so.13", bypasses the detection and loads exactly that library.
-    if (const char *user_lib = std::getenv("CUDNN_FRONTEND_CUDART_LIB_NAME")) {
+    const char *user_lib = get_environment("CUDNN_FRONTEND_CUDART_LIB_NAME");
+    if (user_lib) {
         if (user_lib[0] != '\0') {
             HMODULE handle    = dlopen(user_lib, RTLD_NOW);
             const char *error = reinterpret_cast<const char *>(dlerror());
