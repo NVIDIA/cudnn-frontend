@@ -162,6 +162,10 @@ TEST_CASE("BF16 MoeGroupedMatmulBwd", "[MoeGroupedMatmulBwd][graph]") {
         SKIP("Not supported by cublasLt version");
     }
 
+    if (get_compute_capability() < 90 || get_compute_capability() >= 120) {
+        SKIP("Test requires SM90 - SM119 architectures");
+    }
+
     if (is_arch_supported_by_cudnn() == false) {
         SKIP("Architecture is not supported by current cudnn version");
     }

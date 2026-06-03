@@ -22,6 +22,11 @@ def get_cublaslt_version() -> int:
     return 0
 
 
+def get_compute_capability() -> int:
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor
+
+
 @pytest.mark.skipif(
     cudnn.backend_version() < 91800,
     reason="moe_grouped_matmul requires cuDNN >= 9.18.0",
@@ -150,6 +155,10 @@ def test_bf16_moe_grouped_matmul_fwd(cudnn_handle):
 @pytest.mark.skipif(
     get_cublaslt_version() < 130500,
     reason="moe_grouped_matmul_bwd requires cublasLt >= 13.5",
+)
+@pytest.mark.skipif(
+    get_compute_capability() < 90 or get_compute_capability() >= 120,
+    reason="moe_grouped_matmul_bwd requires SM90 - SM119 architectures",
 )
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
