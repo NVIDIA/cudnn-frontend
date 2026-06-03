@@ -118,7 +118,7 @@ if(CUDNN_STATIC)
         CUDNN::cudnn_all
     )
 
-    find_package(ZLIB)
+    find_package(ZLIB REQUIRED)
 else()
     target_link_libraries(
         CUDNN::cudnn_all
