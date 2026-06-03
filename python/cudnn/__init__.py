@@ -39,14 +39,21 @@ symbols_to_import = [
     "cudnnGraphNotSupportedError",
     "diagonal_alignment",
     "attention_implementation",
+    "moe_grouped_matmul_mode",
+    "scalar_type",
+    "reshape_mode",
 ]
 
 for symbol_name in symbols_to_import:
     globals()[symbol_name] = getattr(_pybind_module, symbol_name)
 
+for _optional_symbol in ["causal_conv1d_forward", "causal_conv1d_backward"]:
+    if hasattr(_pybind_module, _optional_symbol):
+        globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
+
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.16.0"
+__version__ = "1.25.0"
 
 
 def _tensor(
@@ -113,7 +120,15 @@ def _library_device_pointer(input_tensor):
         return _pybind_module._get_data_ptr(input_tensor)
 
 
-def _execute(self, tensor_to_device_buffer, workspace, handle=None):
+def _execute(
+    self,
+    tensor_to_device_buffer,
+    workspace,
+    handle=None,
+    override_uids=None,
+    override_shapes=None,
+    override_strides=None,
+):
     """
     Execute a cudnn graph.
 
@@ -125,17 +140,29 @@ def _execute(self, tensor_to_device_buffer, workspace, handle=None):
         None
     """
     uid_to_tensor_pointer = {
-        x if type(x) is int else x.get_uid(): _library_device_pointer(pointer)
-        for x, pointer in tensor_to_device_buffer.items()
-        if x is not None
+        x if type(x) is int else x.get_uid(): _library_device_pointer(pointer) for x, pointer in tensor_to_device_buffer.items() if x is not None
     }
 
     workspace_pointer = _library_device_pointer(workspace)
-    self._execute(uid_to_tensor_pointer, workspace_pointer, handle)
+    self._execute(
+        uid_to_tensor_pointer,
+        workspace_pointer,
+        handle,
+        override_uids,
+        override_shapes,
+        override_strides,
+    )
 
 
 def _execute_plan_at_index(
-    self, tensor_to_device_buffer, workspace, index, handle=None
+    self,
+    tensor_to_device_buffer,
+    workspace,
+    index,
+    handle=None,
+    override_uids=None,
+    override_shapes=None,
+    override_strides=None,
 ):
     """
     Execute a cudnn graph.
@@ -149,13 +176,19 @@ def _execute_plan_at_index(
         None
     """
     uid_to_tensor_pointer = {
-        x if type(x) is int else x.get_uid(): _library_device_pointer(pointer)
-        for x, pointer in tensor_to_device_buffer.items()
-        if x is not None
+        x if type(x) is int else x.get_uid(): _library_device_pointer(pointer) for x, pointer in tensor_to_device_buffer.items() if x is not None
     }
 
     workspace_pointer = _library_device_pointer(workspace)
-    self._execute_plan_at_index(uid_to_tensor_pointer, workspace_pointer, index, handle)
+    self._execute_plan_at_index(
+        uid_to_tensor_pointer,
+        workspace_pointer,
+        index,
+        handle,
+        override_uids,
+        override_shapes,
+        override_strides,
+    )
 
 
 pygraph.execute = _execute
@@ -164,14 +197,10 @@ pygraph.execute_plan_at_index = _execute_plan_at_index
 
 def load_cudnn():
     # First look at python site packages
-    lib_path = glob.glob(
-        os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/bin/cudnn64_9.dll")
-    )
+    lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/bin/cudnn64_9.dll"))
 
     if lib_path:
-        assert (
-            len(lib_path) == 1
-        ), f"Found {len(lib_path)} libcudnn.dll.x in nvidia-cudnn-cuXX."
+        assert len(lib_path) == 1, f"Found {len(lib_path)} libcudnn.dll.x in nvidia-cudnn-cuXX."
         lib = ctypes.windll.LoadLibrary(lib_path[0])
     else:  # Fallback
         lib = ctypes.windll.LoadLibrary("cudnn64_9.dll")
@@ -181,24 +210,28 @@ def load_cudnn():
 
 
 def _dlopen_cudnn():
-    # First look at python site packages
-    lib_path = glob.glob(
-        os.path.join(
-            sysconfig.get_path("purelib"), "nvidia/cudnn/lib/libcudnn.so.*[0-9]"
-        )
-    )
+    # Honor the dynamic linker search path before packaged cuDNN so local backend
+    # builds can override the wheel dependency during development.
+    for library_dir in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
+        if not library_dir:
+            continue
+        for library_name in ("libcudnn.so.9", "libcudnn.so"):
+            library_path = os.path.join(library_dir, library_name)
+            if not os.path.exists(library_path):
+                continue
+            lib = ctypes.CDLL(library_path)
+            handle = ctypes.cast(lib._handle, ctypes.c_void_p).value
+            _pybind_module._set_dlhandle_cudnn(handle)
+            return
+
+    # Then look at python site packages
+    lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/lib/libcudnn.so.*[0-9]"))
 
     if not lib_path:
-        lib_path = glob.glob(
-            os.path.join(
-                sysconfig.get_path("purelib"), "nvidia/cudnn_jit/lib/libcudnn.so.*[0-9]"
-            )
-        )
+        lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn_jit/lib/libcudnn.so.*[0-9]"))
 
     if lib_path:
-        assert (
-            len(lib_path) == 1
-        ), f"Found {len(lib_path)} libcudnn.so.x in nvidia-cudnn-cuXX."
+        assert len(lib_path) == 1, f"Found {len(lib_path)} libcudnn.so.x in nvidia-cudnn-cuXX."
         lib = ctypes.CDLL(lib_path[0])
     else:  # Fallback
         try:
@@ -224,50 +257,84 @@ from .wrapper import Graph
 
 from typing import Any
 
+_OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
+
+_LAZY_OPTIONAL_IMPORTS = {
+    "DSA": (".deepseek_sparse_attention", "DSA"),
+    "NSA": (".native_sparse_attention", "NSA"),
+    "GemmSwigluSm100": (".gemm_swiglu", "GemmSwigluSm100"),
+    "gemm_swiglu_wrapper_sm100": (".gemm_swiglu", "gemm_swiglu_wrapper_sm100"),
+    "GemmSreluSm100": (".gemm_srelu", "GemmSreluSm100"),
+    "gemm_srelu_wrapper_sm100": (".gemm_srelu", "gemm_srelu_wrapper_sm100"),
+    "GemmDsreluSm100": (".gemm_dsrelu", "GemmDsreluSm100"),
+    "gemm_dsrelu_wrapper_sm100": (".gemm_dsrelu", "gemm_dsrelu_wrapper_sm100"),
+    "GemmAmaxSm100": (".gemm_amax", "GemmAmaxSm100"),
+    "gemm_amax_wrapper_sm100": (".gemm_amax", "gemm_amax_wrapper_sm100"),
+    "RmsNormRhtAmaxSm100": (".rmsnorm_rht_amax", "RmsNormRhtAmaxSm100"),
+    "rmsnorm_rht_amax_wrapper_sm100": (".rmsnorm_rht_amax", "rmsnorm_rht_amax_wrapper_sm100"),
+    "grouped_gemm": (".grouped_gemm", None),
+    "GroupedGemmSwigluSm100": (".grouped_gemm", "GroupedGemmSwigluSm100"),
+    "grouped_gemm_swiglu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_swiglu_wrapper_sm100"),
+    "GroupedGemmDswigluSm100": (".grouped_gemm", "GroupedGemmDswigluSm100"),
+    "grouped_gemm_dswiglu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_dswiglu_wrapper_sm100"),
+    "GroupedGemmSreluSm100": (".grouped_gemm", "GroupedGemmSreluSm100"),
+    "grouped_gemm_srelu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_srelu_wrapper_sm100"),
+    "GroupedGemmDsreluSm100": (".grouped_gemm", "GroupedGemmDsreluSm100"),
+    "grouped_gemm_dsrelu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_dsrelu_wrapper_sm100"),
+    "SdpafwdSm100D256": (".sdpa", "SdpafwdSm100D256"),
+    "sdpa_fwd_wrapper_sm100_d256": (".sdpa", "sdpa_fwd_wrapper_sm100_d256"),
+    "SdpabwdSm100D256": (".sdpa", "SdpabwdSm100D256"),
+    "sdpa_bwd_wrapper_sm100_d256": (".sdpa", "sdpa_bwd_wrapper_sm100_d256"),
+    "GroupedGemmQuantSm100": (".grouped_gemm", "GroupedGemmQuantSm100"),
+    "grouped_gemm_quant_wrapper_sm100": (".grouped_gemm", "grouped_gemm_quant_wrapper_sm100"),
+    "GroupedGemmGluSm100": (".grouped_gemm", "GroupedGemmGluSm100"),
+    "grouped_gemm_glu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_glu_wrapper_sm100"),
+    "GroupedGemmGluHadamardSm100": (".grouped_gemm", "GroupedGemmGluHadamardSm100"),
+    "grouped_gemm_glu_hadamard_wrapper_sm100": (".grouped_gemm", "grouped_gemm_glu_hadamard_wrapper_sm100"),
+    "GroupedGemmDgluSm100": (".grouped_gemm", "GroupedGemmDgluSm100"),
+    "grouped_gemm_dglu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_dglu_wrapper_sm100"),
+    "GroupedGemmWgradSm100": (".grouped_gemm", "GroupedGemmWgradSm100"),
+    "grouped_gemm_wgrad_wrapper_sm100": (".grouped_gemm", "grouped_gemm_wgrad_wrapper_sm100"),
+    "discrete_grouped_gemm": (".discrete_grouped_gemm", None),
+    "DiscreteGroupedGemmSwigluSm100": (".discrete_grouped_gemm", "DiscreteGroupedGemmSwigluSm100"),
+    "discrete_grouped_gemm_swiglu_wrapper_sm100": (".discrete_grouped_gemm", "discrete_grouped_gemm_swiglu_wrapper_sm100"),
+    "DiscreteGroupedGemmDswigluSm100": (".discrete_grouped_gemm", "DiscreteGroupedGemmDswigluSm100"),
+    "discrete_grouped_gemm_dswiglu_wrapper_sm100": (".discrete_grouped_gemm", "discrete_grouped_gemm_dswiglu_wrapper_sm100"),
+}
+
+
+def _load_optional_symbol(name: str) -> Any:
+    module_name, attr_name = _LAZY_OPTIONAL_IMPORTS[name]
+    try:
+        module = importlib.import_module(module_name, package=__name__)
+        value = module if attr_name is None else getattr(module, attr_name)
+    except Exception as e:
+        raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
+
+    globals()[name] = value
+    return value
+
 
 def __getattr__(name: str) -> Any:
-    if name == "GemmSwigluSm100":
-        try:
-            from .gemm_swiglu import GemmSwigluSm100 as _GemmSwigluSm100
+    if name == "ops":
+        # Use importlib rather than "from . import ops" to avoid infinite
+        # recursion. The cycle:
+        #   1. cudnn.ops accessed → __getattr__("ops") fires
+        #   2. "from . import ops" → _handle_fromlist(cudnn, ["ops"], ...)
+        #   3. _handle_fromlist calls hasattr(cudnn, "ops")
+        #   4. "ops" not in __dict__ yet → __getattr__("ops") again → goto 1
+        # importlib.import_module bypasses _handle_fromlist entirely.
+        _ops = importlib.import_module(".ops", __name__)
+        globals()["ops"] = _ops
+        return _ops
 
-            return _GemmSwigluSm100
-        except Exception as e:
-            raise ImportError(
-                f"GemmSwigluSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
+    if name == "experimental":
+        from . import experimental as _experimental
 
-    elif name == "gemm_swiglu_wrapper_sm100":
-        try:
-            from .gemm_swiglu import (
-                gemm_swiglu_wrapper_sm100 as _gemm_swiglu_wrapper_sm100,
-            )
+        globals()["experimental"] = _experimental
+        return _experimental
 
-            return _gemm_swiglu_wrapper_sm100
-        except Exception as e:
-            raise ImportError(
-                f"gemm_swiglu_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
+    if name in _LAZY_OPTIONAL_IMPORTS:
+        return _load_optional_symbol(name)
 
-    elif name == "GemmAmaxSm100":
-        try:
-            from .gemm_amax import GemmAmaxSm100 as _GemmAmaxSm100
-
-            return _GemmAmaxSm100
-        except Exception as e:
-            raise ImportError(
-                f"GemmAmaxSm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-
-    elif name == "gemm_amax_wrapper_sm100":
-        try:
-            from .gemm_amax import (
-                gemm_amax_wrapper_sm100 as _gemm_amax_wrapper_sm100,
-            )
-
-            return _gemm_amax_wrapper_sm100
-        except Exception as e:
-            raise ImportError(
-                f"gemm_amax_wrapper_sm100 requires optional dependencies. Install with 'pip install nvidia-cudnn-frontend[cutedsl]': {e}"
-            ) from e
-    else:
-        raise AttributeError(name)
+    raise AttributeError(name)

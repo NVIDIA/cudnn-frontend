@@ -12,7 +12,7 @@ from test_utils import torch_fork_set_rng
 
 def get_cc():
     """Get CUDA compute capability."""
-    (major, minor) = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability()
     return major * 10 + minor
 
 
@@ -53,23 +53,13 @@ def calculate_block_scale_dims(m, n, k, block_size):
     INDESTRUCTIBLE_128x4_BLOCK_M_N = 128
     INDESTRUCTIBLE_128x4_BLOCK_K = 4
 
-    block_scale_dim_m = (
-        div_up(m, INDESTRUCTIBLE_128x4_BLOCK_M_N) * INDESTRUCTIBLE_128x4_BLOCK_M_N
-    )
-    block_scale_dim_n = (
-        div_up(n, INDESTRUCTIBLE_128x4_BLOCK_M_N) * INDESTRUCTIBLE_128x4_BLOCK_M_N
-    )
-    block_scale_dim_k = (
-        div_up(div_up(k, block_size), INDESTRUCTIBLE_128x4_BLOCK_K)
-        * INDESTRUCTIBLE_128x4_BLOCK_K
-    )
+    block_scale_dim_m = div_up(m, INDESTRUCTIBLE_128x4_BLOCK_M_N) * INDESTRUCTIBLE_128x4_BLOCK_M_N
+    block_scale_dim_n = div_up(n, INDESTRUCTIBLE_128x4_BLOCK_M_N) * INDESTRUCTIBLE_128x4_BLOCK_M_N
+    block_scale_dim_k = div_up(div_up(k, block_size), INDESTRUCTIBLE_128x4_BLOCK_K) * INDESTRUCTIBLE_128x4_BLOCK_K
 
     # For output quantization (lines 461-463)
     block_scale_dim_out_m = block_scale_dim_m
-    block_scale_dim_out_n = (
-        div_up(div_up(n, block_size), INDESTRUCTIBLE_128x4_BLOCK_K)
-        * INDESTRUCTIBLE_128x4_BLOCK_K
-    )
+    block_scale_dim_out_n = div_up(div_up(n, block_size), INDESTRUCTIBLE_128x4_BLOCK_K) * INDESTRUCTIBLE_128x4_BLOCK_K
 
     return (
         block_scale_dim_m,
@@ -203,14 +193,10 @@ class TestBlockScaleQuantizeMatmul:
         )
 
         # Dequantize A (lines 515-517)
-        dequant_tensor_a = g.block_scale_dequantize(
-            tensor_a, block_descale_a, block_size=[1, block_size], name="dequantize_a"
-        )
+        dequant_tensor_a = g.block_scale_dequantize(tensor_a, block_descale_a, block_size=[1, block_size], name="dequantize_a")
 
         # Dequantize B (lines 519-521)
-        dequant_tensor_b = g.block_scale_dequantize(
-            tensor_b, block_descale_b, block_size=[block_size, 1], name="dequantize_b"
-        )
+        dequant_tensor_b = g.block_scale_dequantize(tensor_b, block_descale_b, block_size=[block_size, 1], name="dequantize_b")
 
         # Matmul (lines 523-526)
         tensor_c = g.matmul(
@@ -231,9 +217,7 @@ class TestBlockScaleQuantizeMatmul:
 
         # Set output properties (lines 533-536)
         tensor_d.set_output(True).set_data_type(datatype_output)
-        block_scale.set_output(True).set_data_type(datatype_scale).set_reordering_type(
-            cudnn.tensor_reordering.F8_128x4
-        )
+        block_scale.set_output(True).set_data_type(datatype_scale).set_reordering_type(cudnn.tensor_reordering.F8_128x4)
 
         # Build and validate graph (lines 540-551)
         g.validate()
@@ -250,32 +234,20 @@ class TestBlockScaleQuantizeMatmul:
         # Using uint8 as a generic container since we're just testing the graph execution
         if dtype_a == "FP4_E2M1":
             # FP4 is packed, so size is smaller
-            tensor_a_data = torch.randint(
-                0, 16, (b, m, k // 2), dtype=torch.uint8, device="cuda"
-            )
+            tensor_a_data = torch.randint(0, 16, (b, m, k // 2), dtype=torch.uint8, device="cuda")
         elif dtype_a == "FP8_E4M3":
-            tensor_a_data = torch.randint(
-                0, 256, (b, m, k), dtype=torch.uint8, device="cuda"
-            )
+            tensor_a_data = torch.randint(0, 256, (b, m, k), dtype=torch.uint8, device="cuda")
         elif dtype_a == "FP8_E5M2":
-            tensor_a_data = torch.randint(
-                0, 256, (b, m, k), dtype=torch.uint8, device="cuda"
-            )
+            tensor_a_data = torch.randint(0, 256, (b, m, k), dtype=torch.uint8, device="cuda")
         else:
             tensor_a_data = torch.randn((b, m, k), dtype=torch.float16, device="cuda")
 
         if dtype_b == "FP4_E2M1":
-            tensor_b_data = torch.randint(
-                0, 16, (b, k, n // 2), dtype=torch.uint8, device="cuda"
-            )
+            tensor_b_data = torch.randint(0, 16, (b, k, n // 2), dtype=torch.uint8, device="cuda")
         elif dtype_b == "FP8_E4M3":
-            tensor_b_data = torch.randint(
-                0, 256, (b, k, n), dtype=torch.uint8, device="cuda"
-            )
+            tensor_b_data = torch.randint(0, 256, (b, k, n), dtype=torch.uint8, device="cuda")
         elif dtype_b == "FP8_E5M2":
-            tensor_b_data = torch.randint(
-                0, 256, (b, k, n), dtype=torch.uint8, device="cuda"
-            )
+            tensor_b_data = torch.randint(0, 256, (b, k, n), dtype=torch.uint8, device="cuda")
         else:
             tensor_b_data = torch.randn((b, k, n), dtype=torch.float16, device="cuda")
 
@@ -315,9 +287,7 @@ class TestBlockScaleQuantizeMatmul:
 
         # Output tensor
         if dtype_output == "FP4_E2M1":
-            tensor_d_data = torch.empty(
-                (b, m, n // 2), dtype=torch.uint8, device="cuda"
-            )
+            tensor_d_data = torch.empty((b, m, n // 2), dtype=torch.uint8, device="cuda")
         elif dtype_output == "FP8_E4M3":
             tensor_d_data = torch.empty((b, m, n), dtype=torch.uint8, device="cuda")
         elif dtype_output == "FP8_E5M2":
@@ -326,9 +296,7 @@ class TestBlockScaleQuantizeMatmul:
             tensor_d_data = torch.empty((b, m, n), dtype=torch.float16, device="cuda")
 
         # Get workspace
-        workspace = torch.empty(
-            g.get_workspace_size(), device="cuda", dtype=torch.uint8
-        )
+        workspace = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
         # Execute (lines 557-565)
         variant_pack = {
@@ -347,7 +315,5 @@ class TestBlockScaleQuantizeMatmul:
         assert scale_output_data is not None
 
         print(
-            f"✓ Test passed: b={b}, m={m}, n={n}, k={k}, "
-            f"dtype_a={dtype_a}, dtype_b={dtype_b}, "
-            f"dtype_scale={dtype_scale}, dtype_output={dtype_output}"
+            f"✓ Test passed: b={b}, m={m}, n={n}, k={k}, " f"dtype_a={dtype_a}, dtype_b={dtype_b}, " f"dtype_scale={dtype_scale}, dtype_output={dtype_output}"
         )

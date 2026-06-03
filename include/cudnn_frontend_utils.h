@@ -24,8 +24,10 @@
 #include <exception>
 #include <optional>
 #include <string>
+#include <algorithm>
 #include <variant>
 #include <vector>
+#include <utility>
 #include <iomanip>
 #include <sstream>
 #include <cmath>
@@ -96,21 +98,21 @@ struct nlohmann::adl_serializer<nv_bfloat16> {
 };
 
 template <>
-struct nlohmann::adl_serializer<std::variant<int64_t, int32_t, half, float, nv_bfloat16>> {
+struct nlohmann::adl_serializer<std::variant<int64_t, int32_t, half, float, double, nv_bfloat16>> {
     static void
-    to_json(nlohmann::json& j, const std::variant<int64_t, int32_t, half, float, nv_bfloat16>& data) {
+    to_json(nlohmann::json& j, const std::variant<int64_t, int32_t, half, float, double, nv_bfloat16>& data) {
         std::visit([&](const auto& v) { j = {{"index", data.index()}, {"value", v}}; }, data);
     }
 
     static void
-    from_json(const nlohmann::json& j, std::variant<int64_t, int32_t, half, float, nv_bfloat16>& data) {
+    from_json(const nlohmann::json& j, std::variant<int64_t, int32_t, half, float, double, nv_bfloat16>& data) {
         if (!j.is_object() || !j.contains("index") || !j.contains("value")) {
             return;
         }
 
         size_t type_index = j.at("index").get<size_t>();
         if (type_index == 0) {
-            data = j.at("value").get<int32_t>();
+            data = j.at("value").get<int64_t>();
         } else if (type_index == 1) {
             data = j.at("value").get<int32_t>();
         } else if (type_index == 2) {
@@ -118,6 +120,8 @@ struct nlohmann::adl_serializer<std::variant<int64_t, int32_t, half, float, nv_b
         } else if (type_index == 3) {
             data = j.at("value").get<float>();
         } else if (type_index == 4) {
+            data = j.at("value").get<double>();
+        } else if (type_index == 5) {
             data = j.at("value").get<nv_bfloat16>();
         } else {
             return;
@@ -386,6 +390,20 @@ enum class PaddingMode_t {
     ZERO_PAD
 };
 
+enum class ReshapeMode_t {
+    NOT_SET,
+
+    VIEW_ONLY,
+    LOGICAL
+};
+
+NLOHMANN_JSON_SERIALIZE_ENUM(ReshapeMode_t,
+                             {
+                                 {ReshapeMode_t::NOT_SET, nullptr},
+                                 {ReshapeMode_t::VIEW_ONLY, "VIEW_ONLY"},
+                                 {ReshapeMode_t::LOGICAL, "LOGICAL"},
+                             })
+
 enum class ConvolutionMode_t {
     NOT_SET,
 
@@ -478,7 +496,10 @@ enum class DescriptorType_t {
     OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR,
     OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR,
     OPERATION_CONCATENATE_DESCRIPTOR,
-    OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR
+    OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR,
+    OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR,
+    OPERATION_TRANSPOSE_DESCRIPTOR,
+    OPERATION_SLICE_DESCRIPTOR
 };
 
 enum class NormMode_t {
@@ -617,6 +638,7 @@ enum class HeurMode_t {
     A,
     B,
     FALLBACK,
+    OPENSOURCE,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(HeurMode_t,
@@ -624,6 +646,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(HeurMode_t,
                                  {HeurMode_t::A, "A"},
                                  {HeurMode_t::B, "B"},
                                  {HeurMode_t::FALLBACK, "FALLBACK"},
+                                 {HeurMode_t::OPENSOURCE, "OPENSOURCE"},
                              })
 
 enum class BehaviorNote_t {
@@ -955,6 +978,15 @@ operator<<(std::ostream& os, const DescriptorType_t& mode) {
             break;
         case DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR:
             os << "OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR";
+            break;
+        case DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
+            os << "OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR";
+            break;
+        case DescriptorType_t::OPERATION_TRANSPOSE_DESCRIPTOR:
+            os << "OPERATION_TRANSPOSE_DESCRIPTOR";
+            break;
+        case DescriptorType_t::OPERATION_SLICE_DESCRIPTOR:
+            os << "OPERATION_SLICE_DESCRIPTOR";
             break;
         case DescriptorType_t::NOT_SET:
             os << "NOT_SET";
@@ -1670,6 +1702,30 @@ convert_to_cudnn_type(cudnn_frontend::DescriptorType_t const mode, cudnnBackendD
 #else
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
+        case DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
+#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
+        case DescriptorType_t::OPERATION_TRANSPOSE_DESCRIPTOR:
+#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_BACKEND_OPERATION_TRANSPOSE_DESCRIPTOR;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
+        case DescriptorType_t::OPERATION_SLICE_DESCRIPTOR:
+#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
 
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
@@ -1784,6 +1840,26 @@ convert_to_cudnn_type(cudnn_frontend::NormFwdPhase_t const mode, cudnnBackendNor
     }
     return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 }
+
+#if (CUDNN_VERSION >= 92200)
+static inline cudnnStatus_t
+convert_to_cudnn_type(cudnn_frontend::ReshapeMode_t const mode, cudnnBackendReshapeMode_t& cudnn_mode) {
+    switch (mode) {
+        case ReshapeMode_t::VIEW_ONLY:
+            cudnn_mode = CUDNN_RESHAPE_VIEW_ONLY;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case ReshapeMode_t::LOGICAL:
+            cudnn_mode = CUDNN_RESHAPE_LOGICAL;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+
+#ifndef NO_DEFAULT_IN_SWITCH
+        default:
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
+    }
+    return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+}
+#endif
 
 // To be deprecated. Only exists as setResampleMode(cudnnPaddingMode_t) requires it.
 static inline void
@@ -1915,6 +1991,27 @@ convert_from_cudnn_type(cudnnBackendNormFwdPhase_t const cudnn_mode, cudnn_front
 #endif
     }
 }
+
+#if (CUDNN_VERSION >= 92200)
+// To be deprecated. Only exists as setReshapeMode(cudnnBackendReshapeMode_t) requires it.
+static inline void
+convert_from_cudnn_type(cudnnBackendReshapeMode_t const cudnn_mode, cudnn_frontend::ReshapeMode_t& mode) {
+    mode = ReshapeMode_t::NOT_SET;
+    switch (cudnn_mode) {
+        case CUDNN_RESHAPE_VIEW_ONLY:
+            mode = ReshapeMode_t::VIEW_ONLY;
+            break;
+        case CUDNN_RESHAPE_LOGICAL:
+            mode = ReshapeMode_t::LOGICAL;
+            break;
+
+#ifndef NO_DEFAULT_IN_SWITCH
+        default:
+            break;
+#endif
+    }
+}
+#endif
 
 static inline cudnnStatus_t
 convert_to_cudnn_type(cudnn_frontend::TensorReordering_t const mode, cudnnBackendTensorReordering_t& cudnn_mode) {
@@ -2074,6 +2171,17 @@ convert_from_cudnn_type(cudnnBackendDescriptorType_t const cudnn_mode) {
 #if (CUDNN_VERSION >= 91500)
         case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR:
             return DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR;
+#endif
+#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+        case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
+            return DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR;
+#endif
+
+#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+        case CUDNN_BACKEND_OPERATION_TRANSPOSE_DESCRIPTOR:
+            return DescriptorType_t::OPERATION_TRANSPOSE_DESCRIPTOR;
+        case CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR:
+            return DescriptorType_t::OPERATION_SLICE_DESCRIPTOR;
 #endif
 
 #ifndef NO_DEFAULT_IN_SWITCH
@@ -2488,6 +2596,8 @@ std::string static get_engine_tag(ManagedOpaqueDescriptor const config) {
         return "INVALID_ENGINE_NAME_KNOB_COUNT";
     }
 
+    std::vector<std::pair<cudnnBackendKnobType_t, int64_t>> knob_choices;
+    knob_choices.reserve(static_cast<size_t>(numKnobs));
     for (size_t idx = 0; idx < static_cast<size_t>(numKnobs); ++idx) {
         const cudnnBackendDescriptor_t& knob = extractedKnobs_[idx];
         cudnnBackendKnobType_t type          = CUDNN_KNOB_TYPE_COUNTS;
@@ -2500,9 +2610,92 @@ std::string static get_engine_tag(ManagedOpaqueDescriptor const config) {
         if (status != CUDNN_STATUS_SUCCESS) {
             return "INVALID_ENGINE_NAME_KNOB_CHOICE_KNOB_VALUE";
         }
+        knob_choices.emplace_back(type, choice);
+    }
+    // Sort by knob type so the tag is a deterministic function of the engine
+    // config -- the knob-choice array order differs between the heuristics path
+    // and create_execution_plan (which iterates an unordered_map), but the
+    // engine + knob values are identical.
+    std::sort(knob_choices.begin(), knob_choices.end());
+    for (auto const& [type, choice] : knob_choices) {
         tag << "_k" << type << "=" << choice;
     }
     return tag.str();
+}
+
+// Structured counterpart of get_engine_tag(): engine global index + (knob type,
+// value) choices instead of a formatted string. Reads the same backend attributes.
+cudnnStatus_t static get_engine_id_and_knobs(ManagedOpaqueDescriptor const config,
+                                             int64_t& engineId,
+                                             std::vector<std::pair<cudnnBackendKnobType_t, int64_t>>& knobs) {
+    engineId = -1;
+    knobs.clear();
+
+    ManagedOpaqueDescriptor extractedEngine = make_shared_backend_pointer(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
+    if (extractedEngine->get_status() != CUDNN_STATUS_SUCCESS) {
+        return extractedEngine->get_status();
+    }
+    cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
+
+    int64_t elemCount = 0;
+    auto status       = detail::get_attribute(config->get_backend_descriptor(),
+                                        CUDNN_ATTR_ENGINECFG_ENGINE,
+                                        CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                        1,
+                                        &elemCount,
+                                        &extractedEngine_);
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return status;
+    }
+
+    std::array<ManagedOpaqueDescriptor, CUDNN_KNOB_TYPE_COUNTS> extractedKnobs{{nullptr}};
+    for (auto& knob : extractedKnobs) {
+        knob = make_shared_backend_pointer(CUDNN_BACKEND_KNOB_CHOICE_DESCRIPTOR);
+        if (knob->get_status() != CUDNN_STATUS_SUCCESS) {
+            return knob->get_status();
+        }
+    }
+    std::array<cudnnBackendDescriptor_t, CUDNN_KNOB_TYPE_COUNTS> extractedKnobs_{{nullptr}};
+    for (std::uint32_t i = 0; i < extractedKnobs.size(); i++) {
+        extractedKnobs_[i] = extractedKnobs[i]->get_backend_descriptor();
+    }
+
+    status = detail::get_attribute(
+        extractedEngine_, CUDNN_ATTR_ENGINE_GLOBAL_INDEX, CUDNN_TYPE_INT64, 1, &elemCount, &engineId);
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return status;
+    }
+
+    int64_t numKnobs = 0;
+    status           = detail::get_attribute(config->get_backend_descriptor(),
+                                   CUDNN_ATTR_ENGINECFG_KNOB_CHOICES,
+                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                   CUDNN_KNOB_TYPE_COUNTS,
+                                   &numKnobs,
+                                   &(extractedKnobs_[0]));
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return status;
+    }
+    if (numKnobs > CUDNN_KNOB_TYPE_COUNTS) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+
+    knobs.reserve(static_cast<size_t>(numKnobs));
+    for (size_t idx = 0; idx < static_cast<size_t>(numKnobs); ++idx) {
+        const cudnnBackendDescriptor_t& knob = extractedKnobs_[idx];
+        cudnnBackendKnobType_t type          = CUDNN_KNOB_TYPE_COUNTS;
+        int64_t choice                       = -2;
+        status = detail::get_attribute(knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_TYPE, CUDNN_TYPE_KNOB_TYPE, 1, nullptr, &type);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            return status;
+        }
+        status = detail::get_attribute(knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_VALUE, CUDNN_TYPE_INT64, 1, nullptr, &choice);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            return status;
+        }
+        knobs.emplace_back(type, choice);
+    }
+    return CUDNN_STATUS_SUCCESS;
 }
 
 }  // namespace detail

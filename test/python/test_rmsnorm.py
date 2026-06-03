@@ -21,9 +21,7 @@ class RMSNorm(torch.nn.Module):
         self.eps = eps
         self.dim = dim
 
-    def forward(
-        self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None) -> torch.Tensor:
         # NOTE: the original RMSNorm paper implementation is not equivalent
         norm_x = torch.mean(x * x, dim=self.dim, keepdim=True)
         inv_var = torch.rsqrt(norm_x.float() + self.eps)
@@ -38,12 +36,7 @@ embedding_dim_options = [768, 1024, 1280, 1600]
 input_type_options = [torch.float16, torch.bfloat16]
 bias_options = [True, False]
 
-all_options = [
-    elem
-    for elem in itertools.product(
-        *[embedding_dim_options, input_type_options, bias_options]
-    )
-]
+all_options = [elem for elem in itertools.product(*[embedding_dim_options, input_type_options, bias_options])]
 
 
 @pytest.fixture(params=all_options)
@@ -66,17 +59,9 @@ def test_rmsnorm(param_extract, cudnn_handle):
 
     epsilon_value = 1e-3
 
-    x_gpu = (
-        2 * torch.randn(N, C, H, W, requires_grad=True, device="cuda", dtype=input_type)
-        - 1.25
-    )
-    scale_gpu = (
-        3 * torch.randn(1, C, H, W, requires_grad=True, device="cuda", dtype=input_type)
-        - 2.75
-    )
-    bias_gpu = torch.randn(
-        1, C, H, W, requires_grad=True, device="cuda", dtype=input_type
-    )
+    x_gpu = 2 * torch.randn(N, C, H, W, requires_grad=True, device="cuda", dtype=input_type) - 1.25
+    scale_gpu = 3 * torch.randn(1, C, H, W, requires_grad=True, device="cuda", dtype=input_type) - 2.75
+    bias_gpu = torch.randn(1, C, H, W, requires_grad=True, device="cuda", dtype=input_type)
     epsilon_cpu = torch.full(
         (1, 1, 1, 1),
         epsilon_value,
@@ -88,9 +73,7 @@ def test_rmsnorm(param_extract, cudnn_handle):
     print("Running reference")
 
     model = RMSNorm(eps=epsilon_value, dim=(1, 2, 3)).float()
-    Y_expected, inv_var_expected = model(
-        x_gpu, scale_gpu, bias_gpu if has_bias else None
-    )
+    Y_expected, inv_var_expected = model(x_gpu, scale_gpu, bias_gpu if has_bias else None)
 
     print("Building cudnn graph")
 
@@ -135,9 +118,7 @@ def test_rmsnorm(param_extract, cudnn_handle):
     Y_actual = torch.empty_like(x_gpu)
     inv_var_actual = torch.empty_like(inv_var_expected)
 
-    workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     print("Executing cudnn graph")
 
     graph.execute(
@@ -208,9 +189,7 @@ def test_rmsnorm(param_extract, cudnn_handle):
     DScale_actual = torch.empty_like(scale_gpu)
     Dbias_actual = torch.empty_like(bias_gpu)
 
-    workspace = torch.empty(
-        bwd_graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(bwd_graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     print("Executing cudnn bwd_graph")
 
     bwd_graph.execute(

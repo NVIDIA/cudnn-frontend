@@ -54,6 +54,7 @@ _default_cudnn_handle = None
 # Configure logging
 logger = logging.getLogger(__name__)
 
+
 def _graph_tensor(graph: cudnn.pygraph, tensor: "torch.Tensor") -> cudnn.tensor:
     """Create a tensor in the graph object.
 
@@ -68,11 +69,11 @@ def _graph_tensor(graph: cudnn.pygraph, tensor: "torch.Tensor") -> cudnn.tensor:
         If the input tensor has requires_grad=True, it will be detached
         before creating the graph tensor to avoid gradient tracking issues.
     """
-    try:
-        return graph.tensor_like(tensor)
-    except RuntimeError:
+    if hasattr(tensor, "requires_grad") and tensor.requires_grad:
         # PyTorch tensor with requires_grad=True need to be detached first
         return graph.tensor_like(tensor.detach())
+    else:
+        return graph.tensor_like(tensor)
 
 
 def _find_tensor(
@@ -115,11 +116,7 @@ def _find_tensor(
         for tensor_name, tensor_value in tensor_map.items():
             if tensor is tensor_value:
                 return tensor_name
-    elif (
-        hasattr(tensor, "__dlpack__")
-        and isinstance(dlpack_map, dict)
-        and id(tensor) in dlpack_map
-    ):
+    elif hasattr(tensor, "__dlpack__") and isinstance(dlpack_map, dict) and id(tensor) in dlpack_map:
         tensor = dlpack_map[id(tensor)]
         for tensor_name, tensor_value in tensor_map.items():
             if tensor_value == tensor:
@@ -127,9 +124,7 @@ def _find_tensor(
     raise ValueError("Input not found in tensor map")
 
 
-def _extract_tensor(
-    name: str, tensor: cudnn.tensor, arg_dict: dict
-) -> Optional["torch.Tensor"]:
+def _extract_tensor(name: str, tensor: cudnn.tensor, arg_dict: dict) -> Optional["torch.Tensor"]:
     """Extract a dlpack tensor from the arg_dict that matches the provided name or cudnn tensor
 
     Args:
@@ -170,11 +165,8 @@ def _tensor_like(cudnn_tensor: cudnn.tensor, tensor_type: str = "pyt") -> "torch
         raise RuntimeError("PyTorch is not available")
     dtype = cudnn.datatypes._cudnn_to_torch_data_type(cudnn_tensor.get_data_type())
     if dtype is None:
-        raise TypeError(
-            f"cuDNN uses an unsupported data type in PyTorch: {cudnn_tensor.get_data_type()}"
-        )
-    tensor = torch.empty(cudnn_tensor.get_dim(), device="cuda", dtype=dtype)
-    tensor = torch.as_strided(tensor, cudnn_tensor.get_dim(), cudnn_tensor.get_stride())
+        raise TypeError(f"cuDNN uses an unsupported data type in PyTorch: {cudnn_tensor.get_data_type()}")
+    tensor = torch.empty_strided(cudnn_tensor.get_dim(), cudnn_tensor.get_stride(), device="cuda", dtype=dtype)
     return tensor
 
 
@@ -243,25 +235,15 @@ class Graph:
         self.__kwargs = kwargs
         self.__graph = None  # to hold the cudnn.pygraph object
         self.__tensor_map = {}  # obj id of dlpack tensor -> cudnn tensor
-        self.__tensor_in = (
-            OrderedDict()
-        )  # canonical node::argname -> cudnn tensors used as the input
-        self.__tensor_out = (
-            OrderedDict()
-        )  # canonical node::outname -> cudnn tensors produced by the node
+        self.__tensor_in = OrderedDict()  # canonical node::argname -> cudnn tensors used as the input
+        self.__tensor_out = OrderedDict()  # canonical node::outname -> cudnn tensors produced by the node
         self.__tensor_unknown = []  # list of cuDNN tensors created by user directly
         self.__node_count = {}  # function name of graph node -> number of times used
-        self.__node_names = (
-            set()
-        )  # set of assigned names of graph nodes, to check name collision
+        self.__node_names = set()  # set of assigned names of graph nodes, to check name collision
         self.__input_tuples = None  # tuple of input tensors, if set by set_io_tuples
         self.__output_tuples = None  # tuple of output tensors, if set by set_io_tuples
-        self.__inputs = (
-            inputs or []
-        )  # hold the list of inputs, to be used by set_io_tuples() implicitly
-        self.__outputs = (
-            outputs or []
-        )  # hold the list of outputs, to be used by set_io_tuples() implicitly
+        self.__inputs = inputs or []  # hold the list of inputs, to be used by set_io_tuples() implicitly
+        self.__outputs = outputs or []  # hold the list of outputs, to be used by set_io_tuples() implicitly
         self.__heuristics = heuristics or [heur_mode.A, heur_mode.FALLBACK]
         if not workspace_alloc:
             self.__workspace = False
@@ -270,10 +252,7 @@ class Graph:
         # silently replace the PyTorch dtype into cuDNN dtype
         for key in ["io_data_type", "intermediate_data_type", "compute_data_type"]:
             if key in kwargs:
-                kwargs[key] = (
-                    cudnn.datatypes._torch_to_cudnn_data_type(kwargs[key])
-                    or kwargs[key]
-                )
+                kwargs[key] = cudnn.datatypes._torch_to_cudnn_data_type(kwargs[key]) or kwargs[key]
 
     def __del__(self):
         pass
@@ -282,10 +261,8 @@ class Graph:
         if self.__graph is not None:
             raise RuntimeError("Graph already created")
         self.__graph = cudnn.pygraph(
-            # Pass handle only if self.__handle is not None
-            **(
-                {"handle": self.__handle} if self.__handle not in ["auto", None] else {}
-            ),
+            # Pass handle only if self.__handle is an existing handle
+            **({"handle": self.__handle} if self.__handle not in ["auto", None] else {}),
             **self.__kwargs,
         )
         return self
@@ -335,6 +312,9 @@ class Graph:
         return self.__graph
 
     def __getattr__(self, name: str) -> Any:
+        """Intercept method calls to the graph object, usually during graph
+        construction, and handle them appropriately.
+        """
         attr = getattr(self.__graph, name)
         # calling tensor_like is unnecessary, just pass through
         pass_through = [
@@ -409,6 +389,18 @@ class Graph:
             self.__node_names.add(node_name)
             # process positional arguments for dlpack tensors
             for i, obj in enumerate(args):
+                if isinstance(obj, tuple):
+                    # use case: dropout in sdpa is a tuple of (float, seed tensor, offset tensor)
+                    obj = list(obj)  # convert to list to make it mutable
+                    for j, elem in enumerate(obj):
+                        if hasattr(elem, "__dlpack__"):
+                            obj_id = id(elem)
+                            if obj_id not in self.__tensor_map:
+                                self.__tensor_map[obj_id] = _graph_tensor(self.__graph, elem)
+                            obj[j] = self.__tensor_map[obj_id]
+                        if isinstance(obj[j], cudnn.tensor):
+                            self.__tensor_in[f"{node_name}::{i}::{j}"] = obj[j]
+                    obj = args[i] = tuple(obj)  # convert back to tuple
                 if hasattr(obj, "__dlpack__"):
                     obj_id = id(obj)
                     if obj_id not in self.__tensor_map:
@@ -418,6 +410,18 @@ class Graph:
                     self.__tensor_in[f"{node_name}::{i}"] = obj
             # process keyword arguments for dlpack tensors
             for key, obj in kwargs.items():
+                if isinstance(obj, tuple):
+                    # use case: dropout in sdpa is a tuple of (float, seed tensor, offset tensor)
+                    obj = list(obj)  # convert to list to make it mutable
+                    for j, elem in enumerate(obj):
+                        if hasattr(elem, "__dlpack__"):
+                            obj_id = id(elem)
+                            if obj_id not in self.__tensor_map:
+                                self.__tensor_map[obj_id] = _graph_tensor(self.__graph, elem)
+                            obj[j] = self.__tensor_map[obj_id]
+                        if isinstance(obj[j], cudnn.tensor):
+                            self.__tensor_in[f"{node_name}::{key}::{j}"] = obj[j]
+                    obj = kwargs[key] = tuple(obj)  # convert back to tuple
                 if hasattr(obj, "__dlpack__"):
                     obj_id = id(obj)
                     if obj_id not in self.__tensor_map:
@@ -447,25 +451,17 @@ class Graph:
         if self.__graph is None:
             raise RuntimeError("Graph not created")
         if not self.__graph.get_execution_plan_count():
-            raise RuntimeError(
-                "You should not invoke the graph before the context exits"
-            )
+            raise RuntimeError("You should not invoke the graph before the context exits")
         if len(args) == 1 and isinstance(args[0], dict):
             return self.__call_with_tensor_dict(args[0], **kwargs)
         else:
             if len(args) > 0 and not self.__input_tuples:
-                raise ValueError(
-                    "You should not invoke the graph with positional arguments before running set_io_tuples()"
-                )
+                raise ValueError("You should not invoke the graph with positional arguments before running set_io_tuples()")
             if len(args) != len(self.__input_tuples):
-                raise ValueError(
-                    f"Number of arguments ({len(args)}) does not match number of inputs ({len(self.__input_tuples)})"
-                )
+                raise ValueError(f"Number of arguments ({len(args)}) does not match number of inputs ({len(self.__input_tuples)})")
             return self.__call_with_positional_args(*args, **kwargs)
 
-    def __call_with_positional_args(
-        self, *args, **kwargs
-    ) -> Union["torch.Tensor", Tuple["torch.Tensor", ...]]:
+    def __call_with_positional_args(self, *args, **kwargs) -> Union["torch.Tensor", Tuple["torch.Tensor", ...]]:
         """Execute the graph with positional arguments.
 
         Args:
@@ -485,9 +481,7 @@ class Graph:
         variant_pack = {}
         for cudnn_tensor, user_tensor in zip(self.__input_tuples, args):
             variant_pack[cudnn_tensor.get_uid()] = user_tensor
-        output_tuple = [
-            _tensor_like(cudnn_tensor, "pyt") for cudnn_tensor in self.__output_tuples
-        ]
+        output_tuple = [_tensor_like(cudnn_tensor, "pyt") for cudnn_tensor in self.__output_tuples]
         for cudnn_tensor, user_tensor in zip(self.__output_tuples, output_tuple):
             variant_pack[cudnn_tensor.get_uid()] = user_tensor
         # execute the graph
@@ -540,9 +534,7 @@ class Graph:
         # all non-virtual tensors in __tensor_in and __tensor_out should be filled
         variant_pack = {}
         missing_tensors = {}
-        for name, tensor in itertools.chain(
-            self.__tensor_in.items(), self.__tensor_out.items()
-        ):
+        for name, tensor in itertools.chain(self.__tensor_in.items(), self.__tensor_out.items()):
             if tensor.get_uid() in variant_pack or tensor.get_is_virtual():
                 continue  # already filled or not needed
             user_tensor = _extract_tensor(name, tensor, tensor_dict)
@@ -560,17 +552,13 @@ class Graph:
                 continue  # already filled
             if name in self.__tensor_out:
                 # output tensor not specified, should be created automatically
-                variant_pack[tensor.get_uid()] = tensor_dict[name] = _tensor_like(
-                    tensor, "pyt"
-                )
+                variant_pack[tensor.get_uid()] = tensor_dict[name] = _tensor_like(tensor, "pyt")
                 missing_outputs.append(name)
             else:
                 # input tensor not specified, flag it as missing
                 missing_inputs.append(name)
         if missing_inputs:
-            raise RuntimeError(
-                f"Non-virtual input tensors not found in variant pack: {missing_inputs}"
-            )
+            raise RuntimeError(f"Non-virtual input tensors not found in variant pack: {missing_inputs}")
         if missing_outputs:
             logger.debug("Added output tensors: %s", missing_outputs)
         # execute the graph
@@ -632,9 +620,7 @@ class Graph:
                 tensors_found.add(id(tensor))
                 input_tensors.append(tensor)
             except ValueError:
-                raise ValueError(
-                    f"Input at index {i} ({name}) not found in tensor map"
-                ) from None
+                raise ValueError(f"Input at index {i} ({name}) not found in tensor map") from None
         # Convert "outputs" to a list of names that can be looked up in __tensor_out
         output_tensors = []
         for i, name in enumerate(outputs):
@@ -649,9 +635,7 @@ class Graph:
                 tensors_found.add(id(tensor))
                 output_tensors.append(tensor)
             except ValueError:
-                raise ValueError(
-                    f"Output at index {i} ({name}) not found in tensor map"
-                ) from None
+                raise ValueError(f"Output at index {i} ({name}) not found in tensor map") from None
         # Verify that all input tensors are non-virtual
         for i, tensor in enumerate(input_tensors):
             if tensor.get_is_virtual():
@@ -659,14 +643,10 @@ class Graph:
         # Verify that all non-virtual tensors are covered by input or output
         for name, tensor in self.__tensor_out.items():
             if not tensor.get_is_virtual() and tensor not in output_tensors:
-                raise ValueError(
-                    f"Node output {name} is a non-virtual tensor but not specified as output"
-                )
+                raise ValueError(f"Node output {name} is a non-virtual tensor but not specified as output")
         for name, tensor in self.__tensor_in.items():
             if not tensor.get_is_virtual() and id(tensor) not in tensors_found:
-                raise ValueError(
-                    f"Node input {name} is a non-virtual tensor but not specified as input or output"
-                )
+                raise ValueError(f"Node input {name} is a non-virtual tensor but not specified as input or output")
         # Set the input and output names
         self.__input_tuples = tuple(input_tensors)
         self.__output_tuples = tuple(output_tensors)

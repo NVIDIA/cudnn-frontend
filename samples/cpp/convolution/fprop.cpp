@@ -73,16 +73,16 @@ TEST_CASE("Convolution fprop", "[conv][graph][caching]") {
 
     auto [graph, X, W, Y] = build_new_graph(handle);
 
-    Surface<half> x_tensor(n * c * h * w, false);
-    Surface<half> w_tensor(k * c * r * s, false);
-    Surface<half> y_tensor(n * k * h * w, false);  // Should be p, q.
+    Surface<half> x_tensor(n * c * h * w);
+    Surface<half> w_tensor(k * c * r * s);
+    Surface<half> y_tensor(n * k * h * w);  // Should be p, q.
 
     std::unordered_map<int64_t, void *> variant_pack = {
         {X->get_uid(), x_tensor.devPtr}, {W->get_uid(), w_tensor.devPtr}, {Y->get_uid(), y_tensor.devPtr}};
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::cout << *graph << std::endl;
 
@@ -187,14 +187,14 @@ TEST_CASE("Convolution fprop dynamic shape", "[conv][graph][dynamic_shape]") {
                                                                              const fe::graph::Tensor_attributes *X,
                                                                              const fe::graph::Tensor_attributes *W,
                                                                              const fe::graph::Tensor_attributes *Y) {
-        Surface<half> x_tensor(max_x_volume, false);
-        Surface<half> w_tensor(max_w_volume, false);
-        Surface<half> y_tensor(max_y_volume, false);
+        Surface<half> x_tensor(max_x_volume);
+        Surface<half> w_tensor(max_w_volume);
+        Surface<half> y_tensor(max_y_volume);
 
         std::unordered_map<int64_t, void *> variant_pack = {
             {X->get_uid(), x_tensor.devPtr}, {W->get_uid(), w_tensor.devPtr}, {Y->get_uid(), y_tensor.devPtr}};
 
-        Surface<int8_t> workspace(graph->get_workspace_size(), false);
+        Surface<int8_t> workspace(graph->get_workspace_size());
 
         std::cout << *graph << std::endl;
 
@@ -296,15 +296,15 @@ TEST_CASE("CSBR Graph", "[conv][graph][caching]") {
 
     REQUIRE(cache_hit == false);
 
-    Surface<half> x_tensor(n * c * h * w, false);
-    Surface<half> w_tensor(k * c * r * s, false);
-    Surface<half> s_tensor(k, false);
-    Surface<half> b_tensor(k, false);
-    Surface<half> y_tensor(n * k * h * w, false);  // Should be p, q.
+    Surface<half> x_tensor(n * c * h * w);
+    Surface<half> w_tensor(k * c * r * s);
+    Surface<half> s_tensor(k);
+    Surface<half> b_tensor(k);
+    Surface<half> y_tensor(n * k * h * w);  // Should be p, q.
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void *> variant_pack = {
         {X, x_tensor.devPtr}, {W, w_tensor.devPtr}, {S, s_tensor.devPtr}, {B, b_tensor.devPtr}, {Y, y_tensor.devPtr}};
@@ -436,13 +436,13 @@ TEST_CASE("CSBR Graph dynamic shape", "[conv][graph][dynamic_shape]") {
     for (int idx_shape = 0; idx_shape < conv_shapes_count; idx_shape++) {
         auto [graph, X, W, B, S, Y] = lookup_cache_or_build_graph(handle, idx_shape);
 
-        Surface<half> x_tensor(max_x_volume, false);
-        Surface<half> w_tensor(max_w_volume, false);
-        Surface<half> s_tensor(max_k, false);
-        Surface<half> b_tensor(max_k, false);
-        Surface<half> y_tensor(max_y_volume, false);  // Should be p, q.
+        Surface<half> x_tensor(max_x_volume);
+        Surface<half> w_tensor(max_w_volume);
+        Surface<half> s_tensor(max_k);
+        Surface<half> b_tensor(max_k);
+        Surface<half> y_tensor(max_y_volume);  // Should be p, q.
 
-        Surface<int8_t> workspace(graph->get_workspace_size(), false);
+        Surface<int8_t> workspace(graph->get_workspace_size());
         std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void *> variant_pack = {{X, x_tensor.devPtr},
                                                                                                   {W, w_tensor.devPtr},
                                                                                                   {S, s_tensor.devPtr},
@@ -529,13 +529,13 @@ TEST_CASE("SBRCS", "[conv][genstats][graph]") {
 
     auto [graph, X, W, B, S, Y, SUM, SQ_SUM] = build_new_graph(handle);
 
-    Surface<half> x_tensor(n * c * h * w, false);
-    Surface<half> w_tensor(k * c * r * s, false);
-    Surface<half> s_tensor(c, false);
-    Surface<half> b_tensor(c, false);
-    Surface<half> y_tensor(n * k * h * w, false);  // Should be p, q.
-    Surface<float> sum_tensor(k, false);
-    Surface<float> sq_sum_tensor(k, false);
+    Surface<half> x_tensor(n * c * h * w);
+    Surface<half> w_tensor(k * c * r * s);
+    Surface<half> s_tensor(c);
+    Surface<half> b_tensor(c);
+    Surface<half> y_tensor(n * k * h * w);  // Should be p, q.
+    Surface<float> sum_tensor(k);
+    Surface<float> sq_sum_tensor(k);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void *> variant_pack = {
         {X, x_tensor.devPtr},
@@ -548,7 +548,7 @@ TEST_CASE("SBRCS", "[conv][genstats][graph]") {
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 }
@@ -641,15 +641,15 @@ TEST_CASE("CBR Graph NCHW", "[conv][graph][caching]") {
 
     REQUIRE(cache_hit == false);
 
-    Surface<half> x_tensor(n * c * h * w, false);
-    Surface<half> w_tensor(k * c * r * s, false);
-    Surface<half> b_tensor(k, false);
-    Surface<half> y_tensor(n * k * h * w, false);  // Should be p, q.
-    Surface<half> z_tensor(n * k * h * w, false);  // Should be p, q.
+    Surface<half> x_tensor(n * c * h * w);
+    Surface<half> w_tensor(k * c * r * s);
+    Surface<half> b_tensor(k);
+    Surface<half> y_tensor(n * k * h * w);  // Should be p, q.
+    Surface<half> z_tensor(n * k * h * w);  // Should be p, q.
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void *> variant_pack = {
         {X, x_tensor.devPtr}, {W, w_tensor.devPtr}, {B, b_tensor.devPtr}, {Z, z_tensor.devPtr}, {Y, y_tensor.devPtr}};
@@ -721,16 +721,16 @@ TEST_CASE("Convolution fprop large", "[conv][graph][caching]") {
 
     auto [graph, X, W, Y] = build_new_graph(handle);
 
-    Surface<half> x_tensor(n * c * d * h * w, false);
-    Surface<half> w_tensor(k * c * t * r * s, false);
-    Surface<half> y_tensor(n * k * d * h * w, false);  // Should be p, q.
+    Surface<half> x_tensor(n * c * d * h * w);
+    Surface<half> w_tensor(k * c * t * r * s);
+    Surface<half> y_tensor(n * k * d * h * w);  // Should be p, q.
 
     std::unordered_map<int64_t, void *> variant_pack = {
         {X->get_uid(), x_tensor.devPtr}, {W->get_uid(), w_tensor.devPtr}, {Y->get_uid(), y_tensor.devPtr}};
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::cout << *graph << std::endl;
 
@@ -808,11 +808,11 @@ TEST_CASE("Convolution fprop concatenate", "[conv][graph][caching]") {
 
     auto [graph, X, W, Y, Y0, Y1] = build_new_graph(handle);
 
-    Surface<half> x_tensor(n * c * h * w, false);
-    Surface<half> w_tensor(k * c * r * s, false);
-    Surface<half> y_tensor(n * k * h * w, false);       // Should be p, q.
-    Surface<half> y0_tensor(n * k * h * w, false);      // Should be p, q.
-    Surface<half> y1_tensor(n * 2 * k * h * w, false);  // Should be p, q.
+    Surface<half> x_tensor(n * c * h * w);
+    Surface<half> w_tensor(k * c * r * s);
+    Surface<half> y_tensor(n * k * h * w);       // Should be p, q.
+    Surface<half> y0_tensor(n * k * h * w);      // Should be p, q.
+    Surface<half> y1_tensor(n * 2 * k * h * w);  // Should be p, q.
 
     std::unordered_map<int64_t, void *> variant_pack = {{X->get_uid(), x_tensor.devPtr},
                                                         {W->get_uid(), w_tensor.devPtr},
@@ -822,7 +822,7 @@ TEST_CASE("Convolution fprop concatenate", "[conv][graph][caching]") {
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::cout << *graph << std::endl;
 

@@ -9,9 +9,6 @@ add_executable(
     fusion_sample.cpp
     fp8_sample.cpp
     norm_samples.cpp
-    fused_mha_sample.cpp
-    f16_flash_mha_sample.cpp
-    fp8_flash_mha_sample.cpp
 )
 
 # target flags

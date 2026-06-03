@@ -22,6 +22,12 @@
 
 #pragma once
 
+// Suppress MSVC warning C4756 (overflow in constant arithmetic) that occurs
+// in MSVC's <optional> header with certain compiler versions
+#ifdef _MSC_VER
+#pragma warning(disable : 4756)
+#endif
+
 /*! \mainpage CUDNN FRONTEND API
  *
  * \section Introduction

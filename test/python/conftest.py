@@ -1,9 +1,45 @@
+import os
+
+# Caps peak GPU memory across long pytest-xdist runs (e.g. test_mhas_v2 ~2.5k
+# configs in one worker). Must precede any torch import (including the
+# transitive one via transformer_engine below) -- PyTorch reads this env var
+# once when its CUDA allocator initializes.
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True,garbage_collection_threshold:0.6",
+)
+
+import sys
+import traceback
 import pytest
+
+# Import TransformerEngine BEFORE cudnn to avoid library loading conflicts
+# TE requires specific CUDA library versions that conflict if cudnn is loaded first
+try:
+    import transformer_engine
+except (ImportError, OSError):
+    pass
+
 import cudnn
 import torch
-import argparse
 
 # fmt: off
+
+# =================== CUDA Synchronize Guard =====================
+torch.cuda.synchronize_unsafe = torch.cuda.synchronize
+
+def cuda_synchronize_safe(*args, **kwargs):
+    try:
+        torch.cuda.synchronize_unsafe(*args, **kwargs)
+    except Exception as e:
+        entries = traceback.extract_stack(sys._getframe(1))
+        test_entries = [f for f in entries if "/test/python/" in f.filename]
+        print("Traceback (most recent call last):", flush=True)
+        print(*traceback.format_list(test_entries), end="", flush=True)
+        print(e, flush=True)
+        os._exit(os.EX_SOFTWARE)
+
+torch.cuda.synchronize = cuda_synchronize_safe
 
 # =================== Fixtures =====================
 @pytest.fixture(scope="session", autouse=True)
@@ -26,7 +62,9 @@ def cudnn_handle():
 # =================== PyTest Hooks =====================
 def pytest_load_initial_conftests(args, early_config, parser):
     if not any(arg.startswith("--tb=") for arg in args):
-        args.append("--tb=short")
+        args.insert(0, "--tb=short")
+    if "--no-header" not in args:
+        args.insert(0, "--no-header")
 
 
 def pytest_configure(config):
@@ -52,7 +90,10 @@ def pytest_addoption(parser):
     parser.addoption("--dryrun", action="store", nargs="?", const=1, type=int, default=0, help="show repro commands when 1, 2, or 3 (use with '-s')")
     parser.addoption("--diffs", action="store", type=int, default=10, help="set number of numerical mismatches to display")
     parser.addoption("--repro", action="store", type=str, default=None, help="specify config string to run repro function")
+    parser.addoption("--seed", action="store", type=int, default=None, help="[fuzzer] random seed for reproducibility")
+    parser.addoption("--num-tests", action="store", type=int, default=100, help="[fuzzer] number of random tests to run")
     parser.addoption("--perf", action="store_true", help="enable performance profiling")
+    parser.addoption("--timing_method", action="store", type=str, default="cupti", choices=["events", "cupti"], help="timing method: 'cupti' (torch.profiler device_time, default) or 'events' (CUDA events)")
 
     # MHA command line options to overwrite specific test dimensions in test_mhas.py and test_mhas_v2.py.
     parser.addoption("--b", default=None, type=int, help="[test_mhas.py] batch dimension")
@@ -70,32 +111,41 @@ def pytest_addoption(parser):
 
     parser.addoption("--implementation", action="store", default=None, type=str, choices=["AUTO", "COMPOSITE", "UNIFIED"], help="[test_mhas_v2.py], overwrites implementation")
 
+    parser.addoption("--skip-ref", action="store_true", help="[NSA, DSA, gemm_swiglu, gemm_amax, grouped_gemm_swiglu, sdpa_fwd, sdpa_bwd] Skip reference computation for performance testing")
+
     # NSA (Native Sparse Attention) command line options for test_NSA_selection_attention.py, test_NSA_swa.py
-    parser.addoption("--nsa-batch-size", action="store", default=None, type=int, help="[test_NSA_selection_attention.py, test_NSA_swa.py] Batch size")
-    parser.addoption("--nsa-seq-len", action="store", default=None, type=int, help="[test_NSA_selection_attention.py, test_NSA_swa.py] Sequence length (will be replicated for all batches)")
-    parser.addoption("--nsa-num-q-heads", action="store", default=None, type=int, help="[test_NSA_selection_attention.py, test_NSA_swa.py] Number of query heads")
-    parser.addoption("--nsa-num-kv-heads", action="store", default=None, type=int, help="[test_NSA_selection_attention.py, test_NSA_swa.py] Number of key/value heads")
-    parser.addoption("--nsa-head-dim", action="store", default=None, type=int, help="[test_NSA_selection_attention.py, test_NSA_swa.py] Head dimension")
-    parser.addoption("--nsa-value-dim", action="store", default=None, type=int, help="[test_NSA_selection_attention.py, test_NSA_swa.py] Value dimension")
-    parser.addoption("--nsa-dtype", action="store", default=None, type=str, help="[test_NSA_selection_attention.py, test_NSA_swa.py] Data type (float16, bfloat16, float32)")
-    parser.addoption("--nsa-acc-dtype", action="store", default=None, type=str, help="[test_NSA_selection_attention.py, test_NSA_swa.py] Accumulator data type (float16, bfloat16, float32)")
-    parser.addoption("--nsa-skip-ref", action="store_true", help="[test_NSA_selection_attention.py, test_NSA_swa.py] Skip reference computation for performance testing")
-    parser.addoption("--nsa-block-size", action="store", default=None, type=int, help="[test_NSA_selection_attention.py] Block size")
-    parser.addoption("--nsa-topk-size", action="store", default=None, type=int, help="[test_NSA_selection_attention.py] Top-k size (will be replicated for all batches)")
-    parser.addoption("--nsa-window-size", action="store", default=None, type=int, help="[test_NSA_swa.py] Window size")
-    parser.addoption("--nsa-layout", action="store", default=None, type=str, help="[test_NSA_swa.py] Layout (bshd, thd)")
+    parser.addoption("--nsa-b", action="store", default=None, type=int, help="[NSA] Batch size")
+    parser.addoption("--nsa-s_q", action="store", default=None, type=int, help="[NSA] Query sequence length")
+    parser.addoption("--nsa-s_kv", action="store", default=None, type=int, help="[NSA] Key/value sequence length")
+    parser.addoption("--nsa-d_qk", action="store", default=None, type=int, help="[NSA] Query/key embedding dimension per head")
+    parser.addoption("--nsa-d_v", action="store", default=None, type=int, help="[NSA] Value embedding dimension per head")
+    parser.addoption("--nsa-h_q", action="store", default=None, type=int, help="[NSA] Number of query heads")
+    parser.addoption("--nsa-h_k", action="store", default=None, type=int, help="[NSA] Number of key heads")
+    parser.addoption("--nsa-h_v", action="store", default=None, type=int, help="[NSA] Number of value heads")
+
+    # DSA (DeepSeek Sparse Attention) command line options for test_DSA_*.py
+    parser.addoption("--dsa-b", action="store", default=None, type=int, help="[DSA] Batch size")
+    parser.addoption("--dsa-s_q", action="store", default=None, type=int, help="[DSA] Query sequence length")
+    parser.addoption("--dsa-s_kv", action="store", default=None, type=int, help="[DSA] Key/value sequence length")
+    parser.addoption("--dsa-h_q", action="store", default=None, type=int, help="[DSA] Number of query heads")
+    parser.addoption("--dsa-h_kv", action="store", default=None, type=int, help="[DSA] Number of KV heads")
+    parser.addoption("--dsa-d_qk", action="store", default=None, type=int, help="[DSA] Query/key embedding dimension per head")
+    parser.addoption("--dsa-d_v", action="store", default=None, type=int, help="[DSA] Value embedding dimension per head")
+    parser.addoption("--dsa-topk", action="store", default=None, type=int, help="[DSA] Top-K count")
+    parser.addoption("--dsa-ratio", action="store", default=None, type=int, help="[DSA] Indexer compression ratio")
 
     # GEMM SwiGLU command line options for test_gemm_swiglu.py
     parser.addoption("--gemm-swiglu-mnkl", action="store", default=None, type=str, help="[test_gemm_swiglu.py] M,N,K,L dimensions as comma-separated values (e.g., '256,256,512,1')")
-    
     parser.addoption("--gemm-swiglu-mma-tiler", action="store", default=None, type=str, help="[test_gemm_swiglu.py] MMA tiler (M,N) dimensions as comma-separated values (e.g., '128,128')")
     parser.addoption("--gemm-swiglu-cluster-shape", action="store", default=None, type=str, help="[test_gemm_swiglu.py] Cluster shape (M,N) dimensions as comma-separated values (e.g., '1,1')")
     parser.addoption("--gemm-swiglu-alpha", action="store", default=None, type=float, help="[test_gemm_swiglu.py] Alpha scaling factor")
-    parser.addoption("--gemm-swiglu-skip-ref", action="store_true", help="[test_gemm_swiglu.py] Skip reference computation for performance testing")
 
     # GEMM Amax command line options for test_gemm_amax.py
     parser.addoption("--gemm-amax-mnkl", action="store", default=None, type=str, help="[test_gemm_amax.py] M,N,K,L dimensions as comma-separated values (e.g., '512,256,256,1')")
     parser.addoption("--gemm-amax-mma-tiler", action="store", default=None, type=str, help="[test_gemm_amax.py] MMA tiler (M,N) dimensions as comma-separated values (e.g., '128,128')")
     parser.addoption("--gemm-amax-cluster-shape", action="store", default=None, type=str, help="[test_gemm_amax.py] Cluster shape (M,N) dimensions as comma-separated values (e.g., '1,1')")
-    parser.addoption("--gemm-amax-skip-ref", action="store_true", help="[test_gemm_amax.py] Skip reference computation for performance testing")
+
+    # Grouped GEMM SwiGLU command line options for test_grouped_gemm_swiglu.py
+    parser.addoption("--grouped-gemm-nkl", action="store", default=None, type=str, help="[test_grouped_gemm_swiglu.py] N,K,L dimensions as comma-separated values (e.g., '512,512,4')")
+    parser.addoption("--grouped-gemm-group-m", action="store", default=None, type=str, help="[test_grouped_gemm_swiglu.py] M values per group as comma-separated values (e.g., '256,512,256,256')")
 # fmt: on

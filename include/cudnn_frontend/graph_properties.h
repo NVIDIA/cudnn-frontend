@@ -1,6 +1,8 @@
 
 #pragma once
 
+#include <cerrno>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <numeric>
@@ -17,7 +19,30 @@ namespace cudnn_frontend {
 
 namespace graph {
 
+inline std::optional<float>
+get_rescale_threshold_from_env() {
+    auto const* env_value = std::getenv("CUDNN_RESCALE_THRESHOLD");
+    if (env_value == nullptr || env_value[0] == '\0') {
+        return std::nullopt;
+    }
+
+    errno      = 0;
+    char* end  = nullptr;
+    auto value = std::strtof(env_value, &end);
+    if (env_value == end || (end != nullptr && *end != '\0') || errno == ERANGE) {
+        return std::nullopt;
+    }
+
+    return value;
+}
+
 using managed_backend_descriptor_t = std::vector<ManagedOpaqueDescriptor>;
+
+// Enum to distinguish between runtime parameters and compile-time constants
+enum class ScalarType {
+    RUNTIME_PARAM,      // Value provided at execution time (can change)
+    COMPILE_TIME_CONST  // Value baked into graph (fixed, optimizable)
+};
 
 // simple structure to hold all properties of a tensor.
 // Each property has a getter setter.
@@ -31,7 +56,7 @@ class Tensor_attributes {
     // In approach 1, users provide a value to embed into the graph.
     // In approach 2, users set is_pass_by_value boolean and then pass a pointer to scalar value with execute() API.
     // A closed set of types that are allowed to be passed by value.
-    using pass_by_values_t = std::variant<int64_t, int32_t, half, float, nv_bfloat16>;
+    using pass_by_values_t = std::variant<int64_t, int32_t, half, float, double, nv_bfloat16>;
 
     error_t
     validate() const {
@@ -52,6 +77,22 @@ class Tensor_attributes {
             error_code_t::ATTRIBUTE_NOT_SET,
             "Tensor '" + name + "' can't be a fused scalar and not a pass_by_value tensor at the same time.");
 
+        // Validate compile-time constant constraints
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            has_compile_time_constant && !is_pass_by_value,
+            error_code_t::ATTRIBUTE_NOT_SET,
+            "Tensor '" + name + "' with compile-time constant must have is_pass_by_value=true.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(has_compile_time_constant && is_virtual,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Tensor '" + name + "' can't be both compile-time constant and virtual.");
+
+        // Can't have both compile-time constant and runtime parameter
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            has_compile_time_constant && pass_by_value.has_value(),
+            error_code_t::ATTRIBUTE_NOT_SET,
+            "Tensor '" + name + "' can't have both compile-time constant and runtime pass_by_value.");
+
         return {error_code_t::OK, ""};
     }
 
@@ -68,12 +109,18 @@ class Tensor_attributes {
     std::optional<pass_by_values_t> pass_by_value = std::nullopt;
     bool is_pass_by_value                         = false;
 
+    // Compile-time constant support (distinct from pass_by_value, which is for runtime parameters)
+    bool has_compile_time_constant                              = false;
+    std::optional<pass_by_values_t> compile_time_constant_value = std::nullopt;
+
     TensorReordering_t reordering_type = TensorReordering_t::NONE;
     uid_t uid                          = 0;
     bool uid_assigned                  = false;
 
     std::shared_ptr<Tensor_attributes> ragged_offset;
-    int64_t alignment = 16;  // Default to 16 bytes
+    int64_t alignment        = 16;  // Default to 16 bytes
+    int64_t vector_count     = 1;   // Default to 1 (no vectorization)
+    int64_t vector_dimension = -1;  // Default to -1 (not set)
 
     auto
     fill_from_context(detail::Context const& context) -> Tensor_attributes& {
@@ -131,6 +178,86 @@ class Tensor_attributes {
         is_pass_by_value = true;
         dim = stride = {1};
         data_type    = DataType_t::INT64;
+    }
+
+    Tensor_attributes(double const& scalar) {
+        pass_by_value    = scalar;
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::DOUBLE;
+    }
+
+    // Constructors with ScalarType for compile-time constant or runtime parameter control
+    Tensor_attributes(float const& scalar, ScalarType scalar_type) {
+        if (scalar_type == ScalarType::COMPILE_TIME_CONST) {
+            compile_time_constant_value = scalar;
+            has_compile_time_constant   = true;
+        } else {
+            pass_by_value = scalar;
+        }
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::FLOAT;
+    }
+
+    Tensor_attributes(half const& scalar, ScalarType scalar_type) {
+        if (scalar_type == ScalarType::COMPILE_TIME_CONST) {
+            compile_time_constant_value = scalar;
+            has_compile_time_constant   = true;
+        } else {
+            pass_by_value = scalar;
+        }
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::HALF;
+    }
+
+    Tensor_attributes(nv_bfloat16 const& scalar, ScalarType scalar_type) {
+        if (scalar_type == ScalarType::COMPILE_TIME_CONST) {
+            compile_time_constant_value = scalar;
+            has_compile_time_constant   = true;
+        } else {
+            pass_by_value = scalar;
+        }
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::BFLOAT16;
+    }
+
+    Tensor_attributes(int32_t const& scalar, ScalarType scalar_type) {
+        if (scalar_type == ScalarType::COMPILE_TIME_CONST) {
+            compile_time_constant_value = scalar;
+            has_compile_time_constant   = true;
+        } else {
+            pass_by_value = scalar;
+        }
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::INT32;
+    }
+
+    Tensor_attributes(int64_t const& scalar, ScalarType scalar_type) {
+        if (scalar_type == ScalarType::COMPILE_TIME_CONST) {
+            compile_time_constant_value = scalar;
+            has_compile_time_constant   = true;
+        } else {
+            pass_by_value = scalar;
+        }
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::INT64;
+    }
+
+    Tensor_attributes(double const& scalar, ScalarType scalar_type) {
+        if (scalar_type == ScalarType::COMPILE_TIME_CONST) {
+            compile_time_constant_value = scalar;
+            has_compile_time_constant   = true;
+        } else {
+            pass_by_value = scalar;
+        }
+        is_pass_by_value = true;
+        dim = stride = {1};
+        data_type    = DataType_t::DOUBLE;
     }
 
     std::string
@@ -223,6 +350,35 @@ class Tensor_attributes {
         return *this;
     }
 
+    // Compile-time constant accessors
+    bool
+    get_has_compile_time_constant() const {
+        return has_compile_time_constant;
+    }
+
+    std::optional<pass_by_values_t>
+    get_compile_time_constant() const {
+        return compile_time_constant_value;
+    }
+
+    auto
+    set_compile_time_constant(pass_by_values_t const& value) -> Tensor_attributes& {
+        compile_time_constant_value = value;
+        has_compile_time_constant   = true;
+        if (!is_pass_by_value) {
+            is_pass_by_value = true;
+        }
+        return *this;
+    }
+
+    auto
+    set_as_runtime_parameter() -> Tensor_attributes& {
+        is_pass_by_value            = true;
+        has_compile_time_constant   = false;
+        compile_time_constant_value = std::nullopt;
+        return *this;
+    }
+
     TensorReordering_t
     get_reordering_type() const {
         return reordering_type;
@@ -242,6 +398,23 @@ class Tensor_attributes {
     auto
     set_alignment(int64_t const value) -> Tensor_attributes& {
         alignment = value;
+        return *this;
+    }
+
+    int64_t
+    get_vector_count() const {
+        return vector_count;
+    }
+
+    int64_t
+    get_vector_dimension() const {
+        return vector_dimension;
+    }
+
+    auto
+    set_vector_count_and_dimension(int64_t const count, int64_t const dimension) -> Tensor_attributes& {
+        vector_count     = count;
+        vector_dimension = dimension;
         return *this;
     }
 
@@ -296,9 +469,15 @@ class Attributes {
     get_non_virtual_uids() const {
         std::vector<int64_t> non_virtual_uids;
         auto derived = static_cast<DerivedT const*>(this);
+
+        // Compile-time constants are excluded from the variant pack
+        auto should_be_in_variant_pack = [](std::shared_ptr<Tensor_attributes> const& tensor) {
+            return tensor && tensor->get_is_virtual() == false && !tensor->get_has_compile_time_constant();
+        };
+
         if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
             for (auto tensor : derived->inputs) {
-                if (tensor && tensor->get_is_virtual() == false) {
+                if (should_be_in_variant_pack(tensor)) {
                     non_virtual_uids.push_back(tensor->get_uid());
                     if (auto ragged_offset = tensor->get_ragged_offset()) {
                         non_virtual_uids.push_back(ragged_offset->get_uid());
@@ -308,7 +487,7 @@ class Attributes {
         } else {
             for (auto& [name, tensor] : derived->inputs) {
                 (void)name;
-                if (tensor && tensor->get_is_virtual() == false) {
+                if (should_be_in_variant_pack(tensor)) {
                     non_virtual_uids.push_back(tensor->get_uid());
                     if (auto ragged_offset = tensor->get_ragged_offset()) {
                         non_virtual_uids.push_back(ragged_offset->get_uid());
@@ -319,7 +498,7 @@ class Attributes {
 
         for (auto& [name, tensor] : derived->outputs) {
             (void)name;
-            if (tensor && tensor->get_is_virtual() == false) {
+            if (should_be_in_variant_pack(tensor)) {
                 non_virtual_uids.push_back(tensor->get_uid());
                 if (auto ragged_offset = tensor->get_ragged_offset()) {
                     non_virtual_uids.push_back(ragged_offset->get_uid());
@@ -331,7 +510,7 @@ class Attributes {
         if constexpr (std::is_same_v<DerivedT, Batchnorm_attributes> ||
                       std::is_same_v<DerivedT, Batchnorm_backward_attributes>) {
             for (auto& tensor : derived->peer_stats) {
-                if (tensor && tensor->get_is_virtual() == false) {
+                if (should_be_in_variant_pack(tensor)) {
                     non_virtual_uids.push_back(tensor->get_uid());
                     if (auto ragged_offset = tensor->get_ragged_offset()) {
                         non_virtual_uids.push_back(ragged_offset->get_uid());
@@ -404,13 +583,16 @@ class Attributes {
             set_compute_data_type(context.get_compute_data_type());
         }
 
-        // Handle shape and stride inferencing for fused scalars.
-        // Pick number of dimensions from anyone of non-fused-scalar input/output tensors
-        // In case, all tensors are fused scalars, just keep them 1D.
+        // Infer shape and stride for fused scalars (runtime params and compile-time constants).
+        // Fused scalars expand to match the dimensionality of non-scalar tensors; if all are scalars, keep 1D.
+        auto is_fused_scalar = [](std::shared_ptr<Tensor_attributes> const& tensor) {
+            return tensor && (tensor->get_pass_by_value().has_value() || tensor->get_has_compile_time_constant());
+        };
+
         int64_t number_of_dims = 1;
         if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
             for (auto tensor : derived->inputs) {
-                if (tensor && (tensor->get_pass_by_value().has_value() == false)) {
+                if (tensor && !is_fused_scalar(tensor)) {
                     number_of_dims = tensor->get_dim().size();
                     break;
                 }
@@ -418,7 +600,7 @@ class Attributes {
         } else {
             for (auto [name, tensor] : derived->inputs) {
                 (void)name;
-                if (tensor && (tensor->get_pass_by_value().has_value() == false)) {
+                if (tensor && !is_fused_scalar(tensor)) {
                     number_of_dims = tensor->get_dim().size();
                     break;
                 }
@@ -429,16 +611,17 @@ class Attributes {
         if (number_of_dims == 1) {
             for (auto [name, tensor] : derived->outputs) {
                 (void)name;
-                if (tensor && (tensor->get_pass_by_value().has_value() == false)) {
+                if (tensor && !is_fused_scalar(tensor)) {
                     number_of_dims = tensor->get_dim().size();
                     break;
                 }
             }
         }
 
+        // Expand fused scalar dimensions to match the number of dims of non-scalar tensors
         if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
             for (auto tensor : derived->inputs) {
-                if (tensor && tensor->get_pass_by_value().has_value()) {
+                if (is_fused_scalar(tensor)) {
                     tensor->set_dim(std::vector<int64_t>(number_of_dims, 1));
                     tensor->set_stride(std::vector<int64_t>(number_of_dims, 1));
                 }
@@ -446,7 +629,7 @@ class Attributes {
         } else {
             for (auto [name, tensor] : derived->inputs) {
                 (void)name;
-                if (tensor && tensor->get_pass_by_value().has_value()) {
+                if (is_fused_scalar(tensor)) {
                     tensor->set_dim(std::vector<int64_t>(number_of_dims, 1));
                     tensor->set_stride(std::vector<int64_t>(number_of_dims, 1));
                 }
@@ -849,7 +1032,7 @@ class Matmul_attributes : public Attributes<Matmul_attributes> {
 class Pointwise_attributes : public Attributes<Pointwise_attributes> {
     friend class Attributes<Pointwise_attributes>;
     friend class PointwiseNode;
-    friend class SoftmaxNode;
+    friend class CompositeSoftmaxNode;
     friend class INode;
 
     PointwiseMode_t mode = PointwiseMode_t::NOT_SET;
@@ -889,6 +1072,11 @@ class Pointwise_attributes : public Attributes<Pointwise_attributes> {
         return *this;
     }
 
+    PointwiseMode_t
+    get_mode() const {
+        return mode;
+    }
+
     std::optional<int64_t>
     get_axis() const {
         return axis;
@@ -922,6 +1110,11 @@ class Pointwise_attributes : public Attributes<Pointwise_attributes> {
     set_swish_beta(float const value) {
         this->swish_beta = value;
         return *this;
+    }
+
+    std::optional<float>
+    get_swish_beta() const {
+        return swish_beta;
     }
 
     Pointwise_attributes&
@@ -1002,6 +1195,12 @@ class Layernorm_attributes : public Attributes<Layernorm_attributes> {
     Layernorm_attributes&
     set_epsilon(std::shared_ptr<Tensor_attributes>& value) {
         inputs[Layernorm_attributes::input_names::EPSILON] = value;
+        return *this;
+    }
+
+    Layernorm_attributes&
+    set_epsilon(float const value) {
+        inputs[Layernorm_attributes::input_names::EPSILON] = std::make_shared<Tensor_attributes>(value);
         return *this;
     }
 };
@@ -1384,13 +1583,21 @@ class Reshape_attributes : public Attributes<Reshape_attributes> {
 
     std::vector<int64_t> dim    = {};
     std::vector<int64_t> stride = {};
+    ReshapeMode_t reshape_mode  = ReshapeMode_t::VIEW_ONLY;
 
    public:
     enum class input_names { X };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Reshape_attributes, name, compute_data_type, inputs, outputs, dim, stride)
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Reshape_attributes,
+                                   name,
+                                   compute_data_type,
+                                   inputs,
+                                   outputs,
+                                   dim,
+                                   stride,
+                                   reshape_mode)
 
     std::vector<int64_t>
     get_dim() const {
@@ -1411,6 +1618,54 @@ class Reshape_attributes : public Attributes<Reshape_attributes> {
     auto
     set_stride(std::vector<int64_t> const& value) -> Reshape_attributes& {
         stride = value;
+        return *this;
+    }
+
+    ReshapeMode_t
+    get_reshape_mode() const {
+        return reshape_mode;
+    }
+
+    auto
+    set_reshape_mode(ReshapeMode_t const& value) -> Reshape_attributes& {
+        reshape_mode = value;
+        return *this;
+    }
+};
+
+class Transpose_attributes : public Attributes<Transpose_attributes> {
+    friend class Attributes<Transpose_attributes>;
+    friend class TransposeNode;
+    friend class Graph;
+
+    std::vector<int64_t> permutation;
+
+   public:
+    std::string
+    get_name() const {
+        return name;
+    }
+
+    auto
+    set_name(std::string const& value) -> Transpose_attributes& {
+        name = value;
+        return *this;
+    }
+
+    enum class input_names { X };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { Y };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Transpose_attributes, name, compute_data_type, inputs, outputs, permutation)
+
+    std::vector<int64_t>
+    get_permutation() const {
+        return permutation;
+    }
+
+    auto
+    set_permutation(std::vector<int64_t> const& value) -> Transpose_attributes& {
+        permutation = value;
         return *this;
     }
 };
@@ -1446,6 +1701,80 @@ class Rmsnorm_attributes : public Attributes<Rmsnorm_attributes> {
         inputs[Rmsnorm_attributes::input_names::EPSILON] = value;
         return *this;
     }
+};
+
+class RoPE_attributes : public Attributes<RoPE_attributes> {
+    friend class Attributes<RoPE_attributes>;
+    friend class RoPENode;
+    friend class Graph;
+
+   public:
+    enum class input_names { INPUT, FREQS };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { OUTPUT };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+
+    // Host-side scalar multiplied into cos/sin. Default 1.0 (identity).
+    // Use this to fold YARN mscale and/or attn_scale into RoPE so SDPA can skip its scale multiply.
+    float output_scale = 1.0f;
+
+    // Rotation width (last K dims). 0 = use input's head_dim (full rotation).
+    // When < head_dim, the kernel rotates the last rope_dim dims and scaled-pass-through
+    // copies the first (head_dim - rope_dim) dims. The freqs tensor's last dim must equal
+    // rope_dim (not head_dim). Used for DSv3-style MLA (rope_dim=64, head_dim=192).
+    int64_t rope_dim = 0;
+
+    RoPE_attributes&
+    set_output_scale(float scale) {
+        output_scale = scale;
+        return *this;
+    }
+
+    RoPE_attributes&
+    set_rope_dim(int64_t dim) {
+        rope_dim = dim;
+        return *this;
+    }
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(RoPE_attributes, name, compute_data_type, inputs, outputs, output_scale, rope_dim)
+};
+
+class RoPE_backward_attributes : public Attributes<RoPE_backward_attributes> {
+    friend class Attributes<RoPE_backward_attributes>;
+    friend class RoPEBackwardNode;
+    friend class Graph;
+
+   public:
+    enum class input_names { DY, FREQS };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { DX };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+
+    // Same semantics as fwd: cos/sin pre-multiplied by output_scale, and the nope
+    // segment (head_dim - rope_dim) is scaled-pass-through. Should match the fwd's
+    // values for correct gradient flow.
+    float output_scale = 1.0f;
+    int64_t rope_dim   = 0;
+
+    RoPE_backward_attributes&
+    set_output_scale(float scale) {
+        output_scale = scale;
+        return *this;
+    }
+
+    RoPE_backward_attributes&
+    set_rope_dim(int64_t dim) {
+        rope_dim = dim;
+        return *this;
+    }
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(RoPE_backward_attributes,
+                                   name,
+                                   compute_data_type,
+                                   inputs,
+                                   outputs,
+                                   output_scale,
+                                   rope_dim)
 };
 
 class Rmsnorm_backward_attributes : public Attributes<Rmsnorm_backward_attributes> {
@@ -1616,11 +1945,14 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     AttentionScoreModifier_t attention_score_modifier = nullptr;
     DataType_t mma_core_mode                          = DataType_t::NOT_SET;
 
-    // Deprecated fields for backward compatibility with SDPA_fp8_attributes
-    bool causal_mask              = false;
-    bool causal_mask_bottom_right = false;
-
     AttentionImplementation_t implementation = AttentionImplementation_t::AUTO;
+
+    bool unfuse_fma = false;  // For SM100: use __fmul_rn + __fadd_rn instead of ffma2 in softmax
+
+    bool
+    has_bias() const {
+        return inputs.find(input_names::Bias) != inputs.end() && inputs.at(input_names::Bias) != nullptr;
+    }
 
     bool
     has_causal_like_masking() const {
@@ -1630,6 +1962,11 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     bool
     has_causal_mask_bottom_right() const {
         return right_bound.has_value() && diagonal_alignment == DiagonalAlignment_t::BOTTOM_RIGHT;
+    }
+
+    bool
+    has_sink_token() const {
+        return inputs.find(input_names::SINK_TOKEN) != inputs.end() && inputs.at(input_names::SINK_TOKEN) != nullptr;
     }
 
    public:
@@ -1686,8 +2023,6 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
                                    left_bound,
                                    right_bound,
                                    diagonal_alignment,
-                                   causal_mask,
-                                   causal_mask_bottom_right,
                                    implementation)
 
     SDPA_attributes&
@@ -1781,11 +2116,8 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     set_causal_mask(bool const value) {
         if (value) {
             set_diagonal_alignment(DiagonalAlignment_t::TOP_LEFT);
-            if (!right_bound.has_value()) {
-                set_diagonal_band_right_bound(0);
-            }
+            set_diagonal_band_right_bound(0);
         }
-        causal_mask = value;
         return *this;
     }
 
@@ -1796,11 +2128,8 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     set_causal_mask_bottom_right(bool const value) {
         if (value) {
             set_diagonal_alignment(DiagonalAlignment_t::BOTTOM_RIGHT);
-            if (!right_bound.has_value()) {
-                set_diagonal_band_right_bound(0);
-            }
+            set_diagonal_band_right_bound(0);
         }
-        causal_mask_bottom_right = value;
         return *this;
     }
 
@@ -1880,6 +2209,12 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     SDPA_attributes&
     set_implementation(AttentionImplementation_t value) {
         implementation = value;
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_unfuse_fma(bool value) {
+        unfuse_fma = value;
         return *this;
     }
 
@@ -2073,9 +2408,7 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     set_causal_mask(bool const value) {
         if (value) {
             set_diagonal_alignment(DiagonalAlignment_t::TOP_LEFT);
-            if (!right_bound.has_value()) {
-                set_diagonal_band_right_bound(0);
-            }
+            set_diagonal_band_right_bound(0);
         }
         return *this;
     }
@@ -2087,9 +2420,7 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     set_causal_mask_bottom_right(bool const value) {
         if (value) {
             set_diagonal_alignment(DiagonalAlignment_t::BOTTOM_RIGHT);
-            if (!right_bound.has_value()) {
-                set_diagonal_band_right_bound(0);
-            }
+            set_diagonal_band_right_bound(0);
         }
         return *this;
     }
@@ -2164,9 +2495,11 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
     friend class SDPAFP8BackwardNode;
     friend class Graph;
 
-    bool padding_mask             = false;
-    bool causal_mask              = false;
-    bool causal_mask_bottom_right = false;
+    bool padding_mask               = false;
+    bool is_deterministic_algorithm = false;
+    std::optional<int64_t> left_bound;
+    std::optional<int64_t> right_bound;
+    DiagonalAlignment_t diagonal_alignment = DiagonalAlignment_t::TOP_LEFT;
 
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
@@ -2174,10 +2507,14 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
    public:
     enum class input_names {
         Q,
+        Q_T,
         K,
+        K_T,
         V,
         O,
         dO,
+        dO_T,
+        dO_f16,
         Stats,
         Attn_scale,
         Bias,
@@ -2194,6 +2531,9 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
         Descale_V,
         Descale_O,
         Descale_dO,
+        Descale_dO_T,
+        Descale_K_T,
+        Descale_Q_T,
         Descale_S,
         Descale_dP,
         Scale_dQ,
@@ -2201,10 +2541,11 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
         Scale_dV,
         Scale_S,
         Scale_dP,
+        SINK_TOKEN,
     };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
 
-    enum class output_names { dQ, dK, dV, Amax_dQ, Amax_dK, Amax_dV, Amax_dP };
+    enum class output_names { dQ, dK, dV, Amax_dQ, Amax_dK, Amax_dV, Amax_dP, DSINK_TOKEN };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
 
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(SDPA_fp8_backward_attributes,
@@ -2213,10 +2554,12 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
                                    inputs,
                                    outputs,
                                    padding_mask,
-                                   causal_mask,
                                    dropout_probability,
-                                   causal_mask_bottom_right,
-                                   attn_scale_value)
+                                   left_bound,
+                                   right_bound,
+                                   diagonal_alignment,
+                                   attn_scale_value,
+                                   is_deterministic_algorithm)
 
     SDPA_fp8_backward_attributes&
     set_attn_scale(std::shared_ptr<Tensor_attributes> value) {
@@ -2254,16 +2597,55 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
         return *this;
     }
 
+    bool
+    has_causal_like_masking() const {
+        return right_bound.has_value();
+    }
+
+    bool
+    has_causal_mask_bottom_right() const {
+        return right_bound.has_value() && diagonal_alignment == DiagonalAlignment_t::BOTTOM_RIGHT;
+    }
+
     SDPA_fp8_backward_attributes&
     set_causal_mask(bool const value) {
-        causal_mask = value;
+        if (value) {
+            set_diagonal_alignment(DiagonalAlignment_t::TOP_LEFT);
+            set_diagonal_band_right_bound(0);
+        }
         return *this;
     }
 
     SDPA_fp8_backward_attributes&
     set_causal_mask_bottom_right(bool const value) {
-        causal_mask_bottom_right = value;
+        if (value) {
+            set_diagonal_alignment(DiagonalAlignment_t::BOTTOM_RIGHT);
+            set_diagonal_band_right_bound(0);
+        }
         return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_diagonal_alignment(DiagonalAlignment_t const alignment) {
+        diagonal_alignment = alignment;
+        return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_diagonal_band_right_bound(int const value) {
+        right_bound = value;
+        return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_diagonal_band_left_bound(int const value) {
+        left_bound = value;
+        return *this;
+    }
+
+    bool
+    has_sliding_window() const {
+        return left_bound.has_value();
     }
 
     SDPA_fp8_backward_attributes&
@@ -2285,14 +2667,41 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
         inputs[SDPA_fp8_backward_attributes::input_names::Dropout_scale_inv] = scale_inv;
         return *this;
     }
+
+    SDPA_fp8_backward_attributes&
+    set_deterministic_algorithm(bool const value) {
+        is_deterministic_algorithm = value;
+        return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_sink_token(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_fp8_backward_attributes::input_names::SINK_TOKEN] = std::move(value);
+        return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_dsink_token(std::shared_ptr<Tensor_attributes> value) {
+        outputs[SDPA_fp8_backward_attributes::output_names::DSINK_TOKEN] = std::move(value);
+        return *this;
+    }
+
+    bool
+    has_sink_token() const {
+        return inputs.find(input_names::SINK_TOKEN) != inputs.end() && inputs.at(input_names::SINK_TOKEN) != nullptr;
+    }
 };
 
 using Scaled_dot_product_flash_attention_attributes [[deprecated]]          = SDPA_attributes;
 using Scaled_dot_product_flash_attention_backward_attributes [[deprecated]] = SDPA_backward_attributes;
 
+class CompositeSoftmaxNode;
+class UnifiedSoftmaxNode;
+
 class Softmax_attributes : public Attributes<Softmax_attributes> {
     friend class Attributes<Softmax_attributes>;
-    friend class SoftmaxNode;
+    friend class CompositeSoftmaxNode;
+    friend class UnifiedSoftmaxNode;
     friend class INode;
 
    public:
@@ -2305,6 +2714,46 @@ class Softmax_attributes : public Attributes<Softmax_attributes> {
     Softmax_attributes&
     set_sink(std::shared_ptr<Tensor_attributes> value) {
         inputs[Softmax_attributes::input_names::SINK] = value;
+        return *this;
+    }
+};
+
+template <typename DerivedClass>
+class DiagonalBandMaskNodeBase;
+class CompositeDiagonalBandMaskNode;
+class UnifiedDiagonalBandMaskNode;
+
+// Diagonal band mask attributes.
+// A diagonal band mask is *either* a left-bound mask or a right-bound mask.
+// LeftBound and ShiftRightBound cannot both be set at the same time.
+// If neither LeftBound nor ShiftRightBound is set, a right-bound mask is assumed.
+class DiagonalBandMask_attributes : public Attributes<DiagonalBandMask_attributes> {
+    friend class Attributes<DiagonalBandMask_attributes>;
+    friend class CompositeDiagonalBandMaskNode;
+    friend class UnifiedDiagonalBandMaskNode;
+
+    PointwiseMode_t comparison_mode = PointwiseMode_t::CMP_GT;
+
+   public:
+    enum class input_names { X, SEQ_LEN_Q, SEQ_LEN_KV, LeftBound, ShiftRightBound, B };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { Y };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(DiagonalBandMask_attributes,
+                                   name,
+                                   compute_data_type,
+                                   inputs,
+                                   outputs,
+                                   comparison_mode)
+
+    PointwiseMode_t
+    get_comparison_mode() const {
+        return comparison_mode;
+    }
+
+    DiagonalBandMask_attributes&
+    set_comparison_mode(PointwiseMode_t value) {
+        comparison_mode = value;
         return *this;
     }
 };
@@ -2407,17 +2856,24 @@ class Slice_attributes : public Attributes<Slice_attributes> {
     friend class INode;
 
     std::vector<std::pair<int64_t, int64_t>> slices;
+    std::vector<int64_t> slice_strides = {1};
 
    public:
     enum class input_names { X };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Slice_attributes, name, compute_data_type, inputs, outputs, slices)
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Slice_attributes, name, compute_data_type, inputs, outputs, slices, slice_strides)
 
     Slice_attributes&
     set_slices(std::vector<std::pair<int64_t, int64_t>> const value) {
         slices = value;
+        return *this;
+    }
+
+    Slice_attributes&
+    set_strides(std::vector<int64_t> const value) {
+        slice_strides = value;
         return *this;
     }
 
@@ -2621,6 +3077,19 @@ class Moe_grouped_matmul_attributes : public Attributes<Moe_grouped_matmul_attri
         this->top_k = top_k;
         return *this;
     }
+};
+
+class Moe_grouped_matmul_bwd_attributes : public Attributes<Moe_grouped_matmul_bwd_attributes> {
+    friend class Attributes<Moe_grouped_matmul_bwd_attributes>;
+    friend class MoeGroupedMatmulBwdNode;
+    friend class Graph;
+
+   public:
+    enum class input_names { DOutput, Token, FirstTokenOffset };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { DWeight };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Moe_grouped_matmul_bwd_attributes, name, inputs, outputs)
 };
 
 }  // namespace graph

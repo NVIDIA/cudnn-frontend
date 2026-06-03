@@ -95,10 +95,10 @@ TEST_CASE("Block_scale_dequantize graph creation with negative scales", "[block_
 
     // Test with is_negative_scale = false (explicit)
     auto attributes_positive_explicit = fe::graph::Block_scale_dequantize_attributes()
-                                   .set_name("dq_positive_explicit")
-                                   .set_block_size(block_size)
-                                   .set_is_negative_scale(false)
-                                   .set_compute_data_type(fe::DataType_t::FLOAT);
+                                            .set_name("dq_positive_explicit")
+                                            .set_block_size(block_size)
+                                            .set_is_negative_scale(false)
+                                            .set_compute_data_type(fe::DataType_t::FLOAT);
     REQUIRE(attributes_positive_explicit.get_is_negative_scale() == false);
 
     auto Y_positive_explicit = graph.block_scale_dequantize(X, scale, attributes_positive_explicit);

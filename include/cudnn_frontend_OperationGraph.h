@@ -33,7 +33,7 @@
 #include "cudnn_frontend_Operation.h"
 #include "cudnn_frontend_utils.h"
 // Compile time constant for max ops in a op graph
-constexpr int64_t MAX_OPGRAPH_OPS = 50;
+constexpr int64_t MAX_OPGRAPH_OPS = 250;
 
 namespace cudnn_frontend {
 
@@ -130,7 +130,8 @@ class OperationGraph_v8 : public BackendDescriptor {
     int64_t numOps         = -1;
     std::string opGraphTag = "";
     std::vector<feature_vector_t> feature_vectors;
-    bool is_dynamic_shape_enabled = false;
+    bool is_dynamic_shape_enabled  = false;
+    bool is_override_shape_enabled = false;
 };
 
 ///
@@ -151,6 +152,12 @@ class OperationGraphBuilder_v8 {
     //! Set numoperations and the operations
     auto
     setOperationGraph(int64_t numOps_, Operation_v8 const **ops_) -> OperationGraphBuilder_v8 & {
+        if (numOps_ > MAX_OPGRAPH_OPS) {
+            set_error_and_throw_exception(&m_operationGraph,
+                                          CUDNN_STATUS_BAD_PARAM,
+                                          "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: numOps exceeds MAX_OPGRAPH_OPS");
+            return *this;
+        }
         m_operationGraph.numOps = numOps_;
         m_operationGraph.feature_vectors.resize(static_cast<size_t>(numOps_));
         for (auto i = 0u; i < numOps_; i++) {
@@ -164,6 +171,12 @@ class OperationGraphBuilder_v8 {
     //! Set numoperations and the operations
     auto
     setOperationGraph(std::vector<Operation> const &ops_) -> OperationGraphBuilder_v8 & {
+        if (ops_.size() > static_cast<size_t>(MAX_OPGRAPH_OPS)) {
+            set_error_and_throw_exception(&m_operationGraph,
+                                          CUDNN_STATUS_BAD_PARAM,
+                                          "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: numOps exceeds MAX_OPGRAPH_OPS");
+            return *this;
+        }
         m_operationGraph.numOps = ops_.size();
         m_operationGraph.feature_vectors.resize(ops_.size());
         for (auto i = 0u; i < ops_.size(); i++) {
@@ -176,6 +189,12 @@ class OperationGraphBuilder_v8 {
 
     auto
     addOperation(ManagedOpaqueDescriptor desc) -> OperationGraphBuilder_v8 & {
+        if (m_operationGraph.numOps >= MAX_OPGRAPH_OPS) {
+            set_error_and_throw_exception(&m_operationGraph,
+                                          CUDNN_STATUS_BAD_PARAM,
+                                          "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: numOps exceeds MAX_OPGRAPH_OPS");
+            return *this;
+        }
         m_operationGraph.ops[m_operationGraph.numOps] = desc;
         ++m_operationGraph.numOps;
         return *this;
@@ -188,6 +207,12 @@ class OperationGraphBuilder_v8 {
         return *this;
     }
 
+    auto
+    setIsOverrideShapeEnabled(bool is_enabled) -> OperationGraphBuilder_v8 & {
+        m_operationGraph.is_override_shape_enabled = is_enabled;
+        return *this;
+    }
+
     //! constructs the OperationGraph_v8 by calling the cudnn API
     //! Throws the appropriate error message
     OperationGraph_v8 &&
@@ -197,6 +222,12 @@ class OperationGraphBuilder_v8 {
                 &m_operationGraph,
                 CUDNN_STATUS_BAD_PARAM,
                 "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: Check and Set the CUDNN_ATTR_OPERATIONGRAPH_OPS Count field");
+            return std::move(m_operationGraph);
+        }
+        if (m_operationGraph.numOps > MAX_OPGRAPH_OPS) {
+            set_error_and_throw_exception(&m_operationGraph,
+                                          CUDNN_STATUS_BAD_PARAM,
+                                          "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: numOps exceeds MAX_OPGRAPH_OPS");
             return std::move(m_operationGraph);
         }
         if (m_operationGraph.ops[0] == nullptr) {
@@ -225,7 +256,7 @@ class OperationGraphBuilder_v8 {
             return std::move(m_operationGraph);
         }
 
-        std::array<cudnnBackendDescriptor_t, 50> ops_raw{nullptr};
+        std::array<cudnnBackendDescriptor_t, MAX_OPGRAPH_OPS> ops_raw{nullptr};
         for (auto i = 0u; i < m_operationGraph.numOps; i++) {
             ops_raw[i] = m_operationGraph.ops[i]->get_backend_descriptor();
         }
@@ -260,6 +291,10 @@ class OperationGraphBuilder_v8 {
 
 #if (CUDNN_VERSION >= 90400)
         if (m_operationGraph.is_dynamic_shape_enabled) {
+            NV_CUDNN_FE_DYNAMIC_CHECK_BACKEND_DESCRIPTOR(
+                90400,
+                m_operationGraph,
+                "CUDNN_BACKEND_OPERATION_GRAPH: Dynamic shape support requires cudnn 9.4.0 and above");
             status = detail::set_attribute(m_operationGraph.pointer->get_backend_descriptor(),
                                            CUDNN_ATTR_OPERATIONGRAPH_IS_DYNAMIC_SHAPE_ENABLED,
                                            CUDNN_TYPE_BOOLEAN,
@@ -270,6 +305,27 @@ class OperationGraphBuilder_v8 {
                                               status,
                                               "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: SetAttribute "
                                               "CUDNN_ATTR_OPERATIONGRAPH_IS_DYNAMIC_SHAPE_ENABLED Failed");
+                return std::move(m_operationGraph);
+            }
+        }
+#endif
+
+#if (CUDNN_VERSION >= 92100)
+        if (m_operationGraph.is_override_shape_enabled) {
+            NV_CUDNN_FE_DYNAMIC_CHECK_BACKEND_DESCRIPTOR(
+                92100,
+                m_operationGraph,
+                "CUDNN_BACKEND_OPERATION_GRAPH: Override shape support requires cudnn 9.21.0 and above");
+            status = detail::set_attribute(m_operationGraph.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_OPERATIONGRAPH_IS_OVERRIDE_SHAPE_ENABLED,
+                                           CUDNN_TYPE_BOOLEAN,
+                                           1,
+                                           &m_operationGraph.is_override_shape_enabled);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(&m_operationGraph,
+                                              status,
+                                              "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR: SetAttribute "
+                                              "CUDNN_ATTR_OPERATIONGRAPH_IS_OVERRIDE_SHAPE_ENABLED Failed");
                 return std::move(m_operationGraph);
             }
         }

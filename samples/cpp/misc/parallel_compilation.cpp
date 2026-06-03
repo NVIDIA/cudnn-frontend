@@ -50,9 +50,9 @@ TEST_CASE("Parallel build", "[matmul][graph][parallel]") {
     int64_t const k = 128;
 
     // Initialize input tensors
-    Surface<half> A_gpu(b * m * k, false);
-    Surface<half> B_gpu(b * k * n, false);
-    Surface<half> C_gpu(b * m * n, false);
+    Surface<half> A_gpu(b * m * k);
+    Surface<half> B_gpu(b * k * n);
+    Surface<half> C_gpu(b * m * n);
 
     int64_t a_uid = 0, b_uid = 1, c_uid = 2;
 

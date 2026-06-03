@@ -1,3 +1,5 @@
+
+
 /*
  * Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
  *
@@ -25,6 +27,7 @@
 #include <iostream>
 #include <fstream>
 #include <cstring>
+#include <cstdlib>
 
 namespace cudnn_frontend {
 
@@ -38,15 +41,40 @@ get_environment(const char *name) {
     return std::getenv(name);
 }
 
+inline int
+getLogLevel() {
+#ifdef NV_CUDNN_FRONTEND_DISABLE_LOGGING
+    static int log_level = 0;
+#else
+    static int log_level = []() {
+        const char *env_val = get_environment("CUDNN_FRONTEND_LOG_INFO");
+        return env_val ? std::atoi(env_val) : 0;
+    }();
+#endif
+    return log_level;
+}
+
 inline bool &
 isLoggingEnabled() {
 #ifdef NV_CUDNN_FRONTEND_DISABLE_LOGGING
     static bool log_enabled = false;
 #else
-    static bool log_enabled =
-        get_environment("CUDNN_FRONTEND_LOG_INFO") && std::strncmp(get_environment("CUDNN_FRONTEND_LOG_INFO"), "0", 1);
+    static bool log_enabled = (getLogLevel() > 0);
 #endif
     return log_enabled;
+}
+
+inline bool &
+isLoggingTensorDumpEnabled() {
+#ifdef NV_CUDNN_FRONTEND_DISABLE_LOGGING
+    static bool tensor_dump_enabled = false;
+#else
+    static bool tensor_dump_enabled = []() {
+        int level = getLogLevel();
+        return level >= 1 && level < 10;
+    }();
+#endif
+    return tensor_dump_enabled;
 }
 
 inline std::ostream &

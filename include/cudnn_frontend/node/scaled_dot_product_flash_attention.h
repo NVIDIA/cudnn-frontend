@@ -1,6 +1,8 @@
+
 #pragma once
 
 #include <cstdlib>
+#include <unordered_set>
 
 #include "../../cudnn_frontend_Heuristics.h"
 #include "../../cudnn_frontend_Logging.h"
@@ -8,11 +10,14 @@
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
+#include "diagonal_band_mask.h"
 #include "matmul.h"
 #include "pointwise.h"
+#include "reduction.h"
 #include "rng.h"
 #include "softmax.h"
 #include "paged_cache_load.h"
+#include "block_scale_dequantize.h"
 #include "sdpa_support_surface.h"
 
 namespace cudnn_frontend::graph {
@@ -66,6 +71,8 @@ inline std::shared_ptr<Tensor_attributes> alibi_mask(
     int64_t h_q,
     int64_t& alibi_slopes_size
 );
+
+inline error_t build_operation_subgraph(std::shared_ptr<Graph> graph);
 // clang-format on
 
 }  // namespace attn::score_modifiers
@@ -108,6 +115,20 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
     has_seq_len_kv() const {
         auto seq_len_KV_it = attributes.inputs.find(SDPA_attributes::input_names::SEQ_LEN_KV);
         return ((seq_len_KV_it) != attributes.inputs.end() && seq_len_KV_it->second != nullptr);
+    }
+
+    // Helper function to detect MXFP8 (microscaling FP8) mode
+    // MXFP8 uses block-wise scale factors with E8M0 data type and F8_128x4 reordering
+    // When detected, we use block_scale_dequantize before matmuls instead of pointwise descale after
+    bool
+    is_mxfp8_scaling() const {
+        auto descale_q_it = attributes.inputs.find(input_names::Descale_Q);
+        if (descale_q_it == attributes.inputs.end() || descale_q_it->second == nullptr) {
+            return false;
+        }
+        auto const& descale_q = descale_q_it->second;
+        return (descale_q->get_data_type() == DataType_t::FP8_E8M0 &&
+                descale_q->get_reordering_type() == TensorReordering_t::F8_128x4);
     }
 
     // Helper function to infer KV sequence length
@@ -233,6 +254,120 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "SDPA with sink_token is not supported before 9.13.");
 
+        // Validate MXFP8 scale factors if present
+        if (is_mxfp8_scaling()) {
+            // MXFP8 requires cuDNN 9.21.0 or later
+            RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 92100,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "MXFP8 SDPA requires cuDNN 9.21.0 or later");
+
+            // Get device SM version from context
+            CHECK_CUDNN_FRONTEND_ERROR(this->context.populate_sm_version_from_device());
+            int32_t const sm_version = this->context.get_sm_version();
+            int32_t const prop_major = sm_version / 10;
+
+            RETURN_CUDNN_FRONTEND_ERROR_IF(10 != prop_major,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "MXFP8 SDPA is only supported on Blackwell Data Center architectures.");
+
+            auto const& q_dim  = attributes.inputs.at(input_names::Q)->get_dim();
+            auto const& k_dim  = attributes.inputs.at(input_names::K)->get_dim();
+            auto const& v_dim  = attributes.inputs.at(input_names::V)->get_dim();
+            int64_t const b    = q_dim[0];
+            int64_t const h_q  = q_dim[1];
+            int64_t const s_q  = q_dim[2];
+            int64_t const d    = q_dim[3];
+            int64_t const h_k  = k_dim[1];
+            int64_t const h_v  = v_dim[1];
+            int64_t const s_kv = infer_s_kv();
+
+            // MXFP8 block size is fixed at 32
+            constexpr int64_t block_size = 32;
+            int64_t const d_scale        = (d + block_size - 1) / block_size;
+            int64_t const s_scale        = (s_kv + block_size - 1) / block_size;
+
+            // Validate Descale_Q
+            auto const& descale_q = attributes.inputs.at(input_names::Descale_Q);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_q->get_data_type() != DataType_t::FP8_E8M0,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_Q to have FP8_E8M0 data type");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_q->get_reordering_type() != TensorReordering_t::F8_128x4,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_Q to have F8_128x4 reordering");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                descale_q->get_stride()[3] != 1,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "MXFP8 SDPA requires Descale_Q to have contiguous d_scale dimension (stride[3] == 1)");
+
+            // Validate Descale_K
+            auto const& descale_k = attributes.inputs.at(input_names::Descale_K);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_k->get_data_type() != DataType_t::FP8_E8M0,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_K to have FP8_E8M0 data type");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_k->get_reordering_type() != TensorReordering_t::F8_128x4,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_K to have F8_128x4 reordering");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                descale_k->get_stride()[3] != 1,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "MXFP8 SDPA requires Descale_K to have contiguous d_scale dimension (stride[3] == 1)");
+
+            // Validate Descale_V
+            auto const& descale_v = attributes.inputs.at(input_names::Descale_V);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_v->get_data_type() != DataType_t::FP8_E8M0,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_V to have FP8_E8M0 data type");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(descale_v->get_reordering_type() != TensorReordering_t::F8_128x4,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA requires Descale_V to have F8_128x4 reordering");
+            // // SF_V scales along s dimension (not d), so s_scale must be contiguous
+            // RETURN_CUDNN_FRONTEND_ERROR_IF(
+            //     descale_v->get_stride()[2] != 1,
+            //     error_code_t::GRAPH_NOT_SUPPORTED,
+            //     "MXFP8 SDPA requires Descale_V to have contiguous s_scale dimension (stride[2] == 1)");
+
+            // Validate dimension consistency for SF_Q: [b, h_q, s_q_padded, d_scale_padded]
+            auto const& sf_q_dim = descale_q->get_dim();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(sf_q_dim[0] != b || sf_q_dim[1] != h_q,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA: Descale_Q batch/head dimensions must match Q");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                sf_q_dim[3] < d_scale,
+                error_code_t::ATTRIBUTE_NOT_SET,
+                "MXFP8 SDPA: Descale_Q d_scale dimension too small (expected >= " + std::to_string(d_scale) + ")");
+
+            // Validate dimension consistency for SF_K: [b, h_k, s_kv_padded, d_scale_padded]
+            auto const& sf_k_dim = descale_k->get_dim();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(sf_k_dim[0] != b || sf_k_dim[1] != h_k,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA: Descale_K batch/head dimensions must match K");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                sf_k_dim[3] < d_scale,
+                error_code_t::ATTRIBUTE_NOT_SET,
+                "MXFP8 SDPA: Descale_K d_scale dimension too small (expected >= " + std::to_string(d_scale) + ")");
+
+            // Validate dimension consistency for SF_V: [b, h_v, s_scale_padded, d_padded]
+            auto const& sf_v_dim = descale_v->get_dim();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(sf_v_dim[0] != b || sf_v_dim[1] != h_v,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "MXFP8 SDPA: Descale_V batch/head dimensions must match V");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                sf_v_dim[2] < s_scale,
+                error_code_t::ATTRIBUTE_NOT_SET,
+                "MXFP8 SDPA: Descale_V s_scale dimension too small (expected >= " + std::to_string(s_scale) + ")");
+
+            // Log MXFP8 configuration for debugging
+            getLogger() << "[cudnn_frontend] INFO: MXFP8 SDPA configuration validated:" << std::endl
+                        << "  Q dims: [" << b << ", " << h_q << ", " << s_q << ", " << d << "]" << std::endl
+                        << "  SF_Q dims: [" << sf_q_dim[0] << ", " << sf_q_dim[1] << ", " << sf_q_dim[2] << ", "
+                        << sf_q_dim[3] << "]" << std::endl
+                        << "  SF_K dims: [" << sf_k_dim[0] << ", " << sf_k_dim[1] << ", " << sf_k_dim[2] << ", "
+                        << sf_k_dim[3] << "]" << std::endl
+                        << "  SF_V dims: [" << sf_v_dim[0] << ", " << sf_v_dim[1] << ", " << sf_v_dim[2] << ", "
+                        << sf_v_dim[3] << "]" << std::endl
+                        << "  Expected d_scale: " << d_scale << ", s_scale: " << s_scale << std::endl;
+        }
+
         return {error_code_t::OK, ""};
     }
 
@@ -325,11 +460,73 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
         return {error_code_t::OK, ""};
     }
 
+    error_t
+    collect_tensors_to_dump_node(
+        std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump) const override final {
+        std::unordered_set<Tensor_attributes::uid_t> seen_uids;
+        auto add_tensor = [&tensors_to_dump, &seen_uids](std::shared_ptr<Tensor_attributes> const& tensor) {
+            if (tensor == nullptr) {
+                return;
+            }
+            if (seen_uids.insert(tensor->get_uid()).second) {
+                tensors_to_dump.emplace_back(tensor, 'd');
+            }
+        };
+
+        auto const seq_len_q_it = attributes.inputs.find(input_names::SEQ_LEN_Q);
+        if (seq_len_q_it != attributes.inputs.end()) {
+            add_tensor(seq_len_q_it->second);
+        }
+
+        auto const seq_len_kv_it = attributes.inputs.find(input_names::SEQ_LEN_KV);
+        if (seq_len_kv_it != attributes.inputs.end()) {
+            add_tensor(seq_len_kv_it->second);
+        }
+
+        for (auto const& tensor : {attributes.inputs.at(input_names::Q),
+                                   attributes.inputs.at(input_names::K),
+                                   attributes.inputs.at(input_names::V),
+                                   attributes.outputs.at(output_names::O)}) {
+            if (tensor != nullptr) {
+                add_tensor(tensor->get_ragged_offset());
+            }
+        }
+
+        auto const stats_it = attributes.outputs.find(output_names::Stats);
+        if (stats_it != attributes.outputs.end() && stats_it->second != nullptr) {
+            add_tensor(stats_it->second->get_ragged_offset());
+        }
+
+        auto const max_it = attributes.outputs.find(output_names::Max);
+        if (max_it != attributes.outputs.end() && max_it->second != nullptr) {
+            add_tensor(max_it->second->get_ragged_offset());
+        }
+
+        auto const sum_exp_it = attributes.outputs.find(output_names::Sum_exp);
+        if (sum_exp_it != attributes.outputs.end() && sum_exp_it->second != nullptr) {
+            add_tensor(sum_exp_it->second->get_ragged_offset());
+        }
+
+        return {error_code_t::OK, ""};
+    }
+
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json& j) const override final {
-        j = attributes;
-        j.update(R"({"tag": "SDPA_FWD"})"_json);
+        j               = attributes;
+        j["is_mxfp8"]   = is_mxfp8_scaling();
+        j["unfuse_fma"] = attributes.unfuse_fma;
+        if (auto const rescale_threshold = get_rescale_threshold_from_env(); rescale_threshold.has_value()) {
+            j["rescale_threshold"] = rescale_threshold.value();
+        }
+        if (is_mxfp8_scaling()) {
+            j.update(R"({"tag": "SDPA_MXFP8_FWD"})"_json);
+        } else if (attributes.mma_core_mode == DataType_t::FP8_E4M3 ||
+                   attributes.mma_core_mode == DataType_t::FP8_E5M2) {
+            j.update(R"({"tag": "SDPA_FP8_FWD"})"_json);
+        } else {
+            j.update(R"({"tag": "SDPA"})"_json);
+        }
     }
 #endif
 };
@@ -368,30 +565,71 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
         // Infer s_kv
         int64_t s_kv = infer_s_kv();
 
+        // Check if using MXFP8 (microscaling FP8) with block-wise scale factors
+        // Need to check this early because MXFP8 dequantization must happen before K transpose
+        bool const use_mxfp8 = is_mxfp8_scaling();
+
         std::shared_ptr<Tensor_attributes> k_cache;
         if (!is_paged_k()) {
-            // 1. map K->KT
-            // cuDNN frontend API attention requires Q, K, V where
-            // Q = {b, h_q, s_q, d_qk}
-            // K = {b, h_k, s_kv, d_qk}
-            // V = {b, h_v, s_kv, d_v}
-            // but cuDNN backend API attention requires Q, KT, V
-            // Q = {b, h_q, s_q, d_qk}
-            // KT = {b, h_k, d_qk, s_kv}
-            // V = {b, h_v, s_kv, d_v}
-            // So the code below maps the K->KT
-            std::vector<int64_t> temp_vec;
+            if (use_mxfp8) {
+                // MXFP8: Transpose K and SF_K first, then dequantize
+                // The backend expects both K and its scale factor in transposed layout
 
-            temp_vec = attributes.inputs[input_names::K]->get_dim();
-            std::swap(temp_vec[2], temp_vec[3]);
-            attributes.inputs[input_names::K]->set_dim(temp_vec);
+                // Step 1: Transpose K -> KT by swapping dims and strides
+                // K = {b, h_k, s_kv, d_qk} -> KT = {b, h_k, d_qk, s_kv}
+                std::vector<int64_t> kt_dim    = attributes.inputs[input_names::K]->get_dim();
+                std::vector<int64_t> kt_stride = attributes.inputs[input_names::K]->get_stride();
+                std::swap(kt_dim[2], kt_dim[3]);
+                std::swap(kt_stride[2], kt_stride[3]);
+                attributes.inputs[input_names::K]->set_dim(kt_dim);
+                attributes.inputs[input_names::K]->set_stride(kt_stride);
 
-            temp_vec = attributes.inputs[input_names::K]->get_stride();
-            std::swap(temp_vec[2], temp_vec[3]);
-            attributes.inputs[input_names::K]->set_stride(temp_vec);
+                // Step 2: Transpose SF_K similarly
+                // SF_K = {b, h_k, s_kv_scale, d_qk_scale} -> {b, h_k, d_qk_scale, s_kv_scale}
+                auto& sf_k                       = attributes.inputs[input_names::Descale_K];
+                std::vector<int64_t> sf_k_dim    = sf_k->get_dim();
+                std::vector<int64_t> sf_k_stride = sf_k->get_stride();
+                std::swap(sf_k_dim[2], sf_k_dim[3]);
+                std::swap(sf_k_stride[2], sf_k_stride[3]);
+                sf_k->set_dim(sf_k_dim);
+                sf_k->set_stride(sf_k_stride);
 
-            // 2. Set k_cache
-            k_cache = attributes.inputs[input_names::K];
+                // Step 3: Dequantize transposed K with transposed SF_K
+                auto dequant_k_attrs = Block_scale_dequantize_attributes()
+                                           .set_name("dequant_k")
+                                           .set_block_size({1, 32});  // Standard MXFP8 block size
+
+                auto k_dequant = std::make_shared<Tensor_attributes>();
+                k_dequant->set_is_virtual(true);
+                k_dequant->set_dim(kt_dim);
+                k_dequant->set_stride(kt_stride);
+
+                block_scale_dequantize(attributes.inputs[input_names::K], sf_k, dequant_k_attrs, k_dequant);
+
+                k_cache = k_dequant;
+            } else {
+                // Non-MXFP8: map K->KT directly
+                // cuDNN frontend API attention requires Q, K, V where
+                // Q = {b, h_q, s_q, d_qk}
+                // K = {b, h_k, s_kv, d_qk}
+                // V = {b, h_v, s_kv, d_v}
+                // but cuDNN backend API attention requires Q, KT, V
+                // Q = {b, h_q, s_q, d_qk}
+                // KT = {b, h_k, d_qk, s_kv}
+                // V = {b, h_v, s_kv, d_v}
+                // So the code below maps the K->KT
+                std::vector<int64_t> temp_vec;
+
+                temp_vec = attributes.inputs[input_names::K]->get_dim();
+                std::swap(temp_vec[2], temp_vec[3]);
+                attributes.inputs[input_names::K]->set_dim(temp_vec);
+
+                temp_vec = attributes.inputs[input_names::K]->get_stride();
+                std::swap(temp_vec[2], temp_vec[3]);
+                attributes.inputs[input_names::K]->set_stride(temp_vec);
+
+                k_cache = attributes.inputs[input_names::K];
+            }
         } else {
             // Create a paged cache load operation
             auto paged_cache_load_attributes_k = PagedCacheLoad_attributes().set_name("paged_k_cache_operation");
@@ -412,6 +650,34 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
         // This tensor tracks the main chain of data flow
         std::shared_ptr<Tensor_attributes> last_output;
 
+        // Prepare Q and K for first matmul
+        // For MXFP8: Q is dequantized here, K was dequantized above before transpose
+        // For regular FP8: use raw tensors, descale applied after matmul
+        std::shared_ptr<Tensor_attributes> q_for_bmm1;
+        std::shared_ptr<Tensor_attributes> k_for_bmm1;
+
+        if (use_mxfp8) {
+            // MXFP8: Dequantize Q using block scale factors
+            auto dequant_q_attrs = Block_scale_dequantize_attributes()
+                                       .set_name("dequant_q")
+                                       .set_block_size({1, 32});  // Standard MXFP8 block size
+            auto q_dequant = std::make_shared<Tensor_attributes>();
+            q_dequant->set_is_virtual(true);
+            q_dequant->set_dim(attributes.inputs[input_names::Q]->get_dim());
+            q_dequant->set_stride(attributes.inputs[input_names::Q]->get_stride());
+            block_scale_dequantize(attributes.inputs[input_names::Q],
+                                   attributes.inputs[input_names::Descale_Q],
+                                   dequant_q_attrs,
+                                   q_dequant);
+            q_for_bmm1 = q_dequant;
+
+            // K was already dequantized and transposed above
+            k_for_bmm1 = k_cache;
+        } else {
+            q_for_bmm1 = attributes.inputs[input_names::Q];
+            k_for_bmm1 = k_cache;
+        }
+
         //// Q * K
         auto bmm1_attributes = Matmul_attributes()
                                    .set_name("bmm1")
@@ -422,7 +688,7 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
             bmm1_attributes.set_padding(0.0);
         }
 
-        auto const& bmm1_output = matmul(attributes.inputs[input_names::Q], k_cache, bmm1_attributes);
+        auto const& bmm1_output = matmul(q_for_bmm1, k_for_bmm1, bmm1_attributes);
         // Setting dim and strides as pointwise op wont have knowledge of how to do it for mha.
         bmm1_output->set_dim({b, h_q, s_q, s_kv}).set_stride({h_q * s_q * s_kv, s_q * s_kv, s_kv, 1});
         last_output = bmm1_output;
@@ -443,15 +709,17 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
             last_output = attn_scale_output;
         }
 
-        // Descale Q
-        if (attributes.inputs.find(input_names::Descale_Q) != attributes.inputs.end() &&
+        // Descale Q (only for non-MXFP8 per-tensor scaling)
+        // For MXFP8, descaling was done via block_scale_dequantize before matmul
+        if (!use_mxfp8 && attributes.inputs.find(input_names::Descale_Q) != attributes.inputs.end() &&
             attributes.inputs.at(input_names::Descale_Q) != nullptr) {
             auto descale_q_attributes = Pointwise_attributes().set_mode(PointwiseMode_t::MUL).set_name("descale_q");
             last_output = pointwise(last_output, attributes.inputs.at(input_names::Descale_Q), descale_q_attributes);
         }
 
-        // Descale K
-        if (attributes.inputs.find(input_names::Descale_K) != attributes.inputs.end() &&
+        // Descale K (only for non-MXFP8 per-tensor scaling)
+        // For MXFP8, descaling was done via block_scale_dequantize before matmul
+        if (!use_mxfp8 && attributes.inputs.find(input_names::Descale_K) != attributes.inputs.end() &&
             attributes.inputs.at(input_names::Descale_K) != nullptr) {
             auto descale_k_attributes = Pointwise_attributes().set_mode(PointwiseMode_t::MUL).set_name("descale_k");
             last_output = pointwise(last_output, attributes.inputs.at(input_names::Descale_K), descale_k_attributes);
@@ -502,13 +770,12 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
                 Pointwise_attributes().set_name("gen_col_index").set_mode(PointwiseMode_t::GEN_INDEX).set_axis(3);
             auto col_index_output = pointwise(last_output, col_index_attributes);
             // scalar seq_kv only needs to be passed in case there in no padding mask and seq_kv is not multiple of 64.
-            // Also future versions of cudnn will not need it, hence tensor is pre-fixed with WAR.
-            auto WAR_scalar_max_seq_kv = std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv));
+            // Also future versions of cudnn will not need it, hence tensor is pre-fixed.
+            auto scalar_max_seq_kv = std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv));
 
             auto col_less_seq_kv_attributes =
                 Pointwise_attributes().set_name("col_less_seq_kv").set_mode(PointwiseMode_t::CMP_LT);
-            auto col_less_seq_kv_output =
-                pointwise(col_index_output, WAR_scalar_max_seq_kv, col_less_seq_kv_attributes);
+            auto col_less_seq_kv_output = pointwise(col_index_output, scalar_max_seq_kv, col_less_seq_kv_attributes);
 
             // Lower attributes to binary select attributes
             auto negative_inf_padding =
@@ -684,15 +951,47 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
             matmul(last_output, v_cache, bmm2_attributes, O);
         } else if (attributes.mma_core_mode == DataType_t::FP8_E4M3 ||
                    attributes.mma_core_mode == DataType_t::FP8_E5M2) {
-            auto const& descale_s = attributes.inputs.at(input_names::Descale_S);
-            auto const& descale_v = attributes.inputs.at(input_names::Descale_V);
-            auto const& scale_o   = attributes.inputs.at(input_names::Scale_O);
-            auto const& amax_o    = attributes.outputs.at(output_names::Amax_O);
+            if (use_mxfp8) {
+                // MXFP8: Dequantize V using block scale factors
+                // SF_V should be provided with dims [b, h, s_scale, d] where s is scaled
+                // (different from SF_Q/SF_K which have d scaled)
+                // No transformation needed - use SF_V as provided
 
-            auto bmm2_attributes =
-                Matmul_fp8_attributes().set_name("bmm2").set_m_override(seq_len_q).set_k_override(seq_len_kv);
-            // Special non-functional-style call. Needed because output already created and provided to user.
-            matmul_fp8(last_output, v_cache, descale_s, descale_v, scale_o, bmm2_attributes, O, amax_o);
+                // Dequantize V with SF_V
+                auto dequant_v_attrs = Block_scale_dequantize_attributes()
+                                           .set_name("dequant_v")
+                                           .set_block_size({1, 32});  // Standard MXFP8 block size
+                auto v_dequant = std::make_shared<Tensor_attributes>();
+                v_dequant->set_is_virtual(true);
+                v_dequant->set_dim(v_cache->get_dim());
+                v_dequant->set_stride(v_cache->get_stride());
+                block_scale_dequantize(v_cache, attributes.inputs[input_names::Descale_V], dequant_v_attrs, v_dequant);
+
+                // Use regular matmul with dequantized inputs
+                auto bmm2_attributes =
+                    Matmul_attributes().set_name("bmm2").set_m_override(seq_len_q).set_k_override(seq_len_kv);
+                // Special non-functional-style call. Needed because output already created and provided to user.
+                matmul(last_output, v_dequant, bmm2_attributes, O);
+
+                // Compute Amax_O for MXFP8
+                auto const& amax_o = attributes.outputs.at(output_names::Amax_O);
+                if (amax_o != nullptr) {
+                    auto amax_attributes = Reduction_attributes().set_name("amax_o").set_mode(ReductionMode_t::AMAX);
+                    // Special non-functional-style call. Needed because output already created and provided to user.
+                    reduction(O, amax_attributes, amax_o);
+                }
+            } else {
+                // Regular per-tensor FP8 scaling
+                auto const& descale_s = attributes.inputs.at(input_names::Descale_S);
+                auto const& descale_v = attributes.inputs.at(input_names::Descale_V);
+                auto const& scale_o   = attributes.inputs.at(input_names::Scale_O);
+                auto const& amax_o    = attributes.outputs.at(output_names::Amax_O);
+
+                auto bmm2_attributes =
+                    Matmul_fp8_attributes().set_name("bmm2").set_m_override(seq_len_q).set_k_override(seq_len_kv);
+                // Special non-functional-style call. Needed because output already created and provided to user.
+                matmul_fp8(last_output, v_cache, descale_s, descale_v, scale_o, bmm2_attributes, O, amax_o);
+            }
         } else {
             RETURN_CUDNN_FRONTEND_ERROR_IF(true, error_code_t::GRAPH_NOT_SUPPORTED, "Unsupported MMA core mode");
         }
@@ -724,8 +1023,10 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     mutable std::shared_ptr<Tensor_attributes>
         workaround_padding_mask_seq_len_q;  // Will be edited in pre_validate_node()
     mutable std::shared_ptr<Tensor_attributes>
-        workaround_padding_mask_seq_len_kv;                      // Will be edited in pre_validate_node()
-    mutable int64_t batch_size_for_workaround_padding_mask = 0;  // Will be edited in pre_validate_node()
+        workaround_padding_mask_seq_len_kv;                                  // Will be edited in pre_validate_node()
+    mutable int64_t batch_size_for_workaround_padding_mask         = 0;      // Will be edited in pre_validate_node()
+    mutable bool is_deterministic_algorithm_supported_on_blackwell = false;  // Will be edited in pre_validate_node()
+    mutable bool is_d256_on_blackwell                              = false;  // Will be edited in pre_validate_node()
 
    public:
     mutable SDPA_backward_attributes attributes;  // Will be edited in pre_validate_node() for workaround padding mask
@@ -808,12 +1109,26 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "s_q = s_kv = 1 is not supported.");
 
-        cudaDeviceProp prop;
-        int device;
-        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_get_device(&device));
-        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, device));
+        // Bug workarounds for known problematic versions (TE constraint)
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            detail::get_backend_version() == 91000 || detail::get_backend_version() == 91001,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "SDPA FP16/BF16 backward is not supported on cuDNN 9.10.0/9.10.1 due to known bugs. "
+            "Please consider upgrading to 9.10.2 or newer.");
 
-        if (prop.major == 9) { 
+        // 9.14.0 sliding window bug: non-causal + s_kv > 1024 + sliding window
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            detail::get_backend_version() == 91400 && s_kv > 1024 && attributes.left_bound.has_value() &&
+                !attributes.has_causal_like_masking(),
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "cuDNN 9.14.0 has a known bug with non-causal + s_kv > 1024 + sliding window attention. "
+            "Please consider upgrading to 9.14.1 or newer.");
+
+        CHECK_CUDNN_FRONTEND_ERROR(context.populate_sm_version_from_device());
+        int32_t const sm_version = context.get_sm_version();
+        int32_t const prop_major = sm_version / 10;
+
+        if (prop_major == 9) { 
             // validate basic dimension requirements
 
             if ((detail::get_backend_version() >= 91100) && (detail::get_backend_version() < 91300)) {
@@ -831,12 +1146,15 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                         error_code_t::GRAPH_NOT_SUPPORTED,
                         "Num hidden_dim should be less than or equal to 256 and hidden_dim should be multiple of 8");
 
-        } else if (prop.major == 10 && detail::get_backend_version() >= 91100) {
+        } else if (prop_major == 10 && detail::get_backend_version() >= 91100) {
             // validate basic dimension requirements
             if (d_qk == 192) { // special case for 192 hidden dim
                 RETURN_CUDNN_FRONTEND_ERROR_IF( (d_v != 128),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Num hidden_dim d_v should be equal to 128 if d_qk is 192");
+            } else if (detail::get_backend_version() >= 92300 && d_qk == 256 && d_v == 256) {
+                is_d256_on_blackwell = true;
+                attributes.is_deterministic_algorithm = true;
             } else {
                 RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
                                             error_code_t::GRAPH_NOT_SUPPORTED,
@@ -923,7 +1241,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                                        error_code_t::INVALID_VALUE,
                                        "Left bound (Sliding window length) should be greater than or equals to zero when set.");
 
-         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && (s_q * attributes.left_bound.value() == s_kv * attributes.left_bound.value()) && (detail::get_backend_version() <= 90900) && (prop.major == 9) && attributes.has_causal_mask_bottom_right(),
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && (s_q * attributes.left_bound.value() == s_kv * attributes.left_bound.value()) && (detail::get_backend_version() <= 90900) && (prop_major == 9) && attributes.has_causal_mask_bottom_right(),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "On Hopper architecture, this specific combination of s_q, s_kv, and left_bound + right_bound + bottom right diagonal alignment is not supported for backend version 9.9 or below");
 
@@ -955,31 +1273,30 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                                        "Dropout probability cannot be 1 as corresponding scale wont be well formed.");
 
         // validate options for deterministic algorithm
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.is_deterministic_algorithm && (prop.major == 10),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Deterministic algorithm is not supported on blackwell architecture");
+        if(attributes.is_deterministic_algorithm && (prop_major == 10)) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF( (detail::get_backend_version() < 91800),
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Deterministic algorithm is not supported on blackwell architecture with cudnn version below 9.18.0");
+
+            // dbias bias rng/dropout alibi
+            RETURN_CUDNN_FRONTEND_ERROR_IF(is_dbias || is_rng || is_dropout || attributes.alibi_mask,
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Deterministic algorithm is not supported on blackwell architecture when dbias, rng/dropout, alibi is enabled");
+
+            is_deterministic_algorithm_supported_on_blackwell = true;
+        }
+
+        if(detail::get_backend_version() >= 91801) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.is_deterministic_algorithm,
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Deterministic algorithm is not supported for bprop thd on SM8X and SM12X GPUs");
+
+	    RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.inputs[input_names::Stats]->get_ragged_offset(),
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "Packed/ragged LSE is not supported for bprop thd on SM8X and SM12X GPUs");
+	}
 
         // version specific validation
-        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 8906 && ((s_kv % 64 != 0) || (d_qk % 64 != 0)),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "For cuDNN version below 8.9.6, s_kv not a multiple of 64 or d not a multiple of 64 is not supported");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 8907 && (s_kv % 64 != 0) && (!(attributes.padding_mask)),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "For cuDNN version below 8.9.7, s_kv not a multiple of 64 is not supported");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90000 && ((s_q % 64 != 0) || (s_kv % 64 != 0)) && (attributes.padding_mask || is_dropout),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "For cuDNN version below 9.0.0, s_q/s_kv not a multiple of 64 with padding/dropout mask is not supported");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90000 && (s_q < 64),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-            "                          Sequence length must be greater than or equal to 64 for cudnn version prior to v9.0.0");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90200 && attributes.left_bound.has_value(),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "For cuDNN version below 9.2.0, sliding window attention is not supported");
-
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90500 && is_dbias && attributes.padding_mask,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "For cuDNN version below 9.5.0, dBias with variable sequence lengths is not supported");
@@ -993,14 +1310,9 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                                        "For cuDNN version below 9.6.0, group-query attention with raggged offset is not supported");
 
         // TODO add version check once fixed
-        RETURN_CUDNN_FRONTEND_ERROR_IF(prop.major == 10 && is_rng,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(prop_major == 10 && is_ragged && is_dbias,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Dropout RNG dump is not supported for SM Major version 10");
-
-        // TODO add version check once fixed
-        RETURN_CUDNN_FRONTEND_ERROR_IF(prop.major == 10 && is_ragged && (is_dbias || attributes.is_deterministic_algorithm),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Deterministic kernel or dbias with ragged is not supported for SM Major version 10");
+                                       "dbias with ragged is not supported for SM Major version 10");
 
         // validate that datatype is set for the graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(this->context.get_intermediate_data_type() == DataType_t::NOT_SET,
@@ -1031,6 +1343,19 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             CUDNN_FE_LOG_LABEL_ENDL("WARNING: sdpa_backward.attributes.max_total_seq_len has been set, but d is not a multiple of 16 has a known functional issue. The workspace memory size required to execute this graph may be unexpectedly large");
             attributes.max_total_seq_len_q.reset();
             attributes.max_total_seq_len_kv.reset();
+        }
+
+
+        if(detail::get_backend_version() >= 91801) {
+            int32_t const prop_major = context.get_sm_version() / 10;
+            if(8 == prop_major || 12 == prop_major) {
+		if(attributes.max_total_seq_len_q.has_value() || attributes.max_total_seq_len_kv.has_value()) {
+                    attributes.max_total_seq_len_q.reset();
+                    attributes.max_total_seq_len_kv.reset();
+		    CUDNN_FE_LOG_LABEL_ENDL("WARNING: sdpa_backward.attributes.max_total_seq_len has been set, but ampere style kernels have a known functional issue. The workspace memory size required to execute this graph may be unexpectedly large");
+            
+		}
+	    }
         }
         // clang-format on
 
@@ -1111,6 +1436,8 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
 
         bool use_dp_workspace = false;
 
+        int32_t const prop_major = context.get_sm_version() / 10;
+
         if (detail::get_backend_version() >= 8905 && detail::get_backend_version() < 90000) {
             // workspace optimization is enabled by default when:
             //   8.9.5 <= cudnn version < 9.0.0
@@ -1123,11 +1450,9 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=-1     - always enable workspace opt.
             // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=0      - always disable workspace opt.
             // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT=n      - enable workspace opt. until the n byte limit
-            struct cudaDeviceProp prop;
-            _CUDNN_CHECK_CUDA_ERROR(detail::cuda_get_device_properties(&prop, 0));
 
             // hopper or above
-            if (prop.major >= 9) {
+            if (prop_major >= 9) {
                 // default upper limit for workspace 256MB
                 int64_t max_dp_workspace_bytes = 256 * 1024 * 1024;
 
@@ -1161,7 +1486,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
 
         // Force dP workspace implementation if:
         //  - dBias is enabled (dBias is only supported on workspace implementation)
-        //  - the user force requests deterministic algorithm
+        //  - the user force requests deterministic algorithm on hopper
         if (attributes.outputs[output_names::dBias] || attributes.is_deterministic_algorithm) {
             use_dp_workspace = true;
         }
@@ -1313,7 +1638,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                                 attributes.inputs[input_names::Stats],
                                 Pointwise_attributes().set_name("sub_s_m").set_mode(PointwiseMode_t::SUB));
 
-        // WAR for bug 4475073 by explicitly putting the padding value again after the stats have been loaded
+        // Explicitly put the padding value again after the stats have been loaded
         if (attributes.padding_mask && detail::get_backend_version() >= 90000 &&
             detail::get_backend_version() < 91000) {
             auto row_idx_output = pointwise(last_output,
@@ -1441,15 +1766,15 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
 
             if (attributes.outputs[output_names::dV]->get_ragged_offset() &&
                 attributes.max_total_seq_len_kv.has_value()) {
-                // hack 1 - map dV strides to dV_fullhead strides
+                // map dV strides to dV_fullhead strides
                 std::vector<int64_t> dV_fullhead_stride = attributes.outputs[output_names::dV]->get_stride();
                 dV_fullhead_stride[2]                   = dV_fullhead_stride[2] * (h_q / h_v);  // sequence stride
                 dV_fullhead_stride[0]                   = dV_fullhead_stride[0] * (h_q / h_v);  // batch stride
                 dV_fullhead->set_stride(dV_fullhead_stride);
-                // hack 2 - map dV ragged offset to dV_fullhead ragged offset with implicit multiplier
+                // map dV ragged offset to dV_fullhead ragged offset with implicit multiplier
                 // implicit multiplier = h_q / h_v
                 dV_fullhead->set_ragged_offset(attributes.outputs[output_names::dV]->get_ragged_offset());
-                // hack 3 - non virtual dV full head
+                // non virtual dV full head
                 dV_fullhead->set_is_virtual(false);
                 dV_fullhead_size = attributes.max_total_seq_len_kv.value() * dV_fullhead_stride[2] * sizeof(float);
             } else {
@@ -1553,15 +1878,15 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             if (attributes.outputs[output_names::dK]->get_ragged_offset() &&
                 attributes.max_total_seq_len_kv.has_value()) {
                 // sized THD dK_full_heads
-                // hack 1 - map dK strides to dK_fullhead strides
+                // map dK strides to dK_fullhead strides
                 std::vector<int64_t> dK_fullhead_stride = attributes.outputs[output_names::dK]->get_stride();
                 dK_fullhead_stride[0]                   = dK_fullhead_stride[0] * (h_q / h_k);  // batch stride
                 dK_fullhead_stride[2]                   = dK_fullhead_stride[2] * (h_q / h_k);  // sequence stride
                 dK_fullhead->set_stride(dK_fullhead_stride);
-                // hack 2 - map dK ragged offset to dK_fullhead ragged offset with implicit multiplier
+                // map dK ragged offset to dK_fullhead ragged offset with implicit multiplier
                 // implicit multiplier = h_q / h_k
                 dK_fullhead->set_ragged_offset(attributes.outputs[output_names::dK]->get_ragged_offset());
-                // hack 3 - non virtual dK full head
+                // non virtual dK full head
                 dK_fullhead->set_is_virtual(false);
                 dK_fullhead_size = attributes.max_total_seq_len_kv.value() * dK_fullhead_stride[2] * sizeof(float);
             } else {
@@ -1630,6 +1955,40 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         }
 
         return {error_code_t::OK, ""};
+    }
+
+    std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
+    override_heuristics_query() const {
+        int32_t const sm_version = context.get_sm_version();
+        bool const use_new_knobs = detail::get_backend_version() >= 92300;
+        // {128,128} bprop: tileM=3, tileN=2, kernelCfg=2(bprop warp), streamK=0, cgaM=0
+        if (sm_version > 103 && (is_deterministic_algorithm_supported_on_blackwell)) {
+            if (use_new_knobs) {
+                return {17,
+                        {{KnobType_t::TILE_M, 3},
+                         {KnobType_t::TILE_N, 2},
+                         {KnobType_t::KERNEL_CFG, 2},
+                         {KnobType_t::STREAM_K, 0},
+                         {KnobType_t::TILE_CGA_M, 0},
+                         {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
+            } else {
+                return {17, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
+            }
+        } else if (is_deterministic_algorithm_supported_on_blackwell) {
+            if (use_new_knobs) {
+                return {5,
+                        {{KnobType_t::TILE_M, 3},
+                         {KnobType_t::TILE_N, 2},
+                         {KnobType_t::KERNEL_CFG, 2},
+                         {KnobType_t::STREAM_K, 0},
+                         {KnobType_t::TILE_CGA_M, 0},
+                         {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
+            } else {
+                return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
+            }
+        } else {
+            return {-1, {}};
+        }
     }
 
     virtual int64_t
@@ -1736,7 +2095,7 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
 
     Type
     getType() override final {
-        return Type::UNIFIED_SDPA;
+        return Type::SDPA;
     }
 
     error_t
@@ -1754,6 +2113,111 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
         if (attributes.attn_scale_value.has_value()) {
             attributes.inputs[input_names::Attn_scale] =
                 std::make_shared<Tensor_attributes>(attributes.attn_scale_value.value());
+        }
+
+        // Optional attention score modifier
+        if (attributes.attention_score_modifier != nullptr) {
+            if (!subgraph) init_subgraph();
+            subgraph_output = attributes.attention_score_modifier(subgraph, subgraph_output);
+        }
+
+        // Optional bias
+        if (attributes.inputs.find(input_names::Bias) != attributes.inputs.end() &&
+            attributes.inputs[input_names::Bias]) {
+            if (!subgraph) init_subgraph();
+            subgraph_output =
+                attn::score_modifiers::bias(subgraph, subgraph_output, attributes.inputs[input_names::Bias]);
+        }
+
+        // Optional alibi mask
+        if (attributes.alibi_mask) {
+            if (!subgraph) init_subgraph();
+            auto h_q = attributes.inputs[input_names::Q]->get_dim()[1];
+            subgraph_output =
+                attn::score_modifiers::alibi_mask(subgraph, subgraph_output, alibi_slopes, h_q, alibi_slopes_size);
+        }
+
+        // Optional casual masking
+        if (attributes.left_bound.has_value() || attributes.right_bound.has_value()) {
+            if (!subgraph) init_subgraph();
+
+            auto s_q      = attributes.inputs[input_names::Q]->get_dim()[2];
+            auto s_kv     = infer_s_kv();
+            auto s_kv_ptr = attributes.inputs.find(input_names::SEQ_LEN_KV) != attributes.inputs.end()
+                                ? attributes.inputs[input_names::SEQ_LEN_KV]
+                                : nullptr;
+            auto s_q_ptr  = attributes.inputs.find(input_names::SEQ_LEN_Q) != attributes.inputs.end()
+                                ? attributes.inputs[input_names::SEQ_LEN_Q]
+                                : nullptr;
+
+            subgraph_output = attn::score_modifiers::sliding_window_mask(subgraph,
+                                                                         subgraph_output,
+                                                                         attributes.diagonal_alignment,
+                                                                         attributes.left_bound,
+                                                                         attributes.right_bound,
+                                                                         s_q,
+                                                                         s_kv,
+                                                                         s_q_ptr,
+                                                                         s_kv_ptr);
+        }
+
+        if (subgraph) {
+            subgraph_output->set_name(attributes.name + "::subgraph_output");
+            auto subgraph_node = std::static_pointer_cast<INode>(subgraph);
+            sub_nodes.emplace_back(subgraph_node);
+        }
+
+        // For BE >= 9.21, express softmax as a UnifiedSoftmaxNode whose backend descriptor
+        // will be set via CUDNN_ATTR_OPERATION_SDPA_FWD_SOFTMAX_DESC.
+        // For older versions, stats (if present) is set directly via CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC.
+        auto effective_cudnn_ver = std::min(detail::get_compiled_version(), detail::get_backend_version());
+
+        auto has_output = [&](auto name) {
+            auto it = attributes.outputs.find(name);
+            return it != attributes.outputs.end() && it->second != nullptr;
+        };
+        bool has_softmax_features = has_output(output_names::Stats) || has_output(output_names::Max) ||
+                                    has_output(output_names::Sum_exp) || attributes.has_sink_token();
+
+        if (effective_cudnn_ver >= 92100 && has_softmax_features) {
+            auto b    = attributes.inputs[input_names::Q]->get_dim()[0];
+            auto h_q  = attributes.inputs[input_names::Q]->get_dim()[1];
+            auto s_q  = attributes.inputs[input_names::Q]->get_dim()[2];
+            auto s_kv = infer_s_kv();
+
+            auto softmax_p = std::make_shared<Tensor_attributes>();
+            softmax_p->set_is_virtual(true);
+            softmax_p->set_name(attributes.name + "::softmax_P");
+            softmax_p->set_dim({b, h_q, s_q, s_kv});
+            softmax_p->set_stride({h_q * s_q * s_kv, s_q * s_kv, s_kv, 1});
+
+            auto softmax_s = std::make_shared<Tensor_attributes>();
+            softmax_s->set_is_virtual(true);
+            softmax_s->set_name(attributes.name + "::softmax_S");
+            softmax_s->set_dim({b, h_q, s_q, s_kv});
+            softmax_s->set_stride({h_q * s_q * s_kv, s_q * s_kv, s_kv, 1});
+
+            auto softmax_attrs = Softmax_attributes().set_name(attributes.name + "::softmax");
+            softmax_attrs.inputs[Softmax_attributes::input_names::P]   = softmax_p;
+            softmax_attrs.outputs[Softmax_attributes::output_names::S] = softmax_s;
+
+            if (attributes.has_sink_token()) {
+                softmax_attrs.set_sink(attributes.inputs[input_names::SINK_TOKEN]);
+            }
+            if (has_output(output_names::Stats)) {
+                softmax_attrs.outputs[Softmax_attributes::output_names::Stats] =
+                    attributes.outputs[output_names::Stats];
+            }
+            if (has_output(output_names::Max)) {
+                softmax_attrs.outputs[Softmax_attributes::output_names::Max] = attributes.outputs[output_names::Max];
+            }
+            if (has_output(output_names::Sum_exp)) {
+                softmax_attrs.outputs[Softmax_attributes::output_names::Sum_exp] =
+                    attributes.outputs[output_names::Sum_exp];
+            }
+
+            softmax_node = std::make_shared<UnifiedSoftmaxNode>(std::move(softmax_attrs), context);
+            sub_nodes.emplace_back(softmax_node);
         }
 
         return {error_code_t::OK, ""};
@@ -1806,14 +2270,39 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
                                                        1,
                                                        &backend_o));
 
-        auto stats_it = attributes.outputs.find(SDPA_attributes::output_names::Stats);
-        if (stats_it != attributes.outputs.end()) {
-            auto backend_stats = tensors[stats_it->second->get_uid()]->get_desc()->get_backend_descriptor();
+        if (softmax_node) {
+            auto softmax_ver_error =
+                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "SOFTMAX_DESC in unified SDPA node requires cuDNN 9.21.0"};
+#if (CUDNN_VERSION >= 92100)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92100, softmax_ver_error);
+
+            managed_backend_descriptor_t softmax_raw_ops;
+            std::unordered_set<Tensor_attributes::uid_t> softmax_uids;
+            std::vector<std::shared_ptr<cudnn_frontend::Operation>> softmax_ops;
+            CHECK_CUDNN_FRONTEND_ERROR(
+                softmax_node->create_cudnn_operations(softmax_uids, softmax_ops, softmax_raw_ops, tensors));
+
+            auto backend_softmax = softmax_raw_ops[0]->get_backend_descriptor();
             _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
-                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC,
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_SOFTMAX_DESC,
                                                            CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                                            1,
-                                                           &backend_stats));
+                                                           &backend_softmax));
+
+            uids_involved_in_operations.insert(softmax_uids.begin(), softmax_uids.end());
+#else
+            return softmax_ver_error;
+#endif
+        } else {
+            auto stats_it = attributes.outputs.find(SDPA_attributes::output_names::Stats);
+            if (stats_it != attributes.outputs.end() && stats_it->second) {
+                auto backend_stats = tensors[stats_it->second->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_stats));
+            }
         }
 
         auto attn_scale_it = attributes.inputs.find(SDPA_attributes::input_names::Attn_scale);
@@ -1901,6 +2390,109 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
 #endif
         }
 
+        // Subgraph attributes
+        if (subgraph) {
+            auto subgraph_cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                                                    "Subgraph attributes in unified SDPA node requires cuDNN 9.21.0"};
+#if (CUDNN_VERSION >= 92100)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92100, subgraph_cudnn_ver_error);
+
+            CHECK_CUDNN_FRONTEND_ERROR(attn::score_modifiers::build_operation_subgraph(subgraph));
+            auto subgraph_cudnn   = std::static_pointer_cast<ICudnn>(subgraph);
+            auto backend_subgraph = subgraph_cudnn->get_operation_graph()->get_raw_desc();
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_SUBGRAPH,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &backend_subgraph));
+
+            auto subgraph_input_uid = subgraph_input->get_uid();
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_SUBGRAPH_INPUT_UID,
+                                                           CUDNN_TYPE_INT64,
+                                                           1,
+                                                           &subgraph_input_uid));
+
+            auto subgraph_output_uid = subgraph_output->get_uid();
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_SUBGRAPH_OUTPUT_UID,
+                                                           CUDNN_TYPE_INT64,
+                                                           1,
+                                                           &subgraph_output_uid));
+
+            // Add non-virtual uids from subgraph to uids_involved_in_operations
+            uids_involved_in_operations.insert(subgraph_cudnn->variant_pack_uids.begin(),
+                                               subgraph_cudnn->variant_pack_uids.end());
+#else
+            return subgraph_cudnn_ver_error;
+#endif
+        }
+
+        // Set unfuse_fma attribute (for SM100: use __fmul_rn + __fadd_rn instead of ffma2 in softmax)
+        if (attributes.unfuse_fma) {
+            auto unfuse_fma_cudnn_ver_error =
+                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Unfuse FMA in unified SDPA node requires cuDNN 9.21.0"};
+#if CUDNN_VERSION >= 92100
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92100, unfuse_fma_cudnn_ver_error);
+            bool unfuse_fma_value = true;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_UNFUSE_FMA,
+                                                           CUDNN_TYPE_BOOLEAN,
+                                                           1,
+                                                           &unfuse_fma_value));
+#else
+            return unfuse_fma_cudnn_ver_error;
+#endif
+        }
+
+        // Dropout attributes
+        if (attributes.dropout_probability.has_value() && attributes.dropout_probability.value() != 0.0f) {
+            auto dropout_cudnn_ver_error =
+                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Dropout in unified SDPA node requires cuDNN 9.21.0"};
+#if (CUDNN_VERSION >= 92100)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92100, dropout_cudnn_ver_error);
+
+            float dropout_prob = attributes.dropout_probability.value();
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_PROBABILITY,
+                                                           CUDNN_TYPE_FLOAT,
+                                                           1,
+                                                           &dropout_prob));
+
+            auto seed_it = attributes.inputs.find(SDPA_attributes::input_names::Seed);
+            if (seed_it != attributes.inputs.end() && seed_it->second != nullptr) {
+                auto backend_seed = tensors[seed_it->second->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_SEED_DESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_seed));
+            }
+
+            auto offset_it = attributes.inputs.find(SDPA_attributes::input_names::Offset);
+            if (offset_it != attributes.inputs.end() && offset_it->second != nullptr) {
+                auto backend_offset = tensors[offset_it->second->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_OFFSET_DESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_offset));
+            }
+
+            auto rng_dump_it = attributes.outputs.find(SDPA_attributes::output_names::RNG_DUMP);
+            if (rng_dump_it != attributes.outputs.end() && rng_dump_it->second != nullptr) {
+                auto backend_rng_dump = tensors[rng_dump_it->second->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_RNG_DUMP_DESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_rng_dump));
+            }
+#else
+            return dropout_cudnn_ver_error;
+#endif
+        }
+
         _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(unified_sdpa_operation->get_backend_descriptor()));
 
         raw_operations.push_back(unified_sdpa_operation);
@@ -1914,6 +2506,29 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
         CUDNN_FRONTEND_UNUSED(tensors);
         return cudnn_ver_error;
 #endif  // CUDNN_VERSION >= 91301
+    }
+
+   protected:
+    std::shared_ptr<Graph> subgraph;  // Pre-softmax subgraph
+    std::shared_ptr<Tensor_attributes> subgraph_input;
+    std::shared_ptr<Tensor_attributes> subgraph_output;
+    std::shared_ptr<UnifiedSoftmaxNode> softmax_node;  // Softmax descriptor for BE >= 9.21
+
+    void
+    init_subgraph() {
+        subgraph               = std::make_shared<Graph>();
+        auto subgraph_node     = std::static_pointer_cast<INode>(subgraph);
+        subgraph_node->context = context;
+        subgraph_input         = std::make_shared<Tensor_attributes>();
+        subgraph_input->set_is_virtual(true);
+        subgraph_input->set_name(attributes.name + "::subgraph_input");
+        auto b    = attributes.inputs[input_names::Q]->get_dim()[0];
+        auto h_q  = attributes.inputs[input_names::Q]->get_dim()[1];
+        auto s_q  = attributes.inputs[input_names::Q]->get_dim()[2];
+        auto s_kv = infer_s_kv();
+        subgraph_input->set_dim({b, h_q, s_q, s_kv});
+        subgraph_input->set_stride({h_q * s_q * s_kv, s_q * s_kv, s_kv, 1});
+        subgraph_output = subgraph_input;
     }
 };
 

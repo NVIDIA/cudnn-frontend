@@ -29,9 +29,6 @@ class ConcatenateNode : public NodeCRTP<ConcatenateNode> {
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(!attributes.axis.has_value(), error_code_t::ATTRIBUTE_NOT_SET, "Axis not set\n");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !attributes.in_place_index.has_value(), error_code_t::ATTRIBUTE_NOT_SET, "In-place index not set\n");
-
         auto X = attributes.inputs;
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
@@ -116,12 +113,14 @@ class ConcatenateNode : public NodeCRTP<ConcatenateNode> {
                                                        1,
                                                        &axis));
 
-        int64_t in_place_index = attributes.in_place_index.value();
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(concatenate_operation->get_backend_descriptor(),
-                                                       CUDNN_ATTR_OPERATION_CONCAT_INPLACE_INDEX,
-                                                       CUDNN_TYPE_INT64,
-                                                       1,
-                                                       &in_place_index));
+        if (attributes.in_place_index.has_value()) {
+            int64_t in_place_index = attributes.in_place_index.value();
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(concatenate_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_CONCAT_INPLACE_INDEX,
+                                                           CUDNN_TYPE_INT64,
+                                                           1,
+                                                           &in_place_index));
+        }
 
         _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(concatenate_operation->get_backend_descriptor()));
 

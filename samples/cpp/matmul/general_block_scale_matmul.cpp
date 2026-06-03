@@ -179,10 +179,8 @@ TEST_CASE("General Block Scale Matmul", "[matmul][graph]") {
 
     auto compute_math_precision = test_params.compute_math_precision;
 
-    Surface<int8_t> tensor_a_gpu(div_up(b * m * k * cudnn_frontend::detail::get_element_size_in_bits(datatype_a), 8),
-                                 false);
-    Surface<int8_t> tensor_b_gpu(div_up(b * k * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_b), 8),
-                                 false);
+    Surface<int8_t> tensor_a_gpu(div_up(b * m * k * cudnn_frontend::detail::get_element_size_in_bits(datatype_a), 8));
+    Surface<int8_t> tensor_b_gpu(div_up(b * k * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_b), 8));
 
     int64_t block_scale_dim_a_m = div_up(m, block_size_a_m);
     int64_t block_scale_dim_a_k = div_up(k, block_size_a_k);
@@ -192,16 +190,13 @@ TEST_CASE("General Block Scale Matmul", "[matmul][graph]") {
     Surface<int8_t> block_descale_a_gpu(
         div_up(b * block_scale_dim_a_m * block_scale_dim_a_k *
                    cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale_a),
-               8),
-        false);
+               8));
     Surface<int8_t> block_descale_b_gpu(
         div_up(b * block_scale_dim_b_k * block_scale_dim_b_n *
                    cudnn_frontend::detail::get_element_size_in_bits(datatype_block_scale_b),
-               8),
-        false);
+               8));
 
-    Surface<int8_t> tensor_d_gpu(div_up(b * m * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_d), 8),
-                                 false);
+    Surface<int8_t> tensor_d_gpu(div_up(b * m * n * cudnn_frontend::detail::get_element_size_in_bits(datatype_d), 8));
 
     fe::graph::Graph graph{};
 
@@ -277,7 +272,7 @@ TEST_CASE("General Block Scale Matmul", "[matmul][graph]") {
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {tensor_a, tensor_a_gpu.devPtr},

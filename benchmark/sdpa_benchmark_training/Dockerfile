@@ -1,22 +1,23 @@
-FROM nvcr.io/nvidia/pytorch:25.09-py3
+FROM nvcr.io/nvidia/pytorch:26.03-py3
 
-RUN pip install --upgrade pip && \
-    pip install seaborn
-
-RUN apt-get update && \
-    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
-    dpkg -i cuda-keyring_1.1-1_all.deb && \
-    apt-get update && \
-    apt-get -y install cudnn
-
-RUN pip uninstall -y cudnn
-
-COPY benchmark_bf16_sdpa.py .
-
-COPY benchmark_fp8_sdpa.py .
-
-COPY benchmark_single_sdpa.py .
-
-ENV LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/:$LD_LIBRARY_PATH
-
+# Set working directory
 WORKDIR /workspace
+
+# Update libcudnn9-cuda-13
+RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && \
+    apt-get remove -y *cudnn9* && \
+    apt-get update && \
+    apt-get -y install cudnn && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Clone cudnn_frontend and install latest cudnn
+RUN git clone https://github.com/NVIDIA/cudnn-frontend.git
+RUN pip install -v /workspace/cudnn-frontend
+
+# Clone flash-attention
+RUN pip install fa4 nvidia-cutlass-dsl[cu13]==4.5.0
+
+# Install additional dependencies for benchmarking
+RUN pip install seaborn

@@ -1,7 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
@@ -35,19 +33,50 @@ class ReshapeNode : public NodeCRTP<ReshapeNode> {
             y_tensor->set_dim(attributes.dim);
         }
 
+        // Graph producers may represent scalar reshape outputs
+        // as rank-0 tensors (dim={}).  Without promotion, stride inference below
+        // would call generate_NHWC_stride_order(0), which is UB, and the cuDNN
+        // backend rejects rank-0 descriptors regardless.  Promote to canonical
+        // rank-1 length-1 -- value-preserving because a scalar has volume 1 --
+        // while keeping the normalization node-local so downstream broadcast/shape
+        // inference remains intact.
+        if (y_tensor->get_dim().empty()) {
+            y_tensor->set_dim({1});
+            if (y_tensor->get_stride().empty()) {
+                y_tensor->set_stride({1});
+            }
+        }
+
         if (y_tensor->get_stride().empty()) {
             if (attributes.get_stride().size()) {
                 y_tensor->set_stride(attributes.get_stride());
             } else {
                 auto const& y_dim = y_tensor->get_dim();
-                // Default to NHWC
-                auto const& stride_order = detail::generate_NHWC_stride_order(y_dim.size());
+                // Default to NHWC for multi-axis tensors. generate_NHWC_stride_order
+                // indexes stride_order[1] and assumes num_dims >= 2; use row-major
+                // for scalars (0-D) and vectors (1-D).
+                const int64_t rank = static_cast<int64_t>(y_dim.size());
+                std::vector<int64_t> const stride_order =
+                    rank < 2 ? detail::generate_row_major_stride_order(rank) : detail::generate_NHWC_stride_order(rank);
                 y_tensor->set_stride(detail::generate_stride(y_dim, stride_order));
             }
         }
 
         if (y_tensor->get_dim().empty() || y_tensor->get_stride().empty()) {
             return {error_code_t::SHAPE_DEDUCTION_FAILED, "Reshape node output shape deduction failed"};
+        }
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Reshape_attributes::input_names::X);
+        auto const& input_data_type = X->second->get_data_type();
+        if (y_tensor->get_data_type() == DataType_t::NOT_SET) {
+            y_tensor->set_data_type(input_data_type);
+        } else if (attributes.get_reshape_mode() == ReshapeMode_t::LOGICAL) {
+            // Lexicographic reshape preserves element type; reject inconsistent metadata.
+            // VIEW_ONLY paths (e.g. SDPA backward) may set Y dtype after reshape to match a consumer.
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                y_tensor->get_data_type() != input_data_type,
+                error_code_t::INVALID_VALUE,
+                "Output and input tensor data types must match for LOGICAL reshape operation.");
         }
 
         return {error_code_t::OK, ""};
@@ -62,35 +91,45 @@ class ReshapeNode : public NodeCRTP<ReshapeNode> {
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FE_LOG_LABEL("INFO: " << "Building ReshapeNode operations " << attributes.name << " ");
 
-        auto&& reshape_op_builder = cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_RESHAPE_DESCRIPTOR);
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 reshape_operation;
 
+        _CUDNN_CHECK_CUDNN_ERROR(
+            reshape_operation.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATION_RESHAPE_DESCRIPTOR));
+
+        // Set input tensor X
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Reshape_attributes::input_names::X);
-        reshape_op_builder.setxDesc(*(tensors.at(X->second->get_uid())));
+        auto x_desc = tensors.at(X->second->get_uid())->get_raw_desc();
 
-        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Reshape_attributes::output_names::Y);
-        reshape_op_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
-
-        reshape_op_builder.setyDesc(*(tensors.at(Y->second->get_uid())));
-
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = reshape_op_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = reshape_op_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
-        }
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reshape_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_RESHAPE_XDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &x_desc));
+#if (CUDNN_VERSION >= 92200)
+        // Set reshape mode
+        cudnnBackendReshapeMode_t cudnn_reshape_mode;
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.get_reshape_mode(), cudnn_reshape_mode));
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reshape_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_RESHAPE_MODE,
+                                                       CUDNN_TYPE_RESHAPE_MODE,
+                                                       1,
+                                                       &cudnn_reshape_mode));
 #endif
+        // Set output tensor Y
+        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Reshape_attributes::output_names::Y);
+        auto y_desc = tensors.at(Y->second->get_uid())->get_raw_desc();
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reshape_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_RESHAPE_YDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &y_desc));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(reshape_operation.get_raw_desc()));
+
+        operations.push_back(std::make_shared<Operation_v8>(std::move(reshape_operation)));
+
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
         return {error_code_t::OK, ""};

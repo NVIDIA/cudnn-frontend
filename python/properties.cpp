@@ -24,29 +24,35 @@ class HandleManagement {
     create_handle() {
         cudnnHandle_t handle;
         auto status = detail::create_handle(&handle);
-        throw_if(
-            status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnHandle Create failed");
+        throw_if(status != CUDNN_STATUS_SUCCESS,
+                 cudnn_frontend::error_code_t::HANDLE_ERROR,
+                 "cudnnHandle Create failed " + detail::get_last_error_string_());
         return reinterpret_cast<std::intptr_t>(handle);
     }
 
     static void
     destroy_handle(std::intptr_t handle) {
         auto status = detail::destroy_handle((cudnnHandle_t)handle);
-        throw_if(
-            status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnHandle Destroy failed");
+        throw_if(status != CUDNN_STATUS_SUCCESS,
+                 cudnn_frontend::error_code_t::HANDLE_ERROR,
+                 "cudnnHandle Destroy failed " + detail::get_last_error_string_());
     }
 
     static void
     set_stream(std::intptr_t handle, std::intptr_t stream) {
         auto status = detail::set_stream((cudnnHandle_t)handle, (cudaStream_t)stream);
-        throw_if(status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnSetStream failed");
+        throw_if(status != CUDNN_STATUS_SUCCESS,
+                 cudnn_frontend::error_code_t::HANDLE_ERROR,
+                 "cudnnSetStream failed " + detail::get_last_error_string_());
     }
 
     static std::intptr_t
     get_stream(std::intptr_t handle) {
         cudaStream_t streamId = nullptr;
         auto status           = detail::get_stream((cudnnHandle_t)handle, &streamId);
-        throw_if(status != CUDNN_STATUS_SUCCESS, cudnn_frontend::error_code_t::HANDLE_ERROR, "cudnnGetStream failed");
+        throw_if(status != CUDNN_STATUS_SUCCESS,
+                 cudnn_frontend::error_code_t::HANDLE_ERROR,
+                 "cudnnGetStream failed " + detail::get_last_error_string_());
 
         return reinterpret_cast<std::intptr_t>(streamId);
     }
@@ -55,7 +61,9 @@ class HandleManagement {
 std::shared_ptr<cudnn_frontend::KernelCache>
 create_kernel_cache_helper() {
     auto kernel_cache = std::make_shared<cudnn_frontend::KernelCache>();
-    throw_if(kernel_cache == nullptr, cudnn_frontend::error_code_t::INVALID_VALUE, "kernel cache creation failed");
+    throw_if(kernel_cache == nullptr,
+             cudnn_frontend::error_code_t::INVALID_VALUE,
+             "kernel cache creation failed " + detail::get_last_error_string_());
     return kernel_cache;
 }
 
@@ -76,8 +84,9 @@ kernel_cache_from_json_helper(std::shared_ptr<cudnn_frontend::KernelCache> kerne
 std::shared_ptr<cudnn_frontend::DeviceProperties>
 create_device_properties_helper(int32_t device_id) {
     auto device_properties = std::make_shared<cudnn_frontend::DeviceProperties>();
-    throw_if(
-        device_properties == nullptr, cudnn_frontend::error_code_t::INVALID_VALUE, "device properties creation failed");
+    throw_if(device_properties == nullptr,
+             cudnn_frontend::error_code_t::INVALID_VALUE,
+             "device properties creation failed " + detail::get_last_error_string_());
     if (device_id >= 0) {
         auto err = device_properties->set_device_id(device_id).build();
         throw_if(!err.is_good(), err.code, err.get_message());
@@ -88,8 +97,9 @@ create_device_properties_helper(int32_t device_id) {
 std::shared_ptr<cudnn_frontend::DeviceProperties>
 create_device_properties_helper(std::string const& json_str) {
     auto device_properties = std::make_shared<cudnn_frontend::DeviceProperties>();
-    throw_if(
-        device_properties == nullptr, cudnn_frontend::error_code_t::INVALID_VALUE, "device properties creation failed");
+    throw_if(device_properties == nullptr,
+             cudnn_frontend::error_code_t::INVALID_VALUE,
+             "device properties creation failed " + detail::get_last_error_string_());
     std::vector<uint8_t> serialization_buf(json_str.begin(), json_str.end());
     auto err = device_properties->deserialize(serialization_buf);
     throw_if(err.is_bad(), err.code, err.get_message());
@@ -138,6 +148,14 @@ init_properties(py::module_& m) {
         .value("F16x16", cudnn_frontend::TensorReordering_t::F16x16)
         .value("F8_128x4", cudnn_frontend::TensorReordering_t::F8_128x4);
 
+    py::enum_<cudnn_frontend::graph::ScalarType>(m, "scalar_type")
+        .value("RUNTIME_PARAM", cudnn_frontend::graph::ScalarType::RUNTIME_PARAM)
+        .value("COMPILE_TIME_CONST", cudnn_frontend::graph::ScalarType::COMPILE_TIME_CONST);
+
+    py::enum_<cudnn_frontend::ReshapeMode_t>(m, "reshape_mode")
+        .value("VIEW_ONLY", cudnn_frontend::ReshapeMode_t::VIEW_ONLY)
+        .value("LOGICAL", cudnn_frontend::ReshapeMode_t::LOGICAL);
+
     py::class_<cudnn_frontend::graph::Tensor_attributes, std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(
         m, "tensor")
         .def(py::init<>())
@@ -161,6 +179,7 @@ init_properties(py::module_& m) {
             py::return_value_policy::reference)  // NOTICE THATS ITS JUST ANOTHER NAME FOR SET_IS_VIRTUAL
         .def("get_is_pass_by_value", &cudnn_frontend::graph::Tensor_attributes::get_is_pass_by_value)
         .def("set_is_pass_by_value", &cudnn_frontend::graph::Tensor_attributes::set_is_pass_by_value)
+        .def("get_has_compile_time_constant", &cudnn_frontend::graph::Tensor_attributes::get_has_compile_time_constant)
         .def("get_uid", &cudnn_frontend::graph::Tensor_attributes::get_uid)
         .def("set_uid", &cudnn_frontend::graph::Tensor_attributes::set_uid)
         .def("get_reordering_type", &cudnn_frontend::graph::Tensor_attributes::get_reordering_type)
@@ -170,6 +189,11 @@ init_properties(py::module_& m) {
         .def("get_alignment", &cudnn_frontend::graph::Tensor_attributes::get_alignment)
         .def("set_alignment",
              &cudnn_frontend::graph::Tensor_attributes::set_alignment,
+             py::return_value_policy::reference)
+        .def("get_vector_count", &cudnn_frontend::graph::Tensor_attributes::get_vector_count)
+        .def("get_vector_dimension", &cudnn_frontend::graph::Tensor_attributes::get_vector_dimension)
+        .def("set_vector_count_and_dimension",
+             &cudnn_frontend::graph::Tensor_attributes::set_vector_count_and_dimension,
              py::return_value_policy::reference)
         .def("set_ragged_offset", &cudnn_frontend::graph::Tensor_attributes::set_ragged_offset)
         .def("__repr__", [](cudnn_frontend::graph::Tensor_attributes const& props) {
@@ -207,7 +231,10 @@ init_properties(py::module_& m) {
         .value("SPLIT_P_SLC", cudnn_frontend::KnobType_t::SPLIT_P_SLC)
         .value("TILE_M", cudnn_frontend::KnobType_t::TILE_M)
         .value("TILE_N", cudnn_frontend::KnobType_t::TILE_N)
-        .value("WARP_SPEC_CFG", cudnn_frontend::KnobType_t::WARP_SPEC_CFG);
+        .value("WARP_SPEC_CFG", cudnn_frontend::KnobType_t::WARP_SPEC_CFG)
+        .value("SWAP_AB", cudnn_frontend::KnobType_t::SWAP_AB)
+        .value("INPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::INPUT_TMA_ENABLE)
+        .value("OUTPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::OUTPUT_TMA_ENABLE);
 
     py::class_<cudnn_frontend::Knob, std::shared_ptr<cudnn_frontend::Knob>>(m, "knob")
         .def(py::init<cudnn_frontend::KnobType_t, int64_t, int64_t, int64_t>(),
@@ -260,7 +287,8 @@ init_properties(py::module_& m) {
     py::enum_<cudnn_frontend::HeurMode_t>(m, "heur_mode")
         .value("A", cudnn_frontend::HeurMode_t::A)
         .value("B", cudnn_frontend::HeurMode_t::B)
-        .value("FALLBACK", cudnn_frontend::HeurMode_t::FALLBACK);
+        .value("FALLBACK", cudnn_frontend::HeurMode_t::FALLBACK)
+        .value("OPENSOURCE", cudnn_frontend::HeurMode_t::OPENSOURCE);
 
     py::enum_<cudnn_frontend::ConvolutionMode_t>(m, "convolution_mode")
         .value("CONVOLUTION", cudnn_frontend::ConvolutionMode_t::CONVOLUTION)

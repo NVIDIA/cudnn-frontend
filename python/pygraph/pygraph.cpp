@@ -1,3 +1,4 @@
+#include <optional>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -185,16 +186,21 @@ PyGraph::slice(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
     auto input_dim = input->get_dim();
 
     std::vector<std::pair<int64_t, int64_t>> start_end_indices;
+    std::vector<int64_t> steps;
+    steps.reserve(slices.size());
     for (size_t i = 0; i < slices.size(); ++i) {
         int64_t start, stop, step, length;
         if (!slices[i].compute(input_dim[i], &start, &stop, &step, &length)) {
             throw std::runtime_error("Invalid slice");
         }
+        CUDNN_FRONTEND_UNUSED(length);
         start_end_indices.push_back({start, stop});
+        steps.push_back(step);
     }
 
     auto attributes = cudnn_frontend::graph::Slice_attributes()
                           .set_slices(start_end_indices)
+                          .set_strides(steps)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
 
@@ -350,11 +356,58 @@ PyGraph::reduction(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& in
 }
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
-PyGraph::reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input, std::string const& name) {
-    auto attributes = cudnn_frontend::graph::Reshape_attributes().set_name(name);
+PyGraph::reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+                 std::string const& name,
+                 cudnn_frontend::ReshapeMode_t reshape_mode) {
+    auto attributes = cudnn_frontend::graph::Reshape_attributes().set_name(name).set_reshape_mode(reshape_mode);
 
     auto OUT_0 = graph->reshape(input, attributes);
     return OUT_0;
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::transpose(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+                   std::vector<int64_t> const& permutation,
+                   cudnn_frontend::DataType_t const& compute_data_type,
+                   std::string const& name) {
+    auto attributes = cudnn_frontend::graph::Transpose_attributes()
+                          .set_name(name)
+                          .set_permutation(permutation)
+                          .set_compute_data_type(compute_data_type);
+
+    return graph->transpose(input, attributes);
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::concatenate(std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>> inputs,
+                     int64_t axis,
+                     std::optional<int64_t> in_place_index,
+                     std::string const& name) {
+    auto attributes = cudnn_frontend::graph::Concatenate_attributes().set_axis(axis).set_name(name);
+    if (in_place_index.has_value()) {
+        attributes.set_in_place_index(in_place_index.value());
+    }
+    return graph->concatenate(std::move(inputs), attributes);
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::tensor_scalar(float const& value, cudnn_frontend::graph::ScalarType scalar_type) {
+    return graph->tensor(value, scalar_type);
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::tensor_scalar(double const& value, cudnn_frontend::graph::ScalarType scalar_type) {
+    return graph->tensor(value, scalar_type);
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::tensor_scalar(int32_t const& value, cudnn_frontend::graph::ScalarType scalar_type) {
+    return graph->tensor(value, scalar_type);
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::tensor_scalar(int64_t const& value, cudnn_frontend::graph::ScalarType scalar_type) {
+    return graph->tensor(value, scalar_type);
 }
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
@@ -375,6 +428,19 @@ PyGraph::moe_grouped_matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attrib
 
     auto output = graph->moe_grouped_matmul(token, weight, first_token_offset, token_index, token_ks, attributes);
     return output;
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::moe_grouped_matmul_bwd(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& doutput,
+                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token,
+                                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& first_token_offset,
+                                cudnn_frontend::DataType_t const& compute_data_type,
+                                std::string const& name) {
+    auto attributes = cudnn_frontend::graph::Moe_grouped_matmul_bwd_attributes().set_name(name).set_compute_data_type(
+        compute_data_type);
+
+    auto dweight = graph->moe_grouped_matmul_bwd(doutput, token, first_token_offset, attributes);
+    return dweight;
 }
 
 void
@@ -483,10 +549,57 @@ PyGraph::get_workspace_size() {
 }
 
 int64_t
+PyGraph::get_workspace_size(std::optional<std::intptr_t> exec_handle,
+                            py::object override_uids,
+                            py::object override_shapes,
+                            py::object override_strides) {
+    std::vector<int64_t> override_uids_vec =
+        override_uids.is_none() ? std::vector<int64_t>() : override_uids.cast<std::vector<int64_t>>();
+    std::vector<std::vector<int64_t>> override_shapes_vec =
+        override_shapes.is_none() ? std::vector<std::vector<int64_t>>()
+                                  : override_shapes.cast<std::vector<std::vector<int64_t>>>();
+    std::vector<std::vector<int64_t>> override_strides_vec =
+        override_strides.is_none() ? std::vector<std::vector<int64_t>>()
+                                   : override_strides.cast<std::vector<std::vector<int64_t>>>();
+
+    int64_t workspace     = 0;
+    cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
+    auto status =
+        graph->get_workspace_size(handle_, workspace, override_uids_vec, override_shapes_vec, override_strides_vec);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+
+    return workspace;
+}
+
+int64_t
 PyGraph::get_workspace_size_plan_at_index(int64_t index) {
     int64_t workspace;
 
     auto status = graph->get_workspace_size_plan_at_index(index, workspace);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+
+    return workspace;
+}
+
+int64_t
+PyGraph::get_workspace_size_plan_at_index(int64_t index,
+                                          std::optional<std::intptr_t> exec_handle,
+                                          py::object override_uids,
+                                          py::object override_shapes,
+                                          py::object override_strides) {
+    std::vector<int64_t> override_uids_vec =
+        override_uids.is_none() ? std::vector<int64_t>() : override_uids.cast<std::vector<int64_t>>();
+    std::vector<std::vector<int64_t>> override_shapes_vec =
+        override_shapes.is_none() ? std::vector<std::vector<int64_t>>()
+                                  : override_shapes.cast<std::vector<std::vector<int64_t>>>();
+    std::vector<std::vector<int64_t>> override_strides_vec =
+        override_strides.is_none() ? std::vector<std::vector<int64_t>>()
+                                   : override_strides.cast<std::vector<std::vector<int64_t>>>();
+
+    int64_t workspace     = 0;
+    cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
+    auto status           = graph->get_workspace_size_plan_at_index(
+        handle_, index, workspace, override_uids_vec, override_shapes_vec, override_strides_vec);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     return workspace;
@@ -571,40 +684,110 @@ PyGraph::populate_cuda_graph(
 void
 PyGraph::execute(std::unordered_map<int64_t, std::intptr_t> var_pack,
                  std::intptr_t workspace,
-                 std::optional<std::intptr_t> exec_handle) {
+                 std::optional<std::intptr_t> exec_handle,
+                 py::object override_uids,
+                 py::object override_shapes,
+                 py::object override_strides) {
     std::unordered_map<int64_t, void*> var_pack_;
     var_pack_.reserve(var_pack.size());
     for (auto const& [uid, device_pointer] : var_pack) {
         var_pack_.emplace(uid, (void*)device_pointer);
     }
 
+    // Convert override_uids to a vector of int64_t (one-liner)
+    std::vector<int64_t> override_uids_vec =
+        override_uids.is_none() ? std::vector<int64_t>() : override_uids.cast<std::vector<int64_t>>();
+    std::vector<std::vector<int64_t>> override_shapes_vec =
+        override_shapes.is_none() ? std::vector<std::vector<int64_t>>()
+                                  : override_shapes.cast<std::vector<std::vector<int64_t>>>();
+    std::vector<std::vector<int64_t>> override_strides_vec =
+        override_strides.is_none() ? std::vector<std::vector<int64_t>>()
+                                   : override_strides.cast<std::vector<std::vector<int64_t>>>();
+
     auto workspace_ptr = (void*)workspace;
 
     cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
 
-    auto status = graph->execute(handle_, var_pack_, workspace_ptr);
+    cudnn_frontend::error_t status = {error_code_t::OK, ""};
+    if (override_uids_vec.empty()) {
+        status = graph->execute(handle_, var_pack_, workspace_ptr);
+    } else {
+        status = graph->execute(
+            handle_, var_pack_, workspace_ptr, override_uids_vec, override_shapes_vec, override_strides_vec);
+    }
     throw_if(status.is_bad(), status.get_code(), status.get_message());
-
     return;
+}
+
+void
+PyGraph::prepare_variant_pack_template() {
+    auto status = graph->prepare_variant_pack_template();
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+void
+PyGraph::execute_with_ptrs(std::vector<std::intptr_t> const& user_ptrs,
+                           std::intptr_t workspace,
+                           std::intptr_t exec_handle) {
+    std::vector<void*> ptrs(user_ptrs.size());
+    for (size_t i = 0; i < user_ptrs.size(); i++) {
+        ptrs[i] = (void*)user_ptrs[i];
+    }
+    cudnnHandle_t h = exec_handle ? static_cast<cudnnHandle_t>((void*)exec_handle) : handle;
+    auto status     = graph->execute(h, ptrs.data(), (int)ptrs.size(), (void*)workspace);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+void
+PyGraph::execute_with_raw_ptrs(std::intptr_t user_ptrs_array,
+                               int64_t n_user,
+                               std::intptr_t workspace,
+                               std::intptr_t exec_handle) {
+    static_assert(sizeof(std::intptr_t) == sizeof(void*), "intptr_t and void* must be the same size");
+    throw_if(n_user < 0, error_code_t::INVALID_VALUE, "n_user must be non-negative");
+    throw_if(n_user > 0 && user_ptrs_array == 0, error_code_t::INVALID_VALUE, "user_ptrs_array is null");
+    // user_ptrs_array points to a contiguous intptr_t[] of device pointers — zero copy
+    void** ptrs     = reinterpret_cast<void**>(user_ptrs_array);
+    cudnnHandle_t h = exec_handle ? static_cast<cudnnHandle_t>((void*)exec_handle) : handle;
+    auto status     = graph->execute(h, ptrs, (int)n_user, (void*)workspace);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
 void
 PyGraph::execute_plan_at_index(std::unordered_map<int64_t, std::intptr_t> var_pack,
                                std::intptr_t workspace,
                                int64_t index,
-                               std::optional<std::intptr_t> exec_handle) {
+                               std::optional<std::intptr_t> exec_handle,
+                               py::object override_uids,
+                               py::object override_shapes,
+                               py::object override_strides) {
     std::unordered_map<int64_t, void*> var_pack_;
     for (auto const& [uid, device_pointer] : var_pack) {
         var_pack_.emplace(uid, (void*)device_pointer);
     }
 
+    // Convert override_uids to a vector of int64_t (one-liner)
+    std::vector<int64_t> override_uids_vec =
+        override_uids.is_none() ? std::vector<int64_t>() : override_uids.cast<std::vector<int64_t>>();
+    std::vector<std::vector<int64_t>> override_shapes_vec =
+        override_shapes.is_none() ? std::vector<std::vector<int64_t>>()
+                                  : override_shapes.cast<std::vector<std::vector<int64_t>>>();
+    std::vector<std::vector<int64_t>> override_strides_vec =
+        override_strides.is_none() ? std::vector<std::vector<int64_t>>()
+                                   : override_strides.cast<std::vector<std::vector<int64_t>>>();
+
     auto workspace_ptr = (void*)workspace;
 
     cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
 
-    auto status = graph->execute_plan_at_index(handle_, var_pack_, workspace_ptr, index);
+    cudnn_frontend::error_t status = {error_code_t::OK, ""};
+    if (override_uids_vec.empty()) {
+        status = graph->execute_plan_at_index(handle_, var_pack_, workspace_ptr, index);
+    } else {
+        status = graph->execute_plan_at_index(
+            handle_, var_pack_, workspace_ptr, index, override_uids_vec, override_shapes_vec, override_strides_vec);
+    }
     throw_if(status.is_bad(), status.get_code(), status.get_message());
-
     return;
 }
 
@@ -624,6 +807,15 @@ PyGraph::get_plan_name_at_index(int64_t index) {
     return plan_name;
 }
 
+std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
+PyGraph::get_engine_and_knobs_at_index(int64_t index) {
+    int64_t engine_id = -1;
+    std::unordered_map<KnobType_t, int64_t> knobs;
+    auto status = graph->get_engine_and_knobs_at_index(index, engine_id, knobs);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+    return {engine_id, knobs};
+}
+
 std::vector<int64_t>
 default_vector(void) {
     return {};
@@ -641,7 +833,9 @@ init_pygraph_submodule(py::module_& m) {
                       py::object,
                       py::object,
                       std::shared_ptr<KernelCache>,
-                      std::shared_ptr<cudnn_frontend::DeviceProperties>>(),
+                      std::shared_ptr<cudnn_frontend::DeviceProperties>,
+                      bool,
+                      bool>(),
              py::arg_v("name", "test_graph"),
              py::arg_v("io_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("intermediate_data_type", cudnn_frontend::DataType_t::NOT_SET),
@@ -650,7 +844,9 @@ init_pygraph_submodule(py::module_& m) {
              py::arg_v("sm_count", py::none()),
              py::arg_v("sm_version", py::none()),
              py::arg_v("kernel_cache", nullptr),
-             py::arg_v("device_property", nullptr))
+             py::arg_v("device_property", nullptr),
+             py::arg_v("is_dynamic_shape_enabled", false),
+             py::arg_v("is_override_shape_enabled", false))
         .def("tensor_like",
              py::overload_cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const&, std::string const&>(
                  &PyGraph::tensor_like),
@@ -685,6 +881,8 @@ init_pygraph_submodule(py::module_& m) {
                 Args:
                     input (cudnn_tensor): The input tensor to be sliced.
                     slices (List[slice]): A list of Python slice objects, one for each dimension.
+                        Per-axis step comes from each slice's ``step`` (default 1), after normalization
+                        for the tensor shape (same semantics as indexing a sequence of that length).
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation.
                         Default is NOT_SET.
                     name (Optional[str]): A name for the slice operation.
@@ -694,7 +892,7 @@ init_pygraph_submodule(py::module_& m) {
 
                 Example:
                     >>> input_tensor = graph.tensor([4, 8, 16])
-                    >>> sliced_tensor = graph.slice(input_tensor, [slice(0, 2), slice(1, 5), slice(0, 16)])
+                    >>> sliced_tensor = graph.slice(input_tensor, [slice(0, 2), slice(1, 8, 2), slice(0, 16)])
             )pbdoc")
         .def(
             "conv_fprop",
@@ -927,6 +1125,7 @@ init_pygraph_submodule(py::module_& m) {
              &PyGraph::reshape,
              py::arg("input"),
              py::arg_v("name", ""),
+             py::arg_v("reshape_mode", cudnn_frontend::ReshapeMode_t::VIEW_ONLY),
              R"pbdoc(
                 Reshape an input tensor to other dimensions without changing the actual memory layout.
                 These dimensions to reshape to are inferred from output tensor shape.
@@ -934,10 +1133,73 @@ init_pygraph_submodule(py::module_& m) {
                 Args:
                     input (cudnn_tensor): The input tensor.
                     name (Optional[str]): A name for the operation to be performed.
+                    reshape_mode (cudnn.reshape_mode): VIEW_ONLY (default) or LOGICAL for lexicographic logical reshapes.
 
                 Returns:
                     cudnn_tensor: The result of reshape operation. Please set the dims for the output tensor.
             )pbdoc")
+        .def("transpose",
+             &PyGraph::transpose,
+             py::arg("input"),
+             py::arg("permutation"),
+             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+             py::arg_v("name", ""),
+             R"pbdoc(
+                Permute tensor dimensions using a permutation vector (output axis i reads input axis permutation[i]).
+
+                Args:
+                    input (cudnn_tensor): The input tensor.
+                    permutation (List[int]): Permutation of axis indices.
+                    compute_data_type (Optional[cudnn.data_type]): Optional compute type; default NOT_SET.
+                    name (Optional[str]): Operation name.
+
+                Returns:
+                    cudnn_tensor: Transposed tensor (dims/strides inferred when not set).
+            )pbdoc")
+        .def("concatenate",
+             &PyGraph::concatenate,
+             py::arg("inputs"),
+             py::arg("axis"),
+             py::arg_v("in_place_index", std::optional<int64_t>{}),
+             py::arg_v("name", ""),
+             R"pbdoc(
+                Concatenate tensors along an axis.
+
+                Args:
+                    inputs (List[cudnn_tensor]): Tensors to concatenate.
+                    axis (int): Concatenation axis.
+                    in_place_index (Optional[int]): When set, optional in-place concat per backend semantics.
+                    name (Optional[str]): Operation name.
+
+                Returns:
+                    cudnn_tensor: Concatenated output tensor.
+            )pbdoc")
+        .def("tensor_scalar",
+             py::overload_cast<float const&, cudnn_frontend::graph::ScalarType>(&PyGraph::tensor_scalar),
+             py::arg("value"),
+             py::arg("scalar_type"),
+             R"pbdoc(
+                Create a rank-1 scalar tensor from a Python float, marked runtime or compile-time.
+
+                Args:
+                    value (float): Scalar value.
+                    scalar_type (cudnn.scalar_type): RUNTIME_PARAM or COMPILE_TIME_CONST.
+
+                Returns:
+                    cudnn_tensor: Scalar tensor (set dim/stride/name as needed for your graph).
+            )pbdoc")
+        .def("tensor_scalar",
+             py::overload_cast<double const&, cudnn_frontend::graph::ScalarType>(&PyGraph::tensor_scalar),
+             py::arg("value"),
+             py::arg("scalar_type"))
+        .def("tensor_scalar",
+             py::overload_cast<int32_t const&, cudnn_frontend::graph::ScalarType>(&PyGraph::tensor_scalar),
+             py::arg("value"),
+             py::arg("scalar_type"))
+        .def("tensor_scalar",
+             py::overload_cast<int64_t const&, cudnn_frontend::graph::ScalarType>(&PyGraph::tensor_scalar),
+             py::arg("value"),
+             py::arg("scalar_type"))
         .def("moe_grouped_matmul",
              &PyGraph::moe_grouped_matmul,
              py::arg("token"),
@@ -961,6 +1223,23 @@ init_pygraph_submodule(py::module_& m) {
                     mode (cudnn.moe_grouped_matmul_mode): The mode of the operation.
                     compute_data_type (cudnn.data_type): The data type for computation.
                     top_k (int): The top k value.
+                    name (str): The name of the operation.
+            )pbdoc")
+        .def("moe_grouped_matmul_bwd",
+             &PyGraph::moe_grouped_matmul_bwd,
+             py::arg("doutput"),
+             py::arg("token"),
+             py::arg("first_token_offset"),
+             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::FLOAT),
+             py::arg_v("name", ""),
+             R"pbdoc(
+                Perform MoE Grouped Matmul Bwd operation.
+
+                Args:
+                    doutput (cudnn_tensor): The doutput tensor.
+                    token (cudnn_tensor): The token tensor.
+                    first_token_offset (cudnn_tensor): The first token offset tensor.
+                    compute_data_type (cudnn.data_type): The data type for computation.
                     name (str): The name of the operation.
             )pbdoc")
         .def("get_behavior_notes", &PyGraph::get_behavior_notes)
@@ -1003,16 +1282,23 @@ init_pygraph_submodule(py::module_& m) {
                 Args:
                     index (int): The index of the plan to build.
             )pbdoc")
-        .def("build", (void(PyGraph::*)(std::vector<cudnn_frontend::HeurMode_t> const&)) & PyGraph::build)
-        .def("build", (void(PyGraph::*)()) & PyGraph::build)
+        .def("build", (void (PyGraph::*)(std::vector<cudnn_frontend::HeurMode_t> const&))&PyGraph::build)
+        .def("build", (void (PyGraph::*)())&PyGraph::build)
         .def("get_execution_plan_count",
              &PyGraph::get_execution_plan_count,
              R"pbdoc(
                 Get the number of execution plan candidates.
             )pbdoc")
-        .def("get_workspace_size", &PyGraph::get_workspace_size)
+        .def("get_workspace_size", (int64_t (PyGraph::*)())&PyGraph::get_workspace_size)
+        .def("get_workspace_size",
+             (int64_t (PyGraph::*)(
+                 std::optional<std::intptr_t>, py::object, py::object, py::object))&PyGraph::get_workspace_size,
+             py::arg("handle")           = std::nullopt,
+             py::arg("override_uids")    = py::none(),
+             py::arg("override_shapes")  = py::none(),
+             py::arg("override_strides") = py::none())
         .def("get_workspace_size_plan_at_index",
-             &PyGraph::get_workspace_size_plan_at_index,
+             (int64_t (PyGraph::*)(int64_t))&PyGraph::get_workspace_size_plan_at_index,
              py::arg("index"),
              R"pbdoc(
                 Get workspace for a plan at the given index.
@@ -1020,6 +1306,17 @@ init_pygraph_submodule(py::module_& m) {
                     index (int): The index of the plan to get workspace from.
                     If the graph is not built at the index, this will return 0.
             )pbdoc")
+        .def("get_workspace_size_plan_at_index",
+             (int64_t (PyGraph::*)(int64_t,
+                                   std::optional<std::intptr_t>,
+                                   py::object,
+                                   py::object,
+                                   py::object))&PyGraph::get_workspace_size_plan_at_index,
+             py::arg("index"),
+             py::arg("handle")           = std::nullopt,
+             py::arg("override_uids")    = py::none(),
+             py::arg("override_shapes")  = py::none(),
+             py::arg("override_strides") = py::none())
         .def("query_tensor_attributes_of_uid",
              &PyGraph::query_tensor_attributes_of_uid,
              py::arg("uid"),
@@ -1037,16 +1334,54 @@ init_pygraph_submodule(py::module_& m) {
                     Args:
                     index (int): The index of the plan to get workspace from.
                 )pbdoc")
-        .def("_execute", &PyGraph::execute)
+        .def("get_engine_and_knobs_at_index",
+             &PyGraph::get_engine_and_knobs_at_index,
+             py::arg("index"),
+             R"pbdoc(
+                    Get the engine id and knob choices for a plan at the given index.
+                    Structured counterpart of get_plan_name_at_index; the result can be
+                    passed to create_execution_plan() to rebuild the same kernel.
+                    Args:
+                    index (int): The index of the plan to query.
+                )pbdoc")
+        .def("_execute",
+             &PyGraph::execute,
+             py::arg("var_pack"),
+             py::arg("workspace"),
+             py::arg("handle"),
+             py::arg("override_uids")    = py::none(),
+             py::arg("override_shapes")  = py::none(),
+             py::arg("override_strides") = py::none())
+        .def("_prepare_variant_pack_template", &PyGraph::prepare_variant_pack_template)
+        .def("_get_variant_pack_uids_sorted", &PyGraph::get_variant_pack_uids_sorted)
+        .def("_execute_with_ptrs",
+             &PyGraph::execute_with_ptrs,
+             py::arg("user_ptrs"),
+             py::arg("workspace"),
+             py::arg("handle"))
+        .def("_execute_with_raw_ptrs",
+             &PyGraph::execute_with_raw_ptrs,
+             py::arg("user_ptrs_array"),
+             py::arg("n_user"),
+             py::arg("workspace"),
+             py::arg("handle"))
         .def("populate_cuda_graph", &PyGraph::populate_cuda_graph)
         .def("update_cuda_graph", &PyGraph::update_cuda_graph)
         .def("serialize", &PyGraph::serialize)
         .def("deserialize",
-             (void(PyGraph::*)(std::optional<std::intptr_t>, py::object const&)) & PyGraph::deserialize,
+             (void (PyGraph::*)(std::optional<std::intptr_t>, py::object const&))&PyGraph::deserialize,
              py::arg("handle_"),
              py::arg("pyobj"))
-        .def("deserialize", (void(PyGraph::*)(py::object const&)) & PyGraph::deserialize, py::arg("pyobj"))
-        .def("_execute_plan_at_index", &PyGraph::execute_plan_at_index)
+        .def("deserialize", (void (PyGraph::*)(py::object const&))&PyGraph::deserialize, py::arg("pyobj"))
+        .def("_execute_plan_at_index",
+             &PyGraph::execute_plan_at_index,
+             py::arg("var_pack"),
+             py::arg("workspace"),
+             py::arg("index"),
+             py::arg("handle"),
+             py::arg("override_uids")    = py::none(),
+             py::arg("override_shapes")  = py::none(),
+             py::arg("override_strides") = py::none())
         .def("__repr__", [](PyGraph const& pygraph) {
             std::stringstream ss;
             json j = pygraph.graph;

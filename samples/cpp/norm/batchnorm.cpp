@@ -84,22 +84,22 @@ TEST_CASE("BN Finalize Graph", "[batchnorm][graph]") {
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<float> Sum_tensor(32, false);
-    Surface<float> Sq_sum_tensor(32, false);
-    Surface<float> Mean_tensor(32, false);
-    Surface<float> Var_tensor(32, false);
-    Surface<float> Previous_running_mean_tensor(32, false);
-    Surface<float> Previous_running_var_tensor(32, false);
-    Surface<float> Next_running_mean_tensor(32, false);
-    Surface<float> Next_running_var_tensor(32, false);
-    Surface<float> Scale_tensor(32, false);
-    Surface<float> Bias_tensor(32, false);
-    Surface<float> eq_scale_tensor(32, false);
-    Surface<float> eq_bias_tensor(32, false);
+    Surface<float> Sum_tensor(32);
+    Surface<float> Sq_sum_tensor(32);
+    Surface<float> Mean_tensor(32);
+    Surface<float> Var_tensor(32);
+    Surface<float> Previous_running_mean_tensor(32);
+    Surface<float> Previous_running_var_tensor(32);
+    Surface<float> Next_running_mean_tensor(32);
+    Surface<float> Next_running_var_tensor(32);
+    Surface<float> Scale_tensor(32);
+    Surface<float> Bias_tensor(32);
+    Surface<float> eq_scale_tensor(32);
+    Surface<float> eq_bias_tensor(32);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {sum, Sum_tensor.devPtr},
@@ -212,23 +212,34 @@ TEST_CASE("SGBN Add Relu Graph", "[batchnorm][graph]") {
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<half> X_tensor(4 * 32 * 16 * 16, false);
-    Surface<float> Mean_tensor(32, false);
-    Surface<float> Var_tensor(32, false);
-    Surface<float> Previous_running_mean_tensor(32, false);
-    Surface<float> Previous_running_var_tensor(32, false);
-    Surface<float> Next_running_mean_tensor(32, false);
-    Surface<float> Next_running_var_tensor(32, false);
-    Surface<float> Scale_tensor(32, false);
-    Surface<float> Bias_tensor(32, false);
-    Surface<half> A_tensor(4 * 32 * 16 * 16, false);
-    Surface<half> Y_tensor(4 * 32 * 16 * 16, false);
-    Surface<float> Peer_stats_0_tensor(2 * 4 * 32, false, true);
-    Surface<float> Peer_stats_1_tensor(2 * 4 * 32, false);
+    Surface<half> X_tensor(4 * 32 * 16 * 16);
+    Surface<float> Mean_tensor(32);
+    Surface<float> Var_tensor(32);
+    Surface<float> Previous_running_mean_tensor(32);
+    Surface<float> Previous_running_var_tensor(32);
+    Surface<float> Next_running_mean_tensor(32);
+    Surface<float> Next_running_var_tensor(32);
+    Surface<float> Scale_tensor(32);
+    Surface<float> Bias_tensor(32);
+    Surface<half> A_tensor(4 * 32 * 16 * 16);
+    Surface<half> Y_tensor(4 * 32 * 16 * 16);
+    Surface<float> Peer_stats_0_tensor(2 * 4 * 32);
+    std::vector<float> peer_stats_0_host(Peer_stats_0_tensor.size);
+    initHostImage(peer_stats_0_host.data(), static_cast<int64_t>(peer_stats_0_host.size()));
+    auto* peer_stats_0_bits = reinterpret_cast<uint32_t*>(peer_stats_0_host.data());
+    for (size_t i = 0; i < peer_stats_0_host.size(); i += 2) {
+        peer_stats_0_bits[i + 1] = 1u;
+    }
+    CUDA_CHECK(cudaMemcpy(Peer_stats_0_tensor.devPtr,
+                          peer_stats_0_host.data(),
+                          sizeof(peer_stats_0_host[0]) * peer_stats_0_host.size(),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    Surface<float> Peer_stats_1_tensor(2 * 4 * 32);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
@@ -333,21 +344,32 @@ TEST_CASE("DBN Add Relu Graph", "[BN][graph][backward]") {
 
     REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
 
-    Surface<half> X_tensor(4 * 32 * 16 * 16, false);
-    Surface<int8_t> Mask_tensor(4 * 32 * 16 * 16 / 8, false);
-    Surface<half> DY_tensor(4 * 32 * 16 * 16, false);
-    Surface<float> Mean_tensor(32, false);
-    Surface<float> Inv_variance_tensor(32, false);
-    Surface<float> Scale_tensor(32, false);
-    Surface<float> Dscale_tensor(32, false);
-    Surface<float> Dbias_tensor(32, false);
-    Surface<half> DX_tensor(4 * 32 * 16 * 16, false);
-    Surface<float> Peer_stats_0_tensor(2 * 4 * 32, false, true);
-    Surface<float> Peer_stats_1_tensor(2 * 4 * 32, false);
+    Surface<half> X_tensor(4 * 32 * 16 * 16);
+    Surface<int8_t> Mask_tensor(4 * 32 * 16 * 16 / 8);
+    Surface<half> DY_tensor(4 * 32 * 16 * 16);
+    Surface<float> Mean_tensor(32);
+    Surface<float> Inv_variance_tensor(32);
+    Surface<float> Scale_tensor(32);
+    Surface<float> Dscale_tensor(32);
+    Surface<float> Dbias_tensor(32);
+    Surface<half> DX_tensor(4 * 32 * 16 * 16);
+    Surface<float> Peer_stats_0_tensor(2 * 4 * 32);
+    std::vector<float> peer_stats_0_host(Peer_stats_0_tensor.size);
+    initHostImage(peer_stats_0_host.data(), static_cast<int64_t>(peer_stats_0_host.size()));
+    auto* peer_stats_0_bits = reinterpret_cast<uint32_t*>(peer_stats_0_host.data());
+    for (size_t i = 0; i < peer_stats_0_host.size(); i += 2) {
+        peer_stats_0_bits[i + 1] = 1u;
+    }
+    CUDA_CHECK(cudaMemcpy(Peer_stats_0_tensor.devPtr,
+                          peer_stats_0_host.data(),
+                          sizeof(peer_stats_0_host[0]) * peer_stats_0_host.size(),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    Surface<float> Peer_stats_1_tensor(2 * 4 * 32);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
@@ -364,7 +386,7 @@ TEST_CASE("DBN Add Relu Graph", "[BN][graph][backward]") {
         {peer_stats_1, Peer_stats_1_tensor.devPtr}};
 
     // If is_dx_drelu_virtual, DADD output required
-    Surface<half> DADD_tensor(4 * 32 * 16 * 16, false);
+    Surface<half> DADD_tensor(4 * 32 * 16 * 16);
     if (true == has_dadd) {
         variant_pack[DX_drelu] = DADD_tensor.devPtr;
     }
@@ -442,19 +464,19 @@ TEST_CASE("BN_inference DRelu DBN Graph", "[Batchnorm][graph][backward]") {
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<half> BN_X_tensor(4 * 32 * 16 * 16, false);
-    Surface<half> DY_tensor(4 * 32 * 16 * 16, false);
-    Surface<float> Mean_tensor(32, false);
-    Surface<float> Inv_variance_tensor(32, false);
-    Surface<float> Scale_tensor(32, false);
-    Surface<float> Bias_tensor(32, false);
-    Surface<float> Dscale_tensor(32, false);
-    Surface<float> Dbias_tensor(32, false);
-    Surface<half> DX_tensor(4 * 32 * 16 * 16, false);
+    Surface<half> BN_X_tensor(4 * 32 * 16 * 16);
+    Surface<half> DY_tensor(4 * 32 * 16 * 16);
+    Surface<float> Mean_tensor(32);
+    Surface<float> Inv_variance_tensor(32);
+    Surface<float> Scale_tensor(32);
+    Surface<float> Bias_tensor(32);
+    Surface<float> Dscale_tensor(32);
+    Surface<float> Dbias_tensor(32);
+    Surface<half> DX_tensor(4 * 32 * 16 * 16);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {BN_X, BN_X_tensor.devPtr},

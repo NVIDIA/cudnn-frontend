@@ -38,4 +38,34 @@ To add a new frontend-only API, follow these steps:
 
 **Currently implemented frontend-only APIs**:
 - `GEMM + Amax`
+- `RMSNorm + RHT + Amax`
 - `GEMM + SwiGLU`
+- `GEMM + sReLU`
+- `GEMM + dsReLU`
+- `Grouped Gemm + GLU (Unified)`
+- `Grouped Gemm + GLU + Hadamard`
+- `Grouped Gemm + dGLU (Unified)`
+- `Grouped Gemm + SwiGLU (Legacy, Contiguous-only)`
+- `Grouped Gemm + dSwiglu (Legacy, Contiguous-only)`
+- `Grouped Gemm + sReLU (Contiguous-only)`
+- `Grouped Gemm + dsReLU (Contiguous-only)`
+- `Discrete Grouped Gemm + SwiGLU`
+- `Discrete Grouped Gemm + dSwiglu`
+- `Grouped Gemm + Quant (Legacy, Dense-only)`
+- `Grouped Gemm + Quant (Unified)`
+- `Grouped Gemm + Wgrad`
+- `SDPA Forward (SM100, D=256)`
+- `SDPA Backward (SM100, D=256)`
+
+**In progress frontend-only APIs**:
+- GEMM + Dswiglu
+- GEMM + RoPE
+- Native Sparse Attention (NSA)
+
+## Discrete grouped API notes
+
+The discrete grouped APIs (`DiscreteGroupedGemmSwigluSm100` and `DiscreteGroupedGemmDswigluSm100`) use per-expert pointer arrays instead of a packed `B` tensor:
+
+- Runtime pointer inputs are CUDA `torch.int64` tensors (`b_ptrs`, `sfb_ptrs`) with shape `(num_experts,)`.
+- `compile()` is no-arg and compiles from descriptors captured in the constructor.
+- For CUDA graph capture, call `compile()` before capture and capture only `execute()` with preallocated tensors.

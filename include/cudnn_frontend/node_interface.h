@@ -34,8 +34,12 @@ class ReductionNode;
 class ResampleNode;
 class ReshapeNode;
 class RngNode;
-class SoftmaxNode;
+class CompositeSoftmaxNode;
+class UnifiedSoftmaxNode;
 class MoeGroupedMatmulNode;
+class UnifiedDiagonalBandMaskNode;
+class TransposeNode;
+class SliceNode;
 
 // Interface for all nodes to follow.
 class INode {
@@ -92,6 +96,11 @@ class INode {
     };
 
     virtual error_t
+    collect_tensors_to_dump_node(std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>&) const {
+        return {error_code_t::OK, ""};
+    };
+
+    virtual error_t
     create_cudnn_tensors_node(
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& uid_to_backend_tensors,
         int64_t& potential_uid,
@@ -131,6 +140,7 @@ class INode {
         RMSNORM,
         RNG,
         SLICE,
+        TRANSPOSE,
         WGRAD,
         PAGED_CACHE_LOAD,
         BLOCK_SCALE_QUANTIZE,
@@ -138,8 +148,13 @@ class INode {
         CONCATENATE,
         ADALAYERNORM,
         DADALAYERNORM,
-        UNIFIED_SDPA,
+        SDPA,
+        ROPE,
+        ROPE_BWD,
         MOE_GROUPED_MATMUL,
+        MOE_GROUPED_MATMUL_BWD,
+        DIAGONAL_BAND_MASK,
+        SOFTMAX,
     };
     Type tag;
 
@@ -186,6 +201,13 @@ class INode {
               std::shared_ptr<Tensor_attributes> c);
 
     void
+    pointwise(std::shared_ptr<Tensor_attributes> a,
+              std::shared_ptr<Tensor_attributes> b,
+              std::shared_ptr<Tensor_attributes> c,
+              Pointwise_attributes attributes,
+              std::shared_ptr<Tensor_attributes> d);
+
+    void
     reduction(std::shared_ptr<Tensor_attributes> a,
               Reduction_attributes attributes,
               std::shared_ptr<Tensor_attributes> c);
@@ -229,6 +251,22 @@ class INode {
                        Moe_grouped_matmul_attributes attributes,
                        std::shared_ptr<Tensor_attributes> output);
 
+    void
+    moe_grouped_matmul_bwd(std::shared_ptr<Tensor_attributes> doutput,
+                           std::shared_ptr<Tensor_attributes> token,
+                           std::shared_ptr<Tensor_attributes> first_token_offset,
+                           Moe_grouped_matmul_bwd_attributes attributes,
+                           std::shared_ptr<Tensor_attributes> dweight);
+
+    void
+    transpose(std::shared_ptr<Tensor_attributes> input,
+              Transpose_attributes attributes,
+              std::shared_ptr<Tensor_attributes> output);
+
+    void
+    slice(std::shared_ptr<Tensor_attributes> input,
+          Slice_attributes attributes,
+          std::shared_ptr<Tensor_attributes> output);
     error_t
     validate_subtree() {
         // pre validate to catch errors early
@@ -305,6 +343,16 @@ class INode {
         return {error_code_t::OK, ""};
     }
 
+    error_t
+    collect_tensors_to_dump_subtree(
+        std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump) const {
+        CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_to_dump_node(tensors_to_dump));
+        for (auto const& sub_node : sub_nodes) {
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_tensors_to_dump_subtree(tensors_to_dump));
+        }
+        return {error_code_t::OK, ""};
+    }
+
     int64_t
     get_fe_workspace_size_subtree() const {
         int64_t fe_workspace_size = get_fe_workspace_size_node();
@@ -337,6 +385,11 @@ class INode {
     virtual Type
     getType() = 0;
 
+    virtual std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
+    override_heuristics_query() const {
+        return {-1, {}};
+    }
+
     std::shared_ptr<Tensor_attributes> matmul(std::shared_ptr<Tensor_attributes>,
                                               std::shared_ptr<Tensor_attributes>,
                                               Matmul_attributes);
@@ -353,10 +406,21 @@ class INode {
     std::shared_ptr<Tensor_attributes> reduction(std::shared_ptr<Tensor_attributes>, Reduction_attributes);
     std::array<std::shared_ptr<Tensor_attributes>, 2> resample(std::shared_ptr<Tensor_attributes>, Resample_attributes);
     std::shared_ptr<Tensor_attributes> reshape(std::shared_ptr<Tensor_attributes>, Reshape_attributes);
+    std::shared_ptr<Tensor_attributes> transpose(std::shared_ptr<Tensor_attributes>, Transpose_attributes);
+    std::shared_ptr<Tensor_attributes> slice(std::shared_ptr<Tensor_attributes>, Slice_attributes);
 
     std::shared_ptr<Tensor_attributes> rng(std::shared_ptr<Tensor_attributes>,
                                            std::shared_ptr<Tensor_attributes>,
                                            Rng_attributes);
+
+    std::shared_ptr<Tensor_attributes>
+    diagonal_band_mask(std::shared_ptr<Tensor_attributes> x,
+                       std::shared_ptr<Tensor_attributes> b,
+                       std::shared_ptr<Tensor_attributes> seq_len_q,
+                       std::shared_ptr<Tensor_attributes> seq_len_kv,
+                       std::shared_ptr<Tensor_attributes> left_bound,
+                       std::shared_ptr<Tensor_attributes> shift_right_bound,
+                       DiagonalBandMask_attributes attributes);
 
     INode(detail::Context const& context) : context(context) {}
 

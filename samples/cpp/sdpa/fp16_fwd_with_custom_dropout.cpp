@@ -164,33 +164,33 @@ TEST_CASE("Toy sdpa forward with dropout", "[graph][sdpa][flash][forward]") {
     REQUIRE(graph->build(handle, {fe::HeurMode_t::A}).is_good());
 
     //// Build variant pack
-    Surface<half> q_tensor(b * h_q * s_q * d_qk, false);
-    Surface<half> k_tensor(b * h_k * d_qk * s_kv, false);
-    Surface<half> v_tensor(b * h_v * d_v * s_kv, false);
+    Surface<half> q_tensor(b * h_q * s_q * d_qk);
+    Surface<half> k_tensor(b * h_k * d_qk * s_kv);
+    Surface<half> v_tensor(b * h_v * d_v * s_kv);
 
-    Surface<half> o_tensor(b * s_q * h_q * d_qk, false);
+    Surface<half> o_tensor(b * s_q * h_q * d_qk);
 
     std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> variant_pack = {
         {Q_UID, q_tensor.devPtr}, {K_UID, k_tensor.devPtr}, {V_UID, v_tensor.devPtr}, {O_UID, o_tensor.devPtr}};
 
-    Surface<half> bias_tensor(b * 1 * s_q * s_kv, false);
+    Surface<half> bias_tensor(b * 1 * s_q * s_kv);
     if (has_attn_bias) {
         variant_pack[BIAS_UID] = bias_tensor.devPtr;
     }
 
     float dropout_scale = 0.1f;
-    Surface<half> dropout_mask_tensor(b * h_q * s_q * s_kv, false);
+    Surface<half> dropout_mask_tensor(b * h_q * s_q * s_kv);
     variant_pack[DROPOUT_MASK_UID]  = dropout_mask_tensor.devPtr;
     variant_pack[DROPOUT_SCALE_UID] = &dropout_scale;
 
-    Surface<float> statsTensor(b * h_q * s_q * 1, false);
+    Surface<float> statsTensor(b * h_q * s_q * 1);
     if (generate_stats == true) {
         variant_pack[STATS_UID] = statsTensor.devPtr;
     }
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 

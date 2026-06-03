@@ -37,6 +37,7 @@ find_package(Python 3.8 COMPONENTS Interpreter Development.Module REQUIRED)
 include(${PROJECT_SOURCE_DIR}/cmake/cuDNN.cmake)
 
 option(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE "Whether cmake build system should fetch pybinds." ON)
+set(PYBIND11_FINDPYTHON ON)
 
 
 if(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE)

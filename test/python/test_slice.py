@@ -7,9 +7,7 @@ from looseversion import LooseVersion
 from test_utils import torch_fork_set_rng
 
 
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch"
-)
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 9, reason="requires Hopper or newer arch")
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_int8_bf16_matmul_slice(cudnn_handle):
@@ -22,22 +20,10 @@ def test_int8_bf16_matmul_slice(cudnn_handle):
     slice_K = slice(None, None)
 
     # Initialize input tensors
-    A_gpu = (
-        2
-        * torch.randn(
-            Batch, M, K, requires_grad=False, device="cuda", dtype=torch.bfloat16
-        )
-        - 0.25
-    )
+    A_gpu = 2 * torch.randn(Batch, M, K, requires_grad=False, device="cuda", dtype=torch.bfloat16) - 0.25
     A_slice_gpu = A_gpu[slice_B, slice_M, :]
 
-    B_gpu = (
-        3
-        * torch.randn(
-            Batch, K, N, requires_grad=False, device="cuda", dtype=torch.bfloat16
-        )
-        - 1.25
-    )
+    B_gpu = 3 * torch.randn(Batch, K, N, requires_grad=False, device="cuda", dtype=torch.bfloat16) - 1.25
     B_slice_gpu = B_gpu[slice_B, :, slice_N]
 
     stream = torch.cuda.current_stream().cuda_stream
@@ -53,9 +39,7 @@ def test_int8_bf16_matmul_slice(cudnn_handle):
     B = graph.tensor_like(B_gpu)
     B_slice = graph.slice(B, [slice_B, slice_K, slice_N], name="B_slice")
 
-    C = graph.matmul(
-        name="matmul", A=A_slice, B=B_slice, compute_data_type=cudnn.data_type.FLOAT
-    )
+    C = graph.matmul(name="matmul", A=A_slice, B=B_slice, compute_data_type=cudnn.data_type.FLOAT)
     C.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
 
     graph.validate()
@@ -71,15 +55,11 @@ def test_int8_bf16_matmul_slice(cudnn_handle):
     graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
 
     # Run pyt reference
-    C_expected = torch.matmul(
-        A_slice_gpu.to(torch.bfloat16), B_slice_gpu.to(torch.bfloat16)
-    )
+    C_expected = torch.matmul(A_slice_gpu.to(torch.bfloat16), B_slice_gpu.to(torch.bfloat16))
 
     # Run cudnn graph
     C_actual = torch.zeros_like(C_expected)
-    workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     graph.execute({A: A_gpu, B: B_gpu, C: C_actual}, workspace, handle=cudnn_handle)
     print(A_gpu.data_ptr())
     torch.cuda.synchronize()

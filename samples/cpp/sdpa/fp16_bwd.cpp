@@ -66,7 +66,8 @@ create_sdpa_backward_graph(int64_t const b,
                            bool const causal_mask                     = false,
                            bool const alibi_mask                      = false,
                            bool const padding_mask                    = false,
-                           bool has_attn_bias                         = false) {
+                           bool has_attn_bias                         = false,
+                           bool is_deterministic                      = false) {
     // Create a graph and set common global properties
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(fe::DataType_t::BFLOAT16)
@@ -118,7 +119,8 @@ create_sdpa_backward_graph(int64_t const b,
     auto sdpa_options = fe::graph::SDPA_backward_attributes()
                             .set_name("flash_attention_backward")
                             .set_alibi_mask(alibi_mask)
-                            .set_attn_scale(attn_scale);
+                            .set_attn_scale(attn_scale)
+                            .set_deterministic_algorithm(is_deterministic);
 
     if (causal_mask) {
         sdpa_options.set_diagonal_alignment(cudnn_frontend::DiagonalAlignment_t::TOP_LEFT)
@@ -181,20 +183,27 @@ create_sdpa_backward_graph(int64_t const b,
 
 // Test case for the SDPA backward graph
 TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
-    int64_t b           = 3;     // batch size
-    int64_t h_q         = 4;     // head dim
-    int64_t h_k         = 4;     // head dim
-    int64_t h_v         = 4;     // head dim
-    int64_t s_q         = 1024;  // q tensor is padded to this seq length
-    int64_t s_kv        = 1024;  // k and v tensor is padded to this seq length
-    int64_t d_qk        = 128;   // hidden dim
-    int64_t d_v         = 128;   // hidden dim
-    bool generate_stats = true;
-    float attn_scale    = 0.123f;
-    bool causal_mask    = true;
-    bool padding_mask   = (cudnnGetVersion() >= 8903);
-    bool alibi_mask     = (cudnnGetVersion() >= 8904);
-    bool has_attn_bias  = (cudnnGetVersion() >= 90500);
+    int64_t b             = 3;     // batch size
+    int64_t h_q           = 4;     // head dim
+    int64_t h_k           = 4;     // head dim
+    int64_t h_v           = 4;     // head dim
+    int64_t s_q           = 1024;  // q tensor is padded to this seq length
+    int64_t s_kv          = 1024;  // k and v tensor is padded to this seq length
+    int64_t d_qk          = 128;   // hidden dim
+    int64_t d_v           = 128;   // hidden dim
+    bool generate_stats   = true;
+    float attn_scale      = 0.123f;
+    bool causal_mask      = true;
+    bool padding_mask     = (cudnnGetVersion() >= 8903);
+    bool alibi_mask       = (cudnnGetVersion() >= 8904);
+    bool has_attn_bias    = (cudnnGetVersion() >= 90500);
+    bool is_deterministic = true;
+
+    if (is_deterministic) {
+        // switching off because NOT SUPPORTED in deterministic algorithm
+        alibi_mask    = false;
+        has_attn_bias = false;
+    }
 
     if (cudnnGetVersion() < 8903) {
         SKIP("Test requires cudnn 8.9.3 or above");
@@ -219,25 +228,26 @@ TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
                                             causal_mask,
                                             alibi_mask,
                                             padding_mask,
-                                            has_attn_bias);
+                                            has_attn_bias,
+                                            is_deterministic);
 
     REQUIRE(graph->build(handle, {fe::HeurMode_t::A}).is_good());
 
     //// Build variant pack
     // inputs
-    Surface<half> q_tensor(b * h_q * s_q * d_qk, false);
-    Surface<half> k_tensor(b * h_k * d_qk * s_kv, false);
-    Surface<half> v_tensor(b * h_v * d_v * s_kv, false);
-    Surface<half> o_tensor(b * h_q * s_q * d_v, false);
-    Surface<half> dO_tensor(b * h_q * s_q * d_v, false);
-    Surface<float> stats_tensor(b * h_q * s_q * 1, false);
+    Surface<half> q_tensor(b * h_q * s_q * d_qk);
+    Surface<half> k_tensor(b * h_k * d_qk * s_kv);
+    Surface<half> v_tensor(b * h_v * d_v * s_kv);
+    Surface<half> o_tensor(b * h_q * s_q * d_v);
+    Surface<half> dO_tensor(b * h_q * s_q * d_v);
+    Surface<float> stats_tensor(b * h_q * s_q * 1);
     // outputs
-    Surface<half> dQ_tensor(b * h_q * s_q * d_qk, false);
-    Surface<half> dK_tensor(b * h_k * s_kv * d_qk, false);
-    Surface<half> dV_tensor(b * h_v * s_kv * d_v, false);
+    Surface<half> dQ_tensor(b * h_q * s_q * d_qk);
+    Surface<half> dK_tensor(b * h_k * s_kv * d_qk);
+    Surface<half> dV_tensor(b * h_v * s_kv * d_v);
 
-    Surface<half> bias_tensor(1 * h_q * s_q * s_kv, false);
-    Surface<half> dbias_tensor(1 * h_q * s_q * s_kv, false);
+    Surface<half> bias_tensor(1 * h_q * s_q * s_kv);
+    Surface<half> dbias_tensor(1 * h_q * s_q * s_kv);
 
     // Create variant pack with input and output tensors
     std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> variant_pack = {// inputs
@@ -259,8 +269,8 @@ TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
     }
 
     // If padding mask is enabled, add sequence lengths to the variant pack
-    Surface<int32_t> devActualSeqlenQ(b, false);
-    Surface<int32_t> devActualSeqlenKV(b, false);
+    Surface<int32_t> devActualSeqlenQ(b);
+    Surface<int32_t> devActualSeqlenKV(b);
     if (padding_mask) {
         std::vector<int32_t> hostActualSeqlenQ(b, 20);
         std::vector<int32_t> hostActualSeqlenKV(b, 20);
@@ -282,7 +292,7 @@ TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
     // Allocate workspace
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 

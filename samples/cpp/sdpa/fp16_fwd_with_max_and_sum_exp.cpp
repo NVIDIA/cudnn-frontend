@@ -30,9 +30,9 @@ namespace fe = cudnn_frontend;
 
 /*
 Run this example by using command:
-bin/samples "Toy sdpa forward with sink"
+bin/samples "Toy sdpa forward with max and sum exp"
 
-This example shows how to construct a sdpa forward graph with sink token.
+This example shows how to construct a sdpa forward graph with max and sum exp.
 */
 
 // Tensors in forward pass
@@ -126,6 +126,7 @@ create_sdpa_forward_graph_with_max_and_sum_exp(int64_t const b,
 
     if (generate_max) {
         auto Max = graph->tensor(fe::graph::Tensor_attributes()
+                                     .set_output(true)
                                      .set_name("Max")
                                      .set_uid(MAX_UID)
                                      .set_dim({b, h_q, s_q, 1})
@@ -136,6 +137,7 @@ create_sdpa_forward_graph_with_max_and_sum_exp(int64_t const b,
 
     if (generate_sum_exp) {
         auto Sum_exp = graph->tensor(fe::graph::Tensor_attributes()
+                                         .set_output(true)
                                          .set_name("Sum_exp")
                                          .set_uid(SUM_EXP_UID)
                                          .set_dim({b, h_q, s_q, 1})
@@ -146,7 +148,11 @@ create_sdpa_forward_graph_with_max_and_sum_exp(int64_t const b,
 
     auto [O, Stats] = graph->sdpa(Q, K, V, std::move(sdpa_options));
 
-    O->set_output(true).set_dim({b, h_q, s_q, d_v}).set_stride({h_q * d_v, d_v, b * h_q * d_v, 1}).set_uid(O_UID);
+    O->set_output(true)
+        .set_name("O")
+        .set_dim({b, h_q, s_q, d_v})
+        .set_stride({h_q * d_v, d_v, b * h_q * d_v, 1})
+        .set_uid(O_UID);
 
     if (generate_stats) {
         Stats->set_output(true).set_data_type(fe::DataType_t::FLOAT).set_uid(STATS_UID);
@@ -158,15 +164,16 @@ create_sdpa_forward_graph_with_max_and_sum_exp(int64_t const b,
 }
 
 TEST_CASE("Toy sdpa forward with max and sum exp", "[graph][sdpa][flash][forward]") {
-    int64_t b             = 3;     // batch size
-    int64_t h_q           = 4;     // head dim
-    int64_t h_k           = 4;     // head dim
-    int64_t h_v           = 4;     // head dim
-    int64_t s_q           = 1024;  // q tensor is padded to this seq length
-    int64_t s_kv          = 1024;  // k and v tensor is padded to this seq length
-    int64_t d_qk          = 128;   // hidden dim
-    int64_t d_v           = 128;   // hidden dim
-    bool generate_stats   = false;
+    int64_t b    = 3;     // batch size
+    int64_t h_q  = 4;     // head dim
+    int64_t h_k  = 4;     // head dim
+    int64_t h_v  = 4;     // head dim
+    int64_t s_q  = 1024;  // q tensor is padded to this seq length
+    int64_t s_kv = 1024;  // k and v tensor is padded to this seq length
+    int64_t d_qk = 128;   // hidden dim
+    int64_t d_v  = 128;   // hidden dim
+    // Only 9.21.0 and above supports generating all 3 outputs (stats, max, sum_exp) simultaneously.
+    bool generate_stats   = (cudnnGetVersion() >= 92100);
     bool generate_max     = true;
     bool generate_sum_exp = true;
     float attn_scale      = 0.123f;
@@ -215,22 +222,22 @@ TEST_CASE("Toy sdpa forward with max and sum exp", "[graph][sdpa][flash][forward
     REQUIRE(graph->build_plans(handle).is_good());
 
     //// Build variant pack
-    Surface<half> q_tensor(b * h_q * s_q * d_qk, false);
-    Surface<half> k_tensor(b * h_k * d_qk * s_kv, false);
-    Surface<half> v_tensor(b * h_v * d_v * s_kv, false);
+    Surface<half> q_tensor(b * h_q * s_q * d_qk);
+    Surface<half> k_tensor(b * h_k * d_qk * s_kv);
+    Surface<half> v_tensor(b * h_v * d_v * s_kv);
 
-    Surface<half> o_tensor(b * s_q * h_q * d_qk, false);
+    Surface<half> o_tensor(b * s_q * h_q * d_qk);
 
     std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> variant_pack = {
         {Q_UID, q_tensor.devPtr}, {K_UID, k_tensor.devPtr}, {V_UID, v_tensor.devPtr}, {O_UID, o_tensor.devPtr}};
 
-    Surface<half> bias_tensor(b * 1 * s_q * s_kv, false);
+    Surface<half> bias_tensor(b * 1 * s_q * s_kv);
     if (has_attn_bias) {
         variant_pack[BIAS_UID] = bias_tensor.devPtr;
     }
 
-    Surface<int32_t> devActualSeqlenQ(b, false);
-    Surface<int32_t> devActualSeqlenKV(b, false);
+    Surface<int32_t> devActualSeqlenQ(b);
+    Surface<int32_t> devActualSeqlenKV(b);
     if (padding_mask) {
         std::vector<int32_t> hostActualSeqlenQ(b, 20);
         std::vector<int32_t> hostActualSeqlenKV(b, 20);
@@ -249,9 +256,9 @@ TEST_CASE("Toy sdpa forward with max and sum exp", "[graph][sdpa][flash][forward
         variant_pack[SEQ_LEN_KV_UID] = devActualSeqlenKV.devPtr;
     }
 
-    Surface<float> stats_tensor(b * h_q * s_q * 1, false);
-    Surface<float> max_tensor(b * h_q * s_q * 1, false);
-    Surface<float> sum_exp_tensor(b * h_q * s_q * 1, false);
+    Surface<float> stats_tensor(b * h_q * s_q * 1);
+    Surface<float> max_tensor(b * h_q * s_q * 1);
+    Surface<float> sum_exp_tensor(b * h_q * s_q * 1);
     if (generate_max == true) {
         variant_pack[MAX_UID] = max_tensor.devPtr;
     }
@@ -264,7 +271,7 @@ TEST_CASE("Toy sdpa forward with max and sum exp", "[graph][sdpa][flash][forward
 
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 

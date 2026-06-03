@@ -182,14 +182,14 @@ TEST_CASE("Benchmark conv graph API runtimes", "[conv][graph][benchmark]") {
                                                                              const fe::graph::Tensor_attributes *X,
                                                                              const fe::graph::Tensor_attributes *W,
                                                                              const fe::graph::Tensor_attributes *Y) {
-        Surface<half> x_tensor(max_x_volume, false);
-        Surface<half> w_tensor(max_w_volume, false);
-        Surface<half> y_tensor(max_y_volume, false);
+        Surface<half> x_tensor(max_x_volume);
+        Surface<half> w_tensor(max_w_volume);
+        Surface<half> y_tensor(max_y_volume);
 
         std::unordered_map<int64_t, void *> variant_pack = {
             {X->get_uid(), x_tensor.devPtr}, {W->get_uid(), w_tensor.devPtr}, {Y->get_uid(), y_tensor.devPtr}};
 
-        Surface<int8_t> workspace(graph->get_workspace_size(), false);
+        Surface<int8_t> workspace(graph->get_workspace_size());
 
         REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
     };

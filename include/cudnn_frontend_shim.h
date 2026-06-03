@@ -38,6 +38,8 @@
 #endif
 #include <mutex>
 #include <stdexcept>
+#include <cstdlib>
+#include <string>
 #endif
 
 namespace cudnn_frontend {
@@ -69,11 +71,11 @@ load_cuda_so() {
     dlerror();
 
     // Attempt to open the cuda library
-    HMODULE handle    = dlopen("libcuda.so", RTLD_NOW);
+    HMODULE handle    = dlopen("libcuda.so.1", RTLD_NOW);
     const char *error = reinterpret_cast<const char *>(dlerror());
     if (!handle || error) {
         // If opening the library fails, throw an exception with the error message
-        throw std::runtime_error("Unable to dlopen libcuda.so : " + std::string(error ? error : "Unknown error"));
+        throw std::runtime_error("Unable to dlopen libcuda.so.1 : " + std::string(error ? error : "Unknown error"));
     }
 
     return handle;
@@ -83,6 +85,26 @@ inline HMODULE
 load_cudart_so() {
     // Clear any existing error
     dlerror();
+
+    // Allow the user to override the libcudart selection via an environment variable.
+    // This is useful in environments (e.g. containers such as GKE with the TCPXO NCCL
+    // plugin) where multiple major versions of libcudart are present in the library
+    // search path. In such cases the automatic detection below would otherwise abort
+    // with a "Multiple libcudart libraries found" error. Setting
+    // CUDNN_FRONTEND_CUDART_LIB_NAME to the desired library name (or path), e.g.
+    // "libcudart.so.13", bypasses the detection and loads exactly that library.
+    if (const char *user_lib = std::getenv("CUDNN_FRONTEND_CUDART_LIB_NAME")) {
+        if (user_lib[0] != '\0') {
+            HMODULE handle    = dlopen(user_lib, RTLD_NOW);
+            const char *error = reinterpret_cast<const char *>(dlerror());
+            if (!handle || error) {
+                throw std::runtime_error(
+                    "Unable to load libcudart library specified by CUDNN_FRONTEND_CUDART_LIB_NAME (" +
+                    std::string(user_lib) + "): " + std::string(error ? error : "Unknown error"));
+            }
+            return handle;
+        }
+    }
 
     // List of potential libcudart libraries (Adding major version to support python package)
     constexpr const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
@@ -193,14 +215,14 @@ get_cuda_symbol(CudaLibrary library, const char *function_name) {
 
 #endif
 
-inline CUresult
-cu_graph_create(CUgraph *pGraph, unsigned int flags) {
-    NV_FE_CALL_TO_CU(cu_graph_create, cuGraphCreate, pGraph, flags);
+inline cudaError_t
+cuda_graph_create(cudaGraph_t *pGraph, unsigned int flags) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_create, cudaGraphCreate, pGraph, flags);
 }
 
-inline CUresult
-cu_graph_get_nodes(CUgraph hGraph, CUgraphNode *nodes, size_t *numNodes) {
-    NV_FE_CALL_TO_CU(cu_graph_get_nodes, cuGraphGetNodes, hGraph, nodes, numNodes);
+inline cudaError_t
+cuda_graph_get_nodes(cudaGraph_t hGraph, cudaGraphNode_t *nodes, size_t *numNodes) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_get_nodes, cudaGraphGetNodes, hGraph, nodes, numNodes);
 }
 
 inline cudaError_t
@@ -387,19 +409,24 @@ cuda_get_device(int *device) {
     NV_FE_CALL_TO_CUDA(cuda_get_device, cudaGetDevice, device);
 }
 
+inline cudaError_t
+cuda_pointer_get_attributes(cudaPointerAttributes *attributes, const void *ptr) {
+    NV_FE_CALL_TO_CUDA(cuda_pointer_get_attributes, cudaPointerGetAttributes, attributes, ptr);
+}
+
 inline const char *
 cuda_get_error_string(cudaError_t error) {
     NV_FE_CALL_TO_CUDA(cuda_get_error_string, cudaGetErrorString, error);
 }
 
-inline CUresult
-cu_get_error_string(CUresult error, const char **pStr) {
-    NV_FE_CALL_TO_CU(cu_get_error_string, cuGetErrorString, error, pStr);
-}
-
 inline cudaError_t
 cuda_device_synchronize() {
     NV_FE_CALL_TO_CUDA(cuda_device_synchronize, cudaDeviceSynchronize);
+}
+
+inline cudaError_t
+cuda_stream_synchronize(cudaStream_t stream) {
+    NV_FE_CALL_TO_CUDA(cuda_stream_synchronize, cudaStreamSynchronize, stream);
 }
 
 inline cudaError_t
@@ -421,6 +448,70 @@ inline cudnnStatus_t
 destroy_handle(cudnnHandle_t handle) {
     NV_FE_CALL_TO_BACKEND(destroy_handle, cudnnDestroy, handle);
 }
+
+#if CUDNN_VERSION >= 92200
+inline cudnnStatus_t
+causal_conv1d_forward(cudaStream_t stream,
+                      const void *x,
+                      const void *weight,
+                      const void *bias,
+                      void *y,
+                      int batch,
+                      int dim,
+                      int seq_len,
+                      int kernel_size,
+                      cudnnDataType_t data_type,
+                      cudnnCausalConv1dActivation_t activation) {
+    NV_FE_CALL_TO_BACKEND(causal_conv1d_forward,
+                          cudnnCausalConv1dForward,
+                          stream,
+                          x,
+                          weight,
+                          bias,
+                          y,
+                          batch,
+                          dim,
+                          seq_len,
+                          kernel_size,
+                          data_type,
+                          activation);
+}
+
+inline cudnnStatus_t
+causal_conv1d_backward(cudaStream_t stream,
+                       const void *x,
+                       const void *weight,
+                       const void *bias,
+                       const void *dy,
+                       void *dx,
+                       void *dweight,
+                       void *dbias,
+                       int batch,
+                       int dim,
+                       int seq_len,
+                       int kernel_size,
+                       cudnnDataType_t data_type,
+                       cudnnDataType_t dw_data_type,
+                       cudnnCausalConv1dActivation_t activation) {
+    NV_FE_CALL_TO_BACKEND(causal_conv1d_backward,
+                          cudnnCausalConv1dBackward,
+                          stream,
+                          x,
+                          weight,
+                          bias,
+                          dy,
+                          dx,
+                          dweight,
+                          dbias,
+                          batch,
+                          dim,
+                          seq_len,
+                          kernel_size,
+                          data_type,
+                          dw_data_type,
+                          activation);
+}
+#endif
 
 inline size_t
 get_backend_version(void) {
@@ -509,6 +600,27 @@ finalize(cudnnBackendDescriptor_t descriptor) {
 inline cudnnStatus_t
 execute(cudnnHandle_t handle, cudnnBackendDescriptor_t executionPlan, cudnnBackendDescriptor_t variantPack) {
     NV_FE_CALL_TO_BACKEND(execute, cudnnBackendExecute, handle, executionPlan, variantPack);
+}
+
+inline cudnnStatus_t
+get_execution_plan_workspace_size(cudnnHandle_t handle,
+                                  cudnnBackendDescriptor_t executionPlan,
+                                  cudnnBackendDescriptor_t variantPack,
+                                  size_t *workspaceSizeInBytes) {
+#if CUDNN_VERSION >= 92300 && CUDNN_VERSION < 99900
+    NV_FE_CALL_TO_BACKEND(get_execution_plan_workspace_size,
+                          cudnnGetExecutionPlanWorkspaceSize,
+                          handle,
+                          executionPlan,
+                          variantPack,
+                          workspaceSizeInBytes);
+#else
+    (void)handle;
+    (void)executionPlan;
+    (void)variantPack;
+    (void)workspaceSizeInBytes;
+    return CUDNN_STATUS_VERSION_MISMATCH;
+#endif
 }
 
 inline cudnnStatus_t

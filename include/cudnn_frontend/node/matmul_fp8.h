@@ -1,9 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_MatMulDesc.h"
-#include "../../cudnn_frontend_Heuristics.h"
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 

@@ -11,7 +11,10 @@ Samples leveraging FE's Python interface are located in [samples/python](python/
 * [03_mixed_precision](python/03_mixed_precision_matmul.ipynb)
     Shows how to mutiply tensors of different data types.
 
-* [33_layer_norm](python/33_layernorm_forward_training_and_backward_with_relu_bitmask.ipynb)
+* [23_layer_norm](python/23_layernorm_with_pointwise_add_fusion.ipynb)
+    Shows how to run pointwise add and layer norm fusion with intermediate bfloat16 output.
+
+* [26_layer_norm](python/26_layernorm_forward_training_and_backward_with_relu_bitmask.ipynb)
     Shows how to use layer norm with fusion pattern for relu using a bitmask.
 
 * [50_sdpa](python/50_scaled_dot_product_attention.ipynb)

@@ -109,23 +109,34 @@ TEST_CASE("SGBN with SM carveout", "[batchnorm][graph][sm_carveout]") {
 
     REQUIRE(graph.build_plans(handle).is_good());
 
-    Surface<half> X_tensor(n * c * h * w, false);
-    Surface<float> Mean_tensor(c, false);
-    Surface<float> Var_tensor(c, false);
-    Surface<float> Previous_running_mean_tensor(c, false);
-    Surface<float> Previous_running_var_tensor(c, false);
-    Surface<float> Next_running_mean_tensor(c, false);
-    Surface<float> Next_running_var_tensor(c, false);
-    Surface<float> Scale_tensor(c, false);
-    Surface<float> Bias_tensor(c, false);
+    Surface<half> X_tensor(n * c * h * w);
+    Surface<float> Mean_tensor(c);
+    Surface<float> Var_tensor(c);
+    Surface<float> Previous_running_mean_tensor(c);
+    Surface<float> Previous_running_var_tensor(c);
+    Surface<float> Next_running_mean_tensor(c);
+    Surface<float> Next_running_var_tensor(c);
+    Surface<float> Scale_tensor(c);
+    Surface<float> Bias_tensor(c);
 
-    Surface<half> Y_tensor(n * c * h * w, false);
-    Surface<float> Peer_stats_0_tensor(2 * 4 * c, false, true);
-    Surface<float> Peer_stats_1_tensor(2 * 4 * c, false);
+    Surface<half> Y_tensor(n * c * h * w);
+    Surface<float> Peer_stats_0_tensor(2 * 4 * c);
+    std::vector<float> peer_stats_0_host(Peer_stats_0_tensor.size);
+    initHostImage(peer_stats_0_host.data(), static_cast<int64_t>(peer_stats_0_host.size()));
+    auto* peer_stats_0_bits = reinterpret_cast<uint32_t*>(peer_stats_0_host.data());
+    for (size_t i = 0; i < peer_stats_0_host.size(); i += 2) {
+        peer_stats_0_bits[i + 1] = 1u;
+    }
+    CUDA_CHECK(cudaMemcpy(Peer_stats_0_tensor.devPtr,
+                          peer_stats_0_host.data(),
+                          sizeof(peer_stats_0_host[0]) * peer_stats_0_host.size(),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    Surface<float> Peer_stats_1_tensor(2 * 4 * c);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},

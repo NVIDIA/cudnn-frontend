@@ -54,9 +54,7 @@ def test_device_properties():
         dim=[K, C, R, S],
         stride=[C * R * S, 1, C * S, C],
     )
-    Y_tensor = graph.conv_fprop(
-        X_tensor, W_tensor, padding=padding, stride=stride, dilation=dilation
-    )
+    Y_tensor = graph.conv_fprop(X_tensor, W_tensor, padding=padding, stride=stride, dilation=dilation)
     Y_tensor.set_output(True)
 
     graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -64,16 +62,10 @@ def test_device_properties():
 
     # Step 3
     # Compute reference
-    X_gpu = torch.randn(N, C, H, W, dtype=torch.float32, device="cuda").to(
-        memory_format=torch.channels_last
-    )
-    W_gpu = torch.randn(K, C, R, S, dtype=torch.float32, device="cuda").to(
-        memory_format=torch.channels_last
-    )
+    X_gpu = torch.randn(N, C, H, W, dtype=torch.float32, device="cuda").to(memory_format=torch.channels_last)
+    W_gpu = torch.randn(K, C, R, S, dtype=torch.float32, device="cuda").to(memory_format=torch.channels_last)
     with torch.amp.autocast(device_type="cuda", dtype=torch.float32):
-        Y_ref = torch.nn.functional.conv2d(
-            X_gpu, W_gpu, padding=padding, stride=stride, dilation=dilation
-        )
+        Y_ref = torch.nn.functional.conv2d(X_gpu, W_gpu, padding=padding, stride=stride, dilation=dilation)
 
     # Create handle only when needed (for graph execution)
     cudnn_handle = cudnn.create_handle()
@@ -86,9 +78,7 @@ def test_device_properties():
 
         Y_actual = torch.zeros_like(Y_ref)
 
-        workspace = torch.empty(
-            graph_deserialized.get_workspace_size(), device="cuda", dtype=torch.uint8
-        )
+        workspace = torch.empty(graph_deserialized.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
         graph_deserialized.execute(
             {X_tensor: X_gpu, W_tensor: W_gpu, Y_tensor: Y_actual},

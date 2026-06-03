@@ -9,9 +9,7 @@ from test_utils import torch_fork_set_rng
 embedding_dim_options = [768, 1024, 1280, 1600]
 input_type_options = [torch.bfloat16, torch.float16]
 
-all_options = [
-    elem for elem in itertools.product(*[embedding_dim_options, input_type_options])
-]
+all_options = [elem for elem in itertools.product(*[embedding_dim_options, input_type_options])]
 
 
 @pytest.fixture(params=all_options)
@@ -39,27 +37,9 @@ def test_layernorm(param_extract, cudnn_handle):
 
     epsilon_value = 1e-3
 
-    x_gpu = (
-        3
-        * torch.randn(
-            N, C, H, W, requires_grad=True, device="cuda", dtype=input_type
-        ).to(memory_format=torch.channels_last)
-        - 0.5
-    )
-    scale_gpu = (
-        5
-        * torch.randn(
-            1, C, H, W, requires_grad=True, device="cuda", dtype=input_type
-        ).to(memory_format=torch.channels_last)
-        - 1
-    )
-    bias_gpu = (
-        7
-        * torch.randn(
-            1, C, H, W, requires_grad=True, device="cuda", dtype=input_type
-        ).to(memory_format=torch.channels_last)
-        - 2
-    )
+    x_gpu = 3 * torch.randn(N, C, H, W, requires_grad=True, device="cuda", dtype=input_type).to(memory_format=torch.channels_last) - 0.5
+    scale_gpu = 5 * torch.randn(1, C, H, W, requires_grad=True, device="cuda", dtype=input_type).to(memory_format=torch.channels_last) - 1
+    bias_gpu = 7 * torch.randn(1, C, H, W, requires_grad=True, device="cuda", dtype=input_type).to(memory_format=torch.channels_last) - 2
     epsilon_cpu = torch.full(
         (1, 1, 1, 1),
         epsilon_value,
@@ -76,9 +56,7 @@ def test_layernorm(param_extract, cudnn_handle):
         eps=epsilon_value,
     )
     mean_expected = x_gpu.to(torch.float32).mean(dim=(1, 2, 3), keepdim=True)
-    inv_var_expected = torch.rsqrt(
-        torch.var(x_gpu.to(torch.float32), dim=(1, 2, 3), keepdim=True) + epsilon_value
-    )
+    inv_var_expected = torch.rsqrt(torch.var(x_gpu.to(torch.float32), dim=(1, 2, 3), keepdim=True) + epsilon_value)
 
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
@@ -89,9 +67,7 @@ def test_layernorm(param_extract, cudnn_handle):
         handle=cudnn_handle,
     )
 
-    X = graph.tensor(
-        name="X", dim=x_gpu.size(), stride=x_gpu.stride(), data_type=x_gpu.dtype
-    )
+    X = graph.tensor(name="X", dim=x_gpu.size(), stride=x_gpu.stride(), data_type=x_gpu.dtype)
     scale = graph.tensor(
         name="scale",
         dim=scale_gpu.size(),
@@ -141,9 +117,7 @@ def test_layernorm(param_extract, cudnn_handle):
     mean_actual = torch.empty_like(mean_expected)
     inv_var_actual = torch.empty_like(inv_var_expected)
 
-    workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
     graph.execute(
         {
@@ -179,9 +153,7 @@ def test_layernorm(param_extract, cudnn_handle):
         compute_data_type=cudnn.data_type.FLOAT,
     )
 
-    DY = bwd_graph.tensor(
-        name="DY", dim=x_gpu.size(), stride=x_gpu.stride(), data_type=x_gpu.dtype
-    )
+    DY = bwd_graph.tensor(name="DY", dim=x_gpu.size(), stride=x_gpu.stride(), data_type=x_gpu.dtype)
     X_bwd = bwd_graph.tensor_like(X, name="X")
     scale_bwd = bwd_graph.tensor_like(scale, name="scale")
     mean_bwd = bwd_graph.tensor_like(mean, name="mean")
@@ -216,9 +188,7 @@ def test_layernorm(param_extract, cudnn_handle):
     DScale_actual = torch.empty_like(scale_gpu)
     Dbias_actual = torch.empty_like(bias_gpu)
 
-    workspace = torch.empty(
-        bwd_graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
+    workspace = torch.empty(bwd_graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
     bwd_graph.execute(
         {

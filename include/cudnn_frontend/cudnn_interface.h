@@ -64,6 +64,22 @@ create_cudnn_tensor(
         .setByValue(props->get_is_pass_by_value())
         .setReorderType(props->get_reordering_type());
 
+    // Set vector count and dimension if they are non-default
+    if (props->get_vector_count() > 1 || props->get_vector_dimension() >= 0) {
+        tensor_builder.setVectorCountAndDimension(props->get_vector_count(), props->get_vector_dimension());
+    }
+
+    // Set compile-time constant value before build (if present)
+    if (props->get_has_compile_time_constant()) {
+        auto const_value = props->get_compile_time_constant();
+        if (const_value.has_value()) {
+            std::visit([&tensor_builder](auto&& val) { tensor_builder.setConstValue(val); }, *const_value);
+
+            CUDNN_FE_LOG_LABEL_ENDL("INFO:      Compile-time constant value set for tensor '" << props->get_name()
+                                                                                              << "'");
+        }
+    }
+
     if (auto ragged_offset_props = props->get_ragged_offset()) {
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(ragged_offset_props, tensors, potential_uid, used_uids));
         tensor_builder.setRaggedOffset(tensors.at(ragged_offset_props->get_uid()));
@@ -92,7 +108,13 @@ create_cudnn_tensor(
 }
 }  // namespace detail
 
+namespace graph {
+class UnifiedSDPANode;
+}  // namespace graph
+
 class ICudnn {
+    friend class graph::UnifiedSDPANode;
+
    protected:
     using uid_t = int64_t;
 
@@ -118,7 +140,14 @@ class ICudnn {
     bool is_dynamic_shape_enabled             = false;
     std::shared_ptr<KernelCache> kernel_cache = nullptr;
 
+    bool is_override_shape_enabled = false;
+
     std::shared_ptr<const DeviceProperties> device_properties = nullptr;
+
+    std::shared_ptr<OperationGraph_v8>
+    get_operation_graph() const {
+        return operation_graph;
+    }
 
     error_t
     create_cudnn_operation_graph(cudnnHandle_t handle) {
@@ -130,7 +159,8 @@ class ICudnn {
         auto&& cudnn_operation_graph_builder = cudnn_frontend::OperationGraphBuilder();
         cudnn_operation_graph_builder.setHandle(handle)
             .setOperationGraph(cudnn_operations.size(), cudnn_operations.data())
-            .setIsDynamicShapeEnabled(is_dynamic_shape_enabled);
+            .setIsDynamicShapeEnabled(is_dynamic_shape_enabled)
+            .setIsOverrideShapeEnabled(is_override_shape_enabled);
         for (auto& op : raw_operations) {
             cudnn_operation_graph_builder.addOperation(op);
         }
@@ -176,7 +206,10 @@ class ICudnn {
     execute_cudnn_plan_with_uid(cudnnHandle_t handle,
                                 std::unordered_map<int64_t, void*> const& tensor_uid_to_pointer_map,
                                 void* workspace_ptr,
-                                int64_t plan_index) const {
+                                int64_t plan_index,
+                                std::vector<int64_t> const& override_uids,
+                                std::vector<std::vector<int64_t>> const& override_shapes,
+                                std::vector<std::vector<int64_t>> const& override_strides) const {
         // Make sure device pointer is provided for all uids expected for this plan
         std::vector<void*> device_ptrs;
         std::vector<uid_t> uids;
@@ -191,10 +224,22 @@ class ICudnn {
 
         CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(plan_index));
 
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing plan at index " << plan_index << ".");
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing plan at index " << plan_index
+                                                                 << " with override uids: " << override_uids.size());
 
-        CHECK_CUDNN_FRONTEND_ERROR(
-            detail::execute(handle, plans.execution_plans[plan_index].get(), device_ptrs, uids, workspace_ptr));
+        if (override_uids.size() == 0) {
+            CHECK_CUDNN_FRONTEND_ERROR(
+                detail::execute(handle, plans.execution_plans[plan_index].get(), device_ptrs, uids, workspace_ptr));
+        } else {
+            CHECK_CUDNN_FRONTEND_ERROR(detail::execute(handle,
+                                                       plans.execution_plans[plan_index].get(),
+                                                       device_ptrs,
+                                                       uids,
+                                                       workspace_ptr,
+                                                       override_uids,
+                                                       override_shapes,
+                                                       override_strides));
+        }
 
         return {error_code_t::OK, ""};
     }

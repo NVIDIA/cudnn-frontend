@@ -1,8 +1,5 @@
 #pragma once
 
-#include "../../cudnn_frontend_Heuristics.h"
-#include "../../cudnn_frontend_Logging.h"
-
 #include "../graph_helpers.h"
 #include "../node_interface.h"
 
@@ -75,32 +72,95 @@ class BatchNormNode : public NodeCRTP<BatchNormNode> {
         managed_backend_descriptor_t& raw_operations,
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         CUDNN_FRONTEND_UNUSED(raw_operations);
-        CUDNN_FE_LOG_LABEL("INFO: Building BatchNormNode operations " << attributes.name);
+        CUDNN_FE_LOG_LABEL("INFO: Building BatchNormNode operations " << attributes.name << " ");
 
-        std::vector<cudnn_frontend::Tensor> peer_stats;
-        for (auto const& peer_stat : attributes.peer_stats) {
-            peer_stats.emplace_back(std::move(*(tensors[peer_stat->get_uid()])));
-        }
+        // Create operation by directly calling cuDNN backend API
+        Operation_v8 batchnorm_operation;
 
-        auto&& batchnorm_operation_builder =
-            cudnn_frontend::OperationBuilder(DescriptorType_t::OPERATION_NORM_FORWARD_DESCRIPTOR);
+        _CUDNN_CHECK_CUDNN_ERROR(
+            batchnorm_operation.initialize_managed_backend_pointer(CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR));
 
-        batchnorm_operation_builder.setNormalizationMode(NormMode_t::BATCH_NORM)
-            .setNormFwdPhase(NormFwdPhase_t::TRAINING);
+        // Set norm mode to BATCH_NORM
+        cudnnBackendNormMode_t cudnn_norm_mode;
 
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(NormMode_t::BATCH_NORM, cudnn_norm_mode));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_MODE,
+                                                       CUDNN_TYPE_NORM_MODE,
+                                                       1,
+                                                       &cudnn_norm_mode));
+
+        // Set forward phase to TRAINING
+        cudnnBackendNormFwdPhase_t cudnn_norm_fwd_phase;
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(NormFwdPhase_t::TRAINING, cudnn_norm_fwd_phase));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_PHASE,
+                                                       CUDNN_TYPE_NORM_FWD_PHASE,
+                                                       1,
+                                                       &cudnn_norm_fwd_phase));
+
+        // Set input tensor X
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(X, Batchnorm_attributes::input_names::X);
-        batchnorm_operation_builder.setxDesc(*(tensors[X->second->get_uid()]));
+        auto x_desc = tensors.at(X->second->get_uid())->get_raw_desc();
 
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_XDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &x_desc));
+
+        // Set saved mean and inv_variance
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(MEAN, Batchnorm_attributes::output_names::MEAN);
+        auto mean_desc = tensors.at(MEAN->second->get_uid())->get_raw_desc();
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_MEAN_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &mean_desc));
+
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(INV_VARIANCE, Batchnorm_attributes::output_names::INV_VARIANCE);
-        batchnorm_operation_builder.setSavedMeanAndInvVar(*(tensors[MEAN->second->get_uid()]),
-                                                          *(tensors[INV_VARIANCE->second->get_uid()]));
+        auto inv_var_desc = tensors.at(INV_VARIANCE->second->get_uid())->get_raw_desc();
 
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_INV_VARIANCE_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &inv_var_desc));
+
+        // Set scale and bias tensors
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Batchnorm_attributes::input_names::SCALE);
-        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(BIAS, Batchnorm_attributes::input_names::BIAS);
-        batchnorm_operation_builder.setScaleAndBias(*(tensors[SCALE->second->get_uid()]),
-                                                    *(tensors[BIAS->second->get_uid()]));
+        auto scale_desc = tensors.at(SCALE->second->get_uid())->get_raw_desc();
 
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &scale_desc));
+
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(BIAS, Batchnorm_attributes::input_names::BIAS);
+        auto bias_desc = tensors.at(BIAS->second->get_uid())->get_raw_desc();
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_BIAS_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &bias_desc));
+
+        // Set epsilon tensor
+        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(EPSILON, Batchnorm_attributes::input_names::EPSILON);
+        auto epsilon_desc = tensors.at(EPSILON->second->get_uid())->get_raw_desc();
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_EPSILON_DESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &epsilon_desc));
+
+        // Check for running stats
         bool has_running_stats = true;
         auto it                = attributes.inputs.find(Batchnorm_attributes::input_names::PREV_RUNNING_MEAN);
         if (it == attributes.inputs.end() || it->second == nullptr) {
@@ -108,51 +168,86 @@ class BatchNormNode : public NodeCRTP<BatchNormNode> {
         }
 
         if (has_running_stats) {
+            // Set momentum (exp decay factor)
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(MOMENTUM, Batchnorm_attributes::input_names::MOMENTUM);
+            auto momentum_desc = tensors.at(MOMENTUM->second->get_uid())->get_raw_desc();
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_EXP_AVG_FACTOR_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &momentum_desc));
+
+            // Set prev running mean and var
             CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(PREV_RUNNING_MEAN,
                                                       Batchnorm_attributes::input_names::PREV_RUNNING_MEAN);
+            auto prev_mean_desc = tensors.at(PREV_RUNNING_MEAN->second->get_uid())->get_raw_desc();
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_INPUT_RUNNING_MEAN_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &prev_mean_desc));
+
             CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(PREV_RUNNING_VAR,
                                                       Batchnorm_attributes::input_names::PREV_RUNNING_VAR);
-            batchnorm_operation_builder.setPrevRunningMeanAndVar(*(tensors[PREV_RUNNING_MEAN->second->get_uid()]),
-                                                                 *(tensors[PREV_RUNNING_VAR->second->get_uid()]));
+            auto prev_var_desc = tensors.at(PREV_RUNNING_VAR->second->get_uid())->get_raw_desc();
 
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_INPUT_RUNNING_VAR_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &prev_var_desc));
+
+            // Set next running mean and var
             CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(NEXT_RUNNING_MEAN,
                                                        Batchnorm_attributes::output_names::NEXT_RUNNING_MEAN);
+            auto next_mean_desc = tensors.at(NEXT_RUNNING_MEAN->second->get_uid())->get_raw_desc();
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_OUTPUT_RUNNING_MEAN_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &next_mean_desc));
+
             CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(NEXT_RUNNING_VAR,
                                                        Batchnorm_attributes::output_names::NEXT_RUNNING_VAR);
-            batchnorm_operation_builder.setNextRunningMeanAndVar(*(tensors[NEXT_RUNNING_MEAN->second->get_uid()]),
-                                                                 *(tensors[NEXT_RUNNING_VAR->second->get_uid()]));
+            auto next_var_desc = tensors.at(NEXT_RUNNING_VAR->second->get_uid())->get_raw_desc();
 
-            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(MOMENTUM, Batchnorm_attributes::input_names::MOMENTUM);
-            batchnorm_operation_builder.setExpDecayFactorTensor(*(tensors[MOMENTUM->second->get_uid()]));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_OUTPUT_RUNNING_VAR_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &next_var_desc));
         }
 
-        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(EPSILON, Batchnorm_attributes::input_names::EPSILON);
-        batchnorm_operation_builder.setEpsilonTensor(*(tensors[EPSILON->second->get_uid()]));
-
+        // Set output tensor Y
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Batchnorm_attributes::output_names::Y);
-        batchnorm_operation_builder.setyDesc(*(tensors[Y->second->get_uid()]));
+        auto y_desc = tensors.at(Y->second->get_uid())->get_raw_desc();
 
-        batchnorm_operation_builder.setPeerStatTensor(peer_stats);
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                       CUDNN_ATTR_OPERATION_NORM_FWD_YDESC,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &y_desc));
 
-#ifdef NV_CUDNN_DISABLE_EXCEPTION
-        // disable exception macro is defined. Calling build will not throw.
-        // Check status of desc and return error.
-        auto operation = batchnorm_operation_builder.build();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(operation.get_status() != CUDNN_STATUS_SUCCESS,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       operation.get_error());
-        operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-#else
-        // build() can throw
-        // wrap in try catch
-        try {
-            auto operation = batchnorm_operation_builder.build();
-            operations.push_back(std::make_shared<Operation_v8>(std::move(operation)));
-        } catch (cudnn_frontend::cudnnException& e) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                e.getCudnnStatus() != CUDNN_STATUS_SUCCESS, error_code_t::CUDNN_BACKEND_API_FAILED, e.what());
+        // Set peer stat tensors if any
+        if (!attributes.peer_stats.empty()) {
+            std::vector<cudnnBackendDescriptor_t> peer_stat_descs;
+            for (auto const& peer_stat : attributes.peer_stats) {
+                peer_stat_descs.push_back(tensors.at(peer_stat->get_uid())->get_raw_desc());
+            }
+
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(batchnorm_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_PEER_STAT_DESCS,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           peer_stat_descs.size(),
+                                                           peer_stat_descs.data()));
         }
-#endif
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(batchnorm_operation.get_raw_desc()));
+
+        operations.push_back(std::make_shared<Operation_v8>(std::move(batchnorm_operation)));
 
         auto const& non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());

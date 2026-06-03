@@ -128,17 +128,17 @@ TEST_CASE("Forward Training LayerNorm and Bitmask Clamped ReLU", "[layernorm][gr
 
     REQUIRE(graph.build_plans(handle).is_good());
 
-    Surface<float> X_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> Mean_tensor(batch_size * seq_length, false);
-    Surface<float> Var_tensor(batch_size * seq_length, false);
-    Surface<float> Scale_tensor(hidden_size, false);
-    Surface<float> Bias_tensor(hidden_size, false);
-    Surface<float> Y_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<uint8_t> Relu_Bitmask_tensor(batch_size * seq_length * hidden_size, false);
+    Surface<float> X_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> Mean_tensor(batch_size * seq_length);
+    Surface<float> Var_tensor(batch_size * seq_length);
+    Surface<float> Scale_tensor(hidden_size);
+    Surface<float> Bias_tensor(hidden_size);
+    Surface<float> Y_tensor(batch_size * seq_length * hidden_size);
+    Surface<uint8_t> Relu_Bitmask_tensor(batch_size * seq_length * hidden_size);
 
     int64_t workspace_size;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},
@@ -227,19 +227,19 @@ TEST_CASE("Clamped DReLU using Bitmask and Backward LayerNorm", "[layernorm][gra
 
     REQUIRE(graph.build_plans(handle).is_good());
 
-    Surface<float> X_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> DY_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> Mean_tensor(batch_size * seq_length, false);
-    Surface<float> Inv_variance_tensor(batch_size * seq_length, false);
-    Surface<uint8_t> Mask_tensor(batch_size * seq_length * hidden_size, false);
-    Surface<float> Scale_tensor(hidden_size, false);
-    Surface<float> Dscale_tensor(hidden_size, false);
-    Surface<float> Dbias_tensor(hidden_size, false);
-    Surface<float> DX_tensor(batch_size * seq_length * hidden_size, false);
+    Surface<float> X_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> DY_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> Mean_tensor(batch_size * seq_length);
+    Surface<float> Inv_variance_tensor(batch_size * seq_length);
+    Surface<uint8_t> Mask_tensor(batch_size * seq_length * hidden_size);
+    Surface<float> Scale_tensor(hidden_size);
+    Surface<float> Dscale_tensor(hidden_size);
+    Surface<float> Dbias_tensor(hidden_size);
+    Surface<float> DX_tensor(batch_size * seq_length * hidden_size);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_tensor.devPtr},

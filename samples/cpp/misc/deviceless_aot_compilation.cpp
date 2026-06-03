@@ -83,16 +83,16 @@ TEST_CASE("Deviceless compilation", "[conv][graph][serialization]") {
     auto graph_deserialized = std::make_shared<fe::graph::Graph>();
     REQUIRE(graph_deserialized->deserialize(handle, data_graph).is_good());
 
-    Surface<half> x_tensor(n * c * h * w, false);
-    Surface<half> w_tensor(k * c * r * s, false);
-    Surface<half> y_tensor(n * k * h * w, false);  // Should be p, q.
+    Surface<half> x_tensor(n * c * h * w);
+    Surface<half> w_tensor(k * c * r * s);
+    Surface<half> y_tensor(n * k * h * w);  // Should be p, q.
 
     std::unordered_map<int64_t, void*> variant_pack = {
         {X->get_uid(), x_tensor.devPtr}, {W->get_uid(), w_tensor.devPtr}, {Y->get_uid(), y_tensor.devPtr}};
 
     int64_t workspace_size = 0;
     REQUIRE(graph_deserialized->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::cout << *graph_deserialized << std::endl;
 

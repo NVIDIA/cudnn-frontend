@@ -55,21 +55,21 @@ This example shows how to construct a sdpa backward graph with sink token.
 
 // Function to create the SDPA (Scaled Dot-Product Attention) backward graph
 std::shared_ptr<fe::graph::Graph>
-create_sdpa_backward_graph(int64_t const b,
-                           int64_t const h_q,
-                           int64_t const h_k,
-                           int64_t const h_v,
-                           int64_t const s_q,
-                           int64_t const s_kv,
-                           int64_t const d_qk,
-                           int64_t const d_v,
-                           float const attn_scale                     = 1.0f,
-                           [[maybe_unused]] bool const generate_stats = true,
-                           bool const causal_mask                     = false,
-                           bool const alibi_mask                      = false,
-                           bool const padding_mask                    = false,
-                           bool has_attn_bias                         = false,
-                           bool has_sink_token                        = false) {
+create_sdpa_backward_graph_with_sink(int64_t const b,
+                                     int64_t const h_q,
+                                     int64_t const h_k,
+                                     int64_t const h_v,
+                                     int64_t const s_q,
+                                     int64_t const s_kv,
+                                     int64_t const d_qk,
+                                     int64_t const d_v,
+                                     float const attn_scale                     = 1.0f,
+                                     [[maybe_unused]] bool const generate_stats = true,
+                                     bool const causal_mask                     = false,
+                                     bool const alibi_mask                      = false,
+                                     bool const padding_mask                    = false,
+                                     bool has_attn_bias                         = false,
+                                     bool has_sink_token                        = false) {
     // Create a graph and set common global properties
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(fe::DataType_t::BFLOAT16)
@@ -171,13 +171,13 @@ create_sdpa_backward_graph(int64_t const b,
                                             .set_data_type(fe::DataType_t::FLOAT));
         sdpa_options.set_sink_token(sink_token);
 
-        auto dsink_token = graph->tensor(fe::graph::Tensor_attributes()
-                                             .set_name("dsink_token")
+        auto dSink_token = graph->tensor(fe::graph::Tensor_attributes()
+                                             .set_name("dSink_token")
                                              .set_uid(DSINK_TOKEN_UID)
                                              .set_dim({1, h_q, 1, 1})
                                              .set_stride({h_q, 1, 1, 1})
                                              .set_data_type(fe::DataType_t::FLOAT));
-        sdpa_options.set_dsink_token(dsink_token);
+        sdpa_options.set_dsink_token(dSink_token);
     }
 
     // Compute SDPA backward and get gradients dQ, dK, dV
@@ -227,21 +227,21 @@ TEST_CASE("Toy sdpa backward with sink", "[graph][sdpa][flash][backward]") {
     auto handle     = *handle_ptr;
 
     // Create the SDPA backward graph
-    auto graph = create_sdpa_backward_graph(b,
-                                            h_q,
-                                            h_k,
-                                            h_v,
-                                            s_q,
-                                            s_kv,
-                                            d_qk,
-                                            d_v,
-                                            attn_scale,
-                                            generate_stats,
-                                            causal_mask,
-                                            alibi_mask,
-                                            padding_mask,
-                                            has_attn_bias,
-                                            has_sink_token);
+    auto graph = create_sdpa_backward_graph_with_sink(b,
+                                                      h_q,
+                                                      h_k,
+                                                      h_v,
+                                                      s_q,
+                                                      s_kv,
+                                                      d_qk,
+                                                      d_v,
+                                                      attn_scale,
+                                                      generate_stats,
+                                                      causal_mask,
+                                                      alibi_mask,
+                                                      padding_mask,
+                                                      has_attn_bias,
+                                                      has_sink_token);
 
     // Supported starting 9.13+
     auto status = graph->validate();
@@ -259,19 +259,19 @@ TEST_CASE("Toy sdpa backward with sink", "[graph][sdpa][flash][backward]") {
 
     //// Build variant pack
     // inputs
-    Surface<half> q_tensor(b * h_q * s_q * d_qk, false);
-    Surface<half> k_tensor(b * h_k * d_qk * s_kv, false);
-    Surface<half> v_tensor(b * h_v * d_v * s_kv, false);
-    Surface<half> o_tensor(b * h_q * s_q * d_v, false);
-    Surface<half> dO_tensor(b * h_q * s_q * d_v, false);
-    Surface<float> stats_tensor(b * h_q * s_q * 1, false);
+    Surface<half> q_tensor(b * h_q * s_q * d_qk);
+    Surface<half> k_tensor(b * h_k * d_qk * s_kv);
+    Surface<half> v_tensor(b * h_v * d_v * s_kv);
+    Surface<half> o_tensor(b * h_q * s_q * d_v);
+    Surface<half> dO_tensor(b * h_q * s_q * d_v);
+    Surface<float> stats_tensor(b * h_q * s_q * 1);
     // outputs
-    Surface<half> dQ_tensor(b * h_q * s_q * d_qk, false);
-    Surface<half> dK_tensor(b * h_k * s_kv * d_qk, false);
-    Surface<half> dV_tensor(b * h_v * s_kv * d_v, false);
+    Surface<half> dQ_tensor(b * h_q * s_q * d_qk);
+    Surface<half> dK_tensor(b * h_k * s_kv * d_qk);
+    Surface<half> dV_tensor(b * h_v * s_kv * d_v);
 
-    Surface<half> bias_tensor(1 * h_q * s_q * s_kv, false);
-    Surface<half> dbias_tensor(1 * h_q * s_q * s_kv, false);
+    Surface<half> bias_tensor(1 * h_q * s_q * s_kv);
+    Surface<half> dbias_tensor(1 * h_q * s_q * s_kv);
 
     // Create variant pack with input and output tensors
     std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> variant_pack = {// inputs
@@ -293,8 +293,8 @@ TEST_CASE("Toy sdpa backward with sink", "[graph][sdpa][flash][backward]") {
     }
 
     // If padding mask is enabled, add sequence lengths to the variant pack
-    Surface<int32_t> devActualSeqlenQ(b, false);
-    Surface<int32_t> devActualSeqlenKV(b, false);
+    Surface<int32_t> devActualSeqlenQ(b);
+    Surface<int32_t> devActualSeqlenKV(b);
     if (padding_mask) {
         std::vector<int32_t> hostActualSeqlenQ(b, 20);
         std::vector<int32_t> hostActualSeqlenKV(b, 20);
@@ -314,17 +314,17 @@ TEST_CASE("Toy sdpa backward with sink", "[graph][sdpa][flash][backward]") {
     }
 
     // If sink token is enabled, add it to the variant pack
-    Surface<float> sink_token_tensor(1 * h_q * 1 * 1, false);
-    Surface<float> dsink_token_tensor(1 * h_q * 1 * 1, false);
+    Surface<float> sink_token_tensor(1 * h_q * 1 * 1);
+    Surface<float> dSink_token_tensor(1 * h_q * 1 * 1);
     if (has_sink_token) {
         variant_pack[SINK_TOKEN_UID]  = sink_token_tensor.devPtr;
-        variant_pack[DSINK_TOKEN_UID] = dsink_token_tensor.devPtr;
+        variant_pack[DSINK_TOKEN_UID] = dSink_token_tensor.devPtr;
     }
 
     // Allocate workspace
     int64_t workspace_size = 0;
     REQUIRE(graph->get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 

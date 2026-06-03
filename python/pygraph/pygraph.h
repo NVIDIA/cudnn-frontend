@@ -1,3 +1,4 @@
+#include <optional>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -49,6 +50,7 @@ class PyGraph {
     bool is_handle_owner = false;
 
     std::optional<PyCallback> callback_fn;
+    std::optional<PyCallback> callback_fn_bprop;
 
     PyGraph(Graph_t graph_) : graph(graph_) {};
 
@@ -60,7 +62,9 @@ class PyGraph {
             py::object sm_count,
             py::object sm_version,
             std::shared_ptr<KernelCache> kernel_cache,
-            std::shared_ptr<cudnn_frontend::DeviceProperties> device_properties)
+            std::shared_ptr<cudnn_frontend::DeviceProperties> device_properties,
+            bool is_dynamic_shape_enabled,
+            bool is_override_shape_enabled)
         : graph(std::make_shared<cudnn_frontend::graph::Graph>()) {
         graph->set_compute_data_type(compute_data_type)
             .set_intermediate_data_type(intermediate_data_type)
@@ -84,6 +88,14 @@ class PyGraph {
             graph->set_sm_version(sm_version.cast<int32_t>());
         }
 
+        if (is_dynamic_shape_enabled) {
+            graph->set_dynamic_shape_enabled(true);
+        }
+
+        if (is_override_shape_enabled) {
+            graph->set_override_shape_enabled(true);
+        }
+
         if (kernel_cache) {
             graph->set_kernel_cache(kernel_cache);
             graph->set_dynamic_shape_enabled(true);
@@ -101,6 +113,16 @@ class PyGraph {
 
         if (callback_fn.has_value()) {
             q_kt = this->callback_fn.value()(*py_graph, q_kt);
+        }
+
+        return q_kt;
+    };
+
+    std::function<Tensor_t(Graph_t, Tensor_t)> wrapper_function_bprop = [this](Graph_t graph, Tensor_t q_kt) {
+        auto py_graph = std::make_shared<PyGraph>(graph);
+
+        if (callback_fn_bprop.has_value()) {
+            q_kt = this->callback_fn_bprop.value()(*py_graph, q_kt);
         }
 
         return q_kt;
@@ -246,8 +268,8 @@ class PyGraph {
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     swish(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
-          cudnn_frontend::DataType_t const& compute_data_type,
           std::optional<float> const& swish_beta,
+          cudnn_frontend::DataType_t const& compute_data_type,
           std::string const& name);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
@@ -314,7 +336,33 @@ class PyGraph {
               std::string const& name);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
-    reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input, std::string const& name);
+    reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+            std::string const& name,
+            cudnn_frontend::ReshapeMode_t reshape_mode = cudnn_frontend::ReshapeMode_t::VIEW_ONLY);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    transpose(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+              std::vector<int64_t> const& permutation,
+              cudnn_frontend::DataType_t const& compute_data_type,
+              std::string const& name);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    concatenate(std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>> inputs,
+                int64_t axis,
+                std::optional<int64_t> in_place_index,
+                std::string const& name);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    tensor_scalar(float const& value, cudnn_frontend::graph::ScalarType scalar_type);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    tensor_scalar(double const& value, cudnn_frontend::graph::ScalarType scalar_type);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    tensor_scalar(int32_t const& value, cudnn_frontend::graph::ScalarType scalar_type);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    tensor_scalar(int64_t const& value, cudnn_frontend::graph::ScalarType scalar_type);
 
     std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>
     rmsnorm(cudnn_frontend::NormFwdPhase_t const forward_phase,
@@ -324,6 +372,22 @@ class PyGraph {
             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& epsilon,
             cudnn_frontend::DataType_t const& compute_data_type,
             std::string const& name);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    rope(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& freqs,
+         float output_scale,
+         int64_t rope_dim,
+         cudnn_frontend::DataType_t const& compute_data_type,
+         std::string const& name);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    rope_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dy,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& freqs,
+                  float output_scale,
+                  int64_t rope_dim,
+                  cudnn_frontend::DataType_t const& compute_data_type,
+                  std::string const& name);
 
     std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>
     rmsnorm_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& dy,
@@ -382,7 +446,9 @@ class PyGraph {
          py::object const& generate_stats,
          cudnn_frontend::AttentionImplementation_t const& implementation,
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
-         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp);
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+         bool const unfuse_fma);
 
     // return [dQ, dK, dV]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 3>
@@ -411,7 +477,11 @@ class PyGraph {
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& rng_dump,
                   bool const use_deterministic_algorithm,
                   cudnn_frontend::DataType_t const& compute_data_type,
-                  std::string const& name);
+                  std::string const& name,
+                  std::optional<PyCallback> fn,
+                  std::optional<PyCallback> fn_bprop,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token);
 
     // return [o, stats, amax_s, amax_o]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 4>
@@ -447,9 +517,32 @@ class PyGraph {
              std::optional<PyCallback> fn,
              py::object const& generate_stats,
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
-             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp);
+             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
+             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token);
+
+    // MXFP8 SDPA forward - uses block-wise scale factors (E8M0 with F8_128x4 reordering)
+    // return [o, stats, amax_o]
+    std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 3>
+    sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_q,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_k,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_v,
+               py::object const& attn_scale,
+               bool const use_causal_mask,
+               bool const use_causal_mask_bottom_right,
+               cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
+               py::object const& left_bound,
+               py::object const& right_bound,
+               cudnn_frontend::DataType_t const& compute_data_type,
+               std::string const& name,
+               py::object const& generate_stats,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+               bool const unfuse_fma);
 
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP]
+    // dSink_token is an optional output set via set_dsink_token() attribute
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 7>
     sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
@@ -475,9 +568,52 @@ class PyGraph {
                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
                       bool const use_causal_mask,
                       bool const use_causal_mask_bottom_right,
+                      cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
+                      py::object const& left_bound,
+                      py::object const& right_bound,
+                      bool const use_deterministic_algorithm,
                       py::object const& dropout,
                       cudnn_frontend::DataType_t const& compute_data_type,
-                      std::string const& name);
+                      std::string const& name,
+                      std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+                      std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token);
+
+    // MXFP8 SDPA backward - uses block-wise scale factors (E8M0 with F8_128x4 reordering)
+    // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV]
+    // dSink_token is an optional output set via set_dsink_token() attribute
+    std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 6>
+    sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q_T,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k_T,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& o_f16,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO_f16,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO_T,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& dO,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& stats,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_q,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_q_T,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_k,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_k_T,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_v,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_dO,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale_dO_T,
+                        py::object const& attn_scale,
+                        bool const use_padding_mask,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                        bool const use_causal_mask,
+                        bool const use_causal_mask_bottom_right,
+                        cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
+                        py::object const& left_bound,
+                        py::object const& right_bound,
+                        bool const use_deterministic_algorithm,
+                        py::object const& dropout,
+                        cudnn_frontend::DataType_t const& compute_data_type,
+                        std::string const& name,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     moe_grouped_matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token,
@@ -489,6 +625,13 @@ class PyGraph {
                        cudnn_frontend::DataType_t const& compute_data_type,
                        int32_t const& top_k,
                        std::string const& name);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    moe_grouped_matmul_bwd(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& doutput,
+                           std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token,
+                           std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& first_token_offset,
+                           cudnn_frontend::DataType_t const& compute_data_type,
+                           std::string const& name);
 
     void
     validate();
@@ -529,6 +672,12 @@ class PyGraph {
     int64_t
     get_workspace_size();
 
+    int64_t
+    get_workspace_size(std::optional<std::intptr_t>,
+                       py::object override_uids    = py::none(),
+                       py::object override_shapes  = py::none(),
+                       py::object override_strides = py::none());
+
     void
     populate_cuda_graph(std::intptr_t handle,
                         std::unordered_map<cudnn_frontend::graph::Tensor_attributes::uid_t, int64_t> var_pack,
@@ -542,13 +691,40 @@ class PyGraph {
                       std::intptr_t cuda_graph);
 
     void
-    execute(std::unordered_map<int64_t, int64_t> var_pack, int64_t workspace, std::optional<std::intptr_t>);
+    execute(std::unordered_map<int64_t, int64_t> var_pack,
+            int64_t workspace,
+            std::optional<std::intptr_t>,
+            py::object override_uids    = py::none(),
+            py::object override_shapes  = py::none(),
+            py::object override_strides = py::none());
 
     void
     execute_plan_at_index(std::unordered_map<int64_t, int64_t> var_pack,
                           int64_t workspace,
                           int64_t index,
-                          std::optional<std::intptr_t>);
+                          std::optional<std::intptr_t>,
+                          py::object override_uids    = py::none(),
+                          py::object override_shapes  = py::none(),
+                          py::object override_strides = py::none());
+
+    // --- Variant pack template (called automatically by build_plans) ---
+    void
+    prepare_variant_pack_template();
+
+    std::vector<int64_t>
+    get_variant_pack_uids_sorted() {
+        return graph->get_variant_pack_uids_sorted();
+    }
+
+    void
+    execute_with_ptrs(std::vector<std::intptr_t> const& user_ptrs, std::intptr_t workspace, std::intptr_t exec_handle);
+
+    // Raw pointer version: takes a pointer to an array of device pointers (no pybind11 copy)
+    void
+    execute_with_raw_ptrs(std::intptr_t user_ptrs_array,
+                          int64_t n_user,
+                          std::intptr_t workspace,
+                          std::intptr_t exec_handle);
 
     std::vector<BehaviorNote_t>
     get_behavior_notes();
@@ -609,11 +785,21 @@ class PyGraph {
     int64_t
     get_workspace_size_plan_at_index(int64_t index);
 
+    int64_t
+    get_workspace_size_plan_at_index(int64_t index,
+                                     std::optional<std::intptr_t>,
+                                     py::object override_uids    = py::none(),
+                                     py::object override_shapes  = py::none(),
+                                     py::object override_strides = py::none());
+
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     query_tensor_attributes_of_uid(int64_t const uid) const;
 
     std::string
     get_plan_name_at_index(int64_t index);
+
+    std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
+    get_engine_and_knobs_at_index(int64_t index);
 
    private:
     // Internal SDPA implementation - delegates to sdpa() or sdpa_fp8() based on mma_core_mode
@@ -643,6 +829,7 @@ class PyGraph {
                   py::object const& generate_stats,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
                   cudnn_frontend::DataType_t const& mma_core_mode = cudnn_frontend::DataType_t::HALF,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_q = nullptr,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_k = nullptr,
@@ -650,7 +837,8 @@ class PyGraph {
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_s = nullptr,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> scale_s   = nullptr,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> scale_o   = nullptr,
-                  cudnn_frontend::AttentionImplementation_t const& implementation = AttentionImplementation_t::AUTO);
+                  cudnn_frontend::AttentionImplementation_t const& implementation     = AttentionImplementation_t::AUTO,
+                  bool const unfuse_fma                                               = false);
 };
 
 }  // namespace cudnn_frontend::python_bindings

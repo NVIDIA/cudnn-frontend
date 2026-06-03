@@ -66,13 +66,13 @@ TEST_CASE("Resample Max Pooling NHWC Inference", "[resample][pooling][max][graph
     REQUIRE(graph.check_support().is_good());
     REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
-    Surface<half> X_gpu(N * H * W * C, false);
-    Surface<half> Y_gpu(N * H * W * C, false);
+    Surface<half> X_gpu(N * H * W * C);
+    Surface<half> Y_gpu(N * H * W * C);
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {{X, X_gpu.devPtr},
                                                                                              {Y, Y_gpu.devPtr}};
     int64_t workspace_size                                                                = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 }
@@ -127,14 +127,14 @@ TEST_CASE("Resample Max Pooling NHWC Training", "[resample][pooling][max][graph]
     REQUIRE(graph.check_support().is_good());
     REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
-    Surface<half> X_gpu(N * H * W * C, false);
-    Surface<half> Y_gpu(N * H * W * C, false);
-    Surface<int8_t> Index_gpu(N * H * W * C / 8, false);
+    Surface<half> X_gpu(N * H * W * C);
+    Surface<half> Y_gpu(N * H * W * C);
+    Surface<int8_t> Index_gpu(N * H * W * C / 8);
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {X, X_gpu.devPtr}, {Y, Y_gpu.devPtr}, {Index, Index_gpu.devPtr}};
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 }
@@ -181,13 +181,13 @@ TEST_CASE("Resample Avg Pooling", "[resample][pooling][average][graph]") {
     REQUIRE(graph.check_support().is_good());
     REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
-    Surface<half> X_gpu(N * H * W * C, false);
-    Surface<half> Y_gpu(N * H * W * C, false);
+    Surface<half> X_gpu(N * H * W * C);
+    Surface<half> Y_gpu(N * H * W * C);
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {{X, X_gpu.devPtr},
                                                                                              {Y, Y_gpu.devPtr}};
     int64_t workspace_size                                                                = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 }

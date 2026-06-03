@@ -62,14 +62,14 @@ TEST_CASE("Convolution Dgrad", "[dgrad][graph]") {
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<half> dy_tensor(4 * 64 * 16 * 16, false);
-    Surface<half> w_tensor(64 * 32 * 3 * 3, false);
-    Surface<half> dx_tensor(4 * 32 * 16 * 16, false);
+    Surface<half> dy_tensor(4 * 64 * 16 * 16);
+    Surface<half> w_tensor(64 * 32 * 3 * 3);
+    Surface<half> dx_tensor(4 * 32 * 16 * 16);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
 
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {DY, dy_tensor.devPtr}, {W, w_tensor.devPtr}, {DX, dx_tensor.devPtr}};
@@ -118,14 +118,14 @@ TEST_CASE("Dgrad Drelu Graph", "[dgrad][graph]") {
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<half> dy_tensor(4 * 64 * 16 * 16, false);
-    Surface<half> w_tensor(64 * 32 * 3 * 3, false);
-    Surface<half> x_tensor(4 * 32 * 16 * 16, false);
-    Surface<half> dx_tensor(4 * 32 * 16 * 16, false);
+    Surface<half> dy_tensor(4 * 64 * 16 * 16);
+    Surface<half> w_tensor(64 * 32 * 3 * 3);
+    Surface<half> x_tensor(4 * 32 * 16 * 16);
+    Surface<half> dx_tensor(4 * 32 * 16 * 16);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {DY, dy_tensor.devPtr}, {W, w_tensor.devPtr}, {X, x_tensor.devPtr}, {DX, dx_tensor.devPtr}};
@@ -221,23 +221,23 @@ TEST_CASE("Dgrad Drelu DBNweight Graph", "[dgrad][graph]") {
 
     REQUIRE(graph.build_plans().is_good());
 
-    Surface<half> dy_tensor(4 * 64 * 16 * 16, false);
-    Surface<half> w_tensor(64 * 32 * 3 * 3, false);
-    Surface<half> x_tensor(4 * 32 * 16 * 16, false);
-    Surface<half> drelu_output_tensor(4 * 32 * 16 * 16, false);
-    Surface<float> mean_tensor(1 * 32 * 1 * 1, false);
-    Surface<float> inv_var_tensor(1 * 32 * 1 * 1, false);
-    Surface<float> scale_tensor(1 * 32 * 1 * 1, false);
-    Surface<float> bias_tensor(1 * 32 * 1 * 1, false);
-    Surface<float> dscale_tensor(1 * 32 * 1 * 1, false);
-    Surface<float> dbias_tensor(1 * 32 * 1 * 1, false);
-    Surface<float> eq_scale_dy_tensor(1 * 32 * 1 * 1, false);
-    Surface<float> eq_scale_x_tensor(1 * 32 * 1 * 1, false);
-    Surface<float> eq_bias_tensor(1 * 32 * 1 * 1, false);
+    Surface<half> dy_tensor(4 * 64 * 16 * 16);
+    Surface<half> w_tensor(64 * 32 * 3 * 3);
+    Surface<half> x_tensor(4 * 32 * 16 * 16);
+    Surface<half> drelu_output_tensor(4 * 32 * 16 * 16);
+    Surface<float> mean_tensor(1 * 32 * 1 * 1);
+    Surface<float> inv_var_tensor(1 * 32 * 1 * 1);
+    Surface<float> scale_tensor(1 * 32 * 1 * 1);
+    Surface<float> bias_tensor(1 * 32 * 1 * 1);
+    Surface<float> dscale_tensor(1 * 32 * 1 * 1);
+    Surface<float> dbias_tensor(1 * 32 * 1 * 1);
+    Surface<float> eq_scale_dy_tensor(1 * 32 * 1 * 1);
+    Surface<float> eq_scale_x_tensor(1 * 32 * 1 * 1);
+    Surface<float> eq_bias_tensor(1 * 32 * 1 * 1);
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
-    Surface<int8_t> workspace(workspace_size, false);
+    Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {DY, dy_tensor.devPtr},
