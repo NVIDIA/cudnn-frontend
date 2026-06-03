@@ -821,7 +821,7 @@ def test_norm_random_L0(test_num: int, total_tests: int, config_seed: int, confi
     )
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @pytest.mark.parametrize("test_num,total_tests,config_seed,config", TEST_PARAMS_L1,
                          ids=[make_test_id(p, prefix="u") for p in TEST_PARAMS_L1])
 def test_norm_random_L1(test_num: int, total_tests: int, config_seed: int, config: NormConfig,

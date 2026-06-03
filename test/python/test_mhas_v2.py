@@ -128,7 +128,7 @@ def test_sdpa_random_fwd_L0(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
-@pytest.mark.L0
+@pytest.mark.L1
 def test_sdpa_random_fwd_unified_L0(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -248,7 +248,7 @@ def test_sdpa_random_sq1_L0(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=32, rng_seed=111), ids=lambda p: f"test{p[0]}")
-@pytest.mark.L0
+@pytest.mark.L1
 def test_sdpa_random_sq1_unified_L0(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -319,7 +319,7 @@ def test_sdpa_random_lean_attn_L0(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=222), ids=lambda p: f"test{p[0]}")
-@pytest.mark.L0
+@pytest.mark.L1
 def test_sdpa_random_lean_attn_unified_L0(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -388,7 +388,7 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
-@pytest.mark.L0
+@pytest.mark.L1
 def test_sdpa_random_fwd_ragged_unified_L0(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -494,7 +494,7 @@ def test_sdpa_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
-@pytest.mark.L0
+@pytest.mark.L1
 def test_sdpa_fwd_paged_unified_L0(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -983,6 +983,7 @@ def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
 
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
 @pytest.mark.L0
+@pytest.mark.L1
 @pytest.mark.L2
 @pytest.mark.L3
 @pytest.mark.L4
