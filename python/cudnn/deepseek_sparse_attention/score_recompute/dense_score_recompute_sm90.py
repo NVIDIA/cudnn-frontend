@@ -536,7 +536,7 @@ class DenseScoreRecomputeSm90:
             for h_tile in cutlass.range_constexpr(self.num_head_tiles):
                 eff_m_block = m_block * self.num_head_tiles + h_tile
 
-                # ---- Q TMA + Weights/LSE LDG ----
+                # ---- Q TMA + Weights/LSE load-from-global ----
                 gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (eff_m_block, 0))
                 load_Q, _, _ = copy_ops.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True)
                 if warp_idx_in_wg == 0:
@@ -663,7 +663,7 @@ class DenseScoreRecomputeSm90:
     #    the unified `producer` has warp 0 doing:                            #
     #      wait KVE0 → TMA stage0 → wait KVE1 → TMA stage1 → ...              #
     #    so stage-1's TMA issue is serialized behind stage-0's wait+issue,   #
-    #    even when both consumer WGs have released their KVEmpty.  Perfsim   #
+    #    even when both consumer WGs have released their KVEmpty.  Profiling #
     #    shows WG1's wait KV is ~20-50c longer than WG0's under unified.     #
     #                                                                        #
     #    With warp split, stage-0 and stage-1 pipelines are independent —    #
@@ -724,7 +724,7 @@ class DenseScoreRecomputeSm90:
             for h_tile in cutlass.range_constexpr(self.num_head_tiles):
                 eff_m_block = m_block * self.num_head_tiles + h_tile
 
-                # ---- Q TMA (warp-0) + Weights/LSE LDG (all 128 threads) ----
+                # ---- Q TMA (warp-0) + Weights/LSE load-from-global (all 128 threads) ----
                 gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (eff_m_block, 0))
                 load_Q, _, _ = copy_ops.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True)
                 if warp_idx_in_wg == 0:

@@ -1010,7 +1010,7 @@ class IndexerBackwardSm100:
           - 2D identity for scalar (h, n) coordinates: mode=[0] → h, mode=[1] → n
           - sW pre-loaded into bf16 register array (scalar h enables rW[h])
           - Paired f32x2 packed ops (fma_packed_f32x2 for dW accumulation)
-          - stmatrix bulk store (8 warp-level instructions vs 32+ scalar STS per thread)
+          - stmatrix bulk store (8 warp-level instructions vs 32+ scalar shared-mem stores per thread)
           - Compute and store phases fully separated
         """
         wg_tidx = tidx % self.WARPGROUP_SIZE

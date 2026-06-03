@@ -64,7 +64,7 @@ find_log_2_floor(uint32_t x) {
 
 // Compute FastDivisor_t for the kernel's fastDivMod which uses:
 //   div = __umulhi(2 * val, mul) >> shr
-// This matches cuDNN's find_divisor_v2 (xmma/fast_math.h:118-125).
+// This matches cuDNN backend's find_divisor_v2 fast-math helper.
 inline FastDivisor_t
 make_fast_divisor(uint32_t divisor) {
     FastDivisor_t d;

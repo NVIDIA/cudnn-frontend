@@ -730,18 +730,18 @@ class IndexerBackwardSm90:
 
         n_offset = compute_wg_idx * self.half_block_I
 
-        # STS dK staging: partition sdK_staging using GEMM2's MMA layout
+        # shared-mem store dK staging: partition sdK_staging using GEMM2's MMA layout
         sdK_staging_half = cute.local_tile(sdK_staging, (64, self.block_I), (compute_wg_idx, 0))
         tCsDK_staging = thr_mma2.partition_C(sdK_staging_half)
 
-        # Fused pass sdS write via stmatrix (r2s bulk copy, replaces scalar STS)
+        # Fused pass sdS write via stmatrix (r2s bulk copy, replaces scalar shared-mem stores)
         sdS_half = cute.local_tile(sdS_view, (self.heads_padded, self.half_block_I), (0, compute_wg_idx))
         stmatrix_atom_ds = cute.make_copy_atom(warp.StMatrix8x8x16bOp(), self.q_dtype)
         tiled_r2s_ds = cute.make_tiled_copy_C(stmatrix_atom_ds, tmma1)
         thr_r2s_ds = tiled_r2s_ds.get_slice(wg_tidx)
         tRdDS = thr_r2s_ds.partition_D(sdS_half)
 
-        # P4: 2D block view of sGradSignal for partition-based access (sparse only)
+        # Pass 4: 2D block view of sGradSignal for partition-based access (sparse only)
         if const_expr(not self.is_dense):
             sGS_per_block = cute.make_tensor(
                 sGradSignal.iterator,
@@ -813,7 +813,7 @@ class IndexerBackwardSm90:
             warpgroup.wait_group(0)
 
             # ----- Fused pass: compute dS → registers, then stmatrix → sdS -----
-            # P4: broadcast partition of sGradSignal — eliminates n-coordinate cute.get
+            # Pass 4: broadcast partition of sGradSignal — eliminates n-coordinate cute.get
             if const_expr(self.is_dense):
                 sGS_cur_block = sGradSignal
             else:
@@ -846,7 +846,7 @@ class IndexerBackwardSm90:
                 else:
                     dw_h1 = dw_h1 + dw_val
 
-            # Bulk write dS to SMEM via stmatrix (replaces per-element scalar STS)
+            # Bulk write dS to SMEM via stmatrix (replaces per-element scalar shared-mem stores)
             tRsDS = tiled_r2s_ds.retile(acc_dS)
             cute.copy(tiled_r2s_ds, tRsDS, tRdDS)
             cute.arch.fence_view_async_shared()
@@ -872,13 +872,13 @@ class IndexerBackwardSm90:
             else:
                 gemm(tmma3, acc_dQ, tDQrDS, tDQrKt_s2, zero_init=False, wg_wait=-1)
 
-            # Signal other WG: it can start its GEMM2+3 while we do STS/memory
+            # Signal other WG: it can start its GEMM2+3 while we do shared-mem stores / memory
             if compute_wg_idx == 0:
                 cute.arch.barrier_arrive(barrier_id=self.SCHED_BARRIER_WG1, number_of_threads=self.TOTAL_COMPUTE_THREADS)
             else:
                 cute.arch.barrier_arrive(barrier_id=self.SCHED_BARRIER_WG0, number_of_threads=self.TOTAL_COMPUTE_THREADS)
 
-            warpgroup.wait_group(1)  # GEMM2 done (acc_dK ready for STS)
+            warpgroup.wait_group(1)  # GEMM2 done (acc_dK ready to write to shared mem)
 
             # Deferred DMA wait: previous iteration's bulk reduce must finish
             # reading sdK_staging before we overwrite it (both WGs do their own reduce)
