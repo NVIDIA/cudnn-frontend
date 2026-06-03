@@ -121,25 +121,20 @@ class ScoreGradDense:
 
     def __init__(
         self,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
         ratio: int = 1,
     ):
         assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
-        # ``grad_scale`` is intentionally **not** stored on the object —
-        # baking it as ``self.grad_scale`` would freeze it into the
-        # compiled kernel (every change → recompile). Keep it as a runtime
-        # ``Float32`` arg on ``__call__`` so the same compiled kernel can
-        # be reused when the runtime loss scaling changes for the same
-        # tensor shape.
-        # For BSHD: max_seqlen_q == S_q, max_seqlen_k == S_k.
-        # For THD : max_seqlen_q / k cap the grid + row-stride respectively.
-        self.max_seqlen_q = max_seqlen_q
-        self.max_seqlen_k = max_seqlen_k
+        # Neither ``grad_scale`` nor ``max_seqlen_q/k`` are stored on the object:
+        # baking them in would freeze them into the compiled kernel. grad_scale
+        # would force a recompile on every loss-scale change; max_seqlen would
+        # specialize the launch grid AND the causal-mask bound, so a kernel
+        # compiled for one max_seqlen would be wrong if reused for another. They
+        # are passed as runtime ``Float32``/``Int32`` args on ``__call__`` so one
+        # compiled kernel serves all seqlens / loss scales.
         self.ratio = ratio
 
     @cute.jit
-    def __call__(self, mPredictRaw, mTargetRaw, mLSE, mDenomTarget, mCuSeqlensQ, mCuSeqlensK, grad_scale: Float32, stream):
+    def __call__(self, mPredictRaw, mTargetRaw, mLSE, mDenomTarget, mCuSeqlensQ, mCuSeqlensK, grad_scale: Float32, max_seqlen_q: Int32, max_seqlen_k: Int32, stream):
         # BSHD: mCuSeqlensQ/K = None; tensors carry batch dim.
         #   PredictRaw/TargetRaw: (B, S_q, S_k)   LSE/Denom: (B, S_q)
         # THD: mCuSeqlensQ/K provided; tensors are packed.
@@ -181,10 +176,10 @@ class ScoreGradDense:
             mCuSeqlensK,
             grad_scale,
             seqlen_k_pad,
-            Int32(self.max_seqlen_q),
-            Int32(self.max_seqlen_k),
+            max_seqlen_q,
+            max_seqlen_k,
         ).launch(
-            grid=(batch_size, self.max_seqlen_q, 1),
+            grid=(batch_size, max_seqlen_q, 1),
             block=[self.THREADS_PER_CTA, 1, 1],
             stream=stream,
         )
@@ -1820,7 +1815,11 @@ class DenseIndexerBackward2QGemmSm100:
 # =============================================================================
 # Factory
 # =============================================================================
-_compile_cache: dict = {}
+# compile_key -> compiled kernel, one dict per kernel (score-grad + GEMM).
+# Single-layer pattern (matches forward _interface.py); filled lazily at first
+# execute since cute.compile needs real tensors.
+_score_grad_compile_cache: dict = {}
+_gemm_compile_cache: dict = {}
 
 
 def dense_indexer_backward_sm100(
@@ -1854,8 +1853,12 @@ def dense_indexer_backward_sm100(
     ``_run`` call time so changing it does not trigger recompilation.
     """
     assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
-    key = (
-        is_varlen,
+    # batch/max_seqlen_q/max_seqlen_k/sm_scale are all runtime: both kernels take
+    # max_seqlen_q/k as Int32 args (ScoreGradDense drives its launch grid +
+    # causal-mask bound from them; the GEMM loops at runtime), batch is a dynamic
+    # grid dim, and sm_scale is a runtime Float32. None are keyed (see _build's
+    # compile_key). The per-kernel module caches replace the old dict-of-closures.
+    return _build_cute_dsl_kernel(
         batch,
         max_seqlen_q,
         max_seqlen_k,
@@ -1864,20 +1867,8 @@ def dense_indexer_backward_sm100(
         sm_scale,
         block_I,
         ratio,
+        is_varlen,
     )
-    if key not in _compile_cache:
-        _compile_cache[key] = _build_cute_dsl_kernel(
-            batch,
-            max_seqlen_q,
-            max_seqlen_k,
-            heads,
-            dim,
-            sm_scale,
-            block_I,
-            ratio,
-            is_varlen,
-        )
-    return _compile_cache[key]
 
 
 def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_scale, block_I, ratio, is_varlen):
@@ -1888,18 +1879,16 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
 
     # Kernel 1: ScoreGradDense — applies bottom-right ratio causal mask so
     # masked / padding columns produce grad_signal=0 (won't contaminate GEMM).
-    score_grad_obj = ScoreGradDense(
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        ratio=ratio,
-    )
+    score_grad_obj = ScoreGradDense(ratio=ratio)
 
     # Kernel 2: 2Q GEMM kernel (reads pre-computed grad_signal, 2 Q tokens per CTA).
     # is_varlen branches at compile time on whether CuSeqlens* are None.
     gemm_obj = DenseIndexerBackward2QGemmSm100(head_dim=dim, heads=heads, block_I=block_I, ratio=ratio)
 
-    compiled_score_grad = [None]
-    compiled_gemm = [None]
+    # Only params that change generated code. max_seqlen_q/k are now runtime
+    # Int32 args to ScoreGradDense (drive the launch grid + causal-mask bound)
+    # and to the GEMM, so neither is keyed; batch/sm_scale likewise runtime.
+    compile_key = (is_varlen, heads, dim, block_I, ratio)
 
     def _ensure_compiled_score_grad(IdxScoreRaw, IdxLSE, AttnScoreRaw, AttnL1Norm, CuSeqlensQ, CuSeqlensK, grad_scale, current_stream=None):
         """Lazy-compile kernel 1 (score gradient).
@@ -1915,11 +1904,11 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         factory's cache key, the compiled kernel is reused unchanged when
         the runtime ``grad_scale`` differs from the value seen at compile.
         """
-        if compiled_score_grad[0] is None:
+        if compile_key not in _score_grad_compile_cache:
             s = _resolve_stream(current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
-            compiled_score_grad[0] = cute.compile(
+            _score_grad_compile_cache[compile_key] = cute.compile(
                 score_grad_obj,
                 to_cute_tensor(IdxScoreRaw),
                 to_cute_tensor(AttnScoreRaw),
@@ -1928,6 +1917,8 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
                 cuq_arg,
                 cuk_arg,
                 cutlass.Float32(float(grad_scale)),
+                cutlass.Int32(max_seqlen_q),
+                cutlass.Int32(max_seqlen_k),
                 s,
                 options=compile_options("--opt-level 3"),
             )
@@ -1938,11 +1929,11 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         For BSHD (is_varlen=False) CuSeqlens* are None. For THD they are
         int32 cu_seqlens tensors of shape (B+1,).
         """
-        if compiled_gemm[0] is None:
+        if compile_key not in _gemm_compile_cache:
             s = _resolve_stream(current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
-            compiled_gemm[0] = cute.compile(
+            _gemm_compile_cache[compile_key] = cute.compile(
                 gemm_obj,
                 to_cute_tensor(IndexQ),
                 to_cute_tensor(Weights),
@@ -1971,7 +1962,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         s = _resolve_stream(current_stream)
         _ensure_compiled_gemm(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, CuSeqlensQ, CuSeqlensK, current_stream=current_stream)
         with torch.cuda.nvtx.range("indexer_backward_dsl_dense_gemm_2q"):
-            compiled_gemm[0](
+            _gemm_compile_cache[compile_key](
                 IndexQ,
                 Weights,
                 IndexK,
@@ -2023,7 +2014,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         # Grid = (B, max_seqlen_q, 1); CTAs past per-batch seqlen exit early.
         _ensure_compiled_score_grad(IdxScoreRaw, IdxLSE, AttnScoreRaw, AttnL1Norm, CuSeqlensQ, CuSeqlensK, grad_scale, current_stream=current_stream)
         with torch.cuda.nvtx.range("indexer_backward_dsl_dense_score_grad"):
-            compiled_score_grad[0](
+            _score_grad_compile_cache[compile_key](
                 IdxScoreRaw,
                 AttnScoreRaw,
                 IdxLSE,
@@ -2031,6 +2022,8 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
                 CuSeqlensQ,
                 CuSeqlensK,
                 cutlass.Float32(float(grad_scale)),
+                cutlass.Int32(max_seqlen_q),
+                cutlass.Int32(max_seqlen_k),
                 s,
             )
 

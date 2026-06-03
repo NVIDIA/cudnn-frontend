@@ -129,18 +129,6 @@ def indexer_fwd(
         int(ratio),
         bool(is_varlen),
         bool(use_tma_store),
-        int(seqlen_q_dim),
-        int(seqlen_k_dim),
-        int(batch_size),
-        tuple(q.shape),
-        tuple(k.shape),
-        tuple(w.shape),
-        tuple(out.shape),
-        tuple(q.stride()),
-        tuple(k.stride()),
-        tuple(w.stride()),
-        tuple(out.stride()),
-        float(sm_scale),
     )
     current_stream = resolve_stream()
     if compile_key not in _compile_cache:

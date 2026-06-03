@@ -350,7 +350,6 @@ def _dense_score_recompute(
         _KV_STAGE,
         num_threads,
         _SWAP_AB,
-        topk_max,
         is_index_scores,
         softmax_scale,
         False,

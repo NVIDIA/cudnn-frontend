@@ -213,7 +213,6 @@ class IndexerForward(APIBase):
 
 
 _logger = logging.getLogger(__name__)
-_cache_of_IndexerForwardObjects: dict = {}
 
 
 def indexer_forward_wrapper(
@@ -239,8 +238,8 @@ def indexer_forward_wrapper(
     positions outside the valid KV range with -inf.
     """
     if device_major() == 9:
-        # The APIBase class below owns the SM100 TMA-padded path. Hopper uses a
-        # direct CuTe DSL wrapper so the public wrapper can cover both arches.
+        # Both arches route through their own indexer_fwd wrapper (which owns
+        # output allocation + TMA padding); Hopper uses the SM90 variant.
         scores = indexer_fwd_sm90(
             q,
             k,
@@ -255,88 +254,26 @@ def indexer_forward_wrapper(
         )
         return TupleDict(scores=scores)
 
-    if cu_seqlens_q is not None or cu_seqlens_k is not None:
-        scores = indexer_fwd_sm100(
-            q,
-            k,
-            w,
-            ratio=ratio,
-            qhead_per_kv_head=qhead_per_kv_head,
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
-            num_threads=384,
-            q_stage=q_stage,
-            kv_stage=kv_stage,
-            sm_scale=sm_scale,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-        )
-        return TupleDict(scores=scores)
-
-    b, s_q, h_q, d = q.shape
-    _, s_k, h_kv, _ = k.shape
-    device = q.device
-
-    s_k_padded = (s_k + TMA_ALIGN_ELEMS - 1) // TMA_ALIGN_ELEMS * TMA_ALIGN_ELEMS
-    needs_view = s_k_padded != s_k
-    if needs_view:
-        out_buf = torch.empty((b, s_q, s_k_padded), dtype=torch.float32, device=device)
-        out_padded = out_buf
-    else:
-        out_buf = torch.empty((b, s_q, s_k), dtype=torch.float32, device=device)
-        out_padded = out_buf
-
-    # -inf fill so that skipped n-blocks and masked positions are -inf.
-    out_buf.fill_(float("-inf"))
-
-    if qhead_per_kv_head is None:
-        qhead_per_kv_head = h_q // h_kv
-
-    cache_key = (
-        q.dtype,
-        k.dtype,
-        w.dtype,
-        b,
-        s_q,
-        s_k_padded,
-        h_q,
-        h_kv,
-        d,
-        q.stride(),
-        k.stride(),
-        w.stride(),
-        out_buf.stride(),
-        int(ratio),
-        int(qhead_per_kv_head),
-        int(m_block_size),
-        int(n_block_size),
-        int(q_stage),
-        int(kv_stage),
-        float(sm_scale),
+    # BSHD and THD both go through indexer_fwd (it branches on cu_seqlens
+    # internally): it owns output allocation + TMA padding and uses a single
+    # shape-agnostic compile cache. cu_seqlens_q/k / max_seqlen_q/k are None for
+    # BSHD; seqlen is then derived from the tensor shapes at runtime.
+    scores = indexer_fwd_sm100(
+        q,
+        k,
+        w,
+        ratio=ratio,
+        qhead_per_kv_head=qhead_per_kv_head,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        num_threads=384,
+        q_stage=q_stage,
+        kv_stage=kv_stage,
+        sm_scale=sm_scale,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        current_stream=stream,
     )
-
-    obj = _cache_of_IndexerForwardObjects.get(cache_key)
-    if obj is None:
-        obj = IndexerForward(
-            sample_q=q,
-            sample_k=k,
-            sample_w=w,
-            sample_out=out_padded,
-            ratio=ratio,
-            qhead_per_kv_head=qhead_per_kv_head,
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
-            q_stage=q_stage,
-            kv_stage=kv_stage,
-            sm_scale=sm_scale,
-        )
-        assert obj.check_support()
-        obj.compile()
-        _cache_of_IndexerForwardObjects[cache_key] = obj
-
-    obj.execute(q, k, w, out_padded, current_stream=stream)
-
-    scores = out_buf[:, :, :s_k] if needs_view else out_buf
     return TupleDict(scores=scores)

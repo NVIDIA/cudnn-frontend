@@ -1170,19 +1170,6 @@ class IndexerBackwardSm90:
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         wg_tidx = tidx % self.WARPGROUP_SIZE
 
-        sK_slice_0 = cute.composition(
-            sK[None, None, 0],
-            cute.make_layout((self.block_I, self.head_dim_padded)),
-        )
-        sK_slice_1 = cute.composition(
-            sK[None, None, 1],
-            cute.make_layout((self.block_I, self.head_dim_padded)),
-        )
-        sK_slice_2 = cute.composition(
-            sK[None, None, 2],
-            cute.make_layout((self.block_I, self.head_dim_padded)),
-        )
-
         k_consumed_0_phase = Int32(0)
         k_consumed_1_phase = Int32(0)
         k_consumed_2_phase = Int32(0)
@@ -1201,79 +1188,87 @@ class IndexerBackwardSm90:
         group_idx_local = wg_tidx // GROUP_SIZE
 
         num_k_blocks = self._dense_num_k_blocks(seq_idx, seqlen_q, seqlen_k)
-        for bi in cutlass.range_constexpr(self.num_topk_blocks):
-            if bi < num_k_blocks:
-                stage = bi % NUM_K_STAGES
-                n_block = bi
+        for bi in cutlass.range(0, num_k_blocks, unroll=1):
+            stage = bi % NUM_K_STAGES
+            n_block = bi
 
-                if bi >= NUM_K_STAGES:
-                    if stage == 0:
-                        cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_0, k_consumed_0_phase)
-                        k_consumed_0_phase ^= 1
-                    elif stage == 1:
-                        cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_1, k_consumed_1_phase)
-                        k_consumed_1_phase ^= 1
-                    else:
-                        cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_2, k_consumed_2_phase)
-                        k_consumed_2_phase ^= 1
-
-                sK_slice = sK_slice_0 if stage == 0 else (sK_slice_1 if stage == 1 else sK_slice_2)
-                mbar_k = (mbar + MBAR_K_LOADED_0) if stage == 0 else (
-                    (mbar + MBAR_K_LOADED_1) if stage == 1 else (mbar + MBAR_K_LOADED_2))
-
-                block_end = (n_block + 1) * self.block_I
-                if block_end <= seqlen_k:
-                    gK_tile = cute.local_tile(
-                        mK, (self.block_I, self.head_dim_padded), (n_block, 0),
-                    )
-                    load_fn, _, _ = copy_ops.tma_get_copy_fn(
-                        tma_atom_K, 0, cute.make_layout(1),
-                        gK_tile, sK_slice, single_stage=True,
-                    )
-
-                    if warp_idx_in_wg == 0:
-                        with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive_and_expect_tx(
-                                mbar_k, self.tma_copy_K_bytes,
-                            )
-                        load_fn(tma_bar_ptr=mbar_k)
+            if bi >= NUM_K_STAGES:
+                if stage == 0:
+                    cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_0, k_consumed_0_phase)
+                    k_consumed_0_phase ^= 1
+                elif stage == 1:
+                    cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_1, k_consumed_1_phase)
+                    k_consumed_1_phase ^= 1
                 else:
-                    for r in cutlass.range_constexpr(ROWS_PER_GROUP):
-                        row = r * NUM_GROUPS + group_idx_local
-                        k_pos = n_block * self.block_I + row
-                        if k_pos < seqlen_k:
-                            gK_raw = mKScalar[k_pos, None]
-                            gK = cute.make_tensor(
-                                cute.make_ptr(self.k_dtype, gK_raw.iterator.llvm_ptr,
-                                              cute.AddressSpace.gmem, assumed_align=16),
-                                gK_raw.layout,
-                            )
-                            gChunks = cute.flat_divide(gK, (8,))
-                            sRow = sK_slice[row, None]
-                            sChunks = cute.flat_divide(sRow, (8,))
-                            for tile in cutlass.range_constexpr(self.head_dim_padded // 64):
-                                chunk_idx = tile * 8 + idx_in_group
-                                tSg = async_thr_copy.partition_S(gChunks[None, chunk_idx])
-                                tSs = async_thr_copy.partition_D(sChunks[None, chunk_idx])
-                                cute.copy(async_copy_atom, tSg, tSs)
-                        else:
-                            sRow = sK_slice[row, None]
-                            sChunks = cute.flat_divide(sRow, (8,))
-                            for tile in cutlass.range_constexpr(self.head_dim_padded // 64):
-                                chunk_idx = tile * 8 + idx_in_group
-                                sChunks[None, chunk_idx].fill(0)
+                    cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_2, k_consumed_2_phase)
+                    k_consumed_2_phase ^= 1
 
-                    cute.arch.cp_async_commit_group()
-                    cute.arch.cp_async_wait_group(0)
-                    cute.arch.fence_view_async_shared()
-                    if warp_idx_in_wg == 0:
-                        with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive(mbar_k)
+            # Runtime stage → select the SMEM K-stage view and K_LOADED barrier
+            # by indexing/arithmetic; a constexpr-stage ternary doesn't lower in
+            # this runtime loop. K_LOADED_{0,1,2} are consecutive barriers.
+            sK_slice = cute.composition(
+                sK[None, None, stage],
+                cute.make_layout((self.block_I, self.head_dim_padded)),
+            )
+            mbar_k = mbar + MBAR_K_LOADED_0 + stage
+
+            block_end = (n_block + 1) * self.block_I
+            if block_end <= seqlen_k:
+                gK_tile = cute.local_tile(
+                    mK, (self.block_I, self.head_dim_padded), (n_block, 0),
+                )
+                load_fn, _, _ = copy_ops.tma_get_copy_fn(
+                    tma_atom_K, 0, cute.make_layout(1),
+                    gK_tile, sK_slice, single_stage=True,
+                )
+
+                if warp_idx_in_wg == 0:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            mbar_k, self.tma_copy_K_bytes,
+                        )
+                    load_fn(tma_bar_ptr=mbar_k)
+            else:
+                for r in cutlass.range_constexpr(ROWS_PER_GROUP):
+                    row = r * NUM_GROUPS + group_idx_local
+                    k_pos = n_block * self.block_I + row
+                    if k_pos < seqlen_k:
+                        gK_raw = mKScalar[k_pos, None]
+                        gK = cute.make_tensor(
+                            cute.make_ptr(self.k_dtype, gK_raw.iterator.llvm_ptr,
+                                          cute.AddressSpace.gmem, assumed_align=16),
+                            gK_raw.layout,
+                        )
+                        gChunks = cute.flat_divide(gK, (8,))
+                        sRow = sK_slice[row, None]
+                        sChunks = cute.flat_divide(sRow, (8,))
+                        for tile in cutlass.range_constexpr(self.head_dim_padded // 64):
+                            chunk_idx = tile * 8 + idx_in_group
+                            tSg = async_thr_copy.partition_S(gChunks[None, chunk_idx])
+                            tSs = async_thr_copy.partition_D(sChunks[None, chunk_idx])
+                            cute.copy(async_copy_atom, tSg, tSs)
+                    else:
+                        sRow = sK_slice[row, None]
+                        sChunks = cute.flat_divide(sRow, (8,))
+                        for tile in cutlass.range_constexpr(self.head_dim_padded // 64):
+                            chunk_idx = tile * 8 + idx_in_group
+                            sChunks[None, chunk_idx].fill(0)
+
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.fence_view_async_shared()
+                if warp_idx_in_wg == 0:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(mbar_k)
 
 
 # =============================================================================
 # Factory
 # =============================================================================
+# compile_key -> compiled GEMM kernel. Single-layer cache (matches the forward
+# ``_interface.py`` and ``_score_grad_cute_cache``): the key holds only params
+# that change the generated code, and entries are filled lazily on first
+# execute (``_ensure_compiled``) because ``cute.compile`` needs real tensors.
 _compile_cache: dict = {}
 
 
@@ -1289,17 +1284,23 @@ def indexer_backward_sm90(
     topk_indices_global: bool = True,
 ):
     # ``grad_scale`` is intentionally **not** an argument: it's a host scalar
-    # passed to ``_run`` at call time (forwarded into the score-grad
-    # kernel as a runtime ``Float32``). Keeping it out of this factory's
-    # signature + cache key avoids spurious recompiles.
+    # passed to ``_run`` at call time (forwarded into the score-grad kernel as a
+    # runtime ``Float32``). Keeping it out of the cache key avoids spurious
+    # recompiles.
+    #
+    # ``batch``/``seqlen``/``seqlen_k`` stay in the signature (the ``api.py``
+    # call site passes them positionally) but are **not** keyed: in the kernel
+    # they are runtime-only (dynamic tensor extents + ``Int32`` grid/args, with
+    # ``seqlen``/``seqlen_k`` forwarded as ``cutlass.Int32`` at call time), so a
+    # single compiled kernel serves every shape. Keying them would force
+    # recompiles under varlen / changing batch.
     #
     # Use probability-domain score input (predict) to match SM100 convention.
     # The kernel implements both modes behind const_expr(index_is_log); the
     # unified predict path keeps the SM90 and SM100 dispatcher data flows
-    # identical.
+    # identical. ``score_input_is_log`` is const_expr-branched, so it IS keyed.
     score_input_is_log = False
-    key = (
-        batch,
+    return _build_cute_dsl_kernel(
         seqlen,
         seqlen_k,
         heads,
@@ -1307,23 +1308,9 @@ def indexer_backward_sm90(
         topk,
         sm_scale,
         block_I,
-        score_input_is_log,
-        topk_indices_global,
+        score_input_is_log=score_input_is_log,
+        topk_indices_global=topk_indices_global,
     )
-    if key not in _compile_cache:
-        _compile_cache[key] = _build_cute_dsl_kernel(
-            batch,
-            seqlen,
-            seqlen_k,
-            heads,
-            dim,
-            topk,
-            sm_scale,
-            block_I,
-            score_input_is_log=score_input_is_log,
-            topk_indices_global=topk_indices_global,
-        )
-    return _compile_cache[key]
 
 
 class ScoreGradSm90:
@@ -1503,7 +1490,6 @@ def _score_grad_inplace(
 
 
 def _build_cute_dsl_kernel(
-    batch,
     seqlen,
     seqlen_k,
     heads,
@@ -1528,12 +1514,16 @@ def _build_cute_dsl_kernel(
         topk_indices_global=topk_indices_global,
     )
 
-    compiled_holder = [None]
+    # Only params that change the generated code (mirrors forward _interface.py).
+    # ``seqlen``/``seqlen_k``/``sm_scale`` are NOT keyed: they're forwarded as
+    # runtime ``cutlass.Int32``/``Float32`` args below (seqlen* unused on the
+    # sparse path).
+    compile_key = (heads, dim, topk, block_I, score_input_is_log, topk_indices_global)
 
     def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, current_stream=None):
-        """Lazy-compile the GEMM kernel (kernel 2)."""
+        """Lazy-compile the GEMM kernel (kernel 2) on first execute (needs real tensors)."""
         s = _resolve_stream(current_stream)
-        if compiled_holder[0] is None:
+        if compile_key not in _compile_cache:
             cute_args = [to_cute_tensor(t) for t in [IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices]]
 
             # Pass dummy Int32 values for max_seqlen_q/k: the kernel's __call__
@@ -1541,7 +1531,7 @@ def _build_cute_dsl_kernel(
             # cast ``None`` to ``Int32`` (raises DSLRuntimeError). They are
             # only consumed when is_varlen=True (dense + cu_seqlens), so the
             # values here are unused but must be valid Int32.
-            compiled_holder[0] = cute.compile(
+            _compile_cache[compile_key] = cute.compile(
                 kernel_obj,
                 *cute_args,
                 cutlass.Float32(sm_scale),
@@ -1557,7 +1547,7 @@ def _build_cute_dsl_kernel(
         """Run only kernel 2 (GEMM). Caller must have run kernel 1 and zeroed dIndexK_f32."""
         s = _resolve_stream(current_stream)
         _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, current_stream=current_stream)
-        compiled_holder[0](
+        _compile_cache[compile_key](
             IndexQ,
             Weights,
             IndexK,

@@ -44,6 +44,7 @@ def indexer_fwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    current_stream=None,
 ) -> torch.Tensor:
     """
     Indexer QK forward pass using CuTe DSL kernel.
@@ -130,23 +131,18 @@ def indexer_fwd(
         assert out.shape == out_shape, f"out must have shape {out_shape}, got {tuple(out.shape)}"
         assert out.dtype == torch.float32 and out.is_cuda
 
-    # sm_scale participates in compile_key because cutlass.Float32 is baked
-    # as a constant into the compiled kernel, so distinct scale values need
-    # distinct cache entries.
+    # Key holds only params that change generated code. dtype is read from the
+    # tensor; sm_scale/seqlens are runtime args (cutlass.Float32/Int32), so
+    # they're excluded to avoid spurious recompiles.
     compile_key = (
-        q.dtype,
         head_dim,
         qhead_per_kv_head,
         ratio,
         m_block_size,
         n_block_size,
-        num_threads,
         q_stage,
         kv_stage,
-        float(sm_scale),
         is_varlen,
-        seqlen_q_dim,
-        seqlen_k_dim,
     )
 
     if compile_key not in _compile_cache:
@@ -168,7 +164,7 @@ def indexer_fwd(
             kv_stage=kv_stage,
         )
 
-        current_stream = resolve_stream()
+        current_stream = resolve_stream(current_stream)
         scale_arg = cutlass.Float32(sm_scale)
         max_q_arg = cutlass.Int32(seqlen_q_dim)
         max_k_arg = cutlass.Int32(seqlen_k_dim)
@@ -191,7 +187,7 @@ def indexer_fwd(
 
     # Init to -inf: skipped causal n-blocks and masked positions stay -inf
     out.fill_(float("-inf"))
-    current_stream = resolve_stream()
+    current_stream = resolve_stream(current_stream)
     scale_arg = cutlass.Float32(sm_scale)
     max_q_arg = cutlass.Int32(seqlen_q_dim)
     max_k_arg = cutlass.Int32(seqlen_k_dim)
