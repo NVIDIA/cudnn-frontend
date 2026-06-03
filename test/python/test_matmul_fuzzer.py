@@ -783,7 +783,7 @@ def test_matmul_fuzz(test_num: int, total_tests: int, config_seed: int, config: 
 UNALIGNED_TEST_PARAMS = tlist_with_configs(num_tests=1024, rng_seed=12345, allow_unaligned=True)
 
 
-@pytest.mark.L1  # L1 for stress testing with unaligned dimensions
+@pytest.mark.L0  # L0 for stress testing with unaligned dimensions
 @pytest.mark.parametrize("test_num,total_tests,config_seed,config", UNALIGNED_TEST_PARAMS,
                         ids=[make_test_id(p, prefix="u") for p in UNALIGNED_TEST_PARAMS])
 def test_matmul_fuzz_unaligned(test_num: int, total_tests: int, config_seed: int, config: MatmulConfig, cudnn_handle, request):

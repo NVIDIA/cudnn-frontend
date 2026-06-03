@@ -1255,7 +1255,7 @@ def test_conv_random_L0(test_num: int, total_tests: int, config_seed: int, confi
     )
 
 
-@pytest.mark.L1
+@pytest.mark.L0
 @pytest.mark.parametrize("test_num,total_tests,config_seed,config", TEST_PARAMS_L1,
                         ids=[make_test_id(p, prefix="u") for p in TEST_PARAMS_L1])
 def test_conv_random_L1(test_num: int, total_tests: int, config_seed: int, config: ConvConfig, cudnn_handle, num_diffs, request):
@@ -1469,7 +1469,7 @@ def test_conv_depthwise_L0(test_num: int, total_tests: int, config_seed: int, co
     )
 
 
-@pytest.mark.L1
+@pytest.mark.L0
 @pytest.mark.parametrize("test_num,total_tests,config_seed,config", TEST_PARAMS_DEPTHWISE_L1,
                         ids=[make_test_id(p, prefix="dw") for p in TEST_PARAMS_DEPTHWISE_L1])
 def test_conv_depthwise_L1(test_num: int, total_tests: int, config_seed: int, config: ConvConfig, cudnn_handle, num_diffs, request):
