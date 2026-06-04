@@ -112,6 +112,7 @@ class SparseAttentionBackward(APIBase):
                 dq=dq,
                 dkv=dkv,
                 need_d_sink=True,
+                current_stream=current_stream,
             )
         return _iface_sm100.flash_attn_bwd_sm100(
             q,
@@ -125,6 +126,7 @@ class SparseAttentionBackward(APIBase):
             topk_length=topk_length,
             dq=dq,
             dkv=dkv,
+            current_stream=current_stream,
         )
 
 

@@ -238,6 +238,21 @@ def indexer_forward_wrapper(
     positions outside the valid KV range with -inf.
     """
     if device_major() == 9:
+        unsupported = []
+        if m_block_size != 128:
+            unsupported.append(f"m_block_size={m_block_size}")
+        if n_block_size != 128:
+            unsupported.append(f"n_block_size={n_block_size}")
+        if q_stage != 2:
+            unsupported.append(f"q_stage={q_stage}")
+        if kv_stage != 4:
+            unsupported.append(f"kv_stage={kv_stage}")
+        if unsupported:
+            raise ValueError(
+                "SM90 indexer_forward_wrapper only supports default tuning parameters "
+                "(m_block_size=128, n_block_size=128, q_stage=2, kv_stage=4); got "
+                + ", ".join(unsupported)
+            )
         # Both arches route through their own indexer_fwd wrapper (which owns
         # output allocation + TMA padding); Hopper uses the SM90 variant.
         scores = indexer_fwd_sm90(
@@ -251,6 +266,7 @@ def indexer_forward_wrapper(
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            current_stream=stream,
         )
         return TupleDict(scores=scores)
 

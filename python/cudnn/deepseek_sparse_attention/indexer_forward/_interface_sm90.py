@@ -48,6 +48,7 @@ def indexer_fwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    current_stream=None,
 ) -> torch.Tensor:
     """Indexer QK forward pass using the direct SM90 CuTe DSL port."""
     _validate_common(q, k, w)
@@ -130,7 +131,7 @@ def indexer_fwd(
         bool(is_varlen),
         bool(use_tma_store),
     )
-    current_stream = resolve_stream()
+    current_stream = resolve_stream(current_stream)
     if compile_key not in _compile_cache:
         q_cute = _to_cute_tensor(q)
         k_cute = _to_cute_tensor(k)
