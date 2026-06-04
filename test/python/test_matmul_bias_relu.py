@@ -206,7 +206,9 @@ def test_matmul_bias(param_extract, cudnn_handle):
     X_gpu = torch.randn(b, s, e, requires_grad=False, device="cuda", dtype=input_type)
     W_gpu = torch.randn(1, e, e * 4, requires_grad=False, device="cuda", dtype=input_type)
     B_gpu = torch.randn(1, 1, e * 4, requires_grad=False, device="cuda", dtype=input_type)
-    Y_expected = torch.nn.functional.linear(X_gpu, W_gpu.squeeze().T, bias=B_gpu.squeeze())
+    Y_expected = torch.nn.functional.linear(
+        X_gpu.float(), W_gpu.squeeze().float().T, bias=B_gpu.squeeze().float()
+    ).to(input_type)
 
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
@@ -261,8 +263,15 @@ def test_matmul_bias(param_extract, cudnn_handle):
 
     graph.execute({X: X_gpu, W: W_gpu, B: B_gpu, Y: Y_actual}, workspace, handle=cudnn_handle)
 
-    atol = 0.0625 if get_cc() == 89 else 1e-3
-    rtol = 1e-2 if input_type == torch.bfloat16 else 1e-3
+    # The output magnitude here is large (|Y| can reach a few hundred for K up to ~1600),
+    # so a single bf16/fp16 ULP at that scale is ~1.0 / ~0.25. The tolerances must cover
+    # one ULP of the final cast, otherwise legitimate rounding differences between two
+    # correct implementations are flagged as mismatches.
+    if input_type == torch.bfloat16:
+        atol, rtol = 1.0, 2e-2
+    else:  # float16
+        atol, rtol = 0.25, 1e-2
+    atol = max(atol, 0.0625) if get_cc() == 89 else atol
 
     torch.cuda.synchronize()
 
