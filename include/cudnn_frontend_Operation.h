@@ -336,8 +336,8 @@ class OperationBuilder_v8 {
             return std::move(m_operation);
         }
         if (m_operation.groupoffsetdesc != nullptr) {
-#if (CUDNN_VERSION >= 92400) && (CUDNN_VERSION < 99900)
-            if (detail::get_backend_version() < 92400 || detail::get_backend_version() >= 99900) {
+#if (CUDNN_VERSION >= 92400)
+            if (detail::get_backend_version() < 92400) {
                 set_error_and_throw_exception(&m_operation,
                                               CUDNN_STATUS_NOT_SUPPORTED,
                                               "CUDNN_BACKEND_OPERATION: Reduction group offset is not supported in "
