@@ -17,7 +17,7 @@ def read_lines(source: str) -> List[str]:
     return path.read_text().splitlines()
 
 
-EXECUTE_GRAPH_UID_PATTERN = re.compile(r"Executing graph_uid (\d+)")
+EXECUTE_GRAPH_PATTERN = re.compile(r"Executing gid (\d+)")
 
 
 def _parse_context_entry(line: str) -> Tuple[str, dict] | None:
@@ -42,23 +42,23 @@ def iter_graph_entries(lines: Iterable[str]) -> Iterable[Tuple[str, dict]]:
 def iter_context_entries(lines: Iterable[str]) -> Iterable[Tuple[str, dict]]:
     """Extract execution-linked context entries from log lines.
 
-    Prefer execution order when `Executing graph_uid ...` markers are present.
+    Prefer execution order when `Executing gid ...` markers are present.
     Fall back to serialized graph order for older logs.
     """
     graph_entries = list(iter_graph_entries(lines))
-    graph_entries_by_uid = {}
+    graph_entries_by_gid = {}
     for raw_line, payload in graph_entries:
-        graph_uid = payload.get("graph_uid")
-        if graph_uid is not None:
-            graph_entries_by_uid[int(graph_uid)] = (raw_line, payload)
+        gid = payload.get("gid")
+        if gid is not None:
+            graph_entries_by_gid[int(gid)] = (raw_line, payload)
 
     execution_entries = []
     for line in lines:
-        match = EXECUTE_GRAPH_UID_PATTERN.search(line)
+        match = EXECUTE_GRAPH_PATTERN.search(line)
         if match is None:
             continue
-        graph_uid = int(match.group(1))
-        entry = graph_entries_by_uid.get(graph_uid)
+        gid = int(match.group(1))
+        entry = graph_entries_by_gid.get(gid)
         if entry is not None:
             execution_entries.append(entry)
 

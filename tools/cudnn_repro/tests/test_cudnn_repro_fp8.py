@@ -5,6 +5,8 @@ import cudnn_repro.repro_command as repro_command
 import cudnn_repro.sdpa_fp8_bwd as sdpa_fp8_bwd
 import cudnn_repro.sdpa_fp8_fwd as sdpa_fp8_fwd
 
+from .helpers import tensor_list
+
 
 def _fp8_fwd_payload(*, tag="SDPA_FP8_FWD", ragged=False, paged=False, output_dtype="HALF", mxfp8=False):
     if mxfp8 and tag == "SDPA_FP8_FWD":
@@ -61,6 +63,8 @@ def _fp8_fwd_payload(*, tag="SDPA_FP8_FWD", ragged=False, paged=False, output_dt
         for key in ("1", "2", "3", "4"):
             tensors[key]["ragged_offset_uid"] = 99
     return {
+        "json_version": "2.0",
+        "gid": 1,
         "context": {"io_data_type": "FP8_E4M3"},
         "nodes": [
             {
@@ -78,7 +82,7 @@ def _fp8_fwd_payload(*, tag="SDPA_FP8_FWD", ragged=False, paged=False, output_dt
                 "right_bound": None,
             }
         ],
-        "tensors": tensors,
+        "tensors": tensor_list(tensors),
         "repro_metadata": {"ragged_tensor_names": [""] if ragged else []},
     }
 
@@ -108,6 +112,8 @@ def _fp8_bwd_payload(*, ragged=False, output_dtype="HALF", mxfp8=False):
         inputs["SEQ_LEN_Q"] = 19
         inputs["SEQ_LEN_KV"] = 20
     payload = {
+        "json_version": "2.0",
+        "gid": 1,
         "context": {"io_data_type": "FP8_E4M3"},
         "nodes": [
             {
@@ -159,21 +165,25 @@ def _fp8_bwd_payload(*, ragged=False, output_dtype="HALF", mxfp8=False):
         },
         "repro_metadata": {"ragged_tensor_names": [""] if ragged else []},
     }
+    tensors = payload["tensors"]
     if ragged:
-        payload["tensors"]["19"] = {"uid": 19, "data_type": "INT32", "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [9, 7]}
-        payload["tensors"]["20"] = {"uid": 20, "data_type": "INT32", "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [15, 11]}
+        tensors["19"] = {"uid": 19, "data_type": "INT32", "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [9, 7]}
+        tensors["20"] = {"uid": 20, "data_type": "INT32", "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [15, 11]}
         for key in ("1", "2", "3", "4", "21", "22", "23"):
-            payload["tensors"][key]["ragged_offset_uid"] = 99
+            tensors[key]["ragged_offset_uid"] = 99
+    payload["tensors"] = tensor_list(tensors)
     return payload
 
 
 def test_operations_distinguish_fp8_and_non_fp8_tags():
-    assert operations.detect_operation_key({"nodes": [{"tag": "SDPA_FWD"}]}) == "sdpa_fwd"
-    assert operations.detect_operation_key({"nodes": [{"tag": "SDPA_BWD"}]}) == "sdpa_bwd"
-    assert operations.detect_operation_key({"nodes": [{"tag": "SDPA_FP8_FWD"}]}) == "sdpa_fp8_fwd"
-    assert operations.detect_operation_key({"nodes": [{"tag": "SDPA_FP8_BWD"}]}) == "sdpa_fp8_bwd"
-    assert operations.detect_operation_key({"nodes": [{"tag": "SDPA_MXFP8_FWD"}]}) == "sdpa_fp8_fwd"
-    assert operations.detect_operation_key({"nodes": [{"tag": "SDPA_MXFP8_BWD"}]}) == "sdpa_fp8_bwd"
+    payload = lambda tag: {"json_version": "2.0", "gid": 1, "nodes": [{"tag": tag}], "tensors": []}
+
+    assert operations.detect_operation_key(payload("SDPA_FWD")) == "sdpa_fwd"
+    assert operations.detect_operation_key(payload("SDPA_BWD")) == "sdpa_bwd"
+    assert operations.detect_operation_key(payload("SDPA_FP8_FWD")) == "sdpa_fp8_fwd"
+    assert operations.detect_operation_key(payload("SDPA_FP8_BWD")) == "sdpa_fp8_bwd"
+    assert operations.detect_operation_key(payload("SDPA_MXFP8_FWD")) == "sdpa_fp8_fwd"
+    assert operations.detect_operation_key(payload("SDPA_MXFP8_BWD")) == "sdpa_fp8_bwd"
 
 
 def test_build_fp8_fwd_cfg_extracts_output_type_and_stats():
@@ -187,6 +197,26 @@ def test_build_fp8_fwd_cfg_extracts_output_type_and_stats():
     assert cfg["is_mxfp8"] is False
     assert cfg["shape_stats"] == (2, 4, 16, 1)
     assert cfg["stride_stats"] == (64, 16, 1, 1)
+    assert cfg["seq_len_q"] == [13, 11]
+    assert cfg["seq_len_kv"] == [19, 17]
+
+
+def test_build_fp8_fwd_cfg_detects_ragged_from_offset_inputs():
+    payload = _fp8_fwd_payload(ragged=True)
+    payload["nodes"][0]["inputs"]["RAGGED_OFFSET_Q"] = 17
+    payload["nodes"][0]["inputs"]["RAGGED_OFFSET_KV"] = 18
+    payload["tensors"].extend(
+        tensor_list({
+            "17": {"uid": 17, "data_type": "INT64", "dim": [3, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 13, 24]},
+            "18": {"uid": 18, "data_type": "INT64", "dim": [3, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 19, 36]},
+        })
+    )
+    for tensor in payload["tensors"]:
+        tensor.pop("ragged_offset_uid", None)
+
+    cfg = sdpa_fp8_fwd.build_cfg("{}", payload, seed=123)
+
+    assert cfg["is_ragged"] is True
     assert cfg["seq_len_q"] == [13, 11]
     assert cfg["seq_len_kv"] == [19, 17]
 
