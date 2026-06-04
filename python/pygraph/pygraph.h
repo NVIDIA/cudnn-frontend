@@ -643,7 +643,7 @@ class PyGraph {
     build_operation_graph();
 
     void
-    create_execution_plans(std::vector<cudnn_frontend::HeurMode_t> const&);
+    create_execution_plans(std::vector<cudnn_frontend::HeurMode_t> const&, int64_t const max_engine_configs = -1);
 
     void
     create_execution_plan(int64_t const engine_id, std::unordered_map<KnobType_t, int64_t> const& knobs);

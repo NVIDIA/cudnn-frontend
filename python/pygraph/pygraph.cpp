@@ -477,8 +477,9 @@ PyGraph::get_behavior_notes_for_plan_at_index(int64_t const index) {
 }
 
 void
-PyGraph::create_execution_plans(std::vector<cudnn_frontend::HeurMode_t> const& modes) {
-    auto status = graph->create_execution_plans(modes);
+PyGraph::create_execution_plans(std::vector<cudnn_frontend::HeurMode_t> const& modes,
+                                int64_t const max_engine_configs) {
+    auto status = graph->create_execution_plans(modes, max_engine_configs);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
@@ -521,7 +522,8 @@ void
 PyGraph::build(std::vector<cudnn_frontend::HeurMode_t> const& modes) {
     validate();
     build_operation_graph();
-    create_execution_plans(modes);
+    auto status = graph->create_execution_plans(modes, 1);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
     check_support();
     build_plans(cudnn_frontend::BuildPlanPolicy_t::HEURISTICS_CHOICE);
 }
@@ -1253,7 +1255,10 @@ init_pygraph_submodule(py::module_& m) {
         .def("validate", &PyGraph::validate)
         .def("key", &PyGraph::key)
         .def("build_operation_graph", &PyGraph::build_operation_graph)
-        .def("create_execution_plans", &PyGraph::create_execution_plans)
+        .def("create_execution_plans",
+             &PyGraph::create_execution_plans,
+             py::arg("modes"),
+             py::arg("max_engine_configs") = -1)
         .def("create_execution_plan",
              &PyGraph::create_execution_plan,
              R"pbdoc(

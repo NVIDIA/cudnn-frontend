@@ -1995,7 +1995,7 @@ class Graph : public ICudnn, public INode {
     }
 
     error_t
-    create_execution_plans(std::vector<HeurMode_t> const &mode);
+    create_execution_plans(std::vector<HeurMode_t> const &mode, int64_t max_engine_configs = -1);
 
     error_t
     create_execution_plan(int64_t const engine_id, std::unordered_map<KnobType_t, int64_t> const &knobs);
@@ -2716,7 +2716,7 @@ Graph::get_knobs_for_engine(int64_t const engine, std::vector<Knob> &knobs) {
 }
 
 inline error_t
-Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
+Graph::create_execution_plans(std::vector<HeurMode_t> const &mode, int64_t max_engine_configs) {
     CUDNN_FE_LOG_BANNER("  CREATE EXECUTION PLANS  (HEURISTICS QUERY)  ");
 
     // CHECK IF NEED TO OVERRIDE HEURISTICS QUERY
@@ -2768,7 +2768,12 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
     if (!cudnn_modes.empty()) {
         EngineConfigList op_graph_to_configs;
         CHECK_CUDNN_FRONTEND_ERROR(detail::query_cudnn_heuristics_impl(
-            operation_graph, op_graph_to_configs, cudnn_modes, context.get_target_sm_count(), device_properties));
+            operation_graph,
+            op_graph_to_configs,
+            cudnn_modes,
+            context.get_target_sm_count(),
+            device_properties,
+            max_engine_configs));
 
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Extracting engine configs.");
 
@@ -2874,7 +2879,8 @@ Graph::build(cudnnHandle_t const &handle,
 #endif
     CHECK_CUDNN_FRONTEND_ERROR(this->validate());
     CHECK_CUDNN_FRONTEND_ERROR(this->build_operation_graph(handle));
-    CHECK_CUDNN_FRONTEND_ERROR(this->create_execution_plans(modes));
+    CHECK_CUDNN_FRONTEND_ERROR(
+        this->create_execution_plans(modes, policy == BuildPlanPolicy_t::HEURISTICS_CHOICE ? 1 : -1));
     CHECK_CUDNN_FRONTEND_ERROR(this->check_support());
     CHECK_CUDNN_FRONTEND_ERROR(this->build_plans(policy, do_multithreaded_builds));
     CUDNN_FE_LOG_BANNER("  BUILD ALL OK (with handle) ");
@@ -2890,7 +2896,8 @@ Graph::build(std::vector<HeurMode_t> const &modes, BuildPlanPolicy_t const polic
 #endif
     CHECK_CUDNN_FRONTEND_ERROR(this->validate());
     CHECK_CUDNN_FRONTEND_ERROR(this->build_operation_graph());
-    CHECK_CUDNN_FRONTEND_ERROR(this->create_execution_plans(modes));
+    CHECK_CUDNN_FRONTEND_ERROR(
+        this->create_execution_plans(modes, policy == BuildPlanPolicy_t::HEURISTICS_CHOICE ? 1 : -1));
     CHECK_CUDNN_FRONTEND_ERROR(this->check_support());
     CHECK_CUDNN_FRONTEND_ERROR(this->build_plans(policy, do_multithreaded_builds));
     CUDNN_FE_LOG_BANNER("  BUILD PLANS ALL OK (no handle) ");

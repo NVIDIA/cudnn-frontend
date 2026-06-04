@@ -291,7 +291,7 @@ class Graph:
         # prepare the graph and build plans: Each should return None or raise exception
         self.__graph.validate()
         self.__graph.build_operation_graph()
-        self.__graph.create_execution_plans(self.__heuristics)
+        self.__graph.create_execution_plans(self.__heuristics, max_engine_configs=1)
         # TODO: let user select_behavior_notes() and select_numeric_notes() here
         self.__graph.check_support()
         self.__graph.build_plans()

@@ -130,7 +130,8 @@ query_cudnn_heuristics_impl(std::shared_ptr<OperationGraph_v8> const& operation_
                             cudnn_frontend::EngineConfigList& configs,
                             std::vector<HeurMode_t> const& modes,
                             int32_t sm_count,
-                            std::shared_ptr<const DeviceProperties> device_properties = nullptr) {
+                            std::shared_ptr<const DeviceProperties> device_properties = nullptr,
+                            int64_t max_engine_configs                                = -1) {
     RETURN_CUDNN_FRONTEND_ERROR_IF(
         operation_graph == nullptr,
         error_code_t::HEURISTIC_QUERY_FAILED,
@@ -144,13 +145,13 @@ query_cudnn_heuristics_impl(std::shared_ptr<OperationGraph_v8> const& operation_
     // disable exception macro is defined. Calling build will not throw.
     // Check status of desc and return error.
     statuses = cudnn_frontend::get_heuristics_list(
-        modes, *operation_graph, allowAllConfig, configs, true, sm_count, device_properties);
+        modes, *operation_graph, allowAllConfig, configs, true, sm_count, device_properties, max_engine_configs);
 #else
     // build() can throw
     // wrap in try catch
     try {
         statuses = cudnn_frontend::get_heuristics_list(
-            modes, *operation_graph, allowAllConfig, configs, true, sm_count, device_properties);
+            modes, *operation_graph, allowAllConfig, configs, true, sm_count, device_properties, max_engine_configs);
     } catch (cudnn_frontend::cudnnException& e) {
         // Silly MSVC error that thinks below condition is constexpr
         // RETURN_CUDNN_FRONTEND_ERROR_IF(
