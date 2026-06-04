@@ -33,6 +33,9 @@ enum class KnobType_t {
     TILE_M,
     TILE_N,
     WARP_SPEC_CFG,
+    SWAP_AB,
+    INPUT_TMA_ENABLE,
+    OUTPUT_TMA_ENABLE,
 };
 
 class Knob {
@@ -143,6 +146,19 @@ convert_to_backend_knob_type(KnobType_t const knob_type, cudnnBackendKnobType_t&
             cudnn_knob_type = CUDNN_KNOB_TYPE_WARP_SPEC_CFG;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
 #endif
+#if (CUDNN_VERSION >= 91800)
+        case KnobType_t::SWAP_AB:
+            cudnn_knob_type = CUDNN_KNOB_TYPE_SWAP_AB;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#endif
+#if (CUDNN_VERSION >= 92200)
+        case KnobType_t::INPUT_TMA_ENABLE:
+            cudnn_knob_type = CUDNN_KNOB_TYPE_INPUT_TMA_ENABLE;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::OUTPUT_TMA_ENABLE:
+            cudnn_knob_type = CUDNN_KNOB_TYPE_OUTPUT_TMA_ENABLE;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#endif
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
@@ -219,6 +235,16 @@ convert_from_backend_knob_type(cudnnBackendKnobType_t cudnn_knob_type) {
             return KnobType_t::TILE_N;
         case CUDNN_KNOB_TYPE_WARP_SPEC_CFG:
             return KnobType_t::WARP_SPEC_CFG;
+#endif
+#if (CUDNN_VERSION >= 91800)
+        case CUDNN_KNOB_TYPE_SWAP_AB:
+            return KnobType_t::SWAP_AB;
+#endif
+#if (CUDNN_VERSION >= 92200)
+        case CUDNN_KNOB_TYPE_INPUT_TMA_ENABLE:
+            return KnobType_t::INPUT_TMA_ENABLE;
+        case CUDNN_KNOB_TYPE_OUTPUT_TMA_ENABLE:
+            return KnobType_t::OUTPUT_TMA_ENABLE;
 #endif
         default:
             return KnobType_t::NOT_SET;

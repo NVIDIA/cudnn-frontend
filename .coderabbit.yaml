@@ -1,0 +1,14 @@
+# Repository-specific override
+reviews:
+  profile: chill
+  auto_review:
+    enabled: true # Enable auto-review for this repository
+  path_instructions:
+    - path: "python/cudnn/**"
+      instructions: |
+        - Focus on documentation.
+        - Focus on whether there are test cases in test/python/fe_api
+    - path: "include/**"
+      instructions: |
+        - Make sure the cpp code has good quality
+        - Make sure the dynamic and static cudnn versions are met.

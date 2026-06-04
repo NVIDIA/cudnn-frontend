@@ -253,8 +253,7 @@ TEST_CASE("Toy sdpa forward with dynamic shapes", "[graph][sdpa][flash][forward]
                                                           {h_q * d_v, d_v, override_b * h_q * d_v, 1}};
 
     int64_t override_workspace_size = 0;
-    if (cudnn_frontend::detail::get_backend_version() >= 92300 &&
-        cudnn_frontend::detail::get_backend_version() < 99900) {
+    if (cudnn_frontend::detail::get_backend_version() >= 92300) {
         REQUIRE(graph
                     ->get_workspace_size_plan_at_index(
                         handle, 0, override_workspace_size, override_uids, override_shapes, override_strides)
