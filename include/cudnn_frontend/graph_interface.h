@@ -47,10 +47,24 @@ namespace cudnn_frontend::graph {
 
 class Graph : public ICudnn, public INode {
    private:
+    static constexpr char const* GRAPH_JSON_VERSION = "2.0";
+
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+    static error_t
+    check_graph_json_version(json const& j) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !j.contains("json_version") || !j["json_version"].is_string() ||
+                j["json_version"].get<std::string>() != GRAPH_JSON_VERSION,
+            error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+            "Unsupported graph JSON version. Expected " + std::string(GRAPH_JSON_VERSION));
+        return {error_code_t::OK, ""};
+    }
+#endif
+
     std::unordered_set<std::shared_ptr<Tensor_attributes>> full_graph_inputs;
     std::unordered_set<Tensor_attributes::uid_t> used_uids;
     int64_t fe_workspace_size = 0;
-    uint64_t graph_uid;
+    uint64_t gid;
 
     std::unordered_set<std::shared_ptr<Tensor_attributes>> deserialized_tensor_properties;
     std::unordered_map<uid_t, pass_by_values_t> deserialized_pass_by_value;
@@ -292,7 +306,7 @@ class Graph : public ICudnn, public INode {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j;
         serialize(j);
-        j.erase("graph_uid");
+        j.erase("gid");
         if (remove_shape) {
             for (auto &tensor : j["tensors"]) {
                 tensor["dim"].clear();
@@ -622,8 +636,8 @@ class Graph : public ICudnn, public INode {
 
    public:
     Graph() : INode(detail::Context{}) {
-        static std::atomic<uint64_t> next_graph_uid{1};
-        graph_uid = next_graph_uid.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<uint64_t> next_gid{1};
+        gid = next_gid.fetch_add(1, std::memory_order_relaxed);
     }
 
     error_t
@@ -1452,7 +1466,7 @@ class Graph : public ICudnn, public INode {
         // 4. Run auxiliary kernels (e.g. SDPA reduction accumulator init)
         CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
 
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing graph_uid " << graph_uid);
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing gid " << gid);
         CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, varpack_template.all_uids, ptrs));
 
         // 5. Dispatch
@@ -1731,6 +1745,7 @@ class Graph : public ICudnn, public INode {
     error_t
     deserialize(cudnnHandle_t handle, json const &j, bool const enforce_precompiled = false, bool run_warmup = true) {
         CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE  ");
+        CHECK_CUDNN_FRONTEND_ERROR(check_graph_json_version(j));
 
         // Clear deserialize-owned containers so a re-deserialize on the same Graph
         // does not feed prepare_variant_pack_template() with stale entries from a
@@ -1740,18 +1755,15 @@ class Graph : public ICudnn, public INode {
         deserialized_workspace_modifications.clear();
         tensors_to_dump.clear();
 
-        if (j.contains("graph_uid") && !j["graph_uid"].is_null()) {
-            graph_uid = j["graph_uid"].get<uint64_t>();
-        }
+        gid = j["gid"].get<uint64_t>();
 
-        // Resolve tensor UIDs with deserialized_tensor_properties.
-        if (j.contains("tensors")) {
-            auto tensor_map = j["tensors"].get<std::unordered_map<std::string, json>>();
-            for (const auto &tensor_info : tensor_map) {
-                auto tensor_attributes = std::make_shared<Tensor_attributes>();
-                from_json(tensor_info.second, *tensor_attributes);
-                deserialized_tensor_properties.insert(tensor_attributes);
-            }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains("tensors") || !j["tensors"].is_array(),
+                                       error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                       "Serialized graph tensors must be a list.");
+        for (const auto &tensor_info : j["tensors"]) {
+            auto tensor_attributes = std::make_shared<Tensor_attributes>();
+            from_json(tensor_info, *tensor_attributes);
+            deserialized_tensor_properties.insert(tensor_attributes);
         }
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
@@ -2430,14 +2442,16 @@ class Graph : public ICudnn, public INode {
         // Go over each subnode and serialize them.
         json full_json;
 
-        full_json["context"]["name"]                      = context.get_name();
+        full_json["gid"]                                  = gid;
         full_json["context"]["compute_data_type"]         = context.get_compute_data_type();
         full_json["context"]["intermediate_data_type"]    = context.get_intermediate_data_type();
         full_json["context"]["io_data_type"]              = context.get_io_data_type();
         full_json["context"]["sm_count"]                  = context.get_target_sm_count();
         full_json["context"]["is_dynamic_shape_enabled"]  = context.get_dynamic_shape_enabled();
         full_json["context"]["is_override_shape_enabled"] = context.get_override_shape_enabled();
-        full_json["graph_uid"]                            = graph_uid;
+        if (!context.get_name().empty()) {
+            full_json["context"]["name"] = context.get_name();
+        }
 
         full_json.update(R"( {"tag": "GRAPH"})"_json);
         full_json["nodes"];
@@ -2447,111 +2461,56 @@ class Graph : public ICudnn, public INode {
             full_json["nodes"].push_back(j_sub_node);
         }
 
-        j["context"]   = full_json["context"];
-        j["graph_uid"] = full_json["graph_uid"];
+        j["gid"]     = full_json["gid"];
+        j["context"] = full_json["context"];
 
-        j["json_version"]           = "1.0";
+        j["json_version"]           = GRAPH_JSON_VERSION;
         j["cudnn_backend_version"]  = detail::get_backend_version_string();
         j["cudnn_frontend_version"] = CUDNN_FRONTEND_VERSION;
-        j["nodes"];
-        j["tensors"];
-        std::unordered_set<std::string> tensors;
+        j["nodes"]   = json::array();
+        j["tensors"] = json::array();
+        std::map<Tensor_attributes::tid_t, json> tensors;
+        auto add_tensor = [&](json& refs, std::string const& port_name, json const& tensor_info) {
+            if (tensor_info.is_null()) {
+                return;
+            }
+            auto tensor_tid = tensor_info.at("tid").get<Tensor_attributes::tid_t>();
+            refs[port_name] = tensor_tid;
+            tensors.emplace(tensor_tid, tensor_info);
+        };
         for (const auto &sub_node : full_json["nodes"]) {
-            // Create a short version of the node
             auto short_node       = sub_node;
-            short_node["inputs"]  = {};
-            short_node["outputs"] = {};
+            short_node["inputs"]  = json::object();
+            short_node["outputs"] = json::object();
 
             auto node_name = sub_node["tag"].get<std::string>();
             auto i         = 0;
-            // Process node inputs
             for (const auto &input : sub_node["inputs"]) {
                 std::string port_name;
                 json tensor_info;
 
                 if (node_name == "CONCATENATE") {
-                    // Extract port_name and tensor_name
                     port_name   = std::to_string(i);
                     tensor_info = input;
                     i++;
                 } else {
-                    // Extract port_name and tensor_name
                     port_name   = input[0].get<std::string>();
                     tensor_info = input[1];
                 }
 
-                if (tensor_info.is_null()) {
-                    continue;
-                }
-
-                // Determine the key to use for this tensor
-                std::string tensor_key;
-                json tensor_ref;
-                bool uid_assigned = tensor_info.contains("uid_assigned") && tensor_info["uid_assigned"].get<bool>();
-
-                if (uid_assigned && tensor_info.contains("uid") && tensor_info["uid"].is_number_integer()) {
-                    // Use numeric UID if it was explicitly assigned
-                    int64_t tensor_uid = tensor_info["uid"].get<int64_t>();
-                    tensor_key         = std::to_string(tensor_uid);
-                    tensor_ref         = json(tensor_uid);
-                } else if (tensor_info.contains("name")) {
-                    // Fall back to tensor name if UID not assigned
-                    tensor_key = tensor_info["name"].get<std::string>();
-                    tensor_ref = tensor_key;
-                } else {
-                    continue;
-                }
-
-                // Update short_node inputs
-                short_node["inputs"][port_name] = tensor_ref;
-
-                // Check if the tensor is already in the tensors map
-                if (tensors.find(tensor_key) == tensors.end()) {
-                    // If not, add it to the j["tensors"]
-                    j["tensors"][tensor_key] = tensor_info;
-                }
+                add_tensor(short_node["inputs"], port_name, tensor_info);
             }
 
-            // Process node outputs
             for (const auto &output : sub_node["outputs"]) {
-                // Extract port_name and tensor_name
                 auto port_name   = output[0].get<std::string>();
                 auto tensor_info = output[1];
-
-                if (tensor_info.is_null()) {
-                    continue;
-                }
-
-                // Determine the key to use for this tensor
-                std::string tensor_key;
-                json tensor_ref;
-                bool uid_assigned = tensor_info.contains("uid_assigned") && tensor_info["uid_assigned"].get<bool>();
-
-                if (uid_assigned && tensor_info.contains("uid") && tensor_info["uid"].is_number_integer()) {
-                    // Use numeric UID if it was explicitly assigned
-                    int64_t tensor_uid = tensor_info["uid"].get<int64_t>();
-                    tensor_key         = std::to_string(tensor_uid);
-                    tensor_ref         = json(tensor_uid);
-                } else if (tensor_info.contains("name")) {
-                    // Fall back to tensor name if UID not assigned
-                    tensor_key = tensor_info["name"].get<std::string>();
-                    tensor_ref = tensor_key;
-                } else {
-                    continue;
-                }
-
-                // Update short_node outputs
-                short_node["outputs"][port_name] = tensor_ref;
-
-                // Check if the tensor is already in the tensors map
-                if (tensors.find(tensor_key) == tensors.end()) {
-                    // If not, add it to the j["tensors"]
-                    j["tensors"][tensor_key] = tensor_info;
-                }
+                add_tensor(short_node["outputs"], port_name, tensor_info);
             }
 
-            // Add the short_node to j["nodes"]
             j["nodes"].push_back(short_node);
+        }
+        for (auto const& tensor : tensors) {
+            j["tensors"].push_back(tensor.second);
         }
     };
 #endif
@@ -2565,6 +2524,8 @@ class Graph : public ICudnn, public INode {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     error_t
     deserialize(const json &j, bool const enforce_precompiled = false) {
+        CHECK_CUDNN_FRONTEND_ERROR(check_graph_json_version(j));
+
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             enforce_precompiled,
             error_code_t::GRAPH_NOT_SUPPORTED,
@@ -2595,65 +2556,77 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        if (j.contains("graph_uid") && !j["graph_uid"].is_null()) {
-            graph_uid = j["graph_uid"].get<uint64_t>();
+        gid = j["gid"].get<uint64_t>();
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains("tensors") || !j["tensors"].is_array(),
+                                       error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                       "Serialized graph tensors must be a list.");
+        std::map<Tensor_attributes::tid_t, json> tensor_table;
+        for (auto const& tensor_info : j["tensors"]) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!tensor_info.is_object() || !tensor_info.contains("tid"),
+                                           error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                           "Serialized tensor is missing tid.");
+            auto tensor_tid = tensor_info.at("tid").get<Tensor_attributes::tid_t>();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                tensor_tid <= 0, error_code_t::UNSUPPORTED_GRAPH_FORMAT, "Serialized tensor tid must be positive.");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!tensor_table.emplace(tensor_tid, tensor_info).second,
+                                           error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                           "Serialized graph has duplicate tensor tid " + std::to_string(tensor_tid));
         }
 
-        std::map<std::string, std::shared_ptr<Tensor_attributes>> created_tensors;
-        // Iterate through each sub-node in the full JSON
+        std::map<Tensor_attributes::tid_t, std::shared_ptr<Tensor_attributes>> created_tensors;
+        auto resolve_tensor_ref = [&tensor_table](json const& tensor_ref, json& tensor_info) -> error_t {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !tensor_ref.is_number_integer(),
+                error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                "Serialized tensor references must be numeric tids.");
+            auto tensor_tid = tensor_ref.get<Tensor_attributes::tid_t>();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                tensor_tid <= 0, error_code_t::UNSUPPORTED_GRAPH_FORMAT, "Serialized tensor tid must be positive.");
+
+            auto tensor_iter = tensor_table.find(tensor_tid);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_iter == tensor_table.end(),
+                                           error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                           "Serialized graph is missing tensor for tid " + std::to_string(tensor_tid));
+
+            tensor_info = tensor_iter->second;
+            return {error_code_t::OK, ""};
+        };
+        auto fill_tensor_refs = [&resolve_tensor_ref](json const& tensor_refs, json& tensor_infos) -> error_t {
+            if (!tensor_refs.is_object()) {
+                return {error_code_t::OK, ""};
+            }
+            for (auto &[port_name, tensor_ref] : tensor_refs.items()) {
+                json tensor_info;
+                CHECK_CUDNN_FRONTEND_ERROR(resolve_tensor_ref(tensor_ref, tensor_info));
+                tensor_infos.push_back({port_name, tensor_info});
+            }
+            return {error_code_t::OK, ""};
+        };
+
         if (j.contains("nodes") && j["nodes"].is_array()) {
             for (auto j_sub_node : j["nodes"]) {
-                // Create a JSON object for inputs
                 json inputs;
+                CHECK_CUDNN_FRONTEND_ERROR(fill_tensor_refs(j_sub_node["inputs"], inputs));
 
-                // Iterate through each input of the sub-node
-                if (j_sub_node.contains("inputs") && j_sub_node["inputs"].is_object()) {
-                    for (auto &[port_name, tensor_ref] : j_sub_node["inputs"].items()) {
-                        // Convert tensor reference (either numeric UID or string name) to string key
-                        std::string tensor_key = tensor_ref.is_number_integer()
-                                                     ? std::to_string(tensor_ref.get<int64_t>())
-                                                     : tensor_ref.get<std::string>();
-
-                        if (j.contains("tensors") && j["tensors"].contains(tensor_key)) {
-                            // Add the input to the inputs JSON object
-                            inputs.push_back({port_name, j["tensors"][tensor_key]});
-                        }
-                    }
-                }
-
-                // Create a JSON object for outputs
                 json outputs;
+                CHECK_CUDNN_FRONTEND_ERROR(fill_tensor_refs(j_sub_node["outputs"], outputs));
 
-                // Iterate through each output of the sub-node
-                if (j_sub_node.contains("outputs") && j_sub_node["outputs"].is_object()) {
-                    for (auto &[port_name, tensor_ref] : j_sub_node["outputs"].items()) {
-                        // Convert tensor reference (either numeric UID or string name) to string key
-                        std::string tensor_key = tensor_ref.is_number_integer()
-                                                     ? std::to_string(tensor_ref.get<int64_t>())
-                                                     : tensor_ref.get<std::string>();
-
-                        if (j.contains("tensors") && j["tensors"].contains(tensor_key)) {
-                            // Add the output to the outputs JSON object
-                            outputs.push_back({port_name, j["tensors"][tensor_key]});
-                        }
-                    }
-                }
-
-                // Replace the original inputs and outputs of the sub-node with the new JSON objects
                 j_sub_node["inputs"]  = inputs;
                 j_sub_node["outputs"] = outputs;
 
-                auto check_if_pre_created_tensor = [&created_tensors](std::shared_ptr<Tensor_attributes> t) {
+                auto check_if_pre_created_tensor = [this, &created_tensors](std::shared_ptr<Tensor_attributes> t) {
                     if (t == nullptr) {
                         return t;
                     }
 
-                    if (created_tensors.find(t->get_name()) == created_tensors.end()) {
-                        created_tensors.insert({t->get_name(), t});
-                        return t;
-                    } else {
-                        return created_tensors[t->get_name()];
+                    auto const tid = t->get_tid();
+                    if (tid >= next_tid) {
+                        next_tid = tid + 1;
                     }
+                    auto [created_tensor, inserted] = created_tensors.emplace(tid, t);
+                    (void)inserted;
+                    return created_tensor->second;
                 };
 
 #define CHECK_TENSORS(attributes)                                      \
@@ -3063,6 +3036,7 @@ Graph::set_sm_version(int32_t version) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(Tensor_attributes const &tensor) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(tensor);
+    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3071,6 +3045,7 @@ Graph::tensor(Tensor_attributes const &tensor) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(float const &scalar, ScalarType scalar_type) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
+    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3078,6 +3053,7 @@ Graph::tensor(float const &scalar, ScalarType scalar_type) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(half const &scalar, ScalarType scalar_type) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
+    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3085,6 +3061,7 @@ Graph::tensor(half const &scalar, ScalarType scalar_type) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(nv_bfloat16 const &scalar, ScalarType scalar_type) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
+    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3092,6 +3069,7 @@ Graph::tensor(nv_bfloat16 const &scalar, ScalarType scalar_type) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(int32_t const &scalar, ScalarType scalar_type) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
+    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3099,6 +3077,7 @@ Graph::tensor(int32_t const &scalar, ScalarType scalar_type) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(int64_t const &scalar, ScalarType scalar_type) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
+    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3106,6 +3085,7 @@ Graph::tensor(int64_t const &scalar, ScalarType scalar_type) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(double const &scalar, ScalarType scalar_type) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
+    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3148,6 +3128,7 @@ Graph::tensor_like(std::shared_ptr<Tensor_attributes> const &tensor, std::string
     // uids are not meant to be copied by tensor_like
     // When lowering to cudnn backend, both tensors involved here will get unique uids.
     tensor_ptr->clear_uid();
+    tensor_ptr->assign_tid(next_tid++);
 
     // reset the name too. Defaults to empty string.
     tensor_ptr->set_name(name);

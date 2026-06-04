@@ -50,12 +50,14 @@ class INode {
     detail::Context context;
 
    protected:
+    Tensor_attributes::tid_t next_tid = 1;
+
     // Will eventually be moved to Graph class
     std::unordered_set<std::shared_ptr<Tensor_attributes>> full_graph_outputs;
     std::shared_ptr<Tensor_attributes>
     output_tensor(std::string const& name) {
         auto tensor = std::make_shared<Tensor_attributes>();
-        tensor->set_name(name).set_is_virtual(true);
+        tensor->set_name(name).set_is_virtual(true).assign_tid(next_tid++);
         full_graph_outputs.insert(tensor);
         return tensor;
     }
