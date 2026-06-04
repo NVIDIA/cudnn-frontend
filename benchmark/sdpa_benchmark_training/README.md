@@ -346,4 +346,9 @@ Runs were captured on Lyris GB200 and GB300 with cuDNN 9.22.0 and FAv4 4.0.0b10.
 - `batch=1; num_q_heads=9; num_kv_heads=9; head_dim=128; s_q ∈ {985..8192}; s_kv=62208`
 - Forward-only (autoregressive inference); FA4 bars are BF16 only (the CuTe-DSL FA4 build rejects FP8/MXFP8)
 
+### B300 - Autoregressive video DiT (peak: cuDNN split-K vs FAv4 best num_splits)
+![Autoregressive DiT peak on B300](results/auto_regressive_dit/b300/auto_regressive_dit_no_mask_peak.png)
+- Same shape as above. cuDNN 9.30.0 with prefill split-K enabled on bf16/fp8/mxfp8; FAv4 BF16 swept over `num_splits ∈ {1, 2, 4, 8, 16, 32}` with the best annotated on each bar (`ks=`).
+- Reproduce with `python -m benchmark.sdpa_benchmark_training.bench_ar_dit_peak --out <path>`.
+
 GB200 results are available under the same layout at `results/<config>/gb200/`.
