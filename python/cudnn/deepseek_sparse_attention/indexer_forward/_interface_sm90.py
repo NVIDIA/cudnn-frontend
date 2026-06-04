@@ -15,8 +15,9 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     maybe_contiguous as _maybe_contiguous,
     resolve_stream,
 )
-from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor as _to_cute_tensor
-
+from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
+    to_cute_tensor as _to_cute_tensor,
+)
 
 _SUPPORTED_QHPKV = (32, 64)
 _compile_cache: dict = {}
@@ -91,30 +92,38 @@ def indexer_fwd(
         batch_size, seqlen_q_dim, n_heads_q, head_dim = q.shape
         kb, seqlen_k_dim, n_heads_kv, head_dim_k = k.shape
         assert kb == batch_size, f"q batch ({batch_size}) != k batch ({kb})"
-        assert w.shape == (batch_size, seqlen_q_dim, n_heads_q), (
-            f"w shape must be {(batch_size, seqlen_q_dim, n_heads_q)}, got {tuple(w.shape)}"
-        )
+        assert w.shape == (
+            batch_size,
+            seqlen_q_dim,
+            n_heads_q,
+        ), f"w shape must be {(batch_size, seqlen_q_dim, n_heads_q)}, got {tuple(w.shape)}"
         if seqlen_q_dim > seqlen_k_dim * ratio:
             raise ValueError(
                 f"seqlen_q ({seqlen_q_dim}) must be <= seqlen_k * ratio ({seqlen_k_dim * ratio})"
             )
         out_shape = (batch_size, seqlen_q_dim, seqlen_k_dim)
 
-    assert head_dim == head_dim_k, f"q head_dim ({head_dim}) != k head_dim ({head_dim_k})"
+    assert (
+        head_dim == head_dim_k
+    ), f"q head_dim ({head_dim}) != k head_dim ({head_dim_k})"
     assert head_dim == 128, f"head_dim must be 128, got {head_dim}"
-    assert n_heads_kv == 1, f"SM90 direct fwd currently supports num_head_kv == 1, got {n_heads_kv}"
+    assert (
+        n_heads_kv == 1
+    ), f"SM90 direct fwd currently supports num_head_kv == 1, got {n_heads_kv}"
     assert n_heads_q % n_heads_kv == 0
     if qhead_per_kv_head is None:
         qhead_per_kv_head = n_heads_q // n_heads_kv
     assert qhead_per_kv_head == n_heads_q // n_heads_kv
-    assert qhead_per_kv_head in _SUPPORTED_QHPKV, (
-        f"qhead_per_kv_head must be one of {_SUPPORTED_QHPKV}, got {qhead_per_kv_head}"
-    )
+    assert (
+        qhead_per_kv_head in _SUPPORTED_QHPKV
+    ), f"qhead_per_kv_head must be one of {_SUPPORTED_QHPKV}, got {qhead_per_kv_head}"
 
     if out is None:
         out = torch.empty(out_shape, dtype=torch.float32, device=q.device)
     else:
-        assert out.shape == out_shape, f"out must have shape {out_shape}, got {tuple(out.shape)}"
+        assert (
+            out.shape == out_shape
+        ), f"out must have shape {out_shape}, got {tuple(out.shape)}"
         assert out.dtype == torch.float32 and out.is_cuda
         assert out.is_contiguous(), "out must be contiguous"
 
