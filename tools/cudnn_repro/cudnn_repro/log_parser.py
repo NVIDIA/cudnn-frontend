@@ -5,7 +5,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 
 def read_lines(source: str) -> List[str]:
@@ -33,14 +33,14 @@ def _parse_context_entry(line: str) -> Tuple[str, dict] | None:
     return stripped, payload
 
 
-def _parse_tensor_dump(line: str) -> tuple[int, list[int]] | None:
+def _parse_tensor_dump(line: str) -> Tuple[int, List[int]] | None:
     match = TENSOR_DUMP_PATTERN.search(line)
     if match is None:
         return None
     return int(match.group(1)), [int(value) for value in json.loads(match.group(2))]
 
 
-def _apply_tensor_dumps(entry: Tuple[str, dict], tensor_dumps: dict[int, list[int]]) -> Tuple[str, dict]:
+def _apply_tensor_dumps(entry: Tuple[str, dict], tensor_dumps: Dict[int, List[int]]) -> Tuple[str, dict]:
     if not tensor_dumps:
         return entry
     raw_line, payload = entry
@@ -80,7 +80,7 @@ def iter_context_entries(lines: Iterable[str]) -> Iterable[Tuple[str, dict]]:
         if match is not None:
             if current_entry is not None:
                 execution_entries.append(_apply_tensor_dumps(current_entry, current_dumps))
-                current_dumps = {}
+            current_dumps = {}
             gid = int(match.group(1))
             current_entry = graph_entries_by_gid.get(gid)
             continue

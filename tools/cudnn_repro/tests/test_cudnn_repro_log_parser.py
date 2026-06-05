@@ -67,3 +67,18 @@ def test_iter_context_entries_prefers_current_tensor_dump():
     entries = list(log_parser.iter_context_entries(lines))
 
     assert entries[-1][1]["tensors"][0]["pass_by_value"] == [2]
+
+
+def test_iter_context_entries_ignores_dumps_for_unknown_gid():
+    payload1 = payload(22, "SDPA_BWD", "HALF")
+    payload1["tensors"] = [{"uid": 5}]
+    lines = [
+        json.dumps(payload1),
+        "[cudnn_frontend] INFO: Executing gid 11",
+        "[cudnn_frontend] INFO: Tensor Dump Uid: 5 Name:  Data: [1]",
+        "[cudnn_frontend] INFO: Executing gid 22",
+    ]
+
+    entries = list(log_parser.iter_context_entries(lines))
+
+    assert "pass_by_value" not in entries[-1][1]["tensors"][0]
