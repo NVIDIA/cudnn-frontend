@@ -12,6 +12,7 @@
 #include "reduction.h"
 #include "softmax.h"
 #include "block_scale_dequantize.h"
+#include "scaled_dot_product_flash_attention.h"  // For promote_1d_index_tensor_to_4d()
 
 namespace cudnn_frontend::graph {
 
@@ -21,6 +22,31 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
    private:
     mutable bool is_deterministic_algorithm_supported_on_blackwell = false;  // Will be edited in pre_validate_node()
+
+    // Promote any 1-D seq_len / ragged-offset index tensors to the 4-D
+    // [n, 1, 1, 1] form the cuDNN backend requires (see promote_1d_index_tensor_to_4d).
+    void
+    promote_index_tensors_to_4d() {
+        // TODO: Handle CU_SEQ_LEN_Q and CU_SEQ_LEN_KV once fp8 bprop supports these.
+        for (auto& key : {input_names::SEQ_LEN_Q, input_names::SEQ_LEN_KV}) {
+            auto const it = attributes.inputs.find(key);
+            if (it != attributes.inputs.end()) {
+                promote_1d_index_tensor_to_4d(it->second);
+            }
+        }
+        for (auto& [key, value] : attributes.inputs) {
+            CUDNN_FRONTEND_UNUSED(key);
+            if (value != nullptr) {
+                promote_1d_index_tensor_to_4d(value->get_ragged_offset());
+            }
+        }
+        for (auto& [key, value] : attributes.outputs) {
+            CUDNN_FRONTEND_UNUSED(key);
+            if (value != nullptr) {
+                promote_1d_index_tensor_to_4d(value->get_ragged_offset());
+            }
+        }
+    }
 
    public:
     mutable SDPA_fp8_backward_attributes
@@ -454,6 +480,10 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
     error_t
     infer_properties_node() override final {
+        // If a 1-D length/offset index tensor [n] is supplied, promote it to the 4-D
+        // [n, 1, 1, 1] form the cuDNN backend requires.
+        promote_index_tensors_to_4d();
+
         return {error_code_t::OK, ""};
     }
 
@@ -819,7 +849,9 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                                                                  s_q,
                                                                  s_kv,
                                                                  s_q_ptr,
-                                                                 s_kv_ptr);
+                                                                 s_kv_ptr,
+                                                                 /*cu_s_q_ptr=*/nullptr,
+                                                                 /*cu_s_kv_ptr=*/nullptr);
             sub_nodes.emplace_back(std::move(node_));
         }
 

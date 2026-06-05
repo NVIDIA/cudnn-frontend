@@ -1984,6 +1984,8 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         Bias,
         SEQ_LEN_Q,
         SEQ_LEN_KV,
+        CU_SEQ_LEN_Q,
+        CU_SEQ_LEN_KV,
         Seed,
         Offset,
         Dropout_mask,
@@ -2106,6 +2108,18 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     SDPA_attributes&
     set_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
         inputs[SDPA_attributes::input_names::SEQ_LEN_KV] = std::move(value);
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_cu_seq_len_q(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_attributes::input_names::CU_SEQ_LEN_Q] = std::move(value);
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_cu_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_attributes::input_names::CU_SEQ_LEN_KV] = std::move(value);
         return *this;
     }
 
@@ -2741,7 +2755,7 @@ class DiagonalBandMask_attributes : public Attributes<DiagonalBandMask_attribute
     PointwiseMode_t comparison_mode = PointwiseMode_t::CMP_GT;
 
    public:
-    enum class input_names { X, SEQ_LEN_Q, SEQ_LEN_KV, LeftBound, ShiftRightBound, B };
+    enum class input_names { X, SEQ_LEN_Q, SEQ_LEN_KV, CU_SEQ_LEN_Q, CU_SEQ_LEN_KV, LeftBound, ShiftRightBound, B };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;

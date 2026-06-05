@@ -114,21 +114,21 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
         v = graph_fwd.tensor(uid=GraphFwdUid.v, dim=(num_blocks, h_v, block_size, d_vo), stride=(block_size * h_v * d_vo, block_size * d_vo, d_vo, 1), data_type=cudnn_itype)
 
         use_padding_mask = True
-        kv_seq_len = graph_fwd.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32)
-        q_seq_len = graph_fwd.tensor(uid=GraphFwdUid.q_seq_len, dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32)
+        kv_seq_len = graph_fwd.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
+        q_seq_len = graph_fwd.tensor(uid=GraphFwdUid.q_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
         k_block_table = graph_fwd.tensor(uid=GraphFwdUid.k_block_table, dim=(b, 1, table_size, 1), stride=(table_size, table_size, 1, 1), data_type=cudnn.data_type.INT32)
         v_block_table = graph_fwd.tensor(uid=GraphFwdUid.v_block_table, dim=(b, 1, table_size, 1), stride=(table_size, table_size, 1, 1), data_type=cudnn.data_type.INT32)
 
     if is_ragged:
         use_padding_mask = True
-        q_seq_len = graph_fwd.tensor(uid=GraphFwdUid.q_seq_len, dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32)
-        kv_seq_len = graph_fwd.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32)
+        q_seq_len = graph_fwd.tensor(uid=GraphFwdUid.q_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
+        kv_seq_len = graph_fwd.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
 
-        q_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.q_ragged_offset), dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
-        k_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.k_ragged_offset), dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
-        v_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.v_ragged_offset), dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
-        o_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.o_ragged_offset), dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
-        stats_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.stats_ragged_offset), dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if generate_stats else None
+        q_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.q_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+        k_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.k_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+        v_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.v_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+        o_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.o_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+        stats_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.stats_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if generate_stats else None
         q.set_ragged_offset(q_ragged_offset)
         k.set_ragged_offset(k_ragged_offset)
         v.set_ragged_offset(v_ragged_offset)
@@ -198,15 +198,15 @@ def generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
 
     if is_ragged:
         use_padding_mask = True
-        seq_len_q = graph_bwd.tensor(uid=int(GraphBwdUid.q_seq_len), dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32)
-        seq_len_kv = graph_bwd.tensor(uid=int(GraphBwdUid.kv_seq_len), dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32)
+        seq_len_q = graph_bwd.tensor(uid=int(GraphBwdUid.q_seq_len), dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
+        seq_len_kv = graph_bwd.tensor(uid=int(GraphBwdUid.kv_seq_len), dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
 
-        q_ragged_offset = graph_bwd.tensor(uid=int(GraphBwdUid.q_ragged_offset), dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
-        k_ragged_offset = graph_bwd.tensor(uid=int(GraphBwdUid.k_ragged_offset), dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
-        v_ragged_offset = graph_bwd.tensor(uid=int(GraphBwdUid.v_ragged_offset), dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
-        o_ragged_offset = graph_bwd.tensor(uid=int(GraphBwdUid.o_ragged_offset), dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
-        stats_ragged_offset = graph_bwd.tensor(uid=int(GraphBwdUid.stats_ragged_offset), dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
-        dO_ragged_offset = graph_bwd.tensor(uid=int(GraphBwdUid.dO_ragged_offset), dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
+        q_ragged_offset = graph_bwd.tensor(uid=int(GraphBwdUid.q_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+        k_ragged_offset = graph_bwd.tensor(uid=int(GraphBwdUid.k_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+        v_ragged_offset = graph_bwd.tensor(uid=int(GraphBwdUid.v_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+        o_ragged_offset = graph_bwd.tensor(uid=int(GraphBwdUid.o_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+        stats_ragged_offset = graph_bwd.tensor(uid=int(GraphBwdUid.stats_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+        dO_ragged_offset = graph_bwd.tensor(uid=int(GraphBwdUid.dO_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
         q.set_ragged_offset(q_ragged_offset)
         k.set_ragged_offset(k_ragged_offset)
         v.set_ragged_offset(v_ragged_offset)
@@ -326,8 +326,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     seq_len_kv_list = cfg.seq_len_kv if hasattr(cfg, 'seq_len_kv') and cfg.seq_len_kv else []
 
     if is_ragged:
-        seq_len_q_gpu = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1, 1, 1, 1)
-        seq_len_kv_gpu = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1, 1, 1, 1)
+        seq_len_q_gpu = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1)
+        seq_len_kv_gpu = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1)
         max_t_q = max(64, ((seq_len_q_gpu.sum().item() + 63) // 64) * 64)
         max_t_kv = max(64, ((seq_len_kv_gpu.sum().item() + 63) // 64) * 64)
 
@@ -440,14 +440,14 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if is_paged:
         variant_pack[int(GraphFwdUid.k)] = container_k_gpu
         variant_pack[int(GraphFwdUid.v)] = container_v_gpu
-        variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.full((b, 1, 1, 1), s_kv, device="cuda", dtype=torch.int32)
-        variant_pack[int(GraphFwdUid.q_seq_len)] = torch.full((b, 1, 1, 1), s_qo, device="cuda", dtype=torch.int32)
+        variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.full((b,), s_kv, device="cuda", dtype=torch.int32)
+        variant_pack[int(GraphFwdUid.q_seq_len)] = torch.full((b,), s_qo, device="cuda", dtype=torch.int32)
         variant_pack[int(GraphFwdUid.k_block_table)] = k_block_table_gpu
         variant_pack[int(GraphFwdUid.v_block_table)] = v_block_table_gpu
 
     if is_ragged:
-        variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1, 1, 1, 1)
-        variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1, 1, 1, 1)
+        variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1)
+        variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1)
         variant_pack[int(GraphFwdUid.q_ragged_offset)] = q_ragged_offset_gpu
         variant_pack[int(GraphFwdUid.k_ragged_offset)] = k_ragged_offset_gpu
         variant_pack[int(GraphFwdUid.v_ragged_offset)] = v_ragged_offset_gpu
