@@ -47,16 +47,15 @@ namespace cudnn_frontend::graph {
 
 class Graph : public ICudnn, public INode {
    private:
-    static constexpr char const* GRAPH_JSON_VERSION = "2.0";
+    static constexpr char const *GRAPH_JSON_VERSION = "2.0";
 
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     static error_t
-    check_graph_json_version(json const& j) {
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !j.contains("json_version") || !j["json_version"].is_string() ||
-                j["json_version"].get<std::string>() != GRAPH_JSON_VERSION,
-            error_code_t::UNSUPPORTED_GRAPH_FORMAT,
-            "Unsupported graph JSON version. Expected " + std::string(GRAPH_JSON_VERSION));
+    check_graph_json_version(json const &j) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains("json_version") || !j["json_version"].is_string() ||
+                                           j["json_version"].get<std::string>() != GRAPH_JSON_VERSION,
+                                       error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                       "Unsupported graph JSON version. Expected " + std::string(GRAPH_JSON_VERSION));
         return {error_code_t::OK, ""};
     }
 #endif
@@ -2467,10 +2466,10 @@ class Graph : public ICudnn, public INode {
         j["json_version"]           = GRAPH_JSON_VERSION;
         j["cudnn_backend_version"]  = detail::get_backend_version_string();
         j["cudnn_frontend_version"] = CUDNN_FRONTEND_VERSION;
-        j["nodes"]   = json::array();
-        j["tensors"] = json::array();
+        j["nodes"]                  = json::array();
+        j["tensors"]                = json::array();
         std::map<Tensor_attributes::tid_t, json> tensors;
-        auto add_tensor = [&](json& refs, std::string const& port_name, json const& tensor_info) {
+        auto add_tensor = [&](json &refs, std::string const &port_name, json const &tensor_info) {
             if (tensor_info.is_null()) {
                 return;
             }
@@ -2509,7 +2508,7 @@ class Graph : public ICudnn, public INode {
 
             j["nodes"].push_back(short_node);
         }
-        for (auto const& tensor : tensors) {
+        for (auto const &tensor : tensors) {
             j["tensors"].push_back(tensor.second);
         }
     };
@@ -2562,7 +2561,7 @@ class Graph : public ICudnn, public INode {
                                        error_code_t::UNSUPPORTED_GRAPH_FORMAT,
                                        "Serialized graph tensors must be a list.");
         std::map<Tensor_attributes::tid_t, json> tensor_table;
-        for (auto const& tensor_info : j["tensors"]) {
+        for (auto const &tensor_info : j["tensors"]) {
             auto tensor_tid = tensor_info.at("tid").get<Tensor_attributes::tid_t>();
             RETURN_CUDNN_FRONTEND_ERROR_IF(!tensor_table.emplace(tensor_tid, tensor_info).second,
                                            error_code_t::UNSUPPORTED_GRAPH_FORMAT,
@@ -2570,8 +2569,8 @@ class Graph : public ICudnn, public INode {
         }
 
         std::map<Tensor_attributes::tid_t, std::shared_ptr<Tensor_attributes>> created_tensors;
-        auto resolve_tensor_ref = [&tensor_table](json const& tensor_ref, json& tensor_info) -> error_t {
-            auto tensor_tid = tensor_ref.get<Tensor_attributes::tid_t>();
+        auto resolve_tensor_ref = [&tensor_table](json const &tensor_ref, json &tensor_info) -> error_t {
+            auto tensor_tid  = tensor_ref.get<Tensor_attributes::tid_t>();
             auto tensor_iter = tensor_table.find(tensor_tid);
             RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_iter == tensor_table.end(),
                                            error_code_t::UNSUPPORTED_GRAPH_FORMAT,
@@ -2580,7 +2579,7 @@ class Graph : public ICudnn, public INode {
             tensor_info = tensor_iter->second;
             return {error_code_t::OK, ""};
         };
-        auto fill_tensor_refs = [&resolve_tensor_ref](json const& tensor_refs, json& tensor_infos) -> error_t {
+        auto fill_tensor_refs = [&resolve_tensor_ref](json const &tensor_refs, json &tensor_infos) -> error_t {
             if (!tensor_refs.is_object()) {
                 return {error_code_t::OK, ""};
             }
