@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include "../graph_helpers.h"
