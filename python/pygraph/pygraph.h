@@ -449,7 +449,9 @@ class PyGraph {
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-         bool const unfuse_fma);
+         bool const unfuse_fma,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv);
 
     // return [dQ, dK, dV]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 3>
@@ -816,6 +818,8 @@ class PyGraph {
                   bool const use_padding_mask,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
                   cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
                   py::object const& left_bound,
                   py::object const& right_bound,

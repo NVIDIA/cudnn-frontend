@@ -427,6 +427,8 @@ class INode {
                        std::shared_ptr<Tensor_attributes> b,
                        std::shared_ptr<Tensor_attributes> seq_len_q,
                        std::shared_ptr<Tensor_attributes> seq_len_kv,
+                       std::shared_ptr<Tensor_attributes> cu_seq_len_q,
+                       std::shared_ptr<Tensor_attributes> cu_seq_len_kv,
                        std::shared_ptr<Tensor_attributes> left_bound,
                        std::shared_ptr<Tensor_attributes> shift_right_bound,
                        DiagonalBandMask_attributes attributes);

@@ -59,6 +59,8 @@ class TensorUid(IntEnum):
     k_rot = 33
     dQ_rot = 34
     dK_rot = 35
+    cu_seq_len_q = 36
+    cu_seq_len_kv = 37
 
 def validate_config(cfg):
     if not all((x > 0 and type(x) == int) for x in (cfg.batches, cfg.d_qk, cfg.d_v, cfg.s_q, cfg.s_kv, cfg.h_q, cfg.h_k, cfg.h_v)):
@@ -75,6 +77,10 @@ def validate_config(cfg):
 
     if cfg.is_ragged:
         assert cfg.is_padding == True, "is_ragged=True and is_padding=False not allowed"
+
+    if cfg.is_cu_seq_len:
+        assert cfg.is_padding == True, "is_cu_seq_len=True requires is_padding=True"
+        assert cfg.is_train == False, "is_cu_seq_len=True is forward-only (cu_seq_len is not plumbed for backward)"
 
     assert isinstance(cfg.seq_len_q, (list, tuple)), "input 'seq_len_q' must be list or tuple"
     if cfg.is_padding:
@@ -108,6 +114,10 @@ def validate_config(cfg):
         [(False, False, False), (True, False, False), (False, True, True)]:
         print("@@@@ Overall result: WAIVED, certain combinations of softmax outputs require cuDNN 9.20.0 or higher.")
         pytest.skip("certain combinations of softmax outputs require cuDNN 9.20.0 or higher")
+
+    if cudnn_version < "9.24.0" and cfg.is_cu_seq_len:
+        print("@@@@ Overall result: WAIVED, cu_seq_len_q/cu_seq_len_kv require cuDNN 9.24.0 or higher.")
+        pytest.skip("cu_seq_len_q/cu_seq_len_kv require cuDNN 9.24.0 or higher")
 
 
 def allocate_tensors(cfg, rng_data_gen, perf=False):
@@ -146,10 +156,18 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
             allocs[TensorUid.dV] = alloc_tensor(cfg.shape_v, cfg.data_type, strides=cfg.stride_v)
             allocs[TensorUid.dO] = alloc_tensor(cfg.shape_o, cfg.data_type, strides=cfg.stride_o, rng=rng_data_gen, mean=0.0, std=0.1, sparse_int=si)
 
-    seq_len_q_gpu = torch.tensor(cfg.seq_len_q, dtype=torch.int32, device="cuda").view(-1, 1, 1, 1) if len(cfg.seq_len_q) > 0 else None
-    seq_len_kv_gpu = torch.tensor(cfg.seq_len_kv, dtype=torch.int32, device="cuda").view(-1, 1, 1, 1) if len(cfg.seq_len_kv) > 0 else None
-    allocs[TensorUid.seq_len_q] = (seq_len_q_gpu, None, None)
-    allocs[TensorUid.seq_len_kv] = (seq_len_kv_gpu, None, None)
+    seq_len_q_gpu = torch.tensor(cfg.seq_len_q, dtype=torch.int32, device="cuda").view(-1) if len(cfg.seq_len_q) > 0 else None
+    seq_len_kv_gpu = torch.tensor(cfg.seq_len_kv, dtype=torch.int32, device="cuda").view(-1) if len(cfg.seq_len_kv) > 0 else None
+
+    if cfg.is_cu_seq_len:
+        # When using cu_seq_len, the seq_len_q/seq_len_kv tensors are not part of the
+        # graph; instead, supply 1-D (b+1,) int32 prefix-sums of the per-batch seq_lens
+        # (the frontend promotes these to the 4-D form the backend requires).
+        allocs[TensorUid.cu_seq_len_q] = (prefix_sum(seq_len_q_gpu).to(torch.int32).view(-1), None, None)
+        allocs[TensorUid.cu_seq_len_kv] = (prefix_sum(seq_len_kv_gpu).to(torch.int32).view(-1), None, None)
+    else:
+        allocs[TensorUid.seq_len_q] = (seq_len_q_gpu, None, None)
+        allocs[TensorUid.seq_len_kv] = (seq_len_kv_gpu, None, None)
 
     if cfg.is_ragged:
         allocs[TensorUid.q_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.h_q * cfg.d_qk).to(torch.int64), None, None)
@@ -241,8 +259,11 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
     block_mask_dim = (cfg.batches, cfg.h_q, (cfg.s_q + TILE_M - 1) // TILE_M, ((cfg.s_kv + TILE_N - 1) // TILE_N + 7) // 8)
     block_mask = graph.tensor(uid=int(TensorUid.block_mask), dim=block_mask_dim, stride=(block_mask_dim[1]*block_mask_dim[2]*block_mask_dim[3], block_mask_dim[2]*block_mask_dim[3], block_mask_dim[3], 1), data_type=cudnn.data_type.UINT8) if cfg.is_block_mask else None
 
-    seq_len_q = graph.tensor(uid=int(TensorUid.seq_len_q), dim=(cfg.batches, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32) if cfg.is_padding else None
-    seq_len_kv = graph.tensor(uid=int(TensorUid.seq_len_kv), dim=(cfg.batches, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32) if cfg.is_padding else None
+    seq_len_q = graph.tensor(uid=int(TensorUid.seq_len_q), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if (cfg.is_padding and not cfg.is_cu_seq_len) else None
+    seq_len_kv = graph.tensor(uid=int(TensorUid.seq_len_kv), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if (cfg.is_padding and not cfg.is_cu_seq_len) else None
+
+    cu_seq_len_q = graph.tensor(uid=int(TensorUid.cu_seq_len_q), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_cu_seq_len else None
+    cu_seq_len_kv = graph.tensor(uid=int(TensorUid.cu_seq_len_kv), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_cu_seq_len else None
 
     seed = offset = dropout_tuple = rng_dump = None
     if cfg.is_dropout:
@@ -251,11 +272,11 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         dropout_tuple = (cfg.dropout_prob, seed, offset)
         rng_dump = graph.tensor(uid=int(TensorUid.rng_dump), dim=(cfg.batches, cfg.h_q, cfg.s_q, cfg.s_kv), stride=(cfg.h_q * cfg.s_q * cfg.s_kv, cfg.s_q * cfg.s_kv, cfg.s_kv, 1), data_type=cudnn.data_type.FLOAT)
 
-    q_ragged_offset = graph.tensor(uid=int(TensorUid.q_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
-    k_ragged_offset = graph.tensor(uid=int(TensorUid.k_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
-    v_ragged_offset = graph.tensor(uid=int(TensorUid.v_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
-    o_ragged_offset = graph.tensor(uid=int(TensorUid.o_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
-    stats_ragged_offset = graph.tensor(uid=int(TensorUid.stats_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
+    q_ragged_offset = graph.tensor(uid=int(TensorUid.q_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
+    k_ragged_offset = graph.tensor(uid=int(TensorUid.k_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
+    v_ragged_offset = graph.tensor(uid=int(TensorUid.v_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
+    o_ragged_offset = graph.tensor(uid=int(TensorUid.o_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
+    stats_ragged_offset = graph.tensor(uid=int(TensorUid.stats_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
 
     if cfg.is_ragged:
         q.set_ragged_offset(q_ragged_offset)
@@ -299,6 +320,8 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         use_padding_mask=cfg.is_padding,
         seq_len_q=seq_len_q,
         seq_len_kv=seq_len_kv,
+        cu_seq_len_q=cu_seq_len_q,
+        cu_seq_len_kv=cu_seq_len_kv,
         diagonal_band_left_bound=cfg.left_bound,
         diagonal_band_right_bound=cfg.right_bound,
         diagonal_alignment=cfg.diag_align,
@@ -349,6 +372,8 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         int(TensorUid.block_mask): tensors.get(TensorUid.block_mask),
         int(TensorUid.seq_len_q): tensors.get(TensorUid.seq_len_q),
         int(TensorUid.seq_len_kv): tensors.get(TensorUid.seq_len_kv),
+        int(TensorUid.cu_seq_len_q): tensors.get(TensorUid.cu_seq_len_q),
+        int(TensorUid.cu_seq_len_kv): tensors.get(TensorUid.cu_seq_len_kv),
         int(TensorUid.q_ragged_offset): tensors.get(TensorUid.q_ragged_offset),
         int(TensorUid.k_ragged_offset): tensors.get(TensorUid.k_ragged_offset),
         int(TensorUid.v_ragged_offset): tensors.get(TensorUid.v_ragged_offset),
@@ -408,8 +433,8 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
     bias = graph.tensor(uid=int(TensorUid.bias), dim=bias_dim, stride=bias_stride, data_type=cudnn_dtype) if cfg.is_bias else None
     dBias = graph.tensor(uid=int(TensorUid.dBias), dim=bias_dim, stride=bias_stride, data_type=cudnn_dtype) if cfg.is_bias and not(cfg.d_qk == 256 and cfg.d_v == 256) else None
 
-    seq_len_q = graph.tensor(uid=int(TensorUid.seq_len_q), dim=(cfg.batches, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32) if cfg.is_padding else None
-    seq_len_kv = graph.tensor(uid=int(TensorUid.seq_len_kv), dim=(cfg.batches, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32) if cfg.is_padding else None
+    seq_len_q = graph.tensor(uid=int(TensorUid.seq_len_q), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_padding else None
+    seq_len_kv = graph.tensor(uid=int(TensorUid.seq_len_kv), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_padding else None
 
     seed = offset = dropout_tuple = None
     if cfg.is_dropout:
@@ -459,11 +484,11 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         dK_orig.set_uid(int(TensorUid.dK)).set_output(True).set_data_type(cudnn_dtype).set_dim(cfg.shape_k).set_stride(cfg.stride_k)
 
     if cfg.is_ragged:
-        q_ragged_offset = graph.tensor(uid=int(TensorUid.q_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
-        k_ragged_offset = graph.tensor(uid=int(TensorUid.k_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
-        v_ragged_offset = graph.tensor(uid=int(TensorUid.v_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
-        o_ragged_offset = graph.tensor(uid=int(TensorUid.o_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
-        stats_ragged_offset = graph.tensor(uid=int(TensorUid.stats_ragged_offset), dim=(cfg.batches + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
+        q_ragged_offset = graph.tensor(uid=int(TensorUid.q_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+        k_ragged_offset = graph.tensor(uid=int(TensorUid.k_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+        v_ragged_offset = graph.tensor(uid=int(TensorUid.v_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+        o_ragged_offset = graph.tensor(uid=int(TensorUid.o_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+        stats_ragged_offset = graph.tensor(uid=int(TensorUid.stats_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
         q.set_ragged_offset(q_ragged_offset)
         k.set_ragged_offset(k_ragged_offset)
         v.set_ragged_offset(v_ragged_offset)
@@ -594,6 +619,8 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
     dO_gpu = tensors.get(TensorUid.dO)
     seq_len_q_gpu = tensors.get(TensorUid.seq_len_q)
     seq_len_kv_gpu = tensors.get(TensorUid.seq_len_kv)
+    cu_seq_len_q_gpu = tensors.get(TensorUid.cu_seq_len_q)
+    cu_seq_len_kv_gpu = tensors.get(TensorUid.cu_seq_len_kv)
     block_mask_gpu = tensors.get(TensorUid.block_mask)
     bias_gpu = tensors.get(TensorUid.bias)
     rng_dump_gpu = tensors.get(TensorUid.rng_dump)
@@ -628,8 +655,18 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
         k_ref = k_ref.to(cfg.data_type).float()
 
     dO_ref = dO_gpu.detach().float() if dO_gpu is not None else None
-    seq_len_q_ref = seq_len_q_gpu.flatten().detach() if seq_len_q_gpu is not None else None
-    seq_len_kv_ref = seq_len_kv_gpu.flatten().detach() if seq_len_kv_gpu is not None else None
+    # The reference accepts the per-batch seq_lens in either form: explicit seq_len_*
+    # tensors or the cumulative cu_seq_len_* tensors (recovered via consecutive diffs).
+    def _to_seq_len_ref(seq_len_gpu, cu_seq_len_gpu):
+        if seq_len_gpu is not None:
+            return seq_len_gpu.flatten().detach()
+        if cu_seq_len_gpu is not None:
+            cu = cu_seq_len_gpu.flatten().detach()
+            return (cu[1:] - cu[:-1]).to(torch.int32)
+        return None
+
+    seq_len_q_ref = _to_seq_len_ref(seq_len_q_gpu, cu_seq_len_q_gpu)
+    seq_len_kv_ref = _to_seq_len_ref(seq_len_kv_gpu, cu_seq_len_kv_gpu)
     block_mask_ref = block_mask_gpu.detach() if block_mask_gpu is not None else None
     bias_ref = bias_gpu.detach().float() if bias_gpu is not None else None
     rng_dump_ref = rng_dump_gpu.detach().float() if rng_dump_gpu is not None else None
