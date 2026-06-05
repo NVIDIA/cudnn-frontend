@@ -19,7 +19,7 @@ def read_lines(source: str) -> List[str]:
 
 
 EXECUTE_GRAPH_PATTERN = re.compile(r"Executing gid (\d+)")
-TENSOR_DUMP_PATTERN = re.compile(r"Tensor Dump Tid:\s*(-?\d+).*?Data:\s*(\[.*\])")
+TENSOR_DUMP_PATTERN = re.compile(r"Tensor Dump tid:\s*(-?\d+).*?Data:\s*(\[.*\])")
 
 
 def _parse_context_entry(line: str) -> Tuple[str, dict] | None:
@@ -87,8 +87,8 @@ def iter_context_entries(lines: Iterable[str]) -> Iterable[Tuple[str, dict]]:
 
         dump = _parse_tensor_dump(line)
         if dump is not None:
-            uid, values = dump
-            current_dumps[uid] = values
+            tid, values = dump
+            current_dumps[tid] = values
 
     if current_entry is not None:
         execution_entries.append(_apply_tensor_dumps(current_entry, current_dumps))

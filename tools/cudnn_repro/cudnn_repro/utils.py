@@ -176,10 +176,7 @@ def is_ragged_payload(inputs: dict, entries: tuple[Optional[dict], ...], payload
     if repro_metadata.get("ragged_offset_q") or repro_metadata.get("ragged_offset_kv"):
         return True
     ragged_tensor_names = set(repro_metadata.get("ragged_tensor_names", []))
-    return any(
-        entry is not None and (parse_optional_int(entry.get("ragged_offset_uid")) is not None or entry.get("name") in ragged_tensor_names)
-        for entry in entries
-    )
+    return any(entry is not None and entry.get("name") in ragged_tensor_names for entry in entries)
 
 
 def infer_block_size(page_table_entry: Optional[dict], seq_len_kv: list[int], k_entry: Optional[dict]) -> Optional[int]:
