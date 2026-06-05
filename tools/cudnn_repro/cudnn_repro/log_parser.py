@@ -40,10 +40,7 @@ def _parse_tensor_dump(line: str) -> tuple[int, list[int]] | None:
     return int(match.group(1)), [int(value) for value in json.loads(match.group(2))]
 
 
-def _apply_tensor_dumps(
-    entry: Tuple[str, dict], seen_dumps: dict[int, list[int]], current_dumps: dict[int, list[int]]
-) -> Tuple[str, dict]:
-    tensor_dumps = {**seen_dumps, **current_dumps}
+def _apply_tensor_dumps(entry: Tuple[str, dict], tensor_dumps: dict[int, list[int]]) -> Tuple[str, dict]:
     if not tensor_dumps:
         return entry
     raw_line, payload = entry
@@ -77,14 +74,12 @@ def iter_context_entries(lines: Iterable[str]) -> Iterable[Tuple[str, dict]]:
 
     execution_entries = []
     current_entry = None
-    seen_dumps = {}
     current_dumps = {}
     for line in lines:
         match = EXECUTE_GRAPH_PATTERN.search(line)
         if match is not None:
             if current_entry is not None:
-                execution_entries.append(_apply_tensor_dumps(current_entry, seen_dumps, current_dumps))
-                seen_dumps.update(current_dumps)
+                execution_entries.append(_apply_tensor_dumps(current_entry, current_dumps))
                 current_dumps = {}
             gid = int(match.group(1))
             current_entry = graph_entries_by_gid.get(gid)
@@ -96,7 +91,7 @@ def iter_context_entries(lines: Iterable[str]) -> Iterable[Tuple[str, dict]]:
             current_dumps[uid] = values
 
     if current_entry is not None:
-        execution_entries.append(_apply_tensor_dumps(current_entry, seen_dumps, current_dumps))
+        execution_entries.append(_apply_tensor_dumps(current_entry, current_dumps))
 
     if execution_entries:
         yield from execution_entries
