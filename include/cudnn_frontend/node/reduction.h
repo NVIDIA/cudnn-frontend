@@ -153,10 +153,9 @@ class ReductionNode : public NodeCRTP<ReductionNode> {
         // 5. Set the optional group offset tensor descriptor
         if (Group_offset != attributes.inputs.end() && Group_offset->second != nullptr) {
 #if (CUDNN_VERSION >= 92400)
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                detail::get_backend_version() < 92400,
-                error_code_t::GRAPH_NOT_SUPPORTED,
-                "Reduction group_offset is not supported in cudnn version < 9.24.0");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 92400,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Reduction group_offset is not supported in cudnn version < 9.24.0");
             auto group_offset_backend_desc = tensors.at(Group_offset->second->get_uid())->get_raw_desc();
 
             _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reduction_operation.get_raw_desc(),
