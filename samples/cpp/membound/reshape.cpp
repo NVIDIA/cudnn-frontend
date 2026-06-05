@@ -38,8 +38,8 @@ TEST_CASE("Membound reshape (3,4,5) to (6,10) lexicographic / LOGICAL mode",
     return;
 #endif
 
-    if (!check_device_arch_newer_than("blackwell")) {
-        SKIP("TEST requires device blackwell or newer");
+    if (!is_blackwell_computing_arch()) {
+        SKIP("TensorIR MemBound engine is only supported on SM100-SM109 (data center Blackwell)");
     }
 
 #if (CUDNN_VERSION < 92200)
