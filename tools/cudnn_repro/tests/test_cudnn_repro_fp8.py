@@ -176,7 +176,8 @@ def _fp8_bwd_payload(*, ragged=False, output_dtype="HALF", mxfp8=False):
 
 
 def test_operations_distinguish_fp8_and_non_fp8_tags():
-    payload = lambda tag: {"json_version": "2.0", "gid": 1, "nodes": [{"tag": tag}], "tensors": []}
+    def payload(tag):
+        return {"json_version": "2.0", "gid": 1, "nodes": [{"tag": tag}], "tensors": []}
 
     assert operations.detect_operation_key(payload("SDPA_FWD")) == "sdpa_fwd"
     assert operations.detect_operation_key(payload("SDPA_BWD")) == "sdpa_bwd"
