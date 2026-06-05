@@ -31,3 +31,21 @@ def test_iter_context_entries_falls_back_without_execution_markers():
     entries = list(log_parser.iter_context_entries([json.dumps(payload1), json.dumps(payload2)]))
 
     assert [payload.get("gid") for _, payload in entries] == [11, 22]
+
+
+def test_iter_context_entries_applies_tensor_dumps_by_uid():
+    payload1 = payload(11, "SDPA_FWD", "HALF")
+    payload2 = payload(22, "SDPA_BWD", "HALF")
+    payload1["tensors"] = [{"uid": 5}]
+    payload2["tensors"] = [{"uid": 5}]
+    lines = [
+        json.dumps(payload1),
+        json.dumps(payload2),
+        "[cudnn_frontend] INFO: Executing gid 11",
+        "[cudnn_frontend] INFO: Tensor Dump Uid: 5 Name:  Data: [13, 11]",
+        "[cudnn_frontend] INFO: Executing gid 22",
+    ]
+
+    entries = list(log_parser.iter_context_entries(lines))
+
+    assert entries[-1][1]["tensors"][0]["pass_by_value"] == [13, 11]

@@ -1,5 +1,6 @@
 """Log reading and JSON context entry extraction."""
 
+import copy
 import json
 import re
 import sys
@@ -18,6 +19,7 @@ def read_lines(source: str) -> List[str]:
 
 
 EXECUTE_GRAPH_PATTERN = re.compile(r"Executing gid (\d+)")
+TENSOR_DUMP_PATTERN = re.compile(r"Tensor Dump Uid:\s*(-?\d+).*?Data:\s*(\[.*\])")
 
 
 def _parse_context_entry(line: str) -> Tuple[str, dict] | None:
@@ -29,6 +31,24 @@ def _parse_context_entry(line: str) -> Tuple[str, dict] | None:
     except json.JSONDecodeError:
         return None
     return stripped, payload
+
+
+def _parse_tensor_dump(line: str) -> tuple[int, list[int]] | None:
+    match = TENSOR_DUMP_PATTERN.search(line)
+    if match is None:
+        return None
+    return int(match.group(1)), [int(value) for value in json.loads(match.group(2))]
+
+
+def _apply_tensor_dumps(entry: Tuple[str, dict], tensor_dumps: dict[int, list[int]]) -> Tuple[str, dict]:
+    if not tensor_dumps:
+        return entry
+    raw_line, payload = entry
+    payload = copy.deepcopy(payload)
+    for tensor in payload.get("tensors", []):
+        if tensor.get("uid") in tensor_dumps:
+            tensor["pass_by_value"] = tensor_dumps[tensor["uid"]]
+    return raw_line, payload
 
 
 def iter_graph_entries(lines: Iterable[str]) -> Iterable[Tuple[str, dict]]:
@@ -53,14 +73,24 @@ def iter_context_entries(lines: Iterable[str]) -> Iterable[Tuple[str, dict]]:
             graph_entries_by_gid[int(gid)] = (raw_line, payload)
 
     execution_entries = []
+    current_entry = None
+    tensor_dumps = {}
     for line in lines:
         match = EXECUTE_GRAPH_PATTERN.search(line)
-        if match is None:
+        if match is not None:
+            if current_entry is not None:
+                execution_entries.append(_apply_tensor_dumps(current_entry, tensor_dumps))
+            gid = int(match.group(1))
+            current_entry = graph_entries_by_gid.get(gid)
             continue
-        gid = int(match.group(1))
-        entry = graph_entries_by_gid.get(gid)
-        if entry is not None:
-            execution_entries.append(entry)
+
+        dump = _parse_tensor_dump(line)
+        if dump is not None:
+            uid, values = dump
+            tensor_dumps[uid] = values
+
+    if current_entry is not None:
+        execution_entries.append(_apply_tensor_dumps(current_entry, tensor_dumps))
 
     if execution_entries:
         yield from execution_entries
