@@ -206,9 +206,7 @@ def test_matmul_bias(param_extract, cudnn_handle):
     X_gpu = torch.randn(b, s, e, requires_grad=False, device="cuda", dtype=input_type)
     W_gpu = torch.randn(1, e, e * 4, requires_grad=False, device="cuda", dtype=input_type)
     B_gpu = torch.randn(1, 1, e * 4, requires_grad=False, device="cuda", dtype=input_type)
-    Y_expected = torch.nn.functional.linear(
-        X_gpu.float(), W_gpu.squeeze().float().T, bias=B_gpu.squeeze().float()
-    ).to(input_type)
+    Y_expected = torch.nn.functional.linear(X_gpu.float(), W_gpu.squeeze().float().T, bias=B_gpu.squeeze().float()).to(input_type)
 
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
