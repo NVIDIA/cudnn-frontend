@@ -161,8 +161,8 @@ TEST_CASE("Toy sdpa backward with flexible graph", "[graph][sdpa][flash][backwar
         return;
     }
 
-    if (get_compute_capability() == 120) {
-        SKIP("Backward pass with flexible graphs is not supported on SM version 120 yet");
+    if (get_compute_capability() >= 120) {
+        SKIP("Backward pass with flexible graphs is not supported on SM version 120 and above yet");
         return;
     }
 
