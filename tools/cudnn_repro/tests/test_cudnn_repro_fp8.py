@@ -25,6 +25,8 @@ def _fp8_fwd_payload(*, tag="SDPA_FP8_FWD", ragged=False, paged=False, output_dt
     if ragged:
         inputs["SEQ_LEN_Q"] = 13
         inputs["SEQ_LEN_KV"] = 14
+        inputs["RAGGED_OFFSET_Q"] = 17
+        inputs["RAGGED_OFFSET_KV"] = 18
     if paged:
         inputs["SEQ_LEN_Q"] = 13
         inputs["SEQ_LEN_KV"] = 14
@@ -60,8 +62,8 @@ def _fp8_fwd_payload(*, tag="SDPA_FP8_FWD", ragged=False, paged=False, output_dt
         tensors["15"] = {"uid": 15, "data_type": "INT32", "dim": [2, 1, 5, 1], "stride": [5, 5, 1, 1]}
         tensors["16"] = {"uid": 16, "data_type": "INT32", "dim": [2, 1, 5, 1], "stride": [5, 5, 1, 1]}
     if ragged:
-        for key in ("1", "2", "3", "4"):
-            tensors[key]["ragged_offset_uid"] = 99
+        tensors["17"] = {"uid": 17, "data_type": "INT64", "dim": [3, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 13, 24]}
+        tensors["18"] = {"uid": 18, "data_type": "INT64", "dim": [3, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 19, 36]}
     return {
         "json_version": "2.0",
         "gid": 1,
@@ -111,6 +113,8 @@ def _fp8_bwd_payload(*, ragged=False, output_dtype="HALF", mxfp8=False):
     if ragged:
         inputs["SEQ_LEN_Q"] = 19
         inputs["SEQ_LEN_KV"] = 20
+        inputs["RAGGED_OFFSET_Q"] = 28
+        inputs["RAGGED_OFFSET_KV"] = 29
     payload = {
         "json_version": "2.0",
         "gid": 1,
@@ -169,8 +173,8 @@ def _fp8_bwd_payload(*, ragged=False, output_dtype="HALF", mxfp8=False):
     if ragged:
         tensors["19"] = {"uid": 19, "data_type": "INT32", "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [9, 7]}
         tensors["20"] = {"uid": 20, "data_type": "INT32", "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [15, 11]}
-        for key in ("1", "2", "3", "4", "21", "22", "23"):
-            tensors[key]["ragged_offset_uid"] = 99
+        tensors["28"] = {"uid": 28, "data_type": "INT64", "dim": [3, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 9, 16]}
+        tensors["29"] = {"uid": 29, "data_type": "INT64", "dim": [3, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 15, 26]}
     payload["tensors"] = tensor_list(tensors)
     return payload
 
@@ -204,16 +208,6 @@ def test_build_fp8_fwd_cfg_extracts_output_type_and_stats():
 
 def test_build_fp8_fwd_cfg_detects_ragged_from_offset_inputs():
     payload = _fp8_fwd_payload(ragged=True)
-    payload["nodes"][0]["inputs"]["RAGGED_OFFSET_Q"] = 17
-    payload["nodes"][0]["inputs"]["RAGGED_OFFSET_KV"] = 18
-    payload["tensors"].extend(
-        tensor_list({
-            "17": {"uid": 17, "data_type": "INT64", "dim": [3, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 13, 24]},
-            "18": {"uid": 18, "data_type": "INT64", "dim": [3, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 19, 36]},
-        })
-    )
-    for tensor in payload["tensors"]:
-        tensor.pop("ragged_offset_uid", None)
 
     cfg = sdpa_fp8_fwd.build_cfg("{}", payload, seed=123)
 

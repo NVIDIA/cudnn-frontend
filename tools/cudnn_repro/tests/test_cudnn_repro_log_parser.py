@@ -40,7 +40,7 @@ def test_iter_context_entries_does_not_reuse_tensor_dumps_across_gids():
         json.dumps(payload1),
         json.dumps(payload2),
         "[cudnn_frontend] INFO: Executing gid 11",
-        "[cudnn_frontend] INFO: Tensor Dump Tid: 5 Uid: 101 Name:  Data: [13, 11]",
+        "[cudnn_frontend] INFO: Tensor Dump tid: 5 uid: 101 Name:  Data: [13, 11]",
         "[cudnn_frontend] INFO: Executing gid 22",
     ]
 
@@ -59,9 +59,9 @@ def test_iter_context_entries_prefers_current_tensor_dump():
         json.dumps(payload1),
         json.dumps(payload2),
         "[cudnn_frontend] INFO: Executing gid 11",
-        "[cudnn_frontend] INFO: Tensor Dump Tid: 5 Uid: 101 Name:  Data: [1]",
+        "[cudnn_frontend] INFO: Tensor Dump tid: 5 uid: 101 Name:  Data: [1]",
         "[cudnn_frontend] INFO: Executing gid 22",
-        "[cudnn_frontend] INFO: Tensor Dump Tid: 5 Uid: 202 Name:  Data: [2]",
+        "[cudnn_frontend] INFO: Tensor Dump tid: 5 uid: 202 Name:  Data: [2]",
     ]
 
     entries = list(log_parser.iter_context_entries(lines))
@@ -75,7 +75,7 @@ def test_iter_context_entries_ignores_dumps_for_unknown_gid():
     lines = [
         json.dumps(payload1),
         "[cudnn_frontend] INFO: Executing gid 11",
-        "[cudnn_frontend] INFO: Tensor Dump Tid: 5 Uid: 101 Name:  Data: [1]",
+        "[cudnn_frontend] INFO: Tensor Dump tid: 5 uid: 101 Name:  Data: [1]",
         "[cudnn_frontend] INFO: Executing gid 22",
     ]
 
