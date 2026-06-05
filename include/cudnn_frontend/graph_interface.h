@@ -126,8 +126,14 @@ class Graph : public ICudnn, public INode {
                 size_t num_elements = 1;
                 for (auto d : dims) num_elements *= static_cast<size_t>(d);
                 size_t elem_size = detail::get_data_type_size(tensor->get_data_type());
-                CHECK_CUDNN_FRONTEND_ERROR(detail::log_dump_tensor_content(
-                    it->first, tensor->get_name(), it->second, num_elements, elem_size, fmt, stream));
+                CHECK_CUDNN_FRONTEND_ERROR(detail::log_dump_tensor_content(tensor->get_tid(),
+                                                                           it->first,
+                                                                           tensor->get_name(),
+                                                                           it->second,
+                                                                           num_elements,
+                                                                           elem_size,
+                                                                           fmt,
+                                                                           stream));
             }
         }
 

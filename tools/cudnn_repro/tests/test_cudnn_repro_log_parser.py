@@ -34,13 +34,13 @@ def test_iter_context_entries_falls_back_without_execution_markers():
 def test_iter_context_entries_does_not_reuse_tensor_dumps_across_gids():
     payload1 = payload(11, "SDPA_FWD", "HALF")
     payload2 = payload(22, "SDPA_BWD", "HALF")
-    payload1["tensors"] = [{"uid": 5}]
-    payload2["tensors"] = [{"uid": 5}]
+    payload1["tensors"] = [{"tid": 5}]
+    payload2["tensors"] = [{"tid": 5}]
     lines = [
         json.dumps(payload1),
         json.dumps(payload2),
         "[cudnn_frontend] INFO: Executing gid 11",
-        "[cudnn_frontend] INFO: Tensor Dump Uid: 5 Name:  Data: [13, 11]",
+        "[cudnn_frontend] INFO: Tensor Dump Tid: 5 Uid: 101 Name:  Data: [13, 11]",
         "[cudnn_frontend] INFO: Executing gid 22",
     ]
 
@@ -53,15 +53,15 @@ def test_iter_context_entries_does_not_reuse_tensor_dumps_across_gids():
 def test_iter_context_entries_prefers_current_tensor_dump():
     payload1 = payload(11, "SDPA_FWD", "HALF")
     payload2 = payload(22, "SDPA_BWD", "HALF")
-    payload1["tensors"] = [{"uid": 5}]
-    payload2["tensors"] = [{"uid": 5}]
+    payload1["tensors"] = [{"tid": 5}]
+    payload2["tensors"] = [{"tid": 5}]
     lines = [
         json.dumps(payload1),
         json.dumps(payload2),
         "[cudnn_frontend] INFO: Executing gid 11",
-        "[cudnn_frontend] INFO: Tensor Dump Uid: 5 Name:  Data: [1]",
+        "[cudnn_frontend] INFO: Tensor Dump Tid: 5 Uid: 101 Name:  Data: [1]",
         "[cudnn_frontend] INFO: Executing gid 22",
-        "[cudnn_frontend] INFO: Tensor Dump Uid: 5 Name:  Data: [2]",
+        "[cudnn_frontend] INFO: Tensor Dump Tid: 5 Uid: 202 Name:  Data: [2]",
     ]
 
     entries = list(log_parser.iter_context_entries(lines))
@@ -71,11 +71,11 @@ def test_iter_context_entries_prefers_current_tensor_dump():
 
 def test_iter_context_entries_ignores_dumps_for_unknown_gid():
     payload1 = payload(22, "SDPA_BWD", "HALF")
-    payload1["tensors"] = [{"uid": 5}]
+    payload1["tensors"] = [{"tid": 5}]
     lines = [
         json.dumps(payload1),
         "[cudnn_frontend] INFO: Executing gid 11",
-        "[cudnn_frontend] INFO: Tensor Dump Uid: 5 Name:  Data: [1]",
+        "[cudnn_frontend] INFO: Tensor Dump Tid: 5 Uid: 101 Name:  Data: [1]",
         "[cudnn_frontend] INFO: Executing gid 22",
     ]
 
