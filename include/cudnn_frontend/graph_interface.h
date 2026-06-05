@@ -2563,12 +2563,7 @@ class Graph : public ICudnn, public INode {
                                        "Serialized graph tensors must be a list.");
         std::map<Tensor_attributes::tid_t, json> tensor_table;
         for (auto const& tensor_info : j["tensors"]) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(!tensor_info.is_object() || !tensor_info.contains("tid"),
-                                           error_code_t::UNSUPPORTED_GRAPH_FORMAT,
-                                           "Serialized tensor is missing tid.");
             auto tensor_tid = tensor_info.at("tid").get<Tensor_attributes::tid_t>();
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                tensor_tid <= 0, error_code_t::UNSUPPORTED_GRAPH_FORMAT, "Serialized tensor tid must be positive.");
             RETURN_CUDNN_FRONTEND_ERROR_IF(!tensor_table.emplace(tensor_tid, tensor_info).second,
                                            error_code_t::UNSUPPORTED_GRAPH_FORMAT,
                                            "Serialized graph has duplicate tensor tid " + std::to_string(tensor_tid));
@@ -2576,14 +2571,7 @@ class Graph : public ICudnn, public INode {
 
         std::map<Tensor_attributes::tid_t, std::shared_ptr<Tensor_attributes>> created_tensors;
         auto resolve_tensor_ref = [&tensor_table](json const& tensor_ref, json& tensor_info) -> error_t {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                !tensor_ref.is_number_integer(),
-                error_code_t::UNSUPPORTED_GRAPH_FORMAT,
-                "Serialized tensor references must be numeric tids.");
             auto tensor_tid = tensor_ref.get<Tensor_attributes::tid_t>();
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                tensor_tid <= 0, error_code_t::UNSUPPORTED_GRAPH_FORMAT, "Serialized tensor tid must be positive.");
-
             auto tensor_iter = tensor_table.find(tensor_tid);
             RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_iter == tensor_table.end(),
                                            error_code_t::UNSUPPORTED_GRAPH_FORMAT,
