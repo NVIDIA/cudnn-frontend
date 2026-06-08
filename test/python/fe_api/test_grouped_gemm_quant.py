@@ -6,6 +6,8 @@ for MoE (Mixture of Experts) workloads in both dense and discrete weight modes.
 Used for FC2 (forward down-projection) and dFC1 (backward FC1 GEMMs).
 """
 
+import json
+
 import torch
 import pytest
 from test_utils import torch_fork_set_rng
@@ -1315,6 +1317,140 @@ def _test_grouped_gemm_quant_discrete_compile_execute(
     return inputs, outputs, cfg
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_quant_dense_aot_export_load(tmp_path, monkeypatch, request):
+    pytest.importorskip("cutlass", reason="CuTe DSL is not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    from cudnn.grouped_gemm.grouped_gemm_quant import api as grouped_gemm_quant_api
+
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
+        pytest.skip(f"GroupedGemmQuant dense AOT requires SM100+, found SM{major}{minor}")
+
+    grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+    original_export_aot = grouped_gemm_quant_api.GroupedGemmQuantSm100.export_aot
+    export_calls = 0
+
+    def counting_export_aot(self, *args, **kwargs):
+        nonlocal export_calls
+        export_calls += 1
+        return original_export_aot(self, *args, **kwargs)
+
+    monkeypatch.setattr(grouped_gemm_quant_api.GroupedGemmQuantSm100, "export_aot", counting_export_aot)
+    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "write")
+    monkeypatch.setenv("CUDNN_FE_AOT_DIR", str(tmp_path))
+
+    _test_grouped_gemm_quant_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+    )
+
+    metadata_files = list(tmp_path.glob("*.json"))
+    assert len(metadata_files) == 1
+    metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+    assert metadata["identity"]["kernel_name"] == "GroupedGemmQuantSm100"
+    assert metadata["symbol"].startswith("cudnnfe_GroupedGemmQuantSm100_")
+    assert export_calls == 1
+
+    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "read")
+    _test_grouped_gemm_quant_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+    )
+    assert export_calls == 1
+
+
+def test_grouped_gemm_quant_discrete_aot_export_load(tmp_path, monkeypatch, request):
+    pytest.importorskip("cutlass", reason="CuTe DSL is not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    from cudnn.grouped_gemm.grouped_gemm_quant import api as grouped_gemm_quant_api
+
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
+        pytest.skip(f"GroupedGemmQuant discrete AOT requires SM100+, found SM{major}{minor}")
+
+    grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+    original_export_aot = grouped_gemm_quant_api.GroupedGemmQuantSm100.export_aot
+    export_calls = 0
+
+    def counting_export_aot(self, *args, **kwargs):
+        nonlocal export_calls
+        export_calls += 1
+        return original_export_aot(self, *args, **kwargs)
+
+    monkeypatch.setattr(grouped_gemm_quant_api.GroupedGemmQuantSm100, "export_aot", counting_export_aot)
+    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "write")
+    monkeypatch.setenv("CUDNN_FE_AOT_DIR", str(tmp_path))
+
+    _test_grouped_gemm_quant_discrete_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        b_major="k",
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        skip_unsupported=False,
+    )
+
+    metadata_files = list(tmp_path.glob("*.json"))
+    assert len(metadata_files) == 1
+    metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+    assert metadata["identity"]["kernel_name"] == "GroupedGemmQuantSm100"
+    assert metadata["symbol"].startswith("cudnnfe_GroupedGemmQuantSm100_")
+    assert export_calls == 1
+
+    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "read")
+    _test_grouped_gemm_quant_discrete_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        b_major="k",
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        skip_unsupported=False,
+    )
+    assert export_calls == 1
+
+
 def _test_grouped_gemm_quant_discrete_wrapper(
     ab_dtype,
     c_dtype,
@@ -1331,6 +1467,7 @@ def _test_grouped_gemm_quant_discrete_wrapper(
     request,
     use_dynamic_sched=False,
     row_scale=False,
+    skip_unsupported=True,
 ):
     try:
         from cudnn import grouped_gemm_quant_wrapper_sm100
@@ -1398,6 +1535,8 @@ def _test_grouped_gemm_quant_discrete_wrapper(
                 current_stream=stream,
             )
     except (ValueError, NotImplementedError) as e:
+        if not skip_unsupported:
+            raise
         pytest.skip(f"Unsupported testcase: {e}")
 
     _check_ref_grouped_gemm_quant_discrete(

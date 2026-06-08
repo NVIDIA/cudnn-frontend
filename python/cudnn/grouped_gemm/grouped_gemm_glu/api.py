@@ -596,6 +596,28 @@ class GroupedGemmGluSm100(APIBase):
     #  compile
     # --------------------------------------------------------------------- #
 
+    def _ensure_workspace(self, kernel=None) -> None:
+        if getattr(self, "_workspace", None) is not None:
+            return
+        if kernel is None:
+            kernel = self._kernel(
+                sf_vec_size=self.sf_vec_size,
+                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                vectorized_f32=self.vector_f32,
+                generate_sfd=self.generate_sfd,
+                discrete_col_sfd=self.discrete_col_sfd,
+                expert_cnt=self.expert_cnt,
+                weight_mode=self.weight_mode,
+                act_func=self.act_func,
+                enable_bias=self._has_bias,
+                use_dynamic_sched=self.use_dynamic_sched,
+            )
+        workspace_bytes = kernel.get_workspace_bytes()
+        self._workspace = torch.empty(max(workspace_bytes, 1), dtype=torch.uint8, device=self.a_desc.device)
+
     def compile(self) -> None:
         """Compile the kernel."""
         self._logger.debug("Entering compile")
@@ -633,9 +655,7 @@ class GroupedGemmGluSm100(APIBase):
         )
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
-        # ---- Allocate workspace ----
-        workspace_bytes = gemm_glu.get_workspace_bytes()
-        self._workspace = torch.empty(max(workspace_bytes, 1), dtype=torch.uint8, device="cuda")
+        self._ensure_workspace(gemm_glu)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compile_dense(gemm_glu, max_active_clusters, fake_stream)
@@ -859,60 +879,8 @@ class GroupedGemmGluSm100(APIBase):
             options="--enable-tvm-ffi",
         )
 
-        # Cache workspace pointer for the tensor_api closure
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
-
-        def tensor_api(
-            a_tensor: torch.Tensor,
-            b_tensor: torch.Tensor,
-            c_tensor: torch.Tensor,
-            d_tensor: torch.Tensor,
-            d_col_tensor: Optional[torch.Tensor],
-            sfa_tensor: torch.Tensor,
-            sfb_tensor: torch.Tensor,
-            sfd_row_tensor: Optional[torch.Tensor],
-            sfd_col_tensor: Optional[torch.Tensor],
-            amax_tensor: Optional[torch.Tensor],
-            norm_const_tensor: Optional[torch.Tensor],
-            padded_offsets: torch.Tensor,
-            alpha_tensor: torch.Tensor,
-            prob_tensor: Optional[torch.Tensor],
-            bias_tensor: Optional[torch.Tensor],
-            stream: cuda.CUstream,
-            linear_offset: float = 0.0,
-            geglu_alpha: float = 1.702,
-            glu_clamp_max: float = 7.0,
-            glu_clamp_min: float = -7.0,
-        ) -> None:
-            norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-            _compiled_kernel(
-                a_tensor,
-                b_tensor,
-                sfb_tensor,
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int64(0),
-                cached_workspace_ptr,
-                c_tensor,
-                d_tensor,
-                d_col_tensor,
-                sfa_tensor,
-                sfd_row_tensor,
-                sfd_col_tensor,
-                amax_tensor,
-                norm_const_tensor,
-                padded_offsets,
-                alpha_tensor,
-                prob_tensor,
-                bias_tensor,
-                stream,
-                cutlass.Float32(linear_offset),
-                cutlass.Float32(geglu_alpha),
-                cutlass.Float32(glu_clamp_max),
-                cutlass.Float32(glu_clamp_min),
-            )
-
-        self._compiled_kernel = tensor_api
+        self._raw_compiled_kernel = _compiled_kernel
+        self._compiled_kernel = self._wrap_tensor_api(_compiled_kernel)
 
     # -- Discrete compile path ---------------------------------------------- #
 
@@ -1050,11 +1018,74 @@ class GroupedGemmGluSm100(APIBase):
         self._k = k
         self._b_stride_size = b_stride_size
 
-        # Cache constant values for execute() closure
+        self._raw_compiled_kernel = _compiled_kernel
+        self._compiled_kernel = self._wrap_tensor_api(_compiled_kernel)
+
+    def _wrap_tensor_api(self, function):
+        self._ensure_workspace()
         cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
-        cached_n = cutlass.Int32(self._n)
-        cached_k = cutlass.Int32(self._k)
-        cached_b_stride = cutlass.Int64(self._b_stride_size)
+
+        if self.weight_mode == MoEWeightMode.DENSE:
+            def tensor_api(
+                a_tensor: torch.Tensor,
+                b_tensor: torch.Tensor,
+                c_tensor: torch.Tensor,
+                d_tensor: torch.Tensor,
+                d_col_tensor: Optional[torch.Tensor],
+                sfa_tensor: torch.Tensor,
+                sfb_tensor: torch.Tensor,
+                sfd_row_tensor: Optional[torch.Tensor],
+                sfd_col_tensor: Optional[torch.Tensor],
+                amax_tensor: Optional[torch.Tensor],
+                norm_const_tensor: Optional[torch.Tensor],
+                padded_offsets: torch.Tensor,
+                alpha_tensor: torch.Tensor,
+                prob_tensor: Optional[torch.Tensor],
+                bias_tensor: Optional[torch.Tensor],
+                stream: cuda.CUstream,
+                linear_offset: float = 0.0,
+                geglu_alpha: float = 1.702,
+                glu_clamp_max: float = 7.0,
+                glu_clamp_min: float = -7.0,
+            ) -> None:
+                norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
+                function(
+                    a_tensor,
+                    b_tensor,
+                    sfb_tensor,
+                    cutlass.Int32(0),
+                    cutlass.Int32(0),
+                    cutlass.Int64(0),
+                    cached_workspace_ptr,
+                    c_tensor,
+                    d_tensor,
+                    d_col_tensor,
+                    sfa_tensor,
+                    sfd_row_tensor,
+                    sfd_col_tensor,
+                    amax_tensor,
+                    norm_const_tensor,
+                    padded_offsets,
+                    alpha_tensor,
+                    prob_tensor,
+                    bias_tensor,
+                    stream,
+                    cutlass.Float32(linear_offset),
+                    cutlass.Float32(geglu_alpha),
+                    cutlass.Float32(glu_clamp_max),
+                    cutlass.Float32(glu_clamp_min),
+                )
+
+            return tensor_api
+
+        if len(self.b_shape) == 2:
+            n, k = self.b_shape
+        else:
+            n, k, _ = self.b_shape
+        b_stride_size = k if self.b_major == "k" else n
+        cached_n = cutlass.Int32(n)
+        cached_k = cutlass.Int32(k)
+        cached_b_stride = cutlass.Int64(b_stride_size)
 
         def tensor_api(
             a_tensor: torch.Tensor,
@@ -1079,13 +1110,10 @@ class GroupedGemmGluSm100(APIBase):
             glu_clamp_min: float = -7.0,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-            b_ptrs_addr = int(b_ptrs_device.data_ptr())
-            sfb_ptrs_addr = int(sfb_ptrs_device.data_ptr())
-
-            _compiled_kernel(
+            function(
                 a_tensor,
-                b_ptrs_addr,
-                sfb_ptrs_addr,
+                int(b_ptrs_device.data_ptr()),
+                int(sfb_ptrs_device.data_ptr()),
                 cached_n,
                 cached_k,
                 cached_b_stride,
@@ -1109,7 +1137,7 @@ class GroupedGemmGluSm100(APIBase):
                 cutlass.Float32(glu_clamp_min),
             )
 
-        self._compiled_kernel = tensor_api
+        return tensor_api
 
     # --------------------------------------------------------------------- #
     #  execute
@@ -1561,11 +1589,26 @@ def grouped_gemm_glu_wrapper_sm100(
             num_experts,
         )
 
+    aot_mode = os.getenv("CUDNN_FE_AOT_MODE", "").strip().lower()
+    aot_artifact_dir = os.getenv("CUDNN_FE_AOT_DIR")
+    if aot_mode and aot_mode not in {"read", "write", "readwrite"}:
+        raise ValueError(
+            "CUDNN_FE_AOT_MODE must be one of {'read', 'write', 'readwrite'}, "
+            f"got {aot_mode!r}"
+        )
+    if aot_mode and not aot_artifact_dir:
+        raise ValueError("CUDNN_FE_AOT_DIR is required when CUDNN_FE_AOT_MODE is set")
     # ---- Cache lookup or create + compile ----
-    if cache_key in _cache_of_GroupedGemmGluSm100Objects:
+    use_cache = not aot_mode or aot_mode == "write"
+    if use_cache and cache_key in _cache_of_GroupedGemmGluSm100Objects:
         _logger.debug("grouped_gemm_glu_wrapper_sm100: Using cached object")
         api = _cache_of_GroupedGemmGluSm100Objects[cache_key]
+        if aot_mode == "write" and api._raw_compiled_kernel is None:
+            api = None
     else:
+        api = None
+
+    if api is None:
         _logger.debug("grouped_gemm_glu_wrapper_sm100: Creating new object")
         if is_dense:
             api = GroupedGemmGluSm100(
@@ -1626,7 +1669,18 @@ def grouped_gemm_glu_wrapper_sm100(
 
         if not api.check_support():
             raise RuntimeError("Unsupported configuration")
-        api.compile()
+        if aot_mode == "read":
+            api.load_aot(aot_artifact_dir, cache_key)
+        elif aot_mode == "readwrite":
+            _, _, aot_paths = api._build_aot_symbol_and_paths(aot_artifact_dir, cache_key)
+            if aot_paths.metadata_file.exists() and aot_paths.object_file.exists() and aot_paths.shared_library.exists():
+                api.load_aot(aot_artifact_dir, cache_key)
+            else:
+                api.export_aot(aot_artifact_dir, cache_key)
+        elif aot_mode == "write":
+            api.export_aot(aot_artifact_dir, cache_key)
+        else:
+            api.compile()
         _cache_of_GroupedGemmGluSm100Objects[cache_key] = api
 
     # ---- Execute ----
