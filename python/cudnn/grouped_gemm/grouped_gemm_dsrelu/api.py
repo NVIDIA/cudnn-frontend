@@ -1480,6 +1480,18 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         stride_signature = tuple(None if i in dynamic_stride_dims else s for i, s in enumerate(tensor.stride()))
         return static_shape_suffix, stride_signature, tensor.dtype
 
+    def dynamic_sfd_col_tensor_signature(tensor: Optional[torch.Tensor]) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[torch.dtype]]:
+        if tensor is None:
+            return None, None, None
+        static_shape = (
+            tensor.shape[0],
+            tensor.shape[1],
+            tensor.shape[2],
+            tensor.shape[3],
+            tensor.shape[5],
+        )
+        return dynamic_m_tensor_signature(tensor, static_shape, dynamic_stride_dims=(2, 5))
+
     use_full_dynamic = is_dense and os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
 
     if is_dense:
@@ -1537,8 +1549,8 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             *dynamic_m_tensor_signature(prob_tensor, (1, 1)),
             *dynamic_m_tensor_signature(dprob_tensor, (1, 1)),
             *tensor_signature(dbias_tensor),
-            *dynamic_m_tensor_signature(d_srelu_tensor, (n_out, 1)),
-            *tensor_signature(sfd_col_d_srelu_tensor),
+            *dynamic_m_tensor_signature(d_srelu_tensor, (n_out, 1), dynamic_stride_dims=(2,)),
+            *dynamic_sfd_col_tensor_signature(sfd_col_d_srelu_tensor),
             *tensor_signature(norm_const_tensor),
             tuple(b_ptrs.shape),
             tuple(b_ptrs.stride()),
