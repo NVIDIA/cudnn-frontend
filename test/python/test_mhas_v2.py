@@ -109,7 +109,7 @@ def test_sdpa_random_fwd_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -141,7 +141,7 @@ def test_sdpa_random_fwd_unified_L1(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -188,7 +188,7 @@ def test_sdpa_random_bwd_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=8, max=16),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=192, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256,256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -369,7 +369,7 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -401,7 +401,7 @@ def test_sdpa_random_fwd_ragged_unified_L1(env_info, test_no, request, cudnn_han
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(128,128), (192,128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -443,7 +443,7 @@ def test_sdpa_random_fwd_ragged_offset_multiplier_unified_L1(env_info, test_no, 
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(128,128), (192,128), (256, 256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -477,7 +477,7 @@ def test_sdpa_random_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=8, max=16),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=192, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256,256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -514,7 +514,7 @@ def test_sdpa_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=64, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=64, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -548,7 +548,7 @@ def test_sdpa_fwd_paged_unified_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=64, s_kv_min=1, s_kv_max=512, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=64, s_kv_min=1, s_kv_max=512, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(128,128), (192,128)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -583,7 +583,7 @@ def test_sdpa_random_fwd_unified_block_mask_L0(env_info, test_no, request, cudnn
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(128,128), (192,128)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -617,7 +617,7 @@ def test_sdpa_random_fwd_bias_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=128, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
@@ -650,7 +650,7 @@ def test_sdpa_random_bwd_bias_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=8, max=16),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=192, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256,256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),

@@ -9,8 +9,14 @@ from dataclasses import dataclass, field, asdict
 # fmt: off
 
 def generate_test_seeds(*, num_tests, rng_seed):
+    # Env overrides for focused/expanded sweeps without editing each suite:
+    #   MHAS_NUM_TESTS   - cap (or expand) the number of configs (e.g. small subset for sanitizer runs)
+    #   MHAS_SEED_OFFSET - shift the geometry RNG seed to explore a fresh set of configs
+    import os
+    rng_seed = rng_seed + int(os.environ.get("MHAS_SEED_OFFSET", "0"))
+    n = int(os.environ.get("MHAS_NUM_TESTS", "0")) or num_tests
     rng = random.Random(rng_seed)
-    return [(i+1, num_tests, rng.randint(65536, 2147483647)) for i in range(num_tests)]
+    return [(i+1, n, rng.randint(65536, 2147483647)) for i in range(n)]
 
 
 def get_strides_from_indices(shape, indices=[0, 1, 2, 3], gaps=[0, 0, 0, 0], rng_geom=None):
@@ -498,6 +504,7 @@ class RandomSequenceLength:
             s_kv_min = min(s_kv_min, s_kv_max)
         self.s_q_gen = RandomIntValue(min=s_q_min, max=s_q_max)
         self.s_kv_gen = RandomIntValue(min=s_kv_min, max=s_kv_max)
+        self._s_q_max = s_q_max  # post-cap upper bound, used to clamp the s_q>s_kv branch
         self.distribution = RandomChoice(s_q_distribution)
 
     def __call__(self, rng):
@@ -510,6 +517,16 @@ class RandomSequenceLength:
             s_q = 1
         elif distribution == "s_q=s_kv":
             s_q = s_kv
+        elif distribution == "s_q>s_kv":
+            # Query longer than key/value (cross-attention, chunked prefill).
+            # The default "s_q=random" branch below structurally caps s_q<=s_kv, so
+            # this regime is otherwise never exercised. Caught class: NVBug 5829882
+            # (SDPA hang when S_Q > S_KV).
+            # Clamp to s_q_max so we don't overshoot the suite bound (esp. the SM80
+            # OOM cap) and trigger spurious torch CUDA OOM instead of testing cuDNN.
+            if s_kv < self._s_q_max:
+                s_q = min(s_kv + rng.randint(1, max(1, s_kv)), self._s_q_max)
+            # else: s_kv already at the cap -> no room for s_q>s_kv within bounds; leave s_q.
         else:
             s_q = self.s_q_gen(rng)
 
