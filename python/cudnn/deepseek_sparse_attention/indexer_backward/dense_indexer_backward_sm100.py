@@ -76,7 +76,9 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 
 from cudnn.deepseek_sparse_attention.utils.copy import cpasync_reduce_bulk_add_f32
-from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream as _resolve_stream
+from cudnn.deepseek_sparse_attention.utils.runtime import (
+    resolve_stream as _resolve_stream,
+)
 from cudnn.deepseek_sparse_attention.utils.seqlen import seqlen_info as _seqlen_info
 
 mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
@@ -121,25 +123,32 @@ class ScoreGradDense:
 
     def __init__(
         self,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
         ratio: int = 1,
     ):
         assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
-        # ``grad_scale`` is intentionally **not** stored on the object —
-        # baking it as ``self.grad_scale`` would freeze it into the
-        # compiled kernel (every change → recompile). Keep it as a runtime
-        # ``Float32`` arg on ``__call__`` so the same compiled kernel can
-        # be reused when the runtime loss scaling changes for the same
-        # tensor shape.
-        # For BSHD: max_seqlen_q == S_q, max_seqlen_k == S_k.
-        # For THD : max_seqlen_q / k cap the grid + row-stride respectively.
-        self.max_seqlen_q = max_seqlen_q
-        self.max_seqlen_k = max_seqlen_k
+        # Neither ``grad_scale`` nor ``max_seqlen_q/k`` are stored on the object:
+        # baking them in would freeze them into the compiled kernel. grad_scale
+        # would force a recompile on every loss-scale change; max_seqlen would
+        # specialize the launch grid AND the causal-mask bound, so a kernel
+        # compiled for one max_seqlen would be wrong if reused for another. They
+        # are passed as runtime ``Float32``/``Int32`` args on ``__call__`` so one
+        # compiled kernel serves all seqlens / loss scales.
         self.ratio = ratio
 
     @cute.jit
-    def __call__(self, mPredictRaw, mTargetRaw, mLSE, mDenomTarget, mCuSeqlensQ, mCuSeqlensK, grad_scale: Float32, stream):
+    def __call__(
+        self,
+        mPredictRaw,
+        mTargetRaw,
+        mLSE,
+        mDenomTarget,
+        mCuSeqlensQ,
+        mCuSeqlensK,
+        grad_scale: Float32,
+        max_seqlen_q: Int32,
+        max_seqlen_k: Int32,
+        stream,
+    ):
         # BSHD: mCuSeqlensQ/K = None; tensors carry batch dim.
         #   PredictRaw/TargetRaw: (B, S_q, S_k)   LSE/Denom: (B, S_q)
         # THD: mCuSeqlensQ/K provided; tensors are packed.
@@ -181,10 +190,10 @@ class ScoreGradDense:
             mCuSeqlensK,
             grad_scale,
             seqlen_k_pad,
-            Int32(self.max_seqlen_q),
-            Int32(self.max_seqlen_k),
+            max_seqlen_q,
+            max_seqlen_k,
         ).launch(
-            grid=(batch_size, self.max_seqlen_q, 1),
+            grid=(batch_size, max_seqlen_q, 1),
             block=[self.THREADS_PER_CTA, 1, 1],
             stream=stream,
         )
@@ -230,7 +239,9 @@ class ScoreGradDense:
                 sReduceScratch: cute.struct.Align[cute.struct.MemRange[Float32, 4], 128]
 
             storage = smem.allocate(SharedStorage)
-            sReduceScratch = storage.sReduceScratch.get_tensor(cute.make_layout((4,), stride=(1,)))
+            sReduceScratch = storage.sReduceScratch.get_tensor(
+                cute.make_layout((4,), stride=(1,))
+            )
 
             # Per-batch row views of the score / denom tensors.
             #   BSHD: (S_q, S_k, B) -> (S_q, S_k) by slicing batch_idx; LSE/Denom (S_q, B) -> (S_q,).
@@ -271,8 +282,16 @@ class ScoreGradDense:
 
                     predict = cute.math.exp2((pr - lse_val) * LOG2E, fastmath=True)
                     target = tr / (denom_val + Float32(DENOM_EPS))
-                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
-                    log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                    target_eff = (
+                        target
+                        if target >= Float32(CLIP_PROB_MIN)
+                        else Float32(CLIP_PROB_MIN)
+                    )
+                    log_clip_mask = (
+                        Float32(1.0)
+                        if predict >= Float32(CLIP_PROB_MIN)
+                        else Float32(0.0)
+                    )
                     g = -target_eff * log_clip_mask * grad_scale
 
                     local_sum = local_sum + g
@@ -283,7 +302,12 @@ class ScoreGradDense:
             with cute.arch.elect_one():
                 sReduceScratch[warp_id] = warp_sum
             cute.arch.sync_threads()
-            sum_grad = sReduceScratch[0] + sReduceScratch[1] + sReduceScratch[2] + sReduceScratch[3]
+            sum_grad = (
+                sReduceScratch[0]
+                + sReduceScratch[1]
+                + sReduceScratch[2]
+                + sReduceScratch[3]
+            )
 
             # --- Phase 2: Write grad_signal in-place to PredictRaw ---
             # Padding columns (pos >= seqlen_k_b in THD, or pos >= col_limit) get 0.
@@ -295,8 +319,16 @@ class ScoreGradDense:
 
                     predict = cute.math.exp2((pr - lse_val) * LOG2E, fastmath=True)
                     target = tr / (denom_val + Float32(DENOM_EPS))
-                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
-                    log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                    target_eff = (
+                        target
+                        if target >= Float32(CLIP_PROB_MIN)
+                        else Float32(CLIP_PROB_MIN)
+                    )
+                    log_clip_mask = (
+                        Float32(1.0)
+                        if predict >= Float32(CLIP_PROB_MIN)
+                        else Float32(0.0)
+                    )
                     g = -target_eff * log_clip_mask * grad_scale
 
                     grad_signal = g - predict * sum_grad
@@ -352,10 +384,12 @@ class DenseIndexerBackward2QGemmSm100:
     compute_warp_id = (4, 5, 6, 7)
     reduce_warp_id = (8, 9, 10, 11)
 
-    def __init__(self, head_dim, heads=64, block_I=128):
+    def __init__(self, head_dim, heads=64, block_I=128, ratio=1):
+        assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
         self.head_dim = head_dim
         self.heads = heads
         self.block_I = block_I
+        self.ratio = ratio
         assert heads >= 64
 
         self.head_dim_padded = int(math.ceil(head_dim / 16) * 16)
@@ -370,7 +404,9 @@ class DenseIndexerBackward2QGemmSm100:
 
         # TMEM layout (2Q: S and dK CANNOT share)
         self.tmem_s_offset = 0  # S (single-buffered)
-        self.tmem_dk_offset = 128  # dK (single-buffered, Phase A clear + Phase B accumulate)
+        self.tmem_dk_offset = (
+            128  # dK (single-buffered, Phase A clear + Phase B accumulate)
+        )
         self.tmem_dq0_offset = 256  # dQ_q0 persistent accumulator
         self.tmem_dq1_offset = 384  # dQ_q1 persistent accumulator
         self.tmem_alloc_cols = 512
@@ -435,15 +471,25 @@ class DenseIndexerBackward2QGemmSm100:
         #   THD  W/GS  (*, *)    -> kept as is
         if const_expr(is_varlen):
             mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[1, 2, 0]))
-            mdQ = cute.make_tensor(mdQ.iterator, cute.select(mdQ.layout, mode=[1, 2, 0]))
+            mdQ = cute.make_tensor(
+                mdQ.iterator, cute.select(mdQ.layout, mode=[1, 2, 0])
+            )
             # K, W, dW, mdK_f32, GradSignal stay as is.
         else:
-            mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[2, 3, 1, 0]))
-            mdQ = cute.make_tensor(mdQ.iterator, cute.select(mdQ.layout, mode=[2, 3, 1, 0]))
+            mQ = cute.make_tensor(
+                mQ.iterator, cute.select(mQ.layout, mode=[2, 3, 1, 0])
+            )
+            mdQ = cute.make_tensor(
+                mdQ.iterator, cute.select(mdQ.layout, mode=[2, 3, 1, 0])
+            )
             mK = cute.make_tensor(mK.iterator, cute.select(mK.layout, mode=[1, 2, 0]))
-            mdK_f32 = cute.make_tensor(mdK_f32.iterator, cute.select(mdK_f32.layout, mode=[1, 2, 0]))
+            mdK_f32 = cute.make_tensor(
+                mdK_f32.iterator, cute.select(mdK_f32.layout, mode=[1, 2, 0])
+            )
             mW = cute.make_tensor(mW.iterator, cute.select(mW.layout, mode=[1, 2, 0]))
-            mdW = cute.make_tensor(mdW.iterator, cute.select(mdW.layout, mode=[1, 2, 0]))
+            mdW = cute.make_tensor(
+                mdW.iterator, cute.select(mdW.layout, mode=[1, 2, 0])
+            )
             mGradSignal = cute.make_tensor(
                 mGradSignal.iterator,
                 cute.select(mGradSignal.layout, mode=[1, 2, 0]),
@@ -481,8 +527,12 @@ class DenseIndexerBackward2QGemmSm100:
         # sQ: 2 separate single-stage regions (q0 and q1)
         sQ_q0_layout = _make_smem_layout_a(tmma1, self.gemm1_tiler, self.q_dtype, 1)
         sQ_q1_layout = _make_smem_layout_a(tmma1, self.gemm1_tiler, self.q_dtype, 1)
-        sK_layout = _make_smem_layout_b(tmma1, self.gemm1_tiler, self.k_dtype, 2)  # 2-stage
-        sdS_layout = _make_smem_layout_a(tmma3, self.gemm3_tiler, self.q_dtype, 2)  # 2-stage
+        sK_layout = _make_smem_layout_b(
+            tmma1, self.gemm1_tiler, self.k_dtype, 2
+        )  # 2-stage
+        sdS_layout = _make_smem_layout_a(
+            tmma3, self.gemm3_tiler, self.q_dtype, 2
+        )  # 2-stage
         sdS_store_layout = _make_smem_layout_epi(
             self.q_dtype,
             LayoutEnum.COL_MAJOR,
@@ -490,7 +540,9 @@ class DenseIndexerBackward2QGemmSm100:
             2,
         )
         sdS_g2a_layout = _make_smem_layout_a(tmma2, self.gemm2_tiler, self.q_dtype, 2)
-        sKt_layout = _make_smem_layout_b(tmma3, self.gemm3_tiler, self.k_dtype, 2)  # 2-stage
+        sKt_layout = _make_smem_layout_b(
+            tmma3, self.gemm3_tiler, self.k_dtype, 2
+        )  # 2-stage
         sQ_q0_g2b_layout = _make_smem_layout_b(tmma2, self.gemm2_tiler, self.q_dtype, 1)
         sQ_q1_g2b_layout = _make_smem_layout_b(tmma2, self.gemm2_tiler, self.q_dtype, 1)
 
@@ -662,13 +714,17 @@ class DenseIndexerBackward2QGemmSm100:
             seqlen_k_static,
         )
 
-        # 2Q pair indices are batch-local. Per-batch tensor views are built
-        # below so the rest of the kernel uses q0_local / q1_local uniformly
-        # (no q_global needed — domain_offset / batch slice handles it).
-        q0_local = Int32(seq_idx) * Int32(2)
-        q1_local = q0_local + Int32(1)
-        has_q0 = q0_local < seqlen_q_b
-        has_q1 = q1_local < seqlen_q_b
+        # 2Q pair indices are batch-local and scheduled from largest q to
+        # smallest q. For odd seqlen_q_b this puts the singleton CTA at the
+        # earliest q, so causal block rounding wastes at most one K tile
+        # instead of an almost-full K sequence.
+        q_pair_offset = Int32(seq_idx) * Int32(2)
+        q0_local = seqlen_q_b - Int32(1) - q_pair_offset
+        q1_local = q0_local - Int32(1)
+        has_q0 = q0_local >= Int32(0)
+        has_q1 = q1_local >= Int32(0)
+        q0_tile_local = q0_local if has_q0 else Int32(0)
+        q1_tile_local = q1_local if has_q1 else q0_tile_local
 
         # Per-batch views — collapse BSHD batch dim and THD T-offset into a
         # single batch-local indexing scheme. After this, mQ_q0_b/mQ_q1_b have
@@ -695,7 +751,24 @@ class DenseIndexerBackward2QGemmSm100:
             mdW_b = mdW[None, None, batch_idx]
             mGS_b = mGradSignal[None, None, batch_idx]
 
-        num_kv_blocks = (seqlen_k_b + self.block_I - 1) // self.block_I
+        # Causal-aware K-block bound for this 2Q CTA. GradSignal has already
+        # been zeroed past each q token's bottom-right causal column limit, but
+        # using that limit here avoids TMA/MMA work for wholly future K blocks.
+        ratio = Int32(self.ratio)
+        q_start_b = seqlen_k_b * ratio - seqlen_q_b
+        max_kv_needed_raw = (q_start_b + q0_local + Int32(1)) // ratio
+        max_kv_needed = max_kv_needed_raw if max_kv_needed_raw > Int32(0) else Int32(0)
+        max_kv_needed = max_kv_needed if max_kv_needed < seqlen_k_b else seqlen_k_b
+        num_kv_blocks = (max_kv_needed + self.block_I - 1) // self.block_I
+
+        # If the 2Q pair has no causal KV columns (possible for small q when
+        # ratio > 1), run one all-zero GradSignal block so dQ/dW TMEM
+        # accumulators are initialized before their epilogues store to empty
+        # output tensors.
+        min_kv_blocks = Int32(1) if seqlen_k_b > Int32(0) else Int32(0)
+        num_kv_blocks = (
+            min_kv_blocks if num_kv_blocks < min_kv_blocks else num_kv_blocks
+        )
 
         # TMA descriptor prefetch (load warp only)
         if warp_idx == self.load_warp_id:
@@ -715,21 +788,43 @@ class DenseIndexerBackward2QGemmSm100:
 
         @cute.struct
         class SharedStorage:
-            Q_q0_mbar: cute.struct.MemRange[cutlass.Int64, 2]  # 1-stage TMA: producer+consumer
+            Q_q0_mbar: cute.struct.MemRange[
+                cutlass.Int64, 2
+            ]  # 1-stage TMA: producer+consumer
             Q_q1_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             K_mbar: cute.struct.MemRange[cutlass.Int64, self.K_mbar_size]
             mbar: cute.struct.MemRange[cutlass.Int64, NUM_2Q_BARRIERS]
             tmem_holding_buf: Int32
-            sQ_q0: cute.struct.Align[cute.struct.MemRange[self.q_dtype, sQ_q0_size], self.buffer_align_bytes]
-            sQ_q1: cute.struct.Align[cute.struct.MemRange[self.q_dtype, sQ_q1_size], self.buffer_align_bytes]
-            sK: cute.struct.Align[cute.struct.MemRange[self.k_dtype, sK_size], self.buffer_align_bytes]
-            sdS: cute.struct.Align[cute.struct.MemRange[self.q_dtype, sdS_size], self.buffer_align_bytes]
-            sGradSignal_q0_0: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I], 128]
-            sGradSignal_q0_1: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I], 128]
-            sGradSignal_q1_0: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I], 128]
-            sGradSignal_q1_1: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I], 128]
-            sW: cute.struct.Align[cute.struct.MemRange[self.q_dtype, self.heads * 2], 128]
-            sdK_reduce: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I * self.head_dim_padded], 128]
+            sQ_q0: cute.struct.Align[
+                cute.struct.MemRange[self.q_dtype, sQ_q0_size], self.buffer_align_bytes
+            ]
+            sQ_q1: cute.struct.Align[
+                cute.struct.MemRange[self.q_dtype, sQ_q1_size], self.buffer_align_bytes
+            ]
+            sK: cute.struct.Align[
+                cute.struct.MemRange[self.k_dtype, sK_size], self.buffer_align_bytes
+            ]
+            sdS: cute.struct.Align[
+                cute.struct.MemRange[self.q_dtype, sdS_size], self.buffer_align_bytes
+            ]
+            sGradSignal_q0_0: cute.struct.Align[
+                cute.struct.MemRange[Float32, self.block_I], 128
+            ]
+            sGradSignal_q0_1: cute.struct.Align[
+                cute.struct.MemRange[Float32, self.block_I], 128
+            ]
+            sGradSignal_q1_0: cute.struct.Align[
+                cute.struct.MemRange[Float32, self.block_I], 128
+            ]
+            sGradSignal_q1_1: cute.struct.Align[
+                cute.struct.MemRange[Float32, self.block_I], 128
+            ]
+            sW: cute.struct.Align[
+                cute.struct.MemRange[self.q_dtype, self.heads * 2], 128
+            ]
+            sdK_reduce: cute.struct.Align[
+                cute.struct.MemRange[Float32, self.block_I * self.head_dim_padded], 128
+            ]
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -749,24 +844,48 @@ class DenseIndexerBackward2QGemmSm100:
         sQ_q1 = storage.sQ_q1.get_tensor(sQ_q1_layout.outer, swizzle=sQ_q1_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sdS = storage.sdS.get_tensor(sdS_layout.outer, swizzle=sdS_layout.inner)
-        sdS_store = storage.sdS.get_tensor(sdS_store_layout.outer, swizzle=sdS_store_layout.inner)
+        sdS_store = storage.sdS.get_tensor(
+            sdS_store_layout.outer, swizzle=sdS_store_layout.inner
+        )
         # Recast views for transposed / SwapAB operands
-        sdS_g2a = cute.make_tensor(cute.recast_ptr(sdS.iterator, sdS_g2a_layout.inner), sdS_g2a_layout.outer)
-        sKt = cute.make_tensor(cute.recast_ptr(sK.iterator, sKt_layout.inner), sKt_layout.outer)
-        sQ_q0_g2b = cute.make_tensor(cute.recast_ptr(sQ_q0.iterator, sQ_q0_g2b_layout.inner), sQ_q0_g2b_layout.outer)
-        sQ_q1_g2b = cute.make_tensor(cute.recast_ptr(sQ_q1.iterator, sQ_q1_g2b_layout.inner), sQ_q1_g2b_layout.outer)
+        sdS_g2a = cute.make_tensor(
+            cute.recast_ptr(sdS.iterator, sdS_g2a_layout.inner), sdS_g2a_layout.outer
+        )
+        sKt = cute.make_tensor(
+            cute.recast_ptr(sK.iterator, sKt_layout.inner), sKt_layout.outer
+        )
+        sQ_q0_g2b = cute.make_tensor(
+            cute.recast_ptr(sQ_q0.iterator, sQ_q0_g2b_layout.inner),
+            sQ_q0_g2b_layout.outer,
+        )
+        sQ_q1_g2b = cute.make_tensor(
+            cute.recast_ptr(sQ_q1.iterator, sQ_q1_g2b_layout.inner),
+            sQ_q1_g2b_layout.outer,
+        )
 
         # GradSignal: 2-stage for each Q token (matches 2-stage K pipeline)
-        sGradSignal_q0_0 = storage.sGradSignal_q0_0.get_tensor(cute.make_layout((self.block_I,), stride=(1,)))
-        sGradSignal_q0_1 = storage.sGradSignal_q0_1.get_tensor(cute.make_layout((self.block_I,), stride=(1,)))
-        sGradSignal_q1_0 = storage.sGradSignal_q1_0.get_tensor(cute.make_layout((self.block_I,), stride=(1,)))
-        sGradSignal_q1_1 = storage.sGradSignal_q1_1.get_tensor(cute.make_layout((self.block_I,), stride=(1,)))
+        sGradSignal_q0_0 = storage.sGradSignal_q0_0.get_tensor(
+            cute.make_layout((self.block_I,), stride=(1,))
+        )
+        sGradSignal_q0_1 = storage.sGradSignal_q0_1.get_tensor(
+            cute.make_layout((self.block_I,), stride=(1,))
+        )
+        sGradSignal_q1_0 = storage.sGradSignal_q1_0.get_tensor(
+            cute.make_layout((self.block_I,), stride=(1,))
+        )
+        sGradSignal_q1_1 = storage.sGradSignal_q1_1.get_tensor(
+            cute.make_layout((self.block_I,), stride=(1,))
+        )
         # sW: holds W for both Q tokens (first heads = q0, second heads = q1)
-        sW_full = storage.sW.get_tensor(cute.make_layout((self.heads * 2,), stride=(1,)))
+        sW_full = storage.sW.get_tensor(
+            cute.make_layout((self.heads * 2,), stride=(1,))
+        )
 
         # sdK_reduce: row-major (block_I, head_dim) fp32 for bulk reduce
         sdK_reduce = storage.sdK_reduce.get_tensor(
-            cute.make_layout((self.block_I, self.head_dim_padded), stride=(self.head_dim_padded, 1)),
+            cute.make_layout(
+                (self.block_I, self.head_dim_padded), stride=(self.head_dim_padded, 1)
+            ),
         )
 
         # dQ epilogue SMEM — reuses sK physical memory
@@ -803,7 +922,7 @@ class DenseIndexerBackward2QGemmSm100:
         gQ_q0 = cute.local_tile(
             mQ_q0_b,
             cute.select(self.gemm1_tiler, mode=[0, 2]),
-            (None, None, q0_local),
+            (None, None, q0_tile_local),
         )
         tAgQ_q0 = gemm1_thr_mma.partition_A(gQ_q0)
         tQsQ_q0, tQgQ_q0_mkl = cpasync.tma_partition(
@@ -817,7 +936,7 @@ class DenseIndexerBackward2QGemmSm100:
         gQ_q1 = cute.local_tile(
             mQ_q1_b,
             cute.select(self.gemm1_tiler, mode=[0, 2]),
-            (None, None, q1_local),
+            (None, None, q1_tile_local),
         )
         tAgQ_q1 = gemm1_thr_mma.partition_A(gQ_q1)
         tQsQ_q1, tQgQ_q1_mkl = cpasync.tma_partition(
@@ -872,7 +991,7 @@ class DenseIndexerBackward2QGemmSm100:
         gdQ_q0 = cute.local_tile(
             mdQ_q0_b,
             (self.heads_padded, self.head_dim_padded),
-            (0, 0, q0_local),
+            (0, 0, q0_tile_local),
         )
         sdQ_epi_slice = sdQ_epi[None, None, 0]
         tdQsdQ_q0, tdQgdQ_q0_mkl = cpasync.tma_partition(
@@ -886,7 +1005,7 @@ class DenseIndexerBackward2QGemmSm100:
         gdQ_q1 = cute.local_tile(
             mdQ_q1_b,
             (self.heads_padded, self.head_dim_padded),
-            (0, 0, q1_local),
+            (0, 0, q1_tile_local),
         )
         tdQsdQ_q1, tdQgdQ_q1_mkl = cpasync.tma_partition(
             tma_atom_dQ_q1,
@@ -1076,7 +1195,9 @@ class DenseIndexerBackward2QGemmSm100:
         with T-offset already applied for THD. q_local is the batch-local
         Q token index.
         """
-        GS_PER_THREAD = const_expr((self.block_I + self.WARP_SIZE - 1) // self.WARP_SIZE)
+        GS_PER_THREAD = const_expr(
+            (self.block_I + self.WARP_SIZE - 1) // self.WARP_SIZE
+        )
         for si in cutlass.range_constexpr(GS_PER_THREAD):
             pos = si * self.WARP_SIZE + lane_id
             if pos < self.block_I:
@@ -1301,7 +1422,13 @@ class DenseIndexerBackward2QGemmSm100:
             # GEMM1: S = Q_q0 @ K[bi]
             tmma1.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tSrQ_q0, mode=[2]), unroll=4):
-                cute.gemm(tmma1, tStS, tSrQ_q0[None, None, k_block, 0], tSrK[None, None, k_block, k_stage], tStS)
+                cute.gemm(
+                    tmma1,
+                    tStS,
+                    tSrQ_q0[None, None, k_block, 0],
+                    tSrK[None, None, k_block, k_stage],
+                    tStS,
+                )
                 tmma1.set(tcgen05.Field.ACCUMULATE, True)
             with cute.arch.elect_one():
                 tcgen05.commit(mbar + MBAR_2Q_S_FULL)
@@ -1313,14 +1440,26 @@ class DenseIndexerBackward2QGemmSm100:
             # GEMM2: dK = dS_q0^T @ Q_q0 (ACCUMULATE=False, clear)
             tmma2.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tDKrA_g2, mode=[2]), unroll=4):
-                cute.gemm(tmma2, tDkDk, tDKrA_g2[None, None, k_block, bi % 2], tDKrB_g2_q0[None, None, k_block, 0], tDkDk)
+                cute.gemm(
+                    tmma2,
+                    tDkDk,
+                    tDKrA_g2[None, None, k_block, bi % 2],
+                    tDKrB_g2_q0[None, None, k_block, 0],
+                    tDkDk,
+                )
                 tmma2.set(tcgen05.Field.ACCUMULATE, True)
 
             # GEMM3: dQ_q0 += dS @ Kt[bi]
             tmma3.set(tcgen05.Field.ACCUMULATE, not is_first_dq_q0)
             is_first_dq_q0 = False
             for k_block in cutlass.range(0, cute.size(tDQrDS, mode=[2]), unroll=4):
-                cute.gemm(tmma3, tDqDq_0, tDQrDS[None, None, k_block, bi % 2], tDQrKt[None, None, k_block, k_stage], tDqDq_0)
+                cute.gemm(
+                    tmma3,
+                    tDqDq_0,
+                    tDQrDS[None, None, k_block, bi % 2],
+                    tDQrKt[None, None, k_block, k_stage],
+                    tDqDq_0,
+                )
                 tmma3.set(tcgen05.Field.ACCUMULATE, True)
 
             # ---- Phase B (Q token 1, guarded) ----
@@ -1328,7 +1467,13 @@ class DenseIndexerBackward2QGemmSm100:
                 # GEMM1: S = Q_q1 @ K[bi]
                 tmma1.set(tcgen05.Field.ACCUMULATE, False)
                 for k_block in cutlass.range(0, cute.size(tSrQ_q1, mode=[2]), unroll=4):
-                    cute.gemm(tmma1, tStS, tSrQ_q1[None, None, k_block, 0], tSrK[None, None, k_block, k_stage], tStS)
+                    cute.gemm(
+                        tmma1,
+                        tStS,
+                        tSrQ_q1[None, None, k_block, 0],
+                        tSrK[None, None, k_block, k_stage],
+                        tStS,
+                    )
                     tmma1.set(tcgen05.Field.ACCUMULATE, True)
                 with cute.arch.elect_one():
                     tcgen05.commit(mbar + MBAR_2Q_S_FULL)
@@ -1339,14 +1484,28 @@ class DenseIndexerBackward2QGemmSm100:
 
                 # GEMM2: dK += dS_q1^T @ Q_q1 (ACCUMULATE=True!)
                 tmma2.set(tcgen05.Field.ACCUMULATE, True)
-                for k_block in cutlass.range(0, cute.size(tDKrA_g2, mode=[2]), unroll=4):
-                    cute.gemm(tmma2, tDkDk, tDKrA_g2[None, None, k_block, bi % 2], tDKrB_g2_q1[None, None, k_block, 0], tDkDk)
+                for k_block in cutlass.range(
+                    0, cute.size(tDKrA_g2, mode=[2]), unroll=4
+                ):
+                    cute.gemm(
+                        tmma2,
+                        tDkDk,
+                        tDKrA_g2[None, None, k_block, bi % 2],
+                        tDKrB_g2_q1[None, None, k_block, 0],
+                        tDkDk,
+                    )
 
                 # GEMM3: dQ_q1 += dS @ Kt[bi]
                 tmma3.set(tcgen05.Field.ACCUMULATE, not is_first_dq_q1)
                 is_first_dq_q1 = False
                 for k_block in cutlass.range(0, cute.size(tDQrDS, mode=[2]), unroll=4):
-                    cute.gemm(tmma3, tDqDq_1, tDQrDS[None, None, k_block, bi % 2], tDQrKt[None, None, k_block, k_stage], tDqDq_1)
+                    cute.gemm(
+                        tmma3,
+                        tDqDq_1,
+                        tDQrDS[None, None, k_block, bi % 2],
+                        tDQrKt[None, None, k_block, k_stage],
+                        tDqDq_1,
+                    )
                     tmma3.set(tcgen05.Field.ACCUMULATE, True)
 
             # Signal DK_FULL (after both phases)
@@ -1360,9 +1519,19 @@ class DenseIndexerBackward2QGemmSm100:
     # Helper: dS/dW computation for one block (same as 1Q)
     # =========================================================================
     @cute.jit
-    def _compute_ds_dw_block(self, tSrS, dw_accum, sGS, sW, tCcS, sm_scale: Float32 | float):
+    def _compute_ds_dw_block(
+        self,
+        tSrS,
+        dw_accum,
+        sGS,
+        tCcS,
+        sm_scale: Float32 | float,
+        my_first_h,
+        w_reg_h0: Float32,
+        w_reg_h1: Float32,
+    ):
         """Compute dS and accumulate dW for one block using grad_signal from sGS."""
-        for ei in cutlass.range(0, cute.size(tSrS), 2):
+        for ei in cutlass.range(0, cute.size(tSrS), 2, unroll_full=True):
             h0 = cute.get(tCcS[ei], mode=[0, 0])
             n0 = cute.get(tCcS[ei], mode=[0, 1])
             h1 = cute.get(tCcS[ei + 1], mode=[0, 0])
@@ -1375,8 +1544,8 @@ class DenseIndexerBackward2QGemmSm100:
             s0 = tSrS[ei]
             s1 = tSrS[ei + 1]
 
-            w0 = Float32(sW[h0])
-            w1 = Float32(sW[h1])
+            w0 = w_reg_h0 if h0 == my_first_h else w_reg_h1
+            w1 = w_reg_h0 if h1 == my_first_h else w_reg_h1
             gs0 = sGS[n0]
             gs1 = sGS[n1]
 
@@ -1391,8 +1560,12 @@ class DenseIndexerBackward2QGemmSm100:
                 (dw_accum[ei], dw_accum[ei + 1]),
             )
 
-            tSrS[ei] = gs0 * w0 if s_pos_0 else Float32(0.0)
-            tSrS[ei + 1] = gs1 * w1 if s_pos_1 else Float32(0.0)
+            w0_masked = w0 if s_pos_0 else Float32(0.0)
+            w1_masked = w1 if s_pos_1 else Float32(0.0)
+            tSrS[ei], tSrS[ei + 1] = mul_packed_f32x2(
+                (gs0, gs1),
+                (w0_masked, w1_masked),
+            )
 
     # =========================================================================
     # Compute warpgroup (2Q): Per K block Phase A + Phase B, then epilogue
@@ -1461,6 +1634,12 @@ class DenseIndexerBackward2QGemmSm100:
         cS = cute.make_identity_tensor(s_acc_shape)
         tCcS = thr_tmem_load_s.partition_D(cS)
         tSrS_shape = tCcS.shape
+        my_first_h = cute.get(tCcS[0], mode=[0, 0])
+        my_second_h = my_first_h
+        for ei in cutlass.range(cute.size(tCcS), unroll_full=True):
+            h_check = cute.get(tCcS[ei], mode=[0, 0])
+            if h_check != my_first_h:
+                my_second_h = h_check
 
         # --- TMEM readback (dQ_q0 and dQ_q1) ---
         tiled_tmem_load_dq0 = tcgen05.make_tmem_copy(tmem_load_atom, tDqDq_0)
@@ -1477,9 +1656,25 @@ class DenseIndexerBackward2QGemmSm100:
         # Wait for W loaded
         cute.arch.mbarrier_wait(mbar + MBAR_2Q_W_LOADED, Int32(0))
 
-        # Create sW views for q0 and q1 from sW_full
-        sW_q0 = sW_full  # sW_full[0..heads-1] via direct indexing in _compute_ds_dw_block
-        # For q1, we use offset heads in the sW_full buffer
+        w_q0_h0 = (
+            Float32(sW_full[my_first_h]) if my_first_h < self.heads else Float32(0.0)
+        )
+        w_q0_h1 = (
+            Float32(sW_full[my_second_h]) if my_second_h < self.heads else Float32(0.0)
+        )
+        w_q1_h0 = Float32(0.0)
+        w_q1_h1 = Float32(0.0)
+        if has_q1:
+            w_q1_h0 = (
+                Float32(sW_full[self.heads + my_first_h])
+                if my_first_h < self.heads
+                else Float32(0.0)
+            )
+            w_q1_h1 = (
+                Float32(sW_full[self.heads + my_second_h])
+                if my_second_h < self.heads
+                else Float32(0.0)
+            )
 
         s_full_phase = Int32(0)
         gs_0_phase = Int32(0)
@@ -1517,18 +1712,22 @@ class DenseIndexerBackward2QGemmSm100:
                     tSrS,
                     dw_accum_q0,
                     sGradSignal_q0_0,
-                    sW_q0,
                     tCcS,
                     sm_scale,
+                    my_first_h,
+                    w_q0_h0,
+                    w_q0_h1,
                 )
             else:
                 self._compute_ds_dw_block(
                     tSrS,
                     dw_accum_q0,
                     sGradSignal_q0_1,
-                    sW_q0,
                     tCcS,
                     sm_scale,
+                    my_first_h,
+                    w_q0_h0,
+                    w_q0_h1,
                 )
 
             cute.arch.fence_view_async_tmem_load()
@@ -1561,22 +1760,26 @@ class DenseIndexerBackward2QGemmSm100:
 
                 # Compute dS_q1 + accumulate dW_q1, using sW_full offset by heads
                 if bi % 2 == 0:
-                    self._compute_ds_dw_block_q1(
+                    self._compute_ds_dw_block(
                         tSrS,
                         dw_accum_q1,
                         sGradSignal_q1_0,
-                        sW_full,
                         tCcS,
                         sm_scale,
+                        my_first_h,
+                        w_q1_h0,
+                        w_q1_h1,
                     )
                 else:
-                    self._compute_ds_dw_block_q1(
+                    self._compute_ds_dw_block(
                         tSrS,
                         dw_accum_q1,
                         sGradSignal_q1_1,
-                        sW_full,
                         tCcS,
                         sm_scale,
+                        my_first_h,
+                        w_q1_h0,
+                        w_q1_h1,
                     )
 
                 cute.arch.fence_view_async_tmem_load()
@@ -1685,45 +1888,6 @@ class DenseIndexerBackward2QGemmSm100:
                     mdW_b[q1_local, h] = self.q_dtype(total)
 
     # =========================================================================
-    # Helper: dS/dW for Q token 1 (reads W from sW_full[heads+h])
-    # =========================================================================
-    @cute.jit
-    def _compute_ds_dw_block_q1(self, tSrS, dw_accum, sGS, sW_full, tCcS, sm_scale: Float32 | float):
-        """Compute dS and accumulate dW for Q token 1, using W offset by heads in sW_full."""
-        for ei in cutlass.range(0, cute.size(tSrS), 2):
-            h0 = cute.get(tCcS[ei], mode=[0, 0])
-            n0 = cute.get(tCcS[ei], mode=[0, 1])
-            h1 = cute.get(tCcS[ei + 1], mode=[0, 0])
-            n1 = cute.get(tCcS[ei + 1], mode=[0, 1])
-
-            tSrS[ei], tSrS[ei + 1] = mul_packed_f32x2(
-                (tSrS[ei], tSrS[ei + 1]),
-                (Float32(sm_scale), Float32(sm_scale)),
-            )
-            s0 = tSrS[ei]
-            s1 = tSrS[ei + 1]
-
-            # Q1 W offset: heads + h
-            w0 = Float32(sW_full[self.heads + h0])
-            w1 = Float32(sW_full[self.heads + h1])
-            gs0 = sGS[n0]
-            gs1 = sGS[n1]
-
-            s_pos_0 = s0 > Float32(0.0)
-            s_pos_1 = s1 > Float32(0.0)
-            relu_s0 = s0 if s_pos_0 else Float32(0.0)
-            relu_s1 = s1 if s_pos_1 else Float32(0.0)
-
-            dw_accum[ei], dw_accum[ei + 1] = fma_packed_f32x2(
-                (gs0, gs1),
-                (relu_s0, relu_s1),
-                (dw_accum[ei], dw_accum[ei + 1]),
-            )
-
-            tSrS[ei] = gs0 * w0 if s_pos_0 else Float32(0.0)
-            tSrS[ei + 1] = gs1 * w1 if s_pos_1 else Float32(0.0)
-
-    # =========================================================================
     # Reduce warpgroup (2Q): Single-buffered dK
     # =========================================================================
     @cute.jit
@@ -1810,7 +1974,9 @@ class DenseIndexerBackward2QGemmSm100:
             cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
-    def get_tmem_tensor_2q(self, s_acc_layout, dq_acc_layout, dk_acc_layout, tmem_ptr_base: cute.Pointer):
+    def get_tmem_tensor_2q(
+        self, s_acc_layout, dq_acc_layout, dk_acc_layout, tmem_ptr_base: cute.Pointer
+    ):
         tStS = cute.make_tensor(tmem_ptr_base + self.tmem_s_offset, s_acc_layout)
         tDkDk = cute.make_tensor(tmem_ptr_base + self.tmem_dk_offset, dk_acc_layout)
         tDqDq_0 = cute.make_tensor(tmem_ptr_base + self.tmem_dq0_offset, dq_acc_layout)
@@ -1821,7 +1987,11 @@ class DenseIndexerBackward2QGemmSm100:
 # =============================================================================
 # Factory
 # =============================================================================
-_compile_cache: dict = {}
+# compile_key -> compiled kernel, one dict per kernel (score-grad + GEMM).
+# Single-layer pattern (matches forward _interface.py); filled lazily at first
+# execute since cute.compile needs real tensors.
+_score_grad_compile_cache: dict = {}
+_gemm_compile_cache: dict = {}
 
 
 def dense_indexer_backward_sm100(
@@ -1855,8 +2025,12 @@ def dense_indexer_backward_sm100(
     ``_run`` call time so changing it does not trigger recompilation.
     """
     assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
-    key = (
-        is_varlen,
+    # batch/max_seqlen_q/max_seqlen_k/sm_scale are all runtime: both kernels take
+    # max_seqlen_q/k as Int32 args (ScoreGradDense drives its launch grid +
+    # causal-mask bound from them; the GEMM loops at runtime), batch is a dynamic
+    # grid dim, and sm_scale is a runtime Float32. None are keyed (see _build's
+    # compile_key). The per-kernel module caches replace the old dict-of-closures.
+    return _build_cute_dsl_kernel(
         batch,
         max_seqlen_q,
         max_seqlen_k,
@@ -1865,23 +2039,13 @@ def dense_indexer_backward_sm100(
         sm_scale,
         block_I,
         ratio,
+        is_varlen,
     )
-    if key not in _compile_cache:
-        _compile_cache[key] = _build_cute_dsl_kernel(
-            batch,
-            max_seqlen_q,
-            max_seqlen_k,
-            heads,
-            dim,
-            sm_scale,
-            block_I,
-            ratio,
-            is_varlen,
-        )
-    return _compile_cache[key]
 
 
-def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_scale, block_I, ratio, is_varlen):
+def _build_cute_dsl_kernel(
+    batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_scale, block_I, ratio, is_varlen
+):
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     if torch.cuda.get_device_capability()[0] < 10:
@@ -1889,20 +2053,29 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
 
     # Kernel 1: ScoreGradDense — applies bottom-right ratio causal mask so
     # masked / padding columns produce grad_signal=0 (won't contaminate GEMM).
-    score_grad_obj = ScoreGradDense(
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        ratio=ratio,
-    )
+    score_grad_obj = ScoreGradDense(ratio=ratio)
 
     # Kernel 2: 2Q GEMM kernel (reads pre-computed grad_signal, 2 Q tokens per CTA).
     # is_varlen branches at compile time on whether CuSeqlens* are None.
-    gemm_obj = DenseIndexerBackward2QGemmSm100(head_dim=dim, heads=heads, block_I=block_I)
+    gemm_obj = DenseIndexerBackward2QGemmSm100(
+        head_dim=dim, heads=heads, block_I=block_I, ratio=ratio
+    )
 
-    compiled_score_grad = [None]
-    compiled_gemm = [None]
+    # Only params that change generated code. max_seqlen_q/k are now runtime
+    # Int32 args to ScoreGradDense (drive the launch grid + causal-mask bound)
+    # and to the GEMM, so neither is keyed; batch/sm_scale likewise runtime.
+    compile_key = (is_varlen, heads, dim, block_I, ratio)
 
-    def _ensure_compiled_score_grad(IdxScoreRaw, IdxLSE, AttnScoreRaw, AttnL1Norm, CuSeqlensQ, CuSeqlensK, grad_scale, current_stream=None):
+    def _ensure_compiled_score_grad(
+        IdxScoreRaw,
+        IdxLSE,
+        AttnScoreRaw,
+        AttnL1Norm,
+        CuSeqlensQ,
+        CuSeqlensK,
+        grad_scale,
+        current_stream=None,
+    ):
         """Lazy-compile kernel 1 (score gradient).
 
         For BSHD (is_varlen=False) CuSeqlensQ/K are None and the compiled
@@ -1916,11 +2089,11 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         factory's cache key, the compiled kernel is reused unchanged when
         the runtime ``grad_scale`` differs from the value seen at compile.
         """
-        if compiled_score_grad[0] is None:
+        if compile_key not in _score_grad_compile_cache:
             s = _resolve_stream(current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
-            compiled_score_grad[0] = cute.compile(
+            _score_grad_compile_cache[compile_key] = cute.compile(
                 score_grad_obj,
                 to_cute_tensor(IdxScoreRaw),
                 to_cute_tensor(AttnScoreRaw),
@@ -1929,21 +2102,34 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
                 cuq_arg,
                 cuk_arg,
                 cutlass.Float32(float(grad_scale)),
+                cutlass.Int32(max_seqlen_q),
+                cutlass.Int32(max_seqlen_k),
                 s,
                 options=compile_options("--opt-level 3"),
             )
 
-    def _ensure_compiled_gemm(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, CuSeqlensQ, CuSeqlensK, current_stream=None):
+    def _ensure_compiled_gemm(
+        IndexQ,
+        Weights,
+        IndexK,
+        dIndexQ,
+        dWeights,
+        dIndexK_f32,
+        GradSignal,
+        CuSeqlensQ,
+        CuSeqlensK,
+        current_stream=None,
+    ):
         """Lazy-compile kernel 2 (2Q GEMM).
 
         For BSHD (is_varlen=False) CuSeqlens* are None. For THD they are
         int32 cu_seqlens tensors of shape (B+1,).
         """
-        if compiled_gemm[0] is None:
+        if compile_key not in _gemm_compile_cache:
             s = _resolve_stream(current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
-            compiled_gemm[0] = cute.compile(
+            _gemm_compile_cache[compile_key] = cute.compile(
                 gemm_obj,
                 to_cute_tensor(IndexQ),
                 to_cute_tensor(Weights),
@@ -1961,18 +2147,44 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
                 options=compile_options("--opt-level 3"),
             )
 
-    def _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, CuSeqlensQ=None, CuSeqlensK=None, current_stream=None):
+    def _run_gemm_only(
+        IndexQ,
+        Weights,
+        IndexK,
+        dIndexQ,
+        dWeights,
+        dIndexK_f32,
+        GradSignal,
+        CuSeqlensQ=None,
+        CuSeqlensK=None,
+        current_stream=None,
+    ):
         """Run only kernel 2 (2Q GEMM). Caller must have run kernel 1 and zeroed dIndexK_f32."""
         # Match the compile-time is_varlen to avoid dispatching into a kernel
         # compiled for the other mode.
         if is_varlen:
-            assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled kernel requires cu_seqlens_q/k at runtime"
+            assert (
+                CuSeqlensQ is not None and CuSeqlensK is not None
+            ), "THD-compiled kernel requires cu_seqlens_q/k at runtime"
         else:
-            assert CuSeqlensQ is None and CuSeqlensK is None, "BSHD-compiled kernel must not receive cu_seqlens_q/k"
+            assert (
+                CuSeqlensQ is None and CuSeqlensK is None
+            ), "BSHD-compiled kernel must not receive cu_seqlens_q/k"
         s = _resolve_stream(current_stream)
-        _ensure_compiled_gemm(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, CuSeqlensQ, CuSeqlensK, current_stream=current_stream)
+        _ensure_compiled_gemm(
+            IndexQ,
+            Weights,
+            IndexK,
+            dIndexQ,
+            dWeights,
+            dIndexK_f32,
+            GradSignal,
+            CuSeqlensQ,
+            CuSeqlensK,
+            current_stream=current_stream,
+        )
         with torch.cuda.nvtx.range("indexer_backward_dsl_dense_gemm_2q"):
-            compiled_gemm[0](
+            _gemm_compile_cache[compile_key](
                 IndexQ,
                 Weights,
                 IndexK,
@@ -2015,16 +2227,29 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         kernel 1 so changing it does not require recompilation.
         """
         if is_varlen:
-            assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled kernel requires cu_seqlens_q/k at runtime"
+            assert (
+                CuSeqlensQ is not None and CuSeqlensK is not None
+            ), "THD-compiled kernel requires cu_seqlens_q/k at runtime"
         else:
-            assert CuSeqlensQ is None and CuSeqlensK is None, "BSHD-compiled kernel must not receive cu_seqlens_q/k"
+            assert (
+                CuSeqlensQ is None and CuSeqlensK is None
+            ), "BSHD-compiled kernel must not receive cu_seqlens_q/k"
         s = _resolve_stream(current_stream)
 
         # Kernel 1 (CuTe DSL): in-place overwrites IdxScoreRaw with grad_signal.
         # Grid = (B, max_seqlen_q, 1); CTAs past per-batch seqlen exit early.
-        _ensure_compiled_score_grad(IdxScoreRaw, IdxLSE, AttnScoreRaw, AttnL1Norm, CuSeqlensQ, CuSeqlensK, grad_scale, current_stream=current_stream)
+        _ensure_compiled_score_grad(
+            IdxScoreRaw,
+            IdxLSE,
+            AttnScoreRaw,
+            AttnL1Norm,
+            CuSeqlensQ,
+            CuSeqlensK,
+            grad_scale,
+            current_stream=current_stream,
+        )
         with torch.cuda.nvtx.range("indexer_backward_dsl_dense_score_grad"):
-            compiled_score_grad[0](
+            _score_grad_compile_cache[compile_key](
                 IdxScoreRaw,
                 AttnScoreRaw,
                 IdxLSE,
@@ -2032,12 +2257,25 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
                 CuSeqlensQ,
                 CuSeqlensK,
                 cutlass.Float32(float(grad_scale)),
+                cutlass.Int32(max_seqlen_q),
+                cutlass.Int32(max_seqlen_k),
                 s,
             )
 
         # Kernel 2 (CuTe DSL): 2Q three GEMMs — IdxScoreRaw now contains grad_signal.
         # Grid = (B, ceil(max_seqlen_q/2), 1).
-        _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, IdxScoreRaw, CuSeqlensQ, CuSeqlensK, current_stream=current_stream)
+        _run_gemm_only(
+            IndexQ,
+            Weights,
+            IndexK,
+            dIndexQ,
+            dWeights,
+            dIndexK_f32,
+            IdxScoreRaw,
+            CuSeqlensQ,
+            CuSeqlensK,
+            current_stream=current_stream,
+        )
 
     _run.gemm_only = _run_gemm_only
     _run.is_varlen = is_varlen

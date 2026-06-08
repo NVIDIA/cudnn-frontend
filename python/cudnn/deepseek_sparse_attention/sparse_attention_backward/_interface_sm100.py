@@ -30,6 +30,7 @@ def flash_attn_bwd_sm100(
     topk_length: Optional[torch.Tensor] = None,
     dq: Optional[torch.Tensor] = None,
     dkv: Optional[torch.Tensor] = None,
+    current_stream=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
 
@@ -125,10 +126,10 @@ def flash_attn_bwd_sm100(
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
 
     dtype = torch2cute_dtype_map[q.dtype]
-    current_stream = resolve_stream()
+    current_stream = resolve_stream(current_stream)
 
     has_topk_length = topk_length is not None
-    compile_key = (dtype, head_dim, head_dim_v, block_tile, has_topk_length, num_head)
+    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, has_topk_length)
 
     if compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)

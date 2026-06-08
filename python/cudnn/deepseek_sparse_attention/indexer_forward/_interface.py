@@ -44,6 +44,7 @@ def indexer_fwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    current_stream=None,
 ) -> torch.Tensor:
     """
     Indexer QK forward pass using CuTe DSL kernel.
@@ -70,6 +71,11 @@ def indexer_fwd(
                ``(total_q, max_seqlen_k)`` [FP32]
     """
     q, k, w = [_maybe_contiguous(t) for t in (q, k, w)]
+    for tensor, name in ((q, "q"), (k, "k"), (w, "w")):
+        assert tensor.dtype == torch.bfloat16, f"{name} must be bfloat16, got {tensor.dtype}"
+        assert tensor.is_cuda, f"{name} must be on CUDA device"
+    if num_threads != 384:
+        raise ValueError(f"SM100 indexer_fwd only supports num_threads=384, got {num_threads}")
 
     is_varlen_q = cu_seqlens_q is not None
     is_varlen_k = cu_seqlens_k is not None
@@ -130,23 +136,23 @@ def indexer_fwd(
         assert out.shape == out_shape, f"out must have shape {out_shape}, got {tuple(out.shape)}"
         assert out.dtype == torch.float32 and out.is_cuda
 
-    # sm_scale participates in compile_key because cutlass.Float32 is baked
-    # as a constant into the compiled kernel, so distinct scale values need
-    # distinct cache entries.
+    # Key holds only params that change generated code. Tensor dtypes are keyed
+    # because CuTe reads element types from the compile-time tensor descriptors;
+    # sm_scale/seqlens are runtime args, so they're excluded to avoid spurious
+    # recompiles.
     compile_key = (
         q.dtype,
+        k.dtype,
+        w.dtype,
+        out.dtype,
         head_dim,
         qhead_per_kv_head,
         ratio,
         m_block_size,
         n_block_size,
-        num_threads,
         q_stage,
         kv_stage,
-        float(sm_scale),
         is_varlen,
-        seqlen_q_dim,
-        seqlen_k_dim,
     )
 
     if compile_key not in _compile_cache:
@@ -168,7 +174,7 @@ def indexer_fwd(
             kv_stage=kv_stage,
         )
 
-        current_stream = resolve_stream()
+        current_stream = resolve_stream(current_stream)
         scale_arg = cutlass.Float32(sm_scale)
         max_q_arg = cutlass.Int32(seqlen_q_dim)
         max_k_arg = cutlass.Int32(seqlen_k_dim)
@@ -191,7 +197,7 @@ def indexer_fwd(
 
     # Init to -inf: skipped causal n-blocks and masked positions stay -inf
     out.fill_(float("-inf"))
-    current_stream = resolve_stream()
+    current_stream = resolve_stream(current_stream)
     scale_arg = cutlass.Float32(sm_scale)
     max_q_arg = cutlass.Int32(seqlen_q_dim)
     max_k_arg = cutlass.Int32(seqlen_k_dim)

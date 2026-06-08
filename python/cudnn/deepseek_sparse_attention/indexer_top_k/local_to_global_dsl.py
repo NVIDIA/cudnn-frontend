@@ -160,7 +160,6 @@ def local_to_global(
     stream = resolve_stream(stream)
     compile_key = (
         local_indices.dtype,
-        tuple(local_indices.shape),
         is_varlen,
     )
     if compile_key not in _compile_cache:

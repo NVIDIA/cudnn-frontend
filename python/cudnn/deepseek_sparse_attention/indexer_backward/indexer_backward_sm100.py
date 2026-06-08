@@ -1409,6 +1409,11 @@ class IndexerBackwardSm100:
 # =============================================================================
 # Factory
 # =============================================================================
+# compile_key -> compiled GEMM kernel. Single-layer cache, same pattern as the
+# forward ``_interface.py`` and ``_score_grad_cute_cache`` below: the key holds
+# only params that change the generated code, and entries are filled lazily on
+# first execute (``_ensure_compiled``) because ``cute.compile`` needs the real
+# tensors that the shape-only factory call doesn't have yet.
 _compile_cache: dict = {}
 
 
@@ -1423,27 +1428,28 @@ def indexer_backward_sm100(
     block_I=128,
     topk_indices_global: bool = True,
 ):
-    # ``grad_scale`` is intentionally **not** an argument: it's a host scalar
-    # that the kernels consume only as a multiplicative factor, so it's
-    # passed at ``_run`` call time (and forwarded to ``score_grad`` as a
-    # runtime ``Float32``). Keeping it out of this factory's signature +
-    # cache key avoids spurious recompiles when the caller changes the
-    # runtime loss scaling for the same tensor shape.
+    # ``batch``/``seqlen``/``seqlen_k`` are kept in the signature for a stable,
+    # backend-agnostic factory API (mirrors ``indexer_backward_sm90`` and the
+    # ``api.py`` call site) but are deliberately **not** forwarded into the
+    # compile cache key: in the kernel they are runtime values only (dynamic
+    # tensor extents + ``Int32`` grid/args, never ``const_expr``), so one
+    # compiled kernel serves every shape. Keying them would trigger spurious
+    # recompiles under varlen / changing batch.
+    #
+    # ``grad_scale`` is likewise runtime-only (forwarded into ``score_grad`` as
+    # a ``Float32`` at call time), so it is neither an argument here nor keyed.
     #
     # ``topk_indices_global`` selects the topk-id contract:
     #   True  (default): mTopkIdx carries global flat ids — load directly.
     #   False (legacy):  mTopkIdx carries local-per-batch ids — kernel adds
     #                    ``batch_idx * S_k_per_batch`` to convert to global
     #                    flat for the (B*S_k, D) K/dK view.
-    # Const_expr-branched in the kernel so it's part of the cache key.
+    # Const_expr-branched in the kernel, so it **is** part of the compile key.
     # THD packed varlen is supported at the wrapper level by treating the
     # packed tensors as a single B=1 BSHD batch (sparse path's topk indices
     # already encode per-batch validity, so no kernel-side cu_seqlens are
     # needed). See ``_indexer_backward_sparse_thd`` in csrc/bwd/__init__.py.
-    key = (batch, seqlen, seqlen_k, heads, dim, topk, sm_scale, block_I, topk_indices_global)
-    if key not in _compile_cache:
-        _compile_cache[key] = _build_cute_dsl_kernel(batch, seqlen, seqlen_k, heads, dim, topk, sm_scale, block_I, topk_indices_global=topk_indices_global)
-    return _compile_cache[key]
+    return _build_cute_dsl_kernel(heads, dim, topk, sm_scale, block_I, topk_indices_global=topk_indices_global)
 
 
 class ScoreGradSm100:
@@ -1591,7 +1597,7 @@ def _score_grad_inplace(AttnScore, IndexScore, GradLoss, grad_scale, block_I=128
     _score_grad_inplace_cute(AttnScore, IndexScore, GradLoss, grad_scale, current_stream=current_stream)
 
 
-def _build_cute_dsl_kernel(batch, seqlen, seqlen_k, heads, dim, topk, sm_scale, block_I, topk_indices_global: bool = True):
+def _build_cute_dsl_kernel(heads, dim, topk, sm_scale, block_I, topk_indices_global: bool = True):
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     if torch.cuda.get_device_capability()[0] < 10:
@@ -1604,14 +1610,16 @@ def _build_cute_dsl_kernel(batch, seqlen, seqlen_k, heads, dim, topk, sm_scale, 
         topk_indices_global=topk_indices_global,
     )
 
-    compiled_holder = [None]
+    # Only params that change the generated code (mirrors forward _interface.py).
+    # sm_scale is a runtime Float32 arg (passed fresh per call), so it's not keyed.
+    compile_key = (heads, dim, topk, block_I, topk_indices_global)
 
     def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices, current_stream=None):
-        """Lazy-compile the GEMM kernel (kernel 2)."""
-        if compiled_holder[0] is None:
+        """Lazy-compile the GEMM kernel (kernel 2) on first execute (needs real tensors)."""
+        if compile_key not in _compile_cache:
             s = _resolve_stream(current_stream)
             cute_args = [to_cute_tensor(t) for t in [IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices]]
-            compiled_holder[0] = cute.compile(
+            _compile_cache[compile_key] = cute.compile(
                 kernel_obj,
                 *cute_args,
                 cutlass.Float32(sm_scale),
@@ -1624,7 +1632,7 @@ def _build_cute_dsl_kernel(batch, seqlen, seqlen_k, heads, dim, topk, sm_scale, 
         s = _resolve_stream(current_stream)
         _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, current_stream=current_stream)
         with torch.cuda.nvtx.range("indexer_backward_dsl_gemm"):
-            compiled_holder[0](
+            _compile_cache[compile_key](
                 IndexQ,
                 Weights,
                 IndexK,
