@@ -129,7 +129,7 @@ def flash_attn_bwd_sm100(
     current_stream = resolve_stream(current_stream)
 
     has_topk_length = topk_length is not None
-    compile_key = (dtype, head_dim, head_dim_v, block_tile, has_topk_length)
+    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, has_topk_length)
 
     if compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
