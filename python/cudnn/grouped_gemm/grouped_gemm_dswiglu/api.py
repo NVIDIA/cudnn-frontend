@@ -574,6 +574,12 @@ class GroupedGemmDswigluSm100(APIBase):
             options="--enable-tvm-ffi",
         )
 
+        self._raw_compiled_kernel = _compiled_kernel
+        self._compiled_kernel = self._wrap_tensor_api(_compiled_kernel)
+
+        self._logger.debug("Kernel compiled successfully")
+
+    def _wrap_tensor_api(self, function):
         def tensor_api(
             a_tensor: torch.Tensor,
             b_tensor: torch.Tensor,
@@ -594,7 +600,7 @@ class GroupedGemmDswigluSm100(APIBase):
             stream: cuda.CUstream,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-            _compiled_kernel(
+            function(
                 a_tensor,
                 b_tensor,
                 c_tensor,
@@ -614,9 +620,7 @@ class GroupedGemmDswigluSm100(APIBase):
                 stream,
             )
 
-        self._compiled_kernel = tensor_api
-
-        self._logger.debug("Kernel compiled successfully")
+        return tensor_api
 
     def execute(
         self,
@@ -833,7 +837,18 @@ def grouped_gemm_dswiglu_wrapper_sm100(
         mma_shape_col = (1, ceil_div(n * 2, 128), ceil_div(sf_k_col, 4), 32, 4, 4)
         sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
 
-    if cache_key in _cache_of_GroupedGemmDswigluSm100Objects:
+    aot_mode = os.getenv("CUDNN_FE_AOT_MODE", "").strip().lower()
+    aot_artifact_dir = os.getenv("CUDNN_FE_AOT_DIR")
+    if aot_mode and aot_mode not in {"read", "write", "readwrite"}:
+        raise ValueError(
+            "CUDNN_FE_AOT_MODE must be one of {'read', 'write', 'readwrite'}, "
+            f"got {aot_mode!r}"
+        )
+    if aot_mode and not aot_artifact_dir:
+        raise ValueError("CUDNN_FE_AOT_DIR is required when CUDNN_FE_AOT_MODE is set")
+
+    use_cache = not aot_mode or aot_mode == "write"
+    if use_cache and cache_key in _cache_of_GroupedGemmDswigluSm100Objects:
         _logger.debug("group_gemm_dswiglu_wrapper_sm100: Using previously cached GroupedGemmDswigluSm100 object")
         grouped_gemm_dswiglu, cached_amax_tensor, cached_beta_tensor = _cache_of_GroupedGemmDswigluSm100Objects[cache_key]
         amax_tensor = amax_tensor_buf if amax_tensor_buf is not None else cached_amax_tensor
@@ -845,7 +860,12 @@ def grouped_gemm_dswiglu_wrapper_sm100(
             # Fallback: cache was populated without beta caching (non-NVFP4 path),
             # but caller now passes None (NVFP4 path). Create ones tensor on-the-fly.
             effective_beta = torch.ones(l, dtype=torch.float32, device=a_tensor.device)
+        if aot_mode == "write" and grouped_gemm_dswiglu._raw_compiled_kernel is None:
+            grouped_gemm_dswiglu = None
     else:
+        grouped_gemm_dswiglu = None
+
+    if grouped_gemm_dswiglu is None:
         _logger.debug(
             "group_gemm_dswiglu_wrapper_sm100: No previously cached GroupedGemmDswigluSm100 object found, creating new GroupedGemmDswigluSm100 object"
         )
@@ -890,7 +910,18 @@ def grouped_gemm_dswiglu_wrapper_sm100(
         )
 
         assert grouped_gemm_dswiglu.check_support(), "Unsupported configuration"
-        grouped_gemm_dswiglu.compile()
+        if aot_mode == "read":
+            grouped_gemm_dswiglu.load_aot(aot_artifact_dir, cache_key)
+        elif aot_mode == "readwrite":
+            _, _, aot_paths = grouped_gemm_dswiglu._build_aot_symbol_and_paths(aot_artifact_dir, cache_key)
+            if aot_paths.metadata_file.exists() and aot_paths.object_file.exists() and aot_paths.shared_library.exists():
+                grouped_gemm_dswiglu.load_aot(aot_artifact_dir, cache_key)
+            else:
+                grouped_gemm_dswiglu.export_aot(aot_artifact_dir, cache_key)
+        elif aot_mode == "write":
+            grouped_gemm_dswiglu.export_aot(aot_artifact_dir, cache_key)
+        else:
+            grouped_gemm_dswiglu.compile()
         _cache_of_GroupedGemmDswigluSm100Objects[cache_key] = (grouped_gemm_dswiglu, cached_amax_tensor, cached_beta_tensor)
 
     grouped_gemm_dswiglu.execute(

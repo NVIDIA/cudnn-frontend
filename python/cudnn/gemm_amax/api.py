@@ -12,7 +12,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.api_base import APIBase, TensorDesc, TupleDict, is_power_of_2, ceil_div
+from cudnn.api_base import APIBase, TupleDict, is_power_of_2, ceil_div
 
 
 class GemmAmaxSm100(APIBase):
@@ -305,7 +305,12 @@ class GemmAmaxSm100(APIBase):
             stream=fake_stream,
             options="--enable-tvm-ffi",
         )
+        self._raw_compiled_kernel = _compiled_kernel
+        self._compiled_kernel = self._wrap_tensor_api(_compiled_kernel)
 
+        self._logger.debug("Kernel compiled successfully")
+
+    def _wrap_tensor_api(self, function):
         def tensor_api(
             a_tensor: torch.Tensor,
             b_tensor: torch.Tensor,
@@ -317,7 +322,7 @@ class GemmAmaxSm100(APIBase):
         ):
             amax_tensor = self._pad_tensor_to_ndim(amax_tensor, 3, "amax")
 
-            return _compiled_kernel(
+            return function(
                 a_tensor,
                 b_tensor,
                 sfa_tensor,
@@ -327,13 +332,7 @@ class GemmAmaxSm100(APIBase):
                 stream,
             )
 
-        self._compiled_kernel = tensor_api
-
-        for attr_name in tuple(vars(self)):
-            if attr_name.startswith("sample_"):
-                setattr(self, attr_name, None)
-
-        self._logger.debug("Kernel compiled successfully")
+        return tensor_api
 
     def execute(
         self,
@@ -387,6 +386,15 @@ def gemm_amax_wrapper_sm100(
 ) -> TupleDict:
 
     _logger.debug("gemm_amax_wrapper_sm100: Creating empty output tensors c and amax")
+    aot_mode = os.getenv("CUDNN_FE_AOT_MODE", "").strip().lower()
+    aot_artifact_dir = os.getenv("CUDNN_FE_AOT_DIR")
+    if aot_mode and aot_mode not in {"read", "write", "readwrite"}:
+        raise ValueError(
+            "CUDNN_FE_AOT_MODE must be one of {'read', 'write', 'readwrite'}, "
+            f"got {aot_mode!r}"
+        )
+    if aot_mode and not aot_artifact_dir:
+        raise ValueError("CUDNN_FE_AOT_DIR is required when CUDNN_FE_AOT_MODE is set")
 
     m, _, l = a_tensor.shape
     n, _, l = b_tensor.shape
@@ -398,6 +406,7 @@ def gemm_amax_wrapper_sm100(
     else:
         raise ValueError(f"c_major must be either 'm' or 'n', got {c_major}")
     amax_tensor = torch.full((1, 1, 1), -float("inf"), device=a_tensor.device, dtype=torch.float32)
+    num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
 
     cache_key = (
         a_tensor.shape,
@@ -418,10 +427,18 @@ def gemm_amax_wrapper_sm100(
         mma_tiler_mn,
         cluster_shape_mn,
         sf_vec_size,
+        num_cluster_overlap_margin,
     )
-    if cache_key in _cache_of_GemmAmaxSm100Objects:
+    use_cache = not aot_mode or aot_mode == "write"
+    if use_cache and cache_key in _cache_of_GemmAmaxSm100Objects:
         _logger.debug("gemm_amax_wrapper_sm100: Using previously cached GemmAmaxSm100 object")
         gemm_amax = _cache_of_GemmAmaxSm100Objects[cache_key]
+        if aot_mode == "write" and gemm_amax._raw_compiled_kernel is None:
+            gemm_amax = None
+    else:
+        gemm_amax = None
+
+    if gemm_amax is not None:
         gemm_amax.execute(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
@@ -446,7 +463,18 @@ def gemm_amax_wrapper_sm100(
             sf_vec_size=sf_vec_size,
         )
         assert gemm_amax.check_support()
-        gemm_amax.compile()
+        if aot_mode == "read":
+            gemm_amax.load_aot(aot_artifact_dir, cache_key)
+        elif aot_mode == "readwrite":
+            _, _, aot_paths = gemm_amax._build_aot_symbol_and_paths(aot_artifact_dir, cache_key)
+            if aot_paths.metadata_file.exists() and aot_paths.object_file.exists() and aot_paths.shared_library.exists():
+                gemm_amax.load_aot(aot_artifact_dir, cache_key)
+            else:
+                gemm_amax.export_aot(aot_artifact_dir, cache_key)
+        elif aot_mode == "write":
+            gemm_amax.export_aot(aot_artifact_dir, cache_key)
+        else:
+            gemm_amax.compile()
         gemm_amax.execute(
             a_tensor=a_tensor,
             b_tensor=b_tensor,

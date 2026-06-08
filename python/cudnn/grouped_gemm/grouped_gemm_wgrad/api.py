@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 import logging
 
@@ -240,6 +241,23 @@ class GroupedGemmWgradSm100(APIBase):
         self._is_supported = True
         return True
 
+    def _ensure_workspace(self, kernel=None) -> None:
+        if getattr(self, "_workspace", None) is not None:
+            return
+        if kernel is None:
+            kernel = self._kernel(
+                sf_vec_size=self.sf_vec_size,
+                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                accumulate_on_output=self.accumulate_on_output,
+                expert_cnt=self.expert_cnt,
+                weight_mode=self.weight_mode,
+                input_order=self.input_order,
+            )
+        self._workspace = torch.empty(max(kernel.get_workspace_bytes(), 1), dtype=torch.uint8, device=self.a_desc.device)
+
     def compile(self) -> None:
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -259,7 +277,7 @@ class GroupedGemmWgradSm100(APIBase):
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
-        self._workspace = torch.empty(max(kernel.get_workspace_bytes(), 1), dtype=torch.uint8, device=self.a_desc.device)
+        self._ensure_workspace(kernel)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         if self.weight_mode == MoEWeightMode.DENSE:
@@ -344,34 +362,8 @@ class GroupedGemmWgradSm100(APIBase):
             options="--enable-tvm-ffi",
         )
 
-        cached_workspace = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
-
-        def tensor_api(
-            a_tensor: torch.Tensor,
-            b_tensor: torch.Tensor,
-            sfa_tensor: torch.Tensor,
-            sfb_tensor: torch.Tensor,
-            wgrad_tensor: torch.Tensor,
-            offsets_tensor: torch.Tensor,
-            stream: cuda.CUstream,
-            global_scale_a: Optional[torch.Tensor],
-            global_scale_b: Optional[torch.Tensor],
-        ) -> None:
-            compiled(
-                a_tensor,
-                b_tensor,
-                sfa_tensor,
-                sfb_tensor,
-                wgrad_tensor,
-                offsets_tensor,
-                cached_workspace,
-                stream,
-                global_scale_a,
-                global_scale_b,
-                None,
-            )
-
-        self._compiled_kernel = tensor_api
+        self._raw_compiled_kernel = compiled
+        self._compiled_kernel = self._wrap_tensor_api(compiled)
 
     def _compile_discrete(self, kernel, max_active_clusters, fake_stream) -> None:
         a_fake = (
@@ -452,7 +444,41 @@ class GroupedGemmWgradSm100(APIBase):
             options="--enable-tvm-ffi",
         )
 
+        self._raw_compiled_kernel = compiled
+        self._compiled_kernel = self._wrap_tensor_api(compiled)
+
+    def _wrap_tensor_api(self, function):
+        self._ensure_workspace()
         cached_workspace = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
+
+        if self.weight_mode == MoEWeightMode.DENSE:
+            def tensor_api(
+                a_tensor: torch.Tensor,
+                b_tensor: torch.Tensor,
+                sfa_tensor: torch.Tensor,
+                sfb_tensor: torch.Tensor,
+                wgrad_tensor: torch.Tensor,
+                offsets_tensor: torch.Tensor,
+                stream: cuda.CUstream,
+                global_scale_a: Optional[torch.Tensor],
+                global_scale_b: Optional[torch.Tensor],
+            ) -> None:
+                function(
+                    a_tensor,
+                    b_tensor,
+                    sfa_tensor,
+                    sfb_tensor,
+                    wgrad_tensor,
+                    offsets_tensor,
+                    cached_workspace,
+                    stream,
+                    global_scale_a,
+                    global_scale_b,
+                    None,
+                )
+
+            return tensor_api
+
         single_expert_placeholder = torch.empty_strided(
             self.single_expert_wgrad_desc.shape,
             self.single_expert_wgrad_desc.stride,
@@ -476,7 +502,7 @@ class GroupedGemmWgradSm100(APIBase):
             global_scale_a: Optional[torch.Tensor],
             global_scale_b: Optional[torch.Tensor],
         ) -> None:
-            compiled(
+            function(
                 a_tensor,
                 b_tensor,
                 sfa_tensor,
@@ -490,7 +516,7 @@ class GroupedGemmWgradSm100(APIBase):
                 cached_single_expert,
             )
 
-        self._compiled_kernel = tensor_api
+        return tensor_api
 
     def execute(
         self,
@@ -625,9 +651,24 @@ def grouped_gemm_wgrad_wrapper_sm100(
         input_order,
     )
 
-    if cache_key in _cache_of_GroupedGemmWgradSm100Objects:
+    aot_mode = os.getenv("CUDNN_FE_AOT_MODE", "").strip().lower()
+    aot_artifact_dir = os.getenv("CUDNN_FE_AOT_DIR")
+    if aot_mode and aot_mode not in {"read", "write", "readwrite"}:
+        raise ValueError(
+            "CUDNN_FE_AOT_MODE must be one of {'read', 'write', 'readwrite'}, "
+            f"got {aot_mode!r}"
+        )
+    if aot_mode and not aot_artifact_dir:
+        raise ValueError("CUDNN_FE_AOT_DIR is required when CUDNN_FE_AOT_MODE is set")
+    use_cache = not aot_mode or aot_mode == "write"
+    if use_cache and cache_key in _cache_of_GroupedGemmWgradSm100Objects:
         op = _cache_of_GroupedGemmWgradSm100Objects[cache_key]
+        if aot_mode == "write" and op._raw_compiled_kernel is None:
+            op = None
     else:
+        op = None
+
+    if op is None:
         if output_mode == "dense":
             op = GroupedGemmWgradSm100(
                 sample_a=a_tensor,
@@ -667,7 +708,18 @@ def grouped_gemm_wgrad_wrapper_sm100(
                 input_order=input_order,
             )
         assert op.check_support(), "Unsupported configuration"
-        op.compile()
+        if aot_mode == "read":
+            op.load_aot(aot_artifact_dir, cache_key)
+        elif aot_mode == "readwrite":
+            _, _, aot_paths = op._build_aot_symbol_and_paths(aot_artifact_dir, cache_key)
+            if aot_paths.metadata_file.exists() and aot_paths.object_file.exists() and aot_paths.shared_library.exists():
+                op.load_aot(aot_artifact_dir, cache_key)
+            else:
+                op.export_aot(aot_artifact_dir, cache_key)
+        elif aot_mode == "write":
+            op.export_aot(aot_artifact_dir, cache_key)
+        else:
+            op.compile()
         _cache_of_GroupedGemmWgradSm100Objects[cache_key] = op
 
     op.execute(

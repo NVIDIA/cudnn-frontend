@@ -5,6 +5,8 @@ This module tests the contiguous grouped block-scaled GEMM backward pass
 with dSwiGLU activation gradient for MoE (Mixture of Experts) workloads.
 """
 
+import json
+
 import torch
 import pytest
 from test_utils import torch_fork_set_rng
@@ -177,6 +179,159 @@ def test_grouped_gemm_dswiglu_wrapper_fp8(
         discrete_col_sfd=discrete_col_sfd,
         request=request,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_dswiglu_aot_export_load(tmp_path, monkeypatch, request):
+    pytest.importorskip("cutlass", reason="CuTe DSL is not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    from cudnn import grouped_gemm_dswiglu_wrapper_sm100
+    from cudnn.grouped_gemm.grouped_gemm_dswiglu import api as grouped_gemm_dswiglu_api
+    from cuda.bindings import driver as cuda
+
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
+        pytest.skip(f"GroupedGemmDswiglu AOT requires SM100+, found SM{major}{minor}")
+
+    cfg = grouped_gemm_swiglu_init(
+        request=request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        b_major="k",
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        b_major=cfg["b_major"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+    )
+    inputs, _ = allocate_grouped_gemm_dswiglu_tensors(
+        tensor_m=inputs["tensor_m"],
+        n=cfg["n"],
+        l=cfg["l"],
+        ab_dtype=cfg["ab_dtype"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        input_tensors=inputs,
+    )
+
+    grouped_gemm_dswiglu_api._cache_of_GroupedGemmDswigluSm100Objects.clear()
+    original_export_aot = grouped_gemm_dswiglu_api.GroupedGemmDswigluSm100.export_aot
+    export_calls = 0
+
+    def counting_export_aot(self, *args, **kwargs):
+        nonlocal export_calls
+        export_calls += 1
+        return original_export_aot(self, *args, **kwargs)
+
+    monkeypatch.setattr(grouped_gemm_dswiglu_api.GroupedGemmDswigluSm100, "export_aot", counting_export_aot)
+    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "write")
+    monkeypatch.setenv("CUDNN_FE_AOT_DIR", str(tmp_path))
+
+    try:
+        exported = grouped_gemm_dswiglu_wrapper_sm100(
+            a_tensor=inputs["a_tensor"],
+            b_tensor=inputs["b_tensor"],
+            c_tensor=inputs["c_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            sfb_tensor=inputs["sfb_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            beta_tensor=inputs["beta_tensor"],
+            prob_tensor=inputs["prob_tensor"],
+            norm_const_tensor=inputs.get("norm_const_tensor"),
+            acc_dtype=cfg["acc_dtype"],
+            d_dtype=cfg["d_dtype"],
+            cd_major=cfg["cd_major"],
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            cluster_shape_mn=cfg["cluster_shape_mn"],
+            sf_vec_size=cfg["sf_vec_size"],
+            vector_f32=cfg["vector_f32"],
+            m_aligned=cfg["m_aligned"],
+            discrete_col_sfd=cfg["discrete_col_sfd"],
+            current_stream=stream,
+        )
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+
+    metadata_files = list(tmp_path.glob("*.json"))
+    assert len(metadata_files) == 1
+    metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+    assert metadata["identity"]["kernel_name"] == "GroupedGemmDswigluSm100"
+    assert metadata["symbol"].startswith("cudnnfe_GroupedGemmDswigluSm100_")
+    check_ref_grouped_gemm_dswiglu(inputs, exported, cfg, skip_ref=cfg["skip_ref"])
+    assert export_calls == 1
+
+    cached = grouped_gemm_dswiglu_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        b_tensor=inputs["b_tensor"],
+        c_tensor=inputs["c_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        beta_tensor=inputs["beta_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        current_stream=stream,
+    )
+    check_ref_grouped_gemm_dswiglu(inputs, cached, cfg, skip_ref=cfg["skip_ref"])
+    assert export_calls == 1
+
+    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "read")
+    loaded = grouped_gemm_dswiglu_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        b_tensor=inputs["b_tensor"],
+        c_tensor=inputs["c_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        beta_tensor=inputs["beta_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        current_stream=stream,
+    )
+    check_ref_grouped_gemm_dswiglu(inputs, loaded, cfg, skip_ref=cfg["skip_ref"])
 
 
 @pytest.mark.L0

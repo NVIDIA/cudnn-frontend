@@ -384,6 +384,8 @@ class APIBase(ABC):
         self._is_supported = False
         self._kernel = None
         self._compiled_kernel = None
+        self._raw_compiled_kernel = None
+        self._aot_loaded_artifact = None
         self._interpret_uint8_as_fp4x2 = False
         self._logger = logging.getLogger(self.__class__.__name__)
 
@@ -470,6 +472,111 @@ class APIBase(ABC):
             ...     self._compiled_kernel(input_tensor, output_tensor, current_stream)
         """
         pass
+
+    def _build_aot_symbol_and_paths(self, artifact_dir, cache_key):
+        from cudnn._cutedsl_aot import artifact_paths, build_aot_identity, build_symbol_name
+
+        self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
+        device = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device)
+        compute_capability = major * 10 + minor
+        identity = build_aot_identity(
+            kernel_name=self.__class__.__name__,
+            cache_key=cache_key,
+            compile_options="--enable-tvm-ffi",
+            compute_capability=f"sm{compute_capability}",
+        )
+        symbol = build_symbol_name(f"cudnnfe_{self.__class__.__name__}", identity)
+        paths = artifact_paths(artifact_dir, symbol)
+        return identity, symbol, paths
+
+    def _wrap_tensor_api(self, function):
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement _wrap_tensor_api()"
+        )
+
+    def export_aot(self, artifact_dir, cache_key, *, registry_name=None, force: bool = False):
+        self._logger.debug("Entering export_aot")
+        self._ensure_support_checked()
+        if self._compiled_kernel is None or self._raw_compiled_kernel is None:
+            self.compile()
+        self._runtime_error_if(
+            self._raw_compiled_kernel is None,
+            f"{self.__class__.__name__} raw compiled kernel is not available for AOT export",
+        )
+
+        from cudnn._cutedsl_aot import (
+            AOTExportedArtifact,
+            AOTMetadata,
+            build_registry_name,
+            export_compiled_module,
+        )
+
+        identity, symbol, paths = self._build_aot_symbol_and_paths(artifact_dir, cache_key)
+        resolved_registry_name = registry_name
+        if resolved_registry_name is None:
+            resolved_registry_name = build_registry_name(f"cudnnfe.{self.__class__.__name__}", identity)
+        metadata = AOTMetadata(
+            identity=identity,
+            symbol=symbol,
+            registry_name=resolved_registry_name,
+            object_file=paths.object_file.name,
+            shared_library=paths.shared_library.name,
+            metadata_file=paths.metadata_file.name,
+        )
+        export_compiled_module(
+            self._raw_compiled_kernel,
+            paths,
+            symbol,
+            metadata,
+            force=force,
+        )
+        self._logger.debug("AOT export completed successfully")
+        return AOTExportedArtifact(metadata=metadata, paths=paths)
+
+    def load_aot(self, artifact_dir, cache_key, *, registry_name=None, register: bool = False, override: bool = False):
+        self._logger.debug("Entering load_aot")
+        self._ensure_support_checked()
+
+        from cudnn._cutedsl_aot import load_aot_artifact, read_metadata
+
+        identity, symbol, paths = self._build_aot_symbol_and_paths(artifact_dir, cache_key)
+        missing = [
+            str(path)
+            for path in (paths.object_file, paths.shared_library, paths.metadata_file)
+            if not path.exists()
+        ]
+        self._runtime_error_if(
+            bool(missing),
+            "CuTe DSL AOT artifact set is incomplete; missing " + ", ".join(missing),
+        )
+        metadata = read_metadata(paths.metadata_file)
+        expected_metadata_files = (
+            paths.object_file.name,
+            paths.shared_library.name,
+            paths.metadata_file.name,
+        )
+        actual_metadata_files = (
+            metadata.object_file,
+            metadata.shared_library,
+            metadata.metadata_file,
+        )
+        self._runtime_error_if(
+            metadata.identity != identity
+            or metadata.symbol != symbol
+            or actual_metadata_files != expected_metadata_files,
+            f"CuTe DSL AOT metadata does not match {self.__class__.__name__} configuration",
+        )
+        loaded = load_aot_artifact(
+            paths.metadata_file,
+            registry_name=registry_name,
+            register=register,
+            override=override,
+        )
+        self._aot_loaded_artifact = loaded
+        self._compiled_kernel = self._wrap_tensor_api(loaded.function)
+        self._logger.debug("AOT load completed successfully")
+        return loaded
 
     def __call__(self, *args, **kwargs) -> Any:
         """Convenience method to execute the kernel.

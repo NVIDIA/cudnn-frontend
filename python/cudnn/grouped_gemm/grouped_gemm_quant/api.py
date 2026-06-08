@@ -547,6 +547,27 @@ class GroupedGemmQuantSm100(APIBase):
         self._logger.debug("check_support completed successfully")
         return True
 
+    def _ensure_workspace(self, kernel=None) -> None:
+        if getattr(self, "_workspace", None) is not None:
+            return
+        if kernel is None:
+            kernel = self._kernel(
+                sf_vec_size=self.sf_vec_size,
+                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                vectorized_f32=self.vector_f32,
+                generate_sfd=self.generate_sfd,
+                discrete_col_sfd=self.discrete_col_sfd,
+                enable_bias=self._has_bias,
+                expert_cnt=self.expert_cnt,
+                weight_mode=self.weight_mode,
+                use_dynamic_sched=self.use_dynamic_sched,
+            )
+        workspace_bytes = kernel.get_workspace_bytes()
+        self._workspace = torch.empty(max(workspace_bytes, 1), dtype=torch.uint8, device=self.a_desc.device)
+
     def compile(self) -> None:
         """Compile the kernel."""
         self._logger.debug("Entering compile")
@@ -584,8 +605,7 @@ class GroupedGemmQuantSm100(APIBase):
         )
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
-        workspace_bytes = gemm_quant.get_workspace_bytes()
-        self._workspace = torch.empty(max(workspace_bytes, 1), dtype=torch.uint8, device="cuda")
+        self._ensure_workspace(gemm_quant)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compile_dense(gemm_quant, max_active_clusters, fake_stream)
@@ -805,51 +825,8 @@ class GroupedGemmQuantSm100(APIBase):
             options="--enable-tvm-ffi",
         )
 
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
-
-        def tensor_api(
-            a_tensor: torch.Tensor,
-            b_tensor: torch.Tensor,
-            d_tensor: torch.Tensor,
-            d_col_tensor: Optional[torch.Tensor],
-            sfa_tensor: torch.Tensor,
-            sfb_tensor: torch.Tensor,
-            sfd_row_tensor: Optional[torch.Tensor],
-            sfd_col_tensor: Optional[torch.Tensor],
-            amax_tensor: Optional[torch.Tensor],
-            norm_const_tensor: Optional[torch.Tensor],
-            padded_offsets: torch.Tensor,
-            alpha_tensor: torch.Tensor,
-            row_scale_tensor: Optional[torch.Tensor],
-            prob_tensor: Optional[torch.Tensor],
-            bias_tensor: Optional[torch.Tensor],
-            stream: cuda.CUstream,
-        ) -> None:
-            norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-            _compiled_kernel(
-                a_tensor,
-                b_tensor,
-                sfb_tensor,
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int64(0),
-                cached_workspace_ptr,
-                d_tensor,
-                d_col_tensor,
-                sfa_tensor,
-                sfd_row_tensor,
-                sfd_col_tensor,
-                amax_tensor,
-                norm_const_tensor,
-                padded_offsets,
-                alpha_tensor,
-                row_scale_tensor,
-                bias_tensor,
-                prob_tensor,
-                stream,
-            )
-
-        self._compiled_kernel = tensor_api
+        self._raw_compiled_kernel = _compiled_kernel
+        self._compiled_kernel = self._wrap_tensor_api(_compiled_kernel)
 
     def _compile_discrete(self, gemm_quant, max_active_clusters, fake_stream) -> None:
         """Compile for discrete (per-expert pointer) weight mode."""
@@ -962,7 +939,63 @@ class GroupedGemmQuantSm100(APIBase):
             options="--enable-tvm-ffi",
         )
 
+        self._raw_compiled_kernel = _compiled_kernel
+        self._compiled_kernel = self._wrap_tensor_api(_compiled_kernel)
+
+    def _wrap_tensor_api(self, function):
+        self._ensure_workspace()
         cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
+
+        if self.weight_mode == MoEWeightMode.DENSE:
+            def tensor_api(
+                a_tensor: torch.Tensor,
+                b_tensor: torch.Tensor,
+                d_tensor: torch.Tensor,
+                d_col_tensor: Optional[torch.Tensor],
+                sfa_tensor: torch.Tensor,
+                sfb_tensor: torch.Tensor,
+                sfd_row_tensor: Optional[torch.Tensor],
+                sfd_col_tensor: Optional[torch.Tensor],
+                amax_tensor: Optional[torch.Tensor],
+                norm_const_tensor: Optional[torch.Tensor],
+                padded_offsets: torch.Tensor,
+                alpha_tensor: torch.Tensor,
+                row_scale_tensor: Optional[torch.Tensor],
+                prob_tensor: Optional[torch.Tensor],
+                bias_tensor: Optional[torch.Tensor],
+                stream: cuda.CUstream,
+            ) -> None:
+                norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
+                function(
+                    a_tensor,
+                    b_tensor,
+                    sfb_tensor,
+                    cutlass.Int32(0),
+                    cutlass.Int32(0),
+                    cutlass.Int64(0),
+                    cached_workspace_ptr,
+                    d_tensor,
+                    d_col_tensor,
+                    sfa_tensor,
+                    sfd_row_tensor,
+                    sfd_col_tensor,
+                    amax_tensor,
+                    norm_const_tensor,
+                    padded_offsets,
+                    alpha_tensor,
+                    row_scale_tensor,
+                    bias_tensor,
+                    prob_tensor,
+                    stream,
+                )
+
+            return tensor_api
+
+        if len(self.b_shape) == 2:
+            n, k = self.b_shape
+        else:
+            n, k, _ = self.b_shape
+        b_stride_size = k if self.b_major == "k" else n
         cached_n = cutlass.Int32(n)
         cached_k = cutlass.Int32(k)
         cached_b_stride = cutlass.Int64(b_stride_size)
@@ -986,12 +1019,10 @@ class GroupedGemmQuantSm100(APIBase):
             stream: cuda.CUstream,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-            b_ptrs_addr = int(b_ptrs_device.data_ptr())
-            sfb_ptrs_addr = int(sfb_ptrs_device.data_ptr())
-            _compiled_kernel(
+            function(
                 a_tensor,
-                b_ptrs_addr,
-                sfb_ptrs_addr,
+                int(b_ptrs_device.data_ptr()),
+                int(sfb_ptrs_device.data_ptr()),
                 cached_n,
                 cached_k,
                 cached_b_stride,
@@ -1011,7 +1042,7 @@ class GroupedGemmQuantSm100(APIBase):
                 stream,
             )
 
-        self._compiled_kernel = tensor_api
+        return tensor_api
 
     def execute(
         self,
@@ -1465,10 +1496,25 @@ def grouped_gemm_quant_wrapper_sm100(
             num_experts,
         )
 
-    if cache_key in _cache_of_GroupedGemmQuantSm100Objects:
+    aot_mode = os.getenv("CUDNN_FE_AOT_MODE", "").strip().lower()
+    aot_artifact_dir = os.getenv("CUDNN_FE_AOT_DIR")
+    if aot_mode and aot_mode not in {"read", "write", "readwrite"}:
+        raise ValueError(
+            "CUDNN_FE_AOT_MODE must be one of {'read', 'write', 'readwrite'}, "
+            f"got {aot_mode!r}"
+        )
+    if aot_mode and not aot_artifact_dir:
+        raise ValueError("CUDNN_FE_AOT_DIR is required when CUDNN_FE_AOT_MODE is set")
+    use_cache = not aot_mode or aot_mode == "write"
+    if use_cache and cache_key in _cache_of_GroupedGemmQuantSm100Objects:
         _logger.debug("grouped_gemm_quant_wrapper_sm100: Using previously cached GroupedGemmQuantSm100 object")
         grouped_gemm_quant = _cache_of_GroupedGemmQuantSm100Objects[cache_key]
+        if aot_mode == "write" and grouped_gemm_quant._raw_compiled_kernel is None:
+            grouped_gemm_quant = None
     else:
+        grouped_gemm_quant = None
+
+    if grouped_gemm_quant is None:
         _logger.debug("grouped_gemm_quant_wrapper_sm100: No previously cached object found, creating new GroupedGemmQuantSm100 object")
         if is_dense:
             grouped_gemm_quant = GroupedGemmQuantSm100(
@@ -1526,7 +1572,18 @@ def grouped_gemm_quant_wrapper_sm100(
             )
 
         assert grouped_gemm_quant.check_support(), "Unsupported configuration"
-        grouped_gemm_quant.compile()
+        if aot_mode == "read":
+            grouped_gemm_quant.load_aot(aot_artifact_dir, cache_key)
+        elif aot_mode == "readwrite":
+            _, _, aot_paths = grouped_gemm_quant._build_aot_symbol_and_paths(aot_artifact_dir, cache_key)
+            if aot_paths.metadata_file.exists() and aot_paths.object_file.exists() and aot_paths.shared_library.exists():
+                grouped_gemm_quant.load_aot(aot_artifact_dir, cache_key)
+            else:
+                grouped_gemm_quant.export_aot(aot_artifact_dir, cache_key)
+        elif aot_mode == "write":
+            grouped_gemm_quant.export_aot(aot_artifact_dir, cache_key)
+        else:
+            grouped_gemm_quant.compile()
         _cache_of_GroupedGemmQuantSm100Objects[cache_key] = grouped_gemm_quant
 
     if is_dense:

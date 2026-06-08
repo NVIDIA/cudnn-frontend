@@ -1,5 +1,7 @@
 """Tests for grouped GEMM wgrad FE API."""
 
+import json
+
 import pytest
 import torch
 import cudnn
@@ -169,6 +171,118 @@ def _test_grouped_gemm_wgrad_dense_wrapper(
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+def test_grouped_gemm_wgrad_dense_aot_export_load(tmp_path, monkeypatch):
+    pytest.importorskip("cutlass", reason="CuTe DSL is not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    from cudnn.grouped_gemm.grouped_gemm_wgrad import api as grouped_gemm_wgrad_api
+
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
+        pytest.skip(f"GroupedGemmWgrad dense AOT requires SM100+, found SM{major}{minor}")
+
+    grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
+    original_export_aot = grouped_gemm_wgrad_api.GroupedGemmWgradSm100.export_aot
+    export_calls = 0
+
+    def counting_export_aot(self, *args, **kwargs):
+        nonlocal export_calls
+        export_calls += 1
+        return original_export_aot(self, *args, **kwargs)
+
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "export_aot", counting_export_aot)
+    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "write")
+    monkeypatch.setenv("CUDNN_FE_AOT_DIR", str(tmp_path))
+
+    _test_grouped_gemm_wgrad_dense_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        wgrad_dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+    )
+
+    metadata_files = list(tmp_path.glob("*.json"))
+    assert len(metadata_files) == 1
+    metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+    assert metadata["identity"]["kernel_name"] == "GroupedGemmWgradSm100"
+    assert metadata["symbol"].startswith("cudnnfe_GroupedGemmWgradSm100_")
+    assert export_calls == 1
+
+    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "read")
+    _test_grouped_gemm_wgrad_dense_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        wgrad_dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+    )
+    assert export_calls == 1
+
+
+def test_grouped_gemm_wgrad_discrete_aot_export_load(tmp_path, monkeypatch):
+    pytest.importorskip("cutlass", reason="CuTe DSL is not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    from cudnn.grouped_gemm.grouped_gemm_wgrad import api as grouped_gemm_wgrad_api
+
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
+        pytest.skip(f"GroupedGemmWgrad discrete AOT requires SM100+, found SM{major}{minor}")
+
+    grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
+    original_export_aot = grouped_gemm_wgrad_api.GroupedGemmWgradSm100.export_aot
+    export_calls = 0
+
+    def counting_export_aot(self, *args, **kwargs):
+        nonlocal export_calls
+        export_calls += 1
+        return original_export_aot(self, *args, **kwargs)
+
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "export_aot", counting_export_aot)
+    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "write")
+    monkeypatch.setenv("CUDNN_FE_AOT_DIR", str(tmp_path))
+
+    _test_grouped_gemm_wgrad_discrete_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        wgrad_dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        skip_unsupported=False,
+    )
+
+    metadata_files = list(tmp_path.glob("*.json"))
+    assert len(metadata_files) == 1
+    metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+    assert metadata["identity"]["kernel_name"] == "GroupedGemmWgradSm100"
+    assert metadata["symbol"].startswith("cudnnfe_GroupedGemmWgradSm100_")
+    assert export_calls == 1
+
+    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "read")
+    _test_grouped_gemm_wgrad_discrete_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        wgrad_dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        skip_unsupported=False,
+    )
+    assert export_calls == 1
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
 @with_grouped_gemm_wgrad_params_fp4
 def test_grouped_gemm_wgrad_dense_wrapper_fp4(
     ab_dtype,
@@ -334,6 +448,7 @@ def _test_grouped_gemm_wgrad_discrete_wrapper(
     cluster_shape_mn,
     sf_vec_size,
     sf_dtype,
+    skip_unsupported=True,
 ):
     cfg = grouped_gemm_wgrad_init(
         ab_dtype=ab_dtype,
@@ -363,6 +478,8 @@ def _test_grouped_gemm_wgrad_discrete_wrapper(
                 sf_vec_size=cfg["sf_vec_size"],
             )
     except (ValueError, NotImplementedError) as e:
+        if not skip_unsupported:
+            raise
         pytest.skip(f"Unsupported testcase: {e}")
     torch.cuda.synchronize()
     check_ref_grouped_gemm_wgrad(result["wgrad_tensor"], inputs["ref_result"], cfg["tolerance"])
