@@ -239,9 +239,7 @@ class ScoreGradDense:
                 sReduceScratch: cute.struct.Align[cute.struct.MemRange[Float32, 4], 128]
 
             storage = smem.allocate(SharedStorage)
-            sReduceScratch = storage.sReduceScratch.get_tensor(
-                cute.make_layout((4,), stride=(1,))
-            )
+            sReduceScratch = storage.sReduceScratch.get_tensor(cute.make_layout((4,), stride=(1,)))
 
             # Per-batch row views of the score / denom tensors.
             #   BSHD: (S_q, S_k, B) -> (S_q, S_k) by slicing batch_idx; LSE/Denom (S_q, B) -> (S_q,).
@@ -282,16 +280,8 @@ class ScoreGradDense:
 
                     predict = cute.math.exp2((pr - lse_val) * LOG2E, fastmath=True)
                     target = tr / (denom_val + Float32(DENOM_EPS))
-                    target_eff = (
-                        target
-                        if target >= Float32(CLIP_PROB_MIN)
-                        else Float32(CLIP_PROB_MIN)
-                    )
-                    log_clip_mask = (
-                        Float32(1.0)
-                        if predict >= Float32(CLIP_PROB_MIN)
-                        else Float32(0.0)
-                    )
+                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
+                    log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
                     g = -target_eff * log_clip_mask * grad_scale
 
                     local_sum = local_sum + g
@@ -302,12 +292,7 @@ class ScoreGradDense:
             with cute.arch.elect_one():
                 sReduceScratch[warp_id] = warp_sum
             cute.arch.sync_threads()
-            sum_grad = (
-                sReduceScratch[0]
-                + sReduceScratch[1]
-                + sReduceScratch[2]
-                + sReduceScratch[3]
-            )
+            sum_grad = sReduceScratch[0] + sReduceScratch[1] + sReduceScratch[2] + sReduceScratch[3]
 
             # --- Phase 2: Write grad_signal in-place to PredictRaw ---
             # Padding columns (pos >= seqlen_k_b in THD, or pos >= col_limit) get 0.
@@ -319,16 +304,8 @@ class ScoreGradDense:
 
                     predict = cute.math.exp2((pr - lse_val) * LOG2E, fastmath=True)
                     target = tr / (denom_val + Float32(DENOM_EPS))
-                    target_eff = (
-                        target
-                        if target >= Float32(CLIP_PROB_MIN)
-                        else Float32(CLIP_PROB_MIN)
-                    )
-                    log_clip_mask = (
-                        Float32(1.0)
-                        if predict >= Float32(CLIP_PROB_MIN)
-                        else Float32(0.0)
-                    )
+                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
+                    log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
                     g = -target_eff * log_clip_mask * grad_scale
 
                     grad_signal = g - predict * sum_grad
@@ -404,9 +381,7 @@ class DenseIndexerBackward2QGemmSm100:
 
         # TMEM layout (2Q: S and dK CANNOT share)
         self.tmem_s_offset = 0  # S (single-buffered)
-        self.tmem_dk_offset = (
-            128  # dK (single-buffered, Phase A clear + Phase B accumulate)
-        )
+        self.tmem_dk_offset = 128  # dK (single-buffered, Phase A clear + Phase B accumulate)
         self.tmem_dq0_offset = 256  # dQ_q0 persistent accumulator
         self.tmem_dq1_offset = 384  # dQ_q1 persistent accumulator
         self.tmem_alloc_cols = 512
@@ -471,25 +446,15 @@ class DenseIndexerBackward2QGemmSm100:
         #   THD  W/GS  (*, *)    -> kept as is
         if const_expr(is_varlen):
             mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[1, 2, 0]))
-            mdQ = cute.make_tensor(
-                mdQ.iterator, cute.select(mdQ.layout, mode=[1, 2, 0])
-            )
+            mdQ = cute.make_tensor(mdQ.iterator, cute.select(mdQ.layout, mode=[1, 2, 0]))
             # K, W, dW, mdK_f32, GradSignal stay as is.
         else:
-            mQ = cute.make_tensor(
-                mQ.iterator, cute.select(mQ.layout, mode=[2, 3, 1, 0])
-            )
-            mdQ = cute.make_tensor(
-                mdQ.iterator, cute.select(mdQ.layout, mode=[2, 3, 1, 0])
-            )
+            mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[2, 3, 1, 0]))
+            mdQ = cute.make_tensor(mdQ.iterator, cute.select(mdQ.layout, mode=[2, 3, 1, 0]))
             mK = cute.make_tensor(mK.iterator, cute.select(mK.layout, mode=[1, 2, 0]))
-            mdK_f32 = cute.make_tensor(
-                mdK_f32.iterator, cute.select(mdK_f32.layout, mode=[1, 2, 0])
-            )
+            mdK_f32 = cute.make_tensor(mdK_f32.iterator, cute.select(mdK_f32.layout, mode=[1, 2, 0]))
             mW = cute.make_tensor(mW.iterator, cute.select(mW.layout, mode=[1, 2, 0]))
-            mdW = cute.make_tensor(
-                mdW.iterator, cute.select(mdW.layout, mode=[1, 2, 0])
-            )
+            mdW = cute.make_tensor(mdW.iterator, cute.select(mdW.layout, mode=[1, 2, 0]))
             mGradSignal = cute.make_tensor(
                 mGradSignal.iterator,
                 cute.select(mGradSignal.layout, mode=[1, 2, 0]),
@@ -527,12 +492,8 @@ class DenseIndexerBackward2QGemmSm100:
         # sQ: 2 separate single-stage regions (q0 and q1)
         sQ_q0_layout = _make_smem_layout_a(tmma1, self.gemm1_tiler, self.q_dtype, 1)
         sQ_q1_layout = _make_smem_layout_a(tmma1, self.gemm1_tiler, self.q_dtype, 1)
-        sK_layout = _make_smem_layout_b(
-            tmma1, self.gemm1_tiler, self.k_dtype, 2
-        )  # 2-stage
-        sdS_layout = _make_smem_layout_a(
-            tmma3, self.gemm3_tiler, self.q_dtype, 2
-        )  # 2-stage
+        sK_layout = _make_smem_layout_b(tmma1, self.gemm1_tiler, self.k_dtype, 2)  # 2-stage
+        sdS_layout = _make_smem_layout_a(tmma3, self.gemm3_tiler, self.q_dtype, 2)  # 2-stage
         sdS_store_layout = _make_smem_layout_epi(
             self.q_dtype,
             LayoutEnum.COL_MAJOR,
@@ -540,9 +501,7 @@ class DenseIndexerBackward2QGemmSm100:
             2,
         )
         sdS_g2a_layout = _make_smem_layout_a(tmma2, self.gemm2_tiler, self.q_dtype, 2)
-        sKt_layout = _make_smem_layout_b(
-            tmma3, self.gemm3_tiler, self.k_dtype, 2
-        )  # 2-stage
+        sKt_layout = _make_smem_layout_b(tmma3, self.gemm3_tiler, self.k_dtype, 2)  # 2-stage
         sQ_q0_g2b_layout = _make_smem_layout_b(tmma2, self.gemm2_tiler, self.q_dtype, 1)
         sQ_q1_g2b_layout = _make_smem_layout_b(tmma2, self.gemm2_tiler, self.q_dtype, 1)
 
@@ -766,9 +725,7 @@ class DenseIndexerBackward2QGemmSm100:
         # accumulators are initialized before their epilogues store to empty
         # output tensors.
         min_kv_blocks = Int32(1) if seqlen_k_b > Int32(0) else Int32(0)
-        num_kv_blocks = (
-            min_kv_blocks if num_kv_blocks < min_kv_blocks else num_kv_blocks
-        )
+        num_kv_blocks = min_kv_blocks if num_kv_blocks < min_kv_blocks else num_kv_blocks
 
         # TMA descriptor prefetch (load warp only)
         if warp_idx == self.load_warp_id:
@@ -788,43 +745,21 @@ class DenseIndexerBackward2QGemmSm100:
 
         @cute.struct
         class SharedStorage:
-            Q_q0_mbar: cute.struct.MemRange[
-                cutlass.Int64, 2
-            ]  # 1-stage TMA: producer+consumer
+            Q_q0_mbar: cute.struct.MemRange[cutlass.Int64, 2]  # 1-stage TMA: producer+consumer
             Q_q1_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             K_mbar: cute.struct.MemRange[cutlass.Int64, self.K_mbar_size]
             mbar: cute.struct.MemRange[cutlass.Int64, NUM_2Q_BARRIERS]
             tmem_holding_buf: Int32
-            sQ_q0: cute.struct.Align[
-                cute.struct.MemRange[self.q_dtype, sQ_q0_size], self.buffer_align_bytes
-            ]
-            sQ_q1: cute.struct.Align[
-                cute.struct.MemRange[self.q_dtype, sQ_q1_size], self.buffer_align_bytes
-            ]
-            sK: cute.struct.Align[
-                cute.struct.MemRange[self.k_dtype, sK_size], self.buffer_align_bytes
-            ]
-            sdS: cute.struct.Align[
-                cute.struct.MemRange[self.q_dtype, sdS_size], self.buffer_align_bytes
-            ]
-            sGradSignal_q0_0: cute.struct.Align[
-                cute.struct.MemRange[Float32, self.block_I], 128
-            ]
-            sGradSignal_q0_1: cute.struct.Align[
-                cute.struct.MemRange[Float32, self.block_I], 128
-            ]
-            sGradSignal_q1_0: cute.struct.Align[
-                cute.struct.MemRange[Float32, self.block_I], 128
-            ]
-            sGradSignal_q1_1: cute.struct.Align[
-                cute.struct.MemRange[Float32, self.block_I], 128
-            ]
-            sW: cute.struct.Align[
-                cute.struct.MemRange[self.q_dtype, self.heads * 2], 128
-            ]
-            sdK_reduce: cute.struct.Align[
-                cute.struct.MemRange[Float32, self.block_I * self.head_dim_padded], 128
-            ]
+            sQ_q0: cute.struct.Align[cute.struct.MemRange[self.q_dtype, sQ_q0_size], self.buffer_align_bytes]
+            sQ_q1: cute.struct.Align[cute.struct.MemRange[self.q_dtype, sQ_q1_size], self.buffer_align_bytes]
+            sK: cute.struct.Align[cute.struct.MemRange[self.k_dtype, sK_size], self.buffer_align_bytes]
+            sdS: cute.struct.Align[cute.struct.MemRange[self.q_dtype, sdS_size], self.buffer_align_bytes]
+            sGradSignal_q0_0: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I], 128]
+            sGradSignal_q0_1: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I], 128]
+            sGradSignal_q1_0: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I], 128]
+            sGradSignal_q1_1: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I], 128]
+            sW: cute.struct.Align[cute.struct.MemRange[self.q_dtype, self.heads * 2], 128]
+            sdK_reduce: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I * self.head_dim_padded], 128]
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -844,16 +779,10 @@ class DenseIndexerBackward2QGemmSm100:
         sQ_q1 = storage.sQ_q1.get_tensor(sQ_q1_layout.outer, swizzle=sQ_q1_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sdS = storage.sdS.get_tensor(sdS_layout.outer, swizzle=sdS_layout.inner)
-        sdS_store = storage.sdS.get_tensor(
-            sdS_store_layout.outer, swizzle=sdS_store_layout.inner
-        )
+        sdS_store = storage.sdS.get_tensor(sdS_store_layout.outer, swizzle=sdS_store_layout.inner)
         # Recast views for transposed / SwapAB operands
-        sdS_g2a = cute.make_tensor(
-            cute.recast_ptr(sdS.iterator, sdS_g2a_layout.inner), sdS_g2a_layout.outer
-        )
-        sKt = cute.make_tensor(
-            cute.recast_ptr(sK.iterator, sKt_layout.inner), sKt_layout.outer
-        )
+        sdS_g2a = cute.make_tensor(cute.recast_ptr(sdS.iterator, sdS_g2a_layout.inner), sdS_g2a_layout.outer)
+        sKt = cute.make_tensor(cute.recast_ptr(sK.iterator, sKt_layout.inner), sKt_layout.outer)
         sQ_q0_g2b = cute.make_tensor(
             cute.recast_ptr(sQ_q0.iterator, sQ_q0_g2b_layout.inner),
             sQ_q0_g2b_layout.outer,
@@ -864,28 +793,16 @@ class DenseIndexerBackward2QGemmSm100:
         )
 
         # GradSignal: 2-stage for each Q token (matches 2-stage K pipeline)
-        sGradSignal_q0_0 = storage.sGradSignal_q0_0.get_tensor(
-            cute.make_layout((self.block_I,), stride=(1,))
-        )
-        sGradSignal_q0_1 = storage.sGradSignal_q0_1.get_tensor(
-            cute.make_layout((self.block_I,), stride=(1,))
-        )
-        sGradSignal_q1_0 = storage.sGradSignal_q1_0.get_tensor(
-            cute.make_layout((self.block_I,), stride=(1,))
-        )
-        sGradSignal_q1_1 = storage.sGradSignal_q1_1.get_tensor(
-            cute.make_layout((self.block_I,), stride=(1,))
-        )
+        sGradSignal_q0_0 = storage.sGradSignal_q0_0.get_tensor(cute.make_layout((self.block_I,), stride=(1,)))
+        sGradSignal_q0_1 = storage.sGradSignal_q0_1.get_tensor(cute.make_layout((self.block_I,), stride=(1,)))
+        sGradSignal_q1_0 = storage.sGradSignal_q1_0.get_tensor(cute.make_layout((self.block_I,), stride=(1,)))
+        sGradSignal_q1_1 = storage.sGradSignal_q1_1.get_tensor(cute.make_layout((self.block_I,), stride=(1,)))
         # sW: holds W for both Q tokens (first heads = q0, second heads = q1)
-        sW_full = storage.sW.get_tensor(
-            cute.make_layout((self.heads * 2,), stride=(1,))
-        )
+        sW_full = storage.sW.get_tensor(cute.make_layout((self.heads * 2,), stride=(1,)))
 
         # sdK_reduce: row-major (block_I, head_dim) fp32 for bulk reduce
         sdK_reduce = storage.sdK_reduce.get_tensor(
-            cute.make_layout(
-                (self.block_I, self.head_dim_padded), stride=(self.head_dim_padded, 1)
-            ),
+            cute.make_layout((self.block_I, self.head_dim_padded), stride=(self.head_dim_padded, 1)),
         )
 
         # dQ epilogue SMEM — reuses sK physical memory
@@ -1195,9 +1112,7 @@ class DenseIndexerBackward2QGemmSm100:
         with T-offset already applied for THD. q_local is the batch-local
         Q token index.
         """
-        GS_PER_THREAD = const_expr(
-            (self.block_I + self.WARP_SIZE - 1) // self.WARP_SIZE
-        )
+        GS_PER_THREAD = const_expr((self.block_I + self.WARP_SIZE - 1) // self.WARP_SIZE)
         for si in cutlass.range_constexpr(GS_PER_THREAD):
             pos = si * self.WARP_SIZE + lane_id
             if pos < self.block_I:
@@ -1484,9 +1399,7 @@ class DenseIndexerBackward2QGemmSm100:
 
                 # GEMM2: dK += dS_q1^T @ Q_q1 (ACCUMULATE=True!)
                 tmma2.set(tcgen05.Field.ACCUMULATE, True)
-                for k_block in cutlass.range(
-                    0, cute.size(tDKrA_g2, mode=[2]), unroll=4
-                ):
+                for k_block in cutlass.range(0, cute.size(tDKrA_g2, mode=[2]), unroll=4):
                     cute.gemm(
                         tmma2,
                         tDkDk,
@@ -1656,25 +1569,13 @@ class DenseIndexerBackward2QGemmSm100:
         # Wait for W loaded
         cute.arch.mbarrier_wait(mbar + MBAR_2Q_W_LOADED, Int32(0))
 
-        w_q0_h0 = (
-            Float32(sW_full[my_first_h]) if my_first_h < self.heads else Float32(0.0)
-        )
-        w_q0_h1 = (
-            Float32(sW_full[my_second_h]) if my_second_h < self.heads else Float32(0.0)
-        )
+        w_q0_h0 = Float32(sW_full[my_first_h]) if my_first_h < self.heads else Float32(0.0)
+        w_q0_h1 = Float32(sW_full[my_second_h]) if my_second_h < self.heads else Float32(0.0)
         w_q1_h0 = Float32(0.0)
         w_q1_h1 = Float32(0.0)
         if has_q1:
-            w_q1_h0 = (
-                Float32(sW_full[self.heads + my_first_h])
-                if my_first_h < self.heads
-                else Float32(0.0)
-            )
-            w_q1_h1 = (
-                Float32(sW_full[self.heads + my_second_h])
-                if my_second_h < self.heads
-                else Float32(0.0)
-            )
+            w_q1_h0 = Float32(sW_full[self.heads + my_first_h]) if my_first_h < self.heads else Float32(0.0)
+            w_q1_h1 = Float32(sW_full[self.heads + my_second_h]) if my_second_h < self.heads else Float32(0.0)
 
         s_full_phase = Int32(0)
         gs_0_phase = Int32(0)
@@ -1974,9 +1875,7 @@ class DenseIndexerBackward2QGemmSm100:
             cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
-    def get_tmem_tensor_2q(
-        self, s_acc_layout, dq_acc_layout, dk_acc_layout, tmem_ptr_base: cute.Pointer
-    ):
+    def get_tmem_tensor_2q(self, s_acc_layout, dq_acc_layout, dk_acc_layout, tmem_ptr_base: cute.Pointer):
         tStS = cute.make_tensor(tmem_ptr_base + self.tmem_s_offset, s_acc_layout)
         tDkDk = cute.make_tensor(tmem_ptr_base + self.tmem_dk_offset, dk_acc_layout)
         tDqDq_0 = cute.make_tensor(tmem_ptr_base + self.tmem_dq0_offset, dq_acc_layout)
@@ -2043,9 +1942,7 @@ def dense_indexer_backward_sm100(
     )
 
 
-def _build_cute_dsl_kernel(
-    batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_scale, block_I, ratio, is_varlen
-):
+def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_scale, block_I, ratio, is_varlen):
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     if torch.cuda.get_device_capability()[0] < 10:
@@ -2057,9 +1954,7 @@ def _build_cute_dsl_kernel(
 
     # Kernel 2: 2Q GEMM kernel (reads pre-computed grad_signal, 2 Q tokens per CTA).
     # is_varlen branches at compile time on whether CuSeqlens* are None.
-    gemm_obj = DenseIndexerBackward2QGemmSm100(
-        head_dim=dim, heads=heads, block_I=block_I, ratio=ratio
-    )
+    gemm_obj = DenseIndexerBackward2QGemmSm100(head_dim=dim, heads=heads, block_I=block_I, ratio=ratio)
 
     # Only params that change generated code. max_seqlen_q/k are now runtime
     # Int32 args to ScoreGradDense (drive the launch grid + causal-mask bound)
@@ -2163,13 +2058,9 @@ def _build_cute_dsl_kernel(
         # Match the compile-time is_varlen to avoid dispatching into a kernel
         # compiled for the other mode.
         if is_varlen:
-            assert (
-                CuSeqlensQ is not None and CuSeqlensK is not None
-            ), "THD-compiled kernel requires cu_seqlens_q/k at runtime"
+            assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled kernel requires cu_seqlens_q/k at runtime"
         else:
-            assert (
-                CuSeqlensQ is None and CuSeqlensK is None
-            ), "BSHD-compiled kernel must not receive cu_seqlens_q/k"
+            assert CuSeqlensQ is None and CuSeqlensK is None, "BSHD-compiled kernel must not receive cu_seqlens_q/k"
         s = _resolve_stream(current_stream)
         _ensure_compiled_gemm(
             IndexQ,
@@ -2227,13 +2118,9 @@ def _build_cute_dsl_kernel(
         kernel 1 so changing it does not require recompilation.
         """
         if is_varlen:
-            assert (
-                CuSeqlensQ is not None and CuSeqlensK is not None
-            ), "THD-compiled kernel requires cu_seqlens_q/k at runtime"
+            assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled kernel requires cu_seqlens_q/k at runtime"
         else:
-            assert (
-                CuSeqlensQ is None and CuSeqlensK is None
-            ), "BSHD-compiled kernel must not receive cu_seqlens_q/k"
+            assert CuSeqlensQ is None and CuSeqlensK is None, "BSHD-compiled kernel must not receive cu_seqlens_q/k"
         s = _resolve_stream(current_stream)
 
         # Kernel 1 (CuTe DSL): in-place overwrites IdxScoreRaw with grad_signal.
