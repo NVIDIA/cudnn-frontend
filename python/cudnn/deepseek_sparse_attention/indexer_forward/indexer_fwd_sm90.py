@@ -39,12 +39,8 @@ def _mma_partition_fragment_AB(
     swap_AB: bool,
 ):
     if const_expr(not swap_AB):
-        return thr_mma.make_fragment_A(
-            thr_mma.partition_A(sA)
-        ), thr_mma.make_fragment_B(thr_mma.partition_B(sB))
-    return thr_mma.make_fragment_B(thr_mma.partition_B(sA)), thr_mma.make_fragment_A(
-        thr_mma.partition_A(sB)
-    )
+        return thr_mma.make_fragment_A(thr_mma.partition_A(sA)), thr_mma.make_fragment_B(thr_mma.partition_B(sB))
+    return thr_mma.make_fragment_B(thr_mma.partition_B(sA)), thr_mma.make_fragment_A(thr_mma.partition_A(sB))
 
 
 class IndexerForwardSm90:
@@ -59,9 +55,7 @@ class IndexerForwardSm90:
         is_varlen: bool = False,
         use_tma_store: bool = False,
     ):
-        assert (
-            head_dim == 128
-        ), f"SM90 direct forward supports head_dim=128, got {head_dim}"
+        assert head_dim == 128, f"SM90 direct forward supports head_dim=128, got {head_dim}"
         assert qhead_per_kvhead in (
             32,
             64,
@@ -103,9 +97,7 @@ class IndexerForwardSm90:
             (self.q_per_stage, self.tile_hdim),
             stage=self.q_stages,
         )
-        self.sKV_layout_single = sm90_mma.make_smem_layout(
-            self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_hdim), stage=None
-        )
+        self.sKV_layout_single = sm90_mma.make_smem_layout(self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_hdim), stage=None)
         self.sKV_layout_staged = sm90_mma.make_smem_layout(
             self.dtype,
             LayoutEnum.ROW_MAJOR,
@@ -125,18 +117,10 @@ class IndexerForwardSm90:
         )
 
     def _get_shared_storage_cls(self):
-        sQ_struct = cute.struct.Align[
-            cute.struct.MemRange[self.dtype, cute.cosize(self.sQ_layout_staged)], 1024
-        ]
-        sKV_struct = cute.struct.Align[
-            cute.struct.MemRange[self.dtype, cute.cosize(self.sKV_layout_staged)], 1024
-        ]
-        sW_struct = cute.struct.Align[
-            cute.struct.MemRange[self.dtype, self.tile_m], 128
-        ]
-        sScore_struct = cute.struct.Align[
-            cute.struct.MemRange[Float32, self.q_tokens_per_tile * self.tile_n], 1024
-        ]
+        sQ_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sQ_layout_staged)], 1024]
+        sKV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sKV_layout_staged)], 1024]
+        sW_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, self.tile_m], 128]
+        sScore_struct = cute.struct.Align[cute.struct.MemRange[Float32, self.q_tokens_per_tile * self.tile_n], 1024]
 
         @cute.struct
         class SharedStorage:
@@ -156,9 +140,7 @@ class IndexerForwardSm90:
         return SharedStorage
 
     @cute.jit
-    def _compute_n_blocks(
-        self, m_block: Int32, seqlen_q: Int32, seqlen_k: Int32
-    ) -> Int32:
+    def _compute_n_blocks(self, m_block: Int32, seqlen_q: Int32, seqlen_k: Int32) -> Int32:
         q_global_start = seqlen_k * Int32(self.ratio) - seqlen_q
         last_q_token = (m_block + Int32(1)) * Int32(self.q_tokens_per_tile) - Int32(1)
         kv_limit = (q_global_start + last_q_token + Int32(1)) // Int32(self.ratio)
@@ -169,11 +151,7 @@ class IndexerForwardSm90:
     @cute.jit
     def _iter_n_block(self, iter_idx: Int32, n_block_max: Int32) -> Int32:
         local_count = n_block_max if n_block_max < Int32(3) else Int32(3)
-        return (
-            n_block_max - Int32(1) - iter_idx
-            if iter_idx < local_count
-            else iter_idx - local_count
-        )
+        return n_block_max - Int32(1) - iter_idx if iter_idx < local_count else iter_idx - local_count
 
     @cute.jit
     def _issue_tma(
@@ -187,9 +165,7 @@ class IndexerForwardSm90:
         tile_rows: cutlass.Constexpr[int],
     ):
         g_tile = cute.local_tile(gmem_cur, (tile_rows, self.tile_hdim), (block_idx, 0))
-        load_fn, _, _ = copy_utils.tma_get_copy_fn(
-            tma_atom, 0, cute.make_layout(1), g_tile, smem_tile, single_stage=True
-        )
+        load_fn, _, _ = copy_utils.tma_get_copy_fn(tma_atom, 0, cute.make_layout(1), g_tile, smem_tile, single_stage=True)
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, copy_bytes)
         load_fn(tma_bar_ptr=mbar_ptr)
@@ -255,9 +231,7 @@ class IndexerForwardSm90:
 
         for mi in cutlass.range(kNRows, unroll_full=True):
             for qi in cutlass.range_constexpr(self.q_tokens_per_stage):
-                ps[mi, qi] = (
-                    sm90_ops.warp_reduce(ps[mi, qi], operator.add, width=4) * sm_scale
-                )
+                ps[mi, qi] = sm90_ops.warp_reduce(ps[mi, qi], operator.add, width=4) * sm_scale
 
         if t0 == 0:
             for qi in cutlass.range_constexpr(self.q_tokens_per_stage):
@@ -267,9 +241,7 @@ class IndexerForwardSm90:
                     score = ps[mi, qi]
                     if is_first_nblock:
                         kv_token = n_block * self.tile_n + kv_m
-                        col_lim = (
-                            q_global_start + q_token_base + qi + Int32(1)
-                        ) // Int32(self.ratio)
+                        col_lim = (q_global_start + q_token_base + qi + Int32(1)) // Int32(self.ratio)
                         if kv_token >= seqlen_k or kv_token >= col_lim:
                             score = -Float32.inf
                     sScore[q_offset, kv_m] = score
@@ -316,14 +288,10 @@ class IndexerForwardSm90:
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
-        num_m_blocks = cute.ceil_div(
-            seqlen.seqlen_q * self.qhead_per_kvhead, self.tile_m
-        )
+        num_m_blocks = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.tile_m)
         if block_x < num_m_blocks:
             m_block = num_m_blocks - Int32(1) - block_x
-            n_block_max = self._compute_n_blocks(
-                m_block, seqlen.seqlen_q, seqlen.seqlen_k
-            )
+            n_block_max = self._compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k)
 
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
             mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx]
@@ -432,22 +400,14 @@ class IndexerForwardSm90:
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
-        num_m_blocks = cute.ceil_div(
-            seqlen.seqlen_q * self.qhead_per_kvhead, self.tile_m
-        )
+        num_m_blocks = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.tile_m)
         if block_x < num_m_blocks:
             m_block = num_m_blocks - Int32(1) - block_x
-            n_block_max = self._compute_n_blocks(
-                m_block, seqlen.seqlen_q, seqlen.seqlen_k
-            )
+            n_block_max = self._compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k)
 
             thr_mma = tiled_mma_QK.get_slice(wg_tidx)
-            tSrQ0, tSrK = _mma_partition_fragment_AB(
-                thr_mma, sQ_0, sKV_staged, self.swap_AB
-            )
-            tSrQ1, _ = _mma_partition_fragment_AB(
-                thr_mma, sQ_1, sKV_staged, self.swap_AB
-            )
+            tSrQ0, tSrK = _mma_partition_fragment_AB(thr_mma, sQ_0, sKV_staged, self.swap_AB)
+            tSrQ1, _ = _mma_partition_fragment_AB(thr_mma, sQ_1, sKV_staged, self.swap_AB)
             acc_shape = tiled_mma_QK.partition_shape_C((self.tile_n, self.q_per_stage))
 
             sW0_mma = cute.make_tensor(
@@ -462,12 +422,8 @@ class IndexerForwardSm90:
                 sW0_mma = sm90_ops.transpose_view(sW0_mma)
                 sW1_mma = sm90_ops.transpose_view(sW1_mma)
             weights_slice = (None, 0) if const_expr(not self.swap_AB) else (0, None)
-            tWeights0 = sm90_ops.make_acc_tensor_mn_view(thr_mma.partition_C(sW0_mma))[
-                weights_slice
-            ]
-            tWeights1 = sm90_ops.make_acc_tensor_mn_view(thr_mma.partition_C(sW1_mma))[
-                weights_slice
-            ]
+            tWeights0 = sm90_ops.make_acc_tensor_mn_view(thr_mma.partition_C(sW0_mma))[weights_slice]
+            tWeights1 = sm90_ops.make_acc_tensor_mn_view(thr_mma.partition_C(sW1_mma))[weights_slice]
 
             q0_phase = Int32(0)
             q1_phase = Int32(0)
@@ -517,15 +473,11 @@ class IndexerForwardSm90:
                 if stage == Int32(0):
                     if warp_idx_in_wg == 0:
                         with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive(
-                                mbar_KVEmpty0_ptr, arrive_count=128
-                            )
+                            cute.arch.mbarrier_arrive(mbar_KVEmpty0_ptr, arrive_count=128)
                 else:
                     if warp_idx_in_wg == 0:
                         with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive(
-                                mbar_KVEmpty1_ptr, arrive_count=128
-                            )
+                            cute.arch.mbarrier_arrive(mbar_KVEmpty1_ptr, arrive_count=128)
 
                 if iter_idx > Int32(0):
                     cute.arch.mbarrier_wait(mbar_ScoreEmpty_ptr, score_empty_phase)
@@ -590,14 +542,10 @@ class IndexerForwardSm90:
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
-        num_m_blocks = cute.ceil_div(
-            seqlen.seqlen_q * self.qhead_per_kvhead, self.tile_m
-        )
+        num_m_blocks = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.tile_m)
         if block_x < num_m_blocks:
             m_block = num_m_blocks - Int32(1) - block_x
-            n_block_max = self._compute_n_blocks(
-                m_block, seqlen.seqlen_q, seqlen.seqlen_k
-            )
+            n_block_max = self._compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k)
 
             score_full_phase = Int32(0)
             iter_idx = Int32(0)
@@ -607,9 +555,7 @@ class IndexerForwardSm90:
                 score_full_phase = score_full_phase ^ Int32(1)
 
                 if const_expr(mCuSeqlensQ is not None):
-                    for idx in cutlass.range(
-                        lane, self.q_tokens_per_tile * self.tile_n, 32, unroll=1
-                    ):
+                    for idx in cutlass.range(lane, self.q_tokens_per_tile * self.tile_n, 32, unroll=1):
                         qi = idx // self.tile_n
                         kj = idx - qi * self.tile_n
                         q_local = m_block * self.q_tokens_per_tile + qi
@@ -618,9 +564,7 @@ class IndexerForwardSm90:
                             mOut[seqlen.offset_q + q_local, k_local] = sScore[qi, kj]
                 else:
                     if const_expr(self.use_tma_store):
-                        q_tile_end = (m_block + Int32(1)) * Int32(
-                            self.q_tokens_per_tile
-                        )
+                        q_tile_end = (m_block + Int32(1)) * Int32(self.q_tokens_per_tile)
                         k_tile_end = (n_block + Int32(1)) * Int32(self.tile_n)
                         if q_tile_end <= seqlen.seqlen_q and k_tile_end <= max_seqlen_k:
                             score_tile = (self.q_tokens_per_tile, self.tile_n)
@@ -642,9 +586,7 @@ class IndexerForwardSm90:
                                 cute.arch.cp_async_bulk_commit_group()
                                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                         else:
-                            for idx in cutlass.range(
-                                lane, self.q_tokens_per_tile * self.tile_n, 32, unroll=1
-                            ):
+                            for idx in cutlass.range(lane, self.q_tokens_per_tile * self.tile_n, 32, unroll=1):
                                 qi = idx // self.tile_n
                                 kj = idx - qi * self.tile_n
                                 q_local = m_block * self.q_tokens_per_tile + qi
@@ -652,9 +594,7 @@ class IndexerForwardSm90:
                                 if q_local < seqlen.seqlen_q and k_local < max_seqlen_k:
                                     mOut[batch_idx, q_local, k_local] = sScore[qi, kj]
                     else:
-                        for idx in cutlass.range(
-                            lane, self.q_tokens_per_tile * self.tile_n, 32, unroll=1
-                        ):
+                        for idx in cutlass.range(lane, self.q_tokens_per_tile * self.tile_n, 32, unroll=1):
                             qi = idx // self.tile_n
                             kj = idx - qi * self.tile_n
                             q_local = m_block * self.q_tokens_per_tile + qi
@@ -698,9 +638,7 @@ class IndexerForwardSm90:
                 else:
                     new_strides.append(cute.assume(s, divby=divby))
             new_strides.append(t.stride[-1])
-            return cute.make_tensor(
-                t.iterator, cute.make_layout(t.shape, stride=tuple(new_strides))
-            )
+            return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=tuple(new_strides)))
 
         mQ = _assume_strides(mQ)
         mK = _assume_strides(mK)
@@ -747,12 +685,8 @@ class IndexerForwardSm90:
         tiled_mma_QK = self._get_tiled_mma()
         SharedStorage = self._get_shared_storage_cls()
 
-        self.tma_copy_bytes_Q = cute.size_in_bytes(
-            self.dtype, cute.select(self.sQ_layout_single, mode=[0, 1])
-        )
-        self.tma_copy_bytes_K = cute.size_in_bytes(
-            self.dtype, cute.select(self.sKV_layout_single, mode=[0, 1])
-        )
+        self.tma_copy_bytes_Q = cute.size_in_bytes(self.dtype, cute.select(self.sQ_layout_single, mode=[0, 1]))
+        self.tma_copy_bytes_K = cute.size_in_bytes(self.dtype, cute.select(self.sKV_layout_single, mode=[0, 1]))
 
         tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
@@ -767,13 +701,9 @@ class IndexerForwardSm90:
             (self.tile_n, self.tile_hdim),
         )
         if const_expr(self.use_tma_store):
-            sScore_layout = cute.make_layout(
-                (self.q_tokens_per_tile, self.tile_n), stride=(self.tile_n, 1)
-            )
+            sScore_layout = cute.make_layout((self.q_tokens_per_tile, self.tile_n), stride=(self.tile_n, 1))
             score_tile = (self.q_tokens_per_tile, self.tile_n)
-            score_cta_v_layout = cute.composition(
-                cute.make_identity_layout(mOut_tma_view.shape), score_tile
-            )
+            score_cta_v_layout = cute.composition(cute.make_identity_layout(mOut_tma_view.shape), score_tile)
             tma_atom_Score, mOut_tma = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileS2GOp(),
                 mOut_tma_view,
@@ -784,11 +714,7 @@ class IndexerForwardSm90:
             tma_atom_Score = tma_atom_Q
             mOut_tma = mOut
 
-        batch_size = (
-            cute.size(mCuSeqlensQ.shape[0]) - 1
-            if const_expr(is_varlen)
-            else cute.size(mQ.shape[3])
-        )
+        batch_size = cute.size(mCuSeqlensQ.shape[0]) - 1 if const_expr(is_varlen) else cute.size(mQ.shape[3])
         grid_x = cute.ceil_div(max_seqlen_q * self.qhead_per_kvhead, self.tile_m)
         grid = (grid_x, num_head_kv, batch_size)
 
@@ -841,9 +767,7 @@ class IndexerForwardSm90:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        warp_group_idx = cute.arch.make_warp_uniform(
-            tidx // self.num_threads_per_warp_group
-        )
+        warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
 
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_Q)
@@ -874,22 +798,14 @@ class IndexerForwardSm90:
             cute.arch.mbarrier_init(mbar_ScoreEmpty_ptr, 32)
         cute.arch.sync_threads()
 
-        sQ_staged = storage.sQ.get_tensor(
-            sQ_layout_staged.outer, swizzle=sQ_layout_staged.inner
-        )
-        sKV_staged = storage.sKV.get_tensor(
-            sKV_layout_staged.outer, swizzle=sKV_layout_staged.inner
-        )
+        sQ_staged = storage.sQ.get_tensor(sQ_layout_staged.outer, swizzle=sQ_layout_staged.inner)
+        sKV_staged = storage.sKV.get_tensor(sKV_layout_staged.outer, swizzle=sKV_layout_staged.inner)
         sQ_0 = sQ_staged[None, None, 0]
         sQ_1 = sQ_staged[None, None, 1]
         sKV_0 = sKV_staged[None, None, 0]
         sKV_1 = sKV_staged[None, None, 1]
         sW = storage.sW.get_tensor(cute.make_layout((self.tile_m,), stride=(1,)))
-        sScore = storage.sScore.get_tensor(
-            cute.make_layout(
-                (self.q_tokens_per_tile, self.tile_n), stride=(self.tile_n, 1)
-            )
-        )
+        sScore = storage.sScore.get_tensor(cute.make_layout((self.q_tokens_per_tile, self.tile_n), stride=(self.tile_n, 1)))
 
         if warp_group_idx == 0:
             if warp_idx == 0:

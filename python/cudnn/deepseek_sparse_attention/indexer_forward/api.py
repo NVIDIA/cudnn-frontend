@@ -250,8 +250,7 @@ def indexer_forward_wrapper(
         if unsupported:
             raise ValueError(
                 "SM90 indexer_forward_wrapper only supports default tuning parameters "
-                "(m_block_size=128, n_block_size=128, q_stage=2, kv_stage=4); got "
-                + ", ".join(unsupported)
+                "(m_block_size=128, n_block_size=128, q_stage=2, kv_stage=4); got " + ", ".join(unsupported)
             )
         # Both arches route through their own indexer_fwd wrapper (which owns
         # output allocation + TMA padding); Hopper uses the SM90 variant.
