@@ -16,6 +16,7 @@ This directory contains benchmarking tools for Scaled Dot Product Attention (SDP
   - `ltx2.py` - LTX-2 video DiT self-attention benchmarks (bidirectional, no mask)
   - `gpt_oss.py` - GPT-OSS sliding-window-attention GQA benchmarks (causal, SWA=128)
   - `qwen35.py` - Qwen 3.5 GQA benchmarks (head_dim=256, causal, bf16 bidirectional — Blackwell fp8/fa4 limits)
+  - `auto_regressive_dit.py` - Autoregressive video DiT (short Q, long cached KV, bf16/mxfp8, no_mask)
 - `runner.py` - Configuration-based benchmark runner
 - `config_types.py` - Data types for benchmark configuration
 - `charts.py` - Chart generation utilities
@@ -54,6 +55,9 @@ python -m benchmark.sdpa_benchmark_training.runner --config ltx2
 
 # Run Qwen 3.5 benchmark suite (cuDNN bf16 at head_dim=256)
 python -m benchmark.sdpa_benchmark_training.runner --config qwen35
+
+# Run Autoregressive video DiT benchmark suite (short Q, long cached KV)
+python -m benchmark.sdpa_benchmark_training.runner --config auto_regressive_dit
 
 # Dry run (show what would be executed)
 python -m benchmark.sdpa_benchmark_training.runner --config llama --dry-run
@@ -336,5 +340,15 @@ Runs were captured on GB200 and GB300 with cuDNN 9.23.0 and FAv4 4.0.0b15.
 ### GB300 - Qwen 3.5 (head_dim=256)
 ![Qwen 3.5 Causal on GB300](results/qwen35/gb300/qwen35_top_left.png)
 - `batch=2; num_q_heads=32; num_kv_heads=2; head_dim=256` — cuDNN BF16 at head_dim=256 on Blackwell
+
+### GB300 - Autoregressive video DiT (short Q, long cached KV)
+![Autoregressive DiT on GB300](results/auto_regressive_dit/gb300/auto_regressive_dit_no_mask.png)
+- `batch=1; num_q_heads=9; num_kv_heads=9; head_dim=128; s_q ∈ {985..8192}; s_kv=62208`
+- Forward-only (autoregressive inference). cuDNN 9.30.0 with prefill split-K on bf16/fp8/mxfp8; FAv4 BF16 swept over `num_splits ∈ {1, 2, 4, 8, 16, 32}` with the best annotated on each bar (`ks=`). FAv4 FP8/MXFP8 are absent — the CuTe-DSL FAv4 build rejects those input types.
+- Reproduce with `python -m benchmark.sdpa_benchmark_training.bench_ar_dit_peak --out <path>`.
+
+### GB200 - Autoregressive video DiT
+![Autoregressive DiT on GB200](results/auto_regressive_dit/gb200/auto_regressive_dit_no_mask.png)
+- Same configuration as the GB300 chart above, captured on GB200.
 
 GB200 results are available under the same layout at `results/<config>/gb200/`.
