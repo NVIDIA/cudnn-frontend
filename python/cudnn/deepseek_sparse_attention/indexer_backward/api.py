@@ -147,6 +147,7 @@ class IndexerBackward(APIBase):
         sample_topk_indices: torch.Tensor,  # (B, S_q, topk) INT32
         sm_scale: float = 1.0,
         block_I: int = 128,
+        topk_indices_global: bool = False,
     ):
         super().__init__()
         self.iq_desc = self._make_tensor_desc(sample_index_q, name="sample_index_q")
@@ -170,6 +171,7 @@ class IndexerBackward(APIBase):
         self.topk = topk
         self.sm_scale = float(sm_scale)
         self.block_I = int(block_I)
+        self.topk_indices_global = bool(topk_indices_global)
 
     def check_support(self) -> bool:
         major, _ = torch.cuda.get_device_capability()
@@ -206,6 +208,7 @@ class IndexerBackward(APIBase):
             self.topk,
             sm_scale=self.sm_scale,
             block_I=self.block_I,
+            topk_indices_global=self.topk_indices_global,
         )
 
     def execute(
@@ -423,6 +426,7 @@ def indexer_backward_wrapper(
     loss_coeff: float = 1.0,
     grad_loss: Union[float, torch.Tensor] = 1.0,
     block_I: int = 128,
+    topk_indices_global: bool = False,
     d_index_q: Optional[torch.Tensor] = None,
     d_weights: Optional[torch.Tensor] = None,
     d_index_k: Optional[torch.Tensor] = None,
@@ -435,6 +439,10 @@ def indexer_backward_wrapper(
     ``sum_grad`` during the score-grad precompute stage.
 
     Args:
+        topk_indices_global: whether ``topk_indices`` already contains global
+            flat KV ids. The cudnn top-k wrapper returns local per-batch ids by
+            default, so this wrapper defaults to ``False`` and lets the kernel
+            add the batch offset internally.
         sm_scale: indexer softmax scale baked into the forward via the
             weights-scaling trick.
         loss_coeff: coefficient scaling the KL-divergence loss in the
@@ -471,6 +479,7 @@ def indexer_backward_wrapper(
         topk,
         float(sm_scale),
         int(block_I),
+        bool(topk_indices_global),
     )
     obj = _cache_of_IndexerBackwardObjects.get(key)
     if obj is None:
@@ -486,6 +495,7 @@ def indexer_backward_wrapper(
             sample_topk_indices=topk_indices,
             sm_scale=sm_scale,
             block_I=block_I,
+            topk_indices_global=topk_indices_global,
         )
         assert obj.check_support()
         obj.compile()

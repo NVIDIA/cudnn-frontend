@@ -7,6 +7,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass import Float32, Int32, const_expr
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
@@ -16,79 +17,230 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
 from .indexer_backward_sm90 import (
+    CLIP_LOG_MIN,
     CLIP_PROB_MIN,
     EPS,
     IndexerBackwardSm90,
 )
 
 _dense_compile_cache: dict = {}
+_dense_score_grad_compile_cache: dict = {}
 
 
-def _bottom_right_valid_mask(seqlen_q: int, seqlen_k: int, ratio: int, device) -> torch.Tensor:
-    q_start = seqlen_k * ratio - seqlen_q
-    q_idx = torch.arange(seqlen_q, device=device)
-    kv_idx = torch.arange(seqlen_k, device=device)
-    col_limit = ((q_start + q_idx + 1) // ratio).clamp(max=seqlen_k)
-    return kv_idx.unsqueeze(0) < col_limit.unsqueeze(1)
-
-
-def _score_grad_dense_slice_inplace(attn_slice, idx_slice, grad_scale, ratio):
-    seqlen_q, seqlen_k = idx_slice.shape
-    valid_mask = _bottom_right_valid_mask(seqlen_q, seqlen_k, ratio, idx_slice.device)
-
-    masked_idx_scores = idx_slice.masked_fill(~valid_mask, -1e9)
-    index_score = torch.softmax(masked_idx_scores, dim=-1)
-    attn_score_masked = attn_slice.masked_fill(~valid_mask, 0.0)
-    attn_score = attn_score_masked / attn_score_masked.sum(dim=-1, keepdim=True).clamp(min=EPS)
-
-    target_eff = attn_score.clamp(min=CLIP_PROB_MIN)
-    log_clip_mask = ((index_score >= CLIP_PROB_MIN) & valid_mask).to(attn_slice.dtype)
-    g = -target_eff * log_clip_mask * grad_scale
-    sum_grad = g.sum(dim=-1, keepdim=True)
-    grad_signal = (g - index_score * sum_grad).masked_fill(~valid_mask, 0.0)
-    attn_slice.copy_(grad_signal)
-
-
-def _score_grad_dense_inplace(
-    attn_scores_raw,
-    attn_l1norm,
-    idx_scores_raw,
-    idx_lse,
-    grad_scale,
-    ratio: int = 1,
-    cu_seqlens_q=None,
-    cu_seqlens_k=None,
+@cute.jit
+def _dense_seqlen_info(
+    mCuSeqlensQ,
+    mCuSeqlensK,
+    batch_idx: Int32,
+    seqlen_q_static: Int32,
+    seqlen_k_static: Int32,
 ):
-    """Compute dense grad_signal from raw scores and overwrite attn scores."""
-    assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
-    is_varlen = cu_seqlens_q is not None
-    if is_varlen:
-        assert cu_seqlens_k is not None
-        cu_q = cu_seqlens_q.detach().cpu().tolist()
-        cu_k = cu_seqlens_k.detach().cpu().tolist()
-        for b in range(len(cu_q) - 1):
-            qs, qe = cu_q[b], cu_q[b + 1]
-            ks, ke = cu_k[b], cu_k[b + 1]
-            sq_b = qe - qs
-            sk_b = ke - ks
-            if sq_b == 0 or sk_b == 0:
-                continue
-            _score_grad_dense_slice_inplace(
-                attn_scores_raw[qs:qe, :sk_b],
-                idx_scores_raw[qs:qe, :sk_b],
-                grad_scale,
-                ratio,
-            )
-            if sk_b < attn_scores_raw.shape[1]:
-                attn_scores_raw[qs:qe, sk_b:].zero_()
+    """Return batch-local offsets and lengths for BSHD or THD dense mode."""
+    if const_expr(mCuSeqlensQ is None):
+        return Int32(0), Int32(0), seqlen_q_static, seqlen_k_static
     else:
-        for b in range(idx_scores_raw.shape[0]):
-            _score_grad_dense_slice_inplace(
-                attn_scores_raw[b],
-                idx_scores_raw[b],
-                grad_scale,
-                ratio,
+        q_offset = mCuSeqlensQ[batch_idx]
+        seqlen_q_b = mCuSeqlensQ[batch_idx + Int32(1)] - q_offset
+        k_offset = mCuSeqlensK[batch_idx]
+        seqlen_k_b = mCuSeqlensK[batch_idx + Int32(1)] - k_offset
+        return q_offset, k_offset, seqlen_q_b, seqlen_k_b
+
+
+class ScoreGradDenseSm90:
+    """Dense score-grad precompute: raw scores + denoms -> grad_signal."""
+
+    WARP_SIZE = 32
+    THREADS_PER_CTA = 128
+
+    def __init__(self, ratio: int = 1):
+        assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
+        self.ratio = ratio
+
+    @cute.jit
+    def __call__(
+        self,
+        mIdxScoreRaw,
+        mAttnScoreRaw,
+        mIdxLSE,
+        mAttnL1Norm,
+        mCuSeqlensQ,
+        mCuSeqlensK,
+        grad_scale: Float32,
+        max_seqlen_q: Int32,
+        max_seqlen_k: Int32,
+        stream,
+    ):
+        # BSHD:
+        #   IdxScoreRaw/AttnScoreRaw: (B, S_q, S_k), IdxLSE/AttnL1Norm: (B, S_q)
+        # THD:
+        #   IdxScoreRaw/AttnScoreRaw: (T_q, max_K), IdxLSE/AttnL1Norm: (T_q,)
+        is_varlen = const_expr(mCuSeqlensQ is not None)
+
+        if const_expr(is_varlen):
+            batch_size = cute.size(mCuSeqlensQ.shape[0]) - 1
+        else:
+            mIdxScoreRaw = cute.make_tensor(
+                mIdxScoreRaw.iterator,
+                cute.select(mIdxScoreRaw.layout, mode=[1, 2, 0]),
             )
+            mAttnScoreRaw = cute.make_tensor(
+                mAttnScoreRaw.iterator,
+                cute.select(mAttnScoreRaw.layout, mode=[1, 2, 0]),
+            )
+            mIdxLSE = cute.make_tensor(
+                mIdxLSE.iterator,
+                cute.select(mIdxLSE.layout, mode=[1, 0]),
+            )
+            mAttnL1Norm = cute.make_tensor(
+                mAttnL1Norm.iterator,
+                cute.select(mAttnL1Norm.layout, mode=[1, 0]),
+            )
+            batch_size = cute.size(mIdxScoreRaw.shape[2])
+
+        seqlen_k_pad = cute.size(mIdxScoreRaw.shape[1])
+
+        self.kernel_score_grad(
+            mIdxScoreRaw,
+            mAttnScoreRaw,
+            mIdxLSE,
+            mAttnL1Norm,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            grad_scale,
+            seqlen_k_pad,
+            max_seqlen_q,
+            max_seqlen_k,
+        ).launch(
+            grid=(max_seqlen_q, batch_size, 1),
+            block=[self.THREADS_PER_CTA, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel_score_grad(
+        self,
+        mIdxScoreRaw,
+        mAttnScoreRaw,
+        mIdxLSE,
+        mAttnL1Norm,
+        mCuSeqlensQ,
+        mCuSeqlensK,
+        grad_scale: Float32,
+        seqlen_k_pad: Int32,
+        seqlen_q_static: Int32,
+        seqlen_k_static: Int32,
+    ):
+        tidx = cute.arch.thread_idx()[0]
+        seq_local = cute.arch.block_idx()[0]
+        batch_idx = cute.arch.block_idx()[1]
+        warp_id = tidx // self.WARP_SIZE
+
+        is_varlen = const_expr(mCuSeqlensQ is not None)
+        q_offset, _k_offset, seqlen_q_b, seqlen_k_b = _dense_seqlen_info(
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            Int32(batch_idx),
+            seqlen_q_static,
+            seqlen_k_static,
+        )
+
+        if seq_local < seqlen_q_b:
+            smem = cutlass.utils.SmemAllocator()
+
+            @cute.struct
+            class SharedStorage:
+                sReduceScratch: cute.struct.Align[
+                    cute.struct.MemRange[Float32, 4],
+                    128,
+                ]
+
+            storage = smem.allocate(SharedStorage)
+            sReduceScratch = storage.sReduceScratch.get_tensor(
+                cute.make_layout((4,), stride=(1,))
+            )
+
+            if const_expr(is_varlen):
+                mIdxScore_b = cute.domain_offset((q_offset, Int32(0)), mIdxScoreRaw)
+                mAttnScore_b = cute.domain_offset((q_offset, Int32(0)), mAttnScoreRaw)
+                mIdxLSE_b = cute.domain_offset((q_offset,), mIdxLSE)
+                mAttnL1_b = cute.domain_offset((q_offset,), mAttnL1Norm)
+            else:
+                mIdxScore_b = mIdxScoreRaw[None, None, batch_idx]
+                mAttnScore_b = mAttnScoreRaw[None, None, batch_idx]
+                mIdxLSE_b = mIdxLSE[None, batch_idx]
+                mAttnL1_b = mAttnL1Norm[None, batch_idx]
+
+            idx_lse_val = mIdxLSE_b[seq_local]
+            attn_l1_val = mAttnL1_b[seq_local]
+            LOG2E = Float32(1.4426950408889634)
+
+            ratio = Int32(self.ratio)
+            q_start_b = seqlen_k_b * ratio - seqlen_q_b
+            col_limit_raw = (q_start_b + Int32(seq_local) + Int32(1)) // ratio
+            col_limit = col_limit_raw if col_limit_raw < seqlen_k_b else seqlen_k_b
+
+            local_sum = Float32(0.0)
+            pos = tidx
+            while pos < seqlen_k_pad:
+                if pos < col_limit:
+                    idx_raw = mIdxScore_b[seq_local, pos]
+                    attn_raw = mAttnScore_b[seq_local, pos]
+                    score_minus_lse = idx_raw - idx_lse_val
+                    predict = cute.math.exp2(
+                        score_minus_lse * LOG2E,
+                        fastmath=True,
+                    )
+                    target = attn_raw / (attn_l1_val + Float32(EPS))
+                    target_eff = (
+                        target
+                        if target >= Float32(CLIP_PROB_MIN)
+                        else Float32(CLIP_PROB_MIN)
+                    )
+                    log_clip_mask = (
+                        Float32(1.0)
+                        if score_minus_lse >= Float32(CLIP_LOG_MIN)
+                        else Float32(0.0)
+                    )
+                    local_sum = local_sum + (-target_eff * log_clip_mask * grad_scale)
+                pos = pos + Int32(128)
+
+            warp_sum = cute.arch.warp_reduction_sum(local_sum)
+            with cute.arch.elect_one():
+                sReduceScratch[warp_id] = warp_sum
+            cute.arch.sync_threads()
+            sum_grad = (
+                sReduceScratch[0]
+                + sReduceScratch[1]
+                + sReduceScratch[2]
+                + sReduceScratch[3]
+            )
+
+            pos = tidx
+            while pos < seqlen_k_pad:
+                if pos < col_limit:
+                    idx_raw = mIdxScore_b[seq_local, pos]
+                    attn_raw = mAttnScore_b[seq_local, pos]
+                    score_minus_lse = idx_raw - idx_lse_val
+                    predict = cute.math.exp2(
+                        score_minus_lse * LOG2E,
+                        fastmath=True,
+                    )
+                    target = attn_raw / (attn_l1_val + Float32(EPS))
+                    target_eff = (
+                        target
+                        if target >= Float32(CLIP_PROB_MIN)
+                        else Float32(CLIP_PROB_MIN)
+                    )
+                    log_clip_mask = (
+                        Float32(1.0)
+                        if score_minus_lse >= Float32(CLIP_LOG_MIN)
+                        else Float32(0.0)
+                    )
+                    g = -target_eff * log_clip_mask * grad_scale
+                    mIdxScore_b[seq_local, pos] = g - predict * sum_grad
+                else:
+                    mIdxScore_b[seq_local, pos] = Float32(0.0)
+                pos = pos + Int32(128)
 
 
 def dense_indexer_backward_sm90(
@@ -104,10 +256,8 @@ def dense_indexer_backward_sm90(
 ):
     """Factory for the dense indexer backward gradient kernel on SM90."""
     assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
-    # batch/seqlen are runtime (dynamic grid dim + Int32 args), so they're not
-    # keyed. seqlen_k IS kept: the dense K-load unrolls `range_constexpr(
-    # self.num_topk_blocks)` where num_topk_blocks = seqlen_k // block_I, so it
-    # changes generated code. sm_scale is a runtime Float32 arg (not keyed).
+    # batch/seqlen/seqlen_k are runtime (dynamic grid dims + Int32 args), so
+    # they're not keyed. sm_scale is a runtime Float32 arg (not keyed).
     return _build_cute_dsl_dense_kernel(
         batch,
         seqlen,
@@ -139,6 +289,7 @@ def _build_cute_dsl_dense_kernel(
         raise RuntimeError("Use SM100 kernel for Blackwell")
 
     topk = seqlen_k
+    score_grad_obj = ScoreGradDenseSm90(ratio=ratio)
     kernel_obj = IndexerBackwardSm90(
         head_dim=dim,
         heads=heads,
@@ -148,28 +299,51 @@ def _build_cute_dsl_dense_kernel(
         ratio=ratio,
     )
 
-    # Single-layer compile cache keyed only by params that change generated
-    # code. seqlen_k is runtime now (the dense K-load loops at runtime over
-    # num_k_blocks, like the compute warpgroup), so it's not keyed — batch/
-    # seqlen/sm_scale likewise. dummy_topk_holder is a per-device scratch
-    # tensor, not a compile cache.
-    compile_key = (is_varlen, heads, dim, block_I, ratio)
+    # Compile caches are keyed only by params that change generated code. In
+    # dense mode, K-block traversal is runtime-sized by seqlen_k.
+    score_grad_key = (is_varlen, ratio)
+    gemm_key = (is_varlen, heads, dim, block_I, ratio)
     dummy_topk_holder = [None]
 
     def _get_dummy_topk(device, current_stream=None):
         if dummy_topk_holder[0] is None or dummy_topk_holder[0].device != device:
             with _torch_stream_context(current_stream):
-                dummy_topk_holder[0] = torch.zeros(batch, seqlen, seqlen_k, device=device, dtype=torch.int32)
+                dummy_topk_holder[0] = torch.zeros(
+                    batch, seqlen, seqlen_k, device=device, dtype=torch.int32
+                )
         return dummy_topk_holder[0]
 
-    def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, CuSeqlensQ, CuSeqlensK, current_stream=None):
+    def _ensure_compiled(
+        IndexQ,
+        Weights,
+        IndexK,
+        dIndexQ,
+        dWeights,
+        dIndexK_f32,
+        GradSignal,
+        CuSeqlensQ,
+        CuSeqlensK,
+        current_stream=None,
+    ):
         s = _resolve_stream(current_stream)
-        if compile_key not in _dense_compile_cache:
+        if gemm_key not in _dense_compile_cache:
             dummy_topk = _get_dummy_topk(IndexQ.device, current_stream=current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
-            cute_args = [to_cute_tensor(t) for t in [IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, dummy_topk]]
-            _dense_compile_cache[compile_key] = cute.compile(
+            cute_args = [
+                to_cute_tensor(t)
+                for t in [
+                    IndexQ,
+                    Weights,
+                    IndexK,
+                    dIndexQ,
+                    dWeights,
+                    dIndexK_f32,
+                    GradSignal,
+                    dummy_topk,
+                ]
+            ]
+            _dense_compile_cache[gemm_key] = cute.compile(
                 kernel_obj,
                 *cute_args,
                 cutlass.Float32(sm_scale),
@@ -181,17 +355,114 @@ def _build_cute_dsl_dense_kernel(
                 options=compile_options(),
             )
 
-    def _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, CuSeqlensQ=None, CuSeqlensK=None, current_stream=None):
+    def _ensure_compiled_score_grad(
+        IdxScoreRaw,
+        IdxLSE,
+        AttnScoreRaw,
+        AttnL1Norm,
+        CuSeqlensQ,
+        CuSeqlensK,
+        grad_scale,
+        current_stream=None,
+    ):
+        if score_grad_key not in _dense_score_grad_compile_cache:
+            s = _resolve_stream(current_stream)
+            cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
+            cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
+            _dense_score_grad_compile_cache[score_grad_key] = cute.compile(
+                score_grad_obj,
+                to_cute_tensor(IdxScoreRaw),
+                to_cute_tensor(AttnScoreRaw),
+                to_cute_tensor(IdxLSE),
+                to_cute_tensor(AttnL1Norm),
+                cuq_arg,
+                cuk_arg,
+                cutlass.Float32(float(grad_scale)),
+                cutlass.Int32(seqlen),
+                cutlass.Int32(seqlen_k),
+                s,
+                options=compile_options("--opt-level 3"),
+            )
+
+    def _run_score_grad_only(
+        IdxScoreRaw,
+        IdxLSE,
+        AttnScoreRaw,
+        AttnL1Norm,
+        grad_scale,
+        CuSeqlensQ=None,
+        CuSeqlensK=None,
+        current_stream=None,
+    ):
+        if is_varlen:
+            assert (
+                CuSeqlensQ is not None and CuSeqlensK is not None
+            ), "THD-compiled score-grad kernel requires cu_seqlens_q/k at runtime"
+        else:
+            assert (
+                CuSeqlensQ is None and CuSeqlensK is None
+            ), "BSHD-compiled score-grad kernel must not receive cu_seqlens_q/k"
+        s = _resolve_stream(current_stream)
+        _ensure_compiled_score_grad(
+            IdxScoreRaw,
+            IdxLSE,
+            AttnScoreRaw,
+            AttnL1Norm,
+            CuSeqlensQ,
+            CuSeqlensK,
+            grad_scale,
+            current_stream=current_stream,
+        )
+        _dense_score_grad_compile_cache[score_grad_key](
+            IdxScoreRaw,
+            AttnScoreRaw,
+            IdxLSE,
+            AttnL1Norm,
+            CuSeqlensQ,
+            CuSeqlensK,
+            cutlass.Float32(float(grad_scale)),
+            cutlass.Int32(seqlen),
+            cutlass.Int32(seqlen_k),
+            s,
+        )
+
+    def _run_gemm_only(
+        IndexQ,
+        Weights,
+        IndexK,
+        dIndexQ,
+        dWeights,
+        dIndexK_f32,
+        GradSignal,
+        CuSeqlensQ=None,
+        CuSeqlensK=None,
+        current_stream=None,
+    ):
         """Run fused dense Kernel 2. Caller must run score_grad first."""
         if is_varlen:
-            assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled kernel requires cu_seqlens_q/k at runtime"
+            assert (
+                CuSeqlensQ is not None and CuSeqlensK is not None
+            ), "THD-compiled kernel requires cu_seqlens_q/k at runtime"
         else:
-            assert CuSeqlensQ is None and CuSeqlensK is None, "BSHD-compiled kernel must not receive cu_seqlens_q/k"
+            assert (
+                CuSeqlensQ is None and CuSeqlensK is None
+            ), "BSHD-compiled kernel must not receive cu_seqlens_q/k"
         dummy_topk = _get_dummy_topk(IndexQ.device, current_stream=current_stream)
         s = _resolve_stream(current_stream)
 
-        _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, CuSeqlensQ, CuSeqlensK, current_stream=current_stream)
-        _dense_compile_cache[compile_key](
+        _ensure_compiled(
+            IndexQ,
+            Weights,
+            IndexK,
+            dIndexQ,
+            dWeights,
+            dIndexK_f32,
+            GradSignal,
+            CuSeqlensQ,
+            CuSeqlensK,
+            current_stream=current_stream,
+        )
+        _dense_compile_cache[gemm_key](
             IndexQ,
             Weights,
             IndexK,
@@ -225,33 +496,57 @@ def _build_cute_dsl_dense_kernel(
         current_stream=None,
     ):
         if is_varlen:
-            assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled kernel requires cu_seqlens_q/k at runtime"
+            assert (
+                CuSeqlensQ is not None and CuSeqlensK is not None
+            ), "THD-compiled kernel requires cu_seqlens_q/k at runtime"
         else:
-            assert CuSeqlensQ is None and CuSeqlensK is None, "BSHD-compiled kernel must not receive cu_seqlens_q/k"
-        # Keep the full SM90 dense pipeline aligned with /code/indexer: score-grad
-        # is still torch-based and therefore runs on PyTorch's current stream.
-        # Avoid mixing it with a non-current-stream GEMM until the score-grad
-        # stage has a DSL implementation upstream.
-        _score_grad_dense_inplace(
-            attn_scores_raw,
-            attn_l1norm,
+            assert (
+                CuSeqlensQ is None and CuSeqlensK is None
+            ), "BSHD-compiled kernel must not receive cu_seqlens_q/k"
+        _run_score_grad_only(
             idx_scores_raw,
             idx_lse,
+            attn_scores_raw,
+            attn_l1norm,
             grad_scale,
-            ratio=ratio,
-            cu_seqlens_q=CuSeqlensQ,
-            cu_seqlens_k=CuSeqlensK,
+            CuSeqlensQ,
+            CuSeqlensK,
+            current_stream=current_stream,
         )
-        grad_signal = attn_scores_raw
+        grad_signal = idx_scores_raw
 
         if dIndexK.dtype == torch.float32:
-            _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK, grad_signal, CuSeqlensQ, CuSeqlensK)
+            _run_gemm_only(
+                IndexQ,
+                Weights,
+                IndexK,
+                dIndexQ,
+                dWeights,
+                dIndexK,
+                grad_signal,
+                CuSeqlensQ,
+                CuSeqlensK,
+                current_stream=current_stream,
+            )
         else:
-            dIndexK_f32 = torch.zeros_like(dIndexK, dtype=torch.float32)
-            _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, grad_signal, CuSeqlensQ, CuSeqlensK)
-            dIndexK.copy_(dIndexK_f32)
+            with _torch_stream_context(current_stream):
+                dIndexK_f32 = torch.zeros_like(dIndexK, dtype=torch.float32)
+            _run_gemm_only(
+                IndexQ,
+                Weights,
+                IndexK,
+                dIndexQ,
+                dWeights,
+                dIndexK_f32,
+                grad_signal,
+                CuSeqlensQ,
+                CuSeqlensK,
+                current_stream=current_stream,
+            )
+            with _torch_stream_context(current_stream):
+                dIndexK.copy_(dIndexK_f32)
 
-    _run.score_grad = _score_grad_dense_inplace
+    _run.score_grad = _run_score_grad_only
     _run.gemm_only = _run_gemm_only
     _run.ratio = ratio
     _run.is_varlen = is_varlen

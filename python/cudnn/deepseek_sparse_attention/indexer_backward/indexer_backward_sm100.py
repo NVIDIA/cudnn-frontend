@@ -340,7 +340,7 @@ class IndexerBackwardSm100:
             seqlen,
             batch_size,
         ).launch(
-            grid=(batch_size, seqlen, 1),
+            grid=(seqlen, batch_size, 1),
             block=[self.THREADS_PER_CTA, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
@@ -377,8 +377,8 @@ class IndexerBackwardSm100:
     ):
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        batch_idx = cute.arch.block_idx()[0]
-        seq_idx = cute.arch.block_idx()[1]
+        seq_idx = cute.arch.block_idx()[0]
+        batch_idx = cute.arch.block_idx()[1]
         seqlen_k = cute.size(mK.shape[0])
 
         # TMA descriptor prefetch (load warp only)
@@ -1478,7 +1478,7 @@ class ScoreGradSm100:
         seqlen = cute.size(mAttnScore.shape[0])
         batch_size = cute.size(mAttnScore.shape[2]) if cute.rank(mAttnScore.shape) > 2 else 1
         self.kernel_score_grad(mAttnScore, mIndexScore, mGradLoss, grad_scale).launch(
-            grid=(batch_size, seqlen, 1),
+            grid=(seqlen, batch_size, 1),
             block=[self.THREADS_PER_CTA, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
@@ -1488,8 +1488,8 @@ class ScoreGradSm100:
     @cute.kernel
     def kernel_score_grad(self, mAttnScore, mIndexScore, mGradLoss, grad_scale: Float32 | float):
         tidx = cute.arch.thread_idx()[0]
-        batch_idx = cute.arch.block_idx()[0]
-        seq_idx = cute.arch.block_idx()[1]
+        seq_idx = cute.arch.block_idx()[0]
+        batch_idx = cute.arch.block_idx()[1]
         # grad_scale is a compile/runtime scalar (loss_coeff / (b*sq));
         # grad_loss lives in a shape-(1,) f32 GPU tensor (from autograd).
         # Fold them together once per CTA — the compiler will hoist.

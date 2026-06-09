@@ -34,7 +34,7 @@ Barriers:
   NamedBarrier(5): wg_sched_1  (ping-pong: WG1 syncs on this, WG0 arrives)
 
 SMEM (kernel 2): sGradSignal[topk] holds precomputed grad_signal from kernel 1.
-Grid: (batch, seqlen, 1). Each CTA handles one query position.
+Grid: (seqlen, batch, 1). Each CTA handles one query position.
 """
 
 from __future__ import annotations
@@ -340,7 +340,7 @@ class IndexerBackwardSm90:
             mCuSeqlensQ,
             mCuSeqlensK,
         ).launch(
-            grid=(batch_size, seqlen, 1),
+            grid=(seqlen, batch_size, 1),
             block=[self.THREADS_PER_CTA, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
@@ -377,8 +377,8 @@ class IndexerBackwardSm90:
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         warp_group_idx = tidx // self.WARPGROUP_SIZE
-        batch_idx = cute.arch.block_idx()[0]
-        seq_idx = cute.arch.block_idx()[1]
+        seq_idx = cute.arch.block_idx()[0]
+        batch_idx = cute.arch.block_idx()[1]
         is_varlen = const_expr(self.is_dense and mCuSeqlensQ is not None)
         q_offset, k_offset, seqlen_q_b, seqlen_k_b = _seqlen_info(
             mCuSeqlensQ,
@@ -1401,7 +1401,7 @@ class ScoreGradSm90:
         seqlen = cute.size(mAttnScore.shape[0])
         batch_size = cute.size(mAttnScore.shape[2]) if cute.rank(mAttnScore.shape) > 2 else 1
         self.kernel_score_grad(mAttnScore, mIndexScore, mGradLoss, grad_scale).launch(
-            grid=(batch_size, seqlen, 1),
+            grid=(seqlen, batch_size, 1),
             block=[self.THREADS_PER_CTA, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
@@ -1411,8 +1411,8 @@ class ScoreGradSm90:
     @cute.kernel
     def kernel_score_grad(self, mAttnScore, mIndexScore, mGradLoss, grad_scale: Float32 | float):
         tidx = cute.arch.thread_idx()[0]
-        batch_idx = cute.arch.block_idx()[0]
-        seq_idx = cute.arch.block_idx()[1]
+        seq_idx = cute.arch.block_idx()[0]
+        batch_idx = cute.arch.block_idx()[1]
         # grad_scale is a compile/runtime scalar (loss_coeff / (b*sq));
         # grad_loss lives in a shape-(1,) f32 GPU tensor (from autograd).
         # Fold them together once per CTA — the compiler will hoist.
