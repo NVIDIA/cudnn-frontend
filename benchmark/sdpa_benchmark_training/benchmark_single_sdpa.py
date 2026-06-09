@@ -118,6 +118,12 @@ def parse_args():
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
+        "--fa4_num_splits",
+        default=None,
+        type=int,
+        help="FlashAttention-4 only: force num_splits (KV split count). " "Default is None (FA4 picks automatically).",
+    )
+    parser.add_argument(
         "--fwd_bwd",
         action="store_true",
         help="Run both forward and backward pass (fwd only by default)",
@@ -197,6 +203,7 @@ def run_benchmark(
     deterministic_bwd: bool = False,
     sliding_window_size: Optional[int] = None,
     verbose: bool = False,
+    fa4_num_splits: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Run a single SDPA benchmark.
@@ -288,6 +295,8 @@ def run_benchmark(
         cmd.extend(["--sliding_window_size", str(sliding_window_size)])
     if verbose:
         cmd.append("--verbose")
+    if fa4_num_splits is not None:
+        cmd.extend(["--fa4_num_splits", str(fa4_num_splits)])
 
     # Run benchmark
     result = subprocess.run(
@@ -1102,13 +1111,18 @@ else:
 
         def flash_attention_4_sdpa(query, key, value):
             window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
+            kwargs = dict(
+                causal=args.attn_mask != "no_mask",
+                window_size=window_size,
+                deterministic=args.deterministic_bwd,
+            )
+            if args.fa4_num_splits is not None:
+                kwargs["num_splits"] = args.fa4_num_splits
             output, _ = flash_attn_interface.flash_attn_func(
                 query,
                 key,
                 value,
-                causal=args.attn_mask != "no_mask",
-                window_size=window_size,
-                deterministic=args.deterministic_bwd,
+                **kwargs,
             )
             return output
 
