@@ -59,6 +59,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
 
+
 class GroupedGemmDgluSm100(APIBase):
     """Unified API for grouped GEMM dGLU backward operation on SM100+ GPUs.
 
