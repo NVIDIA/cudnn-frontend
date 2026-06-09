@@ -196,6 +196,10 @@ init_properties(py::module_& m) {
              &cudnn_frontend::graph::Tensor_attributes::set_vector_count_and_dimension,
              py::return_value_policy::reference)
         .def("set_ragged_offset", &cudnn_frontend::graph::Tensor_attributes::set_ragged_offset)
+        .def("get_ragged_offset_multiplier", &cudnn_frontend::graph::Tensor_attributes::get_ragged_offset_multiplier)
+        .def("set_ragged_offset_multiplier",
+             &cudnn_frontend::graph::Tensor_attributes::set_ragged_offset_multiplier,
+             py::return_value_policy::reference)
         .def("__repr__", [](cudnn_frontend::graph::Tensor_attributes const& props) {
             std::ostringstream out;
             out << json{props};

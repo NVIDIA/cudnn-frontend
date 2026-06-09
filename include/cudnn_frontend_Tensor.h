@@ -92,6 +92,9 @@ class Tensor_v8 : public BackendDescriptor {
         if (raggedOffset != nullptr) {
             ss << "\n                                   raggedOffset: Enabled UID: " << raggedOffset->getId();
         }
+        if (hasRaggedOffsetMultiplier()) {
+            ss << "\n                                   raggedOffsetMultiplier: " << raggedOffsetMultiplier;
+        }
         return ss.str();
     }
 
@@ -146,6 +149,16 @@ class Tensor_v8 : public BackendDescriptor {
         return alignment;
     }
 
+    int64_t
+    getRaggedOffsetMultiplier() const {
+        return raggedOffsetMultiplier;
+    }
+
+    bool
+    hasRaggedOffsetMultiplier() const {
+        return raggedOffsetMultiplier != 1;
+    }
+
     bool
     isVirtualTensor() const {
         return isVirtual;
@@ -187,6 +200,7 @@ class Tensor_v8 : public BackendDescriptor {
     cudnn_frontend::TensorReordering_t reorder_type =
         cudnn_frontend::TensorReordering_t::NONE;  //! Type of reordering in the tensor
     std::shared_ptr<Tensor_v8> raggedOffset;       //! Ragged offsets for ragged tensors
+    int64_t raggedOffsetMultiplier = 1;            //! Unit size of ragged offsets in tensor elements
 };
 
 ///
@@ -290,6 +304,12 @@ class TensorBuilder_v8 {
     auto
     setRaggedOffset(std::shared_ptr<Tensor_v8> &raggedOffset) -> TensorBuilder_v8 & {
         m_tensor.raggedOffset = raggedOffset;
+        return *this;
+    }
+
+    auto
+    setRaggedOffsetMultiplier(int64_t const multiplier) -> TensorBuilder_v8 & {
+        m_tensor.raggedOffsetMultiplier = multiplier;
         return *this;
     }
 
@@ -498,6 +518,47 @@ class TensorBuilder_v8 {
             }
         }
 #endif
+
+        // Set ragged offset multiplier
+        if (m_tensor.hasRaggedOffsetMultiplier()) {
+            auto ragged_offset_multiplier_cudnn_ver_error =
+                "CUDNN_BACKEND_TENSOR_DESCRIPTOR: SetAttribute "
+                "CUDNN_ATTR_TENSOR_RAGGED_OFFSET_MULTIPLIER requires cudnn version 9.24.0";
+#if (CUDNN_VERSION >= 92400)
+            NV_CUDNN_FE_DYNAMIC_CHECK_BACKEND_DESCRIPTOR(92400, m_tensor, ragged_offset_multiplier_cudnn_ver_error);
+            if (m_tensor.raggedOffset == nullptr) {
+                set_error_and_throw_exception(
+                    &m_tensor,
+                    CUDNN_STATUS_BAD_PARAM,
+                    "CUDNN_BACKEND_TENSOR_DESCRIPTOR: CUDNN_ATTR_TENSOR_RAGGED_OFFSET_MULTIPLIER requires "
+                    "CUDNN_ATTR_TENSOR_RAGGED_OFFSET_DESC");
+                return std::move(m_tensor);
+            }
+            if (m_tensor.raggedOffsetMultiplier <= 0) {
+                set_error_and_throw_exception(
+                    &m_tensor,
+                    CUDNN_STATUS_BAD_PARAM,
+                    "CUDNN_BACKEND_TENSOR_DESCRIPTOR: CUDNN_ATTR_TENSOR_RAGGED_OFFSET_MULTIPLIER must be positive");
+                return std::move(m_tensor);
+            }
+            status = detail::set_attribute(m_tensor.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_TENSOR_RAGGED_OFFSET_MULTIPLIER,
+                                           CUDNN_TYPE_INT64,
+                                           1,
+                                           &m_tensor.raggedOffsetMultiplier);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(&m_tensor,
+                                              status,
+                                              "CUDNN_BACKEND_TENSOR_DESCRIPTOR: SetAttribute "
+                                              "CUDNN_ATTR_TENSOR_RAGGED_OFFSET_MULTIPLIER Failed");
+                return std::move(m_tensor);
+            }
+#else
+            set_error_and_throw_exception(
+                &m_tensor, CUDNN_STATUS_INVALID_VALUE, ragged_offset_multiplier_cudnn_ver_error);
+            return std::move(m_tensor);
+#endif  // CUDNN_VERSION >= 92400
+        }
 
         // Set the reorder_type
         if (m_tensor.reorder_type != cudnn_frontend::TensorReordering_t::NONE) {

@@ -47,6 +47,36 @@ TEST_CASE("tensor query checks", "[query_tensor_attributes_of_uid]") {
     REQUIRE(t.get_name() == name);
 }
 
+TEST_CASE("tensor ragged offset multiplier attributes", "[tensor_ragged_offset_multiplier]") {
+    namespace fe = cudnn_frontend;
+
+    fe::graph::Graph graph;
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto ragged_offset = graph.tensor(fe::graph::Tensor_attributes()
+                                          .set_name("offsets")
+                                          .set_dim({3, 1, 1, 1})
+                                          .set_stride({1, 1, 1, 1})
+                                          .set_data_type(fe::DataType_t::INT64)
+                                          .set_uid(2));
+
+    auto X = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("ragged")
+                              .set_dim({2, 4, 8, 16})
+                              .set_stride({512, 128, 16, 1})
+                              .set_data_type(fe::DataType_t::HALF)
+                              .set_uid(3)
+                              .set_ragged_offset(ragged_offset)
+                              .set_ragged_offset_multiplier(4));
+
+    fe::graph::Tensor_attributes t;
+    REQUIRE(graph.query_tensor_attributes_of_uid(X->get_uid(), t).is_good());
+    REQUIRE(t.get_ragged_offset_multiplier() == 4);
+    REQUIRE(t.validate().is_good());
+}
+
 TEST_CASE("Block_scale_dequantize graph creation with negative scales", "[block_scale_dequantize_graph]") {
     namespace fe = cudnn_frontend;
 

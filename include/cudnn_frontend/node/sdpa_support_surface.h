@@ -404,6 +404,18 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                     error_code_t::GRAPH_NOT_SUPPORTED,
                     "Composite SDPA node doesn't support CU_SEQ_LEN_Q / CU_SEQ_LEN_KV inputs");
             }
+            // The ragged offset multiplier is only supported by the unified forward engine.
+            // Reject it here so auto-select routes such graphs to the unified implementation.
+            for (const auto& [key, value] : inputs) {
+                RETURN_CUDNN_FRONTEND_ERROR_IF(value != nullptr && value->has_ragged_offset_multiplier(),
+                                               error_code_t::GRAPH_NOT_SUPPORTED,
+                                               "Composite SDPA node doesn't support a ragged offset multiplier");
+            }
+            for (const auto& [key, value] : outputs) {
+                RETURN_CUDNN_FRONTEND_ERROR_IF(value != nullptr && value->has_ragged_offset_multiplier(),
+                                               error_code_t::GRAPH_NOT_SUPPORTED,
+                                               "Composite SDPA node doesn't support a ragged offset multiplier");
+            }
             break;
         case AttentionImplementation_t::UNIFIED: {
             auto effective_cudnn_ver = std::min(detail::get_backend_version(), detail::get_compiled_version());
