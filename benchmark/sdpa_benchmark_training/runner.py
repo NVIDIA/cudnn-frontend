@@ -166,8 +166,10 @@ class BenchmarkRunner:
             det_values = [False] if profile_pass == "fwd" else list(config.deterministic_bwd)
 
             for det_bwd in det_values:
-                # MXFP8 constraints: cudnn-only
-                if data_type == "mxfp8":
+                # FP8/MXFP8 constraints: cudnn-only. FA4's cute interface
+                # rejects non-fp16/bf16 inputs outright, so emitting those
+                # cases just produces tracebacks in the CSV.
+                if data_type in ("fp8", "mxfp8"):
                     if backend != "cudnn":
                         continue
 
