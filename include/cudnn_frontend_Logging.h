@@ -29,17 +29,9 @@
 #include <cstring>
 #include <cstdlib>
 
+#include "cudnn_frontend_shim.h"  // cudnn_frontend::get_environment
+
 namespace cudnn_frontend {
-
-static const char *
-get_environment(const char *name) {
-#ifdef WIN32
-#pragma warning(disable : 4996)
-#define _CRT_SECURE_NO_WARNINGS
-#endif
-
-    return std::getenv(name);
-}
 
 inline int
 getLogLevel() {

@@ -87,7 +87,8 @@ PyGraph::tensor(std::vector<int64_t> const& dim,
                 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& ragged_offset,
                 cudnn_frontend::TensorReordering_t const reordering_type,
                 std::string const& name,
-                int64_t const& uid) {
+                int64_t const& uid,
+                int64_t const& ragged_offset_multiplier) {
     auto props = cudnn_frontend::graph::Tensor_attributes()
                      .set_data_type(data_type)
                      .set_is_virtual(is_virtual)
@@ -96,7 +97,8 @@ PyGraph::tensor(std::vector<int64_t> const& dim,
                      .set_stride(stride)
                      .set_ragged_offset(ragged_offset)
                      .set_reordering_type(reordering_type)
-                     .set_name(name);
+                     .set_name(name)
+                     .set_ragged_offset_multiplier(ragged_offset_multiplier);
 
     if (uid != -1) {
         props.set_uid(uid);
@@ -345,11 +347,15 @@ std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::reduction(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
                    cudnn_frontend::ReductionMode_t const mode,
                    cudnn_frontend::DataType_t const& compute_data_type,
-                   std::string const& name) {
+                   std::string const& name,
+                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> group_offset) {
     auto attributes = cudnn_frontend::graph::Reduction_attributes()
                           .set_mode(mode)
                           .set_compute_data_type(compute_data_type)
                           .set_name(name);
+    if (group_offset != nullptr) {
+        attributes.set_group_offset(std::move(group_offset));
+    }
 
     auto OUT_0 = graph->reduction(input, attributes);
     return OUT_0;
@@ -807,6 +813,15 @@ PyGraph::get_plan_name_at_index(int64_t index) {
     return plan_name;
 }
 
+std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
+PyGraph::get_engine_and_knobs_at_index(int64_t index) {
+    int64_t engine_id = -1;
+    std::unordered_map<KnobType_t, int64_t> knobs;
+    auto status = graph->get_engine_and_knobs_at_index(index, engine_id, knobs);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+    return {engine_id, knobs};
+}
+
 std::vector<int64_t>
 default_vector(void) {
     return {};
@@ -854,7 +869,8 @@ init_pygraph_submodule(py::module_& m) {
              py::arg_v{"ragged_offset", nullptr},
              py::arg_v{"reordering_type", cudnn_frontend::TensorReordering_t::NONE},
              py::arg_v("name", ""),
-             py::arg_v("uid", -1))
+             py::arg_v("uid", -1),
+             py::arg_v("ragged_offset_multiplier", int64_t{1}))
         .def("genstats",
              &PyGraph::genstats,
              py::arg("input"),
@@ -1056,6 +1072,7 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("mode"),
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
              py::arg_v("name", ""),
+             py::arg_v("group_offset", nullptr),
              R"pbdoc(
                 Reduce an input tensor along certain dimensions. These dimensions to reduce on are inferred from output tensor shape.
 
@@ -1064,6 +1081,7 @@ init_pygraph_submodule(py::module_& m) {
                     mode (cudnn.reduction_mode): The mode to use to reduce along a dimension.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                     name (Optional[str]): A name for the operation to be performed.
+                    group_offset (Optional[cudnn_tensor]): The group offset tensor for grouped reduction.
 
                 Returns:
                     cudnn_tensor: The result of reduction operation.
@@ -1324,6 +1342,16 @@ init_pygraph_submodule(py::module_& m) {
                     Get the name for a plan at the given index.
                     Args:
                     index (int): The index of the plan to get workspace from.
+                )pbdoc")
+        .def("get_engine_and_knobs_at_index",
+             &PyGraph::get_engine_and_knobs_at_index,
+             py::arg("index"),
+             R"pbdoc(
+                    Get the engine id and knob choices for a plan at the given index.
+                    Structured counterpart of get_plan_name_at_index; the result can be
+                    passed to create_execution_plan() to rebuild the same kernel.
+                    Args:
+                    index (int): The index of the plan to query.
                 )pbdoc")
         .def("_execute",
              &PyGraph::execute,

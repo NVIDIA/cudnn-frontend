@@ -154,12 +154,16 @@ TEST_CASE("WoQ MoeGroupedMatmul", "[MoeGroupedMatmul][graph]") {
 }
 
 TEST_CASE("BF16 MoeGroupedMatmulBwd", "[MoeGroupedMatmulBwd][graph]") {
-#if (CUDNN_VERSION < 92200) || (CUDNN_VERSION >= 99900)
+#if (CUDNN_VERSION < 92200)
     SKIP("MoE is not supported in cudnn versions prior to 9.22.0");
 #endif
 
     if (cublasLtGetVersion() < 130500) {
         SKIP("Not supported by cublasLt version");
+    }
+
+    if (get_compute_capability() < 90 || get_compute_capability() >= 120) {
+        SKIP("Test requires SM90 - SM119 architectures");
     }
 
     if (is_arch_supported_by_cudnn() == false) {

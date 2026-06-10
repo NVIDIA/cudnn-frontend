@@ -101,12 +101,23 @@ class IndexerBackwardSm90:
     COMPUTE_WG_B = 1  # warps 4-7
     KLOAD_WG = 2  # warps 8-11
 
-    def __init__(self, head_dim, heads=64, block_I=128, topk=512, is_dense=False, topk_indices_global: bool = True):
+    def __init__(
+        self,
+        head_dim,
+        heads=64,
+        block_I=128,
+        topk=512,
+        is_dense=False,
+        topk_indices_global: bool = True,
+        ratio: int = 1,
+    ):
         self.head_dim = head_dim
         self.heads = heads
         self.block_I = block_I
         self.topk = topk
         self.is_dense = is_dense
+        assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
+        self.ratio = ratio
         # Public forward/topk returns global KV ids by default. Sparse mode
         # decodes them to local per-batch ids before indexing K/dK views.
         self.topk_indices_global = topk_indices_global
@@ -152,6 +163,16 @@ class IndexerBackwardSm90:
         # Ping-pong scheduler barriers (WG0 syncs on 4, WG1 syncs on 5)
         self.SCHED_BARRIER_WG0 = 4
         self.SCHED_BARRIER_WG1 = 5
+
+    @cute.jit
+    def _dense_num_k_blocks(self, q_token, seqlen_q, seqlen_k):
+        """Return dense K blocks that can contain valid ratio-causal columns."""
+        ratio = Int32(self.ratio)
+        q_global_start = seqlen_k * ratio - seqlen_q
+        col_limit = (q_global_start + q_token + Int32(1)) // ratio
+        col_limit = col_limit if col_limit > Int32(0) else Int32(0)
+        col_limit = col_limit if col_limit < seqlen_k else seqlen_k
+        return cute.ceil_div(col_limit, self.block_I)
 
     @cute.jit
     def __call__(
@@ -523,6 +544,7 @@ class IndexerBackwardSm90:
                     sm_scale,
                     seq_idx,
                     batch_idx,
+                    seqlen_q_b,
                     seqlen_k_b,
                     tidx,
                     warp_idx,
@@ -561,6 +583,7 @@ class IndexerBackwardSm90:
                     sm_scale,
                     seq_idx,
                     batch_idx,
+                    seqlen_q_b,
                     seqlen_k_b,
                     tidx,
                     warp_idx,
@@ -577,6 +600,7 @@ class IndexerBackwardSm90:
                         sK,
                         batch_idx,
                         seq_idx,
+                        seqlen_q_b,
                         seqlen_k_b,
                         tidx,
                         mbar,
@@ -631,6 +655,7 @@ class IndexerBackwardSm90:
         sm_scale: Float32 | float,
         seq_idx,
         batch_idx,
+        seqlen_q,
         seqlen_k,
         tidx,
         warp_idx,
@@ -730,18 +755,18 @@ class IndexerBackwardSm90:
 
         n_offset = compute_wg_idx * self.half_block_I
 
-        # STS dK staging: partition sdK_staging using GEMM2's MMA layout
+        # shared-mem store dK staging: partition sdK_staging using GEMM2's MMA layout
         sdK_staging_half = cute.local_tile(sdK_staging, (64, self.block_I), (compute_wg_idx, 0))
         tCsDK_staging = thr_mma2.partition_C(sdK_staging_half)
 
-        # Fused pass sdS write via stmatrix (r2s bulk copy, replaces scalar STS)
+        # Fused pass sdS write via stmatrix (r2s bulk copy, replaces scalar shared-mem stores)
         sdS_half = cute.local_tile(sdS_view, (self.heads_padded, self.half_block_I), (0, compute_wg_idx))
         stmatrix_atom_ds = cute.make_copy_atom(warp.StMatrix8x8x16bOp(), self.q_dtype)
         tiled_r2s_ds = cute.make_tiled_copy_C(stmatrix_atom_ds, tmma1)
         thr_r2s_ds = tiled_r2s_ds.get_slice(wg_tidx)
         tRdDS = thr_r2s_ds.partition_D(sdS_half)
 
-        # P4: 2D block view of sGradSignal for partition-based access (sparse only)
+        # Pass 4: 2D block view of sGradSignal for partition-based access (sparse only)
         if const_expr(not self.is_dense):
             sGS_per_block = cute.make_tensor(
                 sGradSignal.iterator,
@@ -758,10 +783,18 @@ class IndexerBackwardSm90:
         # Ping-pong init: WG1 pre-arrives on WG0's scheduler barrier,
         # giving WG0 the head start for the first sync.
         if compute_wg_idx == 1:
-            cute.arch.barrier_arrive(barrier_id=self.SCHED_BARRIER_WG0, number_of_threads=self.TOTAL_COMPUTE_THREADS)
+            cute.arch.barrier_arrive(
+                barrier_id=self.SCHED_BARRIER_WG0,
+                number_of_threads=self.TOTAL_COMPUTE_THREADS,
+            )
+
+        if const_expr(self.is_dense):
+            num_topk_blocks_cur = self._dense_num_k_blocks(seq_idx, seqlen_q, seqlen_k)
+        else:
+            num_topk_blocks_cur = Int32(self.num_topk_blocks)
 
         # ---- Step 3: Main loop over topk blocks ----
-        for bi in cutlass.range(0, self.num_topk_blocks, unroll=1):
+        for bi in cutlass.range(0, num_topk_blocks_cur, unroll=1):
             i_st = bi * self.block_I
             stage = bi % NUM_K_STAGES
 
@@ -793,9 +826,15 @@ class IndexerBackwardSm90:
             # ----- GEMM1: S[H, I/2] = Q[H, D] x K_half[I/2, D] -----
             # Ping-pong: wait for turn → issue WGMMA → signal other WG → wait result
             if compute_wg_idx == 0:
-                cute.arch.barrier(barrier_id=self.SCHED_BARRIER_WG0, number_of_threads=self.TOTAL_COMPUTE_THREADS)
+                cute.arch.barrier(
+                    barrier_id=self.SCHED_BARRIER_WG0,
+                    number_of_threads=self.TOTAL_COMPUTE_THREADS,
+                )
             else:
-                cute.arch.barrier(barrier_id=self.SCHED_BARRIER_WG1, number_of_threads=self.TOTAL_COMPUTE_THREADS)
+                cute.arch.barrier(
+                    barrier_id=self.SCHED_BARRIER_WG1,
+                    number_of_threads=self.TOTAL_COMPUTE_THREADS,
+                )
 
             acc_S = cute.make_rmem_tensor(s_acc_shape, Float32)
             if stage == 0:
@@ -806,14 +845,20 @@ class IndexerBackwardSm90:
                 gemm(tmma1, acc_S, tSrQ, tSrK_s2, zero_init=True, wg_wait=-1)
 
             if compute_wg_idx == 0:
-                cute.arch.barrier_arrive(barrier_id=self.SCHED_BARRIER_WG1, number_of_threads=self.TOTAL_COMPUTE_THREADS)
+                cute.arch.barrier_arrive(
+                    barrier_id=self.SCHED_BARRIER_WG1,
+                    number_of_threads=self.TOTAL_COMPUTE_THREADS,
+                )
             else:
-                cute.arch.barrier_arrive(barrier_id=self.SCHED_BARRIER_WG0, number_of_threads=self.TOTAL_COMPUTE_THREADS)
+                cute.arch.barrier_arrive(
+                    barrier_id=self.SCHED_BARRIER_WG0,
+                    number_of_threads=self.TOTAL_COMPUTE_THREADS,
+                )
 
             warpgroup.wait_group(0)
 
             # ----- Fused pass: compute dS → registers, then stmatrix → sdS -----
-            # P4: broadcast partition of sGradSignal — eliminates n-coordinate cute.get
+            # Pass 4: broadcast partition of sGradSignal — eliminates n-coordinate cute.get
             if const_expr(self.is_dense):
                 sGS_cur_block = sGradSignal
             else:
@@ -846,7 +891,7 @@ class IndexerBackwardSm90:
                 else:
                     dw_h1 = dw_h1 + dw_val
 
-            # Bulk write dS to SMEM via stmatrix (replaces per-element scalar STS)
+            # Bulk write dS to SMEM via stmatrix (replaces per-element scalar shared-mem stores)
             tRsDS = tiled_r2s_ds.retile(acc_dS)
             cute.copy(tiled_r2s_ds, tRsDS, tRdDS)
             cute.arch.fence_view_async_shared()
@@ -856,9 +901,15 @@ class IndexerBackwardSm90:
             # ----- GEMM2 + GEMM3 (ping-pong, pipeline depth 2) -----
             # Ping-pong: wait for turn
             if compute_wg_idx == 0:
-                cute.arch.barrier(barrier_id=self.SCHED_BARRIER_WG0, number_of_threads=self.TOTAL_COMPUTE_THREADS)
+                cute.arch.barrier(
+                    barrier_id=self.SCHED_BARRIER_WG0,
+                    number_of_threads=self.TOTAL_COMPUTE_THREADS,
+                )
             else:
-                cute.arch.barrier(barrier_id=self.SCHED_BARRIER_WG1, number_of_threads=self.TOTAL_COMPUTE_THREADS)
+                cute.arch.barrier(
+                    barrier_id=self.SCHED_BARRIER_WG1,
+                    number_of_threads=self.TOTAL_COMPUTE_THREADS,
+                )
 
             # GEMM2: dK[D/2, I] = Qt_half[D/2, H] x dSt[I, H]
             acc_dK = cute.make_rmem_tensor(dk_acc_shape, Float32)
@@ -872,13 +923,19 @@ class IndexerBackwardSm90:
             else:
                 gemm(tmma3, acc_dQ, tDQrDS, tDQrKt_s2, zero_init=False, wg_wait=-1)
 
-            # Signal other WG: it can start its GEMM2+3 while we do STS/memory
+            # Signal other WG: it can start its GEMM2+3 while we do shared-mem stores / memory
             if compute_wg_idx == 0:
-                cute.arch.barrier_arrive(barrier_id=self.SCHED_BARRIER_WG1, number_of_threads=self.TOTAL_COMPUTE_THREADS)
+                cute.arch.barrier_arrive(
+                    barrier_id=self.SCHED_BARRIER_WG1,
+                    number_of_threads=self.TOTAL_COMPUTE_THREADS,
+                )
             else:
-                cute.arch.barrier_arrive(barrier_id=self.SCHED_BARRIER_WG0, number_of_threads=self.TOTAL_COMPUTE_THREADS)
+                cute.arch.barrier_arrive(
+                    barrier_id=self.SCHED_BARRIER_WG0,
+                    number_of_threads=self.TOTAL_COMPUTE_THREADS,
+                )
 
-            warpgroup.wait_group(1)  # GEMM2 done (acc_dK ready for STS)
+            warpgroup.wait_group(1)  # GEMM2 done (acc_dK ready to write to shared mem)
 
             # Deferred DMA wait: previous iteration's bulk reduce must finish
             # reading sdK_staging before we overwrite it (both WGs do their own reduce)
@@ -1110,7 +1167,12 @@ class IndexerBackwardSm90:
                 if topk_idx >= 0 and topk_idx < seqlen_k:
                     gK_raw = mK[topk_idx, None]
                     gK = cute.make_tensor(
-                        cute.make_ptr(self.k_dtype, gK_raw.iterator.llvm_ptr, cute.AddressSpace.gmem, assumed_align=16),
+                        cute.make_ptr(
+                            self.k_dtype,
+                            gK_raw.iterator.llvm_ptr,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
                         gK_raw.layout,
                     )
                     gChunks = cute.flat_divide(gK, (8,))
@@ -1147,6 +1209,7 @@ class IndexerBackwardSm90:
         sK,
         batch_idx,
         seq_idx,
+        seqlen_q,
         seqlen_k,
         tidx,
         mbar,
@@ -1155,19 +1218,6 @@ class IndexerBackwardSm90:
         """Dense mode K loading via TMA (sequential blocks, no scatter-gather)."""
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         wg_tidx = tidx % self.WARPGROUP_SIZE
-
-        sK_slice_0 = cute.composition(
-            sK[None, None, 0],
-            cute.make_layout((self.block_I, self.head_dim_padded)),
-        )
-        sK_slice_1 = cute.composition(
-            sK[None, None, 1],
-            cute.make_layout((self.block_I, self.head_dim_padded)),
-        )
-        sK_slice_2 = cute.composition(
-            sK[None, None, 2],
-            cute.make_layout((self.block_I, self.head_dim_padded)),
-        )
 
         k_consumed_0_phase = Int32(0)
         k_consumed_1_phase = Int32(0)
@@ -1189,7 +1239,8 @@ class IndexerBackwardSm90:
         idx_in_group = wg_tidx % GROUP_SIZE
         group_idx_local = wg_tidx // GROUP_SIZE
 
-        for bi in cutlass.range_constexpr(self.num_topk_blocks):
+        num_k_blocks = self._dense_num_k_blocks(seq_idx, seqlen_q, seqlen_k)
+        for bi in cutlass.range(0, num_k_blocks, unroll=1):
             stage = bi % NUM_K_STAGES
             n_block = bi
 
@@ -1204,8 +1255,14 @@ class IndexerBackwardSm90:
                     cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_2, k_consumed_2_phase)
                     k_consumed_2_phase ^= 1
 
-            sK_slice = sK_slice_0 if stage == 0 else (sK_slice_1 if stage == 1 else sK_slice_2)
-            mbar_k = (mbar + MBAR_K_LOADED_0) if stage == 0 else ((mbar + MBAR_K_LOADED_1) if stage == 1 else (mbar + MBAR_K_LOADED_2))
+            # Runtime stage → select the SMEM K-stage view and K_LOADED barrier
+            # by indexing/arithmetic; a constexpr-stage ternary doesn't lower in
+            # this runtime loop. K_LOADED_{0,1,2} are consecutive barriers.
+            sK_slice = cute.composition(
+                sK[None, None, stage],
+                cute.make_layout((self.block_I, self.head_dim_padded)),
+            )
+            mbar_k = mbar + MBAR_K_LOADED_0 + stage
 
             block_end = (n_block + 1) * self.block_I
             if block_end <= seqlen_k:
@@ -1237,7 +1294,12 @@ class IndexerBackwardSm90:
                     if k_pos < seqlen_k:
                         gK_raw = mKScalar[k_pos, None]
                         gK = cute.make_tensor(
-                            cute.make_ptr(self.k_dtype, gK_raw.iterator.llvm_ptr, cute.AddressSpace.gmem, assumed_align=16),
+                            cute.make_ptr(
+                                self.k_dtype,
+                                gK_raw.iterator.llvm_ptr,
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
+                            ),
                             gK_raw.layout,
                         )
                         gChunks = cute.flat_divide(gK, (8,))
@@ -1266,6 +1328,10 @@ class IndexerBackwardSm90:
 # =============================================================================
 # Factory
 # =============================================================================
+# compile_key -> compiled GEMM kernel. Single-layer cache (matches the forward
+# ``_interface.py`` and ``_score_grad_cute_cache``): the key holds only params
+# that change the generated code, and entries are filled lazily on first
+# execute (``_ensure_compiled``) because ``cute.compile`` needs real tensors.
 _compile_cache: dict = {}
 
 
@@ -1281,17 +1347,23 @@ def indexer_backward_sm90(
     topk_indices_global: bool = True,
 ):
     # ``grad_scale`` is intentionally **not** an argument: it's a host scalar
-    # passed to ``_run`` at call time (forwarded into the score-grad
-    # kernel as a runtime ``Float32``). Keeping it out of this factory's
-    # signature + cache key avoids spurious recompiles.
+    # passed to ``_run`` at call time (forwarded into the score-grad kernel as a
+    # runtime ``Float32``). Keeping it out of the cache key avoids spurious
+    # recompiles.
+    #
+    # ``batch``/``seqlen``/``seqlen_k`` stay in the signature (the ``api.py``
+    # call site passes them positionally) but are **not** keyed: in the kernel
+    # they are runtime-only (dynamic tensor extents + ``Int32`` grid/args, with
+    # ``seqlen``/``seqlen_k`` forwarded as ``cutlass.Int32`` at call time), so a
+    # single compiled kernel serves every shape. Keying them would force
+    # recompiles under varlen / changing batch.
     #
     # Use probability-domain score input (predict) to match SM100 convention.
     # The kernel implements both modes behind const_expr(index_is_log); the
     # unified predict path keeps the SM90 and SM100 dispatcher data flows
-    # identical.
+    # identical. ``score_input_is_log`` is const_expr-branched, so it IS keyed.
     score_input_is_log = False
-    key = (
-        batch,
+    return _build_cute_dsl_kernel(
         seqlen,
         seqlen_k,
         heads,
@@ -1299,23 +1371,9 @@ def indexer_backward_sm90(
         topk,
         sm_scale,
         block_I,
-        score_input_is_log,
-        topk_indices_global,
+        score_input_is_log=score_input_is_log,
+        topk_indices_global=topk_indices_global,
     )
-    if key not in _compile_cache:
-        _compile_cache[key] = _build_cute_dsl_kernel(
-            batch,
-            seqlen,
-            seqlen_k,
-            heads,
-            dim,
-            topk,
-            sm_scale,
-            block_I,
-            score_input_is_log=score_input_is_log,
-            topk_indices_global=topk_indices_global,
-        )
-    return _compile_cache[key]
 
 
 class ScoreGradSm90:
@@ -1495,7 +1553,6 @@ def _score_grad_inplace(
 
 
 def _build_cute_dsl_kernel(
-    batch,
     seqlen,
     seqlen_k,
     heads,
@@ -1520,20 +1577,46 @@ def _build_cute_dsl_kernel(
         topk_indices_global=topk_indices_global,
     )
 
-    compiled_holder = [None]
+    # Only params that change the generated code (mirrors forward _interface.py).
+    # ``seqlen``/``seqlen_k``/``sm_scale`` are NOT keyed: they're forwarded as
+    # runtime ``cutlass.Int32``/``Float32`` args below (seqlen* unused on the
+    # sparse path).
+    compile_key = (heads, dim, topk, block_I, score_input_is_log, topk_indices_global)
 
-    def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, current_stream=None):
-        """Lazy-compile the GEMM kernel (kernel 2)."""
+    def _ensure_compiled(
+        IndexQ,
+        Weights,
+        IndexK,
+        dIndexQ,
+        dWeights,
+        dIndexK_f32,
+        GradSignal,
+        TopkIndices,
+        current_stream=None,
+    ):
+        """Lazy-compile the GEMM kernel (kernel 2) on first execute (needs real tensors)."""
         s = _resolve_stream(current_stream)
-        if compiled_holder[0] is None:
-            cute_args = [to_cute_tensor(t) for t in [IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices]]
+        if compile_key not in _compile_cache:
+            cute_args = [
+                to_cute_tensor(t)
+                for t in [
+                    IndexQ,
+                    Weights,
+                    IndexK,
+                    dIndexQ,
+                    dWeights,
+                    dIndexK_f32,
+                    GradSignal,
+                    TopkIndices,
+                ]
+            ]
 
             # Pass dummy Int32 values for max_seqlen_q/k: the kernel's __call__
             # signature declares these as ``Int32 = None`` and the JIT cannot
             # cast ``None`` to ``Int32`` (raises DSLRuntimeError). They are
             # only consumed when is_varlen=True (dense + cu_seqlens), so the
             # values here are unused but must be valid Int32.
-            compiled_holder[0] = cute.compile(
+            _compile_cache[compile_key] = cute.compile(
                 kernel_obj,
                 *cute_args,
                 cutlass.Float32(sm_scale),
@@ -1545,11 +1628,31 @@ def _build_cute_dsl_kernel(
                 options=compile_options(),
             )
 
-    def _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, current_stream=None):
+    def _run_gemm_only(
+        IndexQ,
+        Weights,
+        IndexK,
+        dIndexQ,
+        dWeights,
+        dIndexK_f32,
+        GradSignal,
+        TopkIndices,
+        current_stream=None,
+    ):
         """Run only kernel 2 (GEMM). Caller must have run kernel 1 and zeroed dIndexK_f32."""
         s = _resolve_stream(current_stream)
-        _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, current_stream=current_stream)
-        compiled_holder[0](
+        _ensure_compiled(
+            IndexQ,
+            Weights,
+            IndexK,
+            dIndexQ,
+            dWeights,
+            dIndexK_f32,
+            GradSignal,
+            TopkIndices,
+            current_stream=current_stream,
+        )
+        _compile_cache[compile_key](
             IndexQ,
             Weights,
             IndexK,
@@ -1566,7 +1669,20 @@ def _build_cute_dsl_kernel(
             cutlass.Int32(seqlen_k),
         )
 
-    def _run(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK, AttnScore, IndexScore, TopkIndices, GradLoss, grad_scale, current_stream=None):
+    def _run(
+        IndexQ,
+        Weights,
+        IndexK,
+        dIndexQ,
+        dWeights,
+        dIndexK,
+        AttnScore,
+        IndexScore,
+        TopkIndices,
+        GradLoss,
+        grad_scale,
+        current_stream=None,
+    ):
         # ``grad_scale`` is a host scalar (Python float) forwarded as a
         # runtime ``Float32`` arg to the score-grad kernel; changing it
         # across calls does not trigger recompilation.
@@ -1582,12 +1698,32 @@ def _build_cute_dsl_kernel(
 
         if dIndexK.dtype == torch.float32:
             # Caller already provides f32 buffer (e.g., __init__.py); write directly
-            _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK, AttnScore, TopkIndices, current_stream=current_stream)
+            _run_gemm_only(
+                IndexQ,
+                Weights,
+                IndexK,
+                dIndexQ,
+                dWeights,
+                dIndexK,
+                AttnScore,
+                TopkIndices,
+                current_stream=current_stream,
+            )
         else:
             # Need separate f32 buffer for atomicAdd, then convert back
             with _torch_stream_context(current_stream):
                 dIndexK_f32 = torch.zeros_like(dIndexK, dtype=torch.float32)
-            _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices, current_stream=current_stream)
+            _run_gemm_only(
+                IndexQ,
+                Weights,
+                IndexK,
+                dIndexQ,
+                dWeights,
+                dIndexK_f32,
+                AttnScore,
+                TopkIndices,
+                current_stream=current_stream,
+            )
             with _torch_stream_context(current_stream):
                 dIndexK.copy_(dIndexK_f32)
 

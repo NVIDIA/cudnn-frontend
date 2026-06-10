@@ -21,7 +21,7 @@ namespace graph {
 
 inline std::optional<float>
 get_rescale_threshold_from_env() {
-    auto const* env_value = std::getenv("CUDNN_RESCALE_THRESHOLD");
+    auto const* env_value = get_environment("CUDNN_RESCALE_THRESHOLD");
     if (env_value == nullptr || env_value[0] == '\0') {
         return std::nullopt;
     }
@@ -93,6 +93,15 @@ class Tensor_attributes {
             error_code_t::ATTRIBUTE_NOT_SET,
             "Tensor '" + name + "' can't have both compile-time constant and runtime pass_by_value.");
 
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            has_ragged_offset_multiplier() && !ragged_offset,
+            error_code_t::ATTRIBUTE_NOT_SET,
+            "Tensor '" + name + "' with ragged offset multiplier must also have a ragged offset tensor.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(ragged_offset_multiplier <= 0,
+                                       error_code_t::INVALID_VALUE,
+                                       "Tensor '" + name + "' ragged offset multiplier must be positive.");
+
         return {error_code_t::OK, ""};
     }
 
@@ -118,9 +127,10 @@ class Tensor_attributes {
     bool uid_assigned                  = false;
 
     std::shared_ptr<Tensor_attributes> ragged_offset;
-    int64_t alignment        = 16;  // Default to 16 bytes
-    int64_t vector_count     = 1;   // Default to 1 (no vectorization)
-    int64_t vector_dimension = -1;  // Default to -1 (not set)
+    int64_t ragged_offset_multiplier = 1;
+    int64_t alignment                = 16;  // Default to 16 bytes
+    int64_t vector_count             = 1;   // Default to 1 (no vectorization)
+    int64_t vector_dimension         = -1;  // Default to -1 (not set)
 
     auto
     fill_from_context(detail::Context const& context) -> Tensor_attributes& {
@@ -323,6 +333,16 @@ class Tensor_attributes {
         return ragged_offset;
     }
 
+    int64_t
+    get_ragged_offset_multiplier() const {
+        return ragged_offset_multiplier;
+    }
+
+    bool
+    has_ragged_offset_multiplier() const {
+        return ragged_offset_multiplier != 1;
+    }
+
     auto
     set_is_virtual(bool const value) -> Tensor_attributes& {
         is_virtual = value;
@@ -445,6 +465,12 @@ class Tensor_attributes {
     auto
     set_ragged_offset(std::shared_ptr<Tensor_attributes> const& value) -> Tensor_attributes& {
         ragged_offset = value;
+        return *this;
+    }
+
+    auto
+    set_ragged_offset_multiplier(int64_t value) -> Tensor_attributes& {
+        ragged_offset_multiplier = value;
         return *this;
     }
 };
@@ -1339,7 +1365,7 @@ class Reduction_attributes : public Attributes<Reduction_attributes> {
     bool is_deterministic = false;
 
    public:
-    enum class input_names { X };
+    enum class input_names { X, Group_offset };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
@@ -1370,6 +1396,12 @@ class Reduction_attributes : public Attributes<Reduction_attributes> {
     Reduction_attributes&
     set_is_deterministic(bool value) {
         is_deterministic = value;
+        return *this;
+    }
+
+    Reduction_attributes&
+    set_group_offset(std::shared_ptr<Tensor_attributes> value) {
+        inputs[input_names::Group_offset] = std::move(value);
         return *this;
     }
 };
@@ -1978,6 +2010,8 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         Bias,
         SEQ_LEN_Q,
         SEQ_LEN_KV,
+        CU_SEQ_LEN_Q,
+        CU_SEQ_LEN_KV,
         Seed,
         Offset,
         Dropout_mask,
@@ -2100,6 +2134,18 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     SDPA_attributes&
     set_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
         inputs[SDPA_attributes::input_names::SEQ_LEN_KV] = std::move(value);
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_cu_seq_len_q(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_attributes::input_names::CU_SEQ_LEN_Q] = std::move(value);
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_cu_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_attributes::input_names::CU_SEQ_LEN_KV] = std::move(value);
         return *this;
     }
 
@@ -2735,7 +2781,7 @@ class DiagonalBandMask_attributes : public Attributes<DiagonalBandMask_attribute
     PointwiseMode_t comparison_mode = PointwiseMode_t::CMP_GT;
 
    public:
-    enum class input_names { X, SEQ_LEN_Q, SEQ_LEN_KV, LeftBound, ShiftRightBound, B };
+    enum class input_names { X, SEQ_LEN_Q, SEQ_LEN_KV, CU_SEQ_LEN_Q, CU_SEQ_LEN_KV, LeftBound, ShiftRightBound, B };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;

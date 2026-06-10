@@ -117,9 +117,9 @@ def _sparse_indexer_score_recompute(
     compute_capability = _get_device_capability()
 
     if compute_capability >= 10:
-        # sm_scale participates in compile_key because kernels specialize on
-        # the literal value (cutlass.Float32 is baked as a constant).
-        # topk_indices_global also bakes in (controls compile-time global→local
+        # sm_scale is a runtime arg (passed as cutlass.Float32), so it is
+        # excluded from compile_key.
+        # topk_indices_global bakes in (controls compile-time global→local
         # decode of topk ids).
         compile_key = (
             "indexer",
@@ -132,7 +132,6 @@ def _sparse_indexer_score_recompute(
             kv_stage,
             have_topk_length,
             topk_in_smem,
-            float(sm_scale),
             topk_indices_global,
         )
 
@@ -772,11 +771,8 @@ def _dense_indexer_score_recompute(
         n_block_size,
         k_block_size,
         kv_stage,
-        float(sm_scale),
         ratio,
         is_varlen,
-        seqlen_q,
-        seqlen_k,
     )
 
     if compile_key not in _dense_indexer_score_recompute.compile_cache:
@@ -948,8 +944,6 @@ def _dense_attn_score_recompute(
         kv_stage,
         ratio,
         is_varlen,
-        seqlen_q,
-        seqlen_k,
     )
 
     if compile_key not in _dense_attn_score_recompute.compile_cache:

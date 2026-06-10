@@ -121,8 +121,7 @@ def parse_args():
         "--fa4_num_splits",
         default=None,
         type=int,
-        help="FlashAttention-4 only: force num_splits (KV split count). "
-             "Default is None (FA4 picks automatically).",
+        help="FlashAttention-4 only: force num_splits (KV split count). " "Default is None (FA4 picks automatically).",
     )
     parser.add_argument(
         "--fwd_bwd",

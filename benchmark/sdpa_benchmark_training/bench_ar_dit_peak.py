@@ -9,6 +9,7 @@ CSV schema matches the rest of ``benchmark.sdpa_benchmark_training``
 plus an extra ``num_splits`` column so the per-seqlen winners are
 visible.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -73,12 +74,19 @@ def main():
             try:
                 r = run("cudnn", dt, s_q)
                 log.info(f"cudnn {dt:>8} s_q={s_q:>5}: {r['time_ms']:.3f} ms  {r['tflops']:.1f} TF")
-                rows.append(dict(
-                    backend="cudnn", data_type=dt, q_seqlen=s_q, kv_seqlen=S_KV,
-                    num_splits=0,
-                    time_ms=r["time_ms"], tflops=r["tflops"],
-                    gpu_name=gpu_name, cudnn_backend_version=cudnn_be,
-                ))
+                rows.append(
+                    dict(
+                        backend="cudnn",
+                        data_type=dt,
+                        q_seqlen=s_q,
+                        kv_seqlen=S_KV,
+                        num_splits=0,
+                        time_ms=r["time_ms"],
+                        tflops=r["tflops"],
+                        gpu_name=gpu_name,
+                        cudnn_backend_version=cudnn_be,
+                    )
+                )
             except Exception as e:
                 log.info(f"cudnn {dt} s_q={s_q} FAILED: {e}")
 
@@ -89,21 +97,27 @@ def main():
                 r = run("flash_attention_4", "bfloat16", s_q, fa4_num_splits=ks)
                 log.info(f"  fa4  bfloat16 s_q={s_q:>5} num_splits={ks:>2}: {r['time_ms']:.3f} ms  {r['tflops']:.1f} TF")
                 if best is None or r["time_ms"] < best["time_ms"]:
-                    best = dict(r); best["num_splits"] = ks
+                    best = dict(r)
+                    best["num_splits"] = ks
             except Exception as e:
                 log.info(f"  fa4  bfloat16 s_q={s_q} num_splits={ks} FAILED: {e}")
         if best is not None:
             log.info(f"fa4  bfloat16 s_q={s_q:>5} BEST num_splits={best['num_splits']:>2}: {best['time_ms']:.3f} ms  {best['tflops']:.1f} TF")
-            rows.append(dict(
-                backend="flash_attention_4", data_type="bfloat16",
-                q_seqlen=s_q, kv_seqlen=S_KV,
-                num_splits=best["num_splits"],
-                time_ms=best["time_ms"], tflops=best["tflops"],
-                gpu_name=gpu_name, cudnn_backend_version=cudnn_be,
-            ))
+            rows.append(
+                dict(
+                    backend="flash_attention_4",
+                    data_type="bfloat16",
+                    q_seqlen=s_q,
+                    kv_seqlen=S_KV,
+                    num_splits=best["num_splits"],
+                    time_ms=best["time_ms"],
+                    tflops=best["tflops"],
+                    gpu_name=gpu_name,
+                    cudnn_backend_version=cudnn_be,
+                )
+            )
 
-    fields = ["backend", "data_type", "q_seqlen", "kv_seqlen", "num_splits",
-              "time_ms", "tflops", "gpu_name", "cudnn_backend_version"]
+    fields = ["backend", "data_type", "q_seqlen", "kv_seqlen", "num_splits", "time_ms", "tflops", "gpu_name", "cudnn_backend_version"]
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="") as f:

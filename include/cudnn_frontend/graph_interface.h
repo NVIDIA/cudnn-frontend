@@ -1007,6 +1007,15 @@ class Graph : public ICudnn, public INode {
         return ret_val;
     }
 
+    // Structured counterpart of get_plan_name_at_index(): engine index + knob
+    // choices, for replay via create_execution_plan().
+    error_t
+    get_engine_and_knobs_at_index(int64_t plan_index,
+                                  int64_t &engine_id,
+                                  std::unordered_map<KnobType_t, int64_t> &knobs) const {
+        return plans.get_engine_and_knobs_at_index(plan_index, engine_id, knobs);
+    }
+
     error_t
     get_workspace_size(int64_t &cudnn_workspace_size) const {
         return get_workspace_size_plan_at_index(plans.candidate, cudnn_workspace_size);
@@ -1077,7 +1086,7 @@ class Graph : public ICudnn, public INode {
                                        "Runtime workspace query with override shapes requires cuDNN v9.23.0"};
         NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92300, cudnn_ver_error);
 
-#if (CUDNN_VERSION < 92300) || (CUDNN_VERSION >= 99900)
+#if (CUDNN_VERSION < 92300)
         return cudnn_ver_error;
 #endif
 
@@ -1624,6 +1633,14 @@ class Graph : public ICudnn, public INode {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j = json::from_ubjson(data);
 
+        // Clear deserialize-owned containers so a re-deserialize on the same Graph
+        // does not feed prepare_variant_pack_template() with stale entries from a
+        // prior deserialize(handle, old_data).
+        deserialized_tensor_properties.clear();
+        deserialized_pass_by_value.clear();
+        deserialized_workspace_modifications.clear();
+        tensors_to_dump.clear();
+
         if (j.contains("graph_uid") && !j["graph_uid"].is_null()) {
             graph_uid = j["graph_uid"].get<uint64_t>();
         }
@@ -1675,6 +1692,11 @@ class Graph : public ICudnn, public INode {
         // Initialize the execution caches from deserialized data
         cached_pass_by_value           = deserialized_pass_by_value;
         cached_workspace_modifications = deserialized_workspace_modifications;
+
+        // Reset prep state in case this Graph is being re-deserialized; otherwise the
+        // eager prep below would early-return with the old slot layout.
+        varpack_prep_state->prepared.store(false, std::memory_order_release);
+        varpack_template = {};
 
         // Eager prep, matching what build_plans() does for fresh-build graphs.
         CHECK_CUDNN_FRONTEND_ERROR(prepare_variant_pack_template());
@@ -2069,16 +2091,14 @@ class Graph : public ICudnn, public INode {
         VarpackPrepStateBox(VarpackPrepStateBox &&) noexcept = default;
         VarpackPrepStateBox &
         operator=(VarpackPrepStateBox &&) noexcept = default;
-        VarpackPrepStateBox(VarpackPrepStateBox const &other) : ptr(std::make_unique<VarpackPrepState>()) {
-            if (other.ptr) {
-                ptr->prepared.store(other.ptr->prepared.load(std::memory_order_acquire), std::memory_order_release);
-            }
-        }
+        // Copy semantics: never copy the prepared flag. The cached template_ptrs
+        // store raw addresses into the source Graph's pass-by-value storage; a
+        // copied Graph must rebuild its own template on first use.
+        VarpackPrepStateBox(VarpackPrepStateBox const & /*other*/) : ptr(std::make_unique<VarpackPrepState>()) {}
         VarpackPrepStateBox &
         operator=(VarpackPrepStateBox const &other) {
             if (this != &other) {
-                VarpackPrepStateBox tmp(other);
-                ptr.swap(tmp.ptr);
+                ptr = std::make_unique<VarpackPrepState>();
             }
             return *this;
         }

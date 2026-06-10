@@ -938,7 +938,7 @@ class FlashAttentionDSABackwardSm100:
 
             tdKVrQT = QdS_tiled_mma.make_fragment_A(sQT)
             tdKVrdS = QdS_tiled_mma.make_fragment_B(sdS)
-            # Ugly, but I don't know how to handle the correct modes for cute.gemm
+            # Awkward, but I don't know a cleaner way to handle the modes for cute.gemm
             tdKVrQT_shape = (tdKVrQT.shape[0], 1, tdKVrQT.shape[1], tdKVrQT.shape[2], tdKVrQT.shape[3])
             tdKVrQT_stride = (tdKVrQT.stride[0], 0, tdKVrQT.stride[1], tdKVrQT.stride[2], tdKVrQT.stride[3])
             tdKVrQT = cute.make_tensor(tdKVrQT.iterator, cute.make_layout(tdKVrQT_shape, stride=tdKVrQT_stride))

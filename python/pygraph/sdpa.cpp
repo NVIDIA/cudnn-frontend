@@ -24,6 +24,8 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        bool const use_padding_mask,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
                        cudnn_frontend::DiagonalAlignment_t const& diagonal_alignment,
                        py::object const& left_bound,
                        py::object const& right_bound,
@@ -54,6 +56,8 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                           .set_padding_mask(use_padding_mask)
                           .set_seq_len_q(seq_len_q)
                           .set_seq_len_kv(seq_len_kv)
+                          .set_cu_seq_len_q(cu_seq_len_q)
+                          .set_cu_seq_len_kv(cu_seq_len_kv)
                           .set_diagonal_alignment(diagonal_alignment)
                           .set_compute_data_type(compute_data_type)
                           ._set_mma_core_mode(mma_core_mode)
@@ -246,7 +250,9 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-              bool const unfuse_fma) {
+              bool const unfuse_fma,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv) {
     cudnn_frontend::DataType_t mma_core_mode                            = cudnn_frontend::DataType_t::HALF;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_q = nullptr;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_k = nullptr;
@@ -314,6 +320,8 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          use_padding_mask,
                                          seq_len_q,
                                          seq_len_kv,
+                                         cu_seq_len_q,
+                                         cu_seq_len_kv,
                                          actual_diagonal_alignment,
                                          actual_left_bound,
                                          actual_right_bound,
@@ -535,6 +543,9 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token) {
     cudnn_frontend::DataType_t mma_core_mode                             = cudnn_frontend::DataType_t::FP8_E4M3;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> block_mask = nullptr;
+    // cu_seq_len_q/cu_seq_len_kv are not exposed via the fp8 path.
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> cu_seq_len_q  = nullptr;
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> cu_seq_len_kv = nullptr;
 
     // Handle sliding_window to left_bound mapping for backward compatibility
     py::object actual_left_bound = left_bound;
@@ -595,6 +606,8 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          use_padding_mask,
                                          seq_len_q,
                                          seq_len_kv,
+                                         cu_seq_len_q,
+                                         cu_seq_len_kv,
                                          actual_diagonal_alignment,
                                          actual_left_bound,
                                          actual_right_bound,
@@ -1093,6 +1106,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("score_sum_exp", nullptr),
           py::arg_v("sink_token", nullptr),
           py::arg_v("unfuse_fma", false),
+          py::arg_v("cu_seq_len_q", nullptr),
+          py::arg_v("cu_seq_len_kv", nullptr),
           R"pbdoc(
                 Perform scaled dot product attention.
 
@@ -1104,8 +1119,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     bias (Optional[cudnn_tensor]): The bias data for attention. Default is None.
                     use_alibi_mask (Optional[bool]): Whether to use alibi mask. Default is False.
                     use_padding_mask (Optional[bool]): Whether to use padding mask. Default is False.
-                    seq_len_q (Optional[cudnn_tensor]): The sequence length of the query.
-                    seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key.
+                    seq_len_q (Optional[cudnn_tensor]): The sequence length of the query. Accepts shape (b, 1, 1, 1) or 1-D (b,) (promoted automatically).
+                    seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key. Accepts shape (b, 1, 1, 1) or 1-D (b,) (promoted automatically).
                     dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
                     rng_dump (Optional[cudnn_tensor]): Debug tensor to dump the Philox RNG dropout mask. Default is None.
                     paged_attention_k_table (Optional[cudnn_tensor]): The page table to look up offsets into 'k'
@@ -1119,6 +1134,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     score_sum_exp (Optional[cudnn_tensor]): The numerically stable sum of exponents using normalized values wrt max score.
                     sink_token (Optional[cudnn_tensor]): The sink attention token tensor. Shape is (1, h_q, 1, 1), type is float32.
                     unfuse_fma (Optional[bool]): For SM100: use unfused __fmul_rn + __fadd_rn instead of ffma2 in softmax. Default is False.
+                    cu_seq_len_q (Optional[cudnn_tensor]): Cumulative sequence length of the query, shape (b+1, 1, 1, 1) or 1-D (b+1,) (promoted automatically), int32 or int64. Mutually exclusive with seq_len_q. Requires cuDNN 9.24.0 or newer and the UNIFIED implementation.
+                    cu_seq_len_kv (Optional[cudnn_tensor]): Cumulative sequence length of the key, shape (b+1, 1, 1, 1) or 1-D (b+1,) (promoted automatically), int32 or int64. Mutually exclusive with seq_len_kv. Requires cuDNN 9.24.0 or newer and the UNIFIED implementation.
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and diagonal_band_right_bound=0. Default is TOP_LEFT.
                     diagonal_band_left_bound (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
@@ -1183,8 +1200,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     dBias (Optional[cudnn_tensor]): The dBias data for attention. Default is None.
                     use_alibi_mask (Optional[bool]): Whether to use alibi mask. Default is False.
                     use_padding_mask (Optional[bool]): Whether to use padding mask. Default is False.
-                    seq_len_q (Optional[cudnn_tensor]): The sequence length of the query.
-                    seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key.
+                    seq_len_q (Optional[cudnn_tensor]): The sequence length of the query. Accepts shape (b, 1, 1, 1) or 1-D (b,) (promoted automatically).
+                    seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key. Accepts shape (b, 1, 1, 1) or 1-D (b,) (promoted automatically).
                     max_total_seq_len_q (Optional[int]): The maximum number of query sequence tokens for all batches, used for workspace allocation,
                     max_total_seq_len_kv (Optional[int]): The maximum number of key/value sequence tokens for all batches, used for workspace allocation,
                     dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
@@ -1263,8 +1280,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     bias (Optional[cudnn_tensor]): The bias data for attention. Default is None.
                     use_alibi_mask (Optional[bool]): Whether to use alibi mask. Default is False.
                     use_padding_mask (Optional[bool]): Whether to use padding mask. Default is False.
-                    seq_len_q (Optional[cudnn_tensor]): The sequence length of the query.
-                    seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key.
+                    seq_len_q (Optional[cudnn_tensor]): The sequence length of the query. Accepts shape (b, 1, 1, 1) or 1-D (b,) (promoted automatically).
+                    seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key. Accepts shape (b, 1, 1, 1) or 1-D (b,) (promoted automatically).
                     dropout (Optional[Union[Tuple[(probability: float, seed: cudnn_tensor, offset: cudnn_tensor)], Tuple[mask: cudnn_tensor, scale: cudnn_tensor]]]): Whether to do dropout. Default is None.
                     rng_dump (Optional[cudnn_tensor]): Debug tensor to dump the Philox RNG dropout mask. Default is None.
                     paged_attention_k_table (Optional[cudnn_tensor]): The page table to look up offsets into 'k'. Default is None.
@@ -1417,8 +1434,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     scale_dP (cudnn_tensor): Scale factor for dP gradient.
                     attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
                     use_padding_mask (bool): Whether it is an inference step or training step.
-                    seq_len_q (Optional[cudnn_tensor]): The sequence length of the query.
-                    seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key.
+                    seq_len_q (Optional[cudnn_tensor]): The sequence length of the query. Accepts shape (b, 1, 1, 1) or 1-D (b,) (promoted automatically).
+                    seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key. Accepts shape (b, 1, 1, 1) or 1-D (b,) (promoted automatically).
                     use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
                     use_causal_mask_bottom_right (Optional[bool]): Whether to use bottom right aligned causal mask. Default is False.
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. Default is TOP_LEFT.
@@ -1498,8 +1515,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                           descale_dO_T (cudnn_tensor): Descale factor for transposed output gradient.
                           attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
                           use_padding_mask (bool): Whether it is an inference step or training step.
-                          seq_len_q (Optional[cudnn_tensor]): The sequence length of the query.
-                          seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key.
+                          seq_len_q (Optional[cudnn_tensor]): The sequence length of the query. Accepts shape (b, 1, 1, 1) or 1-D (b,) (promoted automatically).
+                          seq_len_kv (Optional[cudnn_tensor]): The sequence length of the key. Accepts shape (b, 1, 1, 1) or 1-D (b,) (promoted automatically).
                           use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
                           use_causal_mask_bottom_right (Optional[bool]): Whether to use bottom right aligned causal mask. Default is False.
                           diagonal_alignment (Optional[cudnn.diagonal_alignment]): Alignment of the diagonal band. Default is TOP_LEFT.

@@ -1046,7 +1046,7 @@ class PersistentDenseGemmKernel:
                 #
                 # Wait for accumulator buffer full
                 #
-                acc_pipeline.consumer_wait(acc_consumer_state)  # Get for the single CGA
+                acc_pipeline.consumer_wait(acc_consumer_state)  # Get for the single cluster
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gAB12 = cute.group_modes(bSG_gAB12, 1, cute.rank(bSG_gAB12))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
