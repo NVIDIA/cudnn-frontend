@@ -493,8 +493,7 @@ to_base64(const void* data, size_t total_bytes) {
 }
 
 inline error_t
-log_dump_tensor_content(int64_t tid,
-                        int64_t uid,
+log_dump_tensor_content(int64_t uid,
                         std::string const& name,
                         void* ptr,
                         size_t num_elements,
@@ -530,8 +529,7 @@ log_dump_tensor_content(int64_t tid,
         default:
             data_str = to_hex(host_buf.data(), num_elements, elem_size);
     }
-    CUDNN_FE_LOG_LABEL_ENDL("Tensor Dump tid: " << tid << " uid: " << uid << " Name: " << name
-                                                << " Data: " << data_str);
+    CUDNN_FE_LOG_LABEL_ENDL("Tensor Dump uid: " << uid << " Name: " << name << " Data: " << data_str);
     return {error_code_t::OK, ""};
 }
 

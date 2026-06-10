@@ -49,7 +49,6 @@ enum class ScalarType {
 class Tensor_attributes {
    public:
     using uid_t = int64_t;
-    using tid_t = int64_t;
 
     // There are two usecases of pass by value tensors:
     // 1. Fused scalar constants
@@ -124,7 +123,6 @@ class Tensor_attributes {
     std::optional<pass_by_values_t> compile_time_constant_value = std::nullopt;
 
     TensorReordering_t reordering_type = TensorReordering_t::NONE;
-    tid_t tid                          = 0;
     uid_t uid                          = 0;
     bool uid_assigned                  = false;
 
@@ -440,11 +438,6 @@ class Tensor_attributes {
         return *this;
     }
 
-    tid_t
-    get_tid() const {
-        return tid;
-    }
-
     uid_t
     get_uid() const {
         return uid;
@@ -466,16 +459,6 @@ class Tensor_attributes {
     set_uid(uid_t value) -> Tensor_attributes& {
         uid          = value;
         uid_assigned = true;
-        return *this;
-    }
-
-   private:
-    friend class Graph;
-    friend class INode;
-
-    auto
-    assign_tid(tid_t value) -> Tensor_attributes& {
-        tid = value;
         return *this;
     }
 

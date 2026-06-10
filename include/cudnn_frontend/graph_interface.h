@@ -78,6 +78,25 @@ class Graph : public ICudnn, public INode {
     std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>> tensors_to_dump;
 
     error_t
+    materialize_tensor_uids() const {
+        std::unordered_set<Tensor_attributes::uid_t> materialized_uids;
+        std::unordered_set<Tensor_attributes const *> visited_tensors;
+        Tensor_attributes::uid_t potential_uid = 1;
+
+        for (auto const &input : full_graph_inputs) {
+            CHECK_CUDNN_FRONTEND_ERROR(
+                detail::materialize_uid(input, potential_uid, materialized_uids, visited_tensors));
+        }
+        for (auto const &output : full_graph_outputs) {
+            CHECK_CUDNN_FRONTEND_ERROR(
+                detail::materialize_uid(output, potential_uid, materialized_uids, visited_tensors));
+        }
+        CHECK_CUDNN_FRONTEND_ERROR(materialize_uids_subtree(potential_uid, materialized_uids, visited_tensors));
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
     get_pre_assigned_uids(std::unordered_set<Tensor_attributes::uid_t> &used_uids) {
         for (auto const &input : full_graph_inputs) {
             if (input->has_uid()) {
@@ -126,14 +145,8 @@ class Graph : public ICudnn, public INode {
                 size_t num_elements = 1;
                 for (auto d : dims) num_elements *= static_cast<size_t>(d);
                 size_t elem_size = detail::get_data_type_size(tensor->get_data_type());
-                CHECK_CUDNN_FRONTEND_ERROR(detail::log_dump_tensor_content(tensor->get_tid(),
-                                                                           it->first,
-                                                                           tensor->get_name(),
-                                                                           it->second,
-                                                                           num_elements,
-                                                                           elem_size,
-                                                                           fmt,
-                                                                           stream));
+                CHECK_CUDNN_FRONTEND_ERROR(detail::log_dump_tensor_content(
+                    it->first, tensor->get_name(), it->second, num_elements, elem_size, fmt, stream));
             }
         }
 
@@ -941,6 +954,7 @@ class Graph : public ICudnn, public INode {
     error_t
     validate() {
         CUDNN_FE_LOG_BANNER("  VALIDATING GRAPH  ");
+        CHECK_CUDNN_FRONTEND_ERROR(materialize_tensor_uids());
         CUDNN_FE_LOG(*this << std::endl;);
 
         // First validate all inputs that the user set.
@@ -1630,6 +1644,7 @@ class Graph : public ICudnn, public INode {
     serialize(std::vector<uint8_t> &data, bool serialize_structure = true) const {
         CUDNN_FE_LOG_BANNER(" SERIALIZE PLAN  ");
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+        CHECK_CUDNN_FRONTEND_ERROR(materialize_tensor_uids());
         json j;
         // Optionally serialize the graph structure (nodes/tensors).
         if (serialize_structure) {
@@ -2474,14 +2489,14 @@ class Graph : public ICudnn, public INode {
         j["cudnn_frontend_version"] = CUDNN_FRONTEND_VERSION;
         j["nodes"]                  = json::array();
         j["tensors"]                = json::array();
-        std::map<Tensor_attributes::tid_t, json> tensors;
+        std::map<Tensor_attributes::uid_t, json> tensors;
         auto add_tensor = [&](json &refs, std::string const &port_name, json const &tensor_info) {
             if (tensor_info.is_null()) {
                 return;
             }
-            auto tensor_tid = tensor_info.at("tid").get<Tensor_attributes::tid_t>();
-            refs[port_name] = tensor_tid;
-            tensors.emplace(tensor_tid, tensor_info);
+            auto tensor_uid = tensor_info.at("uid").get<Tensor_attributes::uid_t>();
+            refs[port_name] = tensor_uid;
+            tensors.emplace(tensor_uid, tensor_info);
         };
         for (const auto &sub_node : full_json["nodes"]) {
             auto short_node       = sub_node;
@@ -2566,21 +2581,21 @@ class Graph : public ICudnn, public INode {
         RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains("tensors") || !j["tensors"].is_array(),
                                        error_code_t::UNSUPPORTED_GRAPH_FORMAT,
                                        "Serialized graph tensors must be a list.");
-        std::map<Tensor_attributes::tid_t, json> tensor_table;
+        std::map<Tensor_attributes::uid_t, json> tensor_table;
         for (auto const &tensor_info : j["tensors"]) {
-            auto tensor_tid = tensor_info.at("tid").get<Tensor_attributes::tid_t>();
-            RETURN_CUDNN_FRONTEND_ERROR_IF(!tensor_table.emplace(tensor_tid, tensor_info).second,
+            auto tensor_uid = tensor_info.at("uid").get<Tensor_attributes::uid_t>();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!tensor_table.emplace(tensor_uid, tensor_info).second,
                                            error_code_t::UNSUPPORTED_GRAPH_FORMAT,
-                                           "Serialized graph has duplicate tensor tid " + std::to_string(tensor_tid));
+                                           "Serialized graph has duplicate tensor uid " + std::to_string(tensor_uid));
         }
 
-        std::map<Tensor_attributes::tid_t, std::shared_ptr<Tensor_attributes>> created_tensors;
+        std::map<Tensor_attributes::uid_t, std::shared_ptr<Tensor_attributes>> created_tensors;
         auto resolve_tensor_ref = [&tensor_table](json const &tensor_ref, json &tensor_info) -> error_t {
-            auto tensor_tid  = tensor_ref.get<Tensor_attributes::tid_t>();
-            auto tensor_iter = tensor_table.find(tensor_tid);
+            auto tensor_uid  = tensor_ref.get<Tensor_attributes::uid_t>();
+            auto tensor_iter = tensor_table.find(tensor_uid);
             RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_iter == tensor_table.end(),
                                            error_code_t::UNSUPPORTED_GRAPH_FORMAT,
-                                           "Serialized graph is missing tensor for tid " + std::to_string(tensor_tid));
+                                           "Serialized graph is missing tensor for uid " + std::to_string(tensor_uid));
 
             tensor_info = tensor_iter->second;
             return {error_code_t::OK, ""};
@@ -2613,11 +2628,8 @@ class Graph : public ICudnn, public INode {
                         return t;
                     }
 
-                    auto const tid = t->get_tid();
-                    if (tid >= next_tid) {
-                        next_tid = tid + 1;
-                    }
-                    auto [created_tensor, inserted] = created_tensors.emplace(tid, t);
+                    auto const uid                  = t->get_uid();
+                    auto [created_tensor, inserted] = created_tensors.emplace(uid, t);
                     (void)inserted;
                     return created_tensor->second;
                 };
@@ -3029,7 +3041,6 @@ Graph::set_sm_version(int32_t version) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(Tensor_attributes const &tensor) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(tensor);
-    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3038,7 +3049,6 @@ Graph::tensor(Tensor_attributes const &tensor) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(float const &scalar, ScalarType scalar_type) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
-    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3046,7 +3056,6 @@ Graph::tensor(float const &scalar, ScalarType scalar_type) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(half const &scalar, ScalarType scalar_type) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
-    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3054,7 +3063,6 @@ Graph::tensor(half const &scalar, ScalarType scalar_type) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(nv_bfloat16 const &scalar, ScalarType scalar_type) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
-    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3062,7 +3070,6 @@ Graph::tensor(nv_bfloat16 const &scalar, ScalarType scalar_type) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(int32_t const &scalar, ScalarType scalar_type) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
-    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3070,7 +3077,6 @@ Graph::tensor(int32_t const &scalar, ScalarType scalar_type) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(int64_t const &scalar, ScalarType scalar_type) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
-    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3078,7 +3084,6 @@ Graph::tensor(int64_t const &scalar, ScalarType scalar_type) {
 inline std::shared_ptr<Tensor_attributes>
 Graph::tensor(double const &scalar, ScalarType scalar_type) {
     auto tensor_ptr = std::make_shared<Tensor_attributes>(scalar, scalar_type);
-    tensor_ptr->assign_tid(next_tid++);
     full_graph_inputs.emplace(tensor_ptr);
     return tensor_ptr;
 }
@@ -3121,7 +3126,6 @@ Graph::tensor_like(std::shared_ptr<Tensor_attributes> const &tensor, std::string
     // uids are not meant to be copied by tensor_like
     // When lowering to cudnn backend, both tensors involved here will get unique uids.
     tensor_ptr->clear_uid();
-    tensor_ptr->assign_tid(next_tid++);
 
     // reset the name too. Defaults to empty string.
     tensor_ptr->set_name(name);

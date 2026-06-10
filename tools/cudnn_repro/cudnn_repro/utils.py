@@ -85,12 +85,12 @@ def parse_optional_int(value: Any) -> Optional[int]:
 
 
 def tensor_entry(tensors: list, hint: Optional[str]) -> Optional[dict]:
-    """Find a tensor entry by graph-local tid reference."""
-    tensor_tid = parse_optional_int(hint)
-    if tensor_tid is None or not isinstance(tensors, list):
+    """Find a tensor entry by uid reference."""
+    tensor_uid = parse_optional_int(hint)
+    if tensor_uid is None or not isinstance(tensors, list):
         return None
     for entry in tensors:
-        if isinstance(entry, dict) and parse_optional_int(entry.get("tid")) == tensor_tid:
+        if isinstance(entry, dict) and parse_optional_int(entry.get("uid")) == tensor_uid:
             return entry
     return None
 

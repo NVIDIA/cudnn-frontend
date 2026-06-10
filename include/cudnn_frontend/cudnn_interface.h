@@ -3,6 +3,7 @@
 #include <memory>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "../cudnn_frontend_Tensor.h"
 #include "../cudnn_frontend_Operation.h"
@@ -29,6 +30,31 @@ assign_uid(graph::Tensor_attributes* const tensor,
 
     tensor->set_uid(potential_uid);
     ++potential_uid;  // increment, as used its used now
+}
+
+inline error_t
+materialize_uid(std::shared_ptr<graph::Tensor_attributes> const& props,
+                int64_t& potential_uid,
+                std::unordered_set<int64_t>& used_uids,
+                std::unordered_set<graph::Tensor_attributes const*>& visited_tensors) {
+    if (props == nullptr || !visited_tensors.insert(props.get()).second) {
+        return {error_code_t::OK, ""};
+    }
+
+    if (props->has_uid()) {
+        auto const [_, inserted] = used_uids.insert(props->get_uid());
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!inserted,
+                                       error_code_t::INVALID_VALUE,
+                                       "uid " + std::to_string(props->get_uid()) + " for tensor named " +
+                                           props->get_name() + " has been already assigned to another tensor.");
+    } else {
+        assign_uid(props.get(), potential_uid, used_uids);
+        used_uids.insert(props->get_uid());
+    }
+
+    CHECK_CUDNN_FRONTEND_ERROR(materialize_uid(props->get_ragged_offset(), potential_uid, used_uids, visited_tensors));
+
+    return {error_code_t::OK, ""};
 }
 
 // TODO: Always returns OK. Can the status and error message be accessed from tensor descriptor?

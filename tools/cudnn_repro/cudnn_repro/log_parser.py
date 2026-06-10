@@ -19,7 +19,7 @@ def read_lines(source: str) -> List[str]:
 
 
 EXECUTE_GRAPH_PATTERN = re.compile(r"Executing gid (\d+)")
-TENSOR_DUMP_PATTERN = re.compile(r"Tensor Dump tid:\s*(-?\d+).*?Data:\s*(\[.*\])")
+TENSOR_DUMP_PATTERN = re.compile(r"Tensor Dump uid:\s*(-?\d+).*?Data:\s*(\[.*\])")
 
 
 def _parse_context_entry(line: str) -> Tuple[str, dict] | None:
@@ -40,14 +40,14 @@ def _parse_tensor_dump(line: str) -> Tuple[int, List[int]] | None:
     return int(match.group(1)), [int(value) for value in json.loads(match.group(2))]
 
 
-def _apply_tensor_dumps(entry: Tuple[str, dict], tensor_dumps_by_tid: Dict[int, List[int]]) -> Tuple[str, dict]:
-    if not tensor_dumps_by_tid:
+def _apply_tensor_dumps(entry: Tuple[str, dict], tensor_dumps_by_uid: Dict[int, List[int]]) -> Tuple[str, dict]:
+    if not tensor_dumps_by_uid:
         return entry
     raw_line, payload = entry
     payload = copy.deepcopy(payload)
     for tensor in payload.get("tensors", []):
-        if tensor.get("tid") in tensor_dumps_by_tid:
-            tensor["pass_by_value"] = tensor_dumps_by_tid[tensor["tid"]]
+        if tensor.get("uid") in tensor_dumps_by_uid:
+            tensor["pass_by_value"] = tensor_dumps_by_uid[tensor["uid"]]
     return raw_line, payload
 
 
@@ -87,8 +87,8 @@ def iter_context_entries(lines: Iterable[str]) -> Iterable[Tuple[str, dict]]:
 
         dump = _parse_tensor_dump(line)
         if dump is not None:
-            tid, values = dump
-            current_dumps[tid] = values
+            uid, values = dump
+            current_dumps[uid] = values
 
     if current_entry is not None:
         execution_entries.append(_apply_tensor_dumps(current_entry, current_dumps))

@@ -599,7 +599,6 @@ to_json(nlohmann::json& j, const Tensor_attributes& ta) {
                        {"pass_by_value", ta.pass_by_value},
                        {"is_pass_by_value", ta.is_pass_by_value},
                        {"reordering_type", ta.reordering_type},
-                       {"tid", ta.tid},
                        {"uid", ta.uid},
                        {"uid_assigned", ta.uid_assigned}};
     if (!ta.name.empty()) {
@@ -625,7 +624,6 @@ from_json(const nlohmann::json& j, Tensor_attributes& ta) {
     ta.is_virtual       = j.at("is_virtual").get<bool>();
     ta.is_pass_by_value = j.at("is_pass_by_value").get<bool>();
     ta.reordering_type  = j.at("reordering_type").get<TensorReordering_t>();
-    ta.tid              = j.at("tid").get<Tensor_attributes::tid_t>();
     ta.uid              = j.at("uid").get<Tensor_attributes::uid_t>();
     ta.uid_assigned     = j.at("uid_assigned").get<bool>();
 

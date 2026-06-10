@@ -50,14 +50,12 @@ class INode {
     detail::Context context;
 
    protected:
-    Tensor_attributes::tid_t next_tid = 1;
-
     // Will eventually be moved to Graph class
     std::unordered_set<std::shared_ptr<Tensor_attributes>> full_graph_outputs;
     std::shared_ptr<Tensor_attributes>
     output_tensor(std::string const& name) {
         auto tensor = std::make_shared<Tensor_attributes>();
-        tensor->set_name(name).set_is_virtual(true).assign_tid(next_tid++);
+        tensor->set_name(name).set_is_virtual(true);
         full_graph_outputs.insert(tensor);
         return tensor;
     }
@@ -99,6 +97,11 @@ class INode {
 
     virtual error_t
     collect_tensors_to_dump_node(std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>&) const {
+        return {error_code_t::OK, ""};
+    };
+
+    virtual error_t
+    materialize_uids_node(int64_t&, std::unordered_set<int64_t>&, std::unordered_set<Tensor_attributes const*>&) const {
         return {error_code_t::OK, ""};
     };
 
@@ -301,6 +304,17 @@ class INode {
         return {error_code_t::OK, ""};
     }
 
+    error_t
+    materialize_uids_subtree(int64_t& potential_uid,
+                             std::unordered_set<int64_t>& used_uids,
+                             std::unordered_set<Tensor_attributes const*>& visited_tensors) const {
+        CHECK_CUDNN_FRONTEND_ERROR(materialize_uids_node(potential_uid, used_uids, visited_tensors));
+        for (auto const& sub_node : sub_nodes) {
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->materialize_uids_subtree(potential_uid, used_uids, visited_tensors));
+        }
+        return {error_code_t::OK, ""};
+    }
+
     // Creates cudnn tensors for each node (and its sub nodes)
     error_t
     create_cudnn_tensors_subtree(
@@ -483,45 +497,59 @@ class NodeCRTP : public INode {
         return {error_code_t::OK, ""};
     }
 
+    template <typename VisitTensor>
+    error_t
+    for_each_node_tensor(VisitTensor&& visit_tensor) const {
+        auto visit = [&](std::shared_ptr<Tensor_attributes> const& tensor) -> error_t {
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(visit_tensor(tensor));
+            }
+            return {error_code_t::OK, ""};
+        };
+
+        if constexpr (std::is_same_v<DerivedT, ConcatenateNode>) {
+            for (auto const& tensor : self().attributes.inputs) {
+                CHECK_CUDNN_FRONTEND_ERROR(visit(tensor));
+            }
+        } else {
+            for (auto const& [name, tensor] : self().attributes.inputs) {
+                (void)name;
+                CHECK_CUDNN_FRONTEND_ERROR(visit(tensor));
+            }
+        }
+
+        for (auto const& [name, tensor] : self().attributes.outputs) {
+            (void)name;
+            CHECK_CUDNN_FRONTEND_ERROR(visit(tensor));
+        }
+
+        if constexpr (std::is_same_v<DerivedT, DBNNode> || std::is_same_v<DerivedT, BatchNormNode>) {
+            for (auto const& tensor : self().attributes.peer_stats) {
+                CHECK_CUDNN_FRONTEND_ERROR(visit(tensor));
+            }
+        }
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    materialize_uids_node(int64_t& potential_uid,
+                          std::unordered_set<int64_t>& used_uids,
+                          std::unordered_set<Tensor_attributes const*>& visited_tensors) const override {
+        return for_each_node_tensor([&](std::shared_ptr<Tensor_attributes> const& tensor) {
+            return detail::materialize_uid(tensor, potential_uid, used_uids, visited_tensors);
+        });
+    }
+
     error_t
     create_cudnn_tensors_node(std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors,
                               int64_t& potential_uid,
                               std::unordered_set<int64_t> const& used_uids) const override {
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Creating cudnn tensors for node named '" << self().attributes.name << "':");
 
-        if constexpr (std::is_same_v<DerivedT, ConcatenateNode>) {
-            for (auto const& tensor : self().attributes.inputs) {
-                if (tensor) {
-                    CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
-                }
-            }
-        } else {
-            for (auto const& [name, tensor] : self().attributes.inputs) {
-                (void)name;
-                if (tensor) {
-                    CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
-                }
-            }
-        }
-
-        for (auto const& [name, tensor] : self().attributes.outputs) {
-            (void)name;
-            if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
-            }
-        }
-
-        // Handle special case of BN where peer_stats is also an input
-        if constexpr (std::is_same_v<DerivedT, DBNNode> || std::is_same_v<DerivedT, BatchNormNode>) {
-            // Special case in BN where peer stats is also an input but is not present in inputs map
-            for (auto const& tensor : self().attributes.peer_stats) {
-                if (tensor) {
-                    CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
-                }
-            }
-        }
-
-        return {error_code_t::OK, ""};
+        return for_each_node_tensor([&](std::shared_ptr<Tensor_attributes> const& tensor) {
+            return detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids);
+        });
     }
 
    protected:

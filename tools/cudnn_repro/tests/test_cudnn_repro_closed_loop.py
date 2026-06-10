@@ -51,10 +51,10 @@ def _normalize_tensor_entry(entry):
 
 def _normalize_payload(payload):
     tensors = payload.get("tensors", [])
-    tensor_by_tid = {int(entry["tid"]): entry for entry in tensors}
+    tensor_by_uid = {int(entry["uid"]): entry for entry in tensors}
 
-    def resolve(tid):
-        return _normalize_tensor_entry(tensor_by_tid[int(tid)])
+    def resolve(uid):
+        return _normalize_tensor_entry(tensor_by_uid[int(uid)])
 
     normalized = {
         "context": payload.get("context"),
