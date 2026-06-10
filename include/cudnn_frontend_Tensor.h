@@ -521,7 +521,7 @@ class TensorBuilder_v8 {
 
         // Set ragged offset multiplier
         if (m_tensor.hasRaggedOffsetMultiplier()) {
-            auto ragged_offset_multiplier_cudnn_ver_error =
+            [[maybe_unused]] auto ragged_offset_multiplier_cudnn_ver_error =
                 "CUDNN_BACKEND_TENSOR_DESCRIPTOR: SetAttribute "
                 "CUDNN_ATTR_TENSOR_RAGGED_OFFSET_MULTIPLIER requires cudnn version 9.24.0";
 #if (CUDNN_VERSION >= 92400)
