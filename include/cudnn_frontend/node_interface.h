@@ -523,7 +523,9 @@ class NodeCRTP : public INode {
             CHECK_CUDNN_FRONTEND_ERROR(visit(tensor));
         }
 
+        // Handle special case of BN where peer_stats is also an input
         if constexpr (std::is_same_v<DerivedT, DBNNode> || std::is_same_v<DerivedT, BatchNormNode>) {
+            // Special case in BN where peer stats is also an input but is not present in inputs map
             for (auto const& tensor : self().attributes.peer_stats) {
                 CHECK_CUDNN_FRONTEND_ERROR(visit(tensor));
             }
