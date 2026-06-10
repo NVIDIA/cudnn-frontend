@@ -350,7 +350,6 @@ def _dense_score_recompute(
         _KV_STAGE,
         num_threads,
         _SWAP_AB,
-        topk_max,
         is_index_scores,
         softmax_scale,
         False,
@@ -397,6 +396,10 @@ def _dense_score_recompute(
             options=compile_options(),
         )
 
+    # The SM90 dense score kernel skips K blocks that are wholly masked by
+    # the ratio-causal rule. Preserve the public contract that masked output
+    # positions are overwritten even when the caller supplies `out`.
+    out.zero_()
     with torch.cuda.nvtx.range(nvtx_range_name):
         cache[compile_key](
             q,
@@ -459,6 +462,9 @@ def _dense_score_recompute_varlen(
 
     cu_q_host = cu_seqlens_q.detach().cpu().tolist()
     cu_k_host = cu_seqlens_k.detach().cpu().tolist()
+    # Native THD uses the same block-skipping kernel; pre-zero so skipped
+    # masked/padding columns do not retain caller-provided values.
+    out.zero_()
     with torch.cuda.nvtx.range(nvtx_range_name + "_thd"):
         for b in range(len(cu_q_host) - 1):
             qs, qe = cu_q_host[b], cu_q_host[b + 1]

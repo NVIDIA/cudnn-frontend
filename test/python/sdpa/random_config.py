@@ -78,6 +78,10 @@ class ExecConfig:
     is_bias: bool = None
     is_block_mask: bool = None
     is_padding: bool = None
+    # When True, supply per-batch sequence lengths via cu_seq_len_q/cu_seq_len_kv
+    # (cumulative sequence-length tensors of shape (b+1, 1, 1, 1)) instead of
+    # the regular per-batch seq_len_q/seq_len_kv tensors. Implies is_padding=True.
+    is_cu_seq_len: bool = None
     is_ragged: bool = None
     is_dropout: bool = None
     is_determin: bool = None
@@ -88,6 +92,7 @@ class ExecConfig:
     with_sink_token: bool = False
     with_unfuse_fma: bool = False
     with_rope: bool = False
+    with_ragged_offset_multiplier: bool = False
     rescale_threshold: float = None
 
     diag_align: cudnn.diagonal_alignment = None
@@ -252,8 +257,10 @@ class RandomizationContext:
         randoms_.d_qk, randoms_.d_v = randoms["d_qk_d_v"]
         randoms_.h_q, randoms_.h_k, randoms_.h_v = randoms["head_count"]
 
-        randoms_.is_ragged = randoms["is_ragged_or_padded_or_full"] == "ragged"
-        randoms_.is_padding = randoms["is_ragged_or_padded_or_full"] == "padded" or randoms["is_ragged_or_padded_or_full"] == "ragged"
+        randoms_.is_ragged = randoms["is_ragged_or_padded_or_full"] in ("ragged", "cu_ragged", "ragged_mult", "cu_ragged_mult")
+        randoms_.is_padding = randoms["is_ragged_or_padded_or_full"] in ("padded", "ragged", "cu_padded", "cu_ragged", "ragged_mult", "cu_ragged_mult")
+        randoms_.is_cu_seq_len = randoms["is_ragged_or_padded_or_full"] in ("cu_padded", "cu_ragged", "cu_ragged_mult")
+        randoms_.with_ragged_offset_multiplier = randoms["is_ragged_or_padded_or_full"] in ("ragged_mult", "cu_ragged_mult")
 
         if randoms["is_ragged_or_padded_or_full"] != "full":
             # ~10% chance of 0-length sequence for each batch

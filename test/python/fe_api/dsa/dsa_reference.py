@@ -158,11 +158,8 @@ def ref_indexer_forward(
     scores = scores * w_f.unsqueeze(-1)  # (B, S_q, H_q, S_k)
     out = scores.sum(dim=2)  # (B, S_q, S_k)
 
-    # Ratio causal mask: for query q, keys k >= (q+1)//ratio are -inf.
-    q_idx = torch.arange(s_q, device=q.device).view(1, s_q, 1)
-    k_idx = torch.arange(s_k, device=q.device).view(1, 1, s_k)
-    mask = k_idx < ((q_idx + 1) // ratio).clamp(min=0)
-    out = torch.where(mask.expand_as(out), out, torch.full_like(out, float("-inf")))
+    valid = _bottom_right_causal_mask(s_q, s_k, ratio, q.device)
+    out = out.masked_fill(~valid.unsqueeze(0), float("-inf"))
     return out
 
 
@@ -176,8 +173,8 @@ def check_ref_indexer_forward(
     rtol: float = 1e-4,
 ):
     out_ref = ref_indexer_forward(q, k, w, ratio)
-    # Compare only over finite positions (mask out -inf).
     finite = torch.isfinite(out_ref)
+    assert torch.equal(torch.isneginf(out_actual), torch.isneginf(out_ref))
     torch.testing.assert_close(
         out_actual[finite],
         out_ref[finite],

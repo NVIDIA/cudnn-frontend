@@ -2,8 +2,11 @@
 
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include "knobs.h"
 #include "../cudnn_frontend_EngineConfig.h"
 #include "../cudnn_frontend_Logging.h"
 #include "graph_helpers.h"
@@ -27,8 +30,9 @@ execute(cudnnHandle_t handle,
         std::vector<int64_t> const& override_uids,
         std::vector<std::vector<int64_t>> const& override_shapes,
         std::vector<std::vector<int64_t>> const& override_strides) {
-    // TODO: below line fails with MSVC. warning C4127: conditional expression is constant
-    // RETURN_CUDNN_FRONTEND_ERROR_IF(!plan, error_code_t::GRAPH_EXECUTION_FAILED, "No plan found to execute!!");
+    if (plan == nullptr) {
+        return {error_code_t::GRAPH_EXECUTION_FAILED, "No plan found to execute!"};
+    }
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing " << plan->getTag() << "...");
 
     backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
@@ -51,8 +55,9 @@ execute(cudnnHandle_t handle,
         std::vector<void*>& device_ptrs,
         std::vector<int64_t> const& uids,
         void* workspace_ptr) {
-    // TODO: below line fails with MSVC. warning C4127: conditional expression is constant
-    // RETURN_CUDNN_FRONTEND_ERROR_IF(!plan, error_code_t::GRAPH_EXECUTION_FAILED, "No plan found to execute!!");
+    if (plan == nullptr) {
+        return {error_code_t::GRAPH_EXECUTION_FAILED, "No plan found to execute!"};
+    }
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing " << plan->getTag() << "...");
 
     backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
@@ -76,6 +81,9 @@ execute(cudnnHandle_t handle,
         void* const* device_ptrs,
         std::vector<int64_t> const& uids,
         void* workspace_ptr) {
+    if (plan == nullptr) {
+        return {error_code_t::GRAPH_EXECUTION_FAILED, "No plan found to execute!"};
+    }
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing " << plan->getTag() << "...");
 
     backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
@@ -99,6 +107,9 @@ execute(cudnnHandle_t handle,
         std::vector<int64_t> const& override_uids,
         std::vector<std::vector<int64_t>> const& override_shapes,
         std::vector<std::vector<int64_t>> const& override_strides) {
+    if (plan == nullptr) {
+        return {error_code_t::GRAPH_EXECUTION_FAILED, "No plan found to execute!"};
+    }
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing " << plan->getTag() << "...");
 
     backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
@@ -466,6 +477,28 @@ class Execution_plan_list {
     error_t
     get_name_at_index(int64_t index, std::string& name) const {
         name = detail::get_engine_tag(engine_configs[index]);
+        return {error_code_t::OK, ""};
+    }
+
+    // Structured counterpart of get_name_at_index(): engine index + knob choices,
+    // suitable for replay via Graph::create_execution_plan(engine_id, knobs).
+    error_t
+    get_engine_and_knobs_at_index(int64_t index,
+                                  int64_t& engine_id,
+                                  std::unordered_map<KnobType_t, int64_t>& knobs) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(index < 0 || index >= static_cast<int64_t>(engine_configs.size()),
+                                       error_code_t::GRAPH_EXECUTION_FAILED,
+                                       "Plan index " + std::to_string(index) + " is invalid.");
+        std::vector<std::pair<cudnnBackendKnobType_t, int64_t>> backend_knobs;
+        auto status = detail::get_engine_id_and_knobs(engine_configs[index], engine_id, backend_knobs);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            status != CUDNN_STATUS_SUCCESS,
+            error_code_t::CUDNN_BACKEND_API_FAILED,
+            "Failed to query engine id / knob choices for plan at index " + std::to_string(index));
+        knobs.clear();
+        for (auto const& backend_knob : backend_knobs) {
+            knobs[convert_from_backend_knob_type(backend_knob.first)] = backend_knob.second;
+        }
         return {error_code_t::OK, ""};
     }
 

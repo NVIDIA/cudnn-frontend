@@ -26,6 +26,9 @@ create_variant_pack(backend_descriptor& variant_pack,
                     void* const* device_ptrs,
                     std::vector<int64_t> const& uids,
                     void* workspace_ptr) {
+    RETURN_CUDNN_FRONTEND_ERROR_IF(device_ptrs == nullptr && !uids.empty(),
+                                   error_code_t::INVALID_VARIANT_PACK,
+                                   "device_ptrs must be non-null when uids are provided.");
     _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
         variant_pack.get_ptr(), CUDNN_ATTR_VARIANT_PACK_WORKSPACE, CUDNN_TYPE_VOID_PTR, 1, &workspace_ptr));
 
@@ -59,6 +62,9 @@ create_variant_pack(backend_descriptor& variant_pack,
                     std::vector<int64_t> const& override_uids,
                     std::vector<std::vector<int64_t>> const& override_shapes,
                     std::vector<std::vector<int64_t>> const& override_strides) {
+    RETURN_CUDNN_FRONTEND_ERROR_IF(device_ptrs == nullptr && !uids.empty(),
+                                   error_code_t::INVALID_VARIANT_PACK,
+                                   "device_ptrs must be non-null when uids are provided.");
     auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Dynamic shapes requires cuDNN v9.18.0"};
 
     NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91800, cudnn_ver_error);

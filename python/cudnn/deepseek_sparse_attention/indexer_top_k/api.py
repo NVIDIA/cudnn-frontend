@@ -22,7 +22,7 @@ def _get_cute_dsl_topk_wrapper():
 
 
 class IndexerTopK(APIBase):
-    """Top-K filter using the SM100 CuTe-DSL radix kernel.
+    """Top-K filter using the SM90+ CuTe-DSL radix kernel.
 
     Selects the ``top_k`` largest entries from each row of ``input_values``.
 
@@ -110,8 +110,8 @@ class IndexerTopK(APIBase):
 
         major, _ = torch.cuda.get_device_capability()
         self._runtime_error_if(
-            major < 10,
-            f"IndexerTopK requires SM100+ compute capability, found SM{major}",
+            major < 9,
+            f"IndexerTopK requires SM90+ compute capability, found SM{major}",
         )
         self._is_supported = True
         return True

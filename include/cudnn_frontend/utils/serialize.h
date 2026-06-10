@@ -365,6 +365,8 @@ NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_attributes::input_names,
                                  {SDPA_attributes::input_names::Bias, "Bias"},
                                  {SDPA_attributes::input_names::SEQ_LEN_Q, "SEQ_LEN_Q"},
                                  {SDPA_attributes::input_names::SEQ_LEN_KV, "SEQ_LEN_KV"},
+                                 {SDPA_attributes::input_names::CU_SEQ_LEN_Q, "CU_SEQ_LEN_Q"},
+                                 {SDPA_attributes::input_names::CU_SEQ_LEN_KV, "CU_SEQ_LEN_KV"},
                                  {SDPA_attributes::input_names::Seed, "Seed"},
                                  {SDPA_attributes::input_names::Offset, "Offset"},
                                  {SDPA_attributes::input_names::Dropout_mask, "Dropout_mask"},
@@ -523,6 +525,8 @@ NLOHMANN_JSON_SERIALIZE_ENUM(DiagonalBandMask_attributes::input_names,
                                  {DiagonalBandMask_attributes::input_names::X, "X"},
                                  {DiagonalBandMask_attributes::input_names::SEQ_LEN_Q, "SEQ_LEN_Q"},
                                  {DiagonalBandMask_attributes::input_names::SEQ_LEN_KV, "SEQ_LEN_KV"},
+                                 {DiagonalBandMask_attributes::input_names::CU_SEQ_LEN_Q, "CU_SEQ_LEN_Q"},
+                                 {DiagonalBandMask_attributes::input_names::CU_SEQ_LEN_KV, "CU_SEQ_LEN_KV"},
                                  {DiagonalBandMask_attributes::input_names::LeftBound, "LeftBound"},
                                  {DiagonalBandMask_attributes::input_names::ShiftRightBound, "ShiftRightBound"},
                                  {DiagonalBandMask_attributes::input_names::B, "B"},
@@ -602,6 +606,9 @@ to_json(nlohmann::json& j, const Tensor_attributes& ta) {
         j["ragged_offset_uid"]  = ta.ragged_offset->get_uid();
         j["ragged_offset_name"] = ta.ragged_offset->get_name();
     }
+    if (ta.has_ragged_offset_multiplier()) {
+        j["ragged_offset_multiplier"] = ta.ragged_offset_multiplier;
+    }
 }
 
 inline void
@@ -618,6 +625,18 @@ from_json(const nlohmann::json& j, Tensor_attributes& ta) {
 
     if (ta.is_pass_by_value && !j["pass_by_value"].is_null()) {
         ta.pass_by_value = j.at("pass_by_value");
+    }
+    if (j.contains("ragged_offset_uid")) {
+        auto ragged_offset          = std::make_shared<Tensor_attributes>();
+        ragged_offset->uid          = j.at("ragged_offset_uid").get<Tensor_attributes::uid_t>();
+        ragged_offset->uid_assigned = true;
+        if (j.contains("ragged_offset_name")) {
+            ragged_offset->name = j.at("ragged_offset_name").get<std::string>();
+        }
+        ta.ragged_offset = ragged_offset;
+    }
+    if (j.contains("ragged_offset_multiplier")) {
+        ta.ragged_offset_multiplier = j.at("ragged_offset_multiplier").get<int64_t>();
     }
 }
 

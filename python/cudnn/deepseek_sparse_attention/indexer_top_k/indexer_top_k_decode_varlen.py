@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SM100 CuTe DSL indexer top-K decode kernel."""
+"""SM90+ CuTe DSL indexer top-K decode kernel."""
 
 import cuda.bindings.driver as cuda
 import cutlass

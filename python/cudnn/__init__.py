@@ -53,7 +53,7 @@ for _optional_symbol in ["causal_conv1d_forward", "causal_conv1d_backward"]:
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.24.1"
+__version__ = "1.25.0"
 
 
 def _tensor(
@@ -67,6 +67,7 @@ def _tensor(
     reordering_type=tensor_reordering.NONE,
     name="",
     uid=-1,
+    ragged_offset_multiplier=1,
 ):
     """
     Create a tensor.
@@ -80,6 +81,7 @@ def _tensor(
         ragged_offset (cudnn_tensor): The ragged offset tensor.
         reordering_type (cudnn.tensor_reordering): The reordering type of the tensor.
         name (str): The name of the tensor.
+        ragged_offset_multiplier (int): Unit size of ragged offsets in tensor elements. A value of 1 means no multiplier.
 
     Returns:
         cudnn_tensor: The created tensor.
@@ -94,6 +96,7 @@ def _tensor(
         reordering_type=reordering_type,
         name=name,
         uid=uid,
+        ragged_offset_multiplier=ragged_offset_multiplier,
     )
 
 

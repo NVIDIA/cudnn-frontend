@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cuda.h>
+#include <cstdlib>
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
 #ifdef _WIN32
@@ -38,9 +39,27 @@
 #endif
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <cstdio>
 #endif
 
 namespace cudnn_frontend {
+
+// Portable environment-variable accessor. Wraps std::getenv and locally silences MSVC's C4996
+// ("getenv is unsafe") warning, which is treated as an error under /WX. Safe here because the
+// returned value is only read. Defined in this low-level header so every layer (including
+// Logging) can share a single definition without inverting include dependencies.
+inline const char *
+get_environment(const char *name) {
+#ifdef _WIN32
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+    return std::getenv(name);
+#ifdef _WIN32
+#pragma warning(pop)
+#endif
+}
 
 // cudnn package initialization set this global handle
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
@@ -84,6 +103,27 @@ load_cudart_so() {
     // Clear any existing error
     dlerror();
 
+    // Allow the user to override the libcudart selection via an environment variable.
+    // This is useful in environments (e.g. containers such as GKE with the TCPXO NCCL
+    // plugin) where multiple major versions of libcudart are present in the library
+    // search path. In such cases the automatic detection below warns about the ambiguity
+    // (see below) and falls back to the first match. Setting CUDNN_FRONTEND_CUDART_LIB_NAME
+    // to the desired library name (or path), e.g. "libcudart.so.13", bypasses the detection
+    // and loads exactly that library.
+    const char *user_lib = get_environment("CUDNN_FRONTEND_CUDART_LIB_NAME");
+    if (user_lib) {
+        if (user_lib[0] != '\0') {
+            HMODULE handle    = dlopen(user_lib, RTLD_NOW);
+            const char *error = reinterpret_cast<const char *>(dlerror());
+            if (!handle || error) {
+                throw std::runtime_error(
+                    "Unable to load libcudart library specified by CUDNN_FRONTEND_CUDART_LIB_NAME (" +
+                    std::string(user_lib) + "): " + std::string(error ? error : "Unknown error"));
+            }
+            return handle;
+        }
+    }
+
     // List of potential libcudart libraries (Adding major version to support python package)
     constexpr const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
     constexpr size_t num_libs    = sizeof(libs) / sizeof(libs[0]);
@@ -97,13 +137,19 @@ load_cudart_so() {
 
         if (handle && !error) {
             if (lib_handle) {
-                // Already loaded one -> multiple found
+                // Already loaded one -> multiple found. This is not fatal: warn on stderr and keep
+                // the first one found. Set CUDNN_FRONTEND_CUDART_LIB_NAME to select one explicitly.
                 dlclose(handle);
-                throw std::runtime_error("Multiple libcudart libraries found: " + std::string(libs[loaded_index]) +
-                                         " and " + std::string(libs[i]));
+                std::fprintf(stderr,
+                             "cuDNN Frontend warning: Multiple libcudart libraries found: %s and %s. "
+                             "Using %s. Set CUDNN_FRONTEND_CUDART_LIB_NAME to select one explicitly.\n",
+                             libs[loaded_index],
+                             libs[i],
+                             libs[loaded_index]);
+            } else {
+                lib_handle   = handle;
+                loaded_index = static_cast<int>(i);
             }
-            lib_handle   = handle;
-            loaded_index = static_cast<int>(i);
         }
     }
 
@@ -585,7 +631,7 @@ get_execution_plan_workspace_size(cudnnHandle_t handle,
                                   cudnnBackendDescriptor_t executionPlan,
                                   cudnnBackendDescriptor_t variantPack,
                                   size_t *workspaceSizeInBytes) {
-#if CUDNN_VERSION >= 92300 && CUDNN_VERSION < 99900
+#if CUDNN_VERSION >= 92300
     NV_FE_CALL_TO_BACKEND(get_execution_plan_workspace_size,
                           cudnnGetExecutionPlanWorkspaceSize,
                           handle,

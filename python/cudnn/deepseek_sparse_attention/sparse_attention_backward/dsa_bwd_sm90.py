@@ -383,7 +383,7 @@ class _FlashAttentionDSABackwardPreprocessSm90:
                 else:
                     mdQaccum_cur = cute.domain_offset((padded_offset_q * self.head_dim_padded,), mdQaccum[head_idx, None])
 
-                    # HACK: Compiler doesn't seem to recognize that padding
+                    # Note: compiler doesn't seem to recognize that padding
                     # by padded_offset_q * self.head_dim_padded keeps alignment
                     # since statically divisible by 4
 
@@ -1403,7 +1403,10 @@ class FlashAttentionDSABackwardSm90:
             global_topk_row = n_block * self.tile_n + local_row
             if global_topk_row < topK:
                 global_kv_row = mTopkIdxs_cur[global_topk_row]
-                if const_expr(self.have_topk_length) or global_kv_row >= 0:
+                should_accumulate_dkv = const_expr(True)
+                if const_expr(not self.have_topk_length):
+                    should_accumulate_dkv = global_kv_row >= 0
+                if should_accumulate_dkv:
                     row_base = global_kv_row * self.tile_hdim + chunk_idx * self.hdim_chunk
 
                     # Each group of 4 MN-view cols maps to one N-tile.
@@ -1551,7 +1554,7 @@ class FlashAttentionDSABackwardSm90:
         )
 
         # (6.5) G4_half_0: dQ[0:128] += dS_scaled(reg) @ sKVt_q0 (RS, immediate)
-        # Fire before STS(dS) — dS_scaled is still in registers, TC reads at issue time.
+        # Fire before storing dS to shared mem — dS_scaled is still in registers, TC reads at issue time.
         mma_dsk_fn_0(tCrA=tdQrdS_scaled, B_idx=None, zero_init=not dQ_accumulate, wg_wait=-1)
 
         # (7) R2S dS_scaled -> sdS (after G4_half_0 issued, regs still valid)

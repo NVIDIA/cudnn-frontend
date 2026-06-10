@@ -98,7 +98,9 @@ class DenseScoreRecomputeSm90:
         # out maxdiff = 0 preserved.  Set DENSE3WG_USE_WARP_SPLIT_PROD=0
         # to force the unified producer for benchmarking / debugging.
         self.use_warp_split_producer = bool(int(os.environ.get("DENSE3WG_USE_WARP_SPLIT_PROD", "1")))
-        self.weights_or_lse_dtype = self.dtype if self.is_index_scores else cutlass.Float32
+        # Cache per-head weights/LSE in FP32 SMEM. For dense indexer this
+        # avoids re-converting BF16 weights inside every K-block epilogue.
+        self.weights_or_lse_dtype = cutlass.Float32
         self.has_topk_length = has_topk_length
         self.num_acc_n_rows_per_thread = self.tile_n // 32
         self.num_warp_groups = self.num_threads // 128
@@ -517,14 +519,10 @@ class DenseScoreRecomputeSm90:
 
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            _ = SeqlenInfoCls(batch_idx)
+            seqlen = SeqlenInfoCls(batch_idx)
             head_idx_kv = head_idx
-
-            if const_expr(self.has_topk_length):
-                topK = mTopkLength[batch_idx, m_block]
-            else:
-                topK = self.topk_max
-            n_block_max = (topK + self.tile_n - 1) // self.tile_n
+            topK = seqlen.seqlen_k
+            n_block_max = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, topK)
 
             mKV_cur = mKV[None, None, head_idx_kv, batch_idx]
             mQ_cur = mQ[None, None, head_idx, batch_idx]
@@ -536,7 +534,7 @@ class DenseScoreRecomputeSm90:
             for h_tile in cutlass.range_constexpr(self.num_head_tiles):
                 eff_m_block = m_block * self.num_head_tiles + h_tile
 
-                # ---- Q TMA + Weights/LSE LDG ----
+                # ---- Q TMA + Weights/LSE load-from-global ----
                 gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (eff_m_block, 0))
                 load_Q, _, _ = copy_ops.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True)
                 if warp_idx_in_wg == 0:
@@ -545,7 +543,7 @@ class DenseScoreRecomputeSm90:
                     load_Q(tma_bar_ptr=mbar_Q_ptr)
 
                 if const_expr(self.is_index_scores):
-                    _pack_gqa.load_Weights_packed(
+                    _pack_gqa.load_Weights_packed_f32(
                         mWeights_cur.iterator.toint(),
                         seqlen_q_packed,
                         sWeights,
@@ -663,7 +661,7 @@ class DenseScoreRecomputeSm90:
     #    the unified `producer` has warp 0 doing:                            #
     #      wait KVE0 → TMA stage0 → wait KVE1 → TMA stage1 → ...              #
     #    so stage-1's TMA issue is serialized behind stage-0's wait+issue,   #
-    #    even when both consumer WGs have released their KVEmpty.  Perfsim   #
+    #    even when both consumer WGs have released their KVEmpty.  Profiling #
     #    shows WG1's wait KV is ~20-50c longer than WG0's under unified.     #
     #                                                                        #
     #    With warp split, stage-0 and stage-1 pipelines are independent —    #
@@ -705,14 +703,10 @@ class DenseScoreRecomputeSm90:
 
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            _ = SeqlenInfoCls(batch_idx)
+            seqlen = SeqlenInfoCls(batch_idx)
             head_idx_kv = head_idx
-
-            if const_expr(self.has_topk_length):
-                topK = mTopkLength[batch_idx, m_block]
-            else:
-                topK = self.topk_max
-            n_block_max = (topK + self.tile_n - 1) // self.tile_n
+            topK = seqlen.seqlen_k
+            n_block_max = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, topK)
 
             mKV_cur = mKV[None, None, head_idx_kv, batch_idx]
             mQ_cur = mQ[None, None, head_idx, batch_idx]
@@ -724,7 +718,7 @@ class DenseScoreRecomputeSm90:
             for h_tile in cutlass.range_constexpr(self.num_head_tiles):
                 eff_m_block = m_block * self.num_head_tiles + h_tile
 
-                # ---- Q TMA (warp-0) + Weights/LSE LDG (all 128 threads) ----
+                # ---- Q TMA (warp-0) + Weights/LSE load-from-global (all 128 threads) ----
                 gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (eff_m_block, 0))
                 load_Q, _, _ = copy_ops.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True)
                 if warp_idx_in_wg == 0:
@@ -733,7 +727,7 @@ class DenseScoreRecomputeSm90:
                     load_Q(tma_bar_ptr=mbar_Q_ptr)
 
                 if const_expr(self.is_index_scores):
-                    _pack_gqa.load_Weights_packed(
+                    _pack_gqa.load_Weights_packed_f32(
                         mWeights_cur.iterator.toint(),
                         seqlen_q_packed,
                         sWeights,
@@ -975,13 +969,9 @@ class DenseScoreRecomputeSm90:
 
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            _ = SeqlenInfoCls(batch_idx)
-
-            if const_expr(self.has_topk_length):
-                topK = mTopkLength[batch_idx, m_block]
-            else:
-                topK = self.topk_max
-            n_block_max = (topK + self.tile_n - 1) // self.tile_n
+            seqlen = SeqlenInfoCls(batch_idx)
+            topK = seqlen.seqlen_k
+            n_block_max = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, topK)
 
             mOut_cur = mOut[batch_idx, m_block, None]
 
@@ -1477,3 +1467,15 @@ class DenseScoreRecomputeSm90:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(mbar_KV_ptr, self.tma_copy_bytes["KV"])
             load_fn(tma_bar_ptr=mbar_KV_ptr)
+
+    @cute.jit
+    def _dense_compute_n_blocks(self, q_token_last, seqlen_q, seqlen_k):
+        """Return K blocks that can contain at least one valid causal column."""
+        ratio = Int32(self.ratio)
+        q_token_last = q_token_last if q_token_last < seqlen_q else seqlen_q - Int32(1)
+
+        q_global_start = seqlen_k * ratio - seqlen_q
+        max_kv_needed = (q_global_start + q_token_last + Int32(1)) // ratio
+        max_kv_needed = max_kv_needed if max_kv_needed > Int32(0) else Int32(0)
+        max_kv_needed = max_kv_needed if max_kv_needed < seqlen_k else seqlen_k
+        return cute.ceil_div(max_kv_needed, self.tile_n)

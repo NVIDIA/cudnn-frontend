@@ -104,8 +104,11 @@ def dense_indexer_backward_sm90(
 ):
     """Factory for the dense indexer backward gradient kernel on SM90."""
     assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
-    key = (
-        is_varlen,
+    # batch/seqlen are runtime (dynamic grid dim + Int32 args), so they're not
+    # keyed. seqlen_k IS kept: the dense K-load unrolls `range_constexpr(
+    # self.num_topk_blocks)` where num_topk_blocks = seqlen_k // block_I, so it
+    # changes generated code. sm_scale is a runtime Float32 arg (not keyed).
+    return _build_cute_dsl_dense_kernel(
         batch,
         seqlen,
         seqlen_k,
@@ -114,20 +117,8 @@ def dense_indexer_backward_sm90(
         sm_scale,
         block_I,
         ratio,
+        is_varlen,
     )
-    if key not in _dense_compile_cache:
-        _dense_compile_cache[key] = _build_cute_dsl_dense_kernel(
-            batch,
-            seqlen,
-            seqlen_k,
-            heads,
-            dim,
-            sm_scale,
-            block_I,
-            ratio,
-            is_varlen,
-        )
-    return _dense_compile_cache[key]
 
 
 def _build_cute_dsl_dense_kernel(
@@ -154,9 +145,15 @@ def _build_cute_dsl_dense_kernel(
         block_I=block_I,
         topk=topk,
         is_dense=True,
+        ratio=ratio,
     )
 
-    compiled_holder = [None]
+    # Single-layer compile cache keyed only by params that change generated
+    # code. seqlen_k is runtime now (the dense K-load loops at runtime over
+    # num_k_blocks, like the compute warpgroup), so it's not keyed — batch/
+    # seqlen/sm_scale likewise. dummy_topk_holder is a per-device scratch
+    # tensor, not a compile cache.
+    compile_key = (is_varlen, heads, dim, block_I, ratio)
     dummy_topk_holder = [None]
 
     def _get_dummy_topk(device, current_stream=None):
@@ -167,12 +164,12 @@ def _build_cute_dsl_dense_kernel(
 
     def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, CuSeqlensQ, CuSeqlensK, current_stream=None):
         s = _resolve_stream(current_stream)
-        if compiled_holder[0] is None:
+        if compile_key not in _dense_compile_cache:
             dummy_topk = _get_dummy_topk(IndexQ.device, current_stream=current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
             cute_args = [to_cute_tensor(t) for t in [IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, dummy_topk]]
-            compiled_holder[0] = cute.compile(
+            _dense_compile_cache[compile_key] = cute.compile(
                 kernel_obj,
                 *cute_args,
                 cutlass.Float32(sm_scale),
@@ -194,7 +191,7 @@ def _build_cute_dsl_dense_kernel(
         s = _resolve_stream(current_stream)
 
         _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, CuSeqlensQ, CuSeqlensK, current_stream=current_stream)
-        compiled_holder[0](
+        _dense_compile_cache[compile_key](
             IndexQ,
             Weights,
             IndexK,

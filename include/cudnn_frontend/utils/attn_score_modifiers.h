@@ -47,6 +47,8 @@ causal_mask_bottom_right(std::shared_ptr<Graph> graph,
     );
 }
 
+// Padding mask for the legacy CompositeSDPANode, not used in UnifiedSDPANode.
+// cu_seq_len_kv and cu_seq_len_q are explicitly not supported.
 [[maybe_unused]] inline std::shared_ptr<Tensor_attributes>
 padding_mask(std::shared_ptr<Graph> graph,
              std::shared_ptr<Tensor_attributes> attention_score,
@@ -168,7 +170,9 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
                     int64_t s_q,
                     int64_t s_kv,
                     std::shared_ptr<Tensor_attributes> s_q_ptr,
-                    std::shared_ptr<Tensor_attributes> s_kv_ptr) {
+                    std::shared_ptr<Tensor_attributes> s_kv_ptr,
+                    std::shared_ptr<Tensor_attributes> cu_s_q_ptr,
+                    std::shared_ptr<Tensor_attributes> cu_s_kv_ptr) {
     std::shared_ptr<Tensor_attributes> return_mask = attention_score;
 
     // Note: the right and left bound subtrees can be constructed in different ways as well that yield functionally
@@ -179,11 +183,19 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
     if (right_bound.has_value()) {
         std::shared_ptr<Tensor_attributes> effective_s_q;
         std::shared_ptr<Tensor_attributes> effective_s_kv;
+        std::shared_ptr<Tensor_attributes> effective_cu_s_q;
+        std::shared_ptr<Tensor_attributes> effective_cu_s_kv;
         if (diagonal_alignment == DiagonalAlignment_t::BOTTOM_RIGHT) {
-            effective_s_q =
-                s_q_ptr != nullptr ? s_q_ptr : std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q));
-            effective_s_kv =
-                s_kv_ptr != nullptr ? s_kv_ptr : std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv));
+            effective_s_q     = s_q_ptr;
+            effective_s_kv    = s_kv_ptr;
+            effective_cu_s_q  = cu_s_q_ptr;
+            effective_cu_s_kv = cu_s_kv_ptr;
+            if (effective_s_q == nullptr && effective_cu_s_q == nullptr) {
+                effective_s_q = std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q));
+            }
+            if (effective_s_kv == nullptr && effective_cu_s_kv == nullptr) {
+                effective_s_kv = std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv));
+            }
         }
 
         std::shared_ptr<Tensor_attributes> effective_shift_right_bound;
@@ -196,6 +208,8 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
                                                 /*b=*/std::make_shared<Tensor_attributes>(get_negative_inf_value()),
                                                 /*seq_len_q=*/effective_s_q,
                                                 /*seq_len_kv=*/effective_s_kv,
+                                                /*cu_seq_len_q=*/effective_cu_s_q,
+                                                /*cu_seq_len_kv=*/effective_cu_s_kv,
                                                 /*left_bound=*/nullptr,
                                                 /*shift_right_bound=*/effective_shift_right_bound,
                                                 DiagonalBandMask_attributes()
@@ -208,6 +222,8 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
         std::shared_ptr<Tensor_attributes> effective_left_bound;
         std::shared_ptr<Tensor_attributes> effective_s_q;
         std::shared_ptr<Tensor_attributes> effective_s_kv;
+        std::shared_ptr<Tensor_attributes> effective_cu_s_q;
+        std::shared_ptr<Tensor_attributes> effective_cu_s_kv;
 
         // When the diagonal is top left aligned: setup a graph so we can compare column + window_size > row
         // All elements for which column + window_size > row, will be retained, all others will be masked out
@@ -221,7 +237,7 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
         // Setup a graph so we can compare column + window_size - (s_kv - s_q) > row
         // Optimization with fixed sequence lengths: single pointwise addition for the left-hand of the comparison
         // Again, all elements satisfying the comparison will be retained.
-        else if (s_kv_ptr == nullptr && s_q_ptr == nullptr) {
+        else if (s_kv_ptr == nullptr && s_q_ptr == nullptr && cu_s_kv_ptr == nullptr && cu_s_q_ptr == nullptr) {
             effective_left_bound = std::make_shared<Tensor_attributes>((float)(left_bound.value() - s_kv + s_q));
         }
         // With bottom right diagonal alignment: general case when at least one of Q and KV have variable sequence
@@ -230,16 +246,24 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
         // Also here, all elements satisfying the comparison will be retained.
         else {
             effective_left_bound = std::make_shared<Tensor_attributes>((int32_t)left_bound.value());
-            effective_s_kv =
-                s_kv_ptr != nullptr ? s_kv_ptr : std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv));
-            effective_s_q =
-                s_q_ptr != nullptr ? s_q_ptr : std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q));
+            effective_s_q        = s_q_ptr;
+            effective_s_kv       = s_kv_ptr;
+            effective_cu_s_q     = cu_s_q_ptr;
+            effective_cu_s_kv    = cu_s_kv_ptr;
+            if (effective_s_q == nullptr && effective_cu_s_q == nullptr) {
+                effective_s_q = std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_q));
+            }
+            if (effective_s_kv == nullptr && effective_cu_s_kv == nullptr) {
+                effective_s_kv = std::make_shared<Tensor_attributes>(static_cast<int32_t>(s_kv));
+            }
         }
 
         return_mask = graph->diagonal_band_mask(/*x=*/return_mask,
                                                 /*b=*/std::make_shared<Tensor_attributes>(get_negative_inf_value()),
                                                 /*seq_len_q=*/effective_s_q,
                                                 /*seq_len_kv=*/effective_s_kv,
+                                                /*cu_seq_len_q=*/effective_cu_s_q,
+                                                /*cu_seq_len_kv=*/effective_cu_s_kv,
                                                 /*left_bound=*/effective_left_bound,
                                                 /*shift_right_bound=*/nullptr,
                                                 DiagonalBandMask_attributes()

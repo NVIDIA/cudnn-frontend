@@ -744,14 +744,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         beta: cute.Tensor,
         prob: cute.Tensor,
         dprob: cute.Tensor,
-        linear_offset: Float32,
         dbias_tensor: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
-        geglu_alpha: Float32 = cutlass.Float32(1.702),
-        glu_clamp_max: Float32 = cutlass.Float32(7.0),
-        glu_clamp_min: Float32 = cutlass.Float32(-7.0),
+        linear_offset: cutlass.Constexpr = 1.0,
+        geglu_alpha: cutlass.Constexpr = 1.702,
+        glu_clamp_max: cutlass.Constexpr = 7.0,
+        glu_clamp_min: cutlass.Constexpr = -7.0,
     ):
         """Execute the GEMM.
 
@@ -761,9 +761,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         ``b_major_mode`` describe the uniform per-expert layout.
 
         ``linear_offset``, ``geglu_alpha``, ``glu_clamp_max``, and
-        ``glu_clamp_min`` are runtime ``cutlass.Float32`` parameters that
-        configure the GeGLU activation that this kernel differentiates -- the
-        forward computed
+        ``glu_clamp_min`` are compile-time constants that configure the GeGLU
+        activation that this kernel differentiates -- the forward computed
             out = (clamp(up, min=glu_clamp_min, max=glu_clamp_max) + linear_offset)
                   * silu(geglu_alpha * clamp(gate, max=glu_clamp_max))
         and the backward consumes the same values plus the corresponding
@@ -2069,10 +2068,10 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         beta: cute.Tensor,
         prob: cute.Tensor,
         dprob: cute.Tensor,
-        linear_offset: Float32,
-        geglu_alpha: Float32,
-        glu_clamp_max: Float32,
-        glu_clamp_min: Float32,
+        linear_offset: cutlass.Constexpr,
+        geglu_alpha: cutlass.Constexpr,
+        glu_clamp_max: cutlass.Constexpr,
+        glu_clamp_min: cutlass.Constexpr,
         mDbias_tensor: Optional[cute.Tensor],
         workspace_ptr,
         cluster_layout_vmnk: cute.Layout,
@@ -3032,10 +3031,10 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                             ab2_vec_load,
                             mProb,
                             square_alpha,
-                            linear_offset,
-                            geglu_alpha,
-                            glu_clamp_max,
-                            glu_clamp_min,
+                            cutlass.Float32(linear_offset),
+                            cutlass.Float32(geglu_alpha),
+                            cutlass.Float32(glu_clamp_max),
+                            cutlass.Float32(glu_clamp_min),
                             dprob_swiglu,
                         )
 

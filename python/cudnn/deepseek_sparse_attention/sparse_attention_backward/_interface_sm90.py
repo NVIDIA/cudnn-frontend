@@ -43,6 +43,7 @@ def flash_attn_bwd_sm90(
     topk_idxs: torch.Tensor = None,
     topk_length: torch.Tensor = None,
     need_d_sink: bool = False,
+    current_stream=None,
 ) -> Tuple[torch.Tensor, ...]:
     """FlashAttention (DSA) Backward Pass for Hopper (SM90), with K=V.
 
@@ -167,7 +168,7 @@ def flash_attn_bwd_sm90(
         dkv_accum.fill_(0)
 
     dtype = torch2cute_dtype_map[q4.dtype]
-    current_stream = resolve_stream()
+    current_stream = resolve_stream(current_stream)
     arch = 90
     num_threads = 256
 

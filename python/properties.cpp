@@ -196,6 +196,10 @@ init_properties(py::module_& m) {
              &cudnn_frontend::graph::Tensor_attributes::set_vector_count_and_dimension,
              py::return_value_policy::reference)
         .def("set_ragged_offset", &cudnn_frontend::graph::Tensor_attributes::set_ragged_offset)
+        .def("get_ragged_offset_multiplier", &cudnn_frontend::graph::Tensor_attributes::get_ragged_offset_multiplier)
+        .def("set_ragged_offset_multiplier",
+             &cudnn_frontend::graph::Tensor_attributes::set_ragged_offset_multiplier,
+             py::return_value_policy::reference)
         .def("__repr__", [](cudnn_frontend::graph::Tensor_attributes const& props) {
             std::ostringstream out;
             out << json{props};
@@ -231,7 +235,10 @@ init_properties(py::module_& m) {
         .value("SPLIT_P_SLC", cudnn_frontend::KnobType_t::SPLIT_P_SLC)
         .value("TILE_M", cudnn_frontend::KnobType_t::TILE_M)
         .value("TILE_N", cudnn_frontend::KnobType_t::TILE_N)
-        .value("WARP_SPEC_CFG", cudnn_frontend::KnobType_t::WARP_SPEC_CFG);
+        .value("WARP_SPEC_CFG", cudnn_frontend::KnobType_t::WARP_SPEC_CFG)
+        .value("SWAP_AB", cudnn_frontend::KnobType_t::SWAP_AB)
+        .value("INPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::INPUT_TMA_ENABLE)
+        .value("OUTPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::OUTPUT_TMA_ENABLE);
 
     py::class_<cudnn_frontend::Knob, std::shared_ptr<cudnn_frontend::Knob>>(m, "knob")
         .def(py::init<cudnn_frontend::KnobType_t, int64_t, int64_t, int64_t>(),

@@ -40,7 +40,7 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 *   **[cudnn SDPA Fprop](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/sdpa):** Open sourcing the Hopper and Blackwell fprop kernels with stats.
 *   **[Fused RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/rms_norm_silu):** Implementation of a fused kernel of RMS normalization followed by SiLU (Swish) activation.
 *   **[SDPA PyTorch Op](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/experimental/ops):** PyTorch custom operator for cuDNN-accelerated Scaled Dot-Product Attention with autograd and `torch.compile` support.
-*   **[DSA](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/native_sparse_attention):** DSA/CSA kernels for DSv4 and DSv3.2 for fprop and bprop.
+*   **[DSA](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/deepseek_sparse_attention):** DSA/CSA kernels for DSv4 and DSv3.2 for fprop and bprop.
 
 ## Tech talks
 
@@ -151,6 +151,24 @@ export CUDNN_FRONTEND_LOG_FILE=execution_log.txt
 - `CUDNN_FRONTEND_LOG_INFO=10`: Basic logging (safe for CUDA graph capture)
 
 Alternatively, you can control logging programmatically via `cudnn_frontend::isLoggingEnabled()`.
+
+### Overriding the CUDA runtime library
+
+When the frontend is built with dynamic loading enabled, it locates the CUDA runtime
+(`libcudart.so.*`) at runtime by searching for the supported major versions. In some
+environments (for example, containers such as GKE where the TCPXO NCCL plugin mounts a
+different `libcudart` major version from the host) multiple versions of `libcudart` may be
+visible on the library search path, and the automatic detection aborts with a
+`Multiple libcudart libraries found` error.
+
+To resolve this, set the `CUDNN_FRONTEND_CUDART_LIB_NAME` environment variable to the
+library name (or full path) that should be loaded. This bypasses the automatic detection:
+
+```bash
+export CUDNN_FRONTEND_CUDART_LIB_NAME=libcudart.so.13
+# or an absolute path
+export CUDNN_FRONTEND_CUDART_LIB_NAME=/usr/local/cuda/lib64/libcudart.so.13
+```
 
 ## License
 

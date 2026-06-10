@@ -34,8 +34,8 @@ TEST_CASE("Compile-time constant scalar multiply and add", "[compile_time_const]
     return;
 #endif
 
-    if (!check_device_arch_newer_than("blackwell")) {
-        SKIP("TEST requires device blackwell or newer");
+    if (!is_blackwell_computing_arch()) {
+        SKIP("Compile-time constant scalar graph (TensorIR) is only supported on SM100-SM109 (data center Blackwell)");
     }
 
 #if (CUDNN_VERSION < 92200)

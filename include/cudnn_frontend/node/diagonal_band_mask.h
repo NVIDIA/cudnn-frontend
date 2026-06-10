@@ -29,7 +29,16 @@ class DiagonalBandMaskNodeBase : public NodeCRTP<DerivedT> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(has_left_bound() && has_shift_right_bound(),
                                        error_code_t::INVALID_VALUE,
                                        "DiagonalBandMaskNode cannot have both left_bound and shift_right_bound");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            (has_seq_len_q() || has_seq_len_kv()) && (has_cu_seq_len_q() || has_cu_seq_len_kv()),
+            error_code_t::INVALID_VALUE,
+            "SEQ_LEN_Q / SEQ_LEN_KV and CU_SEQ_LEN_Q / CU_SEQ_LEN_KV are mutually exclusive");
 
+        return pre_validate_node_extra();
+    }
+
+    virtual error_t
+    pre_validate_node_extra() const {
         return {error_code_t::OK, ""};
     }
 
@@ -65,6 +74,18 @@ class DiagonalBandMaskNodeBase : public NodeCRTP<DerivedT> {
     has_seq_len_kv() const {
         auto seq_len_KV_it = attributes.inputs.find(DiagonalBandMask_attributes::input_names::SEQ_LEN_KV);
         return ((seq_len_KV_it) != attributes.inputs.end() && seq_len_KV_it->second != nullptr);
+    }
+
+    bool
+    has_cu_seq_len_q() const {
+        auto cu_seq_len_Q_it = attributes.inputs.find(DiagonalBandMask_attributes::input_names::CU_SEQ_LEN_Q);
+        return ((cu_seq_len_Q_it) != attributes.inputs.end() && cu_seq_len_Q_it->second != nullptr);
+    }
+
+    bool
+    has_cu_seq_len_kv() const {
+        auto cu_seq_len_KV_it = attributes.inputs.find(DiagonalBandMask_attributes::input_names::CU_SEQ_LEN_KV);
+        return ((cu_seq_len_KV_it) != attributes.inputs.end() && cu_seq_len_KV_it->second != nullptr);
     }
 
     bool
@@ -105,6 +126,17 @@ class CompositeDiagonalBandMaskNode : public DiagonalBandMaskNodeBase<CompositeD
     Type
     getType() override final {
         return Type::COMPOSITE;
+    }
+
+    error_t
+    pre_validate_node_extra() const override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating CompositeDiagonalBandMaskNode " << attributes.name);
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(has_cu_seq_len_q() || has_cu_seq_len_kv(),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "CompositeDiagonalBandMaskNode does not support CU_SEQ_LEN_Q or CU_SEQ_LEN_KV");
+
+        return {error_code_t::OK, ""};
     }
 
     error_t
@@ -306,6 +338,40 @@ class UnifiedDiagonalBandMaskNode : public DiagonalBandMaskNodeBase<UnifiedDiago
                                                            &backend_seq_len_KV));
         }
 
+        if (has_cu_seq_len_q() || has_cu_seq_len_kv()) {
+            auto cu_seq_len_cudnn_ver_error =
+                error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Cumulative sequence length tensors in unified DiagonalBandMask node require cuDNN 9.24.0"};
+#if (CUDNN_VERSION >= 92400)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92400, cu_seq_len_cudnn_ver_error);
+
+            if (has_cu_seq_len_q()) {
+                auto cu_seq_len_Q =
+                    attributes.inputs.find(DiagonalBandMask_attributes::input_names::CU_SEQ_LEN_Q)->second;
+                auto backend_cu_seq_len_Q = tensors[cu_seq_len_Q->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(diagonal_band_mask_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_DIAGONAL_BAND_MASK_CU_SEQ_LEN_QDESC,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_cu_seq_len_Q));
+            }
+
+            if (has_cu_seq_len_kv()) {
+                auto cu_seq_len_KV =
+                    attributes.inputs.find(DiagonalBandMask_attributes::input_names::CU_SEQ_LEN_KV)->second;
+                auto backend_cu_seq_len_KV = tensors[cu_seq_len_KV->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(
+                    detail::set_attribute(diagonal_band_mask_operation->get_backend_descriptor(),
+                                          CUDNN_ATTR_OPERATION_DIAGONAL_BAND_MASK_CU_SEQ_LEN_KVDESC,
+                                          CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                          1,
+                                          &backend_cu_seq_len_KV));
+            }
+#else
+            return cu_seq_len_cudnn_ver_error;
+#endif
+        }
+
         if (has_left_bound()) {
             auto left_bound = attributes.inputs.find(DiagonalBandMask_attributes::input_names::LeftBound)->second;
             auto backend_left_bound = tensors[left_bound->get_uid()]->get_desc()->get_backend_descriptor();
@@ -369,6 +435,8 @@ INode::diagonal_band_mask(std::shared_ptr<Tensor_attributes> x,
                           std::shared_ptr<Tensor_attributes> b,
                           std::shared_ptr<Tensor_attributes> seq_len_q,
                           std::shared_ptr<Tensor_attributes> seq_len_kv,
+                          std::shared_ptr<Tensor_attributes> cu_seq_len_q,
+                          std::shared_ptr<Tensor_attributes> cu_seq_len_kv,
                           std::shared_ptr<Tensor_attributes> left_bound,
                           std::shared_ptr<Tensor_attributes> shift_right_bound,
                           DiagonalBandMask_attributes attributes) {
@@ -379,6 +447,12 @@ INode::diagonal_band_mask(std::shared_ptr<Tensor_attributes> x,
     }
     if (seq_len_kv) {
         attributes.inputs[DiagonalBandMask_attributes::input_names::SEQ_LEN_KV] = seq_len_kv;
+    }
+    if (cu_seq_len_q) {
+        attributes.inputs[DiagonalBandMask_attributes::input_names::CU_SEQ_LEN_Q] = cu_seq_len_q;
+    }
+    if (cu_seq_len_kv) {
+        attributes.inputs[DiagonalBandMask_attributes::input_names::CU_SEQ_LEN_KV] = cu_seq_len_kv;
     }
     if (left_bound) {
         attributes.inputs[DiagonalBandMask_attributes::input_names::LeftBound] = left_bound;
