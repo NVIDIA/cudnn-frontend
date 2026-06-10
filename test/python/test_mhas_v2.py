@@ -129,7 +129,7 @@ def test_sdpa_random_fwd_L0(env_info, test_no, request, cudnn_handle):
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L1
-def test_sdpa_random_fwd_unified_L0(env_info, test_no, request, cudnn_handle):
+def test_sdpa_random_fwd_unified_L1(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
 
@@ -249,7 +249,7 @@ def test_sdpa_random_sq1_L0(env_info, test_no, request, cudnn_handle):
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=32, rng_seed=111), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L1
-def test_sdpa_random_sq1_unified_L0(env_info, test_no, request, cudnn_handle):
+def test_sdpa_random_sq1_unified_L1(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
 
@@ -320,7 +320,7 @@ def test_sdpa_random_lean_attn_L0(env_info, test_no, request, cudnn_handle):
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=222), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L1
-def test_sdpa_random_lean_attn_unified_L0(env_info, test_no, request, cudnn_handle):
+def test_sdpa_random_lean_attn_unified_L1(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
 
@@ -389,7 +389,7 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L1
-def test_sdpa_random_fwd_ragged_unified_L0(env_info, test_no, request, cudnn_handle):
+def test_sdpa_random_fwd_ragged_unified_L1(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
 
@@ -417,6 +417,47 @@ def test_sdpa_random_fwd_ragged_unified_L0(env_info, test_no, request, cudnn_han
 
     test.cfg.dropout_prob = 0.1 if test.cfg.is_dropout else 0.0
     test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
+    test.showConfig(test_no, request)
+
+    exec_sdpa(test.cfg, request, cudnn_handle)
+
+
+# The ragged offset multiplier (CUDNN_ATTR_TENSOR_RAGGED_OFFSET_MULTIPLIER) is only
+# supported on the unified SDPA forward engine; backward/composite engines reject a
+# non-default multiplier. The attribute itself requires cuDNN 9.24.0.
+@pytest.mark.skipif(
+    cudnn.backend_version() < 92400,
+    reason="ragged offset multiplier requires cuDNN >= 9.24.0",
+)
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L1
+def test_sdpa_random_fwd_ragged_offset_multiplier_unified_L1(env_info, test_no, request, cudnn_handle):
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.UNIFIED)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    # Create the randomization context within the test
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(128,128), (192,128), (256, 256)]),
+        head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
+        data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged_mult" : 1, "cu_ragged_mult" : 1}),
+        with_score_max=RandomChoice({True : 1, False : 3}),
+        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
+        with_sink_token=RandomChoice({True : 1, False : 3}),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    # Multiplier is only supported on the unified forward engine.
+    test.cfg.implementation = cudnn.attention_implementation.UNIFIED
     test.showConfig(test_no, request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)
@@ -494,7 +535,7 @@ def test_sdpa_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
-@pytest.mark.L1
+@pytest.mark.L0
 def test_sdpa_fwd_paged_unified_L0(env_info, test_no, request, cudnn_handle):
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)

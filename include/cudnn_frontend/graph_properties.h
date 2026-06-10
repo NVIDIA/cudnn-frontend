@@ -93,6 +93,15 @@ class Tensor_attributes {
             error_code_t::ATTRIBUTE_NOT_SET,
             "Tensor '" + name + "' can't have both compile-time constant and runtime pass_by_value.");
 
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            has_ragged_offset_multiplier() && !ragged_offset,
+            error_code_t::ATTRIBUTE_NOT_SET,
+            "Tensor '" + name + "' with ragged offset multiplier must also have a ragged offset tensor.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(ragged_offset_multiplier <= 0,
+                                       error_code_t::INVALID_VALUE,
+                                       "Tensor '" + name + "' ragged offset multiplier must be positive.");
+
         return {error_code_t::OK, ""};
     }
 
@@ -118,9 +127,10 @@ class Tensor_attributes {
     bool uid_assigned                  = false;
 
     std::shared_ptr<Tensor_attributes> ragged_offset;
-    int64_t alignment        = 16;  // Default to 16 bytes
-    int64_t vector_count     = 1;   // Default to 1 (no vectorization)
-    int64_t vector_dimension = -1;  // Default to -1 (not set)
+    int64_t ragged_offset_multiplier = 1;
+    int64_t alignment                = 16;  // Default to 16 bytes
+    int64_t vector_count             = 1;   // Default to 1 (no vectorization)
+    int64_t vector_dimension         = -1;  // Default to -1 (not set)
 
     auto
     fill_from_context(detail::Context const& context) -> Tensor_attributes& {
@@ -323,6 +333,16 @@ class Tensor_attributes {
         return ragged_offset;
     }
 
+    int64_t
+    get_ragged_offset_multiplier() const {
+        return ragged_offset_multiplier;
+    }
+
+    bool
+    has_ragged_offset_multiplier() const {
+        return ragged_offset_multiplier != 1;
+    }
+
     auto
     set_is_virtual(bool const value) -> Tensor_attributes& {
         is_virtual = value;
@@ -445,6 +465,12 @@ class Tensor_attributes {
     auto
     set_ragged_offset(std::shared_ptr<Tensor_attributes> const& value) -> Tensor_attributes& {
         ragged_offset = value;
+        return *this;
+    }
+
+    auto
+    set_ragged_offset_multiplier(int64_t value) -> Tensor_attributes& {
+        ragged_offset_multiplier = value;
         return *this;
     }
 };

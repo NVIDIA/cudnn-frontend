@@ -84,6 +84,9 @@ create_cudnn_tensor(
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(ragged_offset_props, tensors, potential_uid, used_uids));
         tensor_builder.setRaggedOffset(tensors.at(ragged_offset_props->get_uid()));
     }
+    if (props->has_ragged_offset_multiplier()) {
+        tensor_builder.setRaggedOffsetMultiplier(props->get_ragged_offset_multiplier());
+    }
 
 #ifdef NV_CUDNN_DISABLE_EXCEPTION
     // disable exception macro is defined. Calling build will not throw.

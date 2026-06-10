@@ -87,7 +87,8 @@ PyGraph::tensor(std::vector<int64_t> const& dim,
                 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& ragged_offset,
                 cudnn_frontend::TensorReordering_t const reordering_type,
                 std::string const& name,
-                int64_t const& uid) {
+                int64_t const& uid,
+                int64_t const& ragged_offset_multiplier) {
     auto props = cudnn_frontend::graph::Tensor_attributes()
                      .set_data_type(data_type)
                      .set_is_virtual(is_virtual)
@@ -96,7 +97,8 @@ PyGraph::tensor(std::vector<int64_t> const& dim,
                      .set_stride(stride)
                      .set_ragged_offset(ragged_offset)
                      .set_reordering_type(reordering_type)
-                     .set_name(name);
+                     .set_name(name)
+                     .set_ragged_offset_multiplier(ragged_offset_multiplier);
 
     if (uid != -1) {
         props.set_uid(uid);
@@ -867,7 +869,8 @@ init_pygraph_submodule(py::module_& m) {
              py::arg_v{"ragged_offset", nullptr},
              py::arg_v{"reordering_type", cudnn_frontend::TensorReordering_t::NONE},
              py::arg_v("name", ""),
-             py::arg_v("uid", -1))
+             py::arg_v("uid", -1),
+             py::arg_v("ragged_offset_multiplier", int64_t{1}))
         .def("genstats",
              &PyGraph::genstats,
              py::arg("input"),

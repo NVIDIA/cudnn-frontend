@@ -170,10 +170,18 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         allocs[TensorUid.seq_len_kv] = (seq_len_kv_gpu, None, None)
 
     if cfg.is_ragged:
-        allocs[TensorUid.q_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.h_q * cfg.d_qk).to(torch.int64), None, None)
-        allocs[TensorUid.k_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.h_k * cfg.d_qk).to(torch.int64), None, None)
-        allocs[TensorUid.v_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.h_v * cfg.d_v).to(torch.int64), None, None)
-        allocs[TensorUid.o_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.h_q * cfg.d_v).to(torch.int64), None, None)
+        # When testing the ragged offset multiplier, store the offsets in coarser
+        # units by dividing out a per-tensor multiplier (M_q=M_k=d_qk, M_v=M_o=d_v);
+        # the engine recovers the true element offset by multiplying back. stats keeps
+        # the default multiplier of 1. The chosen multipliers always divide evenly.
+        q_off_mult = cfg.d_qk if cfg.with_ragged_offset_multiplier else 1
+        k_off_mult = cfg.d_qk if cfg.with_ragged_offset_multiplier else 1
+        v_off_mult = cfg.d_v if cfg.with_ragged_offset_multiplier else 1
+        o_off_mult = cfg.d_v if cfg.with_ragged_offset_multiplier else 1
+        allocs[TensorUid.q_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.h_q * cfg.d_qk // q_off_mult).to(torch.int64), None, None)
+        allocs[TensorUid.k_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.h_k * cfg.d_qk // k_off_mult).to(torch.int64), None, None)
+        allocs[TensorUid.v_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.h_v * cfg.d_v // v_off_mult).to(torch.int64), None, None)
+        allocs[TensorUid.o_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.h_q * cfg.d_v // o_off_mult).to(torch.int64), None, None)
         allocs[TensorUid.stats_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.h_q * 1).to(torch.int64), None, None)
 
     if cfg.is_bias:
@@ -282,6 +290,10 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         q.set_ragged_offset(q_ragged_offset)
         k.set_ragged_offset(k_ragged_offset)
         v.set_ragged_offset(v_ragged_offset)
+        if cfg.with_ragged_offset_multiplier:
+            q.set_ragged_offset_multiplier(cfg.d_qk)
+            k.set_ragged_offset_multiplier(cfg.d_qk)
+            v.set_ragged_offset_multiplier(cfg.d_v)
 
     # Create graph tensors for score_max and score_sum_exp
     score_max = score_sum_exp = sink_token = None
@@ -340,6 +352,8 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
     o.set_uid(int(TensorUid.o)).set_output(True).set_dim(cfg.shape_o).set_stride(cfg.stride_o)
     if cfg.is_ragged:
         o.set_ragged_offset(o_ragged_offset)
+        if cfg.with_ragged_offset_multiplier:
+            o.set_ragged_offset_multiplier(cfg.d_v)
 
         if cfg.with_score_max:
             score_max.set_ragged_offset(stats_ragged_offset)
