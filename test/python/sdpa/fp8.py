@@ -311,6 +311,7 @@ def create_paged_container_and_block_table(tensor, block_size):
 def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if request.config.option.dryrun:
         pytest.skip("dryrun")
+    perf = request.config.getoption("--perf")
 
     cudnn_version = LooseVersion(cudnn.backend_version_string())
     if cudnn_version < "9.14.0":
@@ -420,12 +421,15 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     else:
         padding = None
 
-    o_ref, stats_ref, o_amax = compute_ref(q_fp8, k_fp8, v_fp8, attn_scale=attn_scale,
-                                            q_descale=q_descale_gpu, k_descale=k_descale_gpu, v_descale=v_descale_gpu,
-                                            s_scale=s_scale_gpu, s_descale=s_descale_gpu, torch_itype=torch_itype,
-                                            torch_otype=torch_otype, padding=padding,
-                                            left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
-                                            sink_token=sink_token_gpu, rescale_threshold=rescale_threshold)
+    if perf:
+        o_amax = 1.0
+    else:
+        o_ref, stats_ref, o_amax = compute_ref(q_fp8, k_fp8, v_fp8, attn_scale=attn_scale,
+                                                q_descale=q_descale_gpu, k_descale=k_descale_gpu, v_descale=v_descale_gpu,
+                                                s_scale=s_scale_gpu, s_descale=s_descale_gpu, torch_itype=torch_itype,
+                                                torch_otype=torch_otype, padding=padding,
+                                                left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
+                                                sink_token=sink_token_gpu, rescale_threshold=rescale_threshold)
 
     o_scale_gpu = torch.tensor([get_fp8_scale_factor(o_amax, torch_otype)], dtype=torch.float, device="cuda")
 
@@ -497,7 +501,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         variant_pack[int(GraphFwdUid.sink_token)] = sink_token_gpu
 
     workspace = torch.empty(graph_fwd.get_workspace_size(), dtype=torch.uint8, device="cuda")
-    if request.config.getoption("--perf"):
+    if perf:
         times_ms = time_execution(graph_fwd.execute, variant_pack, workspace, cudnn_handle)
         print(f"@@@@ FP8 Fwd graph_fwd.execute avg_time_ms={times_ms.mean().item():.3f}")
         profile_execution(graph_fwd.execute, variant_pack, workspace, cudnn_handle)
@@ -505,21 +509,22 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     torch.cuda.synchronize()
 
     # Compare forward output
-    if is_ragged:
-        o_ref_comp = convert_uniform_to_packed(torch.einsum("bshd->bhsd", o_ref), seq_len_q_ref, max_t_q)
-    else:
-        o_ref_comp = o_ref
+    if not perf:
+        if is_ragged:
+            o_ref_comp = convert_uniform_to_packed(torch.einsum("bshd->bhsd", o_ref), seq_len_q_ref, max_t_q)
+        else:
+            o_ref_comp = o_ref
 
-    o_gpu_float = o_gpu.detach().float() * get_fp8_descale_factor(o_amax, torch_otype)
-    o_ref_float = o_ref_comp.detach().float() * get_fp8_descale_factor(o_amax, torch_otype)
+        o_gpu_float = o_gpu.detach().float() * get_fp8_descale_factor(o_amax, torch_otype)
+        o_ref_float = o_ref_comp.detach().float() * get_fp8_descale_factor(o_amax, torch_otype)
 
-    if is_ragged:
-        t_idx = sum(seq_len_q_list)
-        o_gpu_float[t_idx:] = 0
-        o_ref_float[t_idx:] = 0
+        if is_ragged:
+            t_idx = sum(seq_len_q_list)
+            o_gpu_float[t_idx:] = 0
+            o_ref_float[t_idx:] = 0
 
-    atol, rtol = 0.08, 0.2
-    torch.testing.assert_close(o_gpu_float, o_ref_float, atol=atol, rtol=rtol)
+        atol, rtol = 0.08, 0.2
+        torch.testing.assert_close(o_gpu_float, o_ref_float, atol=atol, rtol=rtol)
 
     # Backward pass
     if not cfg.is_infer:
@@ -530,30 +535,36 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         o_descale_gpu = torch.tensor([get_fp8_descale_factor(o_amax, torch_otype)], dtype=torch.float, device="cuda")
         dO_descale_gpu = torch.tensor([get_fp8_descale_factor(dO_amax, torch_itype)], dtype=torch.float, device="cuda")
 
-        # Get unpacked BSHD references for backward
-        if is_ragged:
-            q_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(q_gpu, seq_len_q_ref, s_qo))
-            k_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(k_gpu, seq_len_kv_ref, s_kv))
-            v_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(v_gpu, seq_len_kv_ref, s_kv))
-            o_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(o_gpu, seq_len_q_ref, s_qo))
-            dO_ref_bwd = dO_fp8
+        if perf:
+            dP_amax = 1.0
+            dQ_amax = 1.0
+            dK_amax = 1.0
+            dV_amax = 1.0
         else:
-            q_ref_bwd = q_gpu
-            k_ref_bwd = k_gpu
-            v_ref_bwd = v_gpu
-            o_ref_bwd = o_gpu
-            dO_ref_bwd = dO_fp8
+            # Get unpacked BSHD references for backward
+            if is_ragged:
+                q_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(q_gpu, seq_len_q_ref, s_qo))
+                k_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(k_gpu, seq_len_kv_ref, s_kv))
+                v_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(v_gpu, seq_len_kv_ref, s_kv))
+                o_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(o_gpu, seq_len_q_ref, s_qo))
+                dO_ref_bwd = dO_fp8
+            else:
+                q_ref_bwd = q_gpu
+                k_ref_bwd = k_gpu
+                v_ref_bwd = v_gpu
+                o_ref_bwd = o_gpu
+                dO_ref_bwd = dO_fp8
 
-        padding_bwd = (seq_len_q_ref, seq_len_kv_ref) if is_ragged else None
-        dQ_ref, dK_ref, dV_ref, dSink_token_ref, dP_amax, dQ_amax, dK_amax, dV_amax = compute_ref_backward(
-            q_ref_bwd, k_ref_bwd, v_ref_bwd, o_ref_bwd, dO_ref_bwd, attn_scale=attn_scale,
-            q_descale=q_descale_gpu, k_descale=k_descale_gpu, v_descale=v_descale_gpu,
-            s_scale=s_scale_gpu, s_descale=s_descale_gpu, torch_itype=torch_itype,
-            o_descale=o_descale_gpu, dO_descale=dO_descale_gpu,
-            torch_otype=torch_otype, padding=padding_bwd,
-            left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
-            sink_token=sink_token_gpu
-        )
+            padding_bwd = (seq_len_q_ref, seq_len_kv_ref) if is_ragged else None
+            dQ_ref, dK_ref, dV_ref, dSink_token_ref, dP_amax, dQ_amax, dK_amax, dV_amax = compute_ref_backward(
+                q_ref_bwd, k_ref_bwd, v_ref_bwd, o_ref_bwd, dO_ref_bwd, attn_scale=attn_scale,
+                q_descale=q_descale_gpu, k_descale=k_descale_gpu, v_descale=v_descale_gpu,
+                s_scale=s_scale_gpu, s_descale=s_descale_gpu, torch_itype=torch_itype,
+                o_descale=o_descale_gpu, dO_descale=dO_descale_gpu,
+                torch_otype=torch_otype, padding=padding_bwd,
+                left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
+                sink_token=sink_token_gpu
+            )
 
         dP_descale_gpu = torch.tensor([get_fp8_descale_factor(dP_amax, torch_itype)], dtype=torch.float, device="cuda")
         dQ_scale_gpu = torch.tensor([get_fp8_scale_factor(dQ_amax, torch_otype)], dtype=torch.float, device="cuda")
@@ -623,7 +634,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
             variant_pack_bwd[int(GraphBwdUid.dSink_token)] = dSink_token_gpu
 
         workspace_bwd = torch.empty(graph_bwd.get_workspace_size(), dtype=torch.uint8, device="cuda")
-        if request.config.getoption("--perf"):
+        if perf:
             times_ms = time_execution(graph_bwd.execute, variant_pack_bwd, workspace_bwd, cudnn_handle)
             print(f"@@@@ FP8 Bwd graph.execute avg_time_ms={times_ms.mean().item():.3f}")
             profile_execution(graph_bwd.execute, variant_pack_bwd, workspace_bwd, cudnn_handle)
@@ -652,36 +663,37 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
                 pytest.fail("determinism check failed", pytrace=False)
             print("@@@@ Determinism check: PASSED, dQ, dK, dV bitwise match between runs.")
 
-        if is_ragged:
-            dQ_ref = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dQ_ref), seq_len_q_ref, max_t_q)
-            dK_ref = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dK_ref), seq_len_kv_ref, max_t_kv)
-            dV_ref = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dV_ref), seq_len_kv_ref, max_t_kv)
+        if not perf:
+            if is_ragged:
+                dQ_ref = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dQ_ref), seq_len_q_ref, max_t_q)
+                dK_ref = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dK_ref), seq_len_kv_ref, max_t_kv)
+                dV_ref = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dV_ref), seq_len_kv_ref, max_t_kv)
 
-        dQ_out = dQ_gpu.detach().float() * get_fp8_descale_factor(dQ_amax, torch_otype)
-        dK_out = dK_gpu.detach().float() * get_fp8_descale_factor(dK_amax, torch_otype)
-        dV_out = dV_gpu.detach().float() * get_fp8_descale_factor(dV_amax, torch_otype)
+            dQ_out = dQ_gpu.detach().float() * get_fp8_descale_factor(dQ_amax, torch_otype)
+            dK_out = dK_gpu.detach().float() * get_fp8_descale_factor(dK_amax, torch_otype)
+            dV_out = dV_gpu.detach().float() * get_fp8_descale_factor(dV_amax, torch_otype)
 
-        dQ_ref_float = dQ_ref.detach().float() * get_fp8_descale_factor(dQ_amax, torch_otype)
-        dK_ref_float = dK_ref.detach().float() * get_fp8_descale_factor(dK_amax, torch_otype)
-        dV_ref_float = dV_ref.detach().float() * get_fp8_descale_factor(dV_amax, torch_otype)
+            dQ_ref_float = dQ_ref.detach().float() * get_fp8_descale_factor(dQ_amax, torch_otype)
+            dK_ref_float = dK_ref.detach().float() * get_fp8_descale_factor(dK_amax, torch_otype)
+            dV_ref_float = dV_ref.detach().float() * get_fp8_descale_factor(dV_amax, torch_otype)
 
-        if is_ragged:
-            t_idx_q = sum(seq_len_q_list)
-            dQ_out[t_idx_q:] = 0
-            dQ_ref_float[t_idx_q:] = 0
-            t_idx_kv = sum(seq_len_kv_list)
-            dK_out[t_idx_kv:] = 0
-            dK_ref_float[t_idx_kv:] = 0
-            dV_out[t_idx_kv:] = 0
-            dV_ref_float[t_idx_kv:] = 0
+            if is_ragged:
+                t_idx_q = sum(seq_len_q_list)
+                dQ_out[t_idx_q:] = 0
+                dQ_ref_float[t_idx_q:] = 0
+                t_idx_kv = sum(seq_len_kv_list)
+                dK_out[t_idx_kv:] = 0
+                dK_ref_float[t_idx_kv:] = 0
+                dV_out[t_idx_kv:] = 0
+                dV_ref_float[t_idx_kv:] = 0
 
-        atol, rtol = 0.04, 0.2
-        torch.testing.assert_close(dQ_out, dQ_ref_float, atol=atol, rtol=rtol)
-        torch.testing.assert_close(dK_out, dK_ref_float, atol=atol, rtol=rtol)
-        torch.testing.assert_close(dV_out, dV_ref_float, atol=atol, rtol=rtol)
+            atol, rtol = 0.04, 0.2
+            torch.testing.assert_close(dQ_out, dQ_ref_float, atol=atol, rtol=rtol)
+            torch.testing.assert_close(dK_out, dK_ref_float, atol=atol, rtol=rtol)
+            torch.testing.assert_close(dV_out, dV_ref_float, atol=atol, rtol=rtol)
 
-        if with_sink_token:
-            torch.testing.assert_close(dSink_token_gpu, dSink_token_ref, atol=0.02, rtol=0.2)
+            if with_sink_token:
+                torch.testing.assert_close(dSink_token_gpu, dSink_token_ref, atol=0.02, rtol=0.2)
 
     # Print hash and stats for determinism verification
     print_tensor_stats(o_gpu, tag="o_gpu")
