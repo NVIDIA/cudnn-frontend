@@ -82,15 +82,30 @@ class Graph : public ICudnn, public INode {
         std::unordered_set<Tensor_attributes const *> visited_tensors;
         Tensor_attributes::uid_t potential_uid = 1;
 
+        tensor_uid_materializer_t materialize_uid;
+        materialize_uid = [&](std::shared_ptr<Tensor_attributes> const &tensor) -> error_t {
+            if (tensor == nullptr || !visited_tensors.insert(tensor.get()).second) {
+                return {error_code_t::OK, ""};
+            }
+
+            if (tensor->has_uid()) {
+                materialized_uids.insert(tensor->get_uid());
+            } else {
+                detail::assign_uid(tensor.get(), potential_uid, materialized_uids);
+                materialized_uids.insert(tensor->get_uid());
+            }
+
+            CHECK_CUDNN_FRONTEND_ERROR(materialize_uid(tensor->get_ragged_offset()));
+            return {error_code_t::OK, ""};
+        };
+
         for (auto const &input : full_graph_inputs) {
-            CHECK_CUDNN_FRONTEND_ERROR(
-                detail::materialize_uid(input, potential_uid, materialized_uids, visited_tensors));
+            CHECK_CUDNN_FRONTEND_ERROR(materialize_uid(input));
         }
         for (auto const &output : full_graph_outputs) {
-            CHECK_CUDNN_FRONTEND_ERROR(
-                detail::materialize_uid(output, potential_uid, materialized_uids, visited_tensors));
+            CHECK_CUDNN_FRONTEND_ERROR(materialize_uid(output));
         }
-        CHECK_CUDNN_FRONTEND_ERROR(materialize_uids_subtree(potential_uid, materialized_uids, visited_tensors));
+        CHECK_CUDNN_FRONTEND_ERROR(materialize_uids_subtree(materialize_uid));
 
         return {error_code_t::OK, ""};
     }

@@ -32,27 +32,6 @@ assign_uid(graph::Tensor_attributes* const tensor,
     ++potential_uid;  // increment, as used its used now
 }
 
-inline error_t
-materialize_uid(std::shared_ptr<graph::Tensor_attributes> const& props,
-                int64_t& potential_uid,
-                std::unordered_set<int64_t>& used_uids,
-                std::unordered_set<graph::Tensor_attributes const*>& visited_tensors) {
-    if (props == nullptr || !visited_tensors.insert(props.get()).second) {
-        return {error_code_t::OK, ""};
-    }
-
-    if (props->has_uid()) {
-        used_uids.insert(props->get_uid());
-    } else {
-        assign_uid(props.get(), potential_uid, used_uids);
-        used_uids.insert(props->get_uid());
-    }
-
-    CHECK_CUDNN_FRONTEND_ERROR(materialize_uid(props->get_ragged_offset(), potential_uid, used_uids, visited_tensors));
-
-    return {error_code_t::OK, ""};
-}
-
 // TODO: Always returns OK. Can the status and error message be accessed from tensor descriptor?
 inline error_t
 create_cudnn_tensor(
