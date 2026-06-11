@@ -1,14 +1,14 @@
 """SM90 indexer forward kernel - direct CuTeDSL port of the old C++ path.
 
-This kernel intentionally follows the old SM90 C++ forward topology:
+This kernel intentionally keeps the SM90 C++ Q/K staging topology:
   * 256 threads / 2 warpgroups
   * WG0 warp0 issues Q/K TMA loads and loads weights
-  * WG0 warp1 stores the score tile to global memory
-  * WG1 runs two 64x64x16 WGMMA stages and the head-reduce epilogue
+  * WG1 runs two 64x64x16 WGMMA stages and writes the reduced scores
 
 The algorithm computes the same score tensor as the C++ kernel:
     sm_scale * sum_h relu(Q_h @ K^T) * W_h
-with bottom-right ratio causal masking.
+with bottom-right ratio causal masking. Reduced BF16 scores are written directly
+from registers to global memory.
 """
 
 import math
@@ -28,7 +28,6 @@ from cudnn.deepseek_sparse_attention.utils import copy as copy_utils
 from cudnn.deepseek_sparse_attention.utils.seqlen import SeqlenInfoQK
 from cudnn.deepseek_sparse_attention.utils.sm90 import mma as sm90_mma
 from cudnn.deepseek_sparse_attention.utils.sm90 import primitives as sm90_ops
-from cudnn.deepseek_sparse_attention.utils.sm90.bwd_barriers import NamedBarrierBwd
 from cudnn.deepseek_sparse_attention.utils.sm90.mma import gemm_w_idx
 
 
@@ -53,7 +52,7 @@ class IndexerForwardSm90:
         qhead_per_kvhead: int = 64,
         ratio: int = 4,
         is_varlen: bool = False,
-        use_tma_store: bool = False,
+        clean_logits: bool = True,
     ):
         assert head_dim == 128, f"SM90 direct forward supports head_dim=128, got {head_dim}"
         assert qhead_per_kvhead in (
@@ -67,7 +66,7 @@ class IndexerForwardSm90:
         self.qhead_per_kvhead = qhead_per_kvhead
         self.ratio = ratio
         self.is_varlen = is_varlen
-        self.use_tma_store = use_tma_store and not is_varlen
+        self.clean_logits = clean_logits
 
         self.tile_m = 128
         self.tile_n = 64
@@ -117,10 +116,15 @@ class IndexerForwardSm90:
         )
 
     def _get_shared_storage_cls(self):
-        sQ_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sQ_layout_staged)], 1024]
-        sKV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sKV_layout_staged)], 1024]
-        sW_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, self.tile_m], 128]
-        sScore_struct = cute.struct.Align[cute.struct.MemRange[Float32, self.q_tokens_per_tile * self.tile_n], 1024]
+        sQ_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype, cute.cosize(self.sQ_layout_staged)], 1024
+        ]
+        sKV_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype, cute.cosize(self.sKV_layout_staged)], 1024
+        ]
+        sW_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype, self.tile_m], 128
+        ]
 
         @cute.struct
         class SharedStorage:
@@ -130,10 +134,7 @@ class IndexerForwardSm90:
             mbar_KV1: cute.struct.MemRange[cutlass.Int64, 2]
             mbar_KVEmpty0: cute.struct.MemRange[cutlass.Int64, 2]
             mbar_KVEmpty1: cute.struct.MemRange[cutlass.Int64, 2]
-            mbar_ScoreFull: cute.struct.MemRange[cutlass.Int64, 2]
-            mbar_ScoreEmpty: cute.struct.MemRange[cutlass.Int64, 2]
             sW: sW_struct
-            sScore: sScore_struct
             sQ: sQ_struct
             sKV: sKV_struct
 
@@ -191,18 +192,20 @@ class IndexerForwardSm90:
                     sW[row] = self.dtype(0.0)
 
     @cute.jit
-    def _epilogue_store_to_smem(
+    def _epilogue_store_to_gmem(
         self,
         q_stage_idx: cutlass.Constexpr[int],
         acc_S: cute.Tensor,
         tWeights: cute.Tensor,
-        sScore: cute.Tensor,
+        mOut: cute.Tensor,
         m_block: Int32,
         n_block: Int32,
         is_first_nblock: Boolean,
         seqlen_q: Int32,
         seqlen_k: Int32,
-        tidx_wg: Int32,
+        max_seqlen_k: Int32,
+        q_batch_offset: Int32,
+        batch_idx: Int32,
         sm_scale: Float32,
     ):
         acc_mn = sm90_ops.make_acc_tensor_mn_view(acc_S)
@@ -237,15 +240,27 @@ class IndexerForwardSm90:
             for qi in cutlass.range_constexpr(self.q_tokens_per_stage):
                 for mi in cutlass.range(kNRows, unroll_full=True):
                     kv_m = m_base + mi * 8
-                    q_offset = q_stage_idx * self.q_tokens_per_stage + qi
+                    q_local = q_token_base + qi
+                    k_local = n_block * self.tile_n + kv_m
                     score = ps[mi, qi]
+                    should_store = Boolean(True)
                     if is_first_nblock:
-                        kv_token = n_block * self.tile_n + kv_m
-                        col_lim = (q_global_start + q_token_base + qi + Int32(1)) // Int32(self.ratio)
-                        if kv_token >= seqlen_k or kv_token >= col_lim:
-                            score = -Float32.inf
-                    sScore[q_offset, kv_m] = score
-        cute.arch.fence_view_async_shared()
+                        col_lim = (
+                            q_global_start + q_local + Int32(1)
+                        ) // Int32(self.ratio)
+                        if k_local >= seqlen_k or k_local >= col_lim:
+                            if const_expr(self.clean_logits):
+                                score = -Float32.inf
+                            else:
+                                should_store = Boolean(False)
+                    elif k_local >= seqlen_k:
+                        should_store = Boolean(False)
+
+                    if should_store and q_local < seqlen_q and k_local < max_seqlen_k:
+                        if const_expr(self.is_varlen):
+                            mOut[q_batch_offset + q_local, k_local] = score
+                        else:
+                            mOut[batch_idx, q_local, k_local] = score
 
     @cute.jit
     def producer(
@@ -370,15 +385,13 @@ class IndexerForwardSm90:
         sQ_1: cute.Tensor,
         sKV_staged: cute.Tensor,
         sW: cute.Tensor,
-        sScore: cute.Tensor,
+        mOut: cute.Tensor,
         mbar_Q0_ptr,
         mbar_Q1_ptr,
         mbar_KV0_ptr,
         mbar_KV1_ptr,
         mbar_KVEmpty0_ptr,
         mbar_KVEmpty1_ptr,
-        mbar_ScoreFull_ptr,
-        mbar_ScoreEmpty_ptr,
         mCuSeqlensQ: cute.Tensor,
         mCuSeqlensK: cute.Tensor,
         max_seqlen_q: Int32,
@@ -429,7 +442,6 @@ class IndexerForwardSm90:
             q1_phase = Int32(0)
             kv0_phase = Int32(0)
             kv1_phase = Int32(0)
-            score_empty_phase = Int32(0)
             warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
             cute.arch.mbarrier_wait(mbar_Q0_ptr, q0_phase)
@@ -479,130 +491,38 @@ class IndexerForwardSm90:
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive(mbar_KVEmpty1_ptr, arrive_count=128)
 
-                if iter_idx > Int32(0):
-                    cute.arch.mbarrier_wait(mbar_ScoreEmpty_ptr, score_empty_phase)
-                    score_empty_phase = score_empty_phase ^ Int32(1)
-
                 is_first = Boolean(iter_idx == Int32(0))
-                self._epilogue_store_to_smem(
+                self._epilogue_store_to_gmem(
                     0,
                     acc0,
                     tWeights0,
-                    sScore,
+                    mOut,
                     m_block,
                     n_block,
                     is_first,
                     seqlen.seqlen_q,
                     seqlen.seqlen_k,
-                    wg_tidx,
+                    max_seqlen_k,
+                    seqlen.offset_q,
+                    batch_idx,
                     sm_scale,
                 )
-                self._epilogue_store_to_smem(
+                self._epilogue_store_to_gmem(
                     1,
                     acc1,
                     tWeights1,
-                    sScore,
+                    mOut,
                     m_block,
                     n_block,
                     is_first,
                     seqlen.seqlen_q,
                     seqlen.seqlen_k,
-                    wg_tidx,
+                    max_seqlen_k,
+                    seqlen.offset_q,
+                    batch_idx,
                     sm_scale,
                 )
 
-                cute.arch.mbarrier_arrive(mbar_ScoreFull_ptr)
-                iter_idx = iter_idx + Int32(1)
-
-    @cute.jit
-    def score_store(
-        self,
-        mOut: cute.Tensor,
-        mOut_tma: cute.Tensor,
-        tma_atom_Score: cute.CopyAtom,
-        sScore: cute.Tensor,
-        mbar_ScoreFull_ptr,
-        mbar_ScoreEmpty_ptr,
-        mCuSeqlensQ: cute.Tensor,
-        mCuSeqlensK: cute.Tensor,
-        max_seqlen_q: Int32,
-        max_seqlen_k: Int32,
-    ):
-        lane = cute.arch.lane_idx()
-        block_x, head_idx, batch_idx = cute.arch.block_idx()
-        del head_idx
-        seqlen = SeqlenInfoQK.create(
-            batch_idx,
-            max_seqlen_q,
-            max_seqlen_k,
-            mCuSeqlensQ,
-            mCuSeqlensK,
-            None,
-            None,
-            tile_m=self.tile_m,
-            tile_n=self.tile_n,
-        )
-        num_m_blocks = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.tile_m)
-        if block_x < num_m_blocks:
-            m_block = num_m_blocks - Int32(1) - block_x
-            n_block_max = self._compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k)
-
-            score_full_phase = Int32(0)
-            iter_idx = Int32(0)
-            while iter_idx < n_block_max:
-                n_block = self._iter_n_block(iter_idx, n_block_max)
-                cute.arch.mbarrier_wait(mbar_ScoreFull_ptr, score_full_phase)
-                score_full_phase = score_full_phase ^ Int32(1)
-
-                if const_expr(mCuSeqlensQ is not None):
-                    for idx in cutlass.range(lane, self.q_tokens_per_tile * self.tile_n, 32, unroll=1):
-                        qi = idx // self.tile_n
-                        kj = idx - qi * self.tile_n
-                        q_local = m_block * self.q_tokens_per_tile + qi
-                        k_local = n_block * self.tile_n + kj
-                        if q_local < seqlen.seqlen_q and k_local < max_seqlen_k:
-                            mOut[seqlen.offset_q + q_local, k_local] = sScore[qi, kj]
-                else:
-                    if const_expr(self.use_tma_store):
-                        q_tile_end = (m_block + Int32(1)) * Int32(self.q_tokens_per_tile)
-                        k_tile_end = (n_block + Int32(1)) * Int32(self.tile_n)
-                        if q_tile_end <= seqlen.seqlen_q and k_tile_end <= max_seqlen_k:
-                            score_tile = (self.q_tokens_per_tile, self.tile_n)
-                            gScore = cute.local_tile(
-                                mOut_tma[None, None, batch_idx],
-                                score_tile,
-                                (m_block, n_block),
-                            )
-                            store_fn, _, _ = copy_utils.tma_get_copy_fn(
-                                tma_atom_Score,
-                                0,
-                                cute.make_layout(1),
-                                sScore,
-                                gScore,
-                                single_stage=True,
-                            )
-                            with cute.arch.elect_one():
-                                store_fn()
-                                cute.arch.cp_async_bulk_commit_group()
-                                cute.arch.cp_async_bulk_wait_group(0, read=True)
-                        else:
-                            for idx in cutlass.range(lane, self.q_tokens_per_tile * self.tile_n, 32, unroll=1):
-                                qi = idx // self.tile_n
-                                kj = idx - qi * self.tile_n
-                                q_local = m_block * self.q_tokens_per_tile + qi
-                                k_local = n_block * self.tile_n + kj
-                                if q_local < seqlen.seqlen_q and k_local < max_seqlen_k:
-                                    mOut[batch_idx, q_local, k_local] = sScore[qi, kj]
-                    else:
-                        for idx in cutlass.range(lane, self.q_tokens_per_tile * self.tile_n, 32, unroll=1):
-                            qi = idx // self.tile_n
-                            kj = idx - qi * self.tile_n
-                            q_local = m_block * self.q_tokens_per_tile + qi
-                            k_local = n_block * self.tile_n + kj
-                            if q_local < seqlen.seqlen_q and k_local < max_seqlen_k:
-                                mOut[batch_idx, q_local, k_local] = sScore[qi, kj]
-                cute.arch.sync_warp()
-                cute.arch.mbarrier_arrive(mbar_ScoreEmpty_ptr)
                 iter_idx = iter_idx + Int32(1)
 
     @cute.jit
@@ -644,12 +564,6 @@ class IndexerForwardSm90:
         mK = _assume_strides(mK)
         mW = _assume_strides(mW)
         mOut = _assume_strides(mOut)
-
-        if const_expr(self.use_tma_store):
-            mOut_tma_view = cute.make_tensor(
-                mOut.iterator,
-                cute.select(mOut.layout, mode=[1, 2, 0]),
-            )
 
         mQ = sm90_ops.select(mQ, [0, 2, 1] if const_expr(is_varlen) else [1, 3, 2, 0])
         mK = sm90_ops.select(mK, [0, 2, 1] if const_expr(is_varlen) else [1, 3, 2, 0])
@@ -700,19 +614,6 @@ class IndexerForwardSm90:
             self.sKV_layout_single,
             (self.tile_n, self.tile_hdim),
         )
-        if const_expr(self.use_tma_store):
-            sScore_layout = cute.make_layout((self.q_tokens_per_tile, self.tile_n), stride=(self.tile_n, 1))
-            score_tile = (self.q_tokens_per_tile, self.tile_n)
-            score_cta_v_layout = cute.composition(cute.make_identity_layout(mOut_tma_view.shape), score_tile)
-            tma_atom_Score, mOut_tma = cpasync.make_tiled_tma_atom(
-                cpasync.CopyBulkTensorTileS2GOp(),
-                mOut_tma_view,
-                sScore_layout,
-                score_cta_v_layout,
-            )
-        else:
-            tma_atom_Score = tma_atom_Q
-            mOut_tma = mOut
 
         batch_size = cute.size(mCuSeqlensQ.shape[0]) - 1 if const_expr(is_varlen) else cute.size(mQ.shape[3])
         grid_x = cute.ceil_div(max_seqlen_q * self.qhead_per_kvhead, self.tile_m)
@@ -725,8 +626,6 @@ class IndexerForwardSm90:
             tma_atom_K,
             mW,
             mOut,
-            mOut_tma,
-            tma_atom_Score,
             self.sQ_layout_staged,
             self.sKV_layout_staged,
             tiled_mma_QK,
@@ -753,8 +652,6 @@ class IndexerForwardSm90:
         tma_atom_K: cute.CopyAtom,
         mW: cute.Tensor,
         mOut: cute.Tensor,
-        mOut_tma: cute.Tensor,
-        tma_atom_Score: cute.CopyAtom,
         sQ_layout_staged: cute.ComposedLayout,
         sKV_layout_staged: cute.ComposedLayout,
         tiled_mma_QK: cute.TiledMma,
@@ -772,8 +669,6 @@ class IndexerForwardSm90:
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_Q)
             cpasync.prefetch_descriptor(tma_atom_K)
-            if const_expr(self.use_tma_store):
-                cpasync.prefetch_descriptor(tma_atom_Score)
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -784,8 +679,6 @@ class IndexerForwardSm90:
         mbar_KV1_ptr = storage.mbar_KV1.data_ptr()
         mbar_KVEmpty0_ptr = storage.mbar_KVEmpty0.data_ptr()
         mbar_KVEmpty1_ptr = storage.mbar_KVEmpty1.data_ptr()
-        mbar_ScoreFull_ptr = storage.mbar_ScoreFull.data_ptr()
-        mbar_ScoreEmpty_ptr = storage.mbar_ScoreEmpty.data_ptr()
 
         if warp_idx == 0:
             cute.arch.mbarrier_init(mbar_Q0_ptr, 1)
@@ -794,8 +687,6 @@ class IndexerForwardSm90:
             cute.arch.mbarrier_init(mbar_KV1_ptr, 1)
             cute.arch.mbarrier_init(mbar_KVEmpty0_ptr, 128)
             cute.arch.mbarrier_init(mbar_KVEmpty1_ptr, 128)
-            cute.arch.mbarrier_init(mbar_ScoreFull_ptr, 128)
-            cute.arch.mbarrier_init(mbar_ScoreEmpty_ptr, 32)
         cute.arch.sync_threads()
 
         sQ_staged = storage.sQ.get_tensor(sQ_layout_staged.outer, swizzle=sQ_layout_staged.inner)
@@ -805,7 +696,6 @@ class IndexerForwardSm90:
         sKV_0 = sKV_staged[None, None, 0]
         sKV_1 = sKV_staged[None, None, 1]
         sW = storage.sW.get_tensor(cute.make_layout((self.tile_m,), stride=(1,)))
-        sScore = storage.sScore.get_tensor(cute.make_layout((self.q_tokens_per_tile, self.tile_n), stride=(self.tile_n, 1)))
 
         if warp_group_idx == 0:
             if warp_idx == 0:
@@ -831,19 +721,6 @@ class IndexerForwardSm90:
                     max_seqlen_q,
                     max_seqlen_k,
                 )
-            elif warp_idx == 1:
-                self.score_store(
-                    mOut,
-                    mOut_tma,
-                    tma_atom_Score,
-                    sScore,
-                    mbar_ScoreFull_ptr,
-                    mbar_ScoreEmpty_ptr,
-                    mCuSeqlensQ,
-                    mCuSeqlensK,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                )
         else:
             self.consumer(
                 tiled_mma_QK,
@@ -851,15 +728,13 @@ class IndexerForwardSm90:
                 sQ_1,
                 sKV_staged,
                 sW,
-                sScore,
+                mOut,
                 mbar_Q0_ptr,
                 mbar_Q1_ptr,
                 mbar_KV0_ptr,
                 mbar_KV1_ptr,
                 mbar_KVEmpty0_ptr,
                 mbar_KVEmpty1_ptr,
-                mbar_ScoreFull_ptr,
-                mbar_ScoreEmpty_ptr,
                 mCuSeqlensQ,
                 mCuSeqlensK,
                 max_seqlen_q,

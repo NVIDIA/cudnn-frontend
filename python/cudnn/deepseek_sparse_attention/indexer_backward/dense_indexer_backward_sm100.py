@@ -6,14 +6,14 @@ Three kernels launched sequentially on the same stream:
   Kernel 1 (CuTe DSL): ScoreGradDense — scalar elementwise + reduction kernel.
       From raw score + denom, normalize → softmax backprop reduction → compute
       grad_signal, in-place overwrite PredictRaw buffer.
-      Grid = (B, max_seqlen_q, 1), Block = (128, 1, 1), 4 warps.
+      Grid = (max_seqlen_q, B, 1), Block = (128, 1, 1), 4 warps.
 
   Kernel 2 (CuTe DSL): DenseIndexerBackward2QGemmSm100 — warp-specialized GEMM kernel.
       Three GEMMs (S, dK, dQ) with elementwise dS/dW computation.
       Two Q tokens per CTA (K-reuse): 6 GEMMs / K block.
       Reads pre-computed grad_signal from GMEM via Load warp (2-stage matching K).
       dK accumulated in float32 via cp.reduce.async.bulk.
-      Grid = (B, ceil(max_seqlen_q/2), 1), Block = (384, 1, 1), 12 warps.
+      Grid = (ceil(max_seqlen_q/2), B, 1), Block = (384, 1, 1), 12 warps.
 
   Kernel 3 (PyTorch): dk_convert — cast dK from float32 to output dtype.
 
@@ -193,7 +193,7 @@ class ScoreGradDense:
             max_seqlen_q,
             max_seqlen_k,
         ).launch(
-            grid=(batch_size, max_seqlen_q, 1),
+            grid=(max_seqlen_q, batch_size, 1),
             block=[self.THREADS_PER_CTA, 1, 1],
             stream=stream,
         )
@@ -213,8 +213,8 @@ class ScoreGradDense:
         seqlen_k_static: Int32,
     ):
         tidx = cute.arch.thread_idx()[0]
-        batch_idx = cute.arch.block_idx()[0]
-        seq_local = cute.arch.block_idx()[1]
+        seq_local = cute.arch.block_idx()[0]
+        batch_idx = cute.arch.block_idx()[1]
         warp_id = tidx // self.WARP_SIZE
         lane_id = tidx % self.WARP_SIZE
 
@@ -278,10 +278,19 @@ class ScoreGradDense:
                     pr = mPredict_b[seq_local, pos]
                     tr = mTarget_b[seq_local, pos]
 
-                    predict = cute.math.exp2((pr - lse_val) * LOG2E, fastmath=True)
+                    score_minus_lse = pr - lse_val
+                    predict = cute.math.exp2(score_minus_lse * LOG2E, fastmath=True)
                     target = tr / (denom_val + Float32(DENOM_EPS))
-                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
-                    log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                    target_eff = (
+                        target
+                        if target >= Float32(CLIP_PROB_MIN)
+                        else Float32(CLIP_PROB_MIN)
+                    )
+                    log_clip_mask = (
+                        Float32(1.0)
+                        if score_minus_lse >= Float32(CLIP_LOG_MIN)
+                        else Float32(0.0)
+                    )
                     g = -target_eff * log_clip_mask * grad_scale
 
                     local_sum = local_sum + g
@@ -302,10 +311,19 @@ class ScoreGradDense:
                     pr = mPredict_b[seq_local, pos]
                     tr = mTarget_b[seq_local, pos]
 
-                    predict = cute.math.exp2((pr - lse_val) * LOG2E, fastmath=True)
+                    score_minus_lse = pr - lse_val
+                    predict = cute.math.exp2(score_minus_lse * LOG2E, fastmath=True)
                     target = tr / (denom_val + Float32(DENOM_EPS))
-                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
-                    log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                    target_eff = (
+                        target
+                        if target >= Float32(CLIP_PROB_MIN)
+                        else Float32(CLIP_PROB_MIN)
+                    )
+                    log_clip_mask = (
+                        Float32(1.0)
+                        if score_minus_lse >= Float32(CLIP_LOG_MIN)
+                        else Float32(0.0)
+                    )
                     g = -target_eff * log_clip_mask * grad_scale
 
                     grad_signal = g - predict * sum_grad
@@ -345,7 +363,7 @@ class DenseIndexerBackward2QGemmSm100:
       Offset 384:  dQ_q1  (128 cols) — Q token 1 persistent accumulator
 
     Barriers: 7 custom.
-    Grid: (batch, ceil(seqlen_q/2), 1).
+    Grid: (ceil(seqlen_q/2), batch, 1).
     """
 
     arch = 100
@@ -612,7 +630,7 @@ class DenseIndexerBackward2QGemmSm100:
             tma_atom_dQ_q1,
             sdQ_epi_layout,
         ).launch(
-            grid=(batch_size, grid_q, 1),
+            grid=(grid_q, batch_size, 1),
             block=[self.THREADS_PER_CTA, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
@@ -657,8 +675,8 @@ class DenseIndexerBackward2QGemmSm100:
     ):
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        batch_idx = cute.arch.block_idx()[0]
-        seq_idx = cute.arch.block_idx()[1]
+        seq_idx = cute.arch.block_idx()[0]
+        batch_idx = cute.arch.block_idx()[1]
 
         is_varlen = const_expr(mCuSeqlensQ is not None)
 
@@ -2124,7 +2142,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         s = _resolve_stream(current_stream)
 
         # Kernel 1 (CuTe DSL): in-place overwrites IdxScoreRaw with grad_signal.
-        # Grid = (B, max_seqlen_q, 1); CTAs past per-batch seqlen exit early.
+        # Grid = (max_seqlen_q, B, 1); CTAs past per-batch seqlen exit early.
         _ensure_compiled_score_grad(
             IdxScoreRaw,
             IdxLSE,
@@ -2150,7 +2168,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
             )
 
         # Kernel 2 (CuTe DSL): 2Q three GEMMs — IdxScoreRaw now contains grad_signal.
-        # Grid = (B, ceil(max_seqlen_q/2), 1).
+        # Grid = (ceil(max_seqlen_q/2), B, 1).
         _run_gemm_only(
             IndexQ,
             Weights,

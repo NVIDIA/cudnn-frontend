@@ -576,18 +576,24 @@ def _dense_indexer_predict_distribution(
     weights: torch.Tensor,  # (B, S_q, H)
     sm_scale: float,
     ratio: int,
+    return_scores: bool = False,
 ) -> torch.Tensor:
     """Dense full-KV predict distribution for dense indexer backward."""
     b, s_q, h, d = q_indexer.shape
     _, s_k, _ = k_indexer.shape
 
-    scores_per_head = torch.einsum("bqhd,bkd->bqhk", q_indexer, k_indexer)
+    scores_per_head = torch.einsum(
+        "bqhd,bkd->bqhk",
+        q_indexer.to(torch.float32),
+        k_indexer.to(torch.float32),
+    )
     scores_per_head = torch.relu(scores_per_head)
     scores = (scores_per_head * (weights * sm_scale).unsqueeze(-1)).sum(dim=2)
 
     valid = _bottom_right_causal_mask(s_q, s_k, ratio, q_indexer.device)
     scores = scores.masked_fill(~valid.unsqueeze(0), float("-inf"))
-    return torch.softmax(scores, dim=-1)
+    predict = torch.softmax(scores, dim=-1)
+    return (predict, scores) if return_scores else predict
 
 
 def ref_dense_indexer_backward(
@@ -605,7 +611,9 @@ def ref_dense_indexer_backward(
     w = weights.detach().clone().requires_grad_(True)
     k = index_k.detach().clone().requires_grad_(True)
 
-    predict = _dense_indexer_predict_distribution(q, k, w, sm_scale, ratio)
+    predict, scores = _dense_indexer_predict_distribution(
+        q, k, w, sm_scale, ratio, return_scores=True
+    )
 
     _, s_q, _, _ = index_q.shape
     _, s_k, _ = index_k.shape
@@ -614,10 +622,14 @@ def ref_dense_indexer_backward(
     target = target / attn_l1norm.to(torch.float32).unsqueeze(-1).clamp(min=1e-10)
 
     eps = math.exp(-100.0)
-    predict_clipped = predict.to(torch.float32).clamp(min=eps)
     target_eff = target.clamp(min=eps)
-    loss = -grad_scale * (target_eff * torch.log(predict_clipped)).sum()
-    grads = torch.autograd.grad(loss, (q, w, k))
+    predict = predict.to(torch.float32)
+    log_clip_mask = (predict >= eps).to(torch.float32)
+    g = -target_eff * log_clip_mask * grad_scale
+    grad_signal = (g - predict * g.sum(dim=-1, keepdim=True)).masked_fill(
+        ~valid.unsqueeze(0), 0.0
+    )
+    grads = torch.autograd.grad(scores, (q, w, k), grad_outputs=grad_signal.to(scores.dtype))
 
     dq, dw, dk = grads
     return (

@@ -116,18 +116,12 @@ def indexer_fwd(
         assert out.dtype == torch.float32 and out.is_cuda
         assert out.is_contiguous(), "out must be contiguous"
 
-    # SM90 TMA store descriptors require the row stride in bytes to be 16B aligned.
-    # The old C++ BSHD path uses TMA store when that descriptor is legal; otherwise
-    # we keep the same warp-scalar writeback used by its varlen path.
-    use_tma_store = (not is_varlen) and (out.stride(1) * out.element_size()) % 16 == 0
-
     compile_key = (
         q.dtype,
         int(head_dim),
         int(qhead_per_kv_head),
         int(ratio),
         bool(is_varlen),
-        bool(use_tma_store),
     )
     current_stream = resolve_stream(current_stream)
     if compile_key not in _compile_cache:
@@ -143,7 +137,6 @@ def indexer_fwd(
             qhead_per_kvhead=int(qhead_per_kv_head),
             ratio=int(ratio),
             is_varlen=is_varlen,
-            use_tma_store=use_tma_store,
         )
         _compile_cache[compile_key] = cute.compile(
             kernel_obj,
