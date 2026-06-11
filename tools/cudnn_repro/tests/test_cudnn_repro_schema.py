@@ -130,6 +130,30 @@ def test_build_cfg_detects_ragged_from_offset_inputs():
     assert cfg["seq_len_kv"] == [11]
 
 
+def test_build_cfg_detects_ragged_from_tensor_offset_refs():
+    payload = fwd_payload()
+    node = payload["nodes"][0]
+    node["padding_mask"] = True
+    node["inputs"].update({"SEQ_LEN_Q": 5, "SEQ_LEN_KV": 6})
+    for entry, offset_uid in zip(payload["tensors"][:4], [7, 8, 8, 7]):
+        entry["ragged_offset_uid"] = offset_uid
+    payload["tensors"].extend(
+        tensor_list({
+            "5": {"uid": 5, "data_type": "INT32", "dim": [1], "stride": [1], "pass_by_value": [13]},
+            "6": {"uid": 6, "data_type": "INT32", "dim": [1], "stride": [1], "pass_by_value": [11]},
+            "7": {"uid": 7, "pass_by_value": [0, 13]},
+            "8": {"uid": 8, "pass_by_value": [0, 11]},
+        })
+    )
+
+    annotated = operations.select_operation(payload).extract_and_annotate("{}", payload, "")
+    cfg = operations.select_operation(annotated).build_cfg("{}", annotated)
+
+    assert cfg["is_ragged"] is True
+    assert annotated["repro_metadata"]["ragged_offset_q"] == [0, 13]
+    assert annotated["repro_metadata"]["ragged_offset_kv"] == [0, 11]
+
+
 def test_build_command_normalizes_enum_fields():
     cfg = {
         "data_type": "torch.float16",

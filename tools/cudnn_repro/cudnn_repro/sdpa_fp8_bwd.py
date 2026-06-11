@@ -145,11 +145,16 @@ def extract_seq_and_ragged(payload: dict, seed: int) -> dict:
     inputs = node.get("inputs", {})
     ragged_offset_q = inputs.get("RAGGED_OFFSET_Q") or inputs.get("RAGGED_OFFSETS_Q")
     ragged_offset_kv = inputs.get("RAGGED_OFFSET_KV") or inputs.get("RAGGED_OFFSETS_KV")
+    q_entry = utils.tensor_entry(tensors, inputs.get("Q"))
+    k_entry = utils.tensor_entry(tensors, inputs.get("K"))
+    v_entry = utils.tensor_entry(tensors, inputs.get("V"))
+    ragged_q_entry = utils.tensor_entry(tensors, ragged_offset_q) or utils.ragged_offset_entry(tensors, q_entry)
+    ragged_kv_entry = utils.tensor_entry(tensors, ragged_offset_kv) or utils.ragged_offset_entry(tensors, k_entry, v_entry)
     return {
         "seq_len_q": utils.seq_len(utils.tensor_entry(tensors, inputs.get("SEQ_LEN_Q"))),
         "seq_len_kv": utils.seq_len(utils.tensor_entry(tensors, inputs.get("SEQ_LEN_KV"))),
-        "ragged_offset_q": utils.seq_len(utils.tensor_entry(tensors, ragged_offset_q)),
-        "ragged_offset_kv": utils.seq_len(utils.tensor_entry(tensors, ragged_offset_kv)),
+        "ragged_offset_q": utils.seq_len(ragged_q_entry),
+        "ragged_offset_kv": utils.seq_len(ragged_kv_entry),
         "rng_data_seed": seed,
     }
 

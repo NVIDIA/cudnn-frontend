@@ -45,9 +45,23 @@ def _apply_tensor_dumps(entry: Tuple[str, dict], tensor_dumps_by_uid: Dict[int, 
         return entry
     raw_line, payload = entry
     payload = copy.deepcopy(payload)
-    for tensor in payload.get("tensors", []):
-        if tensor.get("uid") in tensor_dumps_by_uid:
-            tensor["pass_by_value"] = tensor_dumps_by_uid[tensor["uid"]]
+    tensors = payload.get("tensors", [])
+    tensor_uids = set()
+    ragged_offset_uids = set()
+    for tensor in tensors:
+        uid = tensor.get("uid")
+        if uid is not None:
+            uid = int(uid)
+            tensor_uids.add(uid)
+        ragged_offset_uid = tensor.get("ragged_offset_uid")
+        if ragged_offset_uid is not None:
+            ragged_offset_uids.add(int(ragged_offset_uid))
+        if uid is not None and uid in tensor_dumps_by_uid:
+            tensor["pass_by_value"] = tensor_dumps_by_uid[uid]
+
+    for uid in sorted(ragged_offset_uids - tensor_uids):
+        if uid in tensor_dumps_by_uid:
+            tensors.append({"uid": uid, "pass_by_value": tensor_dumps_by_uid[uid]})
     return raw_line, payload
 
 

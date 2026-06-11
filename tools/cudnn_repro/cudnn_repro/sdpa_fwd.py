@@ -156,6 +156,12 @@ def extract_seq_and_ragged(payload: dict, seed: int) -> dict:
         ragged_q_entry = utils.tensor_entry(tensors, inputs.get("RAGGED_OFFSETS_Q"))
     if ragged_kv_entry is None:
         ragged_kv_entry = utils.tensor_entry(tensors, inputs.get("RAGGED_OFFSETS_KV"))
+    if ragged_q_entry is None:
+        ragged_q_entry = utils.ragged_offset_entry(tensors, utils.tensor_entry(tensors, inputs.get("Q")))
+    if ragged_kv_entry is None:
+        ragged_kv_entry = utils.ragged_offset_entry(
+            tensors, utils.tensor_entry(tensors, inputs.get("K")), utils.tensor_entry(tensors, inputs.get("V"))
+        )
 
     return {
         "seq_len_q": utils.seq_len(seq_q_entry),

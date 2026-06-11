@@ -69,6 +69,20 @@ def test_iter_context_entries_prefers_current_tensor_dump():
     assert entries[-1][1]["tensors"][0]["pass_by_value"] == [2]
 
 
+def test_iter_context_entries_attaches_dumped_ragged_offset_tensor():
+    payload1 = payload(11, "SDPA_FWD", "HALF")
+    payload1["tensors"] = [{"uid": 5, "ragged_offset_uid": 15}]
+    lines = [
+        json.dumps(payload1),
+        "[cudnn_frontend] INFO: Executing gid 11",
+        "[cudnn_frontend] INFO: Tensor Dump uid: 15 Name:  Data: [0, 128]",
+    ]
+
+    entries = list(log_parser.iter_context_entries(lines))
+
+    assert entries[-1][1]["tensors"][-1] == {"uid": 15, "pass_by_value": [0, 128]}
+
+
 def test_iter_context_entries_ignores_dumps_for_unknown_gid():
     payload1 = payload(22, "SDPA_BWD", "HALF")
     payload1["tensors"] = [{"uid": 5}]
