@@ -77,35 +77,35 @@ class Graph : public ICudnn, public INode {
     std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>> tensors_to_dump;
 
     error_t
-    materialize_tensor_uids() const {
-        std::unordered_set<Tensor_attributes::uid_t> materialized_uids;
+    assign_uids() const {
+        std::unordered_set<Tensor_attributes::uid_t> assigned_uids;
         std::unordered_set<Tensor_attributes const *> visited_tensors;
         Tensor_attributes::uid_t potential_uid = 1;
 
-        tensor_uid_materializer_t materialize_uid;
-        materialize_uid = [&](std::shared_ptr<Tensor_attributes> const &tensor) -> error_t {
+        tensor_uid_assigner_t assign_uid;
+        assign_uid = [&](std::shared_ptr<Tensor_attributes> const &tensor) -> error_t {
             if (tensor == nullptr || !visited_tensors.insert(tensor.get()).second) {
                 return {error_code_t::OK, ""};
             }
 
             if (tensor->has_uid()) {
-                materialized_uids.insert(tensor->get_uid());
+                assigned_uids.insert(tensor->get_uid());
             } else {
-                detail::assign_uid(tensor.get(), potential_uid, materialized_uids);
-                materialized_uids.insert(tensor->get_uid());
+                detail::assign_uid(tensor.get(), potential_uid, assigned_uids);
+                assigned_uids.insert(tensor->get_uid());
             }
 
-            CHECK_CUDNN_FRONTEND_ERROR(materialize_uid(tensor->get_ragged_offset()));
+            CHECK_CUDNN_FRONTEND_ERROR(assign_uid(tensor->get_ragged_offset()));
             return {error_code_t::OK, ""};
         };
 
         for (auto const &input : full_graph_inputs) {
-            CHECK_CUDNN_FRONTEND_ERROR(materialize_uid(input));
+            CHECK_CUDNN_FRONTEND_ERROR(assign_uid(input));
         }
         for (auto const &output : full_graph_outputs) {
-            CHECK_CUDNN_FRONTEND_ERROR(materialize_uid(output));
+            CHECK_CUDNN_FRONTEND_ERROR(assign_uid(output));
         }
-        CHECK_CUDNN_FRONTEND_ERROR(materialize_uids_subtree(materialize_uid));
+        CHECK_CUDNN_FRONTEND_ERROR(assign_uids_subtree(assign_uid));
 
         return {error_code_t::OK, ""};
     }
@@ -965,7 +965,7 @@ class Graph : public ICudnn, public INode {
     error_t
     validate() {
         CUDNN_FE_LOG_BANNER("  VALIDATING GRAPH  ");
-        CHECK_CUDNN_FRONTEND_ERROR(materialize_tensor_uids());
+        CHECK_CUDNN_FRONTEND_ERROR(assign_uids());
         CUDNN_FE_LOG(*this << std::endl;);
 
         // First validate all inputs that the user set.
@@ -1655,7 +1655,7 @@ class Graph : public ICudnn, public INode {
     serialize(std::vector<uint8_t> &data, bool serialize_structure = true) const {
         CUDNN_FE_LOG_BANNER(" SERIALIZE PLAN  ");
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
-        CHECK_CUDNN_FRONTEND_ERROR(materialize_tensor_uids());
+        CHECK_CUDNN_FRONTEND_ERROR(assign_uids());
         json j;
         // Optionally serialize the graph structure (nodes/tensors).
         if (serialize_structure) {

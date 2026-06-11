@@ -40,7 +40,7 @@ class UnifiedSoftmaxNode;
 class MoeGroupedMatmulNode;
 class UnifiedDiagonalBandMaskNode;
 
-using tensor_uid_materializer_t = std::function<error_t(std::shared_ptr<Tensor_attributes> const&)>;
+using tensor_uid_assigner_t = std::function<error_t(std::shared_ptr<Tensor_attributes> const&)>;
 class TransposeNode;
 class SliceNode;
 
@@ -104,7 +104,7 @@ class INode {
     };
 
     virtual error_t
-    materialize_uids_node(tensor_uid_materializer_t const&) const {
+    assign_uids_node(tensor_uid_assigner_t const&) const {
         return {error_code_t::OK, ""};
     };
 
@@ -308,10 +308,10 @@ class INode {
     }
 
     error_t
-    materialize_uids_subtree(tensor_uid_materializer_t const& materialize_uid) const {
-        CHECK_CUDNN_FRONTEND_ERROR(materialize_uids_node(materialize_uid));
+    assign_uids_subtree(tensor_uid_assigner_t const& assign_uid) const {
+        CHECK_CUDNN_FRONTEND_ERROR(assign_uids_node(assign_uid));
         for (auto const& sub_node : sub_nodes) {
-            CHECK_CUDNN_FRONTEND_ERROR(sub_node->materialize_uids_subtree(materialize_uid));
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->assign_uids_subtree(assign_uid));
         }
         return {error_code_t::OK, ""};
     }
@@ -499,28 +499,28 @@ class NodeCRTP : public INode {
     }
 
     error_t
-    materialize_uids_node(tensor_uid_materializer_t const& materialize_uid) const override {
+    assign_uids_node(tensor_uid_assigner_t const& assign_uid) const override {
         if constexpr (std::is_same_v<DerivedT, ConcatenateNode>) {
             for (auto const& tensor : self().attributes.inputs) {
-                CHECK_CUDNN_FRONTEND_ERROR(materialize_uid(tensor));
+                CHECK_CUDNN_FRONTEND_ERROR(assign_uid(tensor));
             }
         } else {
             for (auto const& [name, tensor] : self().attributes.inputs) {
                 (void)name;
-                CHECK_CUDNN_FRONTEND_ERROR(materialize_uid(tensor));
+                CHECK_CUDNN_FRONTEND_ERROR(assign_uid(tensor));
             }
         }
 
         for (auto const& [name, tensor] : self().attributes.outputs) {
             (void)name;
-            CHECK_CUDNN_FRONTEND_ERROR(materialize_uid(tensor));
+            CHECK_CUDNN_FRONTEND_ERROR(assign_uid(tensor));
         }
 
         // Handle special case of BN where peer_stats is also an input
         if constexpr (std::is_same_v<DerivedT, DBNNode> || std::is_same_v<DerivedT, BatchNormNode>) {
             // Special case in BN where peer stats is also an input but is not present in inputs map
             for (auto const& tensor : self().attributes.peer_stats) {
-                CHECK_CUDNN_FRONTEND_ERROR(materialize_uid(tensor));
+                CHECK_CUDNN_FRONTEND_ERROR(assign_uid(tensor));
             }
         }
 
