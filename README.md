@@ -42,6 +42,8 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 *   **[SDPA PyTorch Op](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/experimental/ops):** PyTorch custom operator for cuDNN-accelerated Scaled Dot-Product Attention with autograd and `torch.compile` support.
 *   **[DSA](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/deepseek_sparse_attention):** DSA/CSA kernels for DSv4 and DSv3.2 for fprop and bprop.
 
+Contributor credits for these OSS CuTe DSL kernels are listed in [Acknowledgements](ACKNOWLEDGEMENTS.md).
+
 ## Tech talks
 
 * See our latest talk on GPU-Mode
