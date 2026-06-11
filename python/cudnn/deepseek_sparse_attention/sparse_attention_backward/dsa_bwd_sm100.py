@@ -1078,7 +1078,6 @@ class FlashAttentionDSABackwardSm100:
                 mdKV_acc,
                 mTopkIdxs,
                 sTopkIdxs,
-                max_seqlen_kv,
                 tile_count,
                 topk,
                 mma_reduce_dKV_pipeline,
@@ -2043,7 +2042,6 @@ class FlashAttentionDSABackwardSm100:
         mdKV_acc: cute.Tensor,
         mTopkIdxs: cute.Tensor,
         sTopkIdxs: cute.Tensor,
-        max_seqlen_kv: Int32,
         tile_count: Int32,
         topk: Int32,
         mma_reduce_dKV_pipeline,
@@ -2064,8 +2062,6 @@ class FlashAttentionDSABackwardSm100:
         tdKVtdKV3 = tdKVtdKV3[(None, None), 0, 0]
         if cutlass.const_expr(not self.same_hdim_kv):
             tdKVtdKV4 = tdKVtdKV4[(None, None), 0, 0]
-
-        cur_seqlen_kv = max_seqlen_kv
 
         # Set up identity tensor partition once (all dKV sub-tiles share the same layout)
         tmem_load_atom = cute.make_copy_atom(
@@ -2096,7 +2092,7 @@ class FlashAttentionDSABackwardSm100:
                 coord_base = i * 2 - i % 2
                 local_row_idx = cute.get(tTR_cdKV[coord_base], mode=[1])
                 global_row_idx = tile_index * self.block_tile + local_row_idx
-                if global_row_idx < topk and global_row_idx < cur_seqlen_kv:
+                if global_row_idx < topk:
                     if global_row_idx < self.smem_topk_capacity:
                         rTopkIdx[i] = sTopkIdxs[global_row_idx]
                     else:
@@ -2110,7 +2106,7 @@ class FlashAttentionDSABackwardSm100:
                     coord_base = i * 2 - i % 2
                     local_row_idx = cute.get(tTR_cdKV_64[coord_base], mode=[1])
                     global_row_idx = tile_index * self.block_tile + local_row_idx
-                    if global_row_idx < topk and global_row_idx < cur_seqlen_kv:
+                    if global_row_idx < topk:
                         if global_row_idx < self.smem_topk_capacity:
                             rTopkIdx_64[i] = sTopkIdxs[global_row_idx]
                         else:

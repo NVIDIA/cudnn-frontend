@@ -26,9 +26,9 @@ def _make_topk_mask(
     """Materialize a boolean (T, s_kv) mask from topk indices."""
     t, topk = topk_idxs.shape
     mask = torch.zeros(t, s_kv, dtype=torch.bool, device=topk_idxs.device)
-    valid_idx = topk_idxs.clamp(min=0, max=s_kv - 1)
     row_idx = torch.arange(t, device=topk_idxs.device).unsqueeze(1).expand(-1, topk)
-    mask[row_idx, valid_idx] = True
+    valid = (topk_idxs >= 0) & (topk_idxs < s_kv)
+    mask[row_idx[valid], topk_idxs[valid].long()] = True
     if topk_length is not None:
         positions = torch.arange(topk, device=topk_idxs.device).unsqueeze(0).expand(t, -1)
         invalid = positions >= topk_length.unsqueeze(1)
