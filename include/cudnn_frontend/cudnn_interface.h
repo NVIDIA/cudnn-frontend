@@ -42,11 +42,7 @@ materialize_uid(std::shared_ptr<graph::Tensor_attributes> const& props,
     }
 
     if (props->has_uid()) {
-        auto const [_, inserted] = used_uids.insert(props->get_uid());
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!inserted,
-                                       error_code_t::INVALID_VALUE,
-                                       "uid " + std::to_string(props->get_uid()) + " for tensor named " +
-                                           props->get_name() + " has been already assigned to another tensor.");
+        used_uids.insert(props->get_uid());
     } else {
         assign_uid(props.get(), potential_uid, used_uids);
         used_uids.insert(props->get_uid());

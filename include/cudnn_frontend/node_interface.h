@@ -497,50 +497,35 @@ class NodeCRTP : public INode {
         return {error_code_t::OK, ""};
     }
 
-    template <typename VisitTensor>
     error_t
-    for_each_node_tensor(VisitTensor&& visit_tensor) const {
-        auto visit = [&](std::shared_ptr<Tensor_attributes> const& tensor) -> error_t {
-            if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(visit_tensor(tensor));
-            }
-            return {error_code_t::OK, ""};
-        };
-
+    materialize_uids_node(int64_t& potential_uid,
+                          std::unordered_set<int64_t>& used_uids,
+                          std::unordered_set<Tensor_attributes const*>& visited_tensors) const override {
         if constexpr (std::is_same_v<DerivedT, ConcatenateNode>) {
             for (auto const& tensor : self().attributes.inputs) {
-                CHECK_CUDNN_FRONTEND_ERROR(visit(tensor));
+                CHECK_CUDNN_FRONTEND_ERROR(detail::materialize_uid(tensor, potential_uid, used_uids, visited_tensors));
             }
         } else {
             for (auto const& [name, tensor] : self().attributes.inputs) {
                 (void)name;
-                CHECK_CUDNN_FRONTEND_ERROR(visit(tensor));
+                CHECK_CUDNN_FRONTEND_ERROR(detail::materialize_uid(tensor, potential_uid, used_uids, visited_tensors));
             }
         }
 
         for (auto const& [name, tensor] : self().attributes.outputs) {
             (void)name;
-            CHECK_CUDNN_FRONTEND_ERROR(visit(tensor));
+            CHECK_CUDNN_FRONTEND_ERROR(detail::materialize_uid(tensor, potential_uid, used_uids, visited_tensors));
         }
 
         // Handle special case of BN where peer_stats is also an input
         if constexpr (std::is_same_v<DerivedT, DBNNode> || std::is_same_v<DerivedT, BatchNormNode>) {
             // Special case in BN where peer stats is also an input but is not present in inputs map
             for (auto const& tensor : self().attributes.peer_stats) {
-                CHECK_CUDNN_FRONTEND_ERROR(visit(tensor));
+                CHECK_CUDNN_FRONTEND_ERROR(detail::materialize_uid(tensor, potential_uid, used_uids, visited_tensors));
             }
         }
 
         return {error_code_t::OK, ""};
-    }
-
-    error_t
-    materialize_uids_node(int64_t& potential_uid,
-                          std::unordered_set<int64_t>& used_uids,
-                          std::unordered_set<Tensor_attributes const*>& visited_tensors) const override {
-        return for_each_node_tensor([&](std::shared_ptr<Tensor_attributes> const& tensor) {
-            return detail::materialize_uid(tensor, potential_uid, used_uids, visited_tensors);
-        });
     }
 
     error_t
@@ -549,9 +534,39 @@ class NodeCRTP : public INode {
                               std::unordered_set<int64_t> const& used_uids) const override {
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Creating cudnn tensors for node named '" << self().attributes.name << "':");
 
-        return for_each_node_tensor([&](std::shared_ptr<Tensor_attributes> const& tensor) {
-            return detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids);
-        });
+        if constexpr (std::is_same_v<DerivedT, ConcatenateNode>) {
+            for (auto const& tensor : self().attributes.inputs) {
+                if (tensor) {
+                    CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
+                }
+            }
+        } else {
+            for (auto const& [name, tensor] : self().attributes.inputs) {
+                (void)name;
+                if (tensor) {
+                    CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
+                }
+            }
+        }
+
+        for (auto const& [name, tensor] : self().attributes.outputs) {
+            (void)name;
+            if (tensor) {
+                CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
+            }
+        }
+
+        // Handle special case of BN where peer_stats is also an input
+        if constexpr (std::is_same_v<DerivedT, DBNNode> || std::is_same_v<DerivedT, BatchNormNode>) {
+            // Special case in BN where peer stats is also an input but is not present in inputs map
+            for (auto const& tensor : self().attributes.peer_stats) {
+                if (tensor) {
+                    CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
+                }
+            }
+        }
+
+        return {error_code_t::OK, ""};
     }
 
    protected:
