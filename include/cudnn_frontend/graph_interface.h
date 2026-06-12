@@ -111,13 +111,13 @@ class Graph : public ICudnn, public INode {
         std::unordered_set<Tensor_attributes const *> visited_tensors;
         std::vector<std::shared_ptr<Tensor_attributes>> tensors;
 
+        CHECK_CUDNN_FRONTEND_ERROR(collect_tensor_attributes_subtree(tensors));
         for (auto const &input : full_graph_inputs) {
             tensors.push_back(input);
         }
         for (auto const &output : full_graph_outputs) {
             tensors.push_back(output);
         }
-        CHECK_CUDNN_FRONTEND_ERROR(collect_tensor_attributes_subtree(tensors));
 
         for (auto const &tensor : tensors) {
             CHECK_CUDNN_FRONTEND_ERROR(assign_tensor_uid(tensor, used_uids, visited_tensors));
