@@ -2462,6 +2462,11 @@ class Graph : public ICudnn, public INode {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
     serialize(json &j) const override final {
+        auto status = assign_uids();
+        if (status.is_bad()) {
+            throw std::runtime_error(status.get_message());
+        }
+
         // Different from serialization of other INodes.
         // Go over each subnode and serialize them.
         json full_json;
