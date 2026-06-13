@@ -76,9 +76,9 @@ class Graph : public ICudnn, public INode {
     std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>> tensors_to_dump;
 
     error_t
-    assign_tensor_uid(std::shared_ptr<Tensor_attributes> const &tensor,
-                      std::unordered_set<Tensor_attributes::uid_t> &used_uids,
-                      std::unordered_set<Tensor_attributes const *> &visited_tensors) const {
+    collect_assigned_uid(std::shared_ptr<Tensor_attributes> const &tensor,
+                         std::unordered_set<Tensor_attributes::uid_t> &used_uids,
+                         std::unordered_set<Tensor_attributes const *> &visited_tensors) const {
         if (tensor == nullptr || !visited_tensors.insert(tensor.get()).second) {
             return {error_code_t::OK, ""};
         }
@@ -90,7 +90,21 @@ class Graph : public ICudnn, public INode {
                                            "uid " + std::to_string(uid) + " for tensor named " + tensor->get_name() +
                                                " has been already assigned to another tensor.");
             used_uids.insert(uid);
-        } else {
+        }
+
+        CHECK_CUDNN_FRONTEND_ERROR(collect_assigned_uid(tensor->get_ragged_offset(), used_uids, visited_tensors));
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    assign_tensor_uid(std::shared_ptr<Tensor_attributes> const &tensor,
+                      std::unordered_set<Tensor_attributes::uid_t> &used_uids,
+                      std::unordered_set<Tensor_attributes const *> &visited_tensors) const {
+        if (tensor == nullptr || !visited_tensors.insert(tensor.get()).second) {
+            return {error_code_t::OK, ""};
+        }
+
+        if (tensor->has_uid() == false) {
             Tensor_attributes::uid_t uid = 1;
             while (used_uids.find(uid) != used_uids.end()) {
                 ++uid;
@@ -119,6 +133,10 @@ class Graph : public ICudnn, public INode {
             tensors.push_back(output);
         }
 
+        for (auto const &tensor : tensors) {
+            CHECK_CUDNN_FRONTEND_ERROR(collect_assigned_uid(tensor, used_uids, visited_tensors));
+        }
+        visited_tensors.clear();
         for (auto const &tensor : tensors) {
             CHECK_CUDNN_FRONTEND_ERROR(assign_tensor_uid(tensor, used_uids, visited_tensors));
         }
