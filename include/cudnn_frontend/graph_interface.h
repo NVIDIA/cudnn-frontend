@@ -2588,6 +2588,25 @@ class Graph : public ICudnn, public INode {
         }
 
         std::map<Tensor_attributes::uid_t, std::shared_ptr<Tensor_attributes>> created_tensors;
+        for (auto const &[uid, tensor_info] : tensor_table) {
+            auto tensor_attributes = std::make_shared<Tensor_attributes>();
+            from_json(tensor_info, *tensor_attributes);
+            created_tensors[uid] = tensor_attributes;
+        }
+
+        std::vector<std::pair<std::shared_ptr<Tensor_attributes>, std::shared_ptr<Tensor_attributes>>> ragged_offsets;
+        for (auto const &[_, tensor] : created_tensors) {
+            auto ragged_offset = tensor->get_ragged_offset();
+            if (ragged_offset != nullptr) {
+                ragged_offsets.emplace_back(tensor, ragged_offset);
+            }
+        }
+        for (auto const &[tensor, ragged_offset] : ragged_offsets) {
+            auto [created_tensor, inserted] = created_tensors.emplace(ragged_offset->get_uid(), ragged_offset);
+            (void)inserted;
+            tensor->set_ragged_offset(created_tensor->second);
+        }
+
         auto fill_tensor_refs = [&tensor_table](json const &tensor_refs, json &tensor_infos) -> error_t {
             if (!tensor_refs.is_object()) {
                 return {error_code_t::OK, ""};

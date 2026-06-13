@@ -26,12 +26,14 @@ def fwd_payload(*, gid=1, unfuse_fma=False):
                 "padding_mask": False,
             }
         ],
-        "tensors": tensor_list({
-            "1": {"uid": 1, "dim": [1, 3, 16, 64], "stride": [3072, 64, 192, 1]},
-            "2": {"uid": 2, "dim": [1, 1, 16, 64], "stride": [1024, 64, 64, 1]},
-            "3": {"uid": 3, "dim": [1, 1, 16, 64], "stride": [1024, 64, 64, 1]},
-            "4": {"uid": 4, "name": "sdpa_fwd::O", "dim": [1, 3, 16, 64], "stride": [3072, 64, 192, 1]},
-        }),
+        "tensors": tensor_list(
+            {
+                "1": {"uid": 1, "dim": [1, 3, 16, 64], "stride": [3072, 64, 192, 1]},
+                "2": {"uid": 2, "dim": [1, 1, 16, 64], "stride": [1024, 64, 64, 1]},
+                "3": {"uid": 3, "dim": [1, 1, 16, 64], "stride": [1024, 64, 64, 1]},
+                "4": {"uid": 4, "name": "sdpa_fwd::O", "dim": [1, 3, 16, 64], "stride": [3072, 64, 192, 1]},
+            }
+        ),
     }
     return payload
 
@@ -53,12 +55,14 @@ def test_build_cfg_maps_causal_without_explicit_right_bound():
                 "right_bound": None,
             }
         ],
-        "tensors": tensor_list({
-            "1": {"uid": 1, "dim": [2, 4, 128, 64], "stride": [32768, 8192, 64, 1]},
-            "2": {"uid": 2, "dim": [2, 4, 128, 64], "stride": [32768, 8192, 64, 1]},
-            "3": {"uid": 3, "dim": [2, 4, 128, 64], "stride": [32768, 8192, 64, 1]},
-            "4": {"uid": 4, "dim": [2, 4, 128, 64], "stride": [32768, 8192, 64, 1]},
-        }),
+        "tensors": tensor_list(
+            {
+                "1": {"uid": 1, "dim": [2, 4, 128, 64], "stride": [32768, 8192, 64, 1]},
+                "2": {"uid": 2, "dim": [2, 4, 128, 64], "stride": [32768, 8192, 64, 1]},
+                "3": {"uid": 3, "dim": [2, 4, 128, 64], "stride": [32768, 8192, 64, 1]},
+                "4": {"uid": 4, "dim": [2, 4, 128, 64], "stride": [32768, 8192, 64, 1]},
+            }
+        ),
     }
 
     cfg = operations.select_operation(payload).build_cfg("{}", payload)
@@ -91,12 +95,14 @@ def test_build_cfg_preserves_logged_tensor_layout():
                 "right_bound": None,
             }
         ],
-        "tensors": tensor_list({
-            "1": {"uid": 1, "dim": [2, 128, 4, 64], "stride": [32768, 64, 8192, 1]},
-            "2": {"uid": 2, "dim": [2, 128, 4, 64], "stride": [32768, 64, 8192, 1]},
-            "3": {"uid": 3, "dim": [2, 128, 4, 64], "stride": [32768, 64, 8192, 1]},
-            "4": {"uid": 4, "dim": [2, 128, 4, 64], "stride": [32768, 64, 8192, 1]},
-        }),
+        "tensors": tensor_list(
+            {
+                "1": {"uid": 1, "dim": [2, 128, 4, 64], "stride": [32768, 64, 8192, 1]},
+                "2": {"uid": 2, "dim": [2, 128, 4, 64], "stride": [32768, 64, 8192, 1]},
+                "3": {"uid": 3, "dim": [2, 128, 4, 64], "stride": [32768, 64, 8192, 1]},
+                "4": {"uid": 4, "dim": [2, 128, 4, 64], "stride": [32768, 64, 8192, 1]},
+            }
+        ),
     }
 
     cfg = operations.select_operation(payload).build_cfg("{}", payload)
@@ -114,12 +120,14 @@ def test_build_cfg_detects_ragged_from_offset_inputs():
     node["padding_mask"] = True
     node["inputs"].update({"SEQ_LEN_Q": 5, "SEQ_LEN_KV": 6, "RAGGED_OFFSET_Q": 7, "RAGGED_OFFSET_KV": 8})
     payload["tensors"].extend(
-        tensor_list({
-            "5": {"uid": 5, "data_type": "INT32", "dim": [1, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [13]},
-            "6": {"uid": 6, "data_type": "INT32", "dim": [1, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [11]},
-            "7": {"uid": 7, "data_type": "INT64", "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 13]},
-            "8": {"uid": 8, "data_type": "INT64", "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 11]},
-        })
+        tensor_list(
+            {
+                "5": {"uid": 5, "data_type": "INT32", "dim": [1, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [13]},
+                "6": {"uid": 6, "data_type": "INT32", "dim": [1, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [11]},
+                "7": {"uid": 7, "data_type": "INT64", "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 13]},
+                "8": {"uid": 8, "data_type": "INT64", "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 11]},
+            }
+        )
     )
 
     cfg = operations.select_operation(payload).build_cfg("{}", payload)
@@ -138,12 +146,14 @@ def test_build_cfg_detects_ragged_from_tensor_offset_refs():
     for entry, offset_uid in zip(payload["tensors"][:4], [7, 8, 8, 7]):
         entry["ragged_offset_uid"] = offset_uid
     payload["tensors"].extend(
-        tensor_list({
-            "5": {"uid": 5, "data_type": "INT32", "dim": [1], "stride": [1], "pass_by_value": [13]},
-            "6": {"uid": 6, "data_type": "INT32", "dim": [1], "stride": [1], "pass_by_value": [11]},
-            "7": {"uid": 7, "pass_by_value": [0, 13]},
-            "8": {"uid": 8, "pass_by_value": [0, 11]},
-        })
+        tensor_list(
+            {
+                "5": {"uid": 5, "data_type": "INT32", "dim": [1], "stride": [1], "pass_by_value": [13]},
+                "6": {"uid": 6, "data_type": "INT32", "dim": [1], "stride": [1], "pass_by_value": [11]},
+                "7": {"uid": 7, "pass_by_value": [0, 13]},
+                "8": {"uid": 8, "pass_by_value": [0, 11]},
+            }
+        )
     )
 
     annotated = operations.select_operation(payload).extract_and_annotate("{}", payload, "")
