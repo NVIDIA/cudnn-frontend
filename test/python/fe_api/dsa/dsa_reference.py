@@ -611,9 +611,7 @@ def ref_dense_indexer_backward(
     w = weights.detach().clone().requires_grad_(True)
     k = index_k.detach().clone().requires_grad_(True)
 
-    predict, scores = _dense_indexer_predict_distribution(
-        q, k, w, sm_scale, ratio, return_scores=True
-    )
+    predict, scores = _dense_indexer_predict_distribution(q, k, w, sm_scale, ratio, return_scores=True)
 
     _, s_q, _, _ = index_q.shape
     _, s_k, _ = index_k.shape
@@ -626,9 +624,7 @@ def ref_dense_indexer_backward(
     predict = predict.to(torch.float32)
     log_clip_mask = (predict >= eps).to(torch.float32)
     g = -target_eff * log_clip_mask * grad_scale
-    grad_signal = (g - predict * g.sum(dim=-1, keepdim=True)).masked_fill(
-        ~valid.unsqueeze(0), 0.0
-    )
+    grad_signal = (g - predict * g.sum(dim=-1, keepdim=True)).masked_fill(~valid.unsqueeze(0), 0.0)
     grads = torch.autograd.grad(scores, (q, w, k), grad_outputs=grad_signal.to(scores.dtype))
 
     dq, dw, dk = grads
