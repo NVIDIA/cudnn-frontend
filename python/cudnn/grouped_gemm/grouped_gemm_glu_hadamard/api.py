@@ -169,16 +169,17 @@ class GroupedGemmGluHadamardSm100(APIBase):
             l = self.expert_cnt
         _, n_c, _ = self._tensor_shape(self.c_desc, name="sample_c")
         _, n_d, _ = self._tensor_shape(self.d_desc, name="sample_d")
+        n_out = n if self.act_func == "srelu" else n // 2
 
         self._value_error_if(l != self.expert_cnt, f"B L dimension ({l}) must match expert_cnt ({self.expert_cnt})")
         self._value_error_if(n % 64 != 0, f"N must be divisible by 64, got {n}")
-        self._value_error_if((n // 2) % HADAMARD_SIZE != 0, f"N/2 must be divisible by {HADAMARD_SIZE}, got {n // 2}")
+        self._value_error_if(n_out % HADAMARD_SIZE != 0, f"D N dimension must be divisible by {HADAMARD_SIZE}, got {n_out}")
 
         self._check_tensor_shape(self.a_desc, (tensor_m, k, 1), "A")
         if self.weight_mode == MoEWeightMode.DENSE:
             self._check_tensor_shape(self.b_desc, (n, k, l), "B")
         self._check_tensor_shape(self.c_desc, (tensor_m, n, 1), "C")
-        self._check_tensor_shape(self.d_desc, (tensor_m, n // 2, 1), "D")
+        self._check_tensor_shape(self.d_desc, (tensor_m, n_out, 1), "D")
         self._check_tensor_shape(self.sfa_desc, (32, 4, ceil_div(tensor_m, 128), 4, ceil_div(ceil_div(k, self.sf_vec_size), 4), 1), "SFA")
         if self.weight_mode == MoEWeightMode.DENSE:
             self._check_tensor_shape(self.sfb_desc, (32, 4, ceil_div(n, 128), 4, ceil_div(ceil_div(k, self.sf_vec_size), 4), l), "SFB")
@@ -222,7 +223,10 @@ class GroupedGemmGluHadamardSm100(APIBase):
         self._check_dtype(self.acc_dtype, dtype=torch.float32, name="acc_dtype")
 
         self._value_error_if(self.sf_vec_size not in [16, 32], f"sf_vec_size must be 16 or 32, got {self.sf_vec_size}")
-        self._value_error_if(self.act_func not in ["swiglu", "geglu"], f"act_func must be 'swiglu' or 'geglu', got {self.act_func}")
+        self._value_error_if(
+            self.act_func not in ["swiglu", "geglu", "srelu"],
+            f"act_func must be 'swiglu', 'geglu', or 'srelu', got {self.act_func}",
+        )
         self._value_error_if(
             not self.use_2cta_instrs or self.mma_tiler_mn != (256, 256), f"Hadamard fusion requires mma_tiler_mn=(256, 256), got {self.mma_tiler_mn}"
         )
@@ -625,7 +629,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         n_full = n
         k_logical = k_physical * 2 if b_dtype in (torch.float4_e2m1fn_x2, torch.uint8) else k_physical
         b_shape = (n_full, k_logical)
-    n_out = n_full // 2
+    n_out = n_full if act_func == "srelu" else n_full // 2
 
     if cd_major != "n":
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
