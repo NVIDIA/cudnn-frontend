@@ -58,7 +58,7 @@ import os
 import torch
 from typing import Any, Tuple, Optional, overload
 
-from cudnn.api_base import APIBase, TupleDict, ceil_div
+from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type
 
 _BLOCK_SCALED_DTYPE_PAIRS = {
     (dtype, dtype)
@@ -72,7 +72,10 @@ _BLOCK_SCALED_DTYPE_PAIRS = {
 
 
 from ._bf16_api import GroupedGemmDgluBf16API
-from ._blockscaled_api import GroupedGemmDgluBlockScaledAPI
+from ._blockscaled_api import (
+    GroupedGemmDgluBlockScaledAPI,
+    _reject_unsupported_rubin_glu_tune_params,
+)
 
 
 @dataclass(frozen=True)
@@ -521,6 +524,13 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
     # default" (1.0 for dgeglu, 0.0 for dswiglu).
     if linear_offset is None:
         linear_offset = 1.0 if act_func == "dgeglu" else 0.0
+    device_type = get_device_type()
+    _reject_unsupported_rubin_glu_tune_params(
+        device_type == "rubin",
+        geglu_alpha,
+        glu_clamp_max,
+        glu_clamp_min,
+    )
     dgeglu_cache_signature = None
     if act_func == "dgeglu":
         dgeglu_cache_signature = (
@@ -632,6 +642,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
 
     if is_dense:
         cache_key = (
+            device_type,
             weight_mode,
             act_func,
             dgeglu_cache_signature,
@@ -677,6 +688,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
         )
     else:
         cache_key = (
+            device_type,
             weight_mode,
             act_func,
             dgeglu_cache_signature,

@@ -57,7 +57,7 @@ import os
 import torch
 from typing import Any, Tuple, Optional, overload
 
-from cudnn.api_base import APIBase, TupleDict, ceil_div
+from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type
 
 _BLOCK_SCALED_DTYPE_PAIRS = {
     (dtype, dtype)
@@ -71,7 +71,10 @@ _BLOCK_SCALED_DTYPE_PAIRS = {
 
 
 from ._bf16_api import GroupedGemmGluBf16API
-from ._blockscaled_api import GroupedGemmGluBlockScaledAPI
+from ._blockscaled_api import (
+    GroupedGemmGluBlockScaledAPI,
+    _reject_unsupported_rubin_glu_tune_params,
+)
 
 
 @dataclass(frozen=True)
@@ -611,8 +614,11 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
 
     use_full_dynamic = is_dense and os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
 
+    device_type = get_device_type()
+
     if is_dense:
         cache_key = (
+            device_type,
             weight_mode,
             act_func,
             use_full_dynamic,
@@ -655,6 +661,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
         )
     else:
         cache_key = (
+            device_type,
             weight_mode,
             act_func,
             a_tensor.shape[1:],
@@ -1135,6 +1142,12 @@ def grouped_gemm_glu_wrapper_sm100(
     generate_c: bool = False,
 ) -> TupleDict:
     """Dispatch grouped GEMM GLU once from an immutable normalized call."""
+    _reject_unsupported_rubin_glu_tune_params(
+        get_device_type() == "rubin",
+        geglu_alpha,
+        glu_clamp_max,
+        glu_clamp_min,
+    )
     call = GluCall(
         a_tensor=a_tensor,
         sfa_tensor=sfa_tensor,

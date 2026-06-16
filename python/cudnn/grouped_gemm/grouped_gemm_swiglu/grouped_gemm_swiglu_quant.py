@@ -1037,13 +1037,13 @@ class BlockScaledContiguousGroupedGemmKernel:
         real_subtile_idx,
     ) -> None:
         c_buffer = prev_subtile_idx % self.num_c_stage
-        tRS_rC.store(tTR_rAcc.load().to(self.c_dtype))
+        tRS_rC.store(tiled_copy_r2s.retile(tTR_rAcc).load().to(self.c_dtype))
         cute.copy(
             tiled_copy_r2s,
             tRS_rC[(None, None, 0)],
             tRS_sC[(None, None, 1, c_buffer)],
         )
-        tRS_rC.store(tTR_rAcc_gate.load().to(self.c_dtype))
+        tRS_rC.store(tiled_copy_r2s.retile(tTR_rAcc_gate).load().to(self.c_dtype))
         cute.copy(
             tiled_copy_r2s,
             tRS_rC[(None, None, 0)],
