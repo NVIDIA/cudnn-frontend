@@ -21,13 +21,14 @@ from functools import lru_cache
 import torch
 
 # (compute_capability) → cute DSL --gpu-arch flag value.
-# Both H100 and B200/B300 require the architecture-specific ``a`` variant
-# because the indexer kernels use TMA / tcgen05 instructions that are only
-# guaranteed to lower correctly under the ``a`` SASS gencode.
+# H100, B200/B300, and Rubin require architecture-specific variants because
+# the kernels use TMA / tcgen05 instructions that are only guaranteed to lower
+# correctly under the matching SASS gencode.
 _ARCH_MAP = {
     (9, 0): "sm_90a",  # Hopper H100
     (10, 0): "sm_100a",  # Blackwell B200
     (10, 3): "sm_103a",  # Blackwell Ultra B300
+    (10, 7): "sm_100f",  # Rubin
 }
 
 

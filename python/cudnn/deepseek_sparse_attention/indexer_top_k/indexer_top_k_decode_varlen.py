@@ -21,6 +21,8 @@ import cutlass.utils as utils
 import torch
 from cutlass.utils.distributed import atomicAdd
 
+from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+
 from .block_scan import block_prefix_sum_kernel
 from .indexer_top_k_varlen_util import IndexerTopKKernelVarlen
 
@@ -671,7 +673,7 @@ def cute_dsl_topk_wrapper(
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
-            options="--enable-tvm-ffi",
+            options=compile_options(),
         )
         _compile_cache[key] = compiled_kernel
     else:
