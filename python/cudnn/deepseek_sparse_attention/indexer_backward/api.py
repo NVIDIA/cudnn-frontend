@@ -334,8 +334,8 @@ class DenseIndexerBackward(APIBase):
         self._value_error_if(self.ratio < 1, f"ratio must be >= 1, got {self.ratio}")
         self._value_error_if(self.heads < 64, f"DenseIndexerBackward requires heads >= 64, got {self.heads}")
         self._value_error_if(
-            self.max_seqlen_q > self.max_seqlen_k * self.ratio,
-            "DenseIndexerBackward requires S_q <= S_k * ratio for bottom-right causal alignment",
+            self.max_seqlen_q < self.max_seqlen_k * self.ratio,
+            "DenseIndexerBackward requires S_q >= S_k * ratio for bottom-right causal alignment",
         )
         self._is_supported = True
         return True

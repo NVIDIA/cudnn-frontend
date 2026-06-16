@@ -96,8 +96,8 @@ def indexer_fwd(
             seqlen_q_dim,
             n_heads_q,
         ), f"w shape must be {(batch_size, seqlen_q_dim, n_heads_q)}, got {tuple(w.shape)}"
-        if seqlen_q_dim > seqlen_k_dim * ratio:
-            raise ValueError(f"seqlen_q ({seqlen_q_dim}) must be <= seqlen_k * ratio ({seqlen_k_dim * ratio})")
+        if seqlen_q_dim < seqlen_k_dim * ratio:
+            raise ValueError(f"seqlen_q ({seqlen_q_dim}) must be >= seqlen_k * ratio ({seqlen_k_dim * ratio})")
         out_shape = (batch_size, seqlen_q_dim, seqlen_k_dim)
 
     assert head_dim == head_dim_k, f"q head_dim ({head_dim}) != k head_dim ({head_dim_k})"

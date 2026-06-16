@@ -46,7 +46,7 @@ Bottom-right ratio causal:
     q_start_b  = seqlen_k_b * ratio - seqlen_q_b
     col_limit  = min(seqlen_k_b, (q_start_b + q_local + 1) // ratio)
   When seqlen_q_b == seqlen_k_b * ratio, q_start_b == 0 (legacy behavior).
-  Constraint per batch: seqlen_q_b <= seqlen_k_b * ratio.
+  Constraint per batch: seqlen_q_b >= seqlen_k_b * ratio.
 """
 
 from __future__ import annotations
@@ -1917,7 +1917,7 @@ def dense_indexer_backward_sm100(
 
     ``ratio`` is the indexer compression ratio. Bottom-right causal mask is
     applied: kv_local < (seqlen_k_b * ratio - seqlen_q_b + q_local + 1) // ratio.
-    Per batch we require ``seqlen_q_b <= seqlen_k_b * ratio``. ``ratio`` must
+    Per batch we require ``seqlen_q_b >= seqlen_k_b * ratio``. ``ratio`` must
     be passed explicitly — auto-inferring from S_q / S_k is unsafe under THD.
 
     ``grad_scale`` is intentionally **not** an argument to this factory: it's

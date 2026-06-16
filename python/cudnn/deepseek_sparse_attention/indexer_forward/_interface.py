@@ -114,8 +114,8 @@ def indexer_fwd(
         bs, seqlen_q_dim, n_heads_q, head_dim = q.shape
         _, seqlen_k_dim, n_heads_kv, _ = k.shape
         device = q.device
-        if seqlen_q_dim > seqlen_k_dim * ratio:
-            raise ValueError(f"seqlen_q ({seqlen_q_dim}) must be <= seqlen_k * ratio " f"({seqlen_k_dim * ratio})")
+        if seqlen_q_dim < seqlen_k_dim * ratio:
+            raise ValueError(f"seqlen_q ({seqlen_q_dim}) must be >= seqlen_k * ratio " f"({seqlen_k_dim * ratio})")
         out_shape = (bs, seqlen_q_dim, seqlen_k_dim)
         out_buf_shape = None
 
