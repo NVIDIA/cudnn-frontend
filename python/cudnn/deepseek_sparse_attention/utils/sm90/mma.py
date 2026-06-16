@@ -91,7 +91,7 @@ def gemm_w_idx(
 
 
 def mma_partition_fragment_AB(
-    thr_mma: cute.core.ThrMma,
+    thr_mma: cute.ThrMma,
     sA: Optional[cute.Tensor],
     sB: Optional[cute.Tensor],
     swap_AB: bool,

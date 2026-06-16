@@ -165,7 +165,7 @@ def make_tiled_copy_B(  # noqa: N802
 
 def mma_make_fragment_A(  # noqa: N802
     smem: cute.Tensor,
-    thr_mma: cute.core.ThrMma,
+    thr_mma: cute.ThrMma,
     swapAB: cutlass.Constexpr[bool] = False,  # noqa: N803
 ) -> cute.Tensor:
     """Wrapper for cute.mma_make_fragment."""
@@ -176,7 +176,7 @@ def mma_make_fragment_A(  # noqa: N802
 
 def mma_make_fragment_B(  # noqa: N802
     smem: cute.Tensor,
-    thr_mma: cute.core.ThrMma,
+    thr_mma: cute.ThrMma,
     swapAB: cutlass.Constexpr[bool] = False,  # noqa: N803
 ) -> cute.Tensor:
     """Wrapper for cute.mma_make_fragment."""
