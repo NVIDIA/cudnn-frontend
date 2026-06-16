@@ -116,15 +116,9 @@ class IndexerForwardSm90:
         )
 
     def _get_shared_storage_cls(self):
-        sQ_struct = cute.struct.Align[
-            cute.struct.MemRange[self.dtype, cute.cosize(self.sQ_layout_staged)], 1024
-        ]
-        sKV_struct = cute.struct.Align[
-            cute.struct.MemRange[self.dtype, cute.cosize(self.sKV_layout_staged)], 1024
-        ]
-        sW_struct = cute.struct.Align[
-            cute.struct.MemRange[self.dtype, self.tile_m], 128
-        ]
+        sQ_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sQ_layout_staged)], 1024]
+        sKV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sKV_layout_staged)], 1024]
+        sW_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, self.tile_m], 128]
 
         @cute.struct
         class SharedStorage:
@@ -245,9 +239,7 @@ class IndexerForwardSm90:
                     score = ps[mi, qi]
                     should_store = Boolean(True)
                     if is_first_nblock:
-                        col_lim = (
-                            q_global_start + q_local + Int32(1)
-                        ) // Int32(self.ratio)
+                        col_lim = (q_global_start + q_local + Int32(1)) // Int32(self.ratio)
                         if k_local >= seqlen_k or k_local >= col_lim:
                             if const_expr(self.clean_logits):
                                 score = -Float32.inf

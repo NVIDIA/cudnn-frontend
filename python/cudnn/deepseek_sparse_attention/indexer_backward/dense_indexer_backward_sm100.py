@@ -281,16 +281,8 @@ class ScoreGradDense:
                     score_minus_lse = pr - lse_val
                     predict = cute.math.exp2(score_minus_lse * LOG2E, fastmath=True)
                     target = tr / (denom_val + Float32(DENOM_EPS))
-                    target_eff = (
-                        target
-                        if target >= Float32(CLIP_PROB_MIN)
-                        else Float32(CLIP_PROB_MIN)
-                    )
-                    log_clip_mask = (
-                        Float32(1.0)
-                        if score_minus_lse >= Float32(CLIP_LOG_MIN)
-                        else Float32(0.0)
-                    )
+                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
+                    log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
                     g = -target_eff * log_clip_mask * grad_scale
 
                     local_sum = local_sum + g
@@ -314,16 +306,8 @@ class ScoreGradDense:
                     score_minus_lse = pr - lse_val
                     predict = cute.math.exp2(score_minus_lse * LOG2E, fastmath=True)
                     target = tr / (denom_val + Float32(DENOM_EPS))
-                    target_eff = (
-                        target
-                        if target >= Float32(CLIP_PROB_MIN)
-                        else Float32(CLIP_PROB_MIN)
-                    )
-                    log_clip_mask = (
-                        Float32(1.0)
-                        if score_minus_lse >= Float32(CLIP_LOG_MIN)
-                        else Float32(0.0)
-                    )
+                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
+                    log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
                     g = -target_eff * log_clip_mask * grad_scale
 
                     grad_signal = g - predict * sum_grad

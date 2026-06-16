@@ -155,9 +155,7 @@ class ScoreGradDenseSm90:
                 ]
 
             storage = smem.allocate(SharedStorage)
-            sReduceScratch = storage.sReduceScratch.get_tensor(
-                cute.make_layout((4,), stride=(1,))
-            )
+            sReduceScratch = storage.sReduceScratch.get_tensor(cute.make_layout((4,), stride=(1,)))
 
             if const_expr(is_varlen):
                 mIdxScore_b = cute.domain_offset((q_offset, Int32(0)), mIdxScoreRaw)
@@ -191,16 +189,8 @@ class ScoreGradDenseSm90:
                         fastmath=True,
                     )
                     target = attn_raw / (attn_l1_val + Float32(EPS))
-                    target_eff = (
-                        target
-                        if target >= Float32(CLIP_PROB_MIN)
-                        else Float32(CLIP_PROB_MIN)
-                    )
-                    log_clip_mask = (
-                        Float32(1.0)
-                        if score_minus_lse >= Float32(CLIP_LOG_MIN)
-                        else Float32(0.0)
-                    )
+                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
+                    log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
                     local_sum = local_sum + (-target_eff * log_clip_mask * grad_scale)
                 pos = pos + Int32(128)
 
@@ -208,12 +198,7 @@ class ScoreGradDenseSm90:
             with cute.arch.elect_one():
                 sReduceScratch[warp_id] = warp_sum
             cute.arch.sync_threads()
-            sum_grad = (
-                sReduceScratch[0]
-                + sReduceScratch[1]
-                + sReduceScratch[2]
-                + sReduceScratch[3]
-            )
+            sum_grad = sReduceScratch[0] + sReduceScratch[1] + sReduceScratch[2] + sReduceScratch[3]
 
             pos = tidx
             while pos < seqlen_k_pad:
@@ -226,16 +211,8 @@ class ScoreGradDenseSm90:
                         fastmath=True,
                     )
                     target = attn_raw / (attn_l1_val + Float32(EPS))
-                    target_eff = (
-                        target
-                        if target >= Float32(CLIP_PROB_MIN)
-                        else Float32(CLIP_PROB_MIN)
-                    )
-                    log_clip_mask = (
-                        Float32(1.0)
-                        if score_minus_lse >= Float32(CLIP_LOG_MIN)
-                        else Float32(0.0)
-                    )
+                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
+                    log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
                     g = -target_eff * log_clip_mask * grad_scale
                     mIdxScore_b[seq_local, pos] = g - predict * sum_grad
                 else:
@@ -308,9 +285,7 @@ def _build_cute_dsl_dense_kernel(
     def _get_dummy_topk(device, current_stream=None):
         if dummy_topk_holder[0] is None or dummy_topk_holder[0].device != device:
             with _torch_stream_context(current_stream):
-                dummy_topk_holder[0] = torch.zeros(
-                    batch, seqlen, seqlen_k, device=device, dtype=torch.int32
-                )
+                dummy_topk_holder[0] = torch.zeros(batch, seqlen, seqlen_k, device=device, dtype=torch.int32)
         return dummy_topk_holder[0]
 
     def _ensure_compiled(
@@ -395,13 +370,9 @@ def _build_cute_dsl_dense_kernel(
         current_stream=None,
     ):
         if is_varlen:
-            assert (
-                CuSeqlensQ is not None and CuSeqlensK is not None
-            ), "THD-compiled score-grad kernel requires cu_seqlens_q/k at runtime"
+            assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled score-grad kernel requires cu_seqlens_q/k at runtime"
         else:
-            assert (
-                CuSeqlensQ is None and CuSeqlensK is None
-            ), "BSHD-compiled score-grad kernel must not receive cu_seqlens_q/k"
+            assert CuSeqlensQ is None and CuSeqlensK is None, "BSHD-compiled score-grad kernel must not receive cu_seqlens_q/k"
         s = _resolve_stream(current_stream)
         _ensure_compiled_score_grad(
             IdxScoreRaw,
@@ -440,13 +411,9 @@ def _build_cute_dsl_dense_kernel(
     ):
         """Run fused dense Kernel 2. Caller must run score_grad first."""
         if is_varlen:
-            assert (
-                CuSeqlensQ is not None and CuSeqlensK is not None
-            ), "THD-compiled kernel requires cu_seqlens_q/k at runtime"
+            assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled kernel requires cu_seqlens_q/k at runtime"
         else:
-            assert (
-                CuSeqlensQ is None and CuSeqlensK is None
-            ), "BSHD-compiled kernel must not receive cu_seqlens_q/k"
+            assert CuSeqlensQ is None and CuSeqlensK is None, "BSHD-compiled kernel must not receive cu_seqlens_q/k"
         dummy_topk = _get_dummy_topk(IndexQ.device, current_stream=current_stream)
         s = _resolve_stream(current_stream)
 
@@ -496,13 +463,9 @@ def _build_cute_dsl_dense_kernel(
         current_stream=None,
     ):
         if is_varlen:
-            assert (
-                CuSeqlensQ is not None and CuSeqlensK is not None
-            ), "THD-compiled kernel requires cu_seqlens_q/k at runtime"
+            assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled kernel requires cu_seqlens_q/k at runtime"
         else:
-            assert (
-                CuSeqlensQ is None and CuSeqlensK is None
-            ), "BSHD-compiled kernel must not receive cu_seqlens_q/k"
+            assert CuSeqlensQ is None and CuSeqlensK is None, "BSHD-compiled kernel must not receive cu_seqlens_q/k"
         _run_score_grad_only(
             idx_scores_raw,
             idx_lse,
