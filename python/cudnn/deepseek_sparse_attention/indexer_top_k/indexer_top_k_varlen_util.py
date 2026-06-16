@@ -962,8 +962,8 @@ class IndexerTopKKernelVarlen:
             assert self.top_k % vecsize_out == 0
 
             nvec_per_thread = cutlass.const_expr(cute.ceil_div(self.top_k, vecsize_out * self.num_threads_per_cta))
-            topk_vals = cute.make_fragment((vecsize_out, nvec_per_thread), self.dtype)
-            topk_indices = cute.make_fragment((vecsize_out, nvec_per_thread), cutlass.Int32)
+            topk_vals = cute.make_rmem_tensor((vecsize_out, nvec_per_thread), self.dtype)
+            topk_indices = cute.make_rmem_tensor((vecsize_out, nvec_per_thread), cutlass.Int32)
 
             stride = self.num_threads_per_cta * vecsize_out
             for i in cutlass.range(nvec_per_thread, unroll_full=True):
@@ -1018,7 +1018,7 @@ class IndexerTopKKernelVarlen:
 
     @cute.jit
     def predicate_tile(self, tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
-        tApA = cute.make_fragment(
+        tApA = cute.make_rmem_tensor(
             cute.make_layout(
                 (
                     cute.size(tAcA, mode=[0, 1]),
