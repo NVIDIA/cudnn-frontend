@@ -985,7 +985,7 @@ class DenseScoreRecomputeSm100:
 
                 score = (local_sum[0] + local_sum[1]) * Float32(softmax_scale)
 
-                # Bottom-right ratio causal mask + tail OOB. Masked positions
+                # Ratio-causal mask + tail OOB. Masked positions
                 # write 0 to mOut and skip the online LSE update (skipping
                 # avoids -inf-vs-empty edge case when q_token has no valid kv yet).
                 # Two OOB guards on the mOut write:
@@ -1173,7 +1173,7 @@ class DenseScoreRecomputeSm100:
 
                 score = local_sum[0] + local_sum[1]
 
-                # Bottom-right ratio causal mask + tail OOB. Masked positions
+                # Ratio-causal mask + tail OOB. Masked positions
                 # write 0 to mOut (P = exp(QK*scale - LSE) is naturally 0 at
                 # masked) so the warp_reduction_sum (collective; must be invoked
                 # by every lane) naturally excludes them from L1 denom.
