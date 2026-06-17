@@ -2,7 +2,7 @@
 Indexer QK Forward Kernel — SM100 Cute-DSL Implementation.
 
 Computes: S_sum(b,q,k) = sum_h [ReLU(Q_h · K_{g(h)}^T) · W_{b,q,h}]
-with bottom-right aligned ratio causal mask, output FP32.
+with ratio causal masking against compressed-KV positions, output FP32.
 
 Design: SwapAB (K as A, Q_packed as B), PackGQA,
         Ld32x32bOp head reduction, 2 epilogue warpgroups for 2 q_stages.
@@ -162,6 +162,7 @@ class IndexerForwardSm100:
         sm_scale: Float32 | float,
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
+        mQCausalOffsets: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
         """Host-side: layout transpose, PackGQA, TMA creation, kernel launch.
@@ -324,6 +325,7 @@ class IndexerForwardSm100:
             sm_scale,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mQCausalOffsets,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -352,6 +354,7 @@ class IndexerForwardSm100:
         sm_scale: Float32 | float,
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
+        mQCausalOffsets: Optional[cute.Tensor],
     ):
         """Device-side kernel entry with CLC persistent scheduling.
 
@@ -538,6 +541,7 @@ class IndexerForwardSm100:
                 while work_tile.is_valid_tile:
                     batch_idx = work_tile.tile_idx[2]
                     seqlen = SeqlenInfoCls(batch_idx)
+                    q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
                     num_m_blocks_cur = cute.ceil_div(
                         seqlen.seqlen_q * self.qhead_per_kvhead,
                         self.q_stage * self.m_block_size,
@@ -545,7 +549,7 @@ class IndexerForwardSm100:
                     is_valid_m_block = work_tile.tile_idx[0] < num_m_blocks_cur
                     if is_valid_m_block:
                         m_block = num_m_blocks_cur - 1 - work_tile.tile_idx[0]
-                        num_n_blocks = self._causal_num_n_blocks(m_block, seqlen.seqlen_k, seqlen.seqlen_q)
+                        num_n_blocks = self._causal_num_n_blocks(m_block, seqlen.seqlen_k, seqlen.seqlen_q, q_causal_offset)
                         # W load (double-buffered: even tiles → first half, odd tiles → second half)
                         sW_buf_off = (load_tile_count % 2) * self.q_stage * self.m_block_size
                         mW_cur = seqlen.offset_batch_Q(mW, batch_idx, dim=2)
@@ -631,6 +635,7 @@ class IndexerForwardSm100:
                 while work_tile.is_valid_tile:
                     batch_idx = work_tile.tile_idx[2]
                     seqlen = SeqlenInfoCls(batch_idx)
+                    q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
                     num_m_blocks_cur = cute.ceil_div(
                         seqlen.seqlen_q * self.qhead_per_kvhead,
                         self.q_stage * self.m_block_size,
@@ -638,7 +643,7 @@ class IndexerForwardSm100:
                     is_valid_m_block = work_tile.tile_idx[0] < num_m_blocks_cur
                     if is_valid_m_block:
                         m_block = num_m_blocks_cur - 1 - work_tile.tile_idx[0]
-                        num_n_blocks = self._causal_num_n_blocks(m_block, seqlen.seqlen_k, seqlen.seqlen_q)
+                        num_n_blocks = self._causal_num_n_blocks(m_block, seqlen.seqlen_k, seqlen.seqlen_q, q_causal_offset)
                         Q_consumer.reset()
                         handle_Q0 = Q_consumer.wait_and_advance()
                         handle_Q1 = Q_consumer.wait_and_advance()
@@ -741,6 +746,7 @@ class IndexerForwardSm100:
                 while work_tile.is_valid_tile:
                     batch_idx = work_tile.tile_idx[2]
                     seqlen = SeqlenInfoCls(batch_idx)
+                    q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
                     num_m_blocks_cur = cute.ceil_div(
                         seqlen.seqlen_q * self.qhead_per_kvhead,
                         self.q_stage * self.m_block_size,
@@ -748,7 +754,7 @@ class IndexerForwardSm100:
                     is_valid_m_block = work_tile.tile_idx[0] < num_m_blocks_cur
                     if is_valid_m_block:
                         m_block = num_m_blocks_cur - 1 - work_tile.tile_idx[0]
-                        num_n_blocks = self._causal_num_n_blocks(m_block, seqlen.seqlen_k, seqlen.seqlen_q)
+                        num_n_blocks = self._causal_num_n_blocks(m_block, seqlen.seqlen_k, seqlen.seqlen_q, q_causal_offset)
                         local_count = num_n_blocks if num_n_blocks < Int32(3) else Int32(3)
 
                         if const_expr(is_varlen):
@@ -915,6 +921,7 @@ class IndexerForwardSm100:
             while work_tile.is_valid_tile:
                 batch_idx = work_tile.tile_idx[2]
                 seqlen = SeqlenInfoCls(batch_idx)
+                q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
                 num_m_blocks_cur = cute.ceil_div(
                     seqlen.seqlen_q * self.qhead_per_kvhead,
                     self.q_stage * self.m_block_size,
@@ -922,7 +929,7 @@ class IndexerForwardSm100:
                 is_valid_m_block = work_tile.tile_idx[0] < num_m_blocks_cur
                 if is_valid_m_block:
                     m_block = num_m_blocks_cur - 1 - work_tile.tile_idx[0]
-                    num_n_blocks = self._causal_num_n_blocks(m_block, seqlen.seqlen_k, seqlen.seqlen_q)
+                    num_n_blocks = self._causal_num_n_blocks(m_block, seqlen.seqlen_k, seqlen.seqlen_q, q_causal_offset)
                     epi0_sW_base = (epi0_tile_count % 2) * self.q_stage * self.m_block_size
                     epi_s_full_phase_0, score_empty_phase_0 = self._epilogue_warp(
                         0,
@@ -937,6 +944,7 @@ class IndexerForwardSm100:
                         num_n_blocks,
                         seqlen.seqlen_k,
                         seqlen.seqlen_q,
+                        q_causal_offset,
                         tidx,
                         epi_s_full_phase_0,
                         score_empty_phase_0,
@@ -963,6 +971,7 @@ class IndexerForwardSm100:
             while work_tile.is_valid_tile:
                 batch_idx = work_tile.tile_idx[2]
                 seqlen = SeqlenInfoCls(batch_idx)
+                q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
                 num_m_blocks_cur = cute.ceil_div(
                     seqlen.seqlen_q * self.qhead_per_kvhead,
                     self.q_stage * self.m_block_size,
@@ -970,7 +979,7 @@ class IndexerForwardSm100:
                 is_valid_m_block = work_tile.tile_idx[0] < num_m_blocks_cur
                 if is_valid_m_block:
                     m_block = num_m_blocks_cur - 1 - work_tile.tile_idx[0]
-                    num_n_blocks = self._causal_num_n_blocks(m_block, seqlen.seqlen_k, seqlen.seqlen_q)
+                    num_n_blocks = self._causal_num_n_blocks(m_block, seqlen.seqlen_k, seqlen.seqlen_q, q_causal_offset)
                     epi1_sW_base = (epi1_tile_count % 2) * self.q_stage * self.m_block_size
                     epi_s_full_phase_1, score_empty_phase_1 = self._epilogue_warp(
                         1,
@@ -985,6 +994,7 @@ class IndexerForwardSm100:
                         num_n_blocks,
                         seqlen.seqlen_k,
                         seqlen.seqlen_q,
+                        q_causal_offset,
                         tidx,
                         epi_s_full_phase_1,
                         score_empty_phase_1,
@@ -1004,18 +1014,17 @@ class IndexerForwardSm100:
     # Causal n-block computation
     # =========================================================================
     @cute.jit
-    def _causal_num_n_blocks(self, m_block, seqlen_k, seqlen_q):
+    def _causal_num_n_blocks(self, m_block, seqlen_k, seqlen_q, q_causal_offset):
         """Compute causal-aware number of KV n-blocks for a given m_block.
 
-        Under bottom-right ratio causal masking, kv_token >=
-        (q_global_start + q_token + 1) // ratio is masked, where
-        q_global_start = seqlen_k * ratio - seqlen_q.
+        Under ratio causal masking, kv_token >=
+        (q_causal_offset + q_token + 1) // ratio is masked.
         The largest q_token in this CTA tile determines the upper bound on kv_token,
         and therefore how many n-blocks are actually needed.
         """
-        q_global_start = seqlen_k * self.ratio - seqlen_q
         max_q_plus_1 = self.q_stage * (m_block + 1) * self.q_tokens_per_tile
-        max_kv_needed = (q_global_start + max_q_plus_1) // self.ratio
+        max_kv_needed = (q_causal_offset + max_q_plus_1) // self.ratio
+        max_kv_needed = max_kv_needed if max_kv_needed > Int32(0) else Int32(0)
         max_kv_needed = max_kv_needed if max_kv_needed < seqlen_k else seqlen_k
         num_n_blocks = cute.ceil_div(max_kv_needed, self.n_block_size)
         return num_n_blocks
@@ -1038,6 +1047,7 @@ class IndexerForwardSm100:
         num_n_blocks,
         seqlen_k,
         seqlen_q,
+        q_causal_offset,
         tidx,
         epi_s_full_phase,
         score_empty_phase,
@@ -1068,7 +1078,6 @@ class IndexerForwardSm100:
         _sW_base = Int32(0) if sW_base is None else sW_base
         qhpkv = self.qhead_per_kvhead
         ratio = Int32(self.ratio)
-        q_global_start = seqlen_k * ratio - seqlen_q
 
         rW_ILP = 4
         sW_f32_ptr = cute.make_ptr(
@@ -1162,7 +1171,7 @@ class IndexerForwardSm100:
                     q_token = q_token_base + qi
                     val = -Float32.inf
                     if q_token < seqlen_q and kv_token < seqlen_k:
-                        col_limit = (q_global_start + q_token + 1) // ratio
+                        col_limit = (q_causal_offset + q_token + 1) // ratio
                         if kv_token < col_limit:
                             val = rAcc[qi]
                     rAcc[qi] = val

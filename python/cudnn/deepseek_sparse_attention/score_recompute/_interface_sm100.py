@@ -26,6 +26,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_major as _get_device_capability,
     maybe_contiguous,
     resolve_stream as _resolve_stream,
+    validate_q_causal_offsets,
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
@@ -690,6 +691,7 @@ def _dense_indexer_score_recompute(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -738,6 +740,7 @@ def _dense_indexer_score_recompute(
     else:
         bs, seqlen_q, n_heads_q, head_dim = q.shape
         _, seqlen_k, _, _ = k.shape
+    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device)
 
     if qhead_per_kv_head is None:
         qhead_per_kv_head = n_heads_q
@@ -773,6 +776,7 @@ def _dense_indexer_score_recompute(
         kv_stage,
         ratio,
         is_varlen,
+        q_causal_offsets is not None,
     )
 
     if compile_key not in _dense_indexer_score_recompute.compile_cache:
@@ -783,6 +787,7 @@ def _dense_indexer_score_recompute(
         denom_cute = to_cute_tensor(denom_out)
         cu_q_cute = to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
         cu_k_cute = to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
+        q_offsets_cute = to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
 
         kernel_obj = DenseScoreRecomputeSm100(
             head_dim=head_dim,
@@ -813,6 +818,7 @@ def _dense_indexer_score_recompute(
             max_k_arg,
             cu_q_cute,
             cu_k_cute,
+            q_offsets_cute,
             current_stream,
             options=compile_options(),
         )
@@ -833,6 +839,7 @@ def _dense_indexer_score_recompute(
             max_k_arg,
             cu_seqlens_q if is_varlen else None,
             cu_seqlens_k if is_varlen else None,
+            q_causal_offsets,
             current_stream,
         )
     return out, denom_out
@@ -857,6 +864,7 @@ def _dense_attn_score_recompute(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -905,6 +913,7 @@ def _dense_attn_score_recompute(
     else:
         bs, seqlen_q, n_heads_q, head_dim = q.shape
         _, seqlen_k, _, _ = k.shape
+    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device)
 
     if qhead_per_kv_head is None:
         qhead_per_kv_head = n_heads_q
@@ -944,6 +953,7 @@ def _dense_attn_score_recompute(
         kv_stage,
         ratio,
         is_varlen,
+        q_causal_offsets is not None,
     )
 
     if compile_key not in _dense_attn_score_recompute.compile_cache:
@@ -954,6 +964,7 @@ def _dense_attn_score_recompute(
         denom_cute = to_cute_tensor(denom_out)
         cu_q_cute = to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
         cu_k_cute = to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
+        q_offsets_cute = to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
 
         kernel_obj = DenseScoreRecomputeSm100(
             head_dim=head_dim,
@@ -983,6 +994,7 @@ def _dense_attn_score_recompute(
             max_k_arg,
             cu_q_cute,
             cu_k_cute,
+            q_offsets_cute,
             current_stream,
             options=compile_options(),
         )
@@ -1002,6 +1014,7 @@ def _dense_attn_score_recompute(
             max_k_arg,
             cu_seqlens_q if is_varlen else None,
             cu_seqlens_k if is_varlen else None,
+            q_causal_offsets,
             current_stream,
         )
     return out, denom_out
@@ -1026,6 +1039,7 @@ def dense_indexer_score_recompute(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -1071,6 +1085,7 @@ def dense_indexer_score_recompute(
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
+        q_causal_offsets=q_causal_offsets,
         current_stream=current_stream,
     )
 
@@ -1088,6 +1103,7 @@ def dense_attn_score_recompute(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -1131,5 +1147,6 @@ def dense_attn_score_recompute(
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
+        q_causal_offsets=q_causal_offsets,
         current_stream=current_stream,
     )

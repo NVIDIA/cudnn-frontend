@@ -33,6 +33,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_major as _get_device_capability,
     maybe_contiguous,
     resolve_stream as _resolve_stream,
+    validate_q_causal_offsets,
 )
 from .sparse_score_recompute_sm90 import SparseScoreRecomputeSm90
 from .dense_score_recompute_sm90 import DenseScoreRecomputeSm90
@@ -308,6 +309,7 @@ def _dense_score_recompute(
     num_threads: int,
     nvtx_range_name: str,
     ratio: int = 1,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compile + launch the dense 3-WG score kernel."""
@@ -320,6 +322,7 @@ def _dense_score_recompute(
 
     batch_size, seqlen_q, num_head, head_dim = q.shape
     _, seqlen_k, num_head_kv, _ = kv.shape
+    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch_size), q.device)
     assert num_head > num_head_kv and num_head % num_head_kv == 0, f"MQA required: num_head={num_head}, num_head_kv={num_head_kv}"
     qhead_per_kvhead = num_head // num_head_kv
 
@@ -357,6 +360,7 @@ def _dense_score_recompute(
         False,
         False,
         ratio,  # has_topk_length, is_sparse, output_log_probs
+        q_causal_offsets is not None,
     )
 
     cache = _dense_score_recompute.compile_cache
@@ -366,6 +370,7 @@ def _dense_score_recompute(
         out_cute = to_cute_tensor(out)
         weights_cute = to_cute_tensor(weights_or_lse)
         denom_cute = to_cute_tensor(denom_out)
+        q_offsets_cute = to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
 
         kernel_obj = DenseScoreRecomputeSm90(
             dtype,
@@ -393,6 +398,7 @@ def _dense_score_recompute(
             weights_cute,
             None,  # mTopkLength (sparse-only)
             denom_cute,
+            q_offsets_cute,
             options=compile_options(),
         )
 
@@ -410,6 +416,7 @@ def _dense_score_recompute(
             weights_or_lse,
             None,
             denom_out,
+            q_causal_offsets,
         )
     return out, denom_out
 
@@ -429,6 +436,7 @@ def _dense_score_recompute_varlen(
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: Optional[int],
     max_seqlen_k: Optional[int],
+    q_causal_offsets: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """THD packed dense score via per-batch BSHD SM90 launches.
@@ -446,6 +454,8 @@ def _dense_score_recompute_varlen(
     cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
     cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
     assert cu_seqlens_q.is_cuda and cu_seqlens_k.is_cuda
+    batch_size = cu_seqlens_q.shape[0] - 1
+    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch_size), q.device)
 
     total_q = q.shape[0]
     if max_seqlen_k is None:
@@ -476,6 +486,7 @@ def _dense_score_recompute_varlen(
             q_b = q[qs:qe].unsqueeze(0).contiguous()
             kv_b = kv[ks:ke].unsqueeze(0).contiguous()
             per_head_bhs = weights_or_lse[qs:qe].unsqueeze(0).transpose(1, 2).contiguous()
+            q_causal_offsets_b = q_causal_offsets[b : b + 1] if q_causal_offsets is not None else None
             out_b, denom_b = _dense_score_recompute(
                 q_b,
                 kv_b,
@@ -487,6 +498,7 @@ def _dense_score_recompute_varlen(
                 num_threads=num_threads,
                 nvtx_range_name=nvtx_range_name + "_bshd_slice",
                 ratio=ratio,
+                q_causal_offsets=q_causal_offsets_b,
                 current_stream=current_stream,
             )
             out[qs:qe, :sk_b].copy_(out_b[0])
@@ -512,6 +524,7 @@ def dense_indexer_score_recompute(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dense indexer backward score over full KV:
@@ -541,6 +554,7 @@ def dense_indexer_score_recompute(
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
             current_stream=current_stream,
         )
     w_bhs = weights.transpose(1, 2).contiguous()
@@ -555,6 +569,7 @@ def dense_indexer_score_recompute(
         num_threads=num_threads,
         nvtx_range_name="dense_indexer_score_recompute",
         ratio=ratio,
+        q_causal_offsets=q_causal_offsets,
         current_stream=current_stream,
     )
 
@@ -572,6 +587,7 @@ def dense_attn_score_recompute(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dense attention backward score over full KV:
@@ -598,6 +614,7 @@ def dense_attn_score_recompute(
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
             current_stream=current_stream,
         )
     lse_bhs = lse.transpose(1, 2).contiguous()
@@ -612,6 +629,7 @@ def dense_attn_score_recompute(
         num_threads=num_threads,
         nvtx_range_name="dense_attn_score_recompute",
         ratio=ratio,
+        q_causal_offsets=q_causal_offsets,
         current_stream=current_stream,
     )
 

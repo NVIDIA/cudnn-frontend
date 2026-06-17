@@ -184,6 +184,7 @@ class DenseScoreRecomputeSm100:
         max_seqlen_k: Int32,
         mCuSeqlensQ: cute.Tensor | None,
         mCuSeqlensK: cute.Tensor | None,
+        mQCausalOffsets: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
         """Host-side: layout transpose, PackGQA, TMA creation, kernel launch."""
@@ -324,6 +325,7 @@ class DenseScoreRecomputeSm100:
             max_seqlen_k,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mQCausalOffsets,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -353,6 +355,7 @@ class DenseScoreRecomputeSm100:
         max_seqlen_k: Int32,
         mCuSeqlensQ: cute.Tensor | None,
         mCuSeqlensK: cute.Tensor | None,
+        mQCausalOffsets: cute.Tensor | None,
     ):
         """Device-side kernel entry with CLC persistent scheduling."""
         is_varlen = mCuSeqlensQ is not None
@@ -712,6 +715,7 @@ class DenseScoreRecomputeSm100:
                 m_block = work_tile.tile_idx[0]
                 batch_idx = work_tile.tile_idx[2]
                 seqlen = SeqlenInfoCls(batch_idx)
+                q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
                 num_m_blocks_cur = cute.ceil_div(
                     seqlen.seqlen_q * self.qhead_per_kvhead,
                     self.m_block_size,
@@ -737,6 +741,7 @@ class DenseScoreRecomputeSm100:
                             seqlen.seqlen_k,
                             seqlen.seqlen_q,
                             max_seqlen_k,
+                            q_causal_offset,
                             m_block,
                             tidx,
                             s_full_phase,
@@ -758,6 +763,7 @@ class DenseScoreRecomputeSm100:
                             seqlen.seqlen_k,
                             seqlen.seqlen_q,
                             max_seqlen_k,
+                            q_causal_offset,
                             m_block,
                             tidx,
                             s_full_phase,
@@ -867,6 +873,7 @@ class DenseScoreRecomputeSm100:
         seqlen_k,
         seqlen_q,
         max_seqlen_k,
+        q_causal_offset,
         m_block,
         tidx,
         s_full_phase,
@@ -904,10 +911,6 @@ class DenseScoreRecomputeSm100:
         qhpkv = self.qhead_per_kvhead
         q_tokens_per_tile = self.q_tokens_per_tile
         ratio = Int32(self.ratio)
-        # Bottom-right ratio causal mask: kv_token >= (q_global_start + q_token + 1) // ratio
-        # where q_global_start = seqlen_k * ratio - seqlen_q. For seqlen_q == seqlen_k * ratio
-        # this reduces to the original (q_token + 1) // ratio formula.
-        q_global_start = seqlen_k * ratio - seqlen_q
 
         W_ILP = 4
         sW_f32_ptr = cute.make_ptr(
@@ -993,7 +996,7 @@ class DenseScoreRecomputeSm100:
                 #     reach n_block_size-1 which may exceed the buffer width
                 #     for THD with seqlen_k_b < max_seqlen_k.
                 q_token_idx = q_token_base + qi
-                col_limit = (q_global_start + q_token_idx + 1) // ratio
+                col_limit = (q_causal_offset + q_token_idx + 1) // ratio
                 if q_token_idx < seqlen_q and pos < max_seqlen_k:
                     if pos >= col_limit or pos >= seqlen_k:
                         mOut[q_token_idx, pos] = Float32(0.0)
@@ -1058,6 +1061,7 @@ class DenseScoreRecomputeSm100:
         seqlen_k,
         seqlen_q,
         max_seqlen_k,
+        q_causal_offset,
         m_block,
         tidx,
         s_full_phase,
@@ -1091,9 +1095,6 @@ class DenseScoreRecomputeSm100:
         qhpkv = self.qhead_per_kvhead
         q_tokens_per_tile = self.q_tokens_per_tile
         ratio = Int32(self.ratio)
-        # Bottom-right ratio causal mask: kv_token >= (q_global_start + q_token + 1) // ratio
-        # where q_global_start = seqlen_k * ratio - seqlen_q.
-        q_global_start = seqlen_k * ratio - seqlen_q
 
         LSE_ILP = 4
         sLSE_f32_ptr = cute.make_ptr(
@@ -1180,7 +1181,7 @@ class DenseScoreRecomputeSm100:
                 # rationale (q row belonging to other batch, pos past buffer K
                 # extent under THD).
                 q_token_idx = q_token_base + qi
-                col_limit = (q_global_start + q_token_idx + 1) // ratio
+                col_limit = (q_causal_offset + q_token_idx + 1) // ratio
                 if pos >= col_limit or pos >= seqlen_k or q_token_idx >= seqlen_q:
                     score = Float32(0.0)
 

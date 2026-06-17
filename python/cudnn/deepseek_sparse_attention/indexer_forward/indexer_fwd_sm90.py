@@ -7,8 +7,8 @@ This kernel intentionally keeps the SM90 C++ Q/K staging topology:
 
 The algorithm computes the same score tensor as the C++ kernel:
     sm_scale * sum_h relu(Q_h @ K^T) * W_h
-with bottom-right ratio causal masking. Reduced BF16 scores are written directly
-from registers to global memory.
+with ratio causal masking against compressed-KV positions. Reduced BF16 scores
+are written directly from registers to global memory.
 """
 
 import math
@@ -135,10 +135,9 @@ class IndexerForwardSm90:
         return SharedStorage
 
     @cute.jit
-    def _compute_n_blocks(self, m_block: Int32, seqlen_q: Int32, seqlen_k: Int32) -> Int32:
-        q_global_start = seqlen_k * Int32(self.ratio) - seqlen_q
+    def _compute_n_blocks(self, m_block: Int32, seqlen_q: Int32, seqlen_k: Int32, q_causal_offset: Int32) -> Int32:
         last_q_token = (m_block + Int32(1)) * Int32(self.q_tokens_per_tile) - Int32(1)
-        kv_limit = (q_global_start + last_q_token + Int32(1)) // Int32(self.ratio)
+        kv_limit = (q_causal_offset + last_q_token + Int32(1)) // Int32(self.ratio)
         kv_limit = kv_limit if kv_limit < seqlen_k else seqlen_k
         kv_limit = kv_limit if kv_limit > Int32(0) else Int32(0)
         return cute.ceil_div(kv_limit, self.tile_n)
@@ -200,6 +199,7 @@ class IndexerForwardSm90:
         max_seqlen_k: Int32,
         q_batch_offset: Int32,
         batch_idx: Int32,
+        q_causal_offset: Int32,
         sm_scale: Float32,
     ):
         acc_mn = sm90_ops.make_acc_tensor_mn_view(acc_S)
@@ -213,7 +213,6 @@ class IndexerForwardSm90:
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         m_base = t1 + warp_idx_in_wg * 16
         q_token_base = (self.q_stages * m_block + q_stage_idx) * self.q_tokens_per_stage
-        q_global_start = seqlen_k * Int32(self.ratio) - seqlen_q
 
         ps = cute.make_rmem_tensor((kNRows, self.q_tokens_per_stage), Float32)
         ps.fill(Float32(0.0))
@@ -239,7 +238,7 @@ class IndexerForwardSm90:
                     score = ps[mi, qi]
                     should_store = Boolean(True)
                     if is_first_nblock:
-                        col_lim = (q_global_start + q_local + Int32(1)) // Int32(self.ratio)
+                        col_lim = (q_causal_offset + q_local + Int32(1)) // Int32(self.ratio)
                         if k_local >= seqlen_k or k_local >= col_lim:
                             if const_expr(self.clean_logits):
                                 score = -Float32.inf
@@ -275,6 +274,7 @@ class IndexerForwardSm90:
         mbar_KVEmpty1_ptr,
         mCuSeqlensQ: cute.Tensor,
         mCuSeqlensK: cute.Tensor,
+        mQCausalOffsets: cute.Tensor,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
     ):
@@ -295,10 +295,11 @@ class IndexerForwardSm90:
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
+        q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
         num_m_blocks = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.tile_m)
         if block_x < num_m_blocks:
             m_block = num_m_blocks - Int32(1) - block_x
-            n_block_max = self._compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k)
+            n_block_max = self._compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k, q_causal_offset)
 
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
             mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx]
@@ -386,6 +387,7 @@ class IndexerForwardSm90:
         mbar_KVEmpty1_ptr,
         mCuSeqlensQ: cute.Tensor,
         mCuSeqlensK: cute.Tensor,
+        mQCausalOffsets: cute.Tensor,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
         sm_scale: Float32,
@@ -405,10 +407,11 @@ class IndexerForwardSm90:
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
+        q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
         num_m_blocks = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.tile_m)
         if block_x < num_m_blocks:
             m_block = num_m_blocks - Int32(1) - block_x
-            n_block_max = self._compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k)
+            n_block_max = self._compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k, q_causal_offset)
 
             thr_mma = tiled_mma_QK.get_slice(wg_tidx)
             tSrQ0, tSrK = _mma_partition_fragment_AB(thr_mma, sQ_0, sKV_staged, self.swap_AB)
@@ -497,6 +500,7 @@ class IndexerForwardSm90:
                     max_seqlen_k,
                     seqlen.offset_q,
                     batch_idx,
+                    q_causal_offset,
                     sm_scale,
                 )
                 self._epilogue_store_to_gmem(
@@ -512,6 +516,7 @@ class IndexerForwardSm90:
                     max_seqlen_k,
                     seqlen.offset_q,
                     batch_idx,
+                    q_causal_offset,
                     sm_scale,
                 )
 
@@ -530,6 +535,7 @@ class IndexerForwardSm90:
         sm_scale: Float32,
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
+        mQCausalOffsets: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
         is_varlen = mCuSeqlensQ is not None
@@ -624,6 +630,7 @@ class IndexerForwardSm90:
             SharedStorage,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mQCausalOffsets,
             max_seqlen_q,
             max_seqlen_k,
             sm_scale,
@@ -650,6 +657,7 @@ class IndexerForwardSm90:
         SharedStorage: cutlass.Constexpr,
         mCuSeqlensQ: cute.Tensor,
         mCuSeqlensK: cute.Tensor,
+        mQCausalOffsets: cute.Tensor,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
         sm_scale: Float32,
@@ -710,6 +718,7 @@ class IndexerForwardSm90:
                     mbar_KVEmpty1_ptr,
                     mCuSeqlensQ,
                     mCuSeqlensK,
+                    mQCausalOffsets,
                     max_seqlen_q,
                     max_seqlen_k,
                 )
@@ -729,6 +738,7 @@ class IndexerForwardSm90:
                 mbar_KVEmpty1_ptr,
                 mCuSeqlensQ,
                 mCuSeqlensK,
+                mQCausalOffsets,
                 max_seqlen_q,
                 max_seqlen_k,
                 sm_scale,

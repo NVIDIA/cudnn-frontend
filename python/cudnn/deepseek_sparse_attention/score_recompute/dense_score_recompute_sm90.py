@@ -209,6 +209,7 @@ class DenseScoreRecomputeSm90:
         weights_or_lse: cute.Tensor = None,  # (batch, nheads, seqlen_q) Note: weights is half precision
         mTopkLength: cute.Tensor = None,  # (batch, seqlen_q) int32, per-q valid KV count
         mL1NormDenom: cute.Tensor = None,  # (batch, seqlen_q) float32, dense attn L1 norm denominator
+        mQCausalOffsets: cute.Tensor = None,
     ):
         self._check_type(mQ.element_type, mKV.element_type, weights_or_lse.element_type)
 
@@ -332,6 +333,7 @@ class DenseScoreRecomputeSm90:
             qhead_per_kvhead_divmod,
             mL1NormDenom,
             tma_atom_KV,
+            mQCausalOffsets,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -358,6 +360,7 @@ class DenseScoreRecomputeSm90:
         qhead_per_kvhead_divmod: FastDivmodDivisor = None,
         mL1NormDenom: cute.Tensor = None,
         tma_atom_KV: cute.CopyAtom = None,
+        mQCausalOffsets: cute.Tensor = None,
     ):
         # Dense path: no topk length (always full KV iteration).
         mTopkLength = None
@@ -435,6 +438,7 @@ class DenseScoreRecomputeSm90:
                 TileSchedulerCls,
                 softmax_scale_log2,
                 mL1NormDenom,
+                mQCausalOffsets,
             )
         elif warp_group_idx == 1:
             self.consumer(
@@ -454,6 +458,7 @@ class DenseScoreRecomputeSm90:
                 TileSchedulerCls,
                 softmax_scale_log2,
                 mL1NormDenom,
+                mQCausalOffsets,
             )
         else:
             producer_fn = self.producer_warp_split if const_expr(self.use_warp_split_producer) else self.producer
@@ -476,6 +481,7 @@ class DenseScoreRecomputeSm90:
                 tidx,
                 SeqlenInfoCls,
                 TileSchedulerCls,
+                mQCausalOffsets,
             )
 
     # --------------------------------------------------------------------- #
@@ -507,6 +513,7 @@ class DenseScoreRecomputeSm90:
         tidx: Int32,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
+        mQCausalOffsets: cute.Tensor,
     ):
         wg_tidx = tidx % self.num_threads_per_warp_group
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -520,9 +527,10 @@ class DenseScoreRecomputeSm90:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
             head_idx_kv = head_idx
             topK = seqlen.seqlen_k
-            n_block_max = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, topK)
+            n_block_max = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, topK, q_causal_offset)
 
             mKV_cur = mKV[None, None, head_idx_kv, batch_idx]
             mQ_cur = mQ[None, None, head_idx, batch_idx]
@@ -691,6 +699,7 @@ class DenseScoreRecomputeSm90:
         tidx: Int32,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
+        mQCausalOffsets: cute.Tensor,
     ):
         wg_tidx = tidx % self.num_threads_per_warp_group
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -704,9 +713,10 @@ class DenseScoreRecomputeSm90:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
             head_idx_kv = head_idx
             topK = seqlen.seqlen_k
-            n_block_max = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, topK)
+            n_block_max = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, topK, q_causal_offset)
 
             mKV_cur = mKV[None, None, head_idx_kv, batch_idx]
             mQ_cur = mQ[None, None, head_idx, batch_idx]
@@ -917,6 +927,7 @@ class DenseScoreRecomputeSm90:
         TileSchedulerCls: Callable,
         softmax_scale_log2: Float32,
         mL1NormDenom: cute.Tensor,
+        mQCausalOffsets: cute.Tensor,
     ):
         wg_tidx = tidx % self.num_threads_per_warp_group
         lane = cute.arch.lane_idx()
@@ -970,8 +981,9 @@ class DenseScoreRecomputeSm90:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
             topK = seqlen.seqlen_k
-            n_block_max = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, topK)
+            n_block_max = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, topK, q_causal_offset)
 
             mOut_cur = mOut[batch_idx, m_block, None]
 
@@ -1078,6 +1090,7 @@ class DenseScoreRecomputeSm90:
                         m_block,
                         batch_idx,
                         n_block,
+                        q_causal_offset,
                         tidx,
                         accumulate=accumulate,
                         mOut_cur=mOut_cur,
@@ -1223,6 +1236,7 @@ class DenseScoreRecomputeSm90:
         m_block: Int32,
         batch_idx: Int32,
         n_block: Int32,
+        q_causal_offset: Int32,
         tidx: Int32,
         accumulate: Boolean = Boolean(False),  # True when accumulating across head tiles
         mOut_cur: cute.Tensor = None,  # dense: direct write target
@@ -1249,9 +1263,9 @@ class DenseScoreRecomputeSm90:
         acc_S_mn = sm90_ops.make_acc_tensor_mn_view(acc_S)
         warp_col_sum = Float32(0.0)
         ratio = Int32(self.ratio)
-        q_global_start = topK * ratio - Int32(seqlen_q)
-        col_limit_raw = (q_global_start + m_block + Int32(1)) // ratio
+        col_limit_raw = (q_causal_offset + m_block + Int32(1)) // ratio
         col_limit = col_limit_raw if col_limit_raw < topK else topK
+        col_limit = col_limit if col_limit > Int32(0) else Int32(0)
 
         if const_expr(self.is_dense_attn):
             # === Dense attention path ===
@@ -1469,13 +1483,12 @@ class DenseScoreRecomputeSm90:
             load_fn(tma_bar_ptr=mbar_KV_ptr)
 
     @cute.jit
-    def _dense_compute_n_blocks(self, q_token_last, seqlen_q, seqlen_k):
+    def _dense_compute_n_blocks(self, q_token_last, seqlen_q, seqlen_k, q_causal_offset):
         """Return K blocks that can contain at least one valid causal column."""
         ratio = Int32(self.ratio)
         q_token_last = q_token_last if q_token_last < seqlen_q else seqlen_q - Int32(1)
 
-        q_global_start = seqlen_k * ratio - seqlen_q
-        max_kv_needed = (q_global_start + q_token_last + Int32(1)) // ratio
+        max_kv_needed = (q_causal_offset + q_token_last + Int32(1)) // ratio
         max_kv_needed = max_kv_needed if max_kv_needed > Int32(0) else Int32(0)
         max_kv_needed = max_kv_needed if max_kv_needed < seqlen_k else seqlen_k
         return cute.ceil_div(max_kv_needed, self.tile_n)

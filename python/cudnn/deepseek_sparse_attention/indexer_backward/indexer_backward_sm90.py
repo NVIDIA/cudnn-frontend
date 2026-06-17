@@ -165,11 +165,10 @@ class IndexerBackwardSm90:
         self.SCHED_BARRIER_WG1 = 5
 
     @cute.jit
-    def _dense_num_k_blocks(self, q_token, seqlen_q, seqlen_k):
+    def _dense_num_k_blocks(self, q_token, seqlen_q, seqlen_k, q_causal_offset):
         """Return dense K blocks that can contain valid ratio-causal columns."""
         ratio = Int32(self.ratio)
-        q_global_start = seqlen_k * ratio - seqlen_q
-        col_limit = (q_global_start + q_token + Int32(1)) // ratio
+        col_limit = (q_causal_offset + q_token + Int32(1)) // ratio
         col_limit = col_limit if col_limit > Int32(0) else Int32(0)
         col_limit = col_limit if col_limit < seqlen_k else seqlen_k
         return cute.ceil_div(col_limit, self.block_I)
@@ -191,6 +190,7 @@ class IndexerBackwardSm90:
         mCuSeqlensK=None,
         max_seqlen_q: Int32 = None,
         max_seqlen_k: Int32 = None,
+        mQCausalOffsets=None,
     ):
         is_varlen = const_expr(self.is_dense and mCuSeqlensQ is not None)
         self.q_dtype = mQ.element_type
@@ -339,6 +339,7 @@ class IndexerBackwardSm90:
             tma_atom_K,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mQCausalOffsets,
         ).launch(
             grid=(seqlen, batch_size, 1),
             block=[self.THREADS_PER_CTA, 1, 1],
@@ -373,6 +374,7 @@ class IndexerBackwardSm90:
         tma_atom_K: cute.CopyAtom = None,
         mCuSeqlensQ=None,
         mCuSeqlensK=None,
+        mQCausalOffsets=None,
     ):
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -387,6 +389,7 @@ class IndexerBackwardSm90:
             seqlen,
             seqlen_k_static,
         )
+        q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
 
         if const_expr(is_varlen):
             mQ_b = cute.domain_offset((Int32(0), Int32(0), q_offset), mQ)
@@ -546,6 +549,7 @@ class IndexerBackwardSm90:
                     batch_idx,
                     seqlen_q_b,
                     seqlen_k_b,
+                    q_causal_offset,
                     tidx,
                     warp_idx,
                     mbar,
@@ -585,6 +589,7 @@ class IndexerBackwardSm90:
                     batch_idx,
                     seqlen_q_b,
                     seqlen_k_b,
+                    q_causal_offset,
                     tidx,
                     warp_idx,
                     mbar,
@@ -602,6 +607,7 @@ class IndexerBackwardSm90:
                         seq_idx,
                         seqlen_q_b,
                         seqlen_k_b,
+                        q_causal_offset,
                         tidx,
                         mbar,
                         tma_atom_K,
@@ -657,6 +663,7 @@ class IndexerBackwardSm90:
         batch_idx,
         seqlen_q,
         seqlen_k,
+        q_causal_offset,
         tidx,
         warp_idx,
         mbar,
@@ -789,7 +796,7 @@ class IndexerBackwardSm90:
             )
 
         if const_expr(self.is_dense):
-            num_topk_blocks_cur = self._dense_num_k_blocks(seq_idx, seqlen_q, seqlen_k)
+            num_topk_blocks_cur = self._dense_num_k_blocks(seq_idx, seqlen_q, seqlen_k, q_causal_offset)
         else:
             num_topk_blocks_cur = Int32(self.num_topk_blocks)
 
@@ -1211,6 +1218,7 @@ class IndexerBackwardSm90:
         seq_idx,
         seqlen_q,
         seqlen_k,
+        q_causal_offset,
         tidx,
         mbar,
         tma_atom_K,
@@ -1239,7 +1247,7 @@ class IndexerBackwardSm90:
         idx_in_group = wg_tidx % GROUP_SIZE
         group_idx_local = wg_tidx // GROUP_SIZE
 
-        num_k_blocks = self._dense_num_k_blocks(seq_idx, seqlen_q, seqlen_k)
+        num_k_blocks = self._dense_num_k_blocks(seq_idx, seqlen_q, seqlen_k, q_causal_offset)
         for bi in cutlass.range(0, num_k_blocks, unroll=1):
             stage = bi % NUM_K_STAGES
             n_block = bi

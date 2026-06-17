@@ -20,6 +20,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_major as _get_device_capability,
     maybe_contiguous as _maybe_contiguous,
     resolve_stream,
+    validate_q_causal_offsets,
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor as _to_cute_tensor
 
@@ -44,13 +45,14 @@ def indexer_fwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     current_stream=None,
 ) -> torch.Tensor:
     """
     Indexer QK forward pass using CuTe DSL kernel.
 
-    Computes S_sum = sm_scale * sum_h [(Q @ K^T).relu() * W] with
-    bottom-right aligned ratio causal mask.
+    Computes S_sum = sm_scale * sum_h [(Q @ K^T).relu() * W] with a
+    ratio causal mask against compressed-KV positions.
     sm_scale is applied to the fp32 head-reduced score inside the kernel
     (higher precision than pre-multiplying onto bf16 W on the host).
 
@@ -65,6 +67,8 @@ def indexer_fwd(
         out: optional output tensor. BSHD: ``(bs, seqlen_q, seqlen_k)``.
              THD: ``(total_q, max_seqlen_k)`` with local-K columns.
         sm_scale: scalar applied to fp32 score post head-reduce; default 1.0
+        q_causal_offsets: optional int32 CUDA tensor of shape ``(batch,)``.
+             Each entry is the global uncompressed token index for local q[0].
 
     Returns:
         S_sum: BSHD ``(bs, seqlen_q, seqlen_k)`` or THD
@@ -114,10 +118,9 @@ def indexer_fwd(
         bs, seqlen_q_dim, n_heads_q, head_dim = q.shape
         _, seqlen_k_dim, n_heads_kv, _ = k.shape
         device = q.device
-        if seqlen_q_dim < seqlen_k_dim * ratio:
-            raise ValueError(f"seqlen_q ({seqlen_q_dim}) must be >= seqlen_k * ratio " f"({seqlen_k_dim * ratio})")
         out_shape = (bs, seqlen_q_dim, seqlen_k_dim)
         out_buf_shape = None
+    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device)
 
     # TMA S2G requires globalStride aligned to 16 bytes.
     # For FP32, seqlen_k must be a multiple of 4 elements (4 × 4B = 16B).
@@ -153,6 +156,7 @@ def indexer_fwd(
         q_stage,
         kv_stage,
         is_varlen,
+        q_causal_offsets is not None,
     )
 
     if compile_key not in _compile_cache:
@@ -162,6 +166,7 @@ def indexer_fwd(
         out_cute = _to_cute_tensor(out)
         cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
         cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
+        q_offsets_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
 
         kernel_obj = IndexerForwardSm100(
             head_dim=head_dim,
@@ -191,6 +196,7 @@ def indexer_fwd(
             scale_arg,
             cu_q_cute,
             cu_k_cute,
+            q_offsets_cute,
             current_stream,
             options=compile_options(),
         )
@@ -213,6 +219,7 @@ def indexer_fwd(
             scale_arg,
             cu_seqlens_q if is_varlen else None,
             cu_seqlens_k if is_varlen else None,
+            q_causal_offsets,
             current_stream,
         )
 
