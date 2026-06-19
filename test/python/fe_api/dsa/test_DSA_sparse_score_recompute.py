@@ -31,6 +31,8 @@ def _allocate(cfg, score_type: str, has_topk_length: bool):
     topk_length = None
     if has_topk_length:
         topk_length = torch.randint(1, topk_k + 1, (b, s_q), dtype=torch.int32, device=device)
+        positions = torch.arange(topk, device=device, dtype=torch.int32).view(1, 1, topk)
+        topk_indices = topk_indices.masked_fill(positions >= topk_length.unsqueeze(-1), -1)
 
     if score_type == "indexer":
         weights = torch.randn(b, s_q, qhpkv, dtype=torch.bfloat16, device=device)
@@ -54,6 +56,7 @@ def test_DSA_sparse_score_recompute_wrapper(
     head_dim,
     qhead_per_kv_head,
     score_type,
+    has_topk_length,
     request,
 ):
     try:
@@ -69,11 +72,16 @@ def test_DSA_sparse_score_recompute_wrapper(
         head_dim=head_dim,
         qhead_per_kv_head=qhead_per_kv_head,
         score_type=score_type,
+        has_topk_length=has_topk_length,
         min_compute_capability=90,
         s_q_default=256,
         s_kv_default=2048,
     )
-    q, k, aux, topk_indices, topk_length = _allocate(cfg, score_type, has_topk_length=False)
+    q, k, aux, topk_indices, topk_length = _allocate(
+        cfg,
+        score_type,
+        has_topk_length=has_topk_length,
+    )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     try:
@@ -131,7 +139,8 @@ def test_DSA_sparse_score_recompute_wrapper(
 @pytest.mark.L0
 @torch_fork_set_rng(seed=1)
 @pytest.mark.parametrize("score_type", ["indexer", "attention"])
-def test_DSA_sparse_score_recompute_wrapper_batch_gt_one(score_type, request):
+@pytest.mark.parametrize("has_topk_length", [False, True])
+def test_DSA_sparse_score_recompute_wrapper_batch_gt_one(score_type, has_topk_length, request):
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
@@ -146,6 +155,7 @@ def test_DSA_sparse_score_recompute_wrapper_batch_gt_one(score_type, request):
         qhead_per_kv_head=32,
         topk=128,
         score_type=score_type,
+        has_topk_length=has_topk_length,
         min_compute_capability=90,
         b_default=2,
         s_q_default=32,
@@ -154,7 +164,7 @@ def test_DSA_sparse_score_recompute_wrapper_batch_gt_one(score_type, request):
     q, k, aux, topk_indices, topk_length = _allocate(
         cfg,
         score_type,
-        has_topk_length=False,
+        has_topk_length=has_topk_length,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 

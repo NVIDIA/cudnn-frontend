@@ -40,6 +40,7 @@ DSA_SCORE_RECOMPUTE_PARAM_MARKS = [
     pytest.mark.parametrize("head_dim", [128]),
     pytest.mark.parametrize("qhead_per_kv_head", [32]),
     pytest.mark.parametrize("score_type", ["indexer", "attention"]),
+    pytest.mark.parametrize("has_topk_length", [False, True]),
 ]
 
 DSA_INDEXER_BACKWARD_PARAM_MARKS = [
