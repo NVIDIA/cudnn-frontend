@@ -124,6 +124,7 @@ class ScoreGradDense:
     def __init__(
         self,
         ratio: int = 1,
+        block_I: int = 128,
     ):
         assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
         # Neither ``grad_scale`` nor ``max_seqlen_q/k`` are stored on the object:
@@ -134,6 +135,7 @@ class ScoreGradDense:
         # are passed as runtime ``Float32``/``Int32`` args on ``__call__`` so one
         # compiled kernel serves all seqlens / loss scales.
         self.ratio = ratio
+        self.block_I = block_I
 
     @cute.jit
     def __call__(
@@ -273,19 +275,18 @@ class ScoreGradDense:
             # --- Phase 1: Accumulate sum_grad ---
             local_sum = Float32(0.0)
             pos = tidx
-            while pos < seqlen_k_pad:
-                if pos < col_limit:
-                    pr = mPredict_b[seq_local, pos]
-                    tr = mTarget_b[seq_local, pos]
+            while pos < col_limit:
+                pr = mPredict_b[seq_local, pos]
+                tr = mTarget_b[seq_local, pos]
 
-                    score_minus_lse = pr - lse_val
-                    predict = cute.math.exp2(score_minus_lse * LOG2E, fastmath=True)
-                    target = tr / (denom_val + Float32(DENOM_EPS))
-                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
-                    log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                    g = -target_eff * log_clip_mask * grad_scale
+                score_minus_lse = pr - lse_val
+                predict = cute.math.exp2(score_minus_lse * LOG2E, fastmath=True)
+                target = tr / (denom_val + Float32(DENOM_EPS))
+                target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
+                log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
+                g = -target_eff * log_clip_mask * grad_scale
 
-                    local_sum = local_sum + g
+                local_sum = local_sum + g
                 pos = pos + Int32(128)
 
             # Cross-warp reduction (4 warps)
@@ -297,8 +298,23 @@ class ScoreGradDense:
 
             # --- Phase 2: Write grad_signal in-place to PredictRaw ---
             # Padding columns (pos >= seqlen_k_b in THD, or pos >= col_limit) get 0.
+            # Kernel 2 processes q tokens in reversed 2Q pairs and uses the
+            # larger q token's K-block bound. For the smaller q token, clear up
+            # to that pair bound so stale raw scores cannot be consumed as
+            # grad_signal, but skip the rest of the padded K row.
+            rel_from_last = (seqlen_q_b - Int32(1)) - Int32(seq_local)
+            pair_q0_local = Int32(seq_local) + (rel_from_last & Int32(1))
+            pair_col_limit_raw = (q_causal_offset_b + pair_q0_local + Int32(1)) // ratio
+            pair_col_limit = pair_col_limit_raw if pair_col_limit_raw < seqlen_k_b else seqlen_k_b
+            pair_col_limit = pair_col_limit if pair_col_limit > Int32(0) else Int32(0)
+            block_i = Int32(self.block_I)
+            zero_limit = ((pair_col_limit + block_i - Int32(1)) // block_i) * block_i
+            min_zero_limit = block_i if seqlen_k_b > Int32(0) else Int32(0)
+            zero_limit = min_zero_limit if zero_limit < min_zero_limit else zero_limit
+            zero_limit = zero_limit if zero_limit < seqlen_k_pad else seqlen_k_pad
+
             pos = tidx
-            while pos < seqlen_k_pad:
+            while pos < zero_limit:
                 if pos < col_limit:
                     pr = mPredict_b[seq_local, pos]
                     tr = mTarget_b[seq_local, pos]
@@ -1957,7 +1973,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
 
     # Kernel 1: ScoreGradDense — applies ratio causal mask so
     # masked / padding columns produce grad_signal=0 (won't contaminate GEMM).
-    score_grad_obj = ScoreGradDense(ratio=ratio)
+    score_grad_obj = ScoreGradDense(ratio=ratio, block_I=block_I)
 
     # Kernel 2: 2Q GEMM kernel (reads pre-computed grad_signal, 2 Q tokens per CTA).
     # is_varlen branches at compile time on whether CuSeqlens* are None.

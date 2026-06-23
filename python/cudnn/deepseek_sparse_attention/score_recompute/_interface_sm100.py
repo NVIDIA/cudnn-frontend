@@ -827,6 +827,9 @@ def _dense_indexer_score_recompute(
     scale_arg = cutlass.Float32(sm_scale)
     max_q_arg = cutlass.Int32(seqlen_q)
     max_k_arg = cutlass.Int32(seqlen_k)
+    # The kernel only visits K blocks that can contain valid ratio-causal
+    # columns; skipped masked/padding columns must still appear as zero.
+    out.zero_()
     with torch.cuda.nvtx.range("dense_indexer_score_recompute"):
         _dense_indexer_score_recompute.compile_cache[compile_key](
             q,
@@ -1002,6 +1005,8 @@ def _dense_attn_score_recompute(
     current_stream = _resolve_stream(current_stream)
     max_q_arg = cutlass.Int32(seqlen_q)
     max_k_arg = cutlass.Int32(seqlen_k)
+    # See dense indexer path above: skipped masked/padding columns are zero.
+    out.zero_()
     with torch.cuda.nvtx.range("dense_attn_score_recompute"):
         _dense_attn_score_recompute.compile_cache[compile_key](
             q,

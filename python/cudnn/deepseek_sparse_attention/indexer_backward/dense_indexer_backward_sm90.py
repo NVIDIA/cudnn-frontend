@@ -52,9 +52,10 @@ class ScoreGradDenseSm90:
     WARP_SIZE = 32
     THREADS_PER_CTA = 128
 
-    def __init__(self, ratio: int = 1):
+    def __init__(self, ratio: int = 1, block_I: int = 128):
         assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
         self.ratio = ratio
+        self.block_I = block_I
 
     @cute.jit
     def __call__(
@@ -183,19 +184,18 @@ class ScoreGradDenseSm90:
 
             local_sum = Float32(0.0)
             pos = tidx
-            while pos < seqlen_k_pad:
-                if pos < col_limit:
-                    idx_raw = mIdxScore_b[seq_local, pos]
-                    attn_raw = mAttnScore_b[seq_local, pos]
-                    score_minus_lse = idx_raw - idx_lse_val
-                    predict = cute.math.exp2(
-                        score_minus_lse * LOG2E,
-                        fastmath=True,
-                    )
-                    target = attn_raw / (attn_l1_val + Float32(EPS))
-                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
-                    log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                    local_sum = local_sum + (-target_eff * log_clip_mask * grad_scale)
+            while pos < col_limit:
+                idx_raw = mIdxScore_b[seq_local, pos]
+                attn_raw = mAttnScore_b[seq_local, pos]
+                score_minus_lse = idx_raw - idx_lse_val
+                predict = cute.math.exp2(
+                    score_minus_lse * LOG2E,
+                    fastmath=True,
+                )
+                target = attn_raw / (attn_l1_val + Float32(EPS))
+                target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
+                log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
+                local_sum = local_sum + (-target_eff * log_clip_mask * grad_scale)
                 pos = pos + Int32(128)
 
             warp_sum = cute.arch.warp_reduction_sum(local_sum)
@@ -204,8 +204,12 @@ class ScoreGradDenseSm90:
             cute.arch.sync_threads()
             sum_grad = sReduceScratch[0] + sReduceScratch[1] + sReduceScratch[2] + sReduceScratch[3]
 
+            block_i = Int32(self.block_I)
+            zero_limit = ((col_limit + block_i - Int32(1)) // block_i) * block_i
+            zero_limit = zero_limit if zero_limit < seqlen_k_pad else seqlen_k_pad
+
             pos = tidx
-            while pos < seqlen_k_pad:
+            while pos < zero_limit:
                 if pos < col_limit:
                     idx_raw = mIdxScore_b[seq_local, pos]
                     attn_raw = mAttnScore_b[seq_local, pos]
@@ -273,7 +277,7 @@ def _build_cute_dsl_dense_kernel(
         raise RuntimeError("Use SM100 kernel for Blackwell")
 
     topk = seqlen_k
-    score_grad_obj = ScoreGradDenseSm90(ratio=ratio)
+    score_grad_obj = ScoreGradDenseSm90(ratio=ratio, block_I=block_I)
     kernel_obj = IndexerBackwardSm90(
         head_dim=dim,
         heads=heads,
@@ -285,7 +289,7 @@ def _build_cute_dsl_dense_kernel(
 
     # Compile caches are keyed only by params that change generated code. In
     # dense mode, K-block traversal is runtime-sized by seqlen_k.
-    score_grad_key = (is_varlen, ratio, bool(has_q_causal_offsets))
+    score_grad_key = (is_varlen, ratio, block_I, bool(has_q_causal_offsets))
     gemm_key = (is_varlen, heads, dim, block_I, ratio, bool(has_q_causal_offsets))
     dummy_topk_holder = [None]
 
