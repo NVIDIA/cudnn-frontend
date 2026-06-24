@@ -32,7 +32,7 @@ from cudnn.deepseek_sparse_attention.utils.sm90.mma import gemm_w_idx
 
 
 def _mma_partition_fragment_AB(
-    thr_mma: cute.core.ThrMma,
+    thr_mma: cute.ThrMma,
     sA: cute.Tensor,
     sB: cute.Tensor,
     swap_AB: bool,
