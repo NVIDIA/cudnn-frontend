@@ -65,6 +65,10 @@ TEST_CASE("Context serialization", "[context][serialize]") {
 
     REQUIRE(j == j2);
 
+    auto status = fe::graph::Graph().deserialize(j, true);
+    REQUIRE(status.is_bad());
+    REQUIRE(status.get_message().find("enforce_precompiled") != std::string::npos);
+
     REQUIRE(graph.validate().is_good());
 }
 
@@ -584,7 +588,7 @@ TEST_CASE("Plan deserialize prepares variant pack template", "[graph][serialize]
     REQUIRE(graph.serialize(serialized_data).is_good());
 
     fe::graph::Graph graph_deserialized;
-    REQUIRE(graph_deserialized.deserialize(handle, serialized_data).is_good());
+    REQUIRE(graph_deserialized.deserialize(handle, serialized_data, true).is_good());
 
     // Variant pack template should already be populated; no execute needed.
     auto const user_uids = graph_deserialized.get_variant_pack_uids_sorted();
