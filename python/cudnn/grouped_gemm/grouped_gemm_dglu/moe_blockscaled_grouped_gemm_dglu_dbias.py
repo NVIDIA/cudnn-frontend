@@ -1645,7 +1645,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         lane_idx = cute.arch.lane_idx()
         warp_local = warp_idx - self.epilog_warp_id[0]
 
-        for n in cutlass.range(epi_n, unroll_full=True):
+        for n in cutlass.range_constexpr(epi_n):
             sDbias[(n, lane_idx, warp_local)] = d1_vec[n]
             sDbias[(epi_n + n, lane_idx, warp_local)] = d2_vec[n]
 
