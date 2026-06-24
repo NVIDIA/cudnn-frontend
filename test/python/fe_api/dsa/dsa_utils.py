@@ -40,6 +40,10 @@ DSA_SCORE_RECOMPUTE_PARAM_MARKS = [
     pytest.mark.parametrize("head_dim", [128]),
     pytest.mark.parametrize("qhead_per_kv_head", [32]),
     pytest.mark.parametrize("score_type", ["indexer", "attention"]),
+]
+
+DSA_SPARSE_SCORE_RECOMPUTE_PARAM_MARKS = [
+    *DSA_SCORE_RECOMPUTE_PARAM_MARKS,
     pytest.mark.parametrize("has_topk_length", [False, True]),
 ]
 
@@ -78,6 +82,10 @@ def with_dsa_indexer_top_k_params(func):
 
 def with_dsa_score_recompute_params(func):
     return _apply(DSA_PARAM_MARKS + DSA_SCORE_RECOMPUTE_PARAM_MARKS, func)
+
+
+def with_dsa_sparse_score_recompute_params(func):
+    return _apply(DSA_PARAM_MARKS + DSA_SPARSE_SCORE_RECOMPUTE_PARAM_MARKS, func)
 
 
 def with_dsa_indexer_backward_params(func):

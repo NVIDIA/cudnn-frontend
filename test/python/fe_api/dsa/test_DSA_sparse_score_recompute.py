@@ -5,7 +5,7 @@ import torch
 
 from test_utils import torch_fork_set_rng
 
-from fe_api.dsa.dsa_utils import dsa_init, with_dsa_score_recompute_params
+from fe_api.dsa.dsa_utils import dsa_init, with_dsa_sparse_score_recompute_params
 from fe_api.dsa.dsa_reference import check_ref_sparse_score_recompute
 
 
@@ -49,7 +49,7 @@ def _local_to_global_topk_indices(topk_indices: torch.Tensor, seqlen_k: int) -> 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-@with_dsa_score_recompute_params
+@with_dsa_sparse_score_recompute_params
 def test_DSA_sparse_score_recompute_wrapper(
     dtype,
     acc_dtype,
