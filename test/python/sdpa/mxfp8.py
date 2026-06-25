@@ -591,6 +591,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         variant_pack[int(GraphFwdUid.sink_token)] = sink_token_gpu
 
     # Execute
+    torch.cuda.synchronize()
     workspace = torch.empty(graph_fwd.get_workspace_size(), dtype=torch.uint8, device="cuda")
     if request.config.getoption("--perf"):
         times_ms = time_execution(graph_fwd.execute, variant_pack, workspace, cudnn_handle)
