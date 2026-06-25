@@ -1493,7 +1493,9 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
 
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing gid " << gid);
-        CHECK_CUDNN_FRONTEND_ERROR(log_tensor_dumps(handle, varpack_template.all_uids, ptrs));
+        if (isLoggingEnabled()) {
+            CHECK_CUDNN_FRONTEND_ERROR(log_tensor_dumps(handle, varpack_template.all_uids, ptrs));
+        }
 
         // 5. Dispatch
         void *engine_workspace = static_cast<char *>(workspace) + fe_workspace_size;
