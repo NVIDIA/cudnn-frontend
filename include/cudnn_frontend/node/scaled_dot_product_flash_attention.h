@@ -1722,6 +1722,11 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             sub_nodes.emplace_back(node_);
         }
 
+        // last_output = last_output - stats
+        last_output = pointwise(last_output,
+                                attributes.inputs[input_names::Stats],
+                                Pointwise_attributes().set_name("sub_s_m").set_mode(PointwiseMode_t::SUB));
+
         // (optional) Apply padding mask
         if (attributes.padding_mask) {
             auto graph_                  = std::make_shared<Graph>();
@@ -1733,11 +1738,6 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                                                               attributes.inputs[input_names::SEQ_LEN_Q]);
             sub_nodes.emplace_back(node_);
         }
-
-        // last_output = last_output - stats
-        last_output = pointwise(last_output,
-                                attributes.inputs[input_names::Stats],
-                                Pointwise_attributes().set_name("sub_s_m").set_mode(PointwiseMode_t::SUB));
 
         // Explicitly put the padding value again after the stats have been loaded
         if (attributes.padding_mask && detail::get_backend_version() >= 90000 &&
