@@ -776,10 +776,10 @@ class PyGraph {
     serialize() const;
 
     void
-    deserialize(std::optional<std::intptr_t> handle_, py::object const& pyobj);
+    deserialize(std::optional<std::intptr_t> handle_, py::object const& pyobj, bool const enforce_precompiled = false);
 
     void
-    deserialize(py::object const& pyobj);
+    deserialize(py::object const& pyobj, bool const enforce_precompiled = false);
 
     int64_t
     get_execution_plan_count() const {

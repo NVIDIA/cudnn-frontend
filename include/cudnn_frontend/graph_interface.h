@@ -1627,7 +1627,7 @@ class Graph : public ICudnn, public INode {
     }
 
     error_t
-    deserialize(cudnnHandle_t handle, std::vector<uint8_t> const &data) {
+    deserialize(cudnnHandle_t handle, std::vector<uint8_t> const &data, bool const enforce_precompiled = false) {
         CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE  ");
 
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
@@ -1654,8 +1654,12 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        auto serialized_plan = j["cudnn_backend_data"];
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            enforce_precompiled && !j.contains("cudnn_backend_data"),
+            error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
+            "enforce_precompiled requested, but serialized graph has no precompiled execution plan");
 
+        auto serialized_plan = j["cudnn_backend_data"];
         CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, serialized_plan));
 
         plans.behavior_notes = j["behavior_notes"].get<std::vector<std::vector<BehaviorNote_t>>>();
@@ -1721,6 +1725,7 @@ class Graph : public ICudnn, public INode {
 #else
         CUDNN_FRONTEND_UNUSED(handle);
         CUDNN_FRONTEND_UNUSED(data);
+        CUDNN_FRONTEND_UNUSED(enforce_precompiled);
         return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
 #endif
     }
@@ -2462,7 +2467,12 @@ class Graph : public ICudnn, public INode {
     // TODO: temparorily placed in graphs class. This function needs to be a free standing function.
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     error_t
-    deserialize(const json &j) {
+    deserialize(const json &j, bool const enforce_precompiled = false) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            enforce_precompiled,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "enforce_precompiled requires plan serialization; JSON deserialization reconstructs the graph");
+
         if (j.contains("context")) {
             const auto &j_context = j["context"];
             if (j_context.contains("compute_data_type") && !j_context["compute_data_type"].is_null()) {
