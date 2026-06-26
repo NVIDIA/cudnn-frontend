@@ -1,5 +1,5 @@
 """
-Sparse Score Recompute Kernel — SM100 Cute-DSL Implementation.
+Sparse Backward Score Kernel — SM100 Cute-DSL Implementation.
 
 Dual-mode kernel controlled by score_type ("indexer" or "attention"):
 
@@ -50,11 +50,11 @@ from cutlass.utils.blackwell_helpers import (
 )
 
 from cudnn.deepseek_sparse_attention.utils.sm100.gemm import gemm_ptx_partial as _gemm_ptx_partial
-from cudnn.deepseek_sparse_attention.utils import copy as copy_ops
+from cudnn.deepseek_sparse_attention.utils import copy as copy_utils
 
-mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
-add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd="rn")
-fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
+mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd='rn')
+add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd='rn')
+fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd='rn')
 
 
 class SparseScoreRecomputeSm100:
@@ -109,16 +109,21 @@ class SparseScoreRecomputeSm100:
         self.sched_warp_id = 2
         self.num_clc_stage = 1
         self.num_clc_response_bytes = 16
-        assert topk % n_block_size == 0, f"topk ({topk}) must be a multiple of n_block_size ({n_block_size})"
+        assert topk % n_block_size == 0, (
+            f"topk ({topk}) must be a multiple of n_block_size ({n_block_size})"
+        )
         self.num_n_blocks = topk // n_block_size
         self.have_topk_length = have_topk_length
         self.topk_in_smem = topk_in_smem
 
         # Pad head_dim to multiple of 16
         hdim_multiple_of = 16
-        self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
+        self.head_dim_padded = int(
+            math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of
+        )
         assert self.head_dim_padded % 64 == 0, (
-            f"head_dim_padded ({self.head_dim_padded}) must be a multiple of 64 " f"(K loading uses 8 threads × 8 elements = 64 per iteration)"
+            f"head_dim_padded ({self.head_dim_padded}) must be a multiple of 64 "
+            f"(K loading uses 8 threads × 8 elements = 64 per iteration)"
         )
 
         # K-dimension splitting: process head_dim in num_k_chunks chunks of
@@ -126,10 +131,12 @@ class SparseScoreRecomputeSm100:
         # kv_stages for better K load / MMA overlap.
         self.k_block_size = k_block_size if k_block_size is not None else self.head_dim_padded
         assert self.head_dim_padded % self.k_block_size == 0, (
-            f"head_dim_padded ({self.head_dim_padded}) must be a multiple of " f"k_block_size ({self.k_block_size})"
+            f"head_dim_padded ({self.head_dim_padded}) must be a multiple of "
+            f"k_block_size ({self.k_block_size})"
         )
         assert self.k_block_size % 64 == 0, (
-            f"k_block_size ({self.k_block_size}) must be a multiple of 64 " f"(K loading uses 8 threads × 8 elements = 64 per iteration)"
+            f"k_block_size ({self.k_block_size}) must be a multiple of 64 "
+            f"(K loading uses 8 threads × 8 elements = 64 per iteration)"
         )
         self.num_k_chunks = self.head_dim_padded // self.k_block_size
 
@@ -204,12 +211,12 @@ class SparseScoreRecomputeSm100:
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,  # (bs, seqlen_q, n_heads_q, head_dim) BF16
-        mK: cute.Tensor,  # (bs, seqlen_k, head_dim) BF16
-        mPerHead: cute.Tensor,  # (bs, seqlen_q, n_heads_q) — W (BF16) or scaled_LSE (FP32)
-        mTopkIdx: cute.Tensor,  # (bs, seqlen_q, topk) INT32
-        mOut: cute.Tensor,  # (bs, seqlen_q, topk) FP32
-        mTopkLength: cute.Tensor,  # (bs, seqlen_q) INT32 (dummy when unused)
+        mQ: cute.Tensor,          # (bs, seqlen_q, n_heads_q, head_dim) BF16
+        mK: cute.Tensor,          # (bs, seqlen_k, head_dim) BF16
+        mPerHead: cute.Tensor,    # (bs, seqlen_q, n_heads_q) — W (BF16) or LSE (FP32)
+        mTopkIdx: cute.Tensor,    # (bs, seqlen_q, topk) INT32
+        mOut: cute.Tensor,        # (bs, seqlen_q, topk) FP32
+        mTopkLength: cute.Tensor, # (bs, seqlen_q) INT32 (dummy when unused)
         softmax_scale: Float32 | float,
         stream: cuda.CUstream,
     ):
@@ -229,17 +236,19 @@ class SparseScoreRecomputeSm100:
         # --- PackGQA: reshape Q to pack qhpkv heads into seqlen_q dim ---
         shape_Q_packed = (
             (self.qhead_per_kvhead, mQ.shape[0]),  # packed M dim
-            mQ.shape[1],  # head_dim
-            1,  # n_heads_kv
-            *mQ.shape[3:],  # bs (and beyond)
+            mQ.shape[1],                           # head_dim
+            1,                                     # n_heads_kv
+            *mQ.shape[3:],                         # bs (and beyond)
         )
         stride_Q_packed = (
-            (mQ.stride[2], mQ.stride[0]),  # (stride_head, stride_seqlen)
-            mQ.stride[1],  # stride_hdim
+            (mQ.stride[2], mQ.stride[0]),          # (stride_head, stride_seqlen)
+            mQ.stride[1],                          # stride_hdim
             mQ.stride[2] * self.qhead_per_kvhead,  # stride across kv_head groups
-            *mQ.stride[3:],  # stride_bs
+            *mQ.stride[3:],                        # stride_bs
         )
-        mQ = cute.make_tensor(mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed))
+        mQ = cute.make_tensor(
+            mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed)
+        )
 
         # --- K layout: (bs, seqlen_k, head_dim) -> (seqlen_k, head_dim, bs) ---
         mK = cute.make_tensor(mK.iterator, cute.select(mK.layout, mode=[1, 2, 0]))
@@ -264,16 +273,10 @@ class SparseScoreRecomputeSm100:
 
         # --- SMEM layouts --- (K is A operand in swapAB; loaded via cp.async, not TMA)
         sK_layout = _make_smem_layout_a(
-            tiled_mma_qk,
-            self.mma_tiler_qk,
-            self.k_dtype,
-            self.kv_stage,
+            tiled_mma_qk, self.mma_tiler_qk, self.k_dtype, self.kv_stage,
         )
         sQ_layout = _make_smem_layout_b(
-            tiled_mma_qk,
-            self.mma_tiler_qk,
-            self.q_dtype,
-            self.num_k_chunks,
+            tiled_mma_qk, self.mma_tiler_qk, self.q_dtype, self.num_k_chunks,
         )
 
         # TMA atom for Q only (K is sparse-loaded, no TMA)
@@ -305,21 +308,22 @@ class SparseScoreRecomputeSm100:
         # --- Grid and kernel dispatch (CLC persistent scheduling) ---
         seqlen_q_packed = cute.size(mQ.shape[0])
         num_m_blocks = cute.ceil_div(seqlen_q_packed, self.m_block_size)
-        batch_size = cute.size(mQ.shape[3]) if cute.rank(mQ.shape) > 3 else 1
-        tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams((num_m_blocks, 1, batch_size), (*self.cluster_shape_mn, 1))
-        grid_dim = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
+        batch_size = (
+            cute.size(mQ.shape[3]) if cute.rank(mQ.shape) > 3 else 1
+        )
+        tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
+            (num_m_blocks, 1, batch_size), (*self.cluster_shape_mn, 1)
+        )
+        grid_dim = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(
+            tile_sched_params
+        )
         self.kernel(
-            mQ,
-            mK,
-            mPerHead,
-            mTopkIdx,
-            mOut,
+            mQ, mK, mPerHead, mTopkIdx, mOut,
             mTopkLength,
             softmax_scale,
             tma_atom_Q,
             tiled_mma_qk,
-            sQ_layout,
-            sK_layout,
+            sQ_layout, sK_layout,
             tile_sched_params,
         ).launch(
             grid=grid_dim,
@@ -334,17 +338,12 @@ class SparseScoreRecomputeSm100:
     @cute.kernel
     def kernel(
         self,
-        mQ,
-        mK,
-        mPerHead,
-        mTopkIdx,
-        mOut,
+        mQ, mK, mPerHead, mTopkIdx, mOut,
         mTopkLength,
         softmax_scale: Float32 | float,
         tma_atom_Q,
         tiled_mma_qk,
-        sQ_layout,
-        sK_layout,
+        sQ_layout, sK_layout,
         tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams,
     ):
         """Device-side kernel entry with CLC persistent scheduling."""
@@ -352,6 +351,7 @@ class SparseScoreRecomputeSm100:
         seqlen_k = cute.size(mK.shape[0])
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx = cute.arch.thread_idx()[0]
+        neg_log2_e = Float32(-math.log2(math.e))
 
         # --- TMA descriptor prefetch ---
         if warp_idx == 0:
@@ -362,7 +362,7 @@ class SparseScoreRecomputeSm100:
         # =====================================================================
         sQ_size = cute.cosize(sQ_layout)
         sK_size = cute.cosize(sK_layout)
-        sPerHead_size = self.m_block_size * 2  # double-buffer for LOAD/EPI overlap
+        sPerHead_size = self.m_block_size * 2      # double-buffer for LOAD/EPI overlap
         sTopkIdx_size = self.topk * 2 if self.topk_in_smem else 1
 
         @cute.struct
@@ -411,9 +411,15 @@ class SparseScoreRecomputeSm100:
         clc_response_ptr = storage.clc_response.data_ptr()
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
-        sPerHead = storage.sPerHead.get_tensor(cute.make_layout((self.m_block_size,), stride=(1,)))
-        sTopkIdx = storage.sTopkIdx.get_tensor(cute.make_layout((self.topk if self.topk_in_smem else 1,), stride=(1,)))
-        sScoreAll = storage.sScoreAll.get_tensor(cute.make_layout((self.sScoreAll_size,), stride=(1,)))
+        sPerHead = storage.sPerHead.get_tensor(
+            cute.make_layout((self.m_block_size,), stride=(1,))
+        )
+        sTopkIdx = storage.sTopkIdx.get_tensor(
+            cute.make_layout((self.topk if self.topk_in_smem else 1,), stride=(1,))
+        )
+        sScoreAll = storage.sScoreAll.get_tensor(
+            cute.make_layout((self.sScoreAll_size,), stride=(1,))
+        )
 
         # =====================================================================
         # Pipeline setup
@@ -422,7 +428,9 @@ class SparseScoreRecomputeSm100:
             cute.make_layout(self.cluster_shape_mnk),
             (tiled_mma_qk.thr_id.shape,),
         )
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        )
         is_first_cta_in_cluster = cta_rank_in_cluster == 0
 
         # Q pipeline (1 stage: all k_chunks share one barrier with combined tx_count)
@@ -456,7 +464,9 @@ class SparseScoreRecomputeSm100:
 
         # CLC persistent scheduling pipeline
         cluster_size = cute.size(self.cluster_shape_mn)
-        num_clc_consumer_threads = self.WARP_SIZE * (1 + cluster_size * (1 + 1 + 8))  # sched(1) + load(1) + mma(1) + epilogue+Kload(8) warps
+        num_clc_consumer_threads = self.WARP_SIZE * (
+            1 + cluster_size * (1 + 1 + 8)
+        )  # sched(1) + load(1) + mma(1) + epilogue+Kload(8) warps
         clc_pipeline = PipelineClcFetchAsync.create(
             barrier_storage=clc_mbar_ptr,
             num_stages=self.num_clc_stage,
@@ -471,7 +481,9 @@ class SparseScoreRecomputeSm100:
         cute.arch.sync_threads()
         pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
-        clc_consumer_state = make_pipeline_state(PipelineUserType.Consumer, self.num_clc_stage)
+        clc_consumer_state = make_pipeline_state(
+            PipelineUserType.Consumer, self.num_clc_stage
+        )
         tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
             tile_sched_params,
             cute.arch.block_idx(),
@@ -486,7 +498,9 @@ class SparseScoreRecomputeSm100:
         thr_mma_qk = tiled_mma_qk.get_slice(0)
         qk_acc_shape = thr_mma_qk.partition_shape_C(self.mma_tiler_qk[:2])
         tStS_fake = thr_mma_qk.make_fragment_C(qk_acc_shape)
-        tmem_ptr = cute.make_ptr(Float32, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
+        tmem_ptr = cute.make_ptr(
+            Float32, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16
+        )
         tStS_ref = cute.make_tensor(tmem_ptr, tStS_fake.layout)
 
         warp_group_idx = tidx // self.WARPGROUP_SIZE
@@ -520,7 +534,13 @@ class SparseScoreRecomputeSm100:
                             m_idx = m_packed_idx // self.qhead_per_kvhead
                             h_idx = m_packed_idx - m_idx * self.qhead_per_kvhead
                             if m_idx < seqlen_q_load:
-                                sPerHead[per_head_buf_off + row] = mPerHead[m_idx, h_idx, batch_idx]
+                                per_head_value = mPerHead[m_idx, h_idx, batch_idx]
+                                if cutlass.const_expr(self.score_type == "attention"):
+                                    sPerHead[per_head_buf_off + row] = (
+                                        Float32(per_head_value) * neg_log2_e
+                                    )
+                                else:
+                                    sPerHead[per_head_buf_off + row] = per_head_value
                             else:
                                 sPerHead[per_head_buf_off + row] = self.per_head_dtype(0)
 
@@ -547,13 +567,9 @@ class SparseScoreRecomputeSm100:
                             (m_block, _kc),
                         )
                         sQ_cur = sQ[None, None, None, _kc]
-                        load_Q_fn, _, _ = copy_ops.tma_get_copy_fn(
-                            tma_atom_Q,
-                            0,
-                            cute.make_layout(1),
-                            gQ,
-                            sQ_cur,
-                            single_stage=True,
+                        load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_Q, 0, cute.make_layout(1),
+                            gQ, sQ_cur, single_stage=True,
                         )
                         load_Q_fn(tma_bar_ptr=handle_Q.barrier)
 
@@ -572,9 +588,11 @@ class SparseScoreRecomputeSm100:
                 cute.arch.alloc_tmem(tmem_alloc_cols, tmem_holding_buf)
                 cute.arch.sync_warp()
 
-                s_empty_phase = Int32(1)  # unblock first round's s_empty barriers
+                s_empty_phase = Int32(1) # unblock first round's s_empty barriers
                 NUM_SLOTS_MASK = Int32(self.num_tmem_slots - 1)
-                K_mma_state = make_pipeline_state(PipelineUserType.Consumer, self.kv_stage)
+                K_mma_state = make_pipeline_state(
+                    PipelineUserType.Consumer, self.kv_stage
+                )
                 while work_tile.is_valid_tile:
                     m_block = work_tile.tile_idx[0]
                     batch_idx = work_tile.tile_idx[2]
@@ -616,12 +634,9 @@ class SparseScoreRecomputeSm100:
                             tSrQ_kc = tSrQ[None, None, None, _kc]
                             sQ_kc = sQ[None, None, None, _kc]
                             _gemm_ptx_partial(
-                                qk_mma_op,
-                                slot * self.tmem_s_stride,
-                                tSrKi,
-                                tSrQ_kc,
-                                sA=sK_cur,
-                                sB=sQ_kc,
+                                qk_mma_op, slot * self.tmem_s_stride,
+                                tSrKi, tSrQ_kc,
+                                sA=sK_cur, sB=sQ_kc,
                                 zero_init=const_expr(_kc == 0),
                             )
 
@@ -645,8 +660,7 @@ class SparseScoreRecomputeSm100:
                 cute.arch.relinquish_tmem_alloc_permit()
                 cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
                 tmem_ptr_dealloc = cute.arch.retrieve_tmem_ptr(
-                    Float32,
-                    alignment=16,
+                    Float32, alignment=16,
                     ptr_to_buffer_holding_addr=tmem_holding_buf,
                 )
                 cute.arch.dealloc_tmem(tmem_ptr_dealloc, Int32(self.tmem_alloc_cols))
@@ -655,7 +669,9 @@ class SparseScoreRecomputeSm100:
             # Scheduler warp (warp 2): CLC producer loop
             # -----------------------------------------------------------------
             if warp_idx == self.sched_warp_id and is_first_cta_in_cluster:
-                clc_producer_state = make_pipeline_state(PipelineUserType.ProducerConsumer, self.num_clc_stage)
+                clc_producer_state = make_pipeline_state(
+                    PipelineUserType.ProducerConsumer, self.num_clc_stage
+                )
                 while work_tile.is_valid_tile:
                     clc_pipeline.producer_acquire(clc_producer_state)
                     mbarrier_addr = clc_pipeline.producer_get_barrier(clc_producer_state)
@@ -683,18 +699,11 @@ class SparseScoreRecomputeSm100:
                 if cutlass.const_expr(self.score_type == "attention"):
                     if cutlass.const_expr(self.n_block_size >= 128):
                         s_full_phase, reduce_phase = self._epilogue_attention_n128(
-                            tiled_mma_qk,
-                            tStS_ref,
-                            sPerHead,
-                            sScoreAll,
-                            S_mbar_ptr,
-                            reduce_sync_mbar_ptr,
-                            sTopkIdx,
-                            mTopkIdx,
-                            mOut,
+                            tiled_mma_qk, tStS_ref,
+                            sPerHead, sScoreAll, S_mbar_ptr, reduce_sync_mbar_ptr,
+                            sTopkIdx, mTopkIdx, mOut,
                             mTopkLength,
-                            m_block,
-                            batch_idx,
+                            m_block, batch_idx,
                             tidx,
                             s_full_phase,
                             reduce_phase,
@@ -704,18 +713,11 @@ class SparseScoreRecomputeSm100:
                         )
                     else:
                         s_full_phase, reduce_phase = self._epilogue_attention(
-                            tiled_mma_qk,
-                            tStS_ref,
-                            sPerHead,
-                            sScoreAll,
-                            S_mbar_ptr,
-                            reduce_sync_mbar_ptr,
-                            sTopkIdx,
-                            mTopkIdx,
-                            mOut,
+                            tiled_mma_qk, tStS_ref,
+                            sPerHead, sScoreAll, S_mbar_ptr, reduce_sync_mbar_ptr,
+                            sTopkIdx, mTopkIdx, mOut,
                             mTopkLength,
-                            m_block,
-                            batch_idx,
+                            m_block, batch_idx,
                             tidx,
                             s_full_phase,
                             reduce_phase,
@@ -725,19 +727,11 @@ class SparseScoreRecomputeSm100:
                         )
                 else:
                     s_full_phase, reduce_phase = self._epilogue_indexer(
-                        tiled_mma_qk,
-                        tStS_ref,
-                        mPerHead,
-                        sPerHead,
-                        sScoreAll,
-                        S_mbar_ptr,
-                        reduce_sync_mbar_ptr,
-                        sTopkIdx,
-                        mTopkIdx,
-                        mOut,
+                        tiled_mma_qk, tStS_ref,
+                        mPerHead, sPerHead, sScoreAll, S_mbar_ptr, reduce_sync_mbar_ptr,
+                        sTopkIdx, mTopkIdx, mOut,
                         mTopkLength,
-                        m_block,
-                        batch_idx,
+                        m_block, batch_idx,
                         tidx,
                         s_full_phase,
                         reduce_phase,
@@ -785,8 +779,12 @@ class SparseScoreRecomputeSm100:
                 # stage s, keeping 2 groups in flight to improve L2 utilization.
                 # (Full-depth tested: worse — delaying MMA start hurts more
                 # than extra L2 parallelism helps.)
-                K_issue_state = make_pipeline_state(PipelineUserType.Producer, self.kv_stage)
-                K_commit_state = make_pipeline_state(PipelineUserType.Producer, self.kv_stage)
+                K_issue_state = make_pipeline_state(
+                    PipelineUserType.Producer, self.kv_stage
+                )
+                K_commit_state = make_pipeline_state(
+                    PipelineUserType.Producer, self.kv_stage
+                )
 
                 while work_tile.is_valid_tile:
                     m_block = work_tile.tile_idx[0]
@@ -802,23 +800,16 @@ class SparseScoreRecomputeSm100:
                         sK_stage = sK[None, None, None, K_issue_state.index]
                         sK_slice = cute.composition(
                             sK_stage,
-                            cute.make_layout((self.n_block_size, self.k_block_size)),
+                            cute.make_layout(
+                                (self.n_block_size, self.k_block_size)
+                            ),
                         )
                         k_offset = const_expr(_kc * self.k_block_size)
                         self._load_k_rows(
-                            mK,
-                            sK_slice,
-                            mTopkIdx,
-                            mTopkLength,
-                            async_copy_atom,
-                            async_thr_copy,
-                            n_block,
-                            q_token_idx,
-                            batch_idx,
-                            seqlen_k,
-                            topK_cur,
-                            idx_in_group,
-                            group_idx_local,
+                            mK, sK_slice, mTopkIdx, mTopkLength,
+                            async_copy_atom, async_thr_copy,
+                            n_block, q_token_idx, batch_idx, seqlen_k,
+                            topK_cur, idx_in_group, group_idx_local,
                             k_offset=k_offset,
                         )
                         cute.arch.cp_async_commit_group()
@@ -832,23 +823,16 @@ class SparseScoreRecomputeSm100:
                             sK_stage = sK[None, None, None, K_issue_state.index]
                             sK_slice = cute.composition(
                                 sK_stage,
-                                cute.make_layout((self.n_block_size, self.k_block_size)),
+                                cute.make_layout(
+                                    (self.n_block_size, self.k_block_size)
+                                ),
                             )
                             k_offset = const_expr(_kc * self.k_block_size)
                             self._load_k_rows(
-                                mK,
-                                sK_slice,
-                                mTopkIdx,
-                                mTopkLength,
-                                async_copy_atom,
-                                async_thr_copy,
-                                n_block,
-                                q_token_idx,
-                                batch_idx,
-                                seqlen_k,
-                                topK_cur,
-                                idx_in_group,
-                                group_idx_local,
+                                mK, sK_slice, mTopkIdx, mTopkLength,
+                                async_copy_atom, async_thr_copy,
+                                n_block, q_token_idx, batch_idx, seqlen_k,
+                                topK_cur, idx_in_group, group_idx_local,
                                 k_offset=k_offset,
                             )
                             cute.arch.cp_async_commit_group()
@@ -874,7 +858,9 @@ class SparseScoreRecomputeSm100:
                 # Attention: original K load with wait_group(0).
                 # 2-deep tested but regressed -14% (kv_stage=2 too tight,
                 # code bloat from prologue/drain outweighs L2 overlap gain).
-                K_load_state = make_pipeline_state(PipelineUserType.Producer, self.kv_stage)
+                K_load_state = make_pipeline_state(
+                    PipelineUserType.Producer, self.kv_stage
+                )
 
                 while work_tile.is_valid_tile:
                     m_block = work_tile.tile_idx[0]
@@ -894,23 +880,16 @@ class SparseScoreRecomputeSm100:
                             sK_stage = sK[None, None, None, K_load_state.index]
                             sK_slice = cute.composition(
                                 sK_stage,
-                                cute.make_layout((self.n_block_size, self.k_block_size)),
+                                cute.make_layout(
+                                    (self.n_block_size, self.k_block_size)
+                                ),
                             )
                             k_offset = const_expr(_kc * self.k_block_size)
                             self._load_k_rows(
-                                mK,
-                                sK_slice,
-                                mTopkIdx,
-                                mTopkLength,
-                                async_copy_atom,
-                                async_thr_copy,
-                                n_block,
-                                q_token_idx,
-                                batch_idx,
-                                seqlen_k,
-                                topK_cur,
-                                idx_in_group,
-                                group_idx_local,
+                                mK, sK_slice, mTopkIdx, mTopkLength,
+                                async_copy_atom, async_thr_copy,
+                                n_block, q_token_idx, batch_idx, seqlen_k,
+                                topK_cur, idx_in_group, group_idx_local,
                                 k_offset=k_offset,
                             )
                             cute.arch.cp_async_commit_group()
@@ -952,46 +931,43 @@ class SparseScoreRecomputeSm100:
         public global KV ids (``b * seqlen_k + local``); we decode back to
         local-per-batch before indexing into mK ``(seqlen_k, head_dim, bs)``.
         With the flag False, ids are already local (legacy callers — e.g.
-        ``indexer_backward``'s grad path that still expects local).
+        ``indexer_bwd``'s grad path that still expects local).
         """
         NUM_GROUPS = const_expr(self.WARPGROUP_SIZE // 8)
         ROWS_PER_GROUP = const_expr(self.n_block_size // NUM_GROUPS)
-        batch_offset = batch_idx * seqlen_k if const_expr(self.topk_indices_global) else Int32(0)
+        batch_offset = (
+            batch_idx * seqlen_k if const_expr(self.topk_indices_global)
+            else Int32(0)
+        )
         for r in cutlass.range_constexpr(ROWS_PER_GROUP):
             row = r * NUM_GROUPS + group_idx_local
             topk_pos = n_block * self.n_block_size + row
             if const_expr(self.have_topk_length and self.score_type == "attention"):
                 if topk_pos < topK_cur:
-                    topk_raw = Int32(mTopkIdx[q_token_idx, topk_pos, batch_idx])
+                    topk_raw = Int32(
+                        mTopkIdx[q_token_idx, topk_pos, batch_idx]
+                    )
                     topk_local = topk_raw - batch_offset
                     self._copy_row(
-                        mK,
-                        sK_slice,
-                        row,
-                        idx_in_group,
-                        copy_atom,
-                        thr_copy,
-                        topk_local,
-                        batch_idx,
+                        mK, sK_slice, row, idx_in_group,
+                        copy_atom, thr_copy,
+                        topk_local, batch_idx,
                         k_offset=k_offset,
                     )
             else:
                 topk_local = Int32(-1)
                 if topk_pos < topK_cur:
-                    topk_raw = Int32(mTopkIdx[q_token_idx, topk_pos, batch_idx])
+                    topk_raw = Int32(
+                        mTopkIdx[q_token_idx, topk_pos, batch_idx]
+                    )
                     # Invalid (-1) stays negative after the offset subtraction
                     # and is rejected by the bounds check below.
                     topk_local = topk_raw - batch_offset
                 if topk_local >= 0 and topk_local < seqlen_k:
                     self._copy_row(
-                        mK,
-                        sK_slice,
-                        row,
-                        idx_in_group,
-                        copy_atom,
-                        thr_copy,
-                        topk_local,
-                        batch_idx,
+                        mK, sK_slice, row, idx_in_group,
+                        copy_atom, thr_copy,
+                        topk_local, batch_idx,
                         k_offset=k_offset,
                     )
 
@@ -1049,12 +1025,8 @@ class SparseScoreRecomputeSm100:
     # =========================================================================
     @cute.jit
     def _intra_inter_warp_reduce_max(
-        self,
-        sScoreAll,
-        reduce_sync_mbar_ptr,
-        reduce_sync_phase,
-        warp_id_in_wg,
-        local_value,
+        self, sScoreAll, reduce_sync_mbar_ptr, reduce_sync_phase,
+        warp_id_in_wg, local_value,
     ):
         """Reduce local max across 4 warps via smem scratch + mbarrier sync."""
         warp_max = cute.arch.warp_redux_sync(local_value, "fmax")
@@ -1074,12 +1046,8 @@ class SparseScoreRecomputeSm100:
 
     @cute.jit
     def _intra_inter_warp_reduce_sum(
-        self,
-        sScoreAll,
-        reduce_sync_mbar_ptr,
-        reduce_sync_phase,
-        warp_id_in_wg,
-        local_value,
+        self, sScoreAll, reduce_sync_mbar_ptr, reduce_sync_phase,
+        warp_id_in_wg, local_value,
     ):
         """Reduce local sum across 4 warps via smem scratch + mbarrier sync."""
         warp_sum = cute.arch.warp_reduction_sum(local_value)
@@ -1098,12 +1066,8 @@ class SparseScoreRecomputeSm100:
 
     @cute.jit
     def _inter_warp_sync_sum(
-        self,
-        sScoreAll,
-        reduce_sync_mbar_ptr,
-        reduce_sync_phase,
-        warp_id_in_wg,
-        warp_sum,
+        self, sScoreAll, reduce_sync_mbar_ptr, reduce_sync_phase,
+        warp_id_in_wg, warp_sum,
     ):
         """Cross-warp sum sync with pre-computed warp-level sum (skip warp_reduction_sum)."""
         with cute.arch.elect_one():
@@ -1127,17 +1091,10 @@ class SparseScoreRecomputeSm100:
         self,
         tiled_mma_qk,
         tStS_ref,
-        mPerHead,
-        sW,
-        sScoreAll,
-        S_mbar_ptr,
-        reduce_sync_mbar_ptr,
-        sTopkIdx,
-        mTopkIdx,
-        mOut,
+        mPerHead, sW, sScoreAll, S_mbar_ptr, reduce_sync_mbar_ptr,
+        sTopkIdx, mTopkIdx, mOut,
         mTopkLength,
-        m_block,
-        batch_idx,
+        m_block, batch_idx,
         tidx,
         s_full_phase,
         reduce_phase,
@@ -1167,7 +1124,9 @@ class SparseScoreRecomputeSm100:
         cS = cute.make_identity_tensor(self.mma_tiler_qk[:2])
         tScS = thr_tmem_load.partition_D(thr_mma.partition_C(cS))
 
-        tSrS_shape = thr_tmem_load.partition_D(cute.make_identity_tensor(tStS_ref.shape)).shape
+        tSrS_shape = thr_tmem_load.partition_D(
+            cute.make_identity_tensor(tStS_ref.shape)
+        ).shape
         tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
 
         sW_off = Int32(0) if per_head_offset is None else per_head_offset
@@ -1213,10 +1172,8 @@ class SparseScoreRecomputeSm100:
             if const_expr(_ri == 0):
                 cute.autovec_copy(W_src_f32, rW_all_f32)
             tmem_ptr_cur = cute.make_ptr(
-                Float32,
-                _slot * self.tmem_s_stride,
-                mem_space=cute.AddressSpace.tmem,
-                assumed_align=16,
+                Float32, _slot * self.tmem_s_stride,
+                mem_space=cute.AddressSpace.tmem, assumed_align=16,
             )
             tStS_cur = cute.make_tensor(tmem_ptr_cur, tStS_ref.layout)
             tStS_t2r_cur = thr_tmem_load.partition_S(tStS_cur)
@@ -1262,11 +1219,8 @@ class SparseScoreRecomputeSm100:
                 local_max = rScores[ei]
 
         global_max, reduce_phase = self._intra_inter_warp_reduce_max(
-            sScoreAll,
-            reduce_sync_mbar_ptr,
-            reduce_phase,
-            warp_id_in_wg,
-            local_max,
+            sScoreAll, reduce_sync_mbar_ptr, reduce_phase,
+            warp_id_in_wg, local_max,
         )
 
         if global_max > Float32(-1e30):
@@ -1283,11 +1237,8 @@ class SparseScoreRecomputeSm100:
                 cute.make_layout((self.num_warps_in_epi_wg,), stride=(1,)),
             )
             global_sum, reduce_phase = self._intra_inter_warp_reduce_sum(
-                sScoreAll_sum,
-                reduce_sync_mbar_ptr,
-                reduce_phase,
-                warp_id_in_wg,
-                local_exp_sum,
+                sScoreAll_sum, reduce_sync_mbar_ptr, reduce_phase,
+                warp_id_in_wg, local_exp_sum,
             )
 
             inv_sum = Float32(1.0) / global_sum
@@ -1313,16 +1264,10 @@ class SparseScoreRecomputeSm100:
         self,
         tiled_mma_qk,
         tStS_ref,
-        sLSE,
-        sScoreAll,
-        S_mbar_ptr,
-        reduce_sync_mbar_ptr,
-        sTopkIdx,
-        mTopkIdx,
-        mOut,
+        sLSE, sScoreAll, S_mbar_ptr, reduce_sync_mbar_ptr,
+        sTopkIdx, mTopkIdx, mOut,
         mTopkLength,
-        m_block,
-        batch_idx,
+        m_block, batch_idx,
         tidx,
         s_full_phase,
         reduce_phase,
@@ -1337,19 +1282,6 @@ class SparseScoreRecomputeSm100:
         no shfl_xor or is_active gating needed.
         """
         tidx_wg = tidx % self.WARPGROUP_SIZE
-
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8)),
-            Float32,
-        )
-        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStS_ref).get_slice(tidx_wg)
-
-        thr_mma = tiled_mma_qk.get_slice(tidx_wg)
-        cS = cute.make_identity_tensor(self.mma_tiler_qk[:2])
-        tScS = thr_tmem_load.partition_D(thr_mma.partition_C(cS))
-
-        tSrS_shape = thr_tmem_load.partition_D(cute.make_identity_tensor(tStS_ref.shape)).shape
-        tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
 
         sLSE_off = Int32(0) if per_head_offset is None else per_head_offset
         sTopkIdx_off = Int32(0) if topk_idx_offset is None else topk_idx_offset
@@ -1368,7 +1300,7 @@ class SparseScoreRecomputeSm100:
         )
         rLSE_all = cute.make_rmem_tensor((self.m_block_size,), Float32)
 
-        kv_offset = tScS[0][0]
+        kv_offset = Int32(0)
         warp_id_in_wg = tidx_wg // self.WARP_SIZE
 
         log2_e = Float32(math.log2(math.e))
@@ -1387,6 +1319,24 @@ class SparseScoreRecomputeSm100:
         for _ri in cutlass.range_constexpr(self.num_n_blocks):
             n_blk = self.num_n_blocks - 1 - _ri
             _slot = const_expr(n_blk % self.num_tmem_slots)
+
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8)),
+                Float32,
+            )
+            thr_mma = tiled_mma_qk.get_slice(tidx_wg)
+            cS = cute.make_identity_tensor(self.mma_tiler_qk[:2])
+            tScS = tcgen05.make_tmem_copy(
+                tmem_load_atom, tStS_ref,
+            ).get_slice(tidx_wg).partition_D(thr_mma.partition_C(cS))
+            tSrS_shape = tcgen05.make_tmem_copy(
+                tmem_load_atom, tStS_ref,
+            ).get_slice(tidx_wg).partition_D(
+                cute.make_identity_tensor(tStS_ref.shape)
+            ).shape
+            tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
+            kv_offset = tScS[0][0]
+
             cute.arch.mbarrier_wait(S_mbar_ptr + 2 * _slot, s_full_phase)
             if const_expr(_ri == 0):
                 cute.autovec_copy(sLSE_1d, rLSE_all)
@@ -1395,15 +1345,21 @@ class SparseScoreRecomputeSm100:
                 should_copy_tmem = n_blk < n_block_max_epi
             if should_copy_tmem:
                 tmem_ptr_cur = cute.make_ptr(
-                    Float32,
-                    _slot * self.tmem_s_stride,
-                    mem_space=cute.AddressSpace.tmem,
-                    assumed_align=16,
+                    Float32, _slot * self.tmem_s_stride,
+                    mem_space=cute.AddressSpace.tmem, assumed_align=16,
                 )
                 tStS_cur = cute.make_tensor(tmem_ptr_cur, tStS_ref.layout)
-                tStS_t2r_cur = thr_tmem_load.partition_S(tStS_cur)
+                tStS_t2r_cur = tcgen05.make_tmem_copy(
+                    tmem_load_atom, tStS_ref,
+                ).get_slice(tidx_wg).partition_S(tStS_cur)
 
-                cute.copy(thr_tmem_load, tStS_t2r_cur, tSrS)
+                cute.copy(
+                    tcgen05.make_tmem_copy(
+                        tmem_load_atom, tStS_ref,
+                    ).get_slice(tidx_wg),
+                    tStS_t2r_cur,
+                    tSrS,
+                )
                 cute.arch.fence_view_async_tmem_load()
             cute.arch.mbarrier_arrive(S_mbar_ptr + 2 * _slot + 1)
             if const_expr(_slot == 0):
@@ -1422,7 +1378,7 @@ class SparseScoreRecomputeSm100:
                         val0 = tSrS[idx0]
                         val1 = tSrS[idx1]
 
-                        val0, val1 = fma_packed_f32x2(
+                        (val0, val1) = fma_packed_f32x2(
                             (val0, val1),
                             (scale_log2_e, scale_log2_e),
                             lse_pair,
@@ -1449,11 +1405,8 @@ class SparseScoreRecomputeSm100:
 
         # ---- Phase 2: L1-norm (scores already non-negative from exp) ----
         global_sum, reduce_phase = self._inter_warp_sync_sum(
-            sScoreAll,
-            reduce_sync_mbar_ptr,
-            reduce_phase,
-            warp_id_in_wg,
-            warp_sum_acc,
+            sScoreAll, reduce_sync_mbar_ptr, reduce_phase,
+            warp_id_in_wg, warp_sum_acc,
         )
 
         if global_sum > Float32(1e-10):
@@ -1476,16 +1429,10 @@ class SparseScoreRecomputeSm100:
         self,
         tiled_mma_qk,
         tStS_ref,
-        sLSE,
-        sScoreAll,
-        S_mbar_ptr,
-        reduce_sync_mbar_ptr,
-        sTopkIdx,
-        mTopkIdx,
-        mOut,
+        sLSE, sScoreAll, S_mbar_ptr, reduce_sync_mbar_ptr,
+        sTopkIdx, mTopkIdx, mOut,
         mTopkLength,
-        m_block,
-        batch_idx,
+        m_block, batch_idx,
         tidx,
         s_full_phase,
         reduce_phase,
@@ -1502,19 +1449,6 @@ class SparseScoreRecomputeSm100:
         m_block_size/2 heads; a single shfl_xor(2) combines the partial sums.
         """
         tidx_wg = tidx % self.WARPGROUP_SIZE
-
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld16x64bOp(tcgen05.copy.Repetition(self.m_block_size // 2)),
-            Float32,
-        )
-        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStS_ref).get_slice(tidx_wg)
-
-        thr_mma = tiled_mma_qk.get_slice(tidx_wg)
-        cS = cute.make_identity_tensor(self.mma_tiler_qk[:2])
-        tScS = thr_tmem_load.partition_D(thr_mma.partition_C(cS))
-
-        tSrS_shape = thr_tmem_load.partition_D(cute.make_identity_tensor(tStS_ref.shape)).shape
-        tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
 
         sLSE_off = Int32(0) if per_head_offset is None else per_head_offset
         sTopkIdx_off = Int32(0) if topk_idx_offset is None else topk_idx_offset
@@ -1536,12 +1470,12 @@ class SparseScoreRecomputeSm100:
         # tSrLSE[i] pairs with tSrS[i] regardless of fragment layout.
         sLSE_2d = cute.make_tensor(
             sLSE_f32_ptr,
-            cute.make_layout((self.n_block_size, self.m_block_size), stride=(0, 1)),
+            cute.make_layout(
+                (self.n_block_size, self.m_block_size), stride=(0, 1)
+            ),
         )
-        tSsLSE = thr_tmem_load.partition_D(thr_mma.partition_C(sLSE_2d))
-        tSrLSE = cute.make_rmem_tensor(tSsLSE.shape, Float32)
 
-        kv_offset = tScS[0][0]
+        kv_offset = Int32(0)
         warp_id_in_wg = tidx_wg // self.WARP_SIZE
         # Thread i and Thread i^2 share a lane; only one should contribute
         # to warp-level sums / write output.  (tidx_wg % 4) < 2 selects
@@ -1564,23 +1498,56 @@ class SparseScoreRecomputeSm100:
         for _ri in cutlass.range_constexpr(self.num_n_blocks):
             n_blk = self.num_n_blocks - 1 - _ri
             _slot = const_expr(n_blk % self.num_tmem_slots)
+
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld16x64bOp(
+                    tcgen05.copy.Repetition(self.m_block_size // 2)
+                ),
+                Float32,
+            )
+
+            thr_mma = tiled_mma_qk.get_slice(tidx_wg)
+            cS = cute.make_identity_tensor(self.mma_tiler_qk[:2])
+            tScS = tcgen05.make_tmem_copy(
+                tmem_load_atom, tStS_ref,
+            ).get_slice(tidx_wg).partition_D(thr_mma.partition_C(cS))
+            tSrS_shape = tcgen05.make_tmem_copy(
+                tmem_load_atom, tStS_ref,
+            ).get_slice(tidx_wg).partition_D(
+                cute.make_identity_tensor(tStS_ref.shape)
+            ).shape
+            tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
+
+            tSsLSE = tcgen05.make_tmem_copy(
+                tmem_load_atom, tStS_ref,
+            ).get_slice(tidx_wg).partition_D(
+                thr_mma.partition_C(sLSE_2d)
+            )
+            tSrLSE = cute.make_rmem_tensor(tSsLSE.shape, Float32)
+            kv_offset = tScS[0][0]
+
             cute.arch.mbarrier_wait(S_mbar_ptr + 2 * _slot, s_full_phase)
-            if const_expr(_ri == 0):
-                cute.autovec_copy(tSsLSE, tSrLSE)
+            cute.autovec_copy(tSsLSE, tSrLSE)
             should_copy_tmem = const_expr(True)
             if const_expr(self.have_topk_length):
                 should_copy_tmem = n_blk < n_block_max_epi
             if should_copy_tmem:
                 tmem_ptr_cur = cute.make_ptr(
-                    Float32,
-                    _slot * self.tmem_s_stride,
-                    mem_space=cute.AddressSpace.tmem,
-                    assumed_align=16,
+                    Float32, _slot * self.tmem_s_stride,
+                    mem_space=cute.AddressSpace.tmem, assumed_align=16,
                 )
                 tStS_cur = cute.make_tensor(tmem_ptr_cur, tStS_ref.layout)
-                tStS_t2r_cur = thr_tmem_load.partition_S(tStS_cur)
+                tStS_t2r_cur = tcgen05.make_tmem_copy(
+                    tmem_load_atom, tStS_ref,
+                ).get_slice(tidx_wg).partition_S(tStS_cur)
 
-                cute.copy(thr_tmem_load, tStS_t2r_cur, tSrS)
+                cute.copy(
+                    tcgen05.make_tmem_copy(
+                        tmem_load_atom, tStS_ref,
+                    ).get_slice(tidx_wg),
+                    tStS_t2r_cur,
+                    tSrS,
+                )
                 cute.arch.fence_view_async_tmem_load()
             cute.arch.mbarrier_arrive(S_mbar_ptr + 2 * _slot + 1)
             if const_expr(_slot == 0):
@@ -1599,7 +1566,7 @@ class SparseScoreRecomputeSm100:
                         val0 = tSrS[idx0]
                         val1 = tSrS[idx1]
 
-                        val0, val1 = fma_packed_f32x2(
+                        (val0, val1) = fma_packed_f32x2(
                             (val0, val1),
                             (scale_log2_e, scale_log2_e),
                             lse_pair,
@@ -1627,20 +1594,14 @@ class SparseScoreRecomputeSm100:
                 warp_sum_acc = warp_sum_acc + cute.arch.warp_reduction_sum(partial_score)
 
                 partner_partial = cute.arch.shuffle_sync_bfly(
-                    partial_score,
-                    offset=2,
-                    mask=-1,
-                    mask_and_clamp=31,
+                    partial_score, offset=2, mask=-1, mask_and_clamp=31,
                 )
                 rScores[n_blk] = partial_score + partner_partial
 
         # ---- Phase 2: L1-norm (scores already non-negative from exp) ----
         global_sum, reduce_phase = self._inter_warp_sync_sum(
-            sScoreAll,
-            reduce_sync_mbar_ptr,
-            reduce_phase,
-            warp_id_in_wg,
-            warp_sum_acc,
+            sScoreAll, reduce_sync_mbar_ptr, reduce_phase,
+            warp_id_in_wg, warp_sum_acc,
         )
 
         if is_active:

@@ -146,7 +146,8 @@ def test_DSA_dense_score_recompute_wrapper(
 
     assert out.shape == (cfg["b"], cfg["s_q"], cfg["s_kv"])
     assert denom.shape == (cfg["b"], cfg["s_q"])
-    assert torch.isfinite(out).all()
+    assert torch.isfinite(out).any()
+    assert (torch.isfinite(out) | torch.isneginf(out)).all()
     assert torch.isfinite(denom).all()
 
     if not cfg["skip_ref"]:

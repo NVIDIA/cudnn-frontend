@@ -26,6 +26,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_major as _get_device_capability,
     maybe_contiguous,
     resolve_stream as _resolve_stream,
+    torch_stream_context as _torch_stream_context,
     validate_q_causal_offsets,
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
@@ -67,8 +68,12 @@ def _sparse_indexer_score_recompute(
     Returns:
         predict: (bs, seqlen_q, topk) [FP32] — softmax of sparse index scores
     """
-    q_indexer, k_indexer, weights = [maybe_contiguous(t) for t in (q_indexer, k_indexer, weights)]
-    topk_indices = topk_indices.to(torch.int32).contiguous()
+    current_stream = _resolve_stream(current_stream)
+    q_indexer, k_indexer, weights = [
+        maybe_contiguous(t, current_stream) for t in (q_indexer, k_indexer, weights)
+    ]
+    with _torch_stream_context(current_stream):
+        topk_indices = topk_indices.to(torch.int32).contiguous()
 
     if qhead_per_kv_head is None:
         qhead_per_kv_head = q_indexer.shape[2]
@@ -84,12 +89,15 @@ def _sparse_indexer_score_recompute(
     have_topk_length = topk_length is not None
 
     if topk_length is None:
-        topk_length = torch.empty((1, 1), dtype=torch.int32, device=device)
+        with _torch_stream_context(current_stream):
+            topk_length = torch.empty((1, 1), dtype=torch.int32, device=device)
     else:
-        topk_length = topk_length.to(torch.int32).contiguous()
+        with _torch_stream_context(current_stream):
+            topk_length = topk_length.to(torch.int32).contiguous()
 
     if out is None:
-        out = torch.empty((bs, seqlen_q, topk), dtype=torch.float32, device=device)
+        with _torch_stream_context(current_stream):
+            out = torch.empty((bs, seqlen_q, topk), dtype=torch.float32, device=device)
 
     # Compute kv_stage and topk_in_smem from SMEM budget (SM100: 228 KB)
     SM100_SMEM_BYTES = 228 * 1024
@@ -157,7 +165,6 @@ def _sparse_indexer_score_recompute(
                 topk_indices_global=topk_indices_global,
             )
 
-            current_stream = _resolve_stream(current_stream)
             scale_arg = cutlass.Float32(sm_scale)
 
             _sparse_indexer_score_recompute.compile_cache[compile_key] = cute.compile(
@@ -173,7 +180,6 @@ def _sparse_indexer_score_recompute(
                 options=compile_options(),
             )
 
-        current_stream = _resolve_stream(current_stream)
         scale_arg = cutlass.Float32(sm_scale)
         with torch.cuda.nvtx.range("sparse_indexer_score_recompute"):
             _sparse_indexer_score_recompute.compile_cache[compile_key](
@@ -284,8 +290,10 @@ def _sparse_attn_score_recompute(
         target: (bs, seqlen_q, topk) [FP32] — L1-normalized attention scores
     """
 
-    q_attn, k_attn = [maybe_contiguous(t) for t in (q_attn, k_attn)]
-    topk_indices = topk_indices.to(torch.int32).contiguous()
+    current_stream = _resolve_stream(current_stream)
+    q_attn, k_attn = [maybe_contiguous(t, current_stream) for t in (q_attn, k_attn)]
+    with _torch_stream_context(current_stream):
+        topk_indices = topk_indices.to(torch.int32).contiguous()
 
     if qhead_per_kv_head is None:
         qhead_per_kv_head = q_attn.shape[2]
@@ -301,16 +309,17 @@ def _sparse_attn_score_recompute(
     have_topk_length = topk_length is not None
 
     if topk_length is None:
-        topk_length = torch.empty((1, 1), dtype=torch.int32, device=device)
+        with _torch_stream_context(current_stream):
+            topk_length = torch.empty((1, 1), dtype=torch.int32, device=device)
     else:
-        topk_length = topk_length.to(torch.int32).contiguous()
+        with _torch_stream_context(current_stream):
+            topk_length = topk_length.to(torch.int32).contiguous()
 
-    # Pre-scale LSE: scaled_lse = -log2(e) * lse
-    log2_e = math.log2(math.e)
-    scaled_lse = (-log2_e * lse.float()).contiguous()
+    lse = maybe_contiguous(lse, current_stream)
 
     if out is None:
-        out = torch.empty((bs, seqlen_q, topk), dtype=torch.float32, device=device)
+        with _torch_stream_context(current_stream):
+            out = torch.empty((bs, seqlen_q, topk), dtype=torch.float32, device=device)
 
     # Compute kv_stage and topk_in_smem from SMEM budget (SM100: 228 KB)
     SM100_SMEM_BYTES = 228 * 1024
@@ -358,7 +367,7 @@ def _sparse_attn_score_recompute(
         if compile_key not in _sparse_attn_score_recompute.compile_cache:
             q_cute = to_cute_tensor(q_attn)
             k_cute = to_cute_tensor(k_attn)
-            lse_cute = to_cute_tensor(scaled_lse)
+            lse_cute = to_cute_tensor(lse)
             topk_cute = to_cute_tensor(topk_indices)
             out_cute = to_cute_tensor(out)
             topk_length_cute = to_cute_tensor(topk_length)
@@ -377,8 +386,6 @@ def _sparse_attn_score_recompute(
                 topk_indices_global=topk_indices_global,
             )
 
-            current_stream = _resolve_stream(current_stream)
-
             _sparse_attn_score_recompute.compile_cache[compile_key] = cute.compile(
                 kernel_obj,
                 q_cute,
@@ -392,12 +399,11 @@ def _sparse_attn_score_recompute(
                 options=compile_options(),
             )
 
-        current_stream = _resolve_stream(current_stream)
         with torch.cuda.nvtx.range("sparse_attn_score_recompute"):
             _sparse_attn_score_recompute.compile_cache[compile_key](
                 q_attn,
                 k_attn,
-                scaled_lse,
+                lse,
                 topk_indices,
                 out,
                 topk_length,
@@ -714,7 +720,8 @@ def _dense_indexer_score_recompute(
     Returns:
         (out, denom_out)
     """
-    q, k, weights = [maybe_contiguous(t) for t in (q, k, weights)]
+    current_stream = _resolve_stream(current_stream)
+    q, k, weights = [maybe_contiguous(t, current_stream) for t in (q, k, weights)]
 
     is_varlen_q = cu_seqlens_q is not None
     is_varlen_k = cu_seqlens_k is not None
@@ -740,7 +747,9 @@ def _dense_indexer_score_recompute(
     else:
         bs, seqlen_q, n_heads_q, head_dim = q.shape
         _, seqlen_k, _, _ = k.shape
-    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device)
+    q_causal_offsets = validate_q_causal_offsets(
+        q_causal_offsets, int(bs), q.device, stream=current_stream
+    )
 
     if qhead_per_kv_head is None:
         qhead_per_kv_head = n_heads_q
@@ -751,10 +760,12 @@ def _dense_indexer_score_recompute(
 
     if out is None:
         out_shape = (q.shape[0], seqlen_k) if is_varlen else (bs, seqlen_q, seqlen_k)
-        out = torch.empty(out_shape, dtype=torch.float32, device=device)
+        with _torch_stream_context(current_stream):
+            out = torch.empty(out_shape, dtype=torch.float32, device=device)
     if denom_out is None:
         denom_shape = (q.shape[0],) if is_varlen else (bs, seqlen_q)
-        denom_out = torch.empty(denom_shape, dtype=torch.float32, device=device)
+        with _torch_stream_context(current_stream):
+            denom_out = torch.empty(denom_shape, dtype=torch.float32, device=device)
 
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     if k_block_size is None:
@@ -801,7 +812,6 @@ def _dense_indexer_score_recompute(
             is_varlen=is_varlen,
         )
 
-        current_stream = _resolve_stream(current_stream)
         scale_arg = cutlass.Float32(sm_scale)
         max_q_arg = cutlass.Int32(seqlen_q)
         max_k_arg = cutlass.Int32(seqlen_k)
@@ -823,13 +833,13 @@ def _dense_indexer_score_recompute(
             options=compile_options(),
         )
 
-    current_stream = _resolve_stream(current_stream)
     scale_arg = cutlass.Float32(sm_scale)
     max_q_arg = cutlass.Int32(seqlen_q)
     max_k_arg = cutlass.Int32(seqlen_k)
-    # The kernel only visits K blocks that can contain valid ratio-causal
-    # columns; skipped masked/padding columns must still appear as zero.
-    out.zero_()
+    # Dense indexer score is a raw-logit buffer, so masked/skipped positions
+    # must remain outside the softmax/logsumexp domain.
+    with _torch_stream_context(current_stream):
+        out.fill_(float("-inf"))
     with torch.cuda.nvtx.range("dense_indexer_score_recompute"):
         _dense_indexer_score_recompute.compile_cache[compile_key](
             q,
@@ -890,7 +900,8 @@ def _dense_attn_score_recompute(
     Returns:
         (out, denom_out)
     """
-    q, k = [maybe_contiguous(t) for t in (q, k)]
+    current_stream = _resolve_stream(current_stream)
+    q, k = [maybe_contiguous(t, current_stream) for t in (q, k)]
 
     is_varlen_q = cu_seqlens_q is not None
     is_varlen_k = cu_seqlens_k is not None
@@ -916,7 +927,9 @@ def _dense_attn_score_recompute(
     else:
         bs, seqlen_q, n_heads_q, head_dim = q.shape
         _, seqlen_k, _, _ = k.shape
-    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device)
+    q_causal_offsets = validate_q_causal_offsets(
+        q_causal_offsets, int(bs), q.device, stream=current_stream
+    )
 
     if qhead_per_kv_head is None:
         qhead_per_kv_head = n_heads_q
@@ -925,16 +938,16 @@ def _dense_attn_score_recompute(
 
     device = q.device
 
-    # Pre-scale LSE: scaled_lse = -log2(e) * lse
-    log2_e = math.log2(math.e)
-    scaled_lse = (-log2_e * lse.float()).contiguous()
+    lse = maybe_contiguous(lse, current_stream)
 
     if out is None:
         out_shape = (q.shape[0], seqlen_k) if is_varlen else (bs, seqlen_q, seqlen_k)
-        out = torch.empty(out_shape, dtype=torch.float32, device=device)
+        with _torch_stream_context(current_stream):
+            out = torch.empty(out_shape, dtype=torch.float32, device=device)
     if denom_out is None:
         denom_shape = (q.shape[0],) if is_varlen else (bs, seqlen_q)
-        denom_out = torch.empty(denom_shape, dtype=torch.float32, device=device)
+        with _torch_stream_context(current_stream):
+            denom_out = torch.empty(denom_shape, dtype=torch.float32, device=device)
 
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     if k_block_size is None:
@@ -962,7 +975,7 @@ def _dense_attn_score_recompute(
     if compile_key not in _dense_attn_score_recompute.compile_cache:
         q_cute = to_cute_tensor(q)
         k_cute = to_cute_tensor(k)
-        lse_cute = to_cute_tensor(scaled_lse)
+        lse_cute = to_cute_tensor(lse)
         out_cute = to_cute_tensor(out)
         denom_cute = to_cute_tensor(denom_out)
         cu_q_cute = to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
@@ -981,7 +994,6 @@ def _dense_attn_score_recompute(
             is_varlen=is_varlen,
         )
 
-        current_stream = _resolve_stream(current_stream)
         max_q_arg = cutlass.Int32(seqlen_q)
         max_k_arg = cutlass.Int32(seqlen_k)
 
@@ -1002,16 +1014,17 @@ def _dense_attn_score_recompute(
             options=compile_options(),
         )
 
-    current_stream = _resolve_stream(current_stream)
     max_q_arg = cutlass.Int32(seqlen_q)
     max_k_arg = cutlass.Int32(seqlen_k)
-    # See dense indexer path above: skipped masked/padding columns are zero.
-    out.zero_()
+    # Dense score kernels skip K blocks that are wholly outside the
+    # ratio-causal region, so skipped masked/padding columns must be prefilled.
+    with _torch_stream_context(current_stream):
+        out.fill_(float("-inf"))
     with torch.cuda.nvtx.range("dense_attn_score_recompute"):
         _dense_attn_score_recompute.compile_cache[compile_key](
             q,
             k,
-            scaled_lse,
+            lse,
             out,
             denom_out,
             cutlass.Float32(softmax_scale),

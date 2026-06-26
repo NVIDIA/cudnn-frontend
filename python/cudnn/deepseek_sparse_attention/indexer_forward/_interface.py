@@ -20,6 +20,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_major as _get_device_capability,
     maybe_contiguous as _maybe_contiguous,
     resolve_stream,
+    torch_stream_context as _torch_stream_context,
     validate_q_causal_offsets,
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor as _to_cute_tensor
@@ -74,7 +75,8 @@ def indexer_fwd(
         S_sum: BSHD ``(bs, seqlen_q, seqlen_k)`` or THD
                ``(total_q, max_seqlen_k)`` [FP32]
     """
-    q, k, w = [_maybe_contiguous(t) for t in (q, k, w)]
+    current_stream = resolve_stream(current_stream)
+    q, k, w = [_maybe_contiguous(t, current_stream) for t in (q, k, w)]
     for tensor, name in ((q, "q"), (k, "k"), (w, "w")):
         assert tensor.dtype == torch.bfloat16, f"{name} must be bfloat16, got {tensor.dtype}"
         assert tensor.is_cuda, f"{name} must be on CUDA device"
@@ -120,7 +122,9 @@ def indexer_fwd(
         device = q.device
         out_shape = (bs, seqlen_q_dim, seqlen_k_dim)
         out_buf_shape = None
-    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device)
+    q_causal_offsets = validate_q_causal_offsets(
+        q_causal_offsets, int(bs), q.device, stream=current_stream
+    )
 
     # TMA S2G requires globalStride aligned to 16 bytes.
     # For FP32, seqlen_k must be a multiple of 4 elements (4 × 4B = 16B).
@@ -131,10 +135,12 @@ def indexer_fwd(
 
     if need_pad:
         out_buf_shape = (total_q, seqlen_k_padded) if is_varlen else (bs, seqlen_q_dim, seqlen_k_padded)
-        out_buf = torch.empty(out_buf_shape, dtype=torch.float32, device=device)
+        with _torch_stream_context(current_stream):
+            out_buf = torch.empty(out_buf_shape, dtype=torch.float32, device=device)
         out = out_buf[:, :seqlen_k_dim] if is_varlen else out_buf[:, :, :seqlen_k_dim]
     elif out is None:
-        out = torch.empty(out_shape, dtype=torch.float32, device=device)
+        with _torch_stream_context(current_stream):
+            out = torch.empty(out_shape, dtype=torch.float32, device=device)
     else:
         assert out.shape == out_shape, f"out must have shape {out_shape}, got {tuple(out.shape)}"
         assert out.dtype == torch.float32 and out.is_cuda
@@ -179,7 +185,6 @@ def indexer_fwd(
             kv_stage=kv_stage,
         )
 
-        current_stream = resolve_stream(current_stream)
         scale_arg = cutlass.Float32(sm_scale)
         max_q_arg = cutlass.Int32(seqlen_q_dim)
         max_k_arg = cutlass.Int32(seqlen_k_dim)
@@ -202,8 +207,8 @@ def indexer_fwd(
         )
 
     # Init to -inf: skipped causal n-blocks and masked positions stay -inf
-    out.fill_(float("-inf"))
-    current_stream = resolve_stream(current_stream)
+    with _torch_stream_context(current_stream):
+        out.fill_(float("-inf"))
     scale_arg = cutlass.Float32(sm_scale)
     max_q_arg = cutlass.Int32(seqlen_q_dim)
     max_k_arg = cutlass.Int32(seqlen_k_dim)
@@ -224,6 +229,7 @@ def indexer_fwd(
         )
 
     if out_orig is not None and out.data_ptr() != out_orig.data_ptr():
-        out_orig.copy_(out)
+        with _torch_stream_context(current_stream):
+            out_orig.copy_(out)
         return out_orig
     return out

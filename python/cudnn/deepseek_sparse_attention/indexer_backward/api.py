@@ -453,12 +453,13 @@ def indexer_backward_wrapper(
             typically ``1.0`` when the KL loss is summed into the total
             training loss with unit weight. Accepts a 0-D tensor or float.
     """
-    if d_index_q is None:
-        d_index_q = torch.empty_like(index_q)
-    if d_weights is None:
-        d_weights = torch.empty_like(weights)
-    if d_index_k is None:
-        d_index_k = torch.empty_like(index_k)
+    with _torch_stream_context(stream):
+        if d_index_q is None:
+            d_index_q = torch.empty_like(index_q)
+        if d_weights is None:
+            d_weights = torch.empty_like(weights)
+        if d_index_k is None:
+            d_index_k = torch.empty_like(index_k)
 
     b, s_q, h, d = index_q.shape
     s_k = index_k.shape[1]
@@ -590,7 +591,9 @@ def dense_indexer_backward_wrapper(
             max_seqlen_q,
             max_seqlen_k,
         )
-        q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch), index_q_exec.device)
+        q_causal_offsets = validate_q_causal_offsets(
+            q_causal_offsets, int(batch), index_q_exec.device, stream=backend_stream
+        )
 
         if d_index_q is None:
             d_index_q = torch.empty_like(index_q_exec)

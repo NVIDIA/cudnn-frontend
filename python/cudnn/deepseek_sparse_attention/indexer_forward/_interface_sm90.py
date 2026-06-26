@@ -14,6 +14,7 @@ from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     maybe_contiguous as _maybe_contiguous,
     resolve_stream,
+    torch_stream_context as _torch_stream_context,
     validate_q_causal_offsets,
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
@@ -63,9 +64,10 @@ def indexer_fwd(
         raise ValueError("THD input requires both cu_seqlens_q and cu_seqlens_k")
     is_varlen = is_varlen_q
 
-    q = _maybe_contiguous(q)
-    k = _maybe_contiguous(k)
-    w = _maybe_contiguous(w)
+    current_stream = resolve_stream(current_stream)
+    q = _maybe_contiguous(q, current_stream)
+    k = _maybe_contiguous(k, current_stream)
+    w = _maybe_contiguous(w, current_stream)
 
     if is_varlen:
         assert cu_seqlens_q is not None and cu_seqlens_k is not None
@@ -108,10 +110,13 @@ def indexer_fwd(
         qhead_per_kv_head = n_heads_q // n_heads_kv
     assert qhead_per_kv_head == n_heads_q // n_heads_kv
     assert qhead_per_kv_head in _SUPPORTED_QHPKV, f"qhead_per_kv_head must be one of {_SUPPORTED_QHPKV}, got {qhead_per_kv_head}"
-    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch_size), q.device)
+    q_causal_offsets = validate_q_causal_offsets(
+        q_causal_offsets, int(batch_size), q.device, stream=current_stream
+    )
 
     if out is None:
-        out = torch.empty(out_shape, dtype=torch.float32, device=q.device)
+        with _torch_stream_context(current_stream):
+            out = torch.empty(out_shape, dtype=torch.float32, device=q.device)
     else:
         assert out.shape == out_shape, f"out must have shape {out_shape}, got {tuple(out.shape)}"
         assert out.dtype == torch.float32 and out.is_cuda
@@ -125,7 +130,6 @@ def indexer_fwd(
         bool(is_varlen),
         q_causal_offsets is not None,
     )
-    current_stream = resolve_stream(current_stream)
     if compile_key not in _compile_cache:
         q_cute = _to_cute_tensor(q)
         k_cute = _to_cute_tensor(k)
@@ -158,7 +162,8 @@ def indexer_fwd(
             options=compile_options(),
         )
 
-    out.fill_(float("-inf"))
+    with _torch_stream_context(current_stream):
+        out.fill_(float("-inf"))
     with torch.cuda.nvtx.range("indexer_fwd_kernel_sm90_direct_dsl"):
         _compile_cache[compile_key](
             q,
