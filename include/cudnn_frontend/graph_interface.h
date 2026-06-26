@@ -1626,12 +1626,29 @@ class Graph : public ICudnn, public INode {
 #endif
     }
 
+    // Parse the blob then delegate. Callers that already parsed it should call the
+    // json overload to skip this second parse.
     error_t
-    deserialize(cudnnHandle_t handle, std::vector<uint8_t> const &data, bool const enforce_precompiled = false) {
-        CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE  ");
+    deserialize(cudnnHandle_t handle, std::vector<uint8_t> const &data, bool const enforce_precompiled = false,
+                bool run_warmup = true) {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+        return deserialize(handle, json::from_ubjson(data), enforce_precompiled, run_warmup);
+#else
+        CUDNN_FRONTEND_UNUSED(handle);
+        CUDNN_FRONTEND_UNUSED(data);
+        CUDNN_FRONTEND_UNUSED(enforce_precompiled);
+        CUDNN_FRONTEND_UNUSED(run_warmup);
+        return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
+#endif
+    }
 
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
-        json j = json::from_ubjson(data);
+    // Plan deserialize from an already-parsed json (avoids a second from_ubjson).
+    // run_warmup=false skips the throwaway warmup capture and the tensor-properties
+    // build that only feeds it (and tensors_to_dump).
+    error_t
+    deserialize(cudnnHandle_t handle, json const &j, bool const enforce_precompiled = false, bool run_warmup = true) {
+        CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE  ");
 
         // Clear deserialize-owned containers so a re-deserialize on the same Graph
         // does not feed prepare_variant_pack_template() with stale entries from a
@@ -1645,7 +1662,8 @@ class Graph : public ICudnn, public INode {
             graph_uid = j["graph_uid"].get<uint64_t>();
         }
 
-        if (j.contains("tensors")) {
+        // deserialized_tensor_properties feeds warmup() and tensors_to_dump; skip when warmup is off.
+        if (run_warmup && j.contains("tensors")) {
             auto tensor_map = j["tensors"].get<std::unordered_map<std::string, json>>();
             for (const auto &tensor_info : tensor_map) {
                 auto tensor_attributes = std::make_shared<Tensor_attributes>();
@@ -1717,18 +1735,15 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        CHECK_CUDNN_FRONTEND_ERROR(warmup(handle));
+        if (run_warmup) {
+            CHECK_CUDNN_FRONTEND_ERROR(warmup(handle));
+        }
 
         CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE (ALL OK) ");
 
         return {error_code_t::OK, ""};
-#else
-        CUDNN_FRONTEND_UNUSED(handle);
-        CUDNN_FRONTEND_UNUSED(data);
-        CUDNN_FRONTEND_UNUSED(enforce_precompiled);
-        return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
-#endif
     }
+#endif
 
     Type
     getType() override {
