@@ -14,6 +14,8 @@
 
 """SM90+ CuTe DSL indexer top-K decode kernel."""
 
+import math
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -687,18 +689,63 @@ def cute_dsl_topk_wrapper(
         buffer_numbers = 2
     else:
         buffer_numbers = 1
-    # Note: zeros will trigger an elementwise_add kernel.
-    buffer_torch = torch.empty(num_rows, buffer_numbers, num_cols, dtype=torch.int32, device="cuda")
-    g_global_counter_torch = None
 
-    # TVM FFI uses env stream automatically
-    compiled_kernel(
-        input_values,
-        None,  # indices, used for merge blocks kernel of the multi-cta.
-        buffer_torch,
-        g_global_counter_torch,
-        seq_lens,
-        output_indices_torch,
-        output_values_torch,
-    )
+    # Decode-varlen IMA workaround.
+    elems_per_row = buffer_numbers * num_cols
+    int32_max = (1 << 31) - 1
+    total_elems = num_rows * elems_per_row
+
+    if total_elems <= int32_max:
+        # int32 fast path: single launch, unchanged from before chunking.
+        buffer_torch = torch.empty(
+            num_rows,
+            buffer_numbers,
+            num_cols,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        # TVM FFI uses env stream automatically
+        compiled_kernel(
+            input_values,
+            None,  # indices, used for merge blocks kernel of the multi-cta.
+            buffer_torch,
+            None,  # g_global_counter_torch
+            seq_lens,
+            output_indices_torch,
+            output_values_torch,
+        )
+        return output_indices_torch, output_values_torch
+
+    # Fallback
+    if elems_per_row > 0:
+        max_chunk_rows = int32_max // elems_per_row + 1
+    else:
+        max_chunk_rows = num_rows
+    input_elem_bytes = max(1, dtype.width // 8)
+    align_rows = max(1, 32 // input_elem_bytes)
+    row_step = (next_n * align_rows) // math.gcd(next_n, align_rows)
+    if max_chunk_rows < row_step:
+        chunk_rows = num_rows
+    else:
+        chunk_rows = (max_chunk_rows // row_step) * row_step
+    for row_lo in range(0, num_rows, chunk_rows):
+        row_hi = min(row_lo + chunk_rows, num_rows)
+        batch_lo = row_lo // next_n
+        batch_hi = row_hi // next_n
+        chunk_extra = torch.empty(
+            row_hi - row_lo,
+            buffer_numbers,
+            num_cols,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        compiled_kernel(
+            input_values[row_lo:row_hi],
+            None,
+            chunk_extra,
+            None,
+            seq_lens[batch_lo:batch_hi],
+            output_indices_torch[row_lo:row_hi],
+            output_values_torch[row_lo:row_hi] if return_val else None,
+        )
     return output_indices_torch, output_values_torch

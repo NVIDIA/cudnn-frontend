@@ -407,12 +407,12 @@ class IndexerTopKKernelVarlen:
         # Note, for multi-cta version, each ctas must have its own extra_buffer.
         if cutlass.const_expr(self.enable_gmem_store):
             if cutlass.const_expr(self.enable_multi_cta):
-                grid_dim_x, grid_dim_y, _ = cute.arch.grid_dim()
+                _, grid_dim_y, _ = cute.arch.grid_dim()
                 bidx_val, bidy_val, _ = cute.arch.block_idx()
-                buffer_row_id = bidx_val * grid_dim_y + bidy_val
-                buffer = extra_buffer[buffer_row_id, None, None]
+                buffer_row_id = cutlass.Int64(bidx_val) * cutlass.Int64(grid_dim_y) + cutlass.Int64(bidy_val)
             else:
-                buffer = extra_buffer[bidx, None, None]
+                buffer_row_id = cutlass.Int64(bidx)
+            buffer = self._slice_row_64bit(extra_buffer, buffer_row_id)
 
         # for initial scalar load part.
         row_ptr = score.iterator + row_start
@@ -442,7 +442,7 @@ class IndexerTopKKernelVarlen:
         idX = cute.make_identity_tensor((shape[0], aligned_size))
         input_ptr = input.iterator + vec_start
         input_addr_u64 = input_ptr.toint()
-        input_ptr_aligned = cute.make_ptr(self.dtype, input_addr_u64, assumed_align=align_bytes)
+        input_ptr_aligned = cute.make_ptr(self.dtype, input_addr_u64, input.memspace, assumed_align=align_bytes)
 
         input_tensor = cute.make_tensor(
             input_ptr_aligned,
@@ -452,7 +452,7 @@ class IndexerTopKKernelVarlen:
         # slice for CTAs
         gX, cX = [cute.local_tile(mT, tiler_mn, (bidx, None)) for mT in (input_tensor, idX)]
         # Note, we use gX_aligned here to avoid the alignment issue when the input is not aligned.
-        gX_aligned_ptr = cute.make_ptr(self.dtype, gX.iterator.toint(), assumed_align=align_bytes)
+        gX_aligned_ptr = cute.make_ptr(self.dtype, gX.iterator.toint(), gX.memspace, assumed_align=align_bytes)
         gX_aligned = cute.make_tensor(gX_aligned_ptr, cute.make_layout(gX.shape, stride=gX.stride))
 
         self.num_sub_tiles = gX.shape[2]
@@ -989,6 +989,24 @@ class IndexerTopKKernelVarlen:
                     cute.autovec_copy(topk_indices[None, i], mIndices_store[None, col])
                     if cutlass.const_expr(self.return_val):
                         cute.autovec_copy(topk_vals[None, i], mValues_store[None, col])
+
+    def _slice_row_64bit(self, buffer, row_id):
+        row_offset_elems = row_id * cute.size(buffer.stride[0])
+        elem_bytes = buffer.element_type.width // 8
+        row_offset_bytes = row_offset_elems * elem_bytes
+        row_ptr = cute.make_ptr(
+            buffer.element_type,
+            buffer.iterator.toint() + row_offset_bytes,
+            buffer.memspace,
+            assumed_align=elem_bytes,
+        )
+        return cute.make_tensor(
+            row_ptr,
+            cute.make_layout(
+                (buffer.shape[1], buffer.shape[2]),
+                stride=(buffer.stride[1], buffer.stride[2]),
+            ),
+        )
 
     def _get_tiled_copy(self):
         threads_per_row = self.num_threads_per_cta
