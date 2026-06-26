@@ -113,7 +113,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
     :param expert_cnt: Number of experts (compile-time constant).
     :param weight_mode: Dense or Discrete weight layout.
     :param use_dynamic_sched: Use dynamic tile scheduling.
-    :param act_func: Activation function ('swiglu' or 'geglu').
+    :param act_func: Activation function ('swiglu', 'geglu', or 'srelu').
     :param enable_bias: Enable bias addition.
     """
 
@@ -262,7 +262,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         self.num_epilog_warps = len(self.epilog_act_warp_id)  # = 4
 
         self.act_func = act_func
-        if act_func not in ["swiglu", "geglu"]:
+        if act_func not in ["swiglu", "geglu", "srelu"]:
             raise ValueError(f"Invalid activation function: {act_func}")
 
     def _setup_attributes(self):
@@ -324,9 +324,10 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
             self.mma_tiler_sfb[2],
         )
 
+        d_tile_n = self.mma_inst_shape_mn[1] if self.act_func == "srelu" else self.mma_inst_shape_mn[1] // 2
         self.mma_tiler_d = (
             self.mma_inst_shape_mn[0],
-            self.mma_inst_shape_mn[1] // 2,
+            d_tile_n,
             mma_inst_shape_k * mma_inst_tile_k,
         )
         self.cta_tile_shape_mnk_d = (
@@ -354,7 +355,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
             self.cta_tile_shape_mnk_d[0] // self.epi_tile[0],
             self.cta_tile_shape_mnk_d[1] // self.epi_tile[1],
         )
-        self.epi_tile_c = (128, 64)
+        self.epi_tile_c = self.epi_tile if self.act_func == "srelu" else (128, 64)
 
         (
             self.num_acc_stage,
@@ -440,8 +441,10 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
             self.cta_tile_shape_mnk[1] * self.num_acc_stage if not self.overlapping_accum else self.cta_tile_shape_mnk[1] * 2 - self.num_reserved_tmem_cols
         )
 
-        self.epi_tile_n_required = 2 * cute.size(self.epi_tile[1])
-        self.iter_acc_early_release_in_epilogue = ((self.num_reserved_tmem_cols + self.epi_tile_n_required - 1) // self.epi_tile_n_required - 1) * 2
+        self.epi_tile_n_required = cute.size(self.epi_tile[1]) if self.act_func == "srelu" else 2 * cute.size(self.epi_tile[1])
+        self.iter_acc_early_release_in_epilogue = (self.num_reserved_tmem_cols + self.epi_tile_n_required - 1) // self.epi_tile_n_required - 1
+        if self.act_func != "srelu":
+            self.iter_acc_early_release_in_epilogue = self.iter_acc_early_release_in_epilogue * 2
 
     def get_desc_workspace_bytes(self) -> int:
         """Return descriptor workspace size in bytes."""
@@ -999,6 +1002,34 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
             self.epilog_sync_barrier_group0.arrive_and_wait()
 
     @cute.jit
+    def store_c_unary(
+        self,
+        tiled_copy_r2s,
+        tma_atom_c,
+        warp_idx,
+        tTR_rAcc,
+        tRS_rC,
+        tRS_sC,
+        bSG_gC,
+        bSG_sC,
+        c_pipeline,
+        prev_subtile_idx,
+        real_subtile_idx,
+    ):
+        c_buffer = prev_subtile_idx % self.num_c_stage
+        tRS_rC.store(tTR_rAcc.load().to(self.c_dtype))
+        cute.copy(tiled_copy_r2s, tRS_rC[(None, None, 0)], tRS_sC[(None, None, 0, c_buffer)])
+        cute.arch.fence_proxy("async.shared", space="cta")
+        self.epilog_sync_barrier_group0.arrive_and_wait()
+        if warp_idx == self.epilog_act_warp_id[0]:
+            cute.copy(tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, real_subtile_idx)])
+            c_pipeline.producer_commit()
+            if not cutlass.const_expr(self.delay_tma_store_acquire_sync):
+                c_pipeline.producer_acquire()
+        if not cutlass.const_expr(self.delay_tma_store_acquire_sync):
+            self.epilog_sync_barrier_group0.arrive_and_wait()
+
+    @cute.jit
     def geglu_act(self, tCompute, acc_vec_up, acc_vec_gate, mProb, linear_offset=1.0):
         if cutlass.const_expr(self.vectorized_f32):
             LOG2_E = cutlass.Float32(1.4426950408889634)
@@ -1089,6 +1120,27 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
             for i in cutlass.range_constexpr(cute.size(tCompute)):
                 tCompute[i] = acc_vec_up[i] * silu_f32(acc_vec_gate[i], fastmath=True)
                 tCompute[i] = tCompute[i] * mProb
+
+    @cute.jit
+    def srelu_act(self, tCompute, acc_vec, mProb):
+        acc_relu = cute.where(acc_vec > 0, acc_vec, cute.full_like(acc_vec, 0))
+        if cutlass.const_expr(self.vectorized_f32):
+            for i in cutlass.range_constexpr(0, cute.size(tCompute), 2):
+                tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                    (acc_relu[i], acc_relu[i + 1]),
+                    (acc_relu[i], acc_relu[i + 1]),
+                    rnd="rn",
+                    ftz=False,
+                )
+                tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                    (tCompute[i], tCompute[i + 1]),
+                    (mProb, mProb),
+                    rnd="rn",
+                    ftz=False,
+                )
+        else:
+            for i in cutlass.range_constexpr(cute.size(tCompute)):
+                tCompute[i] = acc_relu[i] * acc_relu[i] * mProb
 
     @cute.jit
     def query_hadamard_tmem_a_ptr(self, tile_idx, reverse_subtile, tmem_ptr):
@@ -1954,7 +2006,10 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                     bias_consumer_state.reset_count()
                     bias_pipeline.consumer_wait(bias_consumer_state)
                     sBias_stage = sBias[(None, bias_consumer_state.index)]
-                    sBias_subtiles = cute.flat_divide(sBias_stage, cute.make_layout(2 * self.epi_tile[1]))
+                    if cutlass.const_expr(self.act_func == "srelu"):
+                        sBias_subtiles = cute.flat_divide(sBias_stage, cute.make_layout(self.epi_tile[1]))
+                    else:
+                        sBias_subtiles = cute.flat_divide(sBias_stage, cute.make_layout(2 * self.epi_tile[1]))
 
                 #
                 # Get per-expert C tensor inside tile loop
@@ -2011,20 +2066,25 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                 # Store accumulator to global memory in subtiles
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                for subtile_idx in cutlass.range(0, subtile_cnt, 2, unroll=1):
-                    real_subtile_idx = subtile_idx // 2
+                subtile_step = 1 if cutlass.const_expr(self.act_func == "srelu") else 2
+                for subtile_idx in cutlass.range(0, subtile_cnt, subtile_step, unroll=1):
+                    real_subtile_idx = subtile_idx if cutlass.const_expr(self.act_func == "srelu") else subtile_idx // 2
                     if cutlass.const_expr(self.overlapping_accum):
                         if reverse_subtile:
-                            real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n_required - 1 - subtile_idx // 2
+                            real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n_required - 1 - real_subtile_idx
 
                     #
                     # Load accumulator from tensor memory buffer to register
                     #
-                    tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, real_subtile_idx * 2)]
-                    tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, real_subtile_idx * 2 + 1)]
+                    if cutlass.const_expr(self.act_func == "srelu"):
+                        tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, real_subtile_idx)]
+                    else:
+                        tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, real_subtile_idx * 2)]
+                        tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, real_subtile_idx * 2 + 1)]
 
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
+                    if cutlass.const_expr(self.act_func != "srelu"):
+                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
 
                     #
                     # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
@@ -2040,19 +2100,22 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                     # Apply alpha (+ bias when enabled)
                     #
                     if cutlass.const_expr(self.enable_bias):
-                        sBias_pair = sBias_subtiles[(None, real_subtile_idx)]
-                        sBias_sub = cute.flat_divide(sBias_pair, cute.make_layout(self.epi_tile[1]))
-                        cute.copy(bias_s2r_atom, sBias_sub[(None, 0)], tTR_rBias_gate)
+                        if cutlass.const_expr(self.act_func == "srelu"):
+                            sBias_sub = sBias_subtiles[(None, real_subtile_idx)]
+                            cute.copy(bias_s2r_atom, sBias_sub, tTR_rBias_gate)
+                        else:
+                            sBias_pair = sBias_subtiles[(None, real_subtile_idx)]
+                            sBias_sub = cute.flat_divide(sBias_pair, cute.make_layout(self.epi_tile[1]))
+                            cute.copy(bias_s2r_atom, sBias_sub[(None, 0)], tTR_rBias_gate)
                         bias_vec_gate = tTR_rBias_gate.load()
-                        cute.copy(bias_s2r_atom, sBias_sub[(None, 1)], tTR_rBias_up)
-                        bias_vec_up = tTR_rBias_up.load()
+                        if cutlass.const_expr(self.act_func != "srelu"):
+                            cute.copy(bias_s2r_atom, sBias_sub[(None, 1)], tTR_rBias_up)
+                            bias_vec_up = tTR_rBias_up.load()
 
                         if cutlass.const_expr(self.vectorized_f32):
                             for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc_gate), 2):
                                 bias_gate_f32_0 = bias_vec_gate[i].to(cutlass.Float32)
                                 bias_gate_f32_1 = bias_vec_gate[i + 1].to(cutlass.Float32)
-                                bias_up_f32_0 = bias_vec_up[i].to(cutlass.Float32)
-                                bias_up_f32_1 = bias_vec_up[i + 1].to(cutlass.Float32)
                                 tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1] = cute.arch.fma_packed_f32x2(
                                     (tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1]),
                                     (
@@ -2063,22 +2126,27 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                                     rnd="rn",
                                     ftz=False,
                                 )
-                                tTR_rAcc_up[i], tTR_rAcc_up[i + 1] = cute.arch.fma_packed_f32x2(
-                                    (tTR_rAcc_up[i], tTR_rAcc_up[i + 1]),
-                                    (
-                                        cutlass.Float32(alpha_val),
-                                        cutlass.Float32(alpha_val),
-                                    ),
-                                    (bias_up_f32_0, bias_up_f32_1),
-                                    rnd="rn",
-                                    ftz=False,
-                                )
+                                if cutlass.const_expr(self.act_func != "srelu"):
+                                    bias_up_f32_0 = bias_vec_up[i].to(cutlass.Float32)
+                                    bias_up_f32_1 = bias_vec_up[i + 1].to(cutlass.Float32)
+                                    tTR_rAcc_up[i], tTR_rAcc_up[i + 1] = cute.arch.fma_packed_f32x2(
+                                        (tTR_rAcc_up[i], tTR_rAcc_up[i + 1]),
+                                        (
+                                            cutlass.Float32(alpha_val),
+                                            cutlass.Float32(alpha_val),
+                                        ),
+                                        (bias_up_f32_0, bias_up_f32_1),
+                                        rnd="rn",
+                                        ftz=False,
+                                    )
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_gate)):
                                 tTR_rAcc_gate[i] = tTR_rAcc_gate[i] * cutlass.Float32(alpha_val) + bias_vec_gate[i].to(cutlass.Float32)
-                                tTR_rAcc_up[i] = tTR_rAcc_up[i] * cutlass.Float32(alpha_val) + bias_vec_up[i].to(cutlass.Float32)
+                                if cutlass.const_expr(self.act_func != "srelu"):
+                                    tTR_rAcc_up[i] = tTR_rAcc_up[i] * cutlass.Float32(alpha_val) + bias_vec_up[i].to(cutlass.Float32)
 
-                        if subtile_idx == subtile_cnt - 2:
+                        last_bias_subtile = subtile_cnt - 1 if cutlass.const_expr(self.act_func == "srelu") else subtile_cnt - 2
+                        if subtile_idx == last_bias_subtile:
                             bias_pipeline.consumer_release(bias_consumer_state)
                             bias_consumer_state.advance()
                     else:
@@ -2093,37 +2161,54 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                                     rnd="rn",
                                     ftz=False,
                                 )
-                                tTR_rAcc_up[i], tTR_rAcc_up[i + 1] = cute.arch.mul_packed_f32x2(
-                                    (tTR_rAcc_up[i], tTR_rAcc_up[i + 1]),
-                                    (
-                                        cutlass.Float32(alpha_val),
-                                        cutlass.Float32(alpha_val),
-                                    ),
-                                    rnd="rn",
-                                    ftz=False,
-                                )
+                                if cutlass.const_expr(self.act_func != "srelu"):
+                                    tTR_rAcc_up[i], tTR_rAcc_up[i + 1] = cute.arch.mul_packed_f32x2(
+                                        (tTR_rAcc_up[i], tTR_rAcc_up[i + 1]),
+                                        (
+                                            cutlass.Float32(alpha_val),
+                                            cutlass.Float32(alpha_val),
+                                        ),
+                                        rnd="rn",
+                                        ftz=False,
+                                    )
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_gate)):
                                 tTR_rAcc_gate[i] = tTR_rAcc_gate[i] * cutlass.Float32(alpha_val)
-                                tTR_rAcc_up[i] = tTR_rAcc_up[i] * cutlass.Float32(alpha_val)
+                                if cutlass.const_expr(self.act_func != "srelu"):
+                                    tTR_rAcc_up[i] = tTR_rAcc_up[i] * cutlass.Float32(alpha_val)
 
                     #
-                    # Store gate+up to C tensor (pre-activation for residual)
+                    # Store pre-activation output to C tensor for residual/backward.
                     #
-                    self.store_c(
-                        tiled_copy_r2s,
-                        tma_atom_c,
-                        warp_idx,
-                        tTR_rAcc_gate,
-                        tTR_rAcc_up,
-                        tRS_rC,
-                        tRS_sC,
-                        bSG_gC,
-                        bSG_sC,
-                        c_pipeline,
-                        num_prev_subtiles,
-                        real_subtile_idx,
-                    )
+                    if cutlass.const_expr(self.act_func == "srelu"):
+                        self.store_c_unary(
+                            tiled_copy_r2s,
+                            tma_atom_c,
+                            warp_idx,
+                            tTR_rAcc_gate,
+                            tRS_rC,
+                            tRS_sC,
+                            bSG_gC,
+                            bSG_sC,
+                            c_pipeline,
+                            num_prev_subtiles,
+                            real_subtile_idx,
+                        )
+                    else:
+                        self.store_c(
+                            tiled_copy_r2s,
+                            tma_atom_c,
+                            warp_idx,
+                            tTR_rAcc_gate,
+                            tTR_rAcc_up,
+                            tRS_rC,
+                            tRS_sC,
+                            bSG_gC,
+                            bSG_sC,
+                            c_pipeline,
+                            num_prev_subtiles,
+                            real_subtile_idx,
+                        )
                     num_prev_subtiles = num_prev_subtiles + 1
 
                     #
@@ -2138,22 +2223,25 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                             tTR_rAcc_up[i] = fmax(tTR_rAcc_up[i], geglu_min_val)
 
                     acc_vec_gate = tTR_rAcc_gate.load()
-                    acc_vec_up = tTR_rAcc_up.load()
 
                     #
-                    # Compute GLU activation (SwiGLU or GeGLU)
+                    # Compute activation.
                     #
                     tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
-                    if cutlass.const_expr(self.act_func == "geglu"):
+                    if cutlass.const_expr(self.act_func == "srelu"):
+                        self.srelu_act(tCompute, acc_vec_gate, mProb)
+                    elif cutlass.const_expr(self.act_func == "geglu"):
+                        acc_vec_up = tTR_rAcc_up.load()
                         self.geglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb, linear_offset)
                     elif cutlass.const_expr(self.act_func == "swiglu"):
+                        acc_vec_up = tTR_rAcc_up.load()
                         self.swiglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb)
 
                     if cutlass.const_expr(self.generate_amax):
                         thread_tile_amax = self.amax_reduction_per_thread(tCompute, thread_tile_amax)
 
                     #
-                    # Store post-GLU output to D.
+                    # Store post-activation output to D.
                     #
                     acc_vec = tiled_copy_r2s_d.retile(tCompute).load()
                     tRS_rD.store(acc_vec.to(self.d_dtype))
@@ -2174,7 +2262,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                         d_pipeline.producer_commit()
 
                     #
-                    # Signal the RHT epilogue warps that the post-GLU D tile is in SMEM.
+                    # Signal the RHT epilogue warps that the post-activation D tile is in SMEM.
                     #
                     pingpong_pipeline.producer_acquire(pingpong_act_producer_state)
                     pingpong_pipeline.producer_commit(pingpong_act_producer_state)
@@ -2345,9 +2433,10 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                     subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 else:
                     subtile_cnt = self.cta_tile_shape_mnk[1] // cute.size(self.epi_tile[1])
-                for subtile_idx in cutlass.range(0, subtile_cnt, 2, unroll=1):
+                subtile_step = 1 if cutlass.const_expr(self.act_func == "srelu") else 2
+                for subtile_idx in cutlass.range(0, subtile_cnt, subtile_step, unroll=1):
                     #
-                    # Wait for ACT warps to finish writing the post-GLU D tile to SMEM.
+                    # Wait for ACT warps to finish writing the post-activation D tile to SMEM.
                     #
                     pingpong_pipeline.consumer_wait(pingpong_rht_consumer_state)
 

@@ -592,6 +592,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
 
     # Execute
     workspace = torch.empty(graph_fwd.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    torch.cuda.synchronize()
     if request.config.getoption("--perf"):
         times_ms = time_execution(graph_fwd.execute, variant_pack, workspace, cudnn_handle)
         print(f"@@@@ MXFP8 Fwd graph_fwd.execute avg_time_ms={times_ms.mean().item():.3f}")
@@ -691,12 +692,12 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             variant_pack_bwd[int(GraphBwdUid.dSink_token)] = dSink_token_gpu
 
         # Execute backward graph
-        torch.cuda.synchronize()
         workspace_bwd = torch.empty(graph_bwd.get_workspace_size(), dtype=torch.uint8, device="cuda")
         if request.config.getoption("--perf"):
             times_ms = time_execution(graph_bwd.execute, variant_pack_bwd, workspace_bwd, cudnn_handle)
             print(f"@@@@ MXFP8 Bwd graph_bwd.execute avg_time_ms={times_ms.mean().item():.3f}")
             profile_execution(graph_bwd.execute, variant_pack_bwd, workspace_bwd, cudnn_handle)
+        torch.cuda.synchronize()
         graph_bwd.execute(variant_pack_bwd, workspace_bwd, handle=cudnn_handle)
         torch.cuda.synchronize()
 

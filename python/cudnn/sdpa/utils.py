@@ -165,7 +165,7 @@ def make_tiled_copy_B(  # noqa: N802
 
 def mma_make_fragment_A(  # noqa: N802
     smem: cute.Tensor,
-    thr_mma: cute.core.ThrMma,
+    thr_mma: cute.ThrMma,
     swapAB: cutlass.Constexpr[bool] = False,  # noqa: N803
 ) -> cute.Tensor:
     """Wrapper for cute.mma_make_fragment."""
@@ -176,7 +176,7 @@ def mma_make_fragment_A(  # noqa: N802
 
 def mma_make_fragment_B(  # noqa: N802
     smem: cute.Tensor,
-    thr_mma: cute.core.ThrMma,
+    thr_mma: cute.ThrMma,
     swapAB: cutlass.Constexpr[bool] = False,  # noqa: N803
 ) -> cute.Tensor:
     """Wrapper for cute.mma_make_fragment."""
@@ -207,7 +207,7 @@ def warp_reduce(
 ) -> cute.TensorSSA | cute.Numeric:
     """Reduction in warp."""
     if cutlass.const_expr(isinstance(val, cute.TensorSSA)):
-        res = cute.make_fragment(val.shape, val.dtype)
+        res = cute.make_rmem_tensor(val.shape, val.dtype)
         res.store(val)
         for i in cutlass.range_constexpr(cute.size(val.shape)):
             res[i] = warp_reduce(res[i], op, width)
@@ -350,7 +350,7 @@ def exp2f(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
     :rtype: cute.TensorSSA or Float32.
     """
     if cutlass.const_expr(isinstance(x, cute.TensorSSA)):
-        res = cute.make_fragment(x.shape, Float32)
+        res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
         for i in cutlass.range_constexpr(cute.size(x.shape)):
             res[i] = cute.math.exp2(res[i], fastmath=True)
@@ -399,7 +399,7 @@ def fmax(a: float | Float32, b: float | Float32, c: float | Float32 | None = Non
 def fmax_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80) -> Float32:
     """Fmax reduce wrapper."""
     if cutlass.const_expr(arch < ARCH_SM100 or cute.size(x.shape) % 8 != 0):
-        res = cute.make_fragment(x.shape, Float32)
+        res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
         local_max = [res[0], res[1], res[2], res[3]]
         for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
@@ -413,7 +413,7 @@ def fmax_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch
         return local_max[0] if cutlass.const_expr(init_val is None) else fmax(local_max[0], init_val)
     # [2025-06-15] x.reduce only seems to use 50% 3-input max and 50% 2-input max
     # We instead force the 3-input max.
-    res = cute.make_fragment(x.shape, Float32)
+    res = cute.make_rmem_tensor(x.shape, Float32)
     res.store(x)
     local_max = [
         fmax(init_val, res[0], res[1]) if cutlass.const_expr(init_val is not None) else fmax(res[0], res[1]),
@@ -437,7 +437,7 @@ def fadd_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch
         if cutlass.const_expr(init_val is None):
             init_val = Float32.zero
         return x.reduce(cute.ReductionOp.ADD, init_val, 0)
-    res = cute.make_fragment(x.shape, Float32)
+    res = cute.make_rmem_tensor(x.shape, Float32)
     res.store(x)
     local_sum_0 = cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1])) if cutlass.const_expr(init_val is not None) else (res[0], res[1])
     local_sum = [local_sum_0, (res[2], res[3]), (res[4], res[5]), (res[6], res[7])]
@@ -503,7 +503,7 @@ def predicate_k(
 ) -> cute.Tensor:
     """Wrapper for predicate."""
     # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
-    tApA = cute.make_fragment(  # noqa: N806
+    tApA = cute.make_rmem_tensor(  # noqa: N806
         cute.make_layout(
             (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
             stride=(cute.size(tAcA, mode=[2]), 0, 1),
@@ -547,7 +547,7 @@ def shuffle_sync(
     mask = cute.arch.WARP_SIZE - width
     clamp = cute.arch.WARP_SIZE - 1
     mask_and_clamp = mask << 8 | clamp
-    val = cute.make_fragment(1, type(value))
+    val = cute.make_rmem_tensor(1, type(value))
     val[0] = value
     val_i32 = cute.recast_tensor(val, cutlass.Int32)
     for i in cutlass.range_constexpr(cute.size(val_i32)):

@@ -1283,6 +1283,21 @@ class SparseScoreRecomputeSm100:
         """
         tidx_wg = tidx % self.WARPGROUP_SIZE
 
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8)),
+            Float32,
+        )
+        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStS_ref).get_slice(tidx_wg)
+
+        thr_mma = tiled_mma_qk.get_slice(tidx_wg)
+        cS = cute.make_identity_tensor(self.mma_tiler_qk[:2])
+        tScS = thr_tmem_load.partition_D(thr_mma.partition_C(cS))
+
+        tSrS_shape = thr_tmem_load.partition_D(
+            cute.make_identity_tensor(tStS_ref.shape)
+        ).shape
+        tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
+
         sLSE_off = Int32(0) if per_head_offset is None else per_head_offset
         sTopkIdx_off = Int32(0) if topk_idx_offset is None else topk_idx_offset
         qhpkv = self.qhead_per_kvhead
@@ -1300,7 +1315,7 @@ class SparseScoreRecomputeSm100:
         )
         rLSE_all = cute.make_rmem_tensor((self.m_block_size,), Float32)
 
-        kv_offset = Int32(0)
+        kv_offset = tScS[0][0]
         warp_id_in_wg = tidx_wg // self.WARP_SIZE
 
         log2_e = Float32(math.log2(math.e))
@@ -1320,47 +1335,23 @@ class SparseScoreRecomputeSm100:
             n_blk = self.num_n_blocks - 1 - _ri
             _slot = const_expr(n_blk % self.num_tmem_slots)
 
-            tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8)),
-                Float32,
-            )
-            thr_mma = tiled_mma_qk.get_slice(tidx_wg)
-            cS = cute.make_identity_tensor(self.mma_tiler_qk[:2])
-            tScS = tcgen05.make_tmem_copy(
-                tmem_load_atom, tStS_ref,
-            ).get_slice(tidx_wg).partition_D(thr_mma.partition_C(cS))
-            tSrS_shape = tcgen05.make_tmem_copy(
-                tmem_load_atom, tStS_ref,
-            ).get_slice(tidx_wg).partition_D(
-                cute.make_identity_tensor(tStS_ref.shape)
-            ).shape
-            tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
-            kv_offset = tScS[0][0]
-
             cute.arch.mbarrier_wait(S_mbar_ptr + 2 * _slot, s_full_phase)
             if const_expr(_ri == 0):
                 cute.autovec_copy(sLSE_1d, rLSE_all)
-            should_copy_tmem = const_expr(True)
-            if const_expr(self.have_topk_length):
-                should_copy_tmem = n_blk < n_block_max_epi
-            if should_copy_tmem:
-                tmem_ptr_cur = cute.make_ptr(
-                    Float32, _slot * self.tmem_s_stride,
-                    mem_space=cute.AddressSpace.tmem, assumed_align=16,
-                )
-                tStS_cur = cute.make_tensor(tmem_ptr_cur, tStS_ref.layout)
-                tStS_t2r_cur = tcgen05.make_tmem_copy(
-                    tmem_load_atom, tStS_ref,
-                ).get_slice(tidx_wg).partition_S(tStS_cur)
+            # Keep the TMEM load unconditional: putting tcgen05 TMEM load ops
+            # under the top-k-length runtime guard trips CUTLASS DSL compile.
+            # Invalid blocks are ignored by should_accumulate_score below.
+            tmem_ptr_cur = cute.make_ptr(
+                Float32,
+                _slot * self.tmem_s_stride,
+                mem_space=cute.AddressSpace.tmem,
+                assumed_align=16,
+            )
+            tStS_cur = cute.make_tensor(tmem_ptr_cur, tStS_ref.layout)
+            tStS_t2r_cur = thr_tmem_load.partition_S(tStS_cur)
 
-                cute.copy(
-                    tcgen05.make_tmem_copy(
-                        tmem_load_atom, tStS_ref,
-                    ).get_slice(tidx_wg),
-                    tStS_t2r_cur,
-                    tSrS,
-                )
-                cute.arch.fence_view_async_tmem_load()
+            cute.copy(thr_tmem_load, tStS_t2r_cur, tSrS)
+            cute.arch.fence_view_async_tmem_load()
             cute.arch.mbarrier_arrive(S_mbar_ptr + 2 * _slot + 1)
             if const_expr(_slot == 0):
                 s_full_phase ^= 1
@@ -1450,6 +1441,23 @@ class SparseScoreRecomputeSm100:
         """
         tidx_wg = tidx % self.WARPGROUP_SIZE
 
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld16x64bOp(
+                tcgen05.copy.Repetition(self.m_block_size // 2)
+            ),
+            Float32,
+        )
+        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStS_ref).get_slice(tidx_wg)
+
+        thr_mma = tiled_mma_qk.get_slice(tidx_wg)
+        cS = cute.make_identity_tensor(self.mma_tiler_qk[:2])
+        tScS = thr_tmem_load.partition_D(thr_mma.partition_C(cS))
+
+        tSrS_shape = thr_tmem_load.partition_D(
+            cute.make_identity_tensor(tStS_ref.shape)
+        ).shape
+        tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
+
         sLSE_off = Int32(0) if per_head_offset is None else per_head_offset
         sTopkIdx_off = Int32(0) if topk_idx_offset is None else topk_idx_offset
 
@@ -1474,8 +1482,10 @@ class SparseScoreRecomputeSm100:
                 (self.n_block_size, self.m_block_size), stride=(0, 1)
             ),
         )
+        tSsLSE = thr_tmem_load.partition_D(thr_mma.partition_C(sLSE_2d))
+        tSrLSE = cute.make_rmem_tensor(tSsLSE.shape, Float32)
 
-        kv_offset = Int32(0)
+        kv_offset = tScS[0][0]
         warp_id_in_wg = tidx_wg // self.WARP_SIZE
         # Thread i and Thread i^2 share a lane; only one should contribute
         # to warp-level sums / write output.  (tidx_wg % 4) < 2 selects
@@ -1499,56 +1509,23 @@ class SparseScoreRecomputeSm100:
             n_blk = self.num_n_blocks - 1 - _ri
             _slot = const_expr(n_blk % self.num_tmem_slots)
 
-            tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld16x64bOp(
-                    tcgen05.copy.Repetition(self.m_block_size // 2)
-                ),
-                Float32,
-            )
-
-            thr_mma = tiled_mma_qk.get_slice(tidx_wg)
-            cS = cute.make_identity_tensor(self.mma_tiler_qk[:2])
-            tScS = tcgen05.make_tmem_copy(
-                tmem_load_atom, tStS_ref,
-            ).get_slice(tidx_wg).partition_D(thr_mma.partition_C(cS))
-            tSrS_shape = tcgen05.make_tmem_copy(
-                tmem_load_atom, tStS_ref,
-            ).get_slice(tidx_wg).partition_D(
-                cute.make_identity_tensor(tStS_ref.shape)
-            ).shape
-            tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
-
-            tSsLSE = tcgen05.make_tmem_copy(
-                tmem_load_atom, tStS_ref,
-            ).get_slice(tidx_wg).partition_D(
-                thr_mma.partition_C(sLSE_2d)
-            )
-            tSrLSE = cute.make_rmem_tensor(tSsLSE.shape, Float32)
-            kv_offset = tScS[0][0]
-
             cute.arch.mbarrier_wait(S_mbar_ptr + 2 * _slot, s_full_phase)
-            cute.autovec_copy(tSsLSE, tSrLSE)
-            should_copy_tmem = const_expr(True)
-            if const_expr(self.have_topk_length):
-                should_copy_tmem = n_blk < n_block_max_epi
-            if should_copy_tmem:
-                tmem_ptr_cur = cute.make_ptr(
-                    Float32, _slot * self.tmem_s_stride,
-                    mem_space=cute.AddressSpace.tmem, assumed_align=16,
-                )
-                tStS_cur = cute.make_tensor(tmem_ptr_cur, tStS_ref.layout)
-                tStS_t2r_cur = tcgen05.make_tmem_copy(
-                    tmem_load_atom, tStS_ref,
-                ).get_slice(tidx_wg).partition_S(tStS_cur)
+            if const_expr(_ri == 0):
+                cute.autovec_copy(tSsLSE, tSrLSE)
+            # Keep the TMEM load unconditional: putting tcgen05 TMEM load ops
+            # under the top-k-length runtime guard trips CUTLASS DSL compile.
+            # Invalid blocks are ignored by should_accumulate_score below.
+            tmem_ptr_cur = cute.make_ptr(
+                Float32,
+                _slot * self.tmem_s_stride,
+                mem_space=cute.AddressSpace.tmem,
+                assumed_align=16,
+            )
+            tStS_cur = cute.make_tensor(tmem_ptr_cur, tStS_ref.layout)
+            tStS_t2r_cur = thr_tmem_load.partition_S(tStS_cur)
 
-                cute.copy(
-                    tcgen05.make_tmem_copy(
-                        tmem_load_atom, tStS_ref,
-                    ).get_slice(tidx_wg),
-                    tStS_t2r_cur,
-                    tSrS,
-                )
-                cute.arch.fence_view_async_tmem_load()
+            cute.copy(thr_tmem_load, tStS_t2r_cur, tSrS)
+            cute.arch.fence_view_async_tmem_load()
             cute.arch.mbarrier_arrive(S_mbar_ptr + 2 * _slot + 1)
             if const_expr(_slot == 0):
                 s_full_phase ^= 1

@@ -714,6 +714,7 @@ enum class DataType_t {
     BFLOAT16,
     INT64,
     BOOLEAN,
+    BYTE_BOOLEAN,
     FP8_E4M3,
     FP8_E5M2,
     FAST_FLOAT_FOR_FP8,
@@ -739,6 +740,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(DataType_t,
                                  {DataType_t::BFLOAT16, "BFLOAT16"},
                                  {DataType_t::INT64, "INT64"},
                                  {DataType_t::BOOLEAN, "BOOLEAN"},
+                                 {DataType_t::BYTE_BOOLEAN, "BYTE_BOOLEAN"},
                                  {DataType_t::FP8_E4M3, "FP8_E4M3"},
                                  {DataType_t::FP8_E5M2, "FP8_E5M2"},
                                  {DataType_t::FAST_FLOAT_FOR_FP8, "FAST_FLOAT_FOR_FP8"},
@@ -1038,6 +1040,8 @@ get_data_type_size(DataType_t const data_type) {
         case DataType_t::FP8_E4M3:
         case DataType_t::FP8_E5M2:
             return 1;  // 8-bit float
+        case DataType_t::BYTE_BOOLEAN:
+            return 1;
         case DataType_t::NOT_SET:
         case DataType_t::BOOLEAN:
         default:
@@ -1112,6 +1116,14 @@ convert_to_cudnn_type(cudnn_frontend::DataType_t const mode, cudnnDataType_t& cu
         case DataType_t::BOOLEAN:
             cudnn_mode = CUDNN_DATA_BOOLEAN;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case DataType_t::BYTE_BOOLEAN:
+#if (CUDNN_VERSION >= 93000)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(93000, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_DATA_BYTE_BOOLEAN;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
         case DataType_t::FP8_E4M3:
 #if (CUDNN_VERSION >= 8600)
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(8600, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
@@ -2336,6 +2348,10 @@ convert_from_cudnn_type(cudnnDataType_t const cudnn_mode) {
             return DataType_t::INT64;
         case CUDNN_DATA_BOOLEAN:
             return DataType_t::BOOLEAN;
+#if (CUDNN_VERSION >= 93000)
+        case CUDNN_DATA_BYTE_BOOLEAN:
+            return DataType_t::BYTE_BOOLEAN;
+#endif
 #if (CUDNN_VERSION >= 8600)
         case CUDNN_DATA_FP8_E4M3:
             return DataType_t::FP8_E4M3;
@@ -2423,6 +2439,9 @@ get_element_size_in_bits(cudnn_frontend::DataType_t datatype) {
 #endif
         case DataType_t::BOOLEAN:
             return 1;
+            break;
+        case DataType_t::BYTE_BOOLEAN:
+            return 8;
             break;
         default:
             return 0;
