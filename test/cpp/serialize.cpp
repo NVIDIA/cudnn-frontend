@@ -604,8 +604,7 @@ TEST_CASE("Plan deserialize prepares variant pack template", "[graph][serialize]
 //
 // Note the additive argument order: deserialize(handle, data, enforce_precompiled, run_warmup).
 // Both bools are spelled explicitly below so the positional meaning is unambiguous.
-TEST_CASE("Plan deserialize with run_warmup=false still prepares template",
-          "[graph][serialize][deserialize]") {
+TEST_CASE("Plan deserialize with run_warmup=false still prepares template", "[graph][serialize][deserialize]") {
     namespace fe = cudnn_frontend;
 
     constexpr int64_t a_uid = 1, b_uid = 2, c_uid = 3;
@@ -635,23 +634,28 @@ TEST_CASE("Plan deserialize with run_warmup=false still prepares template",
     // expected uids
     std::vector<int64_t> const expected_uids{a_uid, b_uid, c_uid};
 
-    // test the blob overload, run_warmup=false. 
+    // test the blob overload, run_warmup=false.
     // Check for success and variant pack uids are the same as the expected uids
     SECTION("blob overload, run_warmup=false") {
         fe::graph::Graph graph_deserialized;
-        REQUIRE(graph_deserialized
-                    .deserialize(handle, serialized_data, /*enforce_precompiled=*/false, /*run_warmup=*/false)
-                    .is_good());
+        REQUIRE(
+            graph_deserialized.deserialize(handle, serialized_data, /*enforce_precompiled=*/false, /*run_warmup=*/false)
+                .is_good());
         // check the variant pack uids are the same as the expected uids
         REQUIRE(graph_deserialized.get_variant_pack_uids_sorted() == expected_uids);
+        // tensor metadata must still resolve with warmup skipped (deserialized_tensor_properties)
+        fe::graph::Tensor_attributes queried;
+        REQUIRE(graph_deserialized.query_tensor_attributes_of_uid(a_uid, queried).is_good());
     }
 
-    // test the json overload, run_warmup=false. 
-    // same assertion via the pre‑parsed‑json overload, covering the path that avoids a second from_ubjson.
+    // test the json overload, run_warmup=false.
+    // same assertion via the pre-parsed-json overload, covering the path that avoids a second from_ubjson.
     SECTION("json overload, run_warmup=false") {
         json const j = json::from_ubjson(serialized_data);
         fe::graph::Graph graph_deserialized;
-        REQUIRE(graph_deserialized.deserialize(handle, j, /*enforce_precompiled=*/false, /*run_warmup=*/false).is_good());
+        auto const status =
+            graph_deserialized.deserialize(handle, j, /*enforce_precompiled=*/false, /*run_warmup=*/false);
+        REQUIRE(status.is_good());
         REQUIRE(graph_deserialized.get_variant_pack_uids_sorted() == expected_uids);
     }
 
@@ -663,8 +667,9 @@ TEST_CASE("Plan deserialize with run_warmup=false still prepares template",
             warmed.deserialize(handle, serialized_data, /*enforce_precompiled=*/false, /*run_warmup=*/true).is_good());
 
         fe::graph::Graph skipped;
-        REQUIRE(
-            skipped.deserialize(handle, serialized_data, /*enforce_precompiled=*/false, /*run_warmup=*/false).is_good());
+        auto const skipped_status =
+            skipped.deserialize(handle, serialized_data, /*enforce_precompiled=*/false, /*run_warmup=*/false);
+        REQUIRE(skipped_status.is_good());
 
         // The plan-side state the fast execute path relies on is identical either way.
         REQUIRE(warmed.get_variant_pack_uids_sorted() == skipped.get_variant_pack_uids_sorted());
