@@ -12,10 +12,9 @@ per-token decay in ``(0, 1]``; ``beta_t`` is a scalar per-token write
 strength. The feature map ``phi`` is **not** modeled here — ``q`` and ``k``
 are taken as already-mapped.
 
-This is the reference implementation: forward runs the chunked formulation
-from ``LinearAttentionRef/reference/linear_attention_gdn.py``; backward
-runs autograd through the per-token recurrence. The op is registered
-through ``torch.library.custom_op`` so it composes with autograd,
+Forward and backward dispatch to the vendored cuTile chunked kernel
+(``_gdn_chunk_cutile``), which needs the ``cuda.tile`` runtime. The op is
+registered through ``torch.library.custom_op`` so it composes with autograd,
 ``torch.compile``, and DDP.
 """
 
@@ -26,101 +25,20 @@ from typing import Optional, Tuple
 import math
 import torch
 
-from ._common import (
-    bthd_to_bhtd,
-    bhtd_to_bthd,
-    bth_to_bht,
-    bht_to_bth,
-    chunk_factors_scalar,
-    compute_dtype_for,
-    maybe_zero_state,
-    pad_to_multiple,
-)
 
-
-# ---------------------------------------------------------------------------
-# Reference math (fp32, ``[B, H, T, *]`` layout)
-# ---------------------------------------------------------------------------
-
-
-def _gdn_forward_recurrent(q, k, v, alpha, beta, initial_state):
-    """Per-token GDN recurrence in ``[B, H, T, *]`` layout. All fp32."""
-    T = q.shape[2]
-    S = initial_state
-    out_steps = []
-    for t in range(T):
-        kt = k[:, :, t, :]                            # (B, H, K)
-        vt = v[:, :, t, :]                            # (B, H, V)
-        at = alpha[:, :, t][..., None, None]          # (B, H, 1, 1)
-        at_s = alpha[:, :, t][..., None]              # (B, H, 1)
-        bt = beta[:, :, t][..., None, None]           # (B, H, 1, 1)
-        kt_S = (kt.unsqueeze(-2) @ S).squeeze(-2)     # (B, H, V)
-        residual = vt - at_s * kt_S
-        S = at * S + bt * (kt.unsqueeze(-1) @ residual.unsqueeze(-2))
-        qt = q[:, :, t, :].unsqueeze(-2)              # (B, H, 1, K)
-        out_steps.append((qt @ S).squeeze(-2))        # (B, H, V)
-    return torch.stack(out_steps, dim=2), S
-
-
-def _gdn_forward_chunked(q, k, v, alpha, beta, initial_state, chunk_size):
-    """Chunked GDN forward in ``[B, H, T, *]`` layout. All fp32."""
-    B, H, T_orig, K = q.shape
-    V = v.shape[-1]
-    Bsize = chunk_size
-
-    q, pad = pad_to_multiple(q, Bsize, dim=2)
-    k, _ = pad_to_multiple(k, Bsize, dim=2)
-    v, _ = pad_to_multiple(v, Bsize, dim=2)
-    alpha, _ = pad_to_multiple(alpha, Bsize, dim=2, value=1.0)
-    beta, _ = pad_to_multiple(beta, Bsize, dim=2)
-    T = q.shape[2]
-    Tc = T // Bsize
-
-    q_c = q.unflatten(2, (Tc, Bsize))                                       # (B, H, Tc, Bs, K)
-    k_c = k.unflatten(2, (Tc, Bsize))
-    v_c = v.unflatten(2, (Tc, Bsize))
-    alpha_c = alpha.unflatten(2, (Tc, Bsize))                                # (B, H, Tc, Bs)
-    beta_c = beta.unflatten(2, (Tc, Bsize))
-
-    Lambda, Gamma, L_mat, g = chunk_factors_scalar(alpha_c)
-
-    I_B = torch.eye(Bsize, dtype=q.dtype, device=q.device)
-    L_strict = torch.tril(torch.ones(Bsize, Bsize, dtype=q.dtype, device=q.device), diagonal=-1)
-
-    S = initial_state
-    Os = []
-    for t in range(Tc):
-        pQ = q_c[:, :, t]                                                    # (B, H, Bs, K)
-        pK = k_c[:, :, t]
-        Vt = v_c[:, :, t]
-        bt = beta_c[:, :, t]                                                 # (B, H, Bs)
-        Lambda_t = Lambda[:, :, t].unsqueeze(-1)                             # (B, H, Bs, 1)
-        Gamma_t = Gamma[:, :, t].unsqueeze(-1)
-        L_t = L_mat[:, :, t]                                                 # (B, H, Bs, Bs)
-        g_t = g[:, :, t][..., None, None]                                    # (B, H, 1, 1)
-        diag_b = torch.diag_embed(bt)                                        # (B, H, Bs, Bs)
-
-        kkT = pK @ pK.transpose(-2, -1)
-        A_mat = I_B + L_strict * (diag_b @ (L_t * kkT))
-        T_mat = torch.linalg.solve_triangular(A_mat, diag_b, upper=False)
-
-        Y_t = Vt - (pK * Gamma_t) @ S
-        tilde_V = T_mat @ Y_t
-        H_t = (pQ @ pK.transpose(-2, -1)) * L_t
-        Os.append(H_t @ tilde_V + (pQ * Gamma_t) @ S)
-        S = g_t * S + (pK.transpose(-2, -1) * Lambda_t.transpose(-2, -1)) @ tilde_V
-
-    out = torch.cat(Os, dim=2)[:, :, :T_orig, :]
-    return out, S
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def _get_cutile_fns():
+    # Lazy import: the kernel module pulls in ``cuda.tile``.
+    from ._gdn_chunk_cutile import (
+        chunk_gated_delta_rule_fwd as _ct_fwd,
+        chunk_gated_delta_rule_bwd as _ct_bwd,
+    )
+    return _ct_fwd, _ct_bwd
 
 
 _OP_NAMESPACE = "cudnn"
 _OP_NAME = "gated_delta_net"
+
+_BT = 64  # cuTile kernel chunk size
 
 
 @torch.library.custom_op(f"{_OP_NAMESPACE}::{_OP_NAME}_fwd", mutates_args=())
@@ -134,92 +52,83 @@ def _gdn_fwd(
     chunk_size: int,
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """GDN forward (reference / chunked, fp32 inside).
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """GDN forward.
 
-    Returns ``(o, final_state)``; ``final_state`` is a zero-size tensor when
-    ``output_final_state`` is ``False`` so the op has a static schema.
+    Returns ``(o, final_state, g_cumsum, A)``; ``g_cumsum`` and ``A`` are
+    intermediates saved for the backward. ``final_state`` is a zero-size
+    tensor when ``output_final_state`` is ``False``.
     """
-    B, T, H, K = q.shape
-    V = v.shape[-1]
-    orig_dtype = q.dtype
-    device = q.device
-    cdt = compute_dtype_for(orig_dtype)
-
-    q_f = bthd_to_bhtd(q).to(cdt) * scale                                    # absorb scale into q
-    k_f = bthd_to_bhtd(k).to(cdt)
-    v_f = bthd_to_bhtd(v).to(cdt)
-    g_f = bth_to_bht(g).to(cdt)                                              # log-decay
-    alpha_f = torch.exp(g_f)
-    beta_f = bth_to_bht(beta).to(cdt)
-
-    S0 = (initial_state.to(cdt) if initial_state is not None
-          else maybe_zero_state(None, B, H, K, V, cdt, device))
-
-    o_bhtv, S_T = _gdn_forward_chunked(q_f, k_f, v_f, alpha_f, beta_f, S0, chunk_size)
-    o = bhtd_to_bthd(o_bhtv).to(orig_dtype)
-    if output_final_state:
-        final = S_T.to(orig_dtype)
-    else:
-        final = torch.empty(0, dtype=orig_dtype, device=device)
-    return o, final
+    _ct_fwd, _ = _get_cutile_fns()
+    g_cumsum, o, A, final_state_t, _, _ = _ct_fwd(
+        q=q.contiguous(),
+        k=k.contiguous(),
+        v=v.contiguous(),
+        g=g.contiguous(),
+        beta=beta.contiguous(),
+        scale=scale,
+        initial_state=initial_state.contiguous() if initial_state is not None else None,
+        output_final_state=output_final_state,
+        state_v_first=False,
+    )
+    if not output_final_state:
+        final_state_t = torch.empty(0, dtype=q.dtype, device=q.device)
+    return o.to(q.dtype), final_state_t.to(q.dtype), g_cumsum, A
 
 
 @_gdn_fwd.register_fake
 def _gdn_fwd_fake(q, k, v, g, beta, scale, chunk_size, initial_state=None, output_final_state=False):
     B, T, H, K = q.shape
     V = v.shape[-1]
-    o = torch.empty(B, T, H, V, dtype=q.dtype, device=q.device)
-    if output_final_state:
-        final = torch.empty(B, H, K, V, dtype=q.dtype, device=q.device)
-    else:
-        final = torch.empty(0, dtype=q.dtype, device=q.device)
-    return o, final
+    HV = beta.shape[2]
+    o = q.new_empty(B, T, H, V)
+    final = q.new_empty(B, H, K, V) if output_final_state else q.new_empty(0)
+    g_cumsum = torch.empty(B, T, H, dtype=torch.float32, device=q.device)
+    A = torch.empty(B, T, HV, _BT, dtype=torch.float32, device=q.device)
+    return o, final, g_cumsum, A
 
 
 def _gdn_setup_context(ctx, inputs, output):
     q, k, v, g, beta, scale, chunk_size, initial_state, output_final_state = inputs
-    ctx.save_for_backward(q, k, v, g, beta)
-    ctx.scale = scale
+    o, final_state, g_cumsum, A = output
+    # save_for_backward cannot hold None; keep initial_state as an attribute.
+    ctx.save_for_backward(q, k, v, g, beta, g_cumsum, A)
     ctx.initial_state = initial_state
+    ctx.scale = scale
 
 
-def _gdn_backward(ctx, dO, dFinal):
-    """Backward via autograd through the per-token recurrent reference.
+def _gdn_backward(ctx, dO, dFinal, d_g_cumsum_unused, d_A_unused):
+    q, k, v, g_raw, beta, g_cumsum, A = ctx.saved_tensors
+    initial_state = ctx.initial_state
 
-    The body runs as a regular Python function (no custom-op dispatcher
-    indirection), so autograd is live and ``out.backward(dO)`` traces
-    correctly. A fused chunked backward can replace this without touching
-    the public API.
-    """
-    del dFinal  # we do not propagate grad through the final-state output
-    q, k, v, g, beta = ctx.saved_tensors
-    B, T, H, K = q.shape
-    V = v.shape[-1]
-    scale = ctx.scale
-
-    cdt = compute_dtype_for(q.dtype)
-    with torch.enable_grad():
-        q_r = (bthd_to_bhtd(q).to(cdt) * scale).detach().requires_grad_(True)
-        k_r = bthd_to_bhtd(k).to(cdt).detach().requires_grad_(True)
-        v_r = bthd_to_bhtd(v).to(cdt).detach().requires_grad_(True)
-        g_r = bth_to_bht(g).to(cdt).detach().requires_grad_(True)
-        beta_r = bth_to_bht(beta).to(cdt).detach().requires_grad_(True)
-        S0 = (ctx.initial_state.to(cdt) if ctx.initial_state is not None
-              else torch.zeros(B, H, K, V, dtype=cdt, device=q.device))
-
-        alpha_r = torch.exp(g_r)
-        out, _ = _gdn_forward_recurrent(q_r, k_r, v_r, alpha_r, beta_r, S0)
-        dO_f = bthd_to_bhtd(dO.contiguous()).to(cdt)
-        out.backward(dO_f)
-
-    dq = bhtd_to_bthd(q_r.grad).to(q.dtype) * scale
-    dk = bhtd_to_bthd(k_r.grad).to(k.dtype)
-    dv = bhtd_to_bthd(v_r.grad).to(v.dtype)
-    dg = bht_to_bth(g_r.grad).to(g.dtype)
-    dbeta = bht_to_bth(beta_r.grad).to(beta.dtype)
-    # Match the fwd signature: q, k, v, g, beta, scale, chunk_size, initial_state, output_final_state
-    return dq, dk, dv, dg, dbeta, None, None, None, None
+    _, _ct_bwd = _get_cutile_fns()
+    dht = dFinal if (dFinal is not None and dFinal.numel() > 0) else None
+    dq, dk, dv, db, dg, dh0, _dA_log, _ddt_bias = _ct_bwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g_cumsum,  # already cumsum'd in fwd
+        beta=beta,
+        A=A,
+        scale=ctx.scale,
+        initial_state=initial_state,
+        do=dO.contiguous(),
+        dht=dht,
+        state_v_first=False,
+    )
+    dh0_out = dh0 if initial_state is not None else None
+    # q, k, v, g, beta, scale, chunk_size, initial_state, output_final_state
+    return (
+        dq.to(q.dtype),
+        dk.to(k.dtype),
+        dv.to(v.dtype),
+        dg.to(g_raw.dtype),
+        db.to(beta.dtype),
+        None,
+        None,
+        dh0_out,
+        None,
+    )
 
 
 torch.library.register_autograd(
@@ -246,23 +155,21 @@ def gated_delta_net(
         q: queries, ``[B, T, H, K]``.
         k: keys,    ``[B, T, H, K]``.
         v: values,  ``[B, T, H, V]``.
-        g: log-space scalar decay, ``[B, T, H]`` (so ``alpha = exp(g) in (0, 1]``).
+        g: log-space scalar decay per token, ``[B, T, H]``
+           (``alpha = exp(g) in (0, 1]``).
         beta: per-token write strength, ``[B, T, H]``.
-        scale: attention scale applied to ``q`` before the recurrence. Defaults
-            to ``1 / sqrt(K)``.
+        scale: attention scale applied to ``q``. Defaults to ``1 / sqrt(K)``.
         initial_state: optional recurrent state ``[B, H, K, V]`` (otherwise zero).
-        output_final_state: if ``True``, return the state after the last token
-            in addition to the per-token output.
-        chunk_size: chunk length used by the reference forward.
+        output_final_state: if ``True``, also return the state after the last token.
+        chunk_size: chunk length (cuTile kernel uses 64).
 
     Returns:
         ``(o, final_state)`` where ``o`` is ``[B, T, H, V]``. ``final_state`` is
-        ``[B, H, K, V]`` when ``output_final_state=True``, otherwise an
-        empty tensor.
+        ``[B, H, K, V]`` when ``output_final_state=True``, otherwise empty.
     """
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    return torch.ops.cudnn.gated_delta_net_fwd(
+    o, final_state, _g_cumsum, _A = torch.ops.cudnn.gated_delta_net_fwd(
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
@@ -273,3 +180,4 @@ def gated_delta_net(
         initial_state=initial_state.contiguous() if initial_state is not None else None,
         output_final_state=bool(output_final_state),
     )
+    return o, final_state
