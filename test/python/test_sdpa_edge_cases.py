@@ -6,6 +6,14 @@ from sdpa.fp16 import TensorUid, exec_sdpa
 from sdpa.random_config import ExecConfig
 
 
+ZERO_SEQLEN_CASES = [
+    ([0, 128, 0, 128], [128, 128, 128, 128]),
+    ([128, 128, 128, 128], [0, 128, 0, 128]),
+    ([0, 128, 0, 128], [0, 128, 0, 128]),
+]
+ZERO_SEQLEN_IDS = ["half_zero_q", "half_zero_kv", "half_zero_qkv"]
+
+
 def make_edge_config(
     *,
     data_type=torch.float16,
@@ -15,6 +23,8 @@ def make_edge_config(
     seq_len_q=(),
     seq_len_kv=(),
     is_ragged=False,
+    is_infer=False,
+    is_cu_seq_len=False,
     diag_align=cudnn.diagonal_alignment.TOP_LEFT,
     right_bound=None,
 ):
@@ -23,12 +33,12 @@ def make_edge_config(
         rng_data_seed=1234,
         rng_geom_seed=5678,
         is_alibi=False,
-        is_infer=False,
+        is_infer=is_infer,
         is_paged=False,
         is_bias=False,
         is_block_mask=False,
         is_padding=len(seq_len_q) > 0,
-        is_cu_seq_len=False,
+        is_cu_seq_len=is_cu_seq_len,
         is_ragged=is_ragged,
         is_dropout=False,
         is_determin=False,
@@ -93,12 +103,8 @@ def check_negative_results(tensors):
 @pytest.mark.L0
 @pytest.mark.parametrize(
     ("seq_len_q", "seq_len_kv"),
-    [
-        ([0, 128, 0, 128], [128, 128, 128, 128]),
-        ([128, 128, 128, 128], [0, 128, 0, 128]),
-        ([0, 128, 0, 128], [0, 128, 0, 128]),
-    ],
-    ids=["half_zero_q", "half_zero_kv", "half_zero_qkv"],
+    ZERO_SEQLEN_CASES,
+    ids=ZERO_SEQLEN_IDS,
 )
 def test_thd_zero_seqlen(seq_len_q, seq_len_kv, request, cudnn_handle):
     cfg = make_edge_config(
@@ -106,6 +112,24 @@ def test_thd_zero_seqlen(seq_len_q, seq_len_kv, request, cudnn_handle):
         seq_len_q=seq_len_q,
         seq_len_kv=seq_len_kv,
         is_ragged=True,
+    )
+    exec_sdpa(cfg, request, cudnn_handle)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("seq_len_q", "seq_len_kv"),
+    ZERO_SEQLEN_CASES,
+    ids=ZERO_SEQLEN_IDS,
+)
+def test_cu_seqlen_zero_seqlen(seq_len_q, seq_len_kv, request, cudnn_handle):
+    cfg = make_edge_config(
+        batches=4,
+        seq_len_q=seq_len_q,
+        seq_len_kv=seq_len_kv,
+        is_ragged=True,
+        is_infer=True,
+        is_cu_seq_len=True,
     )
     exec_sdpa(cfg, request, cudnn_handle)
 
