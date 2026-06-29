@@ -1626,12 +1626,50 @@ class Graph : public ICudnn, public INode {
 #endif
     }
 
+    /**
+     * @brief Deserialize an execution plan from a serialized byte blob.
+     *
+     * Parses @p data with from_ubjson and delegates to the json overload. Callers that
+     * have already parsed the blob should call the json overload directly to avoid a
+     * second parse.
+     *
+     * @param handle              cuDNN handle used to rebuild the execution plan.
+     * @param data                UBJSON blob previously produced by serialize().
+     * @param enforce_precompiled When true, fail unless the blob carries a precompiled plan.
+     * @param run_warmup          When false, skip the throwaway warmup capture.
+     * @return error_t OK on success, otherwise an error code describing the failure.
+     */
     error_t
-    deserialize(cudnnHandle_t handle, std::vector<uint8_t> const &data, bool const enforce_precompiled = false) {
-        CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE  ");
+    deserialize(cudnnHandle_t handle,
+                std::vector<uint8_t> const &data,
+                bool const enforce_precompiled = false,
+                bool run_warmup                = true) {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+        return deserialize(handle, json::from_ubjson(data), enforce_precompiled, run_warmup);
+#else
+        CUDNN_FRONTEND_UNUSED(handle);
+        CUDNN_FRONTEND_UNUSED(data);
+        CUDNN_FRONTEND_UNUSED(enforce_precompiled);
+        CUDNN_FRONTEND_UNUSED(run_warmup);
+        return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
+#endif
+    }
 
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
-        json j = json::from_ubjson(data);
+    /**
+     * @brief Deserialize an execution plan from an already-parsed json.
+     *
+     * Avoids a second from_ubjson parse. run_warmup=false skips the throwaway warmup capture.
+     *
+     * @param handle              cuDNN handle used to rebuild the execution plan.
+     * @param j                   Parsed json graph, as produced by serialize().
+     * @param enforce_precompiled When true, fail unless the json carries a precompiled plan.
+     * @param run_warmup          When false, skip the throwaway warmup capture.
+     * @return error_t OK on success, otherwise an error code describing the failure.
+     */
+    error_t
+    deserialize(cudnnHandle_t handle, json const &j, bool const enforce_precompiled = false, bool run_warmup = true) {
+        CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE  ");
 
         // Clear deserialize-owned containers so a re-deserialize on the same Graph
         // does not feed prepare_variant_pack_template() with stale entries from a
@@ -1645,6 +1683,7 @@ class Graph : public ICudnn, public INode {
             graph_uid = j["graph_uid"].get<uint64_t>();
         }
 
+        // Resolve tensor UIDs with deserialized_tensor_properties.
         if (j.contains("tensors")) {
             auto tensor_map = j["tensors"].get<std::unordered_map<std::string, json>>();
             for (const auto &tensor_info : tensor_map) {
@@ -1717,18 +1756,15 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        CHECK_CUDNN_FRONTEND_ERROR(warmup(handle));
+        if (run_warmup) {
+            CHECK_CUDNN_FRONTEND_ERROR(warmup(handle));
+        }
 
         CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE (ALL OK) ");
 
         return {error_code_t::OK, ""};
-#else
-        CUDNN_FRONTEND_UNUSED(handle);
-        CUDNN_FRONTEND_UNUSED(data);
-        CUDNN_FRONTEND_UNUSED(enforce_precompiled);
-        return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
-#endif
     }
+#endif
 
     Type
     getType() override {

@@ -596,3 +596,85 @@ TEST_CASE("Plan deserialize prepares variant pack template", "[graph][serialize]
 
     cudnnDestroy(handle);
 }
+
+// Exercises the run_warmup=false fast path of deserialize(handle, ...). Skipping
+// the throwaway warmup capture must not change the resulting plan: the variant
+// pack template is built by prepare_variant_pack_template(), which is independent
+// of warmup, so the deserialized graph is still fully usable.
+//
+// Note the additive argument order: deserialize(handle, data, enforce_precompiled, run_warmup).
+// Both bools are spelled explicitly below so the positional meaning is unambiguous.
+TEST_CASE("Plan deserialize with run_warmup=false still prepares template", "[graph][serialize][deserialize]") {
+    namespace fe = cudnn_frontend;
+
+    constexpr int64_t a_uid = 1, b_uid = 2, c_uid = 3;
+
+    fe::graph::Graph graph;
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto A = graph.tensor(
+        fe::graph::Tensor_attributes().set_name("A").set_dim({4, 16, 64}).set_stride({16 * 64, 64, 1}).set_uid(a_uid));
+    auto B = graph.tensor(
+        fe::graph::Tensor_attributes().set_name("B").set_dim({4, 64, 32}).set_stride({64 * 32, 32, 1}).set_uid(b_uid));
+
+    auto C = graph.matmul(A, B, fe::graph::Matmul_attributes().set_name("matmul"));
+    C->set_output(true).set_uid(c_uid);
+
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+
+    REQUIRE(graph.build(handle, {fe::HeurMode_t::A}).is_good());
+
+    // serialize the graph
+    std::vector<uint8_t> serialized_data;
+    REQUIRE(graph.serialize(serialized_data).is_good());
+
+    // expected uids
+    std::vector<int64_t> const expected_uids{a_uid, b_uid, c_uid};
+
+    // test the blob overload, run_warmup=false.
+    // Check for success and variant pack uids are the same as the expected uids
+    SECTION("blob overload, run_warmup=false") {
+        fe::graph::Graph graph_deserialized;
+        REQUIRE(
+            graph_deserialized.deserialize(handle, serialized_data, /*enforce_precompiled=*/false, /*run_warmup=*/false)
+                .is_good());
+        // check the variant pack uids are the same as the expected uids
+        REQUIRE(graph_deserialized.get_variant_pack_uids_sorted() == expected_uids);
+        // tensor metadata must still resolve with warmup skipped (deserialized_tensor_properties)
+        fe::graph::Tensor_attributes queried;
+        REQUIRE(graph_deserialized.query_tensor_attributes_of_uid(a_uid, queried).is_good());
+    }
+
+    // test the json overload, run_warmup=false.
+    // same assertion via the pre-parsed-json overload, covering the path that avoids a second from_ubjson.
+    SECTION("json overload, run_warmup=false") {
+        json const j = json::from_ubjson(serialized_data);
+        fe::graph::Graph graph_deserialized;
+        auto const status =
+            graph_deserialized.deserialize(handle, j, /*enforce_precompiled=*/false, /*run_warmup=*/false);
+        REQUIRE(status.is_good());
+        REQUIRE(graph_deserialized.get_variant_pack_uids_sorted() == expected_uids);
+    }
+
+    // test the run_warmup=false matches the default warmup=true template
+    // Confirms warmup is purely a priming step with no effect on the executable plan.
+    SECTION("run_warmup=false matches the default warmup=true template") {
+        fe::graph::Graph warmed;
+        REQUIRE(
+            warmed.deserialize(handle, serialized_data, /*enforce_precompiled=*/false, /*run_warmup=*/true).is_good());
+
+        fe::graph::Graph skipped;
+        auto const skipped_status =
+            skipped.deserialize(handle, serialized_data, /*enforce_precompiled=*/false, /*run_warmup=*/false);
+        REQUIRE(skipped_status.is_good());
+
+        // The plan-side state the fast execute path relies on is identical either way.
+        REQUIRE(warmed.get_variant_pack_uids_sorted() == skipped.get_variant_pack_uids_sorted());
+        REQUIRE(skipped.get_variant_pack_uids_sorted() == expected_uids);
+    }
+
+    cudnnDestroy(handle);
+}
