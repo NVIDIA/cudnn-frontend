@@ -1020,6 +1020,39 @@ def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
         if "CUDNN_RESCALE_THRESHOLD" in os.environ:
             del os.environ["CUDNN_RESCALE_THRESHOLD"]
 
+
+@pytest.mark.L0
+def test_sdpa_mxfp8_perf_L0(monkeypatch, request, cudnn_handle):
+    def fail_reference(*args, **kwargs):
+        raise AssertionError("reference called in perf mode")
+
+    getoption = request.config.getoption
+    def getoption_perf(name, *args, **kwargs):
+        return True if name == "--perf" else getoption(name, *args, **kwargs)
+
+    monkeypatch.setattr(request.config, "getoption", getoption_perf)
+    monkeypatch.setattr("sdpa.mxfp8.compute_ref", fail_reference)
+    monkeypatch.setattr("sdpa.mxfp8.compute_ref_backward", fail_reference)
+
+    cfg = ExecConfig(
+        data_type=torch.float8_e4m3fn,
+        output_type=torch.bfloat16,
+        rng_data_seed=1,
+        is_infer=False,
+        is_determin=False,
+        is_mxfp8=True,
+        batches=1,
+        h_q=1,
+        h_k=1,
+        h_v=1,
+        s_q=128,
+        s_kv=128,
+        d_qk=64,
+        d_v=64,
+    )
+    cfg.fill_derived_fields()
+    exec_sdpa_mxfp8(cfg, request, cudnn_handle)
+
 # # ===================
 # # Single repro test
 # # ===================
