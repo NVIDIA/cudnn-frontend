@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from numbers import Integral, Real
 import operator
-from typing import Any, Optional
+from typing import Any, Iterable, Optional, Tuple
 
 
 def _type_name(value: Any) -> str:
@@ -27,6 +27,15 @@ def require_concrete_dim(value: Any, *, name: str) -> int:
         return operator.index(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise TypeError(f"{name} must be a concrete integer dimension (got {_type_name(value)})") from exc
+
+
+def require_concrete_dims(values: Iterable[Any], *names: str) -> Tuple[int, ...]:
+    """Normalize multiple concrete dimensions in one call."""
+
+    values = tuple(values)
+    if len(values) != len(names):
+        raise ValueError(f"Expected {len(values)} dimension names, got {len(names)}")
+    return tuple(require_concrete_dim(value, name=name) for value, name in zip(values, names))
 
 
 def require_static_int(value: Any, *, name: str) -> int:
@@ -64,6 +73,7 @@ def require_static_float(value: Any, *, name: str) -> float:
 __all__ = [
     "optional_static_int",
     "require_concrete_dim",
+    "require_concrete_dims",
     "require_static_float",
     "require_static_int",
 ]

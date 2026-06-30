@@ -24,6 +24,7 @@ _OPTIONAL_MODULES_AFTER = {name for name in sys.modules if name.split(".", 1)[0]
 
 optional_static_int = _MODULE.optional_static_int
 require_concrete_dim = _MODULE.require_concrete_dim
+require_concrete_dims = _MODULE.require_concrete_dims
 require_static_float = _MODULE.require_static_float
 require_static_int = _MODULE.require_static_int
 
@@ -56,6 +57,17 @@ class JaxStaticValuesTest(unittest.TestCase):
             with self.subTest(value_type=type(value).__name__):
                 with self.assertRaisesRegex(TypeError, "M.*shape-polymorphic"):
                     require_concrete_dim(value, name="M")
+
+    def test_concrete_dims_normalizes_multiple_values(self):
+        result = require_concrete_dims((4, _Integer.VALUE), "M", "N")
+        self.assertEqual(result, (4, 7))
+        self.assertTrue(all(type(value) is int for value in result))
+
+    def test_concrete_dims_checks_name_count_and_preserves_dimension_name(self):
+        with self.assertRaisesRegex(ValueError, "Expected 2 dimension names, got 1"):
+            require_concrete_dims((4, 7), "M")
+        with self.assertRaisesRegex(TypeError, "N.*shape-polymorphic"):
+            require_concrete_dims((4, _DynamicValue()), "M", "N")
 
     def test_static_int_accepts_required_and_optional_integral_values(self):
         self.assertIsNone(optional_static_int(None, name="num_threads"))
