@@ -8,9 +8,9 @@
 
 This frontend integration exposes the kernel as a standard FE-OSS Python API with:
 - a class API (`RmsNormRhtAmaxSm100`)
-- an aligned Torch API (`cudnn.rmsnorm_rht_amax_sm100`)
+- a PyTorch functional API (`cudnn.rmsnorm_rht_amax_sm100`)
 - the existing wrapper API (`rmsnorm_rht_amax_wrapper_sm100`)
-- an aligned experimental JAX API (`cudnn.jax.rmsnorm_rht_amax_sm100`)
+- an experimental JAX functional API (`cudnn.jax.rmsnorm_rht_amax_sm100`)
 - grouped-gemm-style regression coverage for compile/execute, wrapper use, and cache reuse
 
 ## Shapes
@@ -55,11 +55,12 @@ over every element produced by that CTA.
 
 ## API Usage
 
-### Aligned high-level API
+### Comparable framework APIs
 
-The Torch and JAX namespaces expose the same semantic operation name, operand
-names, option names, and result roles. Torch additionally accepts its
-framework-specific stream control.
+Both bindings implement the same forward computation and expose comparable
+inputs, options, and result roles. This operation currently uses the same
+function name in both namespaces; return types, lifecycle, supported layouts,
+and stream handling remain framework-specific.
 
 ``````{tab-set}
 :sync-group: frontend-framework
@@ -89,7 +90,7 @@ result = rmsnorm_rht_amax_sm100(
 output, amax = result
 ```
 
-The aligned Torch function returns `TupleDict(output=..., amax=...)`.
+The PyTorch functional API returns `TupleDict(output=..., amax=...)`.
 
 `````
 
@@ -143,7 +144,7 @@ workspace model, rollout plan, and current limitations.
 
 ### Additional PyTorch APIs
 
-The aligned function above is additive. The existing PyTorch wrapper and class
+The functional API above is additive. The existing PyTorch wrapper and class
 APIs remain first class and retain their original contracts.
 
 #### Existing high-level wrapper
@@ -222,11 +223,11 @@ op.execute(
 
 ### Return values
 
-The aligned Torch function returns a `TupleDict` with keys:
+The PyTorch functional API returns a `TupleDict` with keys:
 - `output`
 - `amax`
 
-The aligned JAX function returns an `RmsNormRhtAmaxResult` named tuple with
+The JAX functional API returns an `RmsNormRhtAmaxResult` named tuple with
 fields `output` and `amax`.
 
 The legacy wrapper returns a `TupleDict` with keys:

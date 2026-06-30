@@ -14,7 +14,6 @@ A simplified view of package structure:
 pyproject.toml                       # Project metadata and dependencies. Optional dependencies for frontend-only APIs are registered here.
 python/cudnn/
 ├── __init__.py                     # Top-level exports (Graph, graph, jit, wrappers, kernels)
-├── frontend/                       # Internal target-support and kernel-ownership catalog
 ├── jax/                            # Optional functional JAX APIs
 ├── graph.py                        # Low-level graph helpers (graph, jit, graph_cache)
 ├── wrapper.py                      # High-level Graph wrapper class
@@ -30,55 +29,46 @@ test/python/                        # Test files
 
 ## Adding new frontend-only APIs
 
-The intended unit is a semantic operation variant, which may own one or more
-main/helper CuTe kernels. The existing Torch conventions remain canonical; JAX
-is an optional additive namespace. JAX-enabled operations expose an aligned
-high-level name in both namespaces while retaining the legacy Torch wrapper:
+The review unit is a user-visible operation, which may use one or more
+main/helper CuTe kernels. PyTorch remains the default interface; JAX is an
+optional functional namespace. When both bindings exist, they should implement
+comparable functionality on their documented overlapping domain and use
+familiar terminology where practical:
 
 ```python
-from cudnn import my_operation
-torch_result = my_operation(torch_inputs, ...)
+from cudnn import my_operation_wrapper
+torch_result = my_operation_wrapper(torch_inputs, ...)
 
 from cudnn.jax import my_operation
 jax_result = my_operation(jax_inputs, ...)
-
-from cudnn import my_operation_wrapper  # unchanged compatibility API
 ```
 
 To add a new frontend-only API:
 
-1. Define the semantic operation: logical inputs and outputs, common option
-   names/defaults, shape/dtype/layout inference, support domain, workspace,
-   aliasing, and initialization behavior.
-2. Add the CuTe implementation. Every `@cute.kernel`, including helper kernels,
-   must be owned by the semantic operation's exact `kernel_anchors` entry.
-3. Preserve or add the canonical Torch class/wrapper API following existing
-   conventions. Add an aligned Torch high-level function whose symbol exactly
-   matches the semantic operation and JAX symbol. Do not replace the legacy
-   `TupleDict`, stream controls, output-buffer lifecycle, or compatibility
-   behavior to make it resemble JAX.
-4. Add the functional JAX adapter using `cutlass.jax.cutlass_call`. It must infer
-   outputs/workspace from abstract metadata, accept XLA's stream, and avoid
-   Torch imports or host reads during tracing.
-5. Register the internal semantic contract in `python/cudnn/frontend`. Every
-   concrete target binding symbol must exactly equal the semantic operation
-   name. The Torch binding is required; JAX must be a `TargetBinding` or explicit
-   `TargetGap(reason, tracking_issue)`. Record parameter/output mappings,
-   target-only arguments, exact `api_anchors`, and exact `kernel_anchors`.
-6. Add common support-domain/numerical parity cases plus Torch and JAX lifecycle
-   tests in `test/python/fe_api/`. JAX coverage should include `eval_shape`,
-   `jit`, lowering, and execution on supported hardware.
-7. Run `test_frontend_target_parity.py`. A new public class/wrapper or physical
-   kernel without a semantic owner is a failure. Existing baselines are
-   migration debt and must not grow for a new operation.
-8. Keep the Torch exports in `cudnn` and expose JAX only from `cudnn.jax`.
+1. Document logical inputs and outputs, supported shapes/dtypes/layouts,
+   workspace, aliasing, initialization, and transformation behavior.
+2. Add the CuTe implementation and preserve the existing PyTorch class/wrapper
+   conventions and compatibility behavior.
+3. If JAX support is in scope, add a functional adapter using
+   `cutlass.jax.cutlass_call`. It must infer outputs/workspace from abstract
+   metadata, accept XLA's stream, and avoid Torch imports or host reads during
+   tracing.
+4. Prefer recognizable operation, operand, option, and result names across
+   frameworks, but document intentional differences. Exact Python names,
+   signatures, defaults, layouts, result containers, and supported domains are
+   not required to match.
+5. Test each framework's lifecycle and compare numerical behavior on the domain
+   they share. JAX coverage should include `eval_shape`, `jit`, lowering, and
+   execution on supported hardware.
+6. During review, consider whether a new or modified PyTorch operation should
+   update JAX. Static lint or LLM review may report likely gaps or drift, but is
+   advisory rather than a public API contract or merge gate.
+7. Keep PyTorch exports in `cudnn` and expose JAX only from `cudnn.jax`.
    Register JAX dependencies only in the optional extra.
 
-The catalog is for ownership, support reporting, and CI; it is not a public
-backend-dispatch facade. Do not use tensor-type dispatch or a traced `target=`
-argument. JAX does not emulate the mutable `APIBase.compile()` / `execute()`
-lifecycle. JAX is optional for users to install, but declaring its support
-status is mandatory for contributors; the normal policy rejects new JAX gaps.
+Do not use tensor-type dispatch or a traced `target=` argument. JAX does not
+emulate the mutable `APIBase.compile()` / `execute()` lifecycle, and adding or
+updating a PyTorch operation does not require a JAX binding.
 
 **Currently implemented frontend-only APIs**:
 - `GEMM + Amax`

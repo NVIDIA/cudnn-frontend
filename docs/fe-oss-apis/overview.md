@@ -49,22 +49,21 @@ support.
 
 ## API Usage
 
-Torch remains the canonical FE-OSS API and preserves its existing wrapper and
-class styles unchanged. A JAX-enabled operation additionally exposes the same
-semantic high-level function name from both framework namespaces:
+PyTorch remains the default FE-OSS interface and preserves its existing
+wrappers and classes. Some operations also provide a functional JAX API under
+`cudnn.jax`. For example, RMSNorm + RHT + amax currently uses the same
+functional name in both namespaces:
 
 ```python
-from cudnn import operation_name               # aligned Torch API
-from cudnn.jax import operation_name           # aligned optional JAX API
-
-from cudnn import operation_name_wrapper       # existing Torch compatibility API
+from cudnn import rmsnorm_rht_amax_sm100
+from cudnn.jax import rmsnorm_rht_amax_sm100
 ```
 
-The aligned functions use the registry's exact semantic operation name and
-share logical operand, option, and result-role names. Torch-only controls such
-as `current_stream` remain additive. JAX does not replace or narrow the legacy
-Torch wrapper, `TupleDict`, class lifecycle, singleton-padding compatibility,
-or stream controls. Backend selection is never inferred from array types.
+Where both bindings exist, they should offer comparable operation semantics and
+recognizable inputs, options, and results. Exact names, signatures, defaults,
+layouts, result containers, lifecycle controls, and supported domains may
+differ by framework. JAX does not replace or narrow the PyTorch APIs, and
+backend selection is never inferred from array types.
 
 ### 1. High-level wrapper
 

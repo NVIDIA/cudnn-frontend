@@ -11,9 +11,10 @@ top-level Torch classes and wrappers remain canonical and backward compatible.
 Add JAX as an optional functional namespace under `cudnn.jax`, lowering CuTe DSL
 launchers through `cutlass.jax.cutlass_call`.
 
-An internal framework-neutral catalog connects those intentionally different
-public APIs. It records semantic parameter/output mappings, exact API and kernel
-ownership, and whether JAX is implemented or is an explicit tracked gap.
+No framework-neutral public API or mandatory cross-framework contract layer is
+needed. Each binding should follow its framework's conventions while reusing
+kernel code and framework-neutral implementation helpers where that reduces
+real duplication.
 
 The distinction matters because a JAX value encountered during tracing is an
 abstract value, not a device buffer:
@@ -30,9 +31,9 @@ abstract value, not a device buffer:
 | Cache | Python object and compiled callable | JAX executable cache plus CUTLASS function/spec cache |
 
 The proof of concept implements this split and ports one real FE-OSS operation,
-RMSNorm + RHT + amax, without changing its existing Torch API. It also adds a
-dependency-free ownership audit so a new public API or physical CuTe kernel
-cannot silently omit its JAX support status.
+RMSNorm + RHT + amax, without changing its existing Torch API. JAX support is
+reviewed per operation rather than required for every new or modified PyTorch
+API or physical CuTe kernel.
 
 ## Scope
 
@@ -129,40 +130,22 @@ CUDA-graph opt-out, and `jax.export`. It deliberately rejects autodiff and
 
 ## Proposed architecture
 
-### Parity by construction
+### Comparable APIs by operation
 
-The unit of API parity is a **semantic operation variant**, not an individual
-`@cute.kernel`. A forward operation may own a main kernel, initialization
-helpers, and architecture-specific implementations while still presenting one
-Torch/JAX contract. Conversely, a public helper that is independently callable
-may deserve its own operation entry even when it shares a kernel module.
+The useful comparison unit is a user-visible operation, not an individual
+`@cute.kernel`. PyTorch and JAX bindings should describe comparable computation
+where their supported domains overlap, while retaining framework-appropriate
+interfaces.
 
-Each operation is registered once with:
-
-```text
-FrontendOperationSpec
-  name                         stable semantic/variant identifier
-  contract_signature           internal common parameters/defaults
-  targets[TORCH]               required aligned high-level binding
-  targets[JAX]                 same-named binding or explicit TargetGap
-  parameter_map                semantic name -> target API name
-  output_map                   semantic role -> target result name
-  target_only_parameters       e.g. Torch current_stream
-  api_anchors                  exact legacy class/wrapper compatibility symbols
-  kernel_anchors               exact @cute.kernel symbols it owns
-  parity_case                  required when a JAX binding exists
-```
-
-The target APIs remain separate and explicit while sharing an exact semantic
-operation name:
+The RMSNorm POC currently uses the same functional name in both namespaces:
 
 ```python
-# Aligned Torch API.
+# PyTorch functional API for this operation.
 from cudnn import rmsnorm_rht_amax_sm100
 
 torch_result = rmsnorm_rht_amax_sm100(...)
 
-# Canonical existing Torch compatibility API, unchanged.
+# Existing PyTorch compatibility API, unchanged.
 from cudnn import rmsnorm_rht_amax_wrapper_sm100
 
 legacy_torch_result = rmsnorm_rht_amax_wrapper_sm100(...)
@@ -179,33 +162,17 @@ ambiguous and brittle. A `target=` argument inside the call would also become
 part of the traced call surface. Importing `cudnn.jax` is the explicit opt-in and
 provides an ordinary stable function to `jax.jit`.
 
-The aligned high-level functions have the same symbol, logical operand names,
-common option names/defaults, and output-role names. Semantic parity still does
-not require identical return container types or framework-only parameters.
-Torch legitimately retains `current_stream`, eager allocation, and `TupleDict`;
-JAX owns its stream and buffers and returns a standard pytree. The legacy Torch
-wrapper and class also retain singleton-padding compatibility, their historical
-names, and their explicit lifecycle.
+Matching names are useful for discoverability but are not required. Prefer
+recognizable logical operands, options, and result concepts where practical;
+exact signatures, defaults, layouts, result containers, lifecycle controls,
+and supported domains may differ. PyTorch legitimately retains explicit stream
+control, eager allocation, `TupleDict`, singleton-padding compatibility, and a
+class lifecycle. JAX owns its buffers and stream and returns standard pytrees.
 
-The registry requires both target keys. A genuinely unavailable target must be
-represented by `TargetGap(reason, tracking_issue)` rather than by omission. The
-normal policy for a newly added operation is stricter: new target gaps do not
-merge. `TargetGap` exists to inventory pre-existing debt and to make an
-exception reviewable, not to make a Torch-only addition look complete.
-
-Here, "optional JAX" means the dependency and namespace are opt-in for users;
-it does not mean JAX support status is optional for contributors. Every
-cataloged operation must say implemented or gap, and the no-growth gate expects
-new operations to be implemented for JAX.
-
-The POC's dependency-free AST audit currently finds 64 public Python API
-anchors and 58 physical `@cute.kernel` symbols. RMSNorm owns two API anchors and
-one kernel under a complete target contract. The remaining 62 API anchors and
-57 kernels are exact-symbol migration baselines. Module-level ownership is not
-sufficient: it would let a new kernel in an existing module pass unnoticed.
-The operation-level JAX-gap baseline starts empty, so a newly cataloged
-operation cannot declare JAX missing without an explicit baseline-policy
-exception.
+Optional JAX means both the dependency and the binding are opt-in. A new or
+modified PyTorch operation does not require a JAX implementation. When a JAX
+binding is provided, its documentation must state the overlapping support
+domain and any meaningful behavioral differences.
 
 The current wrapper inventory makes the functional gap concrete:
 
@@ -220,38 +187,24 @@ The current wrapper inventory makes the functional gap concrete:
 | DeepSeek sparse attention stages | 11 | 0 |
 | **Total** | **33** | **1** |
 
-This is an inventory, not yet a promise that every legacy helper wrapper should
-remain an independent public operation. Phase 1 must group those anchors into
-reviewed semantic family/variant rows before generating the long-term support
-matrix.
+The table is a point-in-time review aid, not a coverage requirement or promise
+that every helper wrapper needs a JAX equivalent.
 
-CI should enforce all of the following:
+Recommended review checks are intentionally lightweight:
 
-1. Discovered public `APIBase` descendants and wrapper functions equal the
-   union of registered API anchors and the checked-in migration baseline.
-2. Every discovered `@cute.kernel` equals a registered kernel owner or a
-   reviewed internal/migration exception.
-3. On a pull request, each baseline set is a subset of its merge-base version.
-   This is what makes debt non-growing; an equality test against an editable
-   file alone cannot enforce that policy.
-4. Every bound target resolves to a module-level callable whose declared
-   semantic parameter/default and output-role mappings still match the catalog.
-   Torch-only parameters are explicit rather than leaked into JAX.
-5. Every complete operation supplies common support-domain and numerical parity
-   cases. Torch and JAX target lanes also test their target-specific lifecycle.
-6. JAX cases cover `eval_shape`, `jit`, custom-call lowering, execution, and
-   documented transformation behavior.
+1. Notice new or modified PyTorch FE-OSS APIs and consider whether a JAX update
+   is useful.
+2. For an implemented pair, compare documented inputs, options, outputs, and
+   supported cases rather than requiring identical Python surfaces.
+3. Run each framework's lifecycle tests and numerical comparisons on the domain
+   they share.
+4. Ensure JAX cases cover `eval_shape`, `jit`, custom-call lowering, execution,
+   and documented transformation behavior.
 
-The AST audit detects structural additions and mapped-default drift. It cannot
-infer that an edit inside an already-owned kernel changed semantics. Shared
-parity fixtures and target execution tests are therefore mandatory, not
-optional follow-up coverage. The canonical Torch wrapper also needs a separate
-compatibility snapshot for its signature, `TupleDict` behavior, singleton-rank
-handling, and stream semantics.
-
-The initial scan covers the Python FE-OSS surface. C++ OSS engine registrations
-need a separate discovery adapter feeding the same semantic catalog; scanning
-Python alone must not be presented as complete repository-wide coverage.
+A static linter or LLM reviewer may report likely support gaps or interface
+drift, but such reports are advisory. They should not create a framework-neutral
+runtime registry, require exact cross-framework signatures, or automatically
+block a justified PyTorch-only change.
 
 ### 1. Framework-neutral operator core
 
@@ -541,7 +494,7 @@ loading before measuring capture/replay.
 Recommended public shape:
 
 ```python
-# Aligned Torch API uses the exact semantic/JAX operation name.
+# PyTorch functional API for this operation.
 from cudnn import rmsnorm_rht_amax_sm100
 
 torch_result = rmsnorm_rht_amax_sm100(
@@ -553,7 +506,7 @@ torch_result = rmsnorm_rht_amax_sm100(
     current_stream=None,
 )
 
-# Existing canonical Torch compatibility API remains unchanged.
+# Existing PyTorch compatibility API remains unchanged.
 from cudnn import rmsnorm_rht_amax_wrapper_sm100
 
 legacy_torch_result = rmsnorm_rht_amax_wrapper_sm100(
@@ -582,17 +535,18 @@ def run(x, weight):
 jax_result = run(x_jax, weight_jax)
 ```
 
-- Torch remains the default, first-class API. Its class lifecycle, wrapper
+- PyTorch remains the default, first-class API. Its class lifecycle, wrapper
   signature, `TupleDict`, singleton-padding behavior, and stream controls are
   compatibility contracts.
-- Every concrete target binding uses the exact semantic operation name. Adding
-  a JAX binding with a different symbol fails the dependency-free registry test.
+- Use related, discoverable names across frameworks where practical; exact
+  symbol matching is not required.
 - JAX is explicitly selected by importing `cudnn.jax`; installing the base or
-  Torch extras does not require JAX.
+  PyTorch extras does not require JAX.
 - JAX operations use functional inputs/outputs and standard named tuples or
-  registered pytrees. They do not emulate Torch output buffers or streams.
-- Common operand/option names, parameter kinds, defaults, and output roles must
-  match. Framework-only parameters and return-container types may differ.
+  registered pytrees. They do not emulate PyTorch output buffers or streams.
+- Document how logical operands, options, and results correspond. Parameter
+  kinds, defaults, containers, layouts, target-only controls, and supported
+  domains may differ.
 - Compile-affecting JAX keyword arguments are Python-static: close them over as
   above or name them in `jax.jit(static_argnames=...)`. Dynamic tensor/scalar
   operands remain explicit inputs.
@@ -601,12 +555,9 @@ jax_result = run(x_jax, weight_jax)
   flattened and reconstructed by their wrappers, but nested inputs do not cross
   the low-level adapter.
 
-The internal catalog is for ownership, support reporting, and CI; it is not a
-replacement public dispatch facade.
-
 The POC adds a `jax` optional dependency group. It intentionally does
-not depend on Torch. Production CI needs a JAX lane whose test bootstrap also
-does not unconditionally import Torch.
+not depend on PyTorch. Production CI needs a JAX lane whose test bootstrap also
+does not unconditionally import PyTorch.
 
 JAX follows a fast-moving pre-1.0 compatibility policy. The current official
 CuTe DSL + JAX guide lists JAX 0.8.1 as its minimum, while CUTLASS 4.5's module
@@ -625,17 +576,6 @@ sides of that boundary.
 
 ### Implemented pieces
 
-- [`cudnn.frontend`](../../python/cudnn/frontend)
-  - is an internal dependency-light support and ownership catalog, not a public
-    execution facade;
-  - requires a concrete canonical Torch wrapper plus a JAX binding or explicit
-    tracked gap;
-  - records semantic parameter/output mappings and intentional target-only
-    parameters such as `current_stream`;
-  - requires a parity-case identifier whenever JAX is available;
-  - records exact public API and physical kernel ownership anchors;
-  - includes a dependency-free audit of all current Python FE-OSS APIs and
-    `@cute.kernel` definitions.
 - [`cudnn.jax.cutedsl`](../../python/cudnn/jax/cutedsl.py)
   - remains an internal POC seam rather than a top-level public export until a
     real workspace-using operator validates the contract;
@@ -649,14 +589,13 @@ sides of that boundary.
   - memoizes launcher adapters for stable CUTLASS cache identity.
 - [`cudnn.jax.rmsnorm_rht_amax_sm100`](../../python/cudnn/jax/rmsnorm_rht_amax.py)
   - validates abstract rank, shape, and BF16 dtype;
-  - matches the canonical Torch option names/defaults and launch heuristics;
+  - uses comparable PyTorch option concepts and launch heuristics;
   - declares `(M, N)` BF16 and `(M / rows_per_cta,)` FP32 outputs;
   - lowers the existing CuTe kernel through `cutlass_call`.
 - CPU-only adapter contract tests cover hidden workspace, initialization,
   aliases, layouts, and invalid metadata.
-- CPU-only parity-contract tests cover canonical Torch ownership, optional JAX
-  status, mapped-default drift, parity-case presence, API discovery, and exact
-  kernel ownership.
+- Dependency-free smoke tests cover the optional JAX namespace, lazy framework
+  imports, the PyTorch functional export, and packaging metadata.
 - A GPU test inspects StableHLO, executes one compiled program twice, and checks
   a numerical JAX reference when JAX, CuTe DSL, CUDA, and SM100 hardware are
   available.
@@ -664,11 +603,6 @@ sides of that boundary.
 ### POC limitations
 
 - Only one operation is exposed.
-- Existing APIs and physical kernels remain in explicit migration baselines;
-  the POC has not yet grouped all legacy anchors into semantic operation rows.
-- The local AST test makes baseline edits visible but cannot by itself forbid a
-  contributor from adding a new exception. Production CI must compare the
-  baseline sets with the pull request's merge base and reject growth.
 - `M` and `N` must be concrete during tracing.
 - JAX currently accepts the rank-2/rank-1 core domain only; the canonical Torch
   wrapper's singleton-padded compatibility remains Torch-specific.
@@ -680,7 +614,7 @@ sides of that boundary.
 - The JAX optional dependency version range needs release-owner approval.
 - Launcher and CUTLASS compile caches are currently unbounded.
 
-## Rollout plan and acceptance gates
+## Rollout plan and validation milestones
 
 ### Phase 0: vertical-slice POC
 
@@ -689,30 +623,26 @@ Status: implemented in this change.
 - Add the JAX CuTe call adapter.
 - Extract one framework-neutral launch config.
 - Port RMSNorm + RHT + amax.
-- Add the Torch-canonical support catalog, aligned target-symbol invariant, and
-  exact-symbol ownership audit.
 - Add CPU contract tests and an SM100 numerical test.
 
-Gate: run the GPU test on SM100, inspect lowered StableHLO for one custom call,
-and verify a second invocation reuses the compiled executable.
+Review checkpoint: run the GPU test on SM100, inspect lowered StableHLO for one
+custom call, and verify a second invocation reuses the compiled executable.
 
 ### Phase 1: neutral metadata core
 
-- Replace the flat migration baselines with catalog rows grouped by semantic
-  family/variant, each carrying API/kernel ownership and gap issue metadata.
-- Add merge-base non-growth enforcement and generate a checked support matrix
-  from the catalog.
+- Generate an informational support matrix if the number of JAX operations
+  grows enough to justify one.
 - Define canonical dtype plus explicit FP4 packing.
 - Define logical shape, compact physical layout, mode mapping, alignment, and
-  divisibility independent of Torch.
+  divisibility independent of PyTorch.
 - Split shape/output inference and support validation from allocation.
-- Preserve existing Torch constructors, wrappers, result containers, and dtype
+- Preserve existing PyTorch constructors, wrappers, result containers, and dtype
   arguments as independently tested compatibility contracts.
-- Add Torch/JAX cross-target metadata tests.
+- Add numerical and metadata comparisons for the domains shared by both
+  bindings.
 
-Gate: the RMSNorm operator has one validation/inference implementation, both
-targets retain numerical behavior, and a new API or `@cute.kernel` fails CI
-until it has a complete semantic owner.
+Review checkpoint: RMSNorm shares validation/inference logic where practical
+and both targets retain expected numerical behavior.
 
 ### Phase 2: workspace-free dense kernels
 
@@ -721,8 +651,8 @@ until it has a complete semantic owner.
 - Exercise initialized auxiliary outputs and legal donation.
 - Define compile-cache observability and limits.
 
-Gate: JIT correctness, layout HLO inspection, concurrent calls, cache reuse, and
-Torch parity on supported shapes.
+Review checkpoint: JIT correctness, layout HLO inspection, concurrent calls,
+cache reuse, and PyTorch/JAX numerical comparison on overlapping shapes.
 
 ### Phase 3: workspace and training
 
@@ -732,8 +662,9 @@ Torch parity on supported shapes.
 - Add `custom_vjp` and residual outputs.
 - Validate CUDA graph replay and reentrancy on multiple streams.
 
-Gate: forward/backward numerical parity, no shared mutable workspace, gradient
-tests, concurrent execution, and memory/capture tests.
+Review checkpoint: forward/backward numerical comparison on overlapping cases,
+no shared mutable workspace, gradient tests, concurrent execution, and
+memory/capture tests.
 
 ### Phase 4: grouped, discrete, and sharded operations
 
@@ -742,8 +673,8 @@ tests, concurrent execution, and memory/capture tests.
 - Add operator-specific `shard_map` examples and partitioning rules.
 - Integrate explicit JAX collectives where distributed semantics require them.
 
-Gate: multi-device correctness, pointer lifetime safety, no host synchronization
-in the runtime path, and deterministic workspace bounds.
+Review checkpoint: multi-device correctness, pointer lifetime safety, no host
+synchronization in the runtime path, and deterministic workspace bounds.
 
 ### Separate track: C++ graph API
 
