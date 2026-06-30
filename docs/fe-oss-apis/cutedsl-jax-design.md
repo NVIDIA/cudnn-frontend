@@ -143,23 +143,29 @@ Each operation is registered once with:
 FrontendOperationSpec
   name                         stable semantic/variant identifier
   contract_signature           internal common parameters/defaults
-  targets[TORCH]               required canonical wrapper binding
-  targets[JAX]                 optional binding or explicit TargetGap
+  targets[TORCH]               required aligned high-level binding
+  targets[JAX]                 same-named binding or explicit TargetGap
   parameter_map                semantic name -> target API name
   output_map                   semantic role -> target result name
   target_only_parameters       e.g. Torch current_stream
-  api_anchors                  exact public class/wrapper symbols it owns
+  api_anchors                  exact legacy class/wrapper compatibility symbols
   kernel_anchors               exact @cute.kernel symbols it owns
   parity_case                  required when a JAX binding exists
 ```
 
-The target APIs remain separate and explicit:
+The target APIs remain separate and explicit while sharing an exact semantic
+operation name:
 
 ```python
-# Canonical existing Torch API, unchanged.
+# Aligned Torch API.
+from cudnn import rmsnorm_rht_amax_sm100
+
+torch_result = rmsnorm_rht_amax_sm100(...)
+
+# Canonical existing Torch compatibility API, unchanged.
 from cudnn import rmsnorm_rht_amax_wrapper_sm100
 
-torch_result = rmsnorm_rht_amax_wrapper_sm100(...)
+legacy_torch_result = rmsnorm_rht_amax_wrapper_sm100(...)
 
 # Optional JAX-native API.
 from cudnn.jax import rmsnorm_rht_amax_sm100
@@ -173,12 +179,13 @@ ambiguous and brittle. A `target=` argument inside the call would also become
 part of the traced call surface. Importing `cudnn.jax` is the explicit opt-in and
 provides an ordinary stable function to `jax.jit`.
 
-Semantic parity does not mean exact Python signatures or return containers.
-Torch legitimately retains `current_stream`, singleton-padding compatibility,
-eager allocation, `TupleDict`, and its explicit class lifecycle. JAX owns its
-stream and buffers, consumes abstract values, and returns a standard pytree. The
-catalog instead checks shared logical operands, common option names/defaults,
-output roles, validation/inference, and registered numerical parity coverage.
+The aligned high-level functions have the same symbol, logical operand names,
+common option names/defaults, and output-role names. Semantic parity still does
+not require identical return container types or framework-only parameters.
+Torch legitimately retains `current_stream`, eager allocation, and `TupleDict`;
+JAX owns its stream and buffers and returns a standard pytree. The legacy Torch
+wrapper and class also retain singleton-padding compatibility, their historical
+names, and their explicit lifecycle.
 
 The registry requires both target keys. A genuinely unavailable target must be
 represented by `TargetGap(reason, tracking_issue)` rather than by omission. The
@@ -534,16 +541,24 @@ loading before measuring capture/replay.
 Recommended public shape:
 
 ```python
-# Existing canonical Torch API and return type remain unchanged.
-from cudnn import rmsnorm_rht_amax_wrapper_sm100
+# Aligned Torch API uses the exact semantic/JAX operation name.
+from cudnn import rmsnorm_rht_amax_sm100
 
-torch_result = rmsnorm_rht_amax_wrapper_sm100(
-    x_tensor=x_torch,
-    w_tensor=weight_torch,
+torch_result = rmsnorm_rht_amax_sm100(
+    x_torch,
+    weight_torch,
     eps=1e-5,
     num_threads=128,
     rows_per_cta=2,
     current_stream=None,
+)
+
+# Existing canonical Torch compatibility API remains unchanged.
+from cudnn import rmsnorm_rht_amax_wrapper_sm100
+
+legacy_torch_result = rmsnorm_rht_amax_wrapper_sm100(
+    x_tensor=x_torch,
+    w_tensor=weight_torch,
 )
 
 # JAX is a separate optional install and namespace.
@@ -570,12 +585,14 @@ jax_result = run(x_jax, weight_jax)
 - Torch remains the default, first-class API. Its class lifecycle, wrapper
   signature, `TupleDict`, singleton-padding behavior, and stream controls are
   compatibility contracts.
+- Every concrete target binding uses the exact semantic operation name. Adding
+  a JAX binding with a different symbol fails the dependency-free registry test.
 - JAX is explicitly selected by importing `cudnn.jax`; installing the base or
   Torch extras does not require JAX.
 - JAX operations use functional inputs/outputs and standard named tuples or
   registered pytrees. They do not emulate Torch output buffers or streams.
-- Common option names and defaults should be retained when meaningful, but
-  exact target signatures and containers are not required.
+- Common operand/option names, parameter kinds, defaults, and output roles must
+  match. Framework-only parameters and return-container types may differ.
 - Compile-affecting JAX keyword arguments are Python-static: close them over as
   above or name them in `jax.jit(static_argnames=...)`. Dynamic tensor/scalar
   operands remain explicit inputs.
@@ -672,7 +689,8 @@ Status: implemented in this change.
 - Add the JAX CuTe call adapter.
 - Extract one framework-neutral launch config.
 - Port RMSNorm + RHT + amax.
-- Add the Torch-canonical support catalog and exact-symbol ownership audit.
+- Add the Torch-canonical support catalog, aligned target-symbol invariant, and
+  exact-symbol ownership audit.
 - Add CPU contract tests and an SM100 numerical test.
 
 Gate: run the GPU test on SM100, inspect lowered StableHLO for one custom call,

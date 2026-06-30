@@ -158,6 +158,10 @@ class FrontendOperationSpec:
         if not all(isinstance(status, (TargetBinding, TargetGap)) for status in normalized_targets.values()):
             raise TypeError(f"{self.name} target entries must be TargetBinding or TargetGap")
 
+        for target, status in normalized_targets.items():
+            if isinstance(status, TargetBinding) and status.symbol != self.name:
+                raise ValueError(f"{self.name} {target.value} binding symbol must match the " f"semantic operation name; got {status.symbol!r}")
+
         contract_names = set(self.contract_signature.parameters)
         output_names = set(self.output_names)
         for target, status in normalized_targets.items():
@@ -215,6 +219,13 @@ class FrontendOperationSpec:
         for semantic_name, target_name in binding.parameter_map.items():
             semantic_parameter = self.contract_signature.parameters[semantic_name]
             target_parameter = actual_parameters[target_name]
+            if semantic_parameter.kind != target_parameter.kind:
+                raise TypeError(
+                    f"{self.name} {target.value} parameter kind for semantic "
+                    f"parameter {semantic_name!r} drifted; expected "
+                    f"{semantic_parameter.kind.description}, got "
+                    f"{target_parameter.kind.description}"
+                )
             if semantic_parameter.default != target_parameter.default:
                 raise TypeError(
                     f"{self.name} {target.value} default for semantic parameter "

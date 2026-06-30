@@ -49,20 +49,22 @@ support.
 
 ## API Usage
 
-Torch remains the canonical FE-OSS API and exposes the following wrapper and
-class styles unchanged. Operations with optional JAX support are exposed in a
-separate namespace:
+Torch remains the canonical FE-OSS API and preserves its existing wrapper and
+class styles unchanged. A JAX-enabled operation additionally exposes the same
+semantic high-level function name from both framework namespaces:
 
 ```python
-from cudnn import operation_name_wrapper       # canonical Torch API
-from cudnn.jax import operation_name           # optional JAX API
+from cudnn import operation_name               # aligned Torch API
+from cudnn.jax import operation_name           # aligned optional JAX API
+
+from cudnn import operation_name_wrapper       # existing Torch compatibility API
 ```
 
-JAX is additive: it does not replace or narrow the Torch wrapper, `TupleDict`,
-class lifecycle, singleton-padding compatibility, or stream controls. The two
-APIs share semantic options and kernel behavior where meaningful, while JAX
-uses functional results and an XLA-owned stream. Backend selection is never
-inferred from array types.
+The aligned functions use the registry's exact semantic operation name and
+share logical operand, option, and result-role names. Torch-only controls such
+as `current_stream` remain additive. JAX does not replace or narrow the legacy
+Torch wrapper, `TupleDict`, class lifecycle, singleton-padding compatibility,
+or stream controls. Backend selection is never inferred from array types.
 
 ### 1. High-level wrapper
 

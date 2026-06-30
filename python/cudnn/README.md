@@ -32,14 +32,17 @@ test/python/                        # Test files
 
 The intended unit is a semantic operation variant, which may own one or more
 main/helper CuTe kernels. The existing Torch conventions remain canonical; JAX
-is an optional additive namespace:
+is an optional additive namespace. JAX-enabled operations expose an aligned
+high-level name in both namespaces while retaining the legacy Torch wrapper:
 
 ```python
-from cudnn import my_operation_wrapper
-torch_result = my_operation_wrapper(torch_inputs, ...)
+from cudnn import my_operation
+torch_result = my_operation(torch_inputs, ...)
 
 from cudnn.jax import my_operation
 jax_result = my_operation(jax_inputs, ...)
+
+from cudnn import my_operation_wrapper  # unchanged compatibility API
 ```
 
 To add a new frontend-only API:
@@ -50,13 +53,16 @@ To add a new frontend-only API:
 2. Add the CuTe implementation. Every `@cute.kernel`, including helper kernels,
    must be owned by the semantic operation's exact `kernel_anchors` entry.
 3. Preserve or add the canonical Torch class/wrapper API following existing
-   conventions. Do not replace its `TupleDict`, stream controls, output-buffer
-   lifecycle, or compatibility behavior to make it resemble JAX.
+   conventions. Add an aligned Torch high-level function whose symbol exactly
+   matches the semantic operation and JAX symbol. Do not replace the legacy
+   `TupleDict`, stream controls, output-buffer lifecycle, or compatibility
+   behavior to make it resemble JAX.
 4. Add the functional JAX adapter using `cutlass.jax.cutlass_call`. It must infer
    outputs/workspace from abstract metadata, accept XLA's stream, and avoid
    Torch imports or host reads during tracing.
-5. Register the internal semantic contract in `python/cudnn/frontend`. The Torch
-   binding is required; JAX must be a `TargetBinding` or explicit
+5. Register the internal semantic contract in `python/cudnn/frontend`. Every
+   concrete target binding symbol must exactly equal the semantic operation
+   name. The Torch binding is required; JAX must be a `TargetBinding` or explicit
    `TargetGap(reason, tracking_issue)`. Record parameter/output mappings,
    target-only arguments, exact `api_anchors`, and exact `kernel_anchors`.
 6. Add common support-domain/numerical parity cases plus Torch and JAX lifecycle

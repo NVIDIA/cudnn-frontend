@@ -27,17 +27,9 @@ _COMMON_OUTPUT_NAMES = {
     targets={
         FrontendTarget.TORCH: TargetBinding(
             module="cudnn.rmsnorm_rht_amax.api",
-            symbol="rmsnorm_rht_amax_wrapper_sm100",
-            parameter_map={
-                **_COMMON_PARAMETER_NAMES,
-                "x": "x_tensor",
-                "weight": "w_tensor",
-            },
-            output_map={
-                **_COMMON_OUTPUT_NAMES,
-                "output": "o_tensor",
-                "amax": "amax_tensor",
-            },
+            symbol="rmsnorm_rht_amax_sm100",
+            parameter_map=_COMMON_PARAMETER_NAMES,
+            output_map=_COMMON_OUTPUT_NAMES,
             target_only_parameters=("current_stream",),
         ),
         FrontendTarget.JAX: TargetBinding(

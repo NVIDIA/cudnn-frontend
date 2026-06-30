@@ -58,6 +58,13 @@ def _binding(
     )
 
 
+def _aligned_bindings(name):
+    return {
+        _REGISTRY_MODULE.FrontendTarget.TORCH: _binding("example.torch", name),
+        _REGISTRY_MODULE.FrontendTarget.JAX: _binding("example.jax", name),
+    }
+
+
 def _base_name(base):
     if isinstance(base, ast.Name):
         return base.id
@@ -174,12 +181,14 @@ class FrontendTargetParityTest(unittest.TestCase):
         self.assertIsInstance(jax_binding, _REGISTRY_MODULE.TargetBinding)
         self.assertEqual(
             torch_binding.qualified_name,
-            "cudnn.rmsnorm_rht_amax.api:rmsnorm_rht_amax_wrapper_sm100",
+            "cudnn.rmsnorm_rht_amax.api:rmsnorm_rht_amax_sm100",
         )
+        self.assertEqual(torch_binding.symbol, operation.name)
+        self.assertEqual(jax_binding.symbol, operation.name)
         self.assertEqual(torch_binding.target_only_parameters, ("current_stream",))
         self.assertEqual(
             dict(torch_binding.output_map),
-            {"output": "o_tensor", "amax": "amax_tensor"},
+            {"output": "output", "amax": "amax"},
         )
         self.assertEqual(
             dict(jax_binding.output_map),
@@ -207,6 +216,35 @@ class FrontendTargetParityTest(unittest.TestCase):
         )
         self.assertNotIn(f"{_TEST_PACKAGE}.rmsnorm_rht_amax.api", sys.modules)
 
+    def test_aligned_torch_name_is_exported_from_the_canonical_namespace(self):
+        top_level_tree = ast.parse(
+            (_CUDNN_ROOT / "__init__.py").read_text(),
+            filename=str(_CUDNN_ROOT / "__init__.py"),
+        )
+        lazy_imports_node = next(
+            node.value
+            for node in top_level_tree.body
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "_LAZY_OPTIONAL_IMPORTS" for target in node.targets)
+        )
+        lazy_imports = ast.literal_eval(lazy_imports_node)
+
+        operation = _FRONTEND.registered_operations()[0]
+        self.assertEqual(
+            lazy_imports[operation.name],
+            (".rmsnorm_rht_amax", operation.name),
+        )
+
+        package_tree = ast.parse(
+            (_CUDNN_ROOT / "rmsnorm_rht_amax" / "__init__.py").read_text(),
+            filename=str(_CUDNN_ROOT / "rmsnorm_rht_amax" / "__init__.py"),
+        )
+        package_exports_node = next(
+            node.value
+            for node in package_tree.body
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets)
+        )
+        self.assertIn(operation.name, ast.literal_eval(package_exports_node))
+
     def test_jax_optional_extra_is_framework_named_and_torch_free(self):
         pyproject = (_REPO_ROOT / "pyproject.toml").read_text()
         optional_dependencies = re.search(
@@ -227,14 +265,15 @@ class FrontendTargetParityTest(unittest.TestCase):
 
     def test_catalog_resolves_target_bindings_lazily(self):
         def torch_impl(
-            x_tensor,
-            w_tensor,
+            x,
+            weight,
+            *,
             eps=1e-5,
             num_threads=None,
             rows_per_cta=None,
             current_stream=None,
         ):
-            return x_tensor, w_tensor, current_stream
+            return x, weight, current_stream
 
         def jax_impl(
             x,
@@ -247,7 +286,7 @@ class FrontendTargetParityTest(unittest.TestCase):
             return x, weight
 
         modules = {
-            "cudnn.rmsnorm_rht_amax.api": types.SimpleNamespace(rmsnorm_rht_amax_wrapper_sm100=torch_impl),
+            "cudnn.rmsnorm_rht_amax.api": types.SimpleNamespace(rmsnorm_rht_amax_sm100=torch_impl),
             "cudnn.jax.rmsnorm_rht_amax": types.SimpleNamespace(rmsnorm_rht_amax_sm100=jax_impl),
         }
         operation = _FRONTEND.registered_operations()[0]
@@ -285,19 +324,33 @@ class FrontendTargetParityTest(unittest.TestCase):
             with self.assertRaisesRegex(TypeError, "default.*eps.*drifted"):
                 operation.resolve(_REGISTRY_MODULE.FrontendTarget.JAX)
 
-    def test_operation_ownership_cannot_overlap(self):
-        targets = {
-            _REGISTRY_MODULE.FrontendTarget.TORCH: _binding("example", "torch_impl"),
-            _REGISTRY_MODULE.FrontendTarget.JAX: _binding("example", "jax_impl"),
-        }
+    def test_semantic_parameter_kind_drift_is_rejected(self):
+        def drifted_jax_impl(
+            x,
+            weight,
+            eps=1e-5,
+            num_threads=None,
+            rows_per_cta=None,
+        ):
+            return x, weight
 
+        operation = _FRONTEND.registered_operations()[0]
+        with mock.patch.object(
+            _REGISTRY_MODULE.importlib,
+            "import_module",
+            return_value=types.SimpleNamespace(rmsnorm_rht_amax_sm100=drifted_jax_impl),
+        ):
+            with self.assertRaisesRegex(TypeError, "parameter kind.*eps.*drifted"):
+                operation.resolve(_REGISTRY_MODULE.FrontendTarget.JAX)
+
+    def test_operation_ownership_cannot_overlap(self):
         for duplicate_kind in ("api", "kernel"):
             with self.subTest(duplicate_kind=duplicate_kind):
                 local_registry = _REGISTRY_MODULE.FrontendOperationRegistry()
 
                 @_REGISTRY_MODULE.frontend_operation(
                     name="first",
-                    targets=targets,
+                    targets=_aligned_bindings("first"),
                     api_anchors=("example.api:First",),
                     kernel_anchors=("example.kernel:First.kernel",),
                     output_names=("output",),
@@ -313,7 +366,7 @@ class FrontendTargetParityTest(unittest.TestCase):
 
                     @_REGISTRY_MODULE.frontend_operation(
                         name="second",
-                        targets=targets,
+                        targets=_aligned_bindings("second"),
                         api_anchors=(second_api,),
                         kernel_anchors=(second_kernel,),
                         output_names=("output",),
@@ -333,9 +386,9 @@ class FrontendTargetParityTest(unittest.TestCase):
             @_REGISTRY_MODULE.frontend_operation(
                 name="duplicate_jax",
                 targets={
-                    _REGISTRY_MODULE.FrontendTarget.TORCH: _binding("example", "torch_impl"),
-                    _REGISTRY_MODULE.FrontendTarget.JAX: _binding("example", "jax_impl"),
-                    "JAX": _binding("example", "other_jax_impl"),
+                    _REGISTRY_MODULE.FrontendTarget.TORCH: _binding("example.torch", "duplicate_jax"),
+                    _REGISTRY_MODULE.FrontendTarget.JAX: _binding("example.jax", "duplicate_jax"),
+                    "JAX": _binding("example.other_jax", "duplicate_jax"),
                 },
                 api_anchors=("example.api:Example",),
                 kernel_anchors=("example.kernel:Example.kernel",),
@@ -353,7 +406,7 @@ class FrontendTargetParityTest(unittest.TestCase):
 
             @_REGISTRY_MODULE.frontend_operation(
                 name="missing_jax",
-                targets={_REGISTRY_MODULE.FrontendTarget.TORCH: _binding("example", "torch_impl")},
+                targets={_REGISTRY_MODULE.FrontendTarget.TORCH: _binding("example", "missing_jax")},
                 api_anchors=("example.api:Example",),
                 kernel_anchors=("example.kernel:Example.kernel",),
                 output_names=("output",),
@@ -375,7 +428,7 @@ class FrontendTargetParityTest(unittest.TestCase):
                         reason="not implemented",
                         tracking_issue="https://example.invalid/issue/1",
                     ),
-                    _REGISTRY_MODULE.FrontendTarget.JAX: _binding("example", "jax_impl"),
+                    _REGISTRY_MODULE.FrontendTarget.JAX: _binding("example", "missing_torch"),
                 },
                 api_anchors=("example.api:Example",),
                 kernel_anchors=("example.kernel:Example.kernel",),
@@ -392,7 +445,7 @@ class FrontendTargetParityTest(unittest.TestCase):
         @_REGISTRY_MODULE.frontend_operation(
             name="known_gap",
             targets={
-                _REGISTRY_MODULE.FrontendTarget.TORCH: _binding("example", "torch_impl"),
+                _REGISTRY_MODULE.FrontendTarget.TORCH: _binding("example", "known_gap"),
                 _REGISTRY_MODULE.FrontendTarget.JAX: _REGISTRY_MODULE.TargetGap(
                     reason="not migrated",
                     tracking_issue="https://example.invalid/issue/1",
@@ -423,8 +476,8 @@ class FrontendTargetParityTest(unittest.TestCase):
             @_REGISTRY_MODULE.frontend_operation(
                 name="missing_parity_case",
                 targets={
-                    _REGISTRY_MODULE.FrontendTarget.TORCH: _binding("example", "torch_impl"),
-                    _REGISTRY_MODULE.FrontendTarget.JAX: _binding("example", "jax_impl"),
+                    _REGISTRY_MODULE.FrontendTarget.TORCH: _binding("example.torch", "missing_parity_case"),
+                    _REGISTRY_MODULE.FrontendTarget.JAX: _binding("example.jax", "missing_parity_case"),
                 },
                 api_anchors=("example.api:Example",),
                 kernel_anchors=("example.kernel:Example.kernel",),
@@ -433,6 +486,26 @@ class FrontendTargetParityTest(unittest.TestCase):
                 registry=local_registry,
             )
             def missing_parity_case(x):
+                return x
+
+    def test_target_symbols_must_match_the_semantic_operation_name(self):
+        local_registry = _REGISTRY_MODULE.FrontendOperationRegistry()
+
+        with self.assertRaisesRegex(ValueError, "binding symbol must match"):
+
+            @_REGISTRY_MODULE.frontend_operation(
+                name="aligned_name",
+                targets={
+                    _REGISTRY_MODULE.FrontendTarget.TORCH: _binding("example.torch", "legacy_wrapper_name"),
+                    _REGISTRY_MODULE.FrontendTarget.JAX: _binding("example.jax", "aligned_name"),
+                },
+                api_anchors=("example.api:Example",),
+                kernel_anchors=("example.kernel:Example.kernel",),
+                output_names=("output",),
+                parity_case="aligned_name",
+                registry=local_registry,
+            )
+            def aligned_name(x):
                 return x
 
     def test_all_discovered_python_apis_are_registered_or_baselined(self):
@@ -476,7 +549,7 @@ class FrontendTargetParityTest(unittest.TestCase):
         target_sources = {
             _REGISTRY_MODULE.FrontendTarget.TORCH: (
                 _CUDNN_ROOT / "rmsnorm_rht_amax" / "api.py",
-                "rmsnorm_rht_amax_wrapper_sm100",
+                "rmsnorm_rht_amax_sm100",
             ),
             _REGISTRY_MODULE.FrontendTarget.JAX: (
                 _CUDNN_ROOT / "jax" / "rmsnorm_rht_amax.py",
@@ -505,21 +578,31 @@ class FrontendTargetParityTest(unittest.TestCase):
         self.assertEqual(
             tuple(torch_parameters),
             (
-                "x_tensor",
-                "w_tensor",
+                "x",
+                "weight",
                 "eps",
                 "num_threads",
                 "rows_per_cta",
                 "current_stream",
             ),
         )
-        self.assertTrue(all(kind == "positional" for kind, _ in torch_parameters.values()))
+        for target in _REGISTRY_MODULE.FrontendTarget:
+            target_parameters = _ast_function_parameters(*target_sources[target])
+            self.assertEqual(target_parameters["x"][0], "positional")
+            self.assertEqual(target_parameters["weight"][0], "positional")
+            for name in ("eps", "num_threads", "rows_per_cta"):
+                self.assertEqual(target_parameters[name][0], "keyword_only")
+        self.assertEqual(torch_parameters["current_stream"][0], "keyword_only")
 
-        jax_parameters = _ast_function_parameters(*target_sources[_REGISTRY_MODULE.FrontendTarget.JAX])
-        self.assertEqual(jax_parameters["x"][0], "positional")
-        self.assertEqual(jax_parameters["weight"][0], "positional")
-        for name in ("eps", "num_threads", "rows_per_cta"):
-            self.assertEqual(jax_parameters[name][0], "keyword_only")
+        legacy_parameters = _ast_function_parameters(
+            _CUDNN_ROOT / "rmsnorm_rht_amax" / "api.py",
+            "rmsnorm_rht_amax_wrapper_sm100",
+        )
+        self.assertEqual(
+            tuple(legacy_parameters),
+            ("x_tensor", "w_tensor", "eps", "num_threads", "rows_per_cta", "current_stream"),
+        )
+        self.assertTrue(all(kind == "positional" for kind, _ in legacy_parameters.values()))
 
     def test_available_jax_binding_has_target_lifecycle_tests(self):
         test_names_by_path = {}
@@ -539,6 +622,10 @@ class FrontendTargetParityTest(unittest.TestCase):
             case = operation.parity_case
             self.assertIn(
                 f"test_{case}_wrapper",
+                test_names_by_path["test_rmsnorm_rht_amax.py"],
+            )
+            self.assertIn(
+                f"test_{case}_aligned_api",
                 test_names_by_path["test_rmsnorm_rht_amax.py"],
             )
             self.assertIn(

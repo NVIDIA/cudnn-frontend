@@ -7,7 +7,6 @@ import logging
 from typing import Optional
 
 from cuda.bindings import driver as cuda
-import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32
@@ -300,3 +299,30 @@ def rmsnorm_rht_amax_wrapper_sm100(
     )
 
     return TupleDict(o_tensor=o_tensor, amax_tensor=amax_tensor)
+
+
+def rmsnorm_rht_amax_sm100(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps: float = 1e-5,
+    num_threads: Optional[int] = None,
+    rows_per_cta: Optional[int] = None,
+    current_stream: Optional[cuda.CUstream] = None,
+) -> TupleDict:
+    """Apply RMSNorm + RHT + amax through the aligned Torch API.
+
+    This additive facade shares its operation name, semantic operands, options,
+    and result roles with ``cudnn.jax.rmsnorm_rht_amax_sm100``.  The existing
+    ``rmsnorm_rht_amax_wrapper_sm100`` API remains unchanged for compatibility.
+    """
+
+    result = rmsnorm_rht_amax_wrapper_sm100(
+        x_tensor=x,
+        w_tensor=weight,
+        eps=eps,
+        num_threads=num_threads,
+        rows_per_cta=rows_per_cta,
+        current_stream=current_stream,
+    )
+    return TupleDict(output=result["o_tensor"], amax=result["amax_tensor"])

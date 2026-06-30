@@ -8,8 +8,9 @@
 
 This frontend integration exposes the kernel as a standard FE-OSS Python API with:
 - a class API (`RmsNormRhtAmaxSm100`)
-- a wrapper API (`rmsnorm_rht_amax_wrapper_sm100`)
-- an optional experimental JAX API (`cudnn.jax.rmsnorm_rht_amax_sm100`)
+- an aligned Torch API (`cudnn.rmsnorm_rht_amax_sm100`)
+- the existing wrapper API (`rmsnorm_rht_amax_wrapper_sm100`)
+- an aligned experimental JAX API (`cudnn.jax.rmsnorm_rht_amax_sm100`)
 - grouped-gemm-style regression coverage for compile/execute, wrapper use, and cache reuse
 
 ## Shapes
@@ -54,7 +55,30 @@ over every element produced by that CTA.
 
 ## API Usage
 
-### High-level wrapper
+### Aligned high-level Torch API
+
+The Torch and JAX namespaces expose the same semantic operation name, operand
+names, option names, and result roles. Torch additionally accepts its
+framework-specific stream control.
+
+```python
+from cudnn import rmsnorm_rht_amax_sm100
+
+result = rmsnorm_rht_amax_sm100(
+    x,
+    weight,
+    eps=1e-5,
+    num_threads=None,
+    rows_per_cta=None,
+    current_stream=None,
+)
+
+output, amax = result
+```
+
+The aligned Torch function returns `TupleDict(output=..., amax=...)`.
+
+### Existing high-level wrapper
 
 ```python
 from cudnn import rmsnorm_rht_amax_wrapper_sm100
@@ -100,8 +124,9 @@ op.execute(
 
 ### Optional experimental JAX API
 
-The existing Torch APIs above remain canonical and unchanged. Install the
-JAX-specific optional dependencies to use the functional JAX namespace:
+The existing Torch wrapper and class APIs above remain canonical and unchanged.
+Install the JAX-specific optional dependencies to use the aligned functional
+JAX namespace:
 
 ```bash
 pip install nvidia-cudnn-frontend[jax]
@@ -134,8 +159,9 @@ The proof of concept requires concrete `M` and `N` during tracing and does not
 yet define autodiff, `vmap`, or automatic partitioning rules. `eps`,
 `num_threads`, and `rows_per_cta` are static compilation state; close them over
 as above or list them in `jax.jit(static_argnames=...)`. JAX returns a standard
-`RmsNormRhtAmaxResult(output, amax)` named tuple; Torch retains its existing
-`TupleDict(o_tensor, amax_tensor)` contract. See
+`RmsNormRhtAmaxResult(output, amax)` named tuple. The aligned Torch function
+uses the same result-role names in a `TupleDict`; the legacy wrapper retains
+its existing `TupleDict(o_tensor, amax_tensor)` contract. See
 [CuTe DSL + JAX support for FE-OSS APIs](cutedsl-jax-design.md) for the design,
 workspace model, rollout plan, and current limitations.
 
@@ -143,11 +169,11 @@ workspace model, rollout plan, and current limitations.
 
 ### Input and output tensors
 
-- `x_tensor` / `sample_x`
+- `x` / `x_tensor` / `sample_x`
   - Shape: `(M, N)`
   - Layout: row-major contiguous
   - Dtype: `torch.bfloat16`
-- `w_tensor` / `sample_w`
+- `weight` / `w_tensor` / `sample_w`
   - Shape: `(N,)`
   - Layout: contiguous
   - Dtype: `torch.bfloat16`
@@ -171,11 +197,15 @@ workspace model, rollout plan, and current limitations.
 
 ### Wrapper return values
 
-Returns a `TupleDict` with keys:
+The aligned Torch function returns a `TupleDict` with keys:
+- `output`
+- `amax`
+
+The legacy wrapper returns a `TupleDict` with keys:
 - `o_tensor`
 - `amax_tensor`
 
-Tuple unpacking order is `(o_tensor, amax_tensor)`.
+Tuple unpacking follows each key order.
 
 ## Support surface and constraints
 
