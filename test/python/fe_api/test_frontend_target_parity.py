@@ -25,8 +25,11 @@ else:
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _PYTHON_ROOT = _REPO_ROOT / "python"
 _CUDNN_ROOT = _PYTHON_ROOT / "cudnn"
+_FE_OSS_DOCS_ROOT = _REPO_ROOT / "docs" / "fe-oss-apis"
 _TEST_PACKAGE = "cudnn_frontend_parity_contract_test"
 _REQUIRED_DEFAULT = "<required>"
+_TAB_SET_PATTERN = re.compile(r"(?ms)^(?P<fence>`{4,})\{tab-set\}\n(?P<body>.*?)^(?P=fence)$")
+_TAB_ITEM_PATTERN = re.compile(r"(?ms)^(?P<fence>`{3,})\{tab-item\} (?P<label>[^\n]+)\n" r"(?P<body>.*?)^(?P=fence)$")
 
 
 def _load_frontend_package():
@@ -632,6 +635,44 @@ class FrontendTargetParityTest(unittest.TestCase):
                 f"test_jax_{case}_jit",
                 test_names_by_path["test_jax_rmsnorm_rht_amax.py"],
             )
+
+    def test_available_jax_binding_has_torch_default_documentation_tabs(self):
+        documentation = {path: path.read_text() for path in sorted(_FE_OSS_DOCS_ROOT.rglob("*.md"))}
+
+        for operation in _FRONTEND.registered_operations():
+            if not isinstance(
+                operation.status(_REGISTRY_MODULE.FrontendTarget.JAX),
+                _REGISTRY_MODULE.TargetBinding,
+            ):
+                continue
+
+            torch_import = f"from cudnn import {operation.name}"
+            jax_import = f"from cudnn.jax import {operation.name}"
+            matching_tab_sets = []
+            for path, contents in documentation.items():
+                for tab_set_match in _TAB_SET_PATTERN.finditer(contents):
+                    tab_set_body = tab_set_match.group("body")
+                    tab_items = [(match.group("label"), match.group("body")) for match in _TAB_ITEM_PATTERN.finditer(tab_set_body)]
+                    by_label = dict(tab_items)
+                    if torch_import in by_label.get("PyTorch", "") and jax_import in by_label.get("JAX", ""):
+                        matching_tab_sets.append((path, tab_set_body, tab_items))
+
+            self.assertEqual(
+                len(matching_tab_sets),
+                1,
+                f"{operation.name} must have exactly one paired PyTorch/JAX " "documentation tab set",
+            )
+            path, tab_set_body, tab_items = matching_tab_sets[0]
+            self.assertEqual(
+                [label for label, _ in tab_items],
+                ["PyTorch", "JAX"],
+                f"PyTorch must be the first tab in {path}",
+            )
+            self.assertIn(":sync-group: frontend-framework", tab_set_body)
+            self.assertIn(":sync: torch", tab_items[0][1])
+            self.assertIn(":selected:", tab_items[0][1])
+            self.assertIn(":sync: jax", tab_items[1][1])
+            self.assertNotIn(":selected:", tab_items[1][1])
 
 
 if __name__ == "__main__":

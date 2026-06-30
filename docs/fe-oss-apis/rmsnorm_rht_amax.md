@@ -55,11 +55,24 @@ over every element produced by that CTA.
 
 ## API Usage
 
-### Aligned high-level Torch API
+### Aligned high-level API
 
 The Torch and JAX namespaces expose the same semantic operation name, operand
 names, option names, and result roles. Torch additionally accepts its
 framework-specific stream control.
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
+Install the CuTe DSL dependencies:
+
+```bash
+pip install nvidia-cudnn-frontend[cutedsl]
+```
 
 ```python
 from cudnn import rmsnorm_rht_amax_sm100
@@ -78,55 +91,12 @@ output, amax = result
 
 The aligned Torch function returns `TupleDict(output=..., amax=...)`.
 
-### Existing high-level wrapper
+`````
 
-```python
-from cudnn import rmsnorm_rht_amax_wrapper_sm100
+`````{tab-item} JAX
+:sync: jax
 
-result = rmsnorm_rht_amax_wrapper_sm100(
-    x_tensor=x,
-    w_tensor=w,
-    eps=1e-5,
-    num_threads=None,   # optional override
-    rows_per_cta=None,  # optional override
-    current_stream=None,
-)
-
-o_tensor, amax_tensor = result
-```
-
-When no overrides are supplied, the wrapper uses the upstream-tuned thread table when available and an upstream-style `rows_per_cta` heuristic.
-
-### Class API
-
-```python
-from cudnn import RmsNormRhtAmaxSm100
-
-op = RmsNormRhtAmaxSm100(
-    sample_x=x,
-    sample_w=w,
-    sample_o=o,
-    sample_amax=amax,
-    eps=1e-5,
-    num_threads=128,
-    rows_per_cta=2,
-)
-assert op.check_support()
-op.compile()
-op.execute(
-    x_tensor=x,
-    w_tensor=w,
-    o_tensor=o,
-    amax_tensor=amax,
-    current_stream=None,
-)
-```
-
-### Optional experimental JAX API
-
-The existing Torch wrapper and class APIs above remain canonical and unchanged.
-Install the JAX-specific optional dependencies to use the aligned functional
-JAX namespace:
+Install the JAX-specific optional dependencies:
 
 ```bash
 pip install nvidia-cudnn-frontend[jax]
@@ -152,18 +122,73 @@ def run(x, weight):
         rows_per_cta=rows_per_cta,
     )
 
-o, amax = run(x, weight)
+output, amax = run(x, weight)
 ```
 
-The proof of concept requires concrete `M` and `N` during tracing and does not
-yet define autodiff, `vmap`, or automatic partitioning rules. `eps`,
+The JAX function returns
+`RmsNormRhtAmaxResult(output=..., amax=...)`, a standard named tuple and JAX
+pytree.
+
+`````
+
+``````
+
+The JAX proof of concept requires concrete `M` and `N` during tracing and does
+not yet define autodiff, `vmap`, or automatic partitioning rules. `eps`,
 `num_threads`, and `rows_per_cta` are static compilation state; close them over
-as above or list them in `jax.jit(static_argnames=...)`. JAX returns a standard
-`RmsNormRhtAmaxResult(output, amax)` named tuple. The aligned Torch function
-uses the same result-role names in a `TupleDict`; the legacy wrapper retains
-its existing `TupleDict(o_tensor, amax_tensor)` contract. See
+as above or list them in `jax.jit(static_argnames=...)`. JAX always uses XLA's
+runtime stream; Torch optionally accepts `current_stream`. See
 [CuTe DSL + JAX support for FE-OSS APIs](cutedsl-jax-design.md) for the design,
 workspace model, rollout plan, and current limitations.
+
+### Additional PyTorch APIs
+
+The aligned function above is additive. The existing PyTorch wrapper and class
+APIs remain first class and retain their original contracts.
+
+#### Existing high-level wrapper
+
+```python
+from cudnn import rmsnorm_rht_amax_wrapper_sm100
+
+result = rmsnorm_rht_amax_wrapper_sm100(
+    x_tensor=x,
+    w_tensor=w,
+    eps=1e-5,
+    num_threads=None,   # optional override
+    rows_per_cta=None,  # optional override
+    current_stream=None,
+)
+
+o_tensor, amax_tensor = result
+```
+
+When no overrides are supplied, the wrapper uses the upstream-tuned thread table when available and an upstream-style `rows_per_cta` heuristic.
+
+#### Class API
+
+```python
+from cudnn import RmsNormRhtAmaxSm100
+
+op = RmsNormRhtAmaxSm100(
+    sample_x=x,
+    sample_w=w,
+    sample_o=o,
+    sample_amax=amax,
+    eps=1e-5,
+    num_threads=128,
+    rows_per_cta=2,
+)
+assert op.check_support()
+op.compile()
+op.execute(
+    x_tensor=x,
+    w_tensor=w,
+    o_tensor=o,
+    amax_tensor=amax,
+    current_stream=None,
+)
+```
 
 ## Parameters
 
@@ -172,18 +197,18 @@ workspace model, rollout plan, and current limitations.
 - `x` / `x_tensor` / `sample_x`
   - Shape: `(M, N)`
   - Layout: row-major contiguous
-  - Dtype: `torch.bfloat16`
+  - Dtype: bfloat16 (`torch.bfloat16` or `jax.numpy.bfloat16`)
 - `weight` / `w_tensor` / `sample_w`
   - Shape: `(N,)`
   - Layout: contiguous
-  - Dtype: `torch.bfloat16`
-- `o_tensor` / `sample_o`
+  - Dtype: bfloat16 (`torch.bfloat16` or `jax.numpy.bfloat16`)
+- `output` / `o_tensor` / `sample_o`
   - Shape: `(M, N)`
   - Layout: row-major contiguous
-  - Dtype: `torch.bfloat16`
-- `amax_tensor` / `sample_amax`
+  - Dtype: bfloat16 (`torch.bfloat16` or `jax.numpy.bfloat16`)
+- `amax` / `amax_tensor` / `sample_amax`
   - Shape: `(M / rows_per_cta,)`
-  - Dtype: `torch.float32`
+  - Dtype: float32 (`torch.float32` or `jax.numpy.float32`)
 
 ### Common parameters
 
@@ -195,11 +220,14 @@ workspace model, rollout plan, and current limitations.
   - Rows processed by each CTA. If omitted, the wrapper uses the upstream-style heuristic over `{2, 4, 8}`.
 - Torch-only CUDA stream (`current_stream`); JAX always uses XLA's stream
 
-### Wrapper return values
+### Return values
 
 The aligned Torch function returns a `TupleDict` with keys:
 - `output`
 - `amax`
+
+The aligned JAX function returns an `RmsNormRhtAmaxResult` named tuple with
+fields `output` and `amax`.
 
 The legacy wrapper returns a `TupleDict` with keys:
 - `o_tensor`
