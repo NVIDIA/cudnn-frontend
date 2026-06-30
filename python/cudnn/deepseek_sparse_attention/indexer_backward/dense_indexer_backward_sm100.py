@@ -342,7 +342,7 @@ class ScoreGradDense:
 # Barrier indices
 MBAR_2Q_S_FULL = 0  # MMA → Compute (phase-flipped 2×/block)
 MBAR_2Q_DS_READY = 1  # Compute → MMA (phase-flipped 2×/block)
-MBAR_2Q_DK_FULL = 2  # MMA → Reduce (1×/block, after Phase B GEMM2)
+MBAR_2Q_DK_FULL = 2  # MMA → Reduce/Compute (1×/block, after dK/dQ GEMMs)
 MBAR_2Q_DK_EMPTY = 3  # Reduce → MMA (1×/block)
 MBAR_2Q_GS_LOADED_0 = 4  # Load → Compute (2-stage K pipeline)
 MBAR_2Q_GS_LOADED_1 = 5
@@ -1725,6 +1725,14 @@ class DenseIndexerBackward2QGemmSm100:
                 cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(mbar + MBAR_2Q_DS_READY)
 
+        # DK_FULL is committed after both dQ GEMM3 phases for every K block.
+        # Observe its final phase before reading the persistent dQ TMEM
+        # accumulators.  There is no next S_FULL hand-off after the last block
+        # to provide this ordering, so omitting this wait races the epilogue
+        # against the final dQ accumulation.
+        final_dk_full_phase = (num_kv_blocks - Int32(1)) & Int32(1)
+        cute.arch.mbarrier_wait(mbar + MBAR_2Q_DK_FULL, final_dk_full_phase)
+
         # dQ staging via coordinate writes — same pattern as sdS.
         sdQ_gemm_view = cute.composition(
             sdQ_epi_slice,
@@ -1757,8 +1765,12 @@ class DenseIndexerBackward2QGemmSm100:
 
         # ---- Epilogue: dQ for q1 via TMA store (guarded) ----
         if has_q1:
-            # Wait for q0 TMA store to complete before reusing sdQ_epi SMEM
-            dQ_store_pipeline.producer_acquire()
+            # The TMA store async group belongs to the issuing warp.  Wait on
+            # that warp, then release the other compute warps together before
+            # they overwrite their portions of the shared dQ staging tile.
+            if warp_idx == compute_warp0:
+                dQ_store_pipeline.producer_acquire()
+            self.compute_sync_barrier.arrive_and_wait()
 
             tDQrDQ_q1 = cute.make_rmem_tensor(tDQrDQ_shape, Float32)
             cute.copy(tiled_tmem_load_dq1, tDqDq_1_t2r, tDQrDQ_q1)
@@ -1808,6 +1820,9 @@ class DenseIndexerBackward2QGemmSm100:
                 total = cute.arch.warp_reduction_sum(my_partial)
                 if lane_id == 0:
                     mdW_b[q1_local, h] = self.q_dtype(total)
+
+        # Ensure the final q0/q1 TMA store has completed before the CTA exits.
+        dQ_store_pipeline.producer_tail()
 
     # =========================================================================
     # Reduce warpgroup (2Q): Single-buffered dK

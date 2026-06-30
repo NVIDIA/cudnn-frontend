@@ -591,9 +591,7 @@ def dense_indexer_backward_wrapper(
             max_seqlen_q,
             max_seqlen_k,
         )
-        q_causal_offsets = validate_q_causal_offsets(
-            q_causal_offsets, int(batch), index_q_exec.device, stream=backend_stream
-        )
+        q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch), index_q_exec.device, stream=backend_stream)
 
         if d_index_q is None:
             d_index_q = torch.empty_like(index_q_exec)

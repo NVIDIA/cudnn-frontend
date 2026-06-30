@@ -122,9 +122,7 @@ def indexer_fwd(
         device = q.device
         out_shape = (bs, seqlen_q_dim, seqlen_k_dim)
         out_buf_shape = None
-    q_causal_offsets = validate_q_causal_offsets(
-        q_causal_offsets, int(bs), q.device, stream=current_stream
-    )
+    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device, stream=current_stream)
 
     # TMA S2G requires globalStride aligned to 16 bytes.
     # For FP32, seqlen_k must be a multiple of 4 elements (4 × 4B = 16B).

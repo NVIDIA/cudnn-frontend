@@ -110,9 +110,7 @@ def indexer_fwd(
         qhead_per_kv_head = n_heads_q // n_heads_kv
     assert qhead_per_kv_head == n_heads_q // n_heads_kv
     assert qhead_per_kv_head in _SUPPORTED_QHPKV, f"qhead_per_kv_head must be one of {_SUPPORTED_QHPKV}, got {qhead_per_kv_head}"
-    q_causal_offsets = validate_q_causal_offsets(
-        q_causal_offsets, int(batch_size), q.device, stream=current_stream
-    )
+    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch_size), q.device, stream=current_stream)
 
     if out is None:
         with _torch_stream_context(current_stream):

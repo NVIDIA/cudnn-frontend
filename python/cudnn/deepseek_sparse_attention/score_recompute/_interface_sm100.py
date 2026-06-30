@@ -69,9 +69,7 @@ def _sparse_indexer_score_recompute(
         predict: (bs, seqlen_q, topk) [FP32] — softmax of sparse index scores
     """
     current_stream = _resolve_stream(current_stream)
-    q_indexer, k_indexer, weights = [
-        maybe_contiguous(t, current_stream) for t in (q_indexer, k_indexer, weights)
-    ]
+    q_indexer, k_indexer, weights = [maybe_contiguous(t, current_stream) for t in (q_indexer, k_indexer, weights)]
     with _torch_stream_context(current_stream):
         topk_indices = topk_indices.to(torch.int32).contiguous()
 
@@ -747,9 +745,7 @@ def _dense_indexer_score_recompute(
     else:
         bs, seqlen_q, n_heads_q, head_dim = q.shape
         _, seqlen_k, _, _ = k.shape
-    q_causal_offsets = validate_q_causal_offsets(
-        q_causal_offsets, int(bs), q.device, stream=current_stream
-    )
+    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device, stream=current_stream)
 
     if qhead_per_kv_head is None:
         qhead_per_kv_head = n_heads_q
@@ -927,9 +923,7 @@ def _dense_attn_score_recompute(
     else:
         bs, seqlen_q, n_heads_q, head_dim = q.shape
         _, seqlen_k, _, _ = k.shape
-    q_causal_offsets = validate_q_causal_offsets(
-        q_causal_offsets, int(bs), q.device, stream=current_stream
-    )
+    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device, stream=current_stream)
 
     if qhead_per_kv_head is None:
         qhead_per_kv_head = n_heads_q

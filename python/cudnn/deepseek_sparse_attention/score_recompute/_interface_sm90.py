@@ -119,9 +119,7 @@ def _sparse_score_recompute(
     assert compute_capability == 9, f"SM90 kernel on compute capability {compute_capability}"
 
     current_stream = _resolve_stream(current_stream)
-    q, kv, weights_or_lse = _validate_and_prepare_common(
-        q, kv, weights_or_lse, is_index_scores, current_stream
-    )
+    q, kv, weights_or_lse = _validate_and_prepare_common(q, kv, weights_or_lse, is_index_scores, current_stream)
 
     batch_size, seqlen_q, num_head, head_dim = q.shape
     _, seqlen_k, num_head_kv, _ = kv.shape
@@ -329,15 +327,11 @@ def _dense_score_recompute(
     assert num_threads == _DENSE_NUM_THREADS, f"SM90 dense score is 3-WG-only (num_threads={_DENSE_NUM_THREADS}); got {num_threads}."
 
     current_stream = _resolve_stream(current_stream)
-    q, kv, weights_or_lse = _validate_and_prepare_common(
-        q, kv, weights_or_lse, is_index_scores, current_stream
-    )
+    q, kv, weights_or_lse = _validate_and_prepare_common(q, kv, weights_or_lse, is_index_scores, current_stream)
 
     batch_size, seqlen_q, num_head, head_dim = q.shape
     _, seqlen_k, num_head_kv, _ = kv.shape
-    q_causal_offsets = validate_q_causal_offsets(
-        q_causal_offsets, int(batch_size), q.device, stream=current_stream
-    )
+    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch_size), q.device, stream=current_stream)
     assert num_head > num_head_kv and num_head % num_head_kv == 0, f"MQA required: num_head={num_head}, num_head_kv={num_head_kv}"
     qhead_per_kvhead = num_head // num_head_kv
 
@@ -471,17 +465,13 @@ def _dense_score_recompute_varlen(
     assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
     assert q.ndim == 3 and kv.ndim == 3 and weights_or_lse.ndim == 2
     current_stream = _resolve_stream(current_stream)
-    q, kv, weights_or_lse = _validate_and_prepare_common(
-        q, kv, weights_or_lse, is_index_scores, current_stream
-    )
+    q, kv, weights_or_lse = _validate_and_prepare_common(q, kv, weights_or_lse, is_index_scores, current_stream)
     with _torch_stream_context(current_stream):
         cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
         cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
     assert cu_seqlens_q.is_cuda and cu_seqlens_k.is_cuda
     batch_size = cu_seqlens_q.shape[0] - 1
-    q_causal_offsets = validate_q_causal_offsets(
-        q_causal_offsets, int(batch_size), q.device, stream=current_stream
-    )
+    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch_size), q.device, stream=current_stream)
 
     total_q = q.shape[0]
     if max_seqlen_k is None:
