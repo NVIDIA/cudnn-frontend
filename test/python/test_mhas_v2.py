@@ -695,6 +695,7 @@ def test_sdpa_fp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         with_sink_token=RandomChoice({True : 1, False : 2}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+    test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.AUTO)
     test.showConfig(test_no, request)
 
     # Randomly enable unfuse_fma via environment variable for SM100
@@ -942,6 +943,7 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
     test.cfg.is_mxfp8 = True
+    test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.AUTO)
 
     # Randomly enable unfuse_fma via environment variable for SM100
     unfuse_fma = rng.choice([True, False])

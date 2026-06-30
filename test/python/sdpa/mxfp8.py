@@ -194,7 +194,8 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
                        cudnn_otype=cudnn.data_type.HALF,
                        left_bound=None, right_bound=None, diag_align=None,
                        with_sink_token=False,
-                       with_unfuse_fma=False):
+                       with_unfuse_fma=False,
+                       implementation=cudnn.attention_implementation.AUTO):
     # Compute padded dimensions for F8_128x4 scale factors
     s_q_padded = ceil_div(s_qo, 128) * 128
     s_kv_padded = ceil_div(s_kv, 128) * 128
@@ -280,6 +281,7 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
         diagonal_band_right_bound=right_bound,
         sink_token=sink_token,
         unfuse_fma=with_unfuse_fma,
+        implementation=implementation,
     )
 
     # Set output tensor properties
@@ -541,6 +543,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
             with_sink_token=with_sink_token,
             with_unfuse_fma=with_unfuse_fma,
+            implementation=cfg.implementation,
         )
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
