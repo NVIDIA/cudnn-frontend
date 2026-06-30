@@ -522,7 +522,9 @@ class PyGraph {
              py::object const& generate_stats,
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
-             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token);
+             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+             bool const unfuse_fma,
+             cudnn_frontend::AttentionImplementation_t const& implementation);
 
     // MXFP8 SDPA forward - uses block-wise scale factors (E8M0 with F8_128x4 reordering)
     // return [o, stats, amax_o]
@@ -543,7 +545,8 @@ class PyGraph {
                std::string const& name,
                py::object const& generate_stats,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-               bool const unfuse_fma);
+               bool const unfuse_fma,
+               cudnn_frontend::AttentionImplementation_t const& implementation);
 
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP]
     // dSink_token is an optional output set via set_dsink_token() attribute
