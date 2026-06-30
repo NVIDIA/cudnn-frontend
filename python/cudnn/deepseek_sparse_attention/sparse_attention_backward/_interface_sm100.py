@@ -7,6 +7,7 @@ import torch
 import cutlass
 import cutlass.cute as cute
 
+from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
@@ -171,7 +172,7 @@ def flash_attn_bwd_sm100(
                 workspace_dKV_tensor,
                 softmax_scale,
                 current_stream,
-                options="--enable-tvm-ffi",
+                options=compile_options(),
             )
 
     with torch.cuda.nvtx.range("flash_attn_bwd_sm100_kernel"):

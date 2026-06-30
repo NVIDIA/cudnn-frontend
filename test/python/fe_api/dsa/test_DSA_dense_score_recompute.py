@@ -6,7 +6,65 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from fe_api.dsa.dsa_utils import dsa_init, with_dsa_score_recompute_params
-from fe_api.dsa.dsa_reference import check_ref_dense_score_recompute
+from fe_api.dsa.dsa_reference import (
+    _batched_ratio_causal_mask,
+    _ratio_causal_mask,
+    check_ref_dense_score_recompute,
+)
+
+
+@pytest.mark.L0
+def test_DSA_ratio_causal_mask_offsets_reference():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    expected_default = torch.tensor(
+        [
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [1, 0, 0],
+            [1, 0, 0],
+            [1, 0, 0],
+            [1, 0, 0],
+            [1, 1, 0],
+            [1, 1, 0],
+            [1, 1, 0],
+        ],
+        dtype=torch.bool,
+        device=device,
+    )
+    expected_cp = torch.tensor(
+        [
+            [1, 0, 0],
+            [1, 0, 0],
+            [1, 0, 0],
+            [1, 1, 0],
+            [1, 1, 0],
+        ],
+        dtype=torch.bool,
+        device=device,
+    )
+    expected_batched = torch.stack(
+        [
+            expected_default[:5],
+            expected_cp,
+            torch.tensor(
+                [
+                    [1, 1, 0],
+                    [1, 1, 0],
+                    [1, 1, 1],
+                    [1, 1, 1],
+                    [1, 1, 1],
+                ],
+                dtype=torch.bool,
+                device=device,
+            ),
+        ]
+    )
+
+    assert torch.equal(_ratio_causal_mask(10, 3, 4, device), expected_default)
+    assert torch.equal(_ratio_causal_mask(5, 3, 4, device, q_causal_offset=4), expected_cp)
+    offsets = torch.tensor([0, 4, 9], dtype=torch.int32, device=device)
+    assert torch.equal(_batched_ratio_causal_mask(5, 3, 4, device, 3, offsets), expected_batched)
 
 
 def _allocate(cfg, score_type: str):
@@ -56,6 +114,7 @@ def test_DSA_dense_score_recompute_wrapper(
         s_kv_default=1024,
     )
     q, k, aux = _allocate(cfg, score_type)
+    q_causal_offsets = torch.full((cfg["b"],), 8, dtype=torch.int32, device=q.device)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     try:
@@ -65,6 +124,7 @@ def test_DSA_dense_score_recompute_wrapper(
                 k,
                 aux,
                 qhead_per_kv_head=qhead_per_kv_head,
+                q_causal_offsets=q_causal_offsets,
                 stream=stream,
             )
         else:
@@ -75,6 +135,7 @@ def test_DSA_dense_score_recompute_wrapper(
                 aux,
                 softmax_scale,
                 qhead_per_kv_head=qhead_per_kv_head,
+                q_causal_offsets=q_causal_offsets,
                 stream=stream,
             )
     except (ValueError, NotImplementedError, RuntimeError) as e:
@@ -85,7 +146,8 @@ def test_DSA_dense_score_recompute_wrapper(
 
     assert out.shape == (cfg["b"], cfg["s_q"], cfg["s_kv"])
     assert denom.shape == (cfg["b"], cfg["s_q"])
-    assert torch.isfinite(out).all()
+    assert torch.isfinite(out).any()
+    assert (torch.isfinite(out) | torch.isneginf(out)).all()
     assert torch.isfinite(denom).all()
 
     if not cfg["skip_ref"]:
@@ -97,6 +159,7 @@ def test_DSA_dense_score_recompute_wrapper(
                 aux,
                 out,
                 denom,
+                q_causal_offsets=q_causal_offsets,
             )
         else:
             check_ref_dense_score_recompute(
@@ -107,4 +170,5 @@ def test_DSA_dense_score_recompute_wrapper(
                 out,
                 denom,
                 softmax_scale=softmax_scale,
+                q_causal_offsets=q_causal_offsets,
             )

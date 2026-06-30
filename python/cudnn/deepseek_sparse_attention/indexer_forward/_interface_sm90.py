@@ -14,6 +14,8 @@ from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     maybe_contiguous as _maybe_contiguous,
     resolve_stream,
+    torch_stream_context as _torch_stream_context,
+    validate_q_causal_offsets,
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
     to_cute_tensor as _to_cute_tensor,
@@ -48,6 +50,7 @@ def indexer_fwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     current_stream=None,
 ) -> torch.Tensor:
     """Indexer QK forward pass using the direct SM90 CuTe DSL port."""
@@ -61,9 +64,10 @@ def indexer_fwd(
         raise ValueError("THD input requires both cu_seqlens_q and cu_seqlens_k")
     is_varlen = is_varlen_q
 
-    q = _maybe_contiguous(q)
-    k = _maybe_contiguous(k)
-    w = _maybe_contiguous(w)
+    current_stream = resolve_stream(current_stream)
+    q = _maybe_contiguous(q, current_stream)
+    k = _maybe_contiguous(k, current_stream)
+    w = _maybe_contiguous(w, current_stream)
 
     if is_varlen:
         assert cu_seqlens_q is not None and cu_seqlens_k is not None
@@ -96,8 +100,6 @@ def indexer_fwd(
             seqlen_q_dim,
             n_heads_q,
         ), f"w shape must be {(batch_size, seqlen_q_dim, n_heads_q)}, got {tuple(w.shape)}"
-        if seqlen_q_dim > seqlen_k_dim * ratio:
-            raise ValueError(f"seqlen_q ({seqlen_q_dim}) must be <= seqlen_k * ratio ({seqlen_k_dim * ratio})")
         out_shape = (batch_size, seqlen_q_dim, seqlen_k_dim)
 
     assert head_dim == head_dim_k, f"q head_dim ({head_dim}) != k head_dim ({head_dim_k})"
@@ -108,9 +110,11 @@ def indexer_fwd(
         qhead_per_kv_head = n_heads_q // n_heads_kv
     assert qhead_per_kv_head == n_heads_q // n_heads_kv
     assert qhead_per_kv_head in _SUPPORTED_QHPKV, f"qhead_per_kv_head must be one of {_SUPPORTED_QHPKV}, got {qhead_per_kv_head}"
+    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch_size), q.device, stream=current_stream)
 
     if out is None:
-        out = torch.empty(out_shape, dtype=torch.float32, device=q.device)
+        with _torch_stream_context(current_stream):
+            out = torch.empty(out_shape, dtype=torch.float32, device=q.device)
     else:
         assert out.shape == out_shape, f"out must have shape {out_shape}, got {tuple(out.shape)}"
         assert out.dtype == torch.float32 and out.is_cuda
@@ -122,8 +126,8 @@ def indexer_fwd(
         int(qhead_per_kv_head),
         int(ratio),
         bool(is_varlen),
+        q_causal_offsets is not None,
     )
-    current_stream = resolve_stream(current_stream)
     if compile_key not in _compile_cache:
         q_cute = _to_cute_tensor(q)
         k_cute = _to_cute_tensor(k)
@@ -131,6 +135,7 @@ def indexer_fwd(
         out_cute = _to_cute_tensor(out)
         cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
         cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
+        q_offsets_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
         kernel_obj = IndexerForwardSm90(
             torch2cute_dtype_map[q.dtype],
             head_dim=int(head_dim),
@@ -150,11 +155,13 @@ def indexer_fwd(
             cutlass.Float32(float(sm_scale)),
             cu_q_cute,
             cu_k_cute,
+            q_offsets_cute,
             current_stream,
             options=compile_options(),
         )
 
-    out.fill_(float("-inf"))
+    with _torch_stream_context(current_stream):
+        out.fill_(float("-inf"))
     with torch.cuda.nvtx.range("indexer_fwd_kernel_sm90_direct_dsl"):
         _compile_cache[compile_key](
             q,
@@ -167,6 +174,7 @@ def indexer_fwd(
             cutlass.Float32(float(sm_scale)),
             cu_seqlens_q if is_varlen else None,
             cu_seqlens_k if is_varlen else None,
+            q_causal_offsets,
             current_stream,
         )
     return out

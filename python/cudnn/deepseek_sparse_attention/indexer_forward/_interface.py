@@ -20,6 +20,8 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_major as _get_device_capability,
     maybe_contiguous as _maybe_contiguous,
     resolve_stream,
+    torch_stream_context as _torch_stream_context,
+    validate_q_causal_offsets,
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor as _to_cute_tensor
 
@@ -44,13 +46,14 @@ def indexer_fwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     current_stream=None,
 ) -> torch.Tensor:
     """
     Indexer QK forward pass using CuTe DSL kernel.
 
-    Computes S_sum = sm_scale * sum_h [(Q @ K^T).relu() * W] with
-    bottom-right aligned ratio causal mask.
+    Computes S_sum = sm_scale * sum_h [(Q @ K^T).relu() * W] with a
+    ratio causal mask against compressed-KV positions.
     sm_scale is applied to the fp32 head-reduced score inside the kernel
     (higher precision than pre-multiplying onto bf16 W on the host).
 
@@ -65,12 +68,15 @@ def indexer_fwd(
         out: optional output tensor. BSHD: ``(bs, seqlen_q, seqlen_k)``.
              THD: ``(total_q, max_seqlen_k)`` with local-K columns.
         sm_scale: scalar applied to fp32 score post head-reduce; default 1.0
+        q_causal_offsets: optional int32 CUDA tensor of shape ``(batch,)``.
+             Each entry is the global uncompressed token index for local q[0].
 
     Returns:
         S_sum: BSHD ``(bs, seqlen_q, seqlen_k)`` or THD
                ``(total_q, max_seqlen_k)`` [FP32]
     """
-    q, k, w = [_maybe_contiguous(t) for t in (q, k, w)]
+    current_stream = resolve_stream(current_stream)
+    q, k, w = [_maybe_contiguous(t, current_stream) for t in (q, k, w)]
     for tensor, name in ((q, "q"), (k, "k"), (w, "w")):
         assert tensor.dtype == torch.bfloat16, f"{name} must be bfloat16, got {tensor.dtype}"
         assert tensor.is_cuda, f"{name} must be on CUDA device"
@@ -114,10 +120,9 @@ def indexer_fwd(
         bs, seqlen_q_dim, n_heads_q, head_dim = q.shape
         _, seqlen_k_dim, n_heads_kv, _ = k.shape
         device = q.device
-        if seqlen_q_dim > seqlen_k_dim * ratio:
-            raise ValueError(f"seqlen_q ({seqlen_q_dim}) must be <= seqlen_k * ratio " f"({seqlen_k_dim * ratio})")
         out_shape = (bs, seqlen_q_dim, seqlen_k_dim)
         out_buf_shape = None
+    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device, stream=current_stream)
 
     # TMA S2G requires globalStride aligned to 16 bytes.
     # For FP32, seqlen_k must be a multiple of 4 elements (4 × 4B = 16B).
@@ -128,10 +133,12 @@ def indexer_fwd(
 
     if need_pad:
         out_buf_shape = (total_q, seqlen_k_padded) if is_varlen else (bs, seqlen_q_dim, seqlen_k_padded)
-        out_buf = torch.empty(out_buf_shape, dtype=torch.float32, device=device)
+        with _torch_stream_context(current_stream):
+            out_buf = torch.empty(out_buf_shape, dtype=torch.float32, device=device)
         out = out_buf[:, :seqlen_k_dim] if is_varlen else out_buf[:, :, :seqlen_k_dim]
     elif out is None:
-        out = torch.empty(out_shape, dtype=torch.float32, device=device)
+        with _torch_stream_context(current_stream):
+            out = torch.empty(out_shape, dtype=torch.float32, device=device)
     else:
         assert out.shape == out_shape, f"out must have shape {out_shape}, got {tuple(out.shape)}"
         assert out.dtype == torch.float32 and out.is_cuda
@@ -153,6 +160,7 @@ def indexer_fwd(
         q_stage,
         kv_stage,
         is_varlen,
+        q_causal_offsets is not None,
     )
 
     if compile_key not in _compile_cache:
@@ -162,6 +170,7 @@ def indexer_fwd(
         out_cute = _to_cute_tensor(out)
         cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
         cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
+        q_offsets_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
 
         kernel_obj = IndexerForwardSm100(
             head_dim=head_dim,
@@ -174,7 +183,6 @@ def indexer_fwd(
             kv_stage=kv_stage,
         )
 
-        current_stream = resolve_stream(current_stream)
         scale_arg = cutlass.Float32(sm_scale)
         max_q_arg = cutlass.Int32(seqlen_q_dim)
         max_k_arg = cutlass.Int32(seqlen_k_dim)
@@ -191,13 +199,14 @@ def indexer_fwd(
             scale_arg,
             cu_q_cute,
             cu_k_cute,
+            q_offsets_cute,
             current_stream,
             options=compile_options(),
         )
 
     # Init to -inf: skipped causal n-blocks and masked positions stay -inf
-    out.fill_(float("-inf"))
-    current_stream = resolve_stream(current_stream)
+    with _torch_stream_context(current_stream):
+        out.fill_(float("-inf"))
     scale_arg = cutlass.Float32(sm_scale)
     max_q_arg = cutlass.Int32(seqlen_q_dim)
     max_k_arg = cutlass.Int32(seqlen_k_dim)
@@ -213,10 +222,12 @@ def indexer_fwd(
             scale_arg,
             cu_seqlens_q if is_varlen else None,
             cu_seqlens_k if is_varlen else None,
+            q_causal_offsets,
             current_stream,
         )
 
     if out_orig is not None and out.data_ptr() != out_orig.data_ptr():
-        out_orig.copy_(out)
+        with _torch_stream_context(current_stream):
+            out_orig.copy_(out)
         return out_orig
     return out

@@ -20,6 +20,7 @@ import cuda.bindings.driver as cuda
 from cudnn.api_base import APIBase, TupleDict
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     torch_stream_context as _torch_stream_context,
+    validate_q_causal_offsets,
 )
 
 from .dense_indexer_backward_sm100 import dense_indexer_backward_sm100
@@ -275,6 +276,7 @@ class DenseIndexerBackward(APIBase):
         batch: Optional[int] = None,
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
+        has_q_causal_offsets: bool = False,
     ):
         super().__init__()
         self.iq_desc = self._make_tensor_desc(sample_index_q, name="sample_index_q")
@@ -292,6 +294,7 @@ class DenseIndexerBackward(APIBase):
         self.block_I = int(block_I)
         self.ratio = int(ratio)
         self.is_thd = bool(is_thd)
+        self.has_q_causal_offsets = bool(has_q_causal_offsets)
 
         if self.is_thd:
             total_q, heads, head_dim = sample_index_q.shape
@@ -333,10 +336,6 @@ class DenseIndexerBackward(APIBase):
         self._value_error_if(self.block_I <= 0, f"block_I must be positive, got {self.block_I}")
         self._value_error_if(self.ratio < 1, f"ratio must be >= 1, got {self.ratio}")
         self._value_error_if(self.heads < 64, f"DenseIndexerBackward requires heads >= 64, got {self.heads}")
-        self._value_error_if(
-            self.max_seqlen_q > self.max_seqlen_k * self.ratio,
-            "DenseIndexerBackward requires S_q <= S_k * ratio for bottom-right causal alignment",
-        )
         self._is_supported = True
         return True
 
@@ -357,6 +356,7 @@ class DenseIndexerBackward(APIBase):
             block_I=self.block_I,
             ratio=self.ratio,
             is_varlen=self.is_thd,
+            has_q_causal_offsets=self.has_q_causal_offsets,
         )
 
     def execute(
@@ -375,6 +375,7 @@ class DenseIndexerBackward(APIBase):
         grad_loss: Union[float, torch.Tensor] = 1.0,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_k: Optional[torch.Tensor] = None,
+        q_causal_offsets: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         backend_stream = None if self._uses_current_stream_pipeline else current_stream
@@ -404,6 +405,7 @@ class DenseIndexerBackward(APIBase):
             grad_scale,
             cu_seqlens_q,
             cu_seqlens_k,
+            q_causal_offsets,
             backend_stream,
         )
 
@@ -451,12 +453,13 @@ def indexer_backward_wrapper(
             typically ``1.0`` when the KL loss is summed into the total
             training loss with unit weight. Accepts a 0-D tensor or float.
     """
-    if d_index_q is None:
-        d_index_q = torch.empty_like(index_q)
-    if d_weights is None:
-        d_weights = torch.empty_like(weights)
-    if d_index_k is None:
-        d_index_k = torch.empty_like(index_k)
+    with _torch_stream_context(stream):
+        if d_index_q is None:
+            d_index_q = torch.empty_like(index_q)
+        if d_weights is None:
+            d_weights = torch.empty_like(weights)
+        if d_index_k is None:
+            d_index_k = torch.empty_like(index_k)
 
     b, s_q, h, d = index_q.shape
     s_k = index_k.shape[1]
@@ -538,6 +541,7 @@ def dense_indexer_backward_wrapper(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     d_index_q: Optional[torch.Tensor] = None,
     d_weights: Optional[torch.Tensor] = None,
     d_index_k: Optional[torch.Tensor] = None,
@@ -587,6 +591,7 @@ def dense_indexer_backward_wrapper(
             max_seqlen_q,
             max_seqlen_k,
         )
+        q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch), index_q_exec.device, stream=backend_stream)
 
         if d_index_q is None:
             d_index_q = torch.empty_like(index_q_exec)
@@ -618,6 +623,7 @@ def dense_indexer_backward_wrapper(
         float(sm_scale),
         int(block_I),
         int(ratio),
+        q_causal_offsets is not None,
     )
     obj = _cache_of_DenseIndexerBackwardObjects.get(key)
     if obj is None:
@@ -639,6 +645,7 @@ def dense_indexer_backward_wrapper(
             batch=batch,
             max_seqlen_q=max_q,
             max_seqlen_k=max_k,
+            has_q_causal_offsets=q_causal_offsets is not None,
         )
         assert obj.check_support()
         obj.compile()
@@ -659,6 +666,7 @@ def dense_indexer_backward_wrapper(
         grad_loss=grad_loss,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
+        q_causal_offsets=q_causal_offsets,
         current_stream=backend_stream,
     )
     with _torch_stream_context(backend_stream):
