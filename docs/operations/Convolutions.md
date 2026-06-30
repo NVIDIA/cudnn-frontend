@@ -43,11 +43,15 @@ set_convolution_mode(ConvolutionMode_t mode_)
 - conv_fprop
     - image
     - weight
-    - padding
+    - pre_padding
+    - post_padding
     - stride
     - dilation
+    - convolution_mode
     - compute_data_type
     - name
+
+The symmetric-padding overload accepts `padding` in place of `pre_padding` and `post_padding`.
 
 (convolution-dgrad)=
 ## Convolution Dgrad
@@ -86,13 +90,17 @@ set_convolution_mode(ConvolutionMode_t mode_)
 ### Python API
 
 - conv_dgrad
-    - filter
     - loss
-    - padding
+    - filter
+    - pre_padding
+    - post_padding
     - stride
     - dilation
+    - convolution_mode
     - compute_data_type
     - name
+
+The symmetric-padding overload accepts `padding` in place of `pre_padding` and `post_padding`.
 
 (convolution-wgrad)=
 ## Convolution Wgrad
@@ -133,8 +141,12 @@ set_convolution_mode(ConvolutionMode_t mode_)
 - conv_wgrad
     - image
     - loss
-    - padding
+    - pre_padding
+    - post_padding
     - stride
     - dilation
+    - convolution_mode
     - compute_data_type
     - name
+
+The symmetric-padding overload accepts `padding` in place of `pre_padding` and `post_padding`.
