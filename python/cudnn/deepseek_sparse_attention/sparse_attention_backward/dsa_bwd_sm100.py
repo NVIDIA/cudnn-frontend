@@ -572,8 +572,8 @@ class FlashAttentionDSABackwardSm100:
 
         convert_grid_x = (mKV.shape[0] + self.block_seq - 1) // self.block_seq
         convert_grid = [
-            1,
             convert_grid_x,
+            1,
             1,
         ]
         convert_block = [self.num_threads_D_convert, self.num_threads_seq, 1]
@@ -616,8 +616,8 @@ class FlashAttentionDSABackwardSm100:
     ):
         tidx, tidy, _ = cute.arch.thread_idx()
         (
-            _,
             seq_block_idx,
+            _,
             batch_idx,
         ) = cute.arch.block_idx()
 
