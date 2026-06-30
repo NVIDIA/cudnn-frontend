@@ -9,6 +9,7 @@
 This frontend integration exposes the kernel as a standard FE-OSS Python API with:
 - a class API (`RmsNormRhtAmaxSm100`)
 - a wrapper API (`rmsnorm_rht_amax_wrapper_sm100`)
+- an optional experimental JAX API (`cudnn.jax.rmsnorm_rht_amax_sm100`)
 - grouped-gemm-style regression coverage for compile/execute, wrapper use, and cache reuse
 
 ## Shapes
@@ -97,6 +98,47 @@ op.execute(
 )
 ```
 
+### Optional experimental JAX API
+
+The existing Torch APIs above remain canonical and unchanged. Install the
+JAX-specific optional dependencies to use the functional JAX namespace:
+
+```bash
+pip install nvidia-cudnn-frontend[jax]
+```
+
+The JAX optional dependency set requires Python 3.11 or newer.
+
+```python
+import jax
+from cudnn.jax import rmsnorm_rht_amax_sm100
+
+eps = 1e-5
+num_threads = 128
+rows_per_cta = 2
+
+@jax.jit
+def run(x, weight):
+    return rmsnorm_rht_amax_sm100(
+        x,
+        weight,
+        eps=eps,
+        num_threads=num_threads,
+        rows_per_cta=rows_per_cta,
+    )
+
+o, amax = run(x, weight)
+```
+
+The proof of concept requires concrete `M` and `N` during tracing and does not
+yet define autodiff, `vmap`, or automatic partitioning rules. `eps`,
+`num_threads`, and `rows_per_cta` are static compilation state; close them over
+as above or list them in `jax.jit(static_argnames=...)`. JAX returns a standard
+`RmsNormRhtAmaxResult(output, amax)` named tuple; Torch retains its existing
+`TupleDict(o_tensor, amax_tensor)` contract. See
+[CuTe DSL + JAX support for FE-OSS APIs](cutedsl-jax-design.md) for the design,
+workspace model, rollout plan, and current limitations.
+
 ## Parameters
 
 ### Input and output tensors
@@ -125,7 +167,7 @@ op.execute(
   - Threads per CTA. If omitted, the API uses the upstream-tuned table when possible, otherwise a valid fallback search.
 - `rows_per_cta: Optional[int]`
   - Rows processed by each CTA. If omitted, the wrapper uses the upstream-style heuristic over `{2, 4, 8}`.
-- CUDA stream (`current_stream`)
+- Torch-only CUDA stream (`current_stream`); JAX always uses XLA's stream
 
 ### Wrapper return values
 
@@ -143,6 +185,7 @@ Tuple unpacking order is `(o_tensor, amax_tensor)`.
 - `EPT = N / num_threads` must be at least `8` and divisible by `8`.
 - `M` must be divisible by `rows_per_cta`.
 - Inputs and output are currently bf16 only.
+- The JAX proof of concept requires concrete shapes and compact row-major inputs.
 - The frontend integration matches the upstream RMSNorm kernel semantics; it does not expose full LayerNorm mean/bias behavior.
 
 ## Verification

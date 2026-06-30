@@ -2,6 +2,9 @@
 
 **FE-OSS APIs are experimental and subject to change.**
 
+Design work for tracing FE-OSS CuTe DSL kernels from JAX is documented in
+[CuTe DSL + JAX support for FE-OSS APIs](cutedsl-jax-design.md).
+
 This folder documents the Python FE APIs implemented under `python/cudnn`. For details on currently implemented operations, see:
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
 - [GEMM + SwiGLU](gemm_fusions/gemm_swiglu.md)
@@ -34,9 +37,32 @@ pip install nvidia-cudnn-frontend[cutedsl]
 
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
 
+The experimental JAX proof of concept uses a separate optional dependency set:
+
+```bash
+pip install nvidia-cudnn-frontend[jax]
+```
+
+This optional dependency set requires Python 3.11 or newer, matching the JAX
+CUDA package requirement; the base frontend package retains its broader Python
+support.
+
 ## API Usage
 
-Each operation exposes two APIs:
+Torch remains the canonical FE-OSS API and exposes the following wrapper and
+class styles unchanged. Operations with optional JAX support are exposed in a
+separate namespace:
+
+```python
+from cudnn import operation_name_wrapper       # canonical Torch API
+from cudnn.jax import operation_name           # optional JAX API
+```
+
+JAX is additive: it does not replace or narrow the Torch wrapper, `TupleDict`,
+class lifecycle, singleton-padding compatibility, or stream controls. The two
+APIs share semantic options and kernel behavior where meaningful, while JAX
+uses functional results and an XLA-owned stream. Backend selection is never
+inferred from array types.
 
 ### 1. High-level wrapper
 

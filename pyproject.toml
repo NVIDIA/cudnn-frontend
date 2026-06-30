@@ -76,3 +76,8 @@ cutedsl = [
     "apache-tvm-ffi",
     "torch-c-dlpack-ext",
 ]
+jax = [
+    "nvidia-cutlass-dsl[cu13]==4.5.0",
+    "cuda-python",
+    "jax[cuda13]>=0.8.1,<0.10",
+]

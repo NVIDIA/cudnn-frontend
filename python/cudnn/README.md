@@ -14,6 +14,8 @@ A simplified view of package structure:
 pyproject.toml                       # Project metadata and dependencies. Optional dependencies for frontend-only APIs are registered here.
 python/cudnn/
 ├── __init__.py                     # Top-level exports (Graph, graph, jit, wrappers, kernels)
+├── frontend/                       # Internal target-support and kernel-ownership catalog
+├── jax/                            # Optional functional JAX APIs
 ├── graph.py                        # Low-level graph helpers (graph, jit, graph_cache)
 ├── wrapper.py                      # High-level Graph wrapper class
 ├── datatypes.py                    # Data type conversions and helpers
@@ -26,15 +28,51 @@ test/python/                        # Test files
 └── fe_api/                         # Test files for frontend-only APIs
 ```
 
-## 
-
 ## Adding new frontend-only APIs
 
-To add a new frontend-only API, follow these steps:
-1. Create a new directory in the `python/cudnn` directory with the name of the API.
-2. Add your kernel implementation and implement the high level API implementation in `api.py`, extending the `APIBase` class in `api_base.py`.
-3. Expose the API import in `python/cudnn/__init__.py` and register the folder in `pyproject.toml`. Register any optional dependences if required.
-4. Add a sample usage/test file in `test/python/fe_api/`.
+The intended unit is a semantic operation variant, which may own one or more
+main/helper CuTe kernels. The existing Torch conventions remain canonical; JAX
+is an optional additive namespace:
+
+```python
+from cudnn import my_operation_wrapper
+torch_result = my_operation_wrapper(torch_inputs, ...)
+
+from cudnn.jax import my_operation
+jax_result = my_operation(jax_inputs, ...)
+```
+
+To add a new frontend-only API:
+
+1. Define the semantic operation: logical inputs and outputs, common option
+   names/defaults, shape/dtype/layout inference, support domain, workspace,
+   aliasing, and initialization behavior.
+2. Add the CuTe implementation. Every `@cute.kernel`, including helper kernels,
+   must be owned by the semantic operation's exact `kernel_anchors` entry.
+3. Preserve or add the canonical Torch class/wrapper API following existing
+   conventions. Do not replace its `TupleDict`, stream controls, output-buffer
+   lifecycle, or compatibility behavior to make it resemble JAX.
+4. Add the functional JAX adapter using `cutlass.jax.cutlass_call`. It must infer
+   outputs/workspace from abstract metadata, accept XLA's stream, and avoid
+   Torch imports or host reads during tracing.
+5. Register the internal semantic contract in `python/cudnn/frontend`. The Torch
+   binding is required; JAX must be a `TargetBinding` or explicit
+   `TargetGap(reason, tracking_issue)`. Record parameter/output mappings,
+   target-only arguments, exact `api_anchors`, and exact `kernel_anchors`.
+6. Add common support-domain/numerical parity cases plus Torch and JAX lifecycle
+   tests in `test/python/fe_api/`. JAX coverage should include `eval_shape`,
+   `jit`, lowering, and execution on supported hardware.
+7. Run `test_frontend_target_parity.py`. A new public class/wrapper or physical
+   kernel without a semantic owner is a failure. Existing baselines are
+   migration debt and must not grow for a new operation.
+8. Keep the Torch exports in `cudnn` and expose JAX only from `cudnn.jax`.
+   Register JAX dependencies only in the optional extra.
+
+The catalog is for ownership, support reporting, and CI; it is not a public
+backend-dispatch facade. Do not use tensor-type dispatch or a traced `target=`
+argument. JAX does not emulate the mutable `APIBase.compile()` / `execute()`
+lifecycle. JAX is optional for users to install, but declaring its support
+status is mandatory for contributors; the normal policy rejects new JAX gaps.
 
 **Currently implemented frontend-only APIs**:
 - `GEMM + Amax`
