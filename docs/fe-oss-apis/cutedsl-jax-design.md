@@ -633,17 +633,17 @@ not depend on PyTorch. Production CI needs a JAX lane whose test bootstrap also
 does not unconditionally import PyTorch.
 
 JAX follows a fast-moving pre-1.0 compatibility policy. The current official
-CuTe DSL + JAX guide lists JAX 0.8.1 as its minimum, while CUTLASS 4.5's module
-still declares a looser 0.5.0 minimum. The POC follows the current guide,
-bounds the experimental range below JAX 0.10, and retains the repository's
-CUTLASS 4.5.0 pin. JAX 0.8.1 and newer require Python 3.11, so this extra has a
-narrower Python requirement than the base package. The repository's current
-test requirements also pin NumPy below 2.0, while JAX 0.8.1 requires NumPy 2;
-the JAX lane therefore needs a separate dependency bootstrap. Pin and test a
-supported JAX/CUTLASS/Python matrix before promoting the integration. In
-particular, CUTLASS 4.5 selects its original FFI implementation below JAX 0.9.1
-and its stateful FFI implementation at JAX 0.9.1 or newer, so CI must cover both
-sides of that boundary.
+CuTe DSL + JAX guide lists JAX 0.8.1 as its recommended version, while CUTLASS
+4.5's module still declares a looser 0.5.0 minimum. The POC requires JAX 0.9.1,
+does not impose a speculative upper bound, and retains the repository's CUTLASS
+4.5.0 pin. Add an upper bound only in response to a demonstrated incompatibility.
+JAX 0.9.1 and newer require Python 3.11, so this extra has a narrower Python
+requirement than the base package. The repository's current test requirements
+also pin NumPy below 2.0, while JAX 0.9.1 requires NumPy 2; the JAX lane therefore
+needs a separate dependency bootstrap. Pin and test a supported
+JAX/CUTLASS/Python matrix before promoting the integration. CUTLASS 4.5 selects
+its stateful FFI implementation at JAX 0.9.1 or newer, so this lower bound also
+removes the legacy FFI branch from the supported integration surface.
 
 ## Proof of concept
 

@@ -79,5 +79,5 @@ cutedsl = [
 jax = [
     "nvidia-cutlass-dsl[cu13]==4.5.0",
     "cuda-python",
-    "jax[cuda13]>=0.8.1,<0.10",
+    "jax[cuda13]>=0.9.1",
 ]
