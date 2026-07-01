@@ -11,7 +11,6 @@ from typing import Any, NamedTuple, Optional
 from .cutedsl import BufferSpec, call_cutedsl
 from .utils import (
     optional_static_int,
-    require_concrete_dims,
     require_static_float,
     require_static_int,
 )
@@ -145,26 +144,9 @@ def indexer_forward_wrapper(
     if w.ndim != 3:
         raise ValueError(f"w must have rank 3 (B, S_q, H_q), got {w.shape}")
 
-    batch, seqlen_q, num_query_heads, head_dim = require_concrete_dims(
-        q.shape,
-        "q batch",
-        "S_q",
-        "H_q",
-        "q head dimension",
-    )
-    k_batch, seqlen_k, num_kv_heads, k_head_dim = require_concrete_dims(
-        k.shape,
-        "k batch",
-        "S_k",
-        "H_kv",
-        "k head dimension",
-    )
-    w_batch, w_seqlen_q, w_num_query_heads = require_concrete_dims(
-        w.shape,
-        "w batch",
-        "w S_q",
-        "w H_q",
-    )
+    batch, seqlen_q, num_query_heads, head_dim = q.shape
+    k_batch, seqlen_k, num_kv_heads, k_head_dim = k.shape
+    w_batch, w_seqlen_q, w_num_query_heads = w.shape
 
     dimensions = {
         "batch": batch,

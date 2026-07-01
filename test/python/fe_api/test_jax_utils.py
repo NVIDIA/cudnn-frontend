@@ -23,8 +23,6 @@ _SPEC.loader.exec_module(_MODULE)
 _OPTIONAL_MODULES_AFTER = {name for name in sys.modules if name.split(".", 1)[0] in _OPTIONAL_ROOTS}
 
 optional_static_int = _MODULE.optional_static_int
-require_concrete_dim = _MODULE.require_concrete_dim
-require_concrete_dims = _MODULE.require_concrete_dims
 require_static_bool = _MODULE.require_static_bool
 require_static_float = _MODULE.require_static_float
 require_static_int = _MODULE.require_static_int
@@ -45,30 +43,6 @@ class _DynamicValue:
 class JaxStaticValuesTest(unittest.TestCase):
     def test_module_imports_no_optional_frameworks(self):
         self.assertEqual(_OPTIONAL_MODULES_AFTER - _OPTIONAL_MODULES_BEFORE, set())
-
-    def test_concrete_dim_accepts_and_normalizes_integral_values(self):
-        for value in (0, -1, 4, _Integer.VALUE):
-            with self.subTest(value=value):
-                result = require_concrete_dim(value, name="M")
-                self.assertIs(type(result), int)
-                self.assertEqual(result, int(value))
-
-    def test_concrete_dim_rejects_nonintegral_and_symbolic_values(self):
-        for value in (True, 4.0, "4", None, _DynamicValue()):
-            with self.subTest(value_type=type(value).__name__):
-                with self.assertRaisesRegex(TypeError, "M.*shape-polymorphic"):
-                    require_concrete_dim(value, name="M")
-
-    def test_concrete_dims_normalizes_multiple_values(self):
-        result = require_concrete_dims((4, _Integer.VALUE), "M", "N")
-        self.assertEqual(result, (4, 7))
-        self.assertTrue(all(type(value) is int for value in result))
-
-    def test_concrete_dims_checks_name_count_and_preserves_dimension_name(self):
-        with self.assertRaisesRegex(ValueError, "Expected 2 dimension names, got 1"):
-            require_concrete_dims((4, 7), "M")
-        with self.assertRaisesRegex(TypeError, "N.*shape-polymorphic"):
-            require_concrete_dims((4, _DynamicValue()), "M", "N")
 
     def test_static_int_accepts_required_and_optional_integral_values(self):
         self.assertIsNone(optional_static_int(None, name="num_threads"))
@@ -125,7 +99,7 @@ class JaxStaticValuesTest(unittest.TestCase):
                 require_static_float(value, name="value")
 
     @unittest.skipUnless(importlib.util.find_spec("jax"), "JAX is not installed")
-    def test_jax_tracers_and_symbolic_dimensions_are_rejected(self):
+    def test_jax_tracers_are_rejected(self):
         import jax
 
         for converter, name in (
@@ -136,10 +110,6 @@ class JaxStaticValuesTest(unittest.TestCase):
             with self.subTest(converter=converter.__name__):
                 with self.assertRaisesRegex(TypeError, "Python-static"):
                     jax.jit(lambda value: converter(value, name=name))(1)
-
-        symbolic_dim = jax.export.symbolic_shape("m")[0]
-        with self.assertRaisesRegex(TypeError, "shape-polymorphic"):
-            require_concrete_dim(symbolic_dim, name="M")
 
 
 if __name__ == "__main__":

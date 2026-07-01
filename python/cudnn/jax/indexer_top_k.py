@@ -9,7 +9,7 @@ from functools import lru_cache
 from typing import Any, NamedTuple
 
 from .cutedsl import BufferSpec, call_cutedsl
-from .utils import require_concrete_dims, require_static_bool, require_static_int
+from .utils import require_static_bool, require_static_int
 
 _INT32_MAX = (1 << 31) - 1
 
@@ -146,12 +146,8 @@ def indexer_top_k_wrapper(
     if len(seq_lens.shape) != 1:
         raise ValueError(f"seq_lens must have rank 1, got shape {seq_lens.shape}")
 
-    num_rows, num_cols = require_concrete_dims(
-        input_values.shape,
-        "num_rows",
-        "num_cols",
-    )
-    (batch_size,) = require_concrete_dims(seq_lens.shape, "batch_size")
+    num_rows, num_cols = input_values.shape
+    (batch_size,) = seq_lens.shape
 
     if num_rows <= 0 or num_cols <= 0:
         raise ValueError(f"input_values dimensions must be positive, got {(num_rows, num_cols)}")

@@ -11,7 +11,7 @@ from typing import Any, NamedTuple, Optional
 from .._rmsnorm_rht_amax_config import resolve_launch_config
 
 from .cutedsl import BufferSpec, call_cutedsl
-from .utils import optional_static_int, require_concrete_dims, require_static_float
+from .utils import optional_static_int, require_static_float
 
 
 class RmsNormRhtAmaxResult(NamedTuple):
@@ -79,7 +79,7 @@ def rmsnorm_rht_amax_sm100(
     if weight.ndim != 1:
         raise ValueError(f"weight must have rank 1, got shape {weight.shape}")
 
-    m, n = require_concrete_dims(x.shape, "M", "N")
+    m, n = x.shape
     if tuple(weight.shape) != (n,):
         raise ValueError(f"weight shape must match the hidden dimension ({n},), " f"got {weight.shape}")
     if x.dtype != jnp.bfloat16 or weight.dtype != jnp.bfloat16:
