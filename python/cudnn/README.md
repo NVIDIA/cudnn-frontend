@@ -76,6 +76,11 @@ Do not use tensor-type dispatch or a traced `target=` argument. JAX does not
 emulate the mutable `APIBase.compile()` / `execute()` lifecycle, and adding or
 updating a PyTorch operation does not require a JAX binding.
 
+The JAX import-boundary test discovers every `jax.py` automatically and follows
+its local kernel dependencies. New JAX operations do not require a per-kernel
+import allowlist; keep shared modules free of required module-scope Torch
+dependencies.
+
 **Currently implemented frontend-only APIs**:
 - `GEMM + Amax`
 - `RMSNorm + RHT + Amax`

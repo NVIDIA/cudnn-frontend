@@ -726,6 +726,8 @@ pending.
   padded result and a real hidden workspace.
 - Add CPU contract tests plus `eval_shape`, lowering, and GPU numerical tests
   for the three wrappers.
+- Enforce the Torch-independent JAX import boundary with an automatically
+  discovered local import graph rather than per-kernel path lists.
 
 Review checkpoint: run all three wrappers on SM100, inspect lowered StableHLO
 for one custom call per wrapper, verify initialized output reset across repeated

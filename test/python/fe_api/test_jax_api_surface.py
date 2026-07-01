@@ -340,33 +340,6 @@ class JaxApiSurfaceTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn(name, torch_symbols)
 
-    def test_shared_dsa_kernel_import_paths_do_not_import_torch(self):
-        shared_files = (
-            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_forward" / "__init__.py",
-            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_forward" / "jax.py",
-            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_forward" / "indexer_fwd_sm100.py",
-            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_top_k" / "__init__.py",
-            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_top_k" / "jax.py",
-            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_top_k" / "indexer_top_k_decode_varlen.py",
-            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_top_k" / "indexer_top_k_varlen_util.py",
-        )
-        for path in shared_files:
-            with self.subTest(path=path.name):
-                tree = ast.parse(path.read_text(), filename=str(path))
-                top_level_imports = (node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom)))
-                imported_roots = {
-                    alias.name.split(".", 1)[0]
-                    for node in top_level_imports
-                    for alias in node.names
-                    if isinstance(node, ast.Import)
-                }
-                imported_roots.update(
-                    node.module.split(".", 1)[0]
-                    for node in tree.body
-                    if isinstance(node, ast.ImportFrom) and node.module
-                )
-                self.assertNotIn("torch", imported_roots)
-
     def test_jax_optional_extra_does_not_install_torch(self):
         pyproject = (_REPO_ROOT / "pyproject.toml").read_text()
         optional_dependencies = re.search(
