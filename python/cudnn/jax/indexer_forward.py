@@ -9,11 +9,6 @@ from functools import lru_cache
 from typing import Any, NamedTuple, Optional
 
 from .cutedsl import BufferSpec, call_cutedsl
-from .utils import (
-    optional_static_int,
-    require_static_float,
-    require_static_int,
-)
 
 _TMA_ALIGN_ELEMENTS = 4
 
@@ -176,16 +171,11 @@ def indexer_forward_wrapper(
     if q.dtype != jnp.bfloat16 or k.dtype != jnp.bfloat16 or w.dtype != jnp.bfloat16:
         raise ValueError("q, k, and w must all have dtype bfloat16, " f"got {q.dtype}, {k.dtype}, and {w.dtype}")
 
-    ratio = require_static_int(ratio, name="ratio")
     if ratio < 1:
         raise ValueError(f"ratio must be at least 1, got {ratio}")
     if seqlen_q > seqlen_k * ratio:
         raise ValueError(f"S_q ({seqlen_q}) must be no greater than " f"S_k * ratio ({seqlen_k * ratio})")
 
-    qhead_per_kv_head = optional_static_int(
-        qhead_per_kv_head,
-        name="qhead_per_kv_head",
-    )
     if qhead_per_kv_head is None:
         if num_query_heads % num_kv_heads != 0:
             raise ValueError(f"H_q ({num_query_heads}) must be divisible by H_kv " f"({num_kv_heads})")
@@ -197,11 +187,6 @@ def indexer_forward_wrapper(
     if qhead_per_kv_head not in (32, 64):
         raise ValueError("qhead_per_kv_head must be 32 or 64, " f"got {qhead_per_kv_head}")
 
-    m_block_size = require_static_int(m_block_size, name="m_block_size")
-    n_block_size = require_static_int(n_block_size, name="n_block_size")
-    q_stage = require_static_int(q_stage, name="q_stage")
-    kv_stage = require_static_int(kv_stage, name="kv_stage")
-    sm_scale = require_static_float(sm_scale, name="sm_scale")
     _require_supported_config(
         m_block_size=m_block_size,
         n_block_size=n_block_size,

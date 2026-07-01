@@ -11,7 +11,6 @@ from typing import Any, NamedTuple, Optional
 from .._rmsnorm_rht_amax_config import resolve_launch_config
 
 from .cutedsl import BufferSpec, call_cutedsl
-from .utils import optional_static_int, require_static_float
 
 
 class RmsNormRhtAmaxResult(NamedTuple):
@@ -85,9 +84,6 @@ def rmsnorm_rht_amax_sm100(
     if x.dtype != jnp.bfloat16 or weight.dtype != jnp.bfloat16:
         raise ValueError("x and weight must both have dtype bfloat16, " f"got {x.dtype} and {weight.dtype}")
 
-    num_threads = optional_static_int(num_threads, name="num_threads")
-    rows_per_cta = optional_static_int(rows_per_cta, name="rows_per_cta")
-    eps = require_static_float(eps, name="eps")
     resolved_num_threads, resolved_rows_per_cta = resolve_launch_config(
         m,
         n,

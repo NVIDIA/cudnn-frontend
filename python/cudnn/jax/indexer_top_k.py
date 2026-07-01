@@ -9,7 +9,6 @@ from functools import lru_cache
 from typing import Any, NamedTuple
 
 from .cutedsl import BufferSpec, call_cutedsl
-from .utils import require_static_bool, require_static_int
 
 _INT32_MAX = (1 << 31) - 1
 
@@ -127,15 +126,10 @@ def indexer_top_k_wrapper(
             "integration; install the 'jax' optional dependencies"
         ) from exc
 
-    return_val = require_static_bool(return_val, name="return_val")
     if not return_val:
         raise NotImplementedError(
             "The JAX indexer_top_k_wrapper proof of concept currently requires " "return_val=True"
         )
-
-    top_k = require_static_int(top_k, name="top_k")
-    next_n = require_static_int(next_n, name="next_n")
-    num_copy_bits = require_static_int(num_copy_bits, name="num_copy_bits")
 
     if not hasattr(input_values, "shape") or not hasattr(input_values, "dtype"):
         raise TypeError("input_values must be a JAX array with shape and dtype metadata")
