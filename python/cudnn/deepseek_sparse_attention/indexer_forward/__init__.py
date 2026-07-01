@@ -1,18 +1,15 @@
-"""Lazy framework exports for the DeepSeek indexer-forward operation.
+"""Lazy API exports for the DeepSeek indexer-forward operation.
 
-``api.py`` is always the Torch implementation and ``jax.py`` is always the
-JAX implementation. The unqualified package API prefers Torch when available
-and otherwise exposes the JAX API.
+Unqualified symbols always come from the Torch ``api.py``. The JAX API is
+available explicitly through the sibling ``jax`` namespace.
 """
 
-from ..._framework_api import make_framework_api
+from ..._operation_api import make_operation_api
 
 
-_TORCH_EXPORTS = ("IndexerForward", "indexer_forward_wrapper")
-_JAX_EXPORTS = ("IndexerForwardResult", "indexer_forward_wrapper")
+_API_EXPORTS = ("IndexerForward", "indexer_forward_wrapper")
 
-__all__, __getattr__ = make_framework_api(
+__all__, __getattr__ = make_operation_api(
     globals(),
-    torch_exports=_TORCH_EXPORTS,
-    jax_exports=_JAX_EXPORTS,
+    exports=_API_EXPORTS,
 )

@@ -38,12 +38,11 @@ physical CuTe kernel.
 
 This source-layout variant co-locates the bindings for each implemented
 operation: `api.py` is always Torch and a sibling `jax.py` is always JAX. The
-operation package selects Torch when it is installed and otherwise exposes the
-JAX symbols in a JAX-only installation. When both are installed, Torch wins;
-`cudnn.jax` remains the unambiguous way to request JAX. This is import-time
-selection, not array-type dispatch. A shared `_framework_api.py` helper applies
-that policy without importing either framework; each operation retains its own
-Torch and JAX export lists.
+operation package's unqualified symbols always resolve from `api.py`; JAX is
+requested explicitly through `<operation>.jax` or `cudnn.jax`. Installed
+dependencies never change a symbol's framework. A shared `_operation_api.py`
+helper applies this lazy routing without importing either framework, while each
+`jax.py` owns its JAX export list.
 
 ## Scope
 
@@ -169,7 +168,7 @@ jax_result = rmsnorm_rht_amax_sm100(...)
 The DSA POCs preserve the existing wrapper names and namespace shape:
 
 ```python
-# PyTorch remains the default.
+# Existing unqualified names remain PyTorch.
 from cudnn import DSA
 
 torch_scores = DSA.indexer_forward_wrapper(...)
@@ -186,7 +185,7 @@ The implementations are co-located with the kernels:
 
 ```text
 cudnn/
-  _framework_api.py                         shared lazy API selection
+  _operation_api.py                         shared lazy operation exports
   jax/                                      shared facade and cutedsl.py
   rmsnorm_rht_amax/{api.py,jax.py,config.py,kernel.py}
   deepseek_sparse_attention/
@@ -608,14 +607,14 @@ def run(x, weight):
 jax_result = run(x_jax, weight_jax)
 ```
 
-- PyTorch remains the default, first-class API. Its class lifecycle, wrapper
+- The existing PyTorch API remains first class. Its class lifecycle, wrapper
   signature, `TupleDict`, singleton-padding behavior, and stream controls are
   compatibility contracts.
 - Use related, discoverable names across frameworks where practical; exact
   symbol matching is not required.
-- JAX is explicitly selected by importing `cudnn.jax`; a JAX-only installation
-  may also receive JAX from an operation package's Torch-first availability
-  fallback. Installing the base or PyTorch extras does not require JAX.
+- JAX is explicitly selected by importing `cudnn.jax` or an operation's sibling
+  `.jax` namespace. There is no availability-based fallback from an unqualified
+  PyTorch name. Installing the base or PyTorch extras does not require JAX.
 - JAX operations use functional inputs/outputs and standard named tuples or
   registered pytrees. They do not emulate PyTorch output buffers or streams.
 - Document how logical operands, options, and results correspond. Parameter

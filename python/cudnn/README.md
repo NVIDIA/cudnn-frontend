@@ -14,14 +14,14 @@ A simplified view of package structure:
 pyproject.toml                       # Project metadata and dependencies. Optional dependencies for frontend-only APIs are registered here.
 python/cudnn/
 ├── __init__.py                     # Top-level exports (Graph, graph, jit, wrappers, kernels)
-├── _framework_api.py               # Shared Torch-first lazy API selector
+├── _operation_api.py               # Shared lazy operation API exports
 ├── jax/                            # Lazy JAX facade and shared CuTe/JAX adapter
 ├── graph.py                        # Low-level graph helpers (graph, jit, graph_cache)
 ├── wrapper.py                      # High-level Graph wrapper class
 ├── datatypes.py                    # Data type conversions and helpers
 ├── api_base.py                     # Abstract API base class for frontend-only APIs
 ├── {frontend-only-api-name}/
-│   ├── __init__.py                 # Torch-first lazy framework selection
+│   ├── __init__.py                 # Lazy api.py exports and explicit .jax namespace
 │   ├── api.py                      # PyTorch API implementation
 │   ├── jax.py                      # Optional JAX functional API
 │   ├── config.py                   # Framework-neutral operator configuration
@@ -33,10 +33,10 @@ test/python/                        # Test files
 ## Adding new frontend-only APIs
 
 The review unit is a user-visible operation, which may use one or more
-main/helper CuTe kernels. PyTorch remains the default interface; JAX is an
-optional functional namespace. When both bindings exist, they should implement
-comparable functionality on their documented overlapping domain and use
-familiar terminology where practical:
+main/helper CuTe kernels. Existing unqualified names retain their PyTorch
+meaning; JAX is an explicit optional functional namespace. When both bindings
+exist, they should implement comparable functionality on their documented
+overlapping domain and use familiar terminology where practical:
 
 ```python
 from cudnn import my_operation_wrapper
@@ -67,10 +67,10 @@ To add a new frontend-only API:
    update JAX. Static lint or LLM review may report likely gaps or drift, but is
    advisory rather than a public API contract or merge gate.
 7. Keep `api.py` as the PyTorch implementation and place an optional JAX
-   implementation in `jax.py` beside it. The operation package selects Torch
-   when available and falls back to JAX only in a JAX-only installation;
-   `cudnn.jax` remains the deterministic JAX facade. Register JAX dependencies
-   only in the optional extra.
+   implementation in `jax.py` beside it. Unqualified operation symbols always
+   resolve from `api.py`; use `<operation>.jax` or `cudnn.jax` explicitly for
+   JAX. Dependency availability must not change a symbol's framework. Register
+   JAX dependencies only in the optional extra.
 
 Do not use tensor-type dispatch or a traced `target=` argument. JAX does not
 emulate the mutable `APIBase.compile()` / `execute()` lifecycle, and adding or
