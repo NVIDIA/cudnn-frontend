@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Framework-neutral launch config for RMSNorm + RHT + amax."""
+"""Framework-neutral launch configuration for RMSNorm + RHT + amax."""
 
 from typing import Optional, Tuple
 

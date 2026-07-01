@@ -23,6 +23,7 @@ python/cudnn/
 │   ├── __init__.py                 # Torch-first lazy framework selection
 │   ├── api.py                      # PyTorch API implementation
 │   ├── jax.py                      # Optional JAX functional API
+│   ├── config.py                   # Framework-neutral operator configuration
 │   └── {kernel_name}.py            # Kernel implementation, i.e CuteDSL
 test/python/                        # Test files
 └── fe_api/                         # Test files for frontend-only APIs

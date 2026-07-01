@@ -17,7 +17,7 @@ else:
     pytestmark = pytest.mark.L0
 
 
-_MODULE_PATH = Path(__file__).resolve().parents[3] / "python" / "cudnn" / "_rmsnorm_rht_amax_config.py"
+_MODULE_PATH = Path(__file__).resolve().parents[3] / "python" / "cudnn" / "rmsnorm_rht_amax" / "config.py"
 _SPEC = importlib.util.spec_from_file_location("cudnn_rmsnorm_rht_amax_config", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
@@ -27,7 +27,7 @@ _SPEC.loader.exec_module(_MODULE)
 
 class RmsNormRhtAmaxLaunchConfigTest(unittest.TestCase):
     def test_package_does_not_eagerly_import_torch_api(self):
-        package_dir = _MODULE_PATH.parent / "rmsnorm_rht_amax"
+        package_dir = _MODULE_PATH.parent
         module_name = "cudnn_rmsnorm_rht_amax_lazy_import_test"
         package_spec = importlib.util.spec_from_file_location(
             module_name,

@@ -11,9 +11,8 @@ from typing import Any, NamedTuple, Optional
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from .._rmsnorm_rht_amax_config import resolve_launch_config
-
 from ..jax.cutedsl import BufferSpec, call_cutedsl
+from .config import resolve_launch_config
 
 
 class RmsNormRhtAmaxResult(NamedTuple):

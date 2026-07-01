@@ -185,7 +185,7 @@ The implementations are co-located with the kernels:
 ```text
 cudnn/
   jax/                                      shared facade and cutedsl.py
-  rmsnorm_rht_amax/{api.py,jax.py,kernel.py}
+  rmsnorm_rht_amax/{api.py,jax.py,config.py,kernel.py}
   deepseek_sparse_attention/
     indexer_forward/{api.py,jax.py,...}
     indexer_top_k/{api.py,jax.py,...}
@@ -261,7 +261,7 @@ The core must not allocate tensors, inspect device values, access data pointers,
 or choose a framework stream.
 
 The POC starts this extraction with
-[`_rmsnorm_rht_amax_config.py`](../../python/cudnn/_rmsnorm_rht_amax_config.py),
+[`rmsnorm_rht_amax/config.py`](../../python/cudnn/rmsnorm_rht_amax/config.py),
 which mirrors the canonical Torch launch rules for JAX without modifying the
 Torch implementation. Moving both targets onto one neutral implementation is a
 Phase 1 change gated by Torch compatibility snapshots.
