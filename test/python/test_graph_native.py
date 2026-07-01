@@ -1,0 +1,418 @@
+"""Unit tests for Python-native graph representation."""
+
+import pytest
+
+from cudnn.graph_types import NodeType, Tensor
+from cudnn.nodes import Node, _row_major_stride
+from cudnn.graph_native import NativeGraph, GraphContext
+
+pytestmark = pytest.mark.L0
+
+
+class TestTensor:
+    """Tests for Tensor."""
+
+    def test_create_tensor(self):
+        t = Tensor(name="test", dim=[8, 64, 128], stride=[8192, 128, 1])
+        assert t.name == "test"
+        assert t.dim == [8, 64, 128]
+        assert not t.is_virtual
+
+    def test_builder_pattern(self):
+        t = Tensor()
+        t.set_name("my_tensor").set_dim([4, 32]).set_stride([32, 1]).set_output(True)
+        assert t.name == "my_tensor"
+        assert not t.is_virtual
+
+    def test_set_output(self):
+        t = Tensor(is_virtual=True)
+        t.set_output(True)
+        assert not t.is_virtual
+        t.set_output(False)
+        assert t.is_virtual
+
+    def test_validation_success(self):
+        t = Tensor(name="valid", dim=[8, 64], stride=[64, 1])
+        t.validate()
+
+    def test_validation_no_dims(self):
+        t = Tensor(name="no_dims", stride=[64, 1])
+        with pytest.raises(ValueError, match="dims not set"):
+            t.validate()
+
+    def test_validation_dim_stride_mismatch(self):
+        t = Tensor(name="mismatch", dim=[8, 64, 128], stride=[64, 1])
+        with pytest.raises(ValueError, match="mismatch"):
+            t.validate()
+
+    def test_uid_management(self):
+        t = Tensor(name="test")
+        assert not t.uid_assigned
+        t.set_uid(42)
+        assert t.uid == 42
+        assert t.uid_assigned
+
+
+class TestNode:
+    """Tests for Node class."""
+
+    def test_create_node(self):
+        node = Node("mm1", NodeType.MATMUL)
+        assert node.name == "mm1"
+        assert node.node_type == NodeType.MATMUL
+        assert node.inputs == {}
+        assert node.outputs == {}
+        assert node.params == {}
+
+    def test_node_with_tensors(self):
+        node = Node("mm1", NodeType.MATMUL)
+        a = Tensor(name="A", dim=[8, 64], stride=[64, 1])
+        b = Tensor(name="B", dim=[64, 32], stride=[32, 1])
+        c = Tensor(name="C", dim=[8, 32], stride=[32, 1])
+
+        node.inputs["A"] = a
+        node.inputs["B"] = b
+        node.outputs["C"] = c
+
+        assert node.inputs["A"] is a
+        assert node.outputs["C"] is c
+
+    def test_node_params(self):
+        node = Node("conv1", NodeType.CONV_FPROP)
+        node.params["padding"] = [1, 1]
+        node.params["stride"] = [2, 2]
+        assert node.params["padding"] == [1, 1]
+
+    def test_node_repr(self):
+        node = Node("mm1", NodeType.MATMUL)
+        assert repr(node) == "Node('mm1', MATMUL)"
+
+
+class TestMatmulInference:
+    """Tests for matmul dimension inference."""
+
+    def test_infer_2d(self):
+        node = Node("mm", NodeType.MATMUL)
+        a = Tensor(name="A", dim=[64, 128], stride=[128, 1])
+        b = Tensor(name="B", dim=[128, 256], stride=[256, 1])
+        c = Tensor(name="C", is_virtual=True)
+
+        node.inputs["A"] = a
+        node.inputs["B"] = b
+        node.outputs["C"] = c
+
+        node.infer_properties(GraphContext())
+        assert c.dim == [64, 256]
+
+    def test_infer_3d_batched(self):
+        node = Node("mm", NodeType.MATMUL)
+        a = Tensor(name="A", dim=[8, 64, 128], stride=[8192, 128, 1])
+        b = Tensor(name="B", dim=[8, 128, 256], stride=[32768, 256, 1])
+        c = Tensor(name="C", is_virtual=True)
+
+        node.inputs["A"] = a
+        node.inputs["B"] = b
+        node.outputs["C"] = c
+
+        node.infer_properties(GraphContext())
+        assert c.dim == [8, 64, 256]
+
+    def test_infer_strides(self):
+        node = Node("mm", NodeType.MATMUL)
+        a = Tensor(name="A", dim=[8, 64], stride=[64, 1])
+        b = Tensor(name="B", dim=[64, 32], stride=[32, 1])
+        c = Tensor(name="C", is_virtual=True)
+
+        node.inputs["A"] = a
+        node.inputs["B"] = b
+        node.outputs["C"] = c
+
+        node.infer_properties(GraphContext())
+        assert c.stride == [32, 1]
+
+
+class TestRowMajorStride:
+    """Tests for stride computation."""
+
+    def test_1d(self):
+        assert _row_major_stride([10]) == [1]
+
+    def test_2d(self):
+        assert _row_major_stride([8, 64]) == [64, 1]
+
+    def test_3d(self):
+        assert _row_major_stride([4, 8, 16]) == [128, 16, 1]
+
+    def test_empty(self):
+        assert _row_major_stride([]) == []
+
+
+class TestNativeGraph:
+    """Tests for NativeGraph."""
+
+    def test_creation(self):
+        g = NativeGraph()
+        assert len(g.nodes) == 0
+        assert len(g.tensors) == 0
+
+    def test_with_context(self):
+        g = NativeGraph(io_data_type="HALF", compute_data_type="FLOAT")
+        assert g.context.io_data_type == "HALF"
+        assert g.context.compute_data_type == "FLOAT"
+
+    def test_tensor_creation(self):
+        g = NativeGraph()
+        t = g.tensor(dim=[8, 64, 128], name="my_tensor")
+        assert t.name == "my_tensor"
+        assert t.dim == [8, 64, 128]
+        assert t.stride == [8192, 128, 1]
+        assert "my_tensor" in g.tensors
+
+    def test_matmul(self):
+        g = NativeGraph()
+        A = g.tensor(dim=[8, 64, 128], name="A")
+        B = g.tensor(dim=[8, 128, 256], name="B")
+        C = g.matmul(A, B, name="mm1")
+
+        assert len(g.nodes) == 1
+        assert g.nodes[0].node_type == NodeType.MATMUL
+        assert g.nodes[0].name == "mm1"
+        assert C.is_virtual
+
+    def test_matmul_inputs_outputs(self):
+        g = NativeGraph()
+        A = g.tensor(dim=[8, 64, 128], name="A")
+        B = g.tensor(dim=[8, 128, 256], name="B")
+        C = g.matmul(A, B, name="mm1")
+
+        node = g.nodes[0]
+        assert node.inputs["A"] is A
+        assert node.inputs["B"] is B
+        assert node.outputs["C"] is C
+        assert node.params["padding"] == 0.0
+
+    def test_find_tensor_by_name(self):
+        g = NativeGraph()
+        t = g.tensor(dim=[8, 64], name="test")
+        assert g.find_tensor("test") is t
+
+    def test_find_tensor_by_uid(self):
+        g = NativeGraph()
+        t = g.tensor(dim=[8, 64], name="test")
+        assert g.find_tensor(t.uid) is t
+
+    def test_find_tensor_not_found(self):
+        g = NativeGraph()
+        assert g.find_tensor("nonexistent") is None
+
+    def test_inspect(self):
+        g = NativeGraph(io_data_type="HALF")
+        A = g.tensor(dim=[8, 64], name="A")
+        B = g.tensor(dim=[64, 32], name="B")
+        C = g.matmul(A, B, name="mm1")
+
+        info = g.inspect()
+        assert len(info["nodes"]) == 1
+        assert info["nodes"][0]["name"] == "mm1"
+        assert info["nodes"][0]["type"] == "MATMUL"
+        assert info["nodes"][0]["params"]["padding"] == 0.0
+        assert "A" in info["tensors"]
+
+    def test_auto_naming(self):
+        g = NativeGraph()
+        A = g.tensor(dim=[8, 64], name="A")
+        B = g.tensor(dim=[64, 32], name="B")
+
+        g.matmul(A, B)
+        g.matmul(A, B)
+
+        assert g.nodes[0].name == "matmul.0"
+        assert g.nodes[1].name == "matmul.1"
+
+    def test_validation(self):
+        g = NativeGraph()
+        A = g.tensor(dim=[8, 64], stride=[64, 1], name="A")
+        B = g.tensor(dim=[64, 32], stride=[32, 1], name="B")
+        g.matmul(A, B)
+        g.validate()
+
+    def test_pointwise_add(self):
+        g = NativeGraph()
+        A = g.tensor(dim=[8, 64], name="A")
+        B = g.tensor(dim=[8, 64], name="B")
+        C = g.add(A, B)
+
+        assert len(g.nodes) == 1
+        assert g.nodes[0].node_type == NodeType.POINTWISE
+        assert "mode" in g.nodes[0].params
+
+    def test_relu(self):
+        g = NativeGraph()
+        X = g.tensor(dim=[8, 64], name="X")
+        Y = g.relu(X)
+        assert g.nodes[0].node_type == NodeType.POINTWISE
+
+    def test_chaining(self):
+        g = NativeGraph()
+        A = g.tensor(dim=[8, 64, 128], name="A")
+        B = g.tensor(dim=[8, 128, 256], name="B")
+        bias = g.tensor(dim=[1, 1, 256], name="bias")
+
+        C = g.matmul(A, B)
+        D = g.add(C, bias)
+        E = g.relu(D)
+
+        assert len(g.nodes) == 3
+        assert [n.node_type for n in g.nodes] == [NodeType.MATMUL, NodeType.POINTWISE, NodeType.POINTWISE]
+
+    def test_get_node(self):
+        g = NativeGraph()
+        A = g.tensor(dim=[8, 64], name="A")
+        B = g.tensor(dim=[64, 32], name="B")
+        g.matmul(A, B, name="mm1")
+
+        node = g.get_node("mm1")
+        assert node.name == "mm1"
+        assert g.get_node("nonexistent") is None
+
+    def test_conv_fprop(self):
+        g = NativeGraph()
+        X = g.tensor(dim=[1, 3, 32, 32], name="X")
+        W = g.tensor(dim=[16, 3, 3, 3], name="W")
+        Y = g.conv_fprop(X, W, padding=[1, 1], stride=[1, 1], dilation=[1, 1], name="conv1")
+
+        assert g.nodes[0].node_type == NodeType.CONV_FPROP
+        assert g.nodes[0].params["pre_padding"] == [1, 1]
+        assert g.nodes[0].params["stride"] == [1, 1]
+
+    def test_sdpa_inference(self):
+        """Test SDPA forward inference mode."""
+        g = NativeGraph()
+        # [B, H, S, D] layout
+        Q = g.tensor(dim=[2, 8, 128, 64], name="Q")
+        K = g.tensor(dim=[2, 8, 128, 64], name="K")
+        V = g.tensor(dim=[2, 8, 128, 64], name="V")
+
+        O = g.sdpa(Q, K, V, is_inference=True, use_causal_mask=True, name="attn")
+
+        assert len(g.nodes) == 1
+        assert g.nodes[0].node_type == NodeType.SDPA
+        assert g.nodes[0].params["is_inference"] is True
+        assert g.nodes[0].params["use_causal_mask"] is True
+        assert "O" in g.nodes[0].outputs
+
+    def test_sdpa_training(self):
+        """Test SDPA forward training mode (returns stats)."""
+        g = NativeGraph()
+        Q = g.tensor(dim=[2, 8, 128, 64], name="Q")
+        K = g.tensor(dim=[2, 8, 128, 64], name="K")
+        V = g.tensor(dim=[2, 8, 128, 64], name="V")
+
+        O, stats = g.sdpa(Q, K, V, is_inference=False, attn_scale=0.125, name="attn")
+
+        assert len(g.nodes) == 1
+        assert g.nodes[0].params["is_inference"] is False
+        assert g.nodes[0].params["attn_scale"] == 0.125
+        assert "O" in g.nodes[0].outputs
+        assert "stats" in g.nodes[0].outputs
+
+
+@pytest.mark.L1
+class TestCuTileEngine:
+    """Tests for MatmulCuTileEngine native execution with unified API."""
+
+    @pytest.fixture
+    def cutile_available(self):
+        try:
+            import cuda.tile  # noqa: F401
+            import cuda.bindings.runtime as cudart
+
+            err, device_id = cudart.cudaGetDevice()
+            err, props = cudart.cudaGetDeviceProperties(device_id)
+            return props.major * 10 + props.minor >= 100
+        except (ImportError, Exception):
+            return False
+
+    def test_matmul_cutile(self, cutile_available):
+        """Test matmul execution with torch tensors passed directly."""
+        if not cutile_available:
+            pytest.skip("cuTile or Blackwell GPU not available")
+
+        import torch
+
+        a_data = torch.randn(2, 3, 4, device="cuda", dtype=torch.float32)
+        b_data = torch.randn(2, 4, 5, device="cuda", dtype=torch.float32)
+        c_data = torch.empty(2, 3, 5, device="cuda", dtype=torch.float32)
+
+        # Pass torch tensors directly — no g.tensor() or set_output() needed
+        g = NativeGraph(use_native=True)
+        C = g.matmul(a_data, b_data)
+
+        # execute() lazy-builds; C is auto-marked as output (leaf tensor)
+        g.execute({C: c_data})
+
+        c_expected = torch.matmul(a_data, b_data)
+        assert c_data.shape == c_expected.shape
+        assert torch.allclose(c_data, c_expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.L1
+class TestIntegration:
+    """Integration tests requiring cuDNN."""
+
+    @pytest.fixture
+    def cudnn_available(self):
+        try:
+            import cudnn
+
+            return cudnn.backend_version() >= 91200
+        except Exception:
+            return False
+
+    def test_build(self, cudnn_available):
+        if not cudnn_available:
+            pytest.skip("cuDNN not available")
+
+        import cudnn
+
+        g = NativeGraph(
+            io_data_type=cudnn.data_type.HALF,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        A = g.tensor(dim=[8, 64, 128], name="A")
+        B = g.tensor(dim=[8, 128, 256], name="B")
+        C = g.matmul(A, B)
+        C.set_output(True)
+
+        g.build()
+        assert g._is_built
+        assert g.get_workspace_size() >= 0
+
+    def test_sdpa_build(self, cudnn_available):
+        """Test building SDPA graph."""
+        if not cudnn_available:
+            pytest.skip("cuDNN not available")
+
+        import cudnn
+
+        g = NativeGraph(
+            io_data_type=cudnn.data_type.HALF,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        # [B, H, S, D] layout
+        Q = g.tensor(dim=[2, 8, 128, 64], name="Q")
+        K = g.tensor(dim=[2, 8, 128, 64], name="K")
+        V = g.tensor(dim=[2, 8, 128, 64], name="V")
+
+        O = g.sdpa(Q, K, V, is_inference=True, use_causal_mask=True, name="attn")
+        O.set_output(True)
+
+        try:
+            g.build()
+            assert g._is_built
+        except cudnn.cudnnGraphNotSupportedError:
+            pytest.skip("SDPA not supported on this hardware/configuration")
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

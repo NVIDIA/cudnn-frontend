@@ -258,6 +258,11 @@ else:
 from .graph import graph, jit, graph_cache
 from .wrapper import Graph
 
+# Native Python graph (backend-agnostic IR + pluggable execution backends)
+from .graph_types import NodeType, Tensor
+from .graph_native import NativeGraph, GraphContext
+from .nodes import Node
+
 from typing import Any
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
