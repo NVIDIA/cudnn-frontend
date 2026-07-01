@@ -217,50 +217,6 @@ def _make_launch_adapter(fn: Callable[..., None], plan: _CallPlan) -> Callable[.
         )
 
 
-def _validate_tensor_spec(
-    spec: Any,
-    rank: int,
-    *,
-    name: str,
-    tensor_spec_type: type,
-) -> None:
-    """Validate native CUTLASS tensor metadata before JAX lowering."""
-
-    if spec is None:
-        return
-    if not isinstance(spec, tensor_spec_type):
-        raise TypeError(f"{name} tensor_spec must be cutlass.jax.TensorSpec or None, " f"got {type(spec).__name__}")
-
-    for field_name in ("layout", "mode"):
-        value = getattr(spec, field_name)
-        if value is None:
-            continue
-        if not isinstance(value, tuple):
-            raise TypeError(f"{name} tensor_spec.{field_name} must be a tuple or None")
-        if any(not isinstance(item, int) or isinstance(item, bool) for item in value):
-            raise TypeError(f"{name} tensor_spec.{field_name} entries must be integers")
-        if len(value) != rank or tuple(sorted(value)) != tuple(range(rank)):
-            raise ValueError(f"{name} tensor_spec.{field_name} must be a permutation of " f"range({rank}), got {value}")
-
-    if spec.static is not None and not isinstance(spec.static, bool):
-        raise TypeError(f"{name} tensor_spec.static must be bool or None")
-
-    alignment = spec.ptr_assumed_align
-    if not isinstance(alignment, int) or isinstance(alignment, bool):
-        raise TypeError(f"{name} tensor_spec.ptr_assumed_align must be an integer")
-    if alignment <= 0 or (alignment & (alignment - 1)):
-        raise ValueError(f"{name} tensor_spec.ptr_assumed_align must be a positive power of two")
-
-    divisibility = spec.divisibility
-    if isinstance(divisibility, tuple) and len(divisibility) != rank:
-        raise ValueError(f"{name} tensor_spec.divisibility must have rank {rank}, " f"got {divisibility}")
-    if divisibility is not None and not isinstance(divisibility, (int, tuple)):
-        raise TypeError(f"{name} tensor_spec.divisibility must be an integer, tuple, or None")
-    divisibility_values = divisibility if isinstance(divisibility, tuple) else (divisibility,)
-    if any(value is not None and (not isinstance(value, int) or isinstance(value, bool) or value <= 0) for value in divisibility_values):
-        raise ValueError(f"{name} tensor_spec.divisibility entries must be positive integers " f"or None, got {divisibility}")
-
-
 def _make_initialized_buffer(spec: BufferSpec, jax_numpy: Any) -> Any:
     if spec.initialization is BufferInitialization.ZERO:
         return jax_numpy.zeros(spec.shape, dtype=spec.dtype)
@@ -326,23 +282,6 @@ def _call_cutedsl_with_modules(
                 f"values with shape and dtype metadata; input #{input_idx} "
                 f"is {type(value).__name__}"
             )
-
-    tensor_spec_type = cutlass_jax_module.TensorSpec
-    for input_idx, spec in enumerate(normalized_input_specs):
-        _validate_tensor_spec(
-            spec,
-            len(inputs[input_idx].shape),
-            name=f"input #{input_idx}",
-            tensor_spec_type=tensor_spec_type,
-        )
-
-    for result in plan.all_results:
-        _validate_tensor_spec(
-            result.tensor_spec,
-            len(result.shape),
-            name=result.name,
-            tensor_spec_type=tensor_spec_type,
-        )
 
     # Fail before lowering when a requested alias cannot describe the same
     # logical buffer. XLA may still insert a protective copy unless the caller
@@ -436,9 +375,10 @@ def call_cutedsl(
     sequence of array-like values; nested pytrees are intentionally outside the
     FE ABI. ``input_specs`` and ``BufferSpec.tensor_spec`` accept native
     ``cutlass.jax.TensorSpec`` objects. An aliased input and output must use
-    identical tensor metadata. The JAX function remains functional: callers should use
-    ``donate_argnums`` when they want XLA to reuse aliased input storage without
-    a copy.
+    identical tensor metadata. TensorSpec validation is delegated to
+    ``cutlass.jax.cutlass_call``. The JAX function remains functional: callers
+    should use ``donate_argnums`` when they want XLA to reuse aliased input
+    storage without a copy.
     """
 
     try:

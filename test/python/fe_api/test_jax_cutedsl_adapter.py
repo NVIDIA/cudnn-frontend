@@ -258,7 +258,9 @@ class CallCutedslAdapterTest(unittest.TestCase):
             mode=(1, 0),
             static=True,
             ptr_assumed_align=128,
-            divisibility=(16, 8),
+            # CUTLASS accepts -1 divisibility sentinels. The adapter must not
+            # reinterpret or narrow the native TensorSpec contract.
+            divisibility=(-1, -1),
         )
         output_spec = _FakeCutlassTensorSpec(
             layout=(1, 0),
@@ -302,85 +304,7 @@ class CallCutedslAdapterTest(unittest.TestCase):
 
         self.assertIsNone(bridge.calls[0][1]["output_spec"][0])
 
-    def test_native_tensor_spec_metadata_is_validated(self):
-        invalid_specs = (
-            (
-                "layout permutation",
-                _FakeCutlassTensorSpec(layout=(0, 0)),
-                ValueError,
-                "layout.*permutation",
-            ),
-            (
-                "mode rank",
-                _FakeCutlassTensorSpec(mode=(0,)),
-                ValueError,
-                "mode.*permutation",
-            ),
-            (
-                "mode element type",
-                _FakeCutlassTensorSpec(mode=(False, True)),
-                TypeError,
-                "mode entries.*integers",
-            ),
-            (
-                "static type",
-                _FakeCutlassTensorSpec(static="yes"),
-                TypeError,
-                "static.*bool",
-            ),
-            (
-                "pointer alignment",
-                _FakeCutlassTensorSpec(ptr_assumed_align=3),
-                ValueError,
-                "ptr_assumed_align.*power of two",
-            ),
-            (
-                "divisibility value",
-                _FakeCutlassTensorSpec(divisibility=(16, 0)),
-                ValueError,
-                "divisibility.*positive",
-            ),
-            (
-                "divisibility rank",
-                _FakeCutlassTensorSpec(divisibility=(16,)),
-                ValueError,
-                "divisibility.*rank 2",
-            ),
-        )
-
-        for label, tensor_spec, error_type, message in invalid_specs:
-            with self.subTest(label=label):
-                with self.assertRaisesRegex(error_type, message):
-                    self._call(
-                        lambda stream, x, output: None,
-                        (_Array((8, 16), "f32", "x"),),
-                        outputs=(BufferSpec("output", (8, 16), "f32"),),
-                        input_specs=(tensor_spec,),
-                    )
-
-        with self.assertRaisesRegex(TypeError, "TensorSpec or None"):
-            self._call(
-                lambda stream, x, output: None,
-                (_Array((8, 16), "f32", "x"),),
-                outputs=(BufferSpec("output", (8, 16), "f32"),),
-                input_specs=(object(),),
-            )
-
-        with self.assertRaisesRegex(ValueError, "output.*layout.*permutation"):
-            self._call(
-                lambda stream, x, output: None,
-                (_Array((8, 16), "f32", "x"),),
-                outputs=(
-                    BufferSpec(
-                        "output",
-                        (8, 16),
-                        "f32",
-                        tensor_spec=_FakeCutlassTensorSpec(layout=(0, 0)),
-                    ),
-                ),
-            )
-
-    def test_rejects_invalid_specs_and_aliases(self):
+    def test_rejects_invalid_call_plans_and_aliases(self):
         with self.assertRaisesRegex(ValueError, "at least one public output"):
             self._call(lambda stream, x: None, (_Array((1,), "f32", "x"),), outputs=())
 
@@ -439,14 +363,6 @@ class CallCutedslAdapterTest(unittest.TestCase):
                 (_Array((1,), "f32", "x"),),
                 outputs=(BufferSpec("output", (1,), "f32"),),
                 static_args={"compile_options": "not a kernel argument"},
-            )
-
-        with self.assertRaisesRegex(ValueError, "permutation"):
-            self._call(
-                lambda stream, x, y: None,
-                (_Array((1, 1), "f32", "x"),),
-                outputs=(BufferSpec("output", (1, 1), "f32"),),
-                input_specs=(_FakeCutlassTensorSpec(layout=(0, 0)),),
             )
 
 
