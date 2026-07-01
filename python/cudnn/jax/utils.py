@@ -57,6 +57,18 @@ def optional_static_int(value: Any, *, name: str) -> Optional[int]:
     return None if value is None else require_static_int(value, name=name)
 
 
+def require_static_bool(value: Any, *, name: str) -> bool:
+    """Normalize a host-static boolean compile parameter."""
+
+    if not isinstance(value, bool):
+        raise TypeError(
+            f"{name} must be a Python-static bool; close over it or mark it "
+            "static with jax.jit(static_argnames=...) "
+            f"(got {_type_name(value)})"
+        )
+    return value
+
+
 def require_static_float(value: Any, *, name: str) -> float:
     """Normalize a host-static real-valued compile parameter."""
 
@@ -74,6 +86,7 @@ __all__ = [
     "optional_static_int",
     "require_concrete_dim",
     "require_concrete_dims",
+    "require_static_bool",
     "require_static_float",
     "require_static_int",
 ]

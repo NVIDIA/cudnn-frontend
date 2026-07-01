@@ -25,6 +25,7 @@ _OPTIONAL_MODULES_AFTER = {name for name in sys.modules if name.split(".", 1)[0]
 optional_static_int = _MODULE.optional_static_int
 require_concrete_dim = _MODULE.require_concrete_dim
 require_concrete_dims = _MODULE.require_concrete_dims
+require_static_bool = _MODULE.require_static_bool
 require_static_float = _MODULE.require_static_float
 require_static_int = _MODULE.require_static_int
 
@@ -93,6 +94,14 @@ class JaxStaticValuesTest(unittest.TestCase):
                 self.assertIs(type(result), float)
                 self.assertEqual(result, float(value))
 
+    def test_static_bool_accepts_only_builtin_bools(self):
+        self.assertIs(require_static_bool(True, name="return_val"), True)
+        self.assertIs(require_static_bool(False, name="return_val"), False)
+        for value in (None, 0, 1, "true", _DynamicValue()):
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaisesRegex(TypeError, "return_val.*Python-static bool"):
+                    require_static_bool(value, name="return_val")
+
     def test_static_float_rejects_nonreal_and_dynamic_values(self):
         for value in (None, True, "0.125", b"0.125", 1 + 0j, _DynamicValue()):
             with self.subTest(value_type=type(value).__name__):
@@ -122,6 +131,7 @@ class JaxStaticValuesTest(unittest.TestCase):
         for converter, name in (
             (require_static_int, "num_threads"),
             (require_static_float, "eps"),
+            (require_static_bool, "return_val"),
         ):
             with self.subTest(converter=converter.__name__):
                 with self.assertRaisesRegex(TypeError, "Python-static"):

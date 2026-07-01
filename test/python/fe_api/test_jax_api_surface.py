@@ -47,8 +47,31 @@ class JaxApiSurfaceTest(unittest.TestCase):
         after = {name for name in sys.modules if name.split(".", 1)[0] in optional_roots}
         self.assertEqual(after - before, set())
         self.assertTrue(callable(jax_namespace.rmsnorm_rht_amax_sm100))
+        self.assertTrue(callable(jax_namespace.indexer_forward_wrapper))
+        self.assertTrue(callable(jax_namespace.indexer_top_k_wrapper))
+        self.assertIs(
+            jax_namespace.DSA.indexer_forward_wrapper,
+            jax_namespace.indexer_forward_wrapper,
+        )
+        self.assertIs(jax_namespace.DSA.indexer_top_k_wrapper, jax_namespace.indexer_top_k_wrapper)
         self.assertEqual(jax_namespace.RmsNormRhtAmaxResult._fields, ("output", "amax"))
-        self.assertEqual(jax_namespace.__all__, ["RmsNormRhtAmaxResult", "rmsnorm_rht_amax_sm100"])
+        self.assertEqual(jax_namespace.IndexerForwardResult._fields, ("scores",))
+        self.assertEqual(jax_namespace.IndexerTopKResult._fields, ("indices", "values"))
+        self.assertEqual(
+            jax_namespace.__all__,
+            [
+                "DSA",
+                "IndexerForwardResult",
+                "IndexerTopKResult",
+                "RmsNormRhtAmaxResult",
+                "indexer_forward_wrapper",
+                "indexer_top_k_wrapper",
+                "rmsnorm_rht_amax_sm100",
+            ],
+        )
+
+        after_symbol_load = {name for name in sys.modules if name.split(".", 1)[0] in optional_roots}
+        self.assertEqual(after_symbol_load - before, set())
 
     def test_torch_function_remains_a_lazy_top_level_export(self):
         top_level_tree = ast.parse(
@@ -65,6 +88,48 @@ class JaxApiSurfaceTest(unittest.TestCase):
             lazy_imports["rmsnorm_rht_amax_sm100"],
             (".rmsnorm_rht_amax", "rmsnorm_rht_amax_sm100"),
         )
+        self.assertEqual(lazy_imports["DSA"], (".deepseek_sparse_attention", "DSA"))
+
+    def test_dsa_operator_names_match_torch_namespace(self):
+        dsa_tree = ast.parse(
+            (_CUDNN_ROOT / "deepseek_sparse_attention" / "__init__.py").read_text(),
+            filename=str(_CUDNN_ROOT / "deepseek_sparse_attention" / "__init__.py"),
+        )
+        symbols_node = next(
+            node.value
+            for node in dsa_tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "_SYMBOLS" for target in node.targets)
+        )
+        torch_symbols = ast.literal_eval(symbols_node)
+        for name in ("indexer_forward_wrapper", "indexer_top_k_wrapper"):
+            with self.subTest(name=name):
+                self.assertIn(name, torch_symbols)
+
+    def test_shared_dsa_kernel_import_paths_do_not_import_torch(self):
+        shared_files = (
+            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_forward" / "__init__.py",
+            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_forward" / "indexer_fwd_sm100.py",
+            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_top_k" / "__init__.py",
+            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_top_k" / "indexer_top_k_decode_varlen.py",
+            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_top_k" / "indexer_top_k_varlen_util.py",
+        )
+        for path in shared_files:
+            with self.subTest(path=path.name):
+                tree = ast.parse(path.read_text(), filename=str(path))
+                top_level_imports = (node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom)))
+                imported_roots = {
+                    alias.name.split(".", 1)[0]
+                    for node in top_level_imports
+                    for alias in node.names
+                    if isinstance(node, ast.Import)
+                }
+                imported_roots.update(
+                    node.module.split(".", 1)[0]
+                    for node in tree.body
+                    if isinstance(node, ast.ImportFrom) and node.module
+                )
+                self.assertNotIn("torch", imported_roots)
 
     def test_jax_optional_extra_does_not_install_torch(self):
         pyproject = (_REPO_ROOT / "pyproject.toml").read_text()

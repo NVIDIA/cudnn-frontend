@@ -1,16 +1,10 @@
 """Shared cute.compile option helpers.
 
-The cute DSL compiler accepts ``--gpu-arch <sm_XXX>`` to lock SASS to a
-specific architecture. Without it, the compiler falls back to the device
-arch reported by ``torch.cuda.get_device_capability()`` via the cute DSL's
-internal map (see ``cutlass/base_dsl/runtime/cuda.py``). That map currently
-hardcodes ``(10, 0) → "sm_100a"`` (B200) but treats unknown caps as
-``"sm_<major><minor>"`` *without* the architecture-specific ``a`` suffix —
-which silently drops sm_X-a-only features (TMA bulk, tcgen05, etc.) on
-B300 and beyond.
-
-So we always pass an explicit ``--gpu-arch`` chosen at runtime from the
-device capability. ``compile_options(extra)`` is the single entry point;
+The CuTe DSL compiler accepts ``--gpu-arch <sm_XXX>`` to lock SASS to a
+specific architecture. CUTLASS 4.5 auto-detects the known SM90a, SM100a, and
+SM103a targets, but the Torch DSA path still passes the target explicitly so
+it is visible in compile options/cache keys and unsupported devices fail with
+a DSA-specific error. ``compile_options(extra)`` is the single entry point;
 DSA ``cute.compile`` call sites should route through it.
 """
 

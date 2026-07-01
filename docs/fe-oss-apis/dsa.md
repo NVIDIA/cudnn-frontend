@@ -6,10 +6,11 @@
 
 The DeepSeek Sparse Attention (DSA) module integrates a set of CuTe-DSL
 kernels that support the sparse-attention path used by DeepSeek-style models.
-Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs; Indexer
-Forward and Indexer Top-K remain SM100+ only. The kernels are
-delivered as Python classes / wrappers that follow the same `APIBase`
-pattern as other cuDNN Frontend operations.
+Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs. The existing
+PyTorch Indexer Forward and Indexer Top-K wrappers both support SM90+, while
+the current JAX Indexer Forward proof of concept is limited to SM100. The
+kernels are delivered as Python classes / wrappers that follow the same
+`APIBase` pattern as other cuDNN Frontend operations.
 
 **Scope:** this module ships CuTe-DSL kernels for DSA backward, indexer
 scores/top-K, sparse/dense score recompute, and sparse/dense indexer
@@ -24,7 +25,7 @@ The module packages the following operations:
 2. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
    ratio causal mask). Non-fused; pair with **Indexer Top-K** for the
    top-K step.
-3. **Indexer Top-K** – SM100 CuTe-DSL radix top-K kernel with per-row
+3. **Indexer Top-K** – SM90+ CuTe-DSL radix top-K kernel with per-row
    ``seq_lens``.
 4. **Sparse Indexer / Attention Score Recompute** – sparse (top-K) recompute
    of indexer and attention scores for training loss.
@@ -59,15 +60,41 @@ Training-score loss path:
 
 ## Installation
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```bash
 pip install nvidia-cudnn-frontend[cutedsl]
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```bash
+pip install nvidia-cudnn-frontend[jax]
+```
+
+The JAX optional dependency set requires Python 3.11 or newer.
+
+`````
+
+``````
 
 ---
 
 ## API Usage
 
 ### DSA Namespace
+
+PyTorch remains the default and exposes every DSA class and wrapper below.
+The optional JAX namespace currently implements the two score-selection
+wrappers described in sections 2 and 3.
 
 ```python
 from cudnn import DSA
@@ -141,12 +168,57 @@ reduces to `(q+1)//ratio` when `S_q == S_k * ratio`).
   - `k`: `(B, S_k, H_kv, D)` BF16
   - `w`: `(B, S_q, H_q)` BF16
 - **Output** — `scores`: `(B, S_q, S_k)` FP32
-- **Constraints** — SM100+, `head_dim == 128`, `qhead_per_kv_head ∈ {32, 64}`
+- **Constraints** — PyTorch SM90+; JAX POC SM100;
+  `head_dim == 128`, `qhead_per_kv_head ∈ {32, 64}`
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
 
 ```python
+from cudnn import DSA
+
 result = DSA.indexer_forward_wrapper(q, k, w, ratio=4)
 scores = result["scores"]
 ```
+
+The existing wrapper returns a `TupleDict` and retains its optional stream,
+THD inputs, and explicit sequence-bound controls.
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+from cudnn.jax import DSA
+
+@jax.jit
+def indexer_scores(q, k, w):
+    return DSA.indexer_forward_wrapper(q, k, w, ratio=4)
+
+scores = indexer_scores(q, k, w).scores
+```
+
+The JAX wrapper returns `IndexerForwardResult(scores=...)`. Its public result
+has shape `(B, S_q, S_k)`. Internally, the custom call uses an FP32 result whose
+last dimension is padded to a multiple of four for TMA. That physical result is
+initialized to `-inf`, aliased into the custom call, and sliced back to `S_k`;
+the initialization preserves positions that the causal kernel deliberately
+does not write.
+
+The proof of concept supports concrete, compact BSHD inputs only. THD inputs,
+`cu_seqlens_*`, and shape-polymorphic export are not yet supported. Tuning
+options and `sm_scale` are Python-static compilation state, and XLA supplies
+the runtime stream.
+
+`````
+
+``````
 
 ### 3. Indexer Top-K
 
@@ -158,15 +230,77 @@ with variable per-row effective length.
   - `seq_lens`: `(batch_size,)` INT32 (per-batch effective column count)
 - **Outputs** — tuple `(indices, values)` (values is `None` when
   `return_val=False`)
-- **Constraints** — SM100+, `top_k ≤ 2048`
+- **Constraints** — SM90+, `top_k ≤ 2048`
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
 
 ```python
+from cudnn import DSA
+
 result = DSA.indexer_top_k_wrapper(
     scores.reshape(-1, scores.shape[-1]),
     seq_lens, top_k=512,
 )
 indices, values = result["indices"], result["values"]
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+from cudnn.jax import DSA
+
+@jax.jit
+def select_scores(scores, seq_lens):
+    return DSA.indexer_top_k_wrapper(
+        scores.reshape(-1, scores.shape[-1]),
+        seq_lens,
+        top_k=512,
+        next_n=1,
+        return_val=True,
+    )
+
+result = select_scores(scores, seq_lens)
+indices, values = result.indices, result.values
+```
+
+The JAX wrapper returns `IndexerTopKResult(indices=..., values=...)`, with both
+arrays shaped `(n_rows, top_k)`. The JAX proof of concept currently requires
+`return_val=True`; the PyTorch wrapper retains its `return_val=False` mode. The
+radix kernel needs an INT32 temporary of shape
+`(n_rows, buffer_count, num_cols)`, where `buffer_count` is two for FP32 input
+and one for FP16/BF16. The adapter declares that temporary as an uninitialized
+custom-call result and drops it from the public result, allowing XLA to own its
+lifetime instead of caching mutable workspace in Python. The kernel consumes
+the global scratch path when its bucketed column count exceeds the in-CTA
+candidate capacity; the launcher retains the same buffer ABI for smaller
+problems.
+
+`top_k`, `next_n`, `return_val`, and `num_copy_bits` are Python-static. Shapes
+must be concrete, `n_rows` must equal `seq_lens.shape[0] * next_n`, and
+`0 < top_k <= min(num_cols, 2048)`. The kernel has no scalar tail when it
+selects a vectorized output path, so the wrapper rejects configurations where
+`top_k` is not divisible by the selected output vector width. Runtime lengths
+are trusted kernel inputs:
+every `seq_lens[b]` must satisfy
+`top_k + next_n - 1 <= seq_lens[b] <= num_cols`, which keeps every staggered
+row at least `top_k` elements long and prevents out-of-range reads. JAX tracing
+does not copy those values to the host for validation. The JAX proof of concept
+rejects workspace sizes above the INT32 indexing limit instead of implementing
+the PyTorch path's row-chunked fallback, and it does not expose the persistent
+global-counter path.
+
+`````
+
+``````
 
 ### 4. Sparse Indexer Score Recompute
 
@@ -255,12 +389,19 @@ result = DSA.dense_indexer_backward_wrapper(
 
 ## Limitations
 
-- **Architecture support** — Sparse Attention Backward, Score Recompute, and
-  Indexer Backward support SM90 and SM100; Indexer Forward and Indexer Top-K
-  remain SM100+ only.
+- **Architecture support** — Existing PyTorch DSA kernels, including Indexer
+  Forward and Indexer Top-K, support SM90 and SM100. The JAX Indexer Forward
+  proof of concept currently targets SM100 only; JAX Indexer Top-K supports
+  SM90+. The JAX proof of concept relies on CUTLASS target auto-detection and
+  currently assumes that all GPUs visible to one process have the same
+  architecture.
 - **No fused forward** — the production forward is FlashMLA (C++); this
   module ships only the CuTe-DSL kernels.
 - **Indexer Forward only supports `head_dim = 128`** and
   `qhead_per_kv_head ∈ {32, 64}`.
 - **Top-K only up to 2048**; `top_k > 2048` is not supported by the
   underlying radix top-K kernel.
+- **JAX coverage is currently limited to Indexer Forward and Indexer Top-K.**
+  Both require concrete compact shapes and do not define autodiff, `vmap`, or
+  automatic sharding rules. Indexer Forward currently supports only fixed BSHD
+  inputs; its broader PyTorch wrapper remains unchanged.

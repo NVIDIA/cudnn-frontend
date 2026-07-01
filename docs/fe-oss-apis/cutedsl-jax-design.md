@@ -30,10 +30,10 @@ abstract value, not a device buffer:
 | Mutation | Preallocated outputs are mutated | Public API remains functional; legal aliases are declared |
 | Cache | Python object and compiled callable | JAX executable cache plus CUTLASS function/spec cache |
 
-The proof of concept implements this split and ports one real FE-OSS operation,
-RMSNorm + RHT + amax, without changing its existing Torch API. JAX support is
-reviewed per operation rather than required for every new or modified PyTorch
-API or physical CuTe kernel.
+The proof of concept implements this split for three real FE-OSS operations:
+RMSNorm + RHT + amax, DSA Indexer Forward, and DSA Indexer Top-K. The existing
+Torch APIs remain unchanged. JAX support is reviewed per operation rather than
+required for every new or modified PyTorch API or physical CuTe kernel.
 
 ## Scope
 
@@ -137,7 +137,7 @@ The useful comparison unit is a user-visible operation, not an individual
 where their supported domains overlap, while retaining framework-appropriate
 interfaces.
 
-The RMSNorm POC currently uses the same functional name in both namespaces:
+The RMSNorm POC uses the same functional name in both namespaces:
 
 ```python
 # PyTorch functional API for this operation.
@@ -154,6 +154,22 @@ legacy_torch_result = rmsnorm_rht_amax_wrapper_sm100(...)
 from cudnn.jax import rmsnorm_rht_amax_sm100
 
 jax_result = rmsnorm_rht_amax_sm100(...)
+```
+
+The DSA POCs preserve the existing wrapper names and namespace shape:
+
+```python
+# PyTorch remains the default.
+from cudnn import DSA
+
+torch_scores = DSA.indexer_forward_wrapper(...)
+torch_topk = DSA.indexer_top_k_wrapper(...)
+
+# JAX is an explicit optional namespace.
+from cudnn.jax import DSA
+
+jax_scores = DSA.indexer_forward_wrapper(...)
+jax_topk = DSA.indexer_top_k_wrapper(...)
 ```
 
 Implicit array-type dispatch is deliberately rejected. JAX tracers, Torch fake
@@ -184,8 +200,8 @@ The current wrapper inventory makes the functional gap concrete:
 | Discrete grouped GEMM | 2 | 0 |
 | SDPA | 2 | 0 |
 | Native sparse attention | 4 | 0 |
-| DeepSeek sparse attention stages | 11 | 0 |
-| **Total** | **33** | **1** |
+| DeepSeek sparse attention stages | 11 | 2 |
+| **Total** | **33** | **3** |
 
 The table is a point-in-time review aid, not a coverage requirement or promise
 that every helper wrapper needs a JAX equivalent.
@@ -398,6 +414,29 @@ An initializer is an aliased operand because custom-call result buffers are not
 initialized. XLA retains functional semantics; `donate_argnums` is needed when a
 caller wants guaranteed reuse of a user input rather than copy protection.
 
+The two DSA POCs model both nontrivial cases in wrappers around real kernels:
+
+- Indexer Forward declares an internal FP32 result with `S_k` rounded up to a
+  multiple of four for TMA, initializes it to `-inf`, aliases that initialized
+  operand to the result, and returns only the logical `[..., :S_k]` slice. The
+  fill is semantically required because the causal kernel deliberately skips
+  some tiles.
+- Indexer Top-K declares an uninitialized hidden INT32 workspace of shape
+  `(n_rows, buffer_count, num_cols)`, where `buffer_count` is two for FP32 and
+  one for FP16/BF16. Its global scratch path is consumed when the bucketed
+  column count exceeds the in-CTA candidate capacity. The workspace is a
+  custom-call result but is not returned by the Python wrapper, so every
+  invocation gets XLA-managed temporary storage.
+
+These examples justify keeping one small internal record that groups a
+buffer's abstract shape/dtype, native `TensorSpec`, initialization policy, and
+visibility while constructing the custom call. They do not justify a second
+public tensor metadata model: layout remains `cutlass.jax.TensorSpec`, and
+ordinary public results remain JAX abstract values. `BufferSpec` should stay an
+adapter implementation detail; if future wrappers use only ordinary results,
+the lower-level seam can be simplified to accept `ShapeDtypeStruct` values
+directly rather than expanding this record.
+
 Workspace size must be derivable from abstract input metadata before XLA buffer
 assignment. If a future plan can only determine its workspace at runtime, choose
 one of:
@@ -433,7 +472,7 @@ a thread-safe stateful runtime design.
 | SDPA backward | Per-call zeroed workspace, multi-kernel ordering, residual contract, and `custom_vjp`. |
 | Grouped GEMM | Per-call descriptor/scheduler workspace, helper launches, counters, and metadata validation without host reads. |
 | Discrete grouped GEMM | Current device-address tensors are not traceable. Pass expert buffers as real operands and build pointer tables in device workspace, or defer this mode. |
-| DSA/NSA orchestration | Remove host value inspection, define fixed-capacity outputs for compaction, and audit every multi-kernel temporary. |
+| DSA/NSA orchestration | DSA Indexer Forward and Indexer Top-K POCs implemented for concrete fixed-shape inputs, including initialized padded output and real hidden workspace. GPU validation and the remaining host-value/multi-kernel audits are pending. |
 | Distributed kernels | Replace `torch.distributed` assumptions with explicit JAX collectives/partitioning; do not hide cross-replica state in a CuTe call. |
 
 Optional tensors alter call arity and are therefore static graph variants.
@@ -480,8 +519,8 @@ be replicated.
 ### Export and dynamic shapes
 
 CUTLASS demonstrates `jax.export` with symbolic dimensions and divisibility
-hints, but each FE kernel must be audited. The POC intentionally requires
-concrete `M` and `N` and uses static tensors.
+hints, but each FE kernel must be audited. The current RMSNorm and DSA POCs
+require concrete shapes during tracing and use static tensors.
 
 Exported programs also require the matching CUTLASS runtime and custom-call
 registration in the consuming process. They are not runtime-independent
@@ -586,8 +625,8 @@ sides of that boundary.
 ### Implemented pieces
 
 - [`cudnn.jax.cutedsl`](../../python/cudnn/jax/cutedsl.py)
-  - remains an internal POC seam rather than a top-level public export until a
-    real workspace-using operator validates the contract;
+  - remains an internal POC seam rather than a top-level public export; DSA
+    Indexer Top-K now consumes its workspace path from a real-kernel wrapper;
   - translates output/workspace metadata to `cutlass_call`;
   - appends hidden workspaces and drops them from public results;
   - supports uninitialized, zeroed, and constant-filled buffers;
@@ -602,25 +641,49 @@ sides of that boundary.
   - uses comparable PyTorch option concepts and launch heuristics;
   - declares `(M, N)` BF16 and `(M / rows_per_cta,)` FP32 outputs;
   - lowers the existing CuTe kernel through `cutlass_call`.
+- [`cudnn.jax.DSA.indexer_forward_wrapper`](../../python/cudnn/jax/indexer_forward.py)
+  - preserves the existing DSA wrapper name while accepting fixed BSHD JAX
+    arrays;
+  - declares a TMA-padded FP32 result initialized to `-inf` and returns its
+    unpadded logical slice;
+  - supports the SM100 `head_dim=128` domain with concrete shapes and static
+    launch configuration.
+- [`cudnn.jax.DSA.indexer_top_k_wrapper`](../../python/cudnn/jax/indexer_top_k.py)
+  - preserves the existing DSA wrapper name for FP32/FP16/BF16 score rows;
+  - returns INT32 indices and selected values while hiding the radix kernel's
+    per-call INT32 workspace from the public result;
+  - supports concrete shapes and `return_val=True`; it rejects workspace sizes
+    above the kernel's INT32 indexing limit rather than host-chunking the call.
 - CPU-only adapter contract tests cover hidden workspace, initialization,
   aliases, layouts, and invalid metadata.
 - Dependency-free smoke tests cover the optional JAX namespace, lazy framework
   imports, the PyTorch functional export, and packaging metadata.
-- A GPU test inspects StableHLO, executes one compiled program twice, and checks
-  a numerical JAX reference when JAX, CuTe DSL, CUDA, and SM100 hardware are
-  available.
+- The RMSNorm and DSA tests cover `eval_shape`; their GPU cases inspect
+  StableHLO custom calls and compare numerical JAX references when JAX, CuTe
+  DSL, CUDA, and SM100 are available. The RMSNorm and Indexer Forward cases
+  also execute one compiled program twice to check reuse and output reset.
 
 ### POC limitations
 
-- Only one operation is exposed.
-- `M` and `N` must be concrete during tracing.
-- JAX currently accepts the rank-2/rank-1 core domain only; the canonical Torch
-  wrapper's singleton-padded compatibility remains Torch-specific.
+- Three operations are exposed: RMSNorm + RHT + amax, DSA Indexer Forward, and
+  DSA Indexer Top-K.
+- Shapes must be concrete during tracing.
+- RMSNorm accepts its rank-2/rank-1 core domain. DSA Indexer Forward currently
+  accepts fixed BSHD only, and DSA Indexer Top-K requires `return_val=True` and
+  a workspace within the INT32 indexing limit. The top-K wrapper also rejects
+  configurations where `top_k` is not divisible by the native kernel's
+  selected output vector width. The broader Torch compatibility domains remain
+  unchanged.
 - No custom gradient, batching, or partitioning rule.
+- The POC relies on CUTLASS 4.5 target auto-detection and assumes all visible
+  GPUs have one architecture. Heterogeneous-architecture processes remain
+  unsupported until CUTLASS includes the lowering target in its compile-cache
+  key (or the API adds an explicit static target override).
 - No local SM100 GPU was available for execution in the development
-  environment; the GPU test is present but must run in CI.
-- The generic workspace path is contract-tested with a fake CUTLASS bridge; the
-  first real operator does not need device workspace.
+  environment. The RMSNorm and DSA GPU tests are present but must run in CI.
+- CPU contract tests still use a fake CUTLASS bridge for deterministic edge
+  cases. DSA Indexer Top-K now connects the hidden-workspace path to a real
+  kernel wrapper and has a GPU test, but that test was not executable locally.
 - The JAX optional dependency version range needs release-owner approval.
 - Launcher and CUTLASS compile caches are currently unbounded.
 
@@ -628,15 +691,20 @@ sides of that boundary.
 
 ### Phase 0: vertical-slice POC
 
-Status: implemented in this change.
+Status: wrapper implementation complete in this change; DSA GPU validation is
+pending.
 
 - Add the JAX CuTe call adapter.
 - Extract one framework-neutral launch config.
 - Port RMSNorm + RHT + amax.
-- Add CPU contract tests and an SM100 numerical test.
+- Port DSA Indexer Forward and Indexer Top-K to exercise a constant-initialized
+  padded result and a real hidden workspace.
+- Add CPU contract tests plus `eval_shape`, lowering, and GPU numerical tests
+  for the three wrappers.
 
-Review checkpoint: run the GPU test on SM100, inspect lowered StableHLO for one
-custom call, and verify a second invocation reuses the compiled executable.
+Review checkpoint: run all three wrappers on SM100, inspect lowered StableHLO
+for one custom call per wrapper, verify initialized output reset across repeated
+Indexer Forward calls, and confirm the Top-K workspace is not user-visible.
 
 ### Phase 1: neutral metadata core
 
@@ -667,7 +735,8 @@ cache reuse, and PyTorch/JAX numerical comparison on overlapping shapes.
 ### Phase 3: workspace and training
 
 - Port SDPA forward/backward.
-- Allocate per-call hidden workspace with explicit zero/fill semantics.
+- Extend the validated per-call workspace model to zeroed, multi-kernel, and
+  residual-bearing training cases.
 - Make sequence maxima static arguments or explicit bounds.
 - Add `custom_vjp` and residual outputs.
 - Validate CUDA graph replay and reentrancy on multiple streams.
