@@ -12,33 +12,22 @@ from typing import Any, Dict, List, Optional, Union
 class NodeType(Enum):
     """Operation node types. Maps to INode::Type in node_interface.h."""
 
+    # Only the op types exercised by this version are listed. Add more as
+    # needed, following the block-scale / MoE / reduction examples (enum entry
+    # here + a builder in graph_native + inference in nodes + lowering).
     COMPOSITE = auto()
     BATCHNORM = auto()
     BATCHNORM_INFERENCE = auto()
     CONV_DGRAD = auto()
     CONV_FPROP = auto()
     CONV_WGRAD = auto()
-    DBN = auto()
-    DIN = auto()
-    DLN = auto()
-    DRN = auto()
-    GENSTATS = auto()
-    INSTANCENORM = auto()
-    LAYERNORM = auto()
     MATMUL = auto()
     MATMUL_FP8 = auto()
     POINTWISE = auto()
     REDUCTION = auto()
-    RESAMPLE = auto()
-    RESHAPE = auto()
-    RMSNORM = auto()
     SDPA = auto()
     SDPA_BWD = auto()
     SDPA_FP8 = auto()
-    SLICE = auto()
-    ADALAYERNORM = auto()
-    BN_FINALIZE = auto()
-    CONCATENATE = auto()
     MOE_GROUPED_MATMUL = auto()
     BLOCK_SCALE_QUANTIZE = auto()
     BLOCK_SCALE_DEQUANTIZE = auto()

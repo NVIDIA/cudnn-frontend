@@ -52,6 +52,28 @@ Per the proposal (and Anerudhan's feedback), backend selection happens at
 - `check_support()` / `build_plans()` / `get_workspace_size()` / `execute()`
   dispatch on the selected backend (`None` ⇒ cuDNN).
 
+### Target: one mixed candidate list (heuristics == backends)
+
+The heuristics list and the backend list are the *same* list. The end state is
+that `create_execution_plans()` takes a mixed candidate set — native engines and
+cuDNN `heur_mode`s together — and produces a **ranked list of candidate plans
+across backends**, e.g.:
+
+```python
+g.create_execution_plans([PyEngineA, PyEngineB, cudnn.heur_mode.A])
+```
+
+Selection is then heuristic (priority order) or autotune (benchmark) — exactly
+cuDNN FE's existing "multiple plans → deselect / autotune / pick" model, just
+extended across backends. 2163 already prototyped this: its `heur_mode.TBD`
+sentinel lives in the same list as `heur_mode.A`.
+
+This PR ships the **first-supporting-by-priority** version (Router picks one
+backend; `heuristics` is forwarded only to the cuDNN fallback). Generalizing to
+the ranked mixed list is a contained Router change (`select() -> one` becomes
+`plan(sources) -> ranked list` + a pick step) — deferred to when there is a real
+second backend to rank against (MR-B).
+
 ## Usage
 
 ```python
