@@ -200,52 +200,6 @@ class CallCutedslAdapterTest(unittest.TestCase):
         self.assertEqual(fake_jnp.allocations[1][0], "full")
         self.assertEqual(fake_jnp.allocations[1][2], 0)
 
-    def test_user_alias_is_reconstructed_in_canonical_output_position(self):
-        seen = []
-
-        def kernel(stream, x, output, workspace):
-            seen.append((x, output, workspace))
-
-        x = _Array((16,), "f16", "x")
-        result, _, bridge = self._call(
-            kernel,
-            (x,),
-            outputs=(BufferSpec("output", (16,), "f16"),),
-            workspaces=(BufferSpec("workspace", (8,), "u8"),),
-            input_output_aliases={0: 0},
-        )
-
-        self.assertIs(result[0], x)
-        self.assertIs(seen[0][0], x)
-        self.assertIs(seen[0][1], x)
-        self.assertEqual(seen[0][2].label, "result-1")
-        self.assertEqual(bridge.calls[0][1]["input_output_aliases"], {0: 0})
-
-    def test_middle_alias_preserves_fresh_result_order(self):
-        seen = []
-
-        def kernel(stream, x, first, aliased, third, workspace):
-            seen.append((first, aliased, third, workspace))
-
-        x = _Array((4,), "f32", "x")
-        result, _, _ = self._call(
-            kernel,
-            (x,),
-            outputs=(
-                BufferSpec("first", (4,), "f32"),
-                BufferSpec("aliased", (4,), "f32"),
-                BufferSpec("third", (4,), "f32"),
-            ),
-            workspaces=(BufferSpec("workspace", (16,), "u8"),),
-            input_output_aliases={0: 1},
-        )
-
-        self.assertEqual([value.label for value in result], ["result-0", "x", "result-2"])
-        self.assertEqual(
-            [value.label for value in seen[0]],
-            ["result-0", "x", "result-2", "result-3"],
-        )
-
     def test_native_tensor_specs_are_forwarded_without_conversion(self):
         input_spec = _FakeCutlassTensorSpec(
             layout=(1, 0),
@@ -298,7 +252,7 @@ class CallCutedslAdapterTest(unittest.TestCase):
 
         self.assertIsNone(bridge.calls[0][1]["output_spec"][0])
 
-    def test_rejects_invalid_call_plans_and_aliases(self):
+    def test_rejects_invalid_call_plans(self):
         with self.assertRaisesRegex(ValueError, "at least one public output"):
             self._call(lambda stream, x: None, (_Array((1,), "f32", "x"),), outputs=())
 
@@ -310,46 +264,12 @@ class CallCutedslAdapterTest(unittest.TestCase):
                 workspaces=(BufferSpec("same", (1,), "u8"),),
             )
 
-        with self.assertRaisesRegex(ValueError, "only public outputs"):
-            self._call(
-                lambda stream, x, y, z: None,
-                (_Array((1,), "f32", "x"),),
-                outputs=(BufferSpec("output", (1,), "f32"),),
-                workspaces=(BufferSpec("workspace", (1,), "u8"),),
-                input_output_aliases={0: 1},
-            )
-
         with self.assertRaisesRegex(ValueError, "Expected 1 input tensor spec"):
             self._call(
                 lambda stream, x, y: None,
                 (_Array((1,), "f32", "x"),),
                 outputs=(BufferSpec("output", (1,), "f32"),),
                 input_specs=(),
-            )
-
-        with self.assertRaisesRegex(ValueError, "shape/dtype"):
-            self._call(
-                lambda stream, x, y: None,
-                (_Array((2,), "f32", "x"),),
-                outputs=(BufferSpec("output", (1,), "f32"),),
-                input_output_aliases={0: 0},
-            )
-
-        with self.assertRaisesRegex(ValueError, "cannot both alias.*initialization"):
-            self._call(
-                lambda stream, x, y: None,
-                (_Array((2,), "f32", "x"),),
-                outputs=(BufferSpec("output", (2,), "f32", fill_value=0),),
-                input_output_aliases={0: 0},
-            )
-
-        with self.assertRaisesRegex(ValueError, "identical TensorSpec"):
-            self._call(
-                lambda stream, x, y: None,
-                (_Array((2, 2), "f32", "x"),),
-                outputs=(BufferSpec("output", (2, 2), "f32"),),
-                input_specs=(_FakeCutlassTensorSpec(mode=(1, 0)),),
-                input_output_aliases={0: 0},
             )
 
         with self.assertRaisesRegex(TypeError, "flat sequence"):

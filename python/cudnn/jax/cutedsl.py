@@ -74,7 +74,6 @@ def _build_call_plan(
     num_user_inputs: int,
     outputs: Sequence[BufferSpec],
     workspaces: Sequence[BufferSpec],
-    input_output_aliases: Optional[Mapping[int, int]],
 ) -> _CallPlan:
     outputs = tuple(outputs)
     workspaces = tuple(workspaces)
@@ -88,31 +87,15 @@ def _build_call_plan(
     if len(set(names)) != len(names):
         raise ValueError(f"Buffer names must be unique, got {names}")
 
-    aliases = dict(input_output_aliases or {})
-    if len(set(aliases.values())) != len(aliases):
-        raise ValueError("Each result may alias at most one input")
-
+    aliases = []
     result_sources: list[Optional[int]] = [None] * len(all_results)
-    for input_idx, output_idx in aliases.items():
-        if not isinstance(input_idx, int) or isinstance(input_idx, bool) or not isinstance(output_idx, int) or isinstance(output_idx, bool):
-            raise TypeError("Alias indices must be integers")
-        if input_idx < 0 or input_idx >= num_user_inputs:
-            raise ValueError(f"Invalid aliased input index {input_idx}; there are " f"{num_user_inputs} user inputs")
-        if output_idx < 0 or output_idx >= len(outputs):
-            raise ValueError(f"Invalid aliased output index {output_idx}; only public outputs " "may alias user inputs")
-        if outputs[output_idx].fill_value is not None:
-            raise ValueError(f"{outputs[output_idx].name} cannot both alias a user input and " "request initialization")
-        result_sources[output_idx] = input_idx
-
     initialized_indices = []
     next_input_idx = num_user_inputs
     for result_idx, spec in enumerate(all_results):
         if spec.fill_value is None:
             continue
-        if result_sources[result_idx] is not None:
-            raise ValueError(f"{spec.name} has more than one storage source")
         result_sources[result_idx] = next_input_idx
-        aliases[next_input_idx] = result_idx
+        aliases.append((next_input_idx, result_idx))
         initialized_indices.append(result_idx)
         next_input_idx += 1
 
@@ -121,7 +104,7 @@ def _build_call_plan(
         all_results=all_results,
         num_public_results=len(outputs),
         result_input_sources=tuple(result_sources),
-        input_output_aliases=tuple(sorted(aliases.items())),
+        input_output_aliases=tuple(aliases),
         initialized_result_indices=tuple(initialized_indices),
     )
 
@@ -204,7 +187,6 @@ def _call_cutedsl_with_modules(
     outputs: Sequence[BufferSpec],
     workspaces: Sequence[BufferSpec] = (),
     input_specs: Optional[Sequence[Optional[TensorSpec]]] = None,
-    input_output_aliases: Optional[Mapping[int, int]] = None,
     static_args: Optional[Mapping[str, Any]] = None,
     allow_cuda_graph: bool = True,
     compile_options: Any = None,
@@ -236,7 +218,6 @@ def _call_cutedsl_with_modules(
         num_user_inputs=len(inputs),
         outputs=outputs,
         workspaces=workspaces,
-        input_output_aliases=input_output_aliases,
     )
 
     if input_specs is None:
@@ -253,34 +234,6 @@ def _call_cutedsl_with_modules(
                 "call_cutedsl inputs must be a flat sequence of array-like "
                 f"values with shape and dtype metadata; input #{input_idx} "
                 f"is {type(value).__name__}"
-            )
-
-    # Fail before lowering when a requested alias cannot describe the same
-    # logical buffer. XLA may still insert a protective copy unless the caller
-    # donates a user input, but aliased input/result avals must agree.
-    for input_idx, output_idx in plan.input_output_aliases:
-        if input_idx >= plan.num_user_inputs:
-            continue
-        input_value = inputs[input_idx]
-        output_spec = plan.all_results[output_idx]
-        try:
-            input_shape = tuple(input_value.shape)
-            input_dtype = input_value.dtype
-        except AttributeError as exc:
-            raise TypeError(f"Aliased input #{input_idx} must expose shape and dtype metadata") from exc
-        if input_shape != output_spec.shape or input_dtype != output_spec.dtype:
-            raise ValueError(
-                f"Aliased input #{input_idx} has shape/dtype "
-                f"{input_shape}/{input_dtype}, but output "
-                f"{output_spec.name} requires "
-                f"{output_spec.shape}/{output_spec.dtype}"
-            )
-        input_spec = normalized_input_specs[input_idx]
-        if input_spec != output_spec.tensor_spec:
-            raise ValueError(
-                f"Aliased input #{input_idx} and output {output_spec.name} must "
-                "use identical TensorSpec metadata; CUTLASS compiles the "
-                "aliased buffer from the input spec"
             )
 
     initialized_buffers = []
@@ -325,7 +278,6 @@ def call_cutedsl(
     outputs: Sequence[BufferSpec],
     workspaces: Sequence[BufferSpec] = (),
     input_specs: Optional[Sequence[Optional[TensorSpec]]] = None,
-    input_output_aliases: Optional[Mapping[int, int]] = None,
     static_args: Optional[Mapping[str, Any]] = None,
     allow_cuda_graph: bool = True,
     compile_options: Any = None,
@@ -342,15 +294,12 @@ def call_cutedsl(
     workspace results are hidden.  All output and workspace sizes must be
     derivable from abstract input metadata, not from runtime tensor values.
 
-    ``input_output_aliases`` uses CUTLASS/JAX's ``{input_index: output_index}``
-    convention and only addresses public outputs. Inputs must be a flat
-    sequence of array-like values; nested pytrees are intentionally outside the
-    FE ABI. ``input_specs`` and ``BufferSpec.tensor_spec`` accept native
-    ``cutlass.jax.TensorSpec`` objects. An aliased input and output must use
-    identical tensor metadata. TensorSpec validation is delegated to
-    ``cutlass.jax.cutlass_call``. The JAX function remains functional: callers
-    should use ``donate_argnums`` when they want XLA to reuse aliased input
-    storage without a copy.
+    Inputs must be a flat sequence of array-like values; nested pytrees are
+    intentionally outside the FE ABI. ``input_specs`` and
+    ``BufferSpec.tensor_spec`` accept native ``cutlass.jax.TensorSpec`` objects;
+    validation is delegated to ``cutlass.jax.cutlass_call``. Filled buffers are
+    passed as internal aliased inputs so the public JAX function remains
+    functional.
     """
 
     try:
@@ -366,7 +315,6 @@ def call_cutedsl(
         outputs=outputs,
         workspaces=workspaces,
         input_specs=input_specs,
-        input_output_aliases=input_output_aliases,
         static_args=static_args,
         allow_cuda_graph=allow_cuda_graph,
         compile_options=compile_options,

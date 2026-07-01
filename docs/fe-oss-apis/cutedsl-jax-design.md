@@ -404,15 +404,16 @@ categories:
 | Buffer requirement | JAX representation |
 | --- | --- |
 | Fully overwritten output/workspace | Uninitialized custom-call result |
-| Must start at zero | `jnp.zeros` operand aliased to the result |
+| Must start at zero | `jnp.full(..., 0)` operand aliased to the result |
 | Must start at a constant such as `-inf` | `jnp.full` operand aliased to the result |
-| Public in-place result | Declared input/output alias; donation recommended |
+| Public in-place result | Deferred until a real wrapper needs caller-provided aliasing |
 | Forward residual needed by backward | Real JAX output/residual, not workspace |
 | Data-dependent workspace size | Unsupported initially; use a static upper bound or later runtime allocator fallback |
 
 An initializer is an aliased operand because custom-call result buffers are not
-initialized. XLA retains functional semantics; `donate_argnums` is needed when a
-caller wants guaranteed reuse of a user input rather than copy protection.
+initialized. The POC generates this alias internally. Caller-provided in-place
+aliases and donation policy should be added only when a real operator requires
+them.
 
 The two DSA POCs model both nontrivial cases in wrappers around real kernels:
 
@@ -630,9 +631,8 @@ sides of that boundary.
   - translates output/workspace metadata to `cutlass_call`;
   - appends hidden workspaces and drops them from public results;
   - supports uninitialized, zeroed, and constant-filled buffers;
-  - reconstructs canonical launcher order when results alias inputs;
-  - requires identical input/output metadata for an alias and rejects nested
-    low-level input pytrees;
+  - reconstructs canonical launcher order for internally filled results;
+  - rejects nested low-level input pytrees;
   - passes native `cutlass.jax.TensorSpec` objects through for compact
     layout/mode/divisibility/alignment metadata;
   - memoizes launcher adapters for stable CUTLASS cache identity.
@@ -655,7 +655,7 @@ sides of that boundary.
   - supports concrete shapes and `return_val=True`; it rejects workspace sizes
     above the kernel's INT32 indexing limit rather than host-chunking the call.
 - CPU-only adapter contract tests cover hidden workspace, initialization,
-  aliases, layouts, and invalid metadata.
+  layout passthrough, and invalid call plans.
 - Dependency-free smoke tests cover the optional JAX namespace, lazy framework
   imports, the PyTorch functional export, and packaging metadata.
 - The RMSNorm and DSA tests cover `eval_shape`; their GPU cases inspect
