@@ -22,7 +22,6 @@ dtype, layout, and support inference before they can use this adapter.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence, Tuple
 
@@ -30,47 +29,28 @@ if TYPE_CHECKING:
     from cutlass.jax import TensorSpec
 
 
-class BufferInitialization(str, Enum):
-    """Initialization policy for an output or workspace buffer."""
-
-    UNINITIALIZED = "uninitialized"
-    ZERO = "zero"
-    VALUE = "value"
-
-
 @dataclass(frozen=True)
 class BufferSpec:
-    """Shape, dtype, tensor metadata, and initialization for a result.
+    """Shape, dtype, tensor metadata, and optional fill value for a result.
 
     A spec passed through ``outputs`` is returned to the caller.  A spec passed
     through ``workspaces`` is supplied to the CuTe launcher after the public
     outputs and then omitted from the JAX-visible result. ``tensor_spec`` is a
     native :class:`cutlass.jax.TensorSpec`; ``None`` asks CUTLASS to infer its
-    default from the shape and dtype.
+    default from the shape and dtype. ``fill_value=None`` leaves the result
+    uninitialized; any other value initializes it before the kernel launch.
     """
 
     name: str
     shape: Tuple[Any, ...]
     dtype: Any
     tensor_spec: TensorSpec | None = None
-    initialization: BufferInitialization = BufferInitialization.UNINITIALIZED
     fill_value: Any = None
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("BufferSpec.name must not be empty")
         object.__setattr__(self, "shape", tuple(self.shape))
-        if not isinstance(self.initialization, BufferInitialization):
-            object.__setattr__(
-                self,
-                "initialization",
-                BufferInitialization(self.initialization),
-            )
-        if self.initialization is BufferInitialization.VALUE:
-            if self.fill_value is None:
-                raise ValueError(f"{self.name} uses VALUE initialization but has no fill_value")
-        elif self.fill_value is not None:
-            raise ValueError(f"{self.name} has a fill_value but its initialization policy is " f"{self.initialization.value}")
 
 
 @dataclass(frozen=True)
@@ -120,14 +100,14 @@ def _build_call_plan(
             raise ValueError(f"Invalid aliased input index {input_idx}; there are " f"{num_user_inputs} user inputs")
         if output_idx < 0 or output_idx >= len(outputs):
             raise ValueError(f"Invalid aliased output index {output_idx}; only public outputs " "may alias user inputs")
-        if outputs[output_idx].initialization is not BufferInitialization.UNINITIALIZED:
+        if outputs[output_idx].fill_value is not None:
             raise ValueError(f"{outputs[output_idx].name} cannot both alias a user input and " "request initialization")
         result_sources[output_idx] = input_idx
 
     initialized_indices = []
     next_input_idx = num_user_inputs
     for result_idx, spec in enumerate(all_results):
-        if spec.initialization is BufferInitialization.UNINITIALIZED:
+        if spec.fill_value is None:
             continue
         if result_sources[result_idx] is not None:
             raise ValueError(f"{spec.name} has more than one storage source")
@@ -215,14 +195,6 @@ def _make_launch_adapter(fn: Callable[..., None], plan: _CallPlan) -> Callable[.
             plan.num_total_inputs,
             plan.result_input_sources,
         )
-
-
-def _make_initialized_buffer(spec: BufferSpec, jax_numpy: Any) -> Any:
-    if spec.initialization is BufferInitialization.ZERO:
-        return jax_numpy.zeros(spec.shape, dtype=spec.dtype)
-    if spec.initialization is BufferInitialization.VALUE:
-        return jax_numpy.full(spec.shape, spec.fill_value, dtype=spec.dtype)
-    raise AssertionError(f"Unexpected initialization policy for {spec.name}")
 
 
 def _call_cutedsl_with_modules(
@@ -315,7 +287,7 @@ def _call_cutedsl_with_modules(
     initialized_specs = []
     for result_idx in plan.initialized_result_indices:
         spec = plan.all_results[result_idx]
-        initialized_buffers.append(_make_initialized_buffer(spec, jax_numpy_module))
+        initialized_buffers.append(jax_numpy_module.full(spec.shape, spec.fill_value, dtype=spec.dtype))
         initialized_specs.append(spec.tensor_spec)
 
     cutlass_input_specs = normalized_input_specs + tuple(initialized_specs)
@@ -406,7 +378,6 @@ def call_cutedsl(
 
 
 __all__ = [
-    "BufferInitialization",
     "BufferSpec",
     "call_cutedsl",
 ]

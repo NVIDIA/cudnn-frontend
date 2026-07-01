@@ -27,7 +27,6 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
-BufferInitialization = _MODULE.BufferInitialization
 BufferSpec = _MODULE.BufferSpec
 _call_cutedsl_with_modules = _MODULE._call_cutedsl_with_modules
 
@@ -55,11 +54,6 @@ class _FakeJax:
 class _FakeJaxNumpy:
     def __init__(self):
         self.allocations = []
-
-    def zeros(self, shape, dtype):
-        result = _Array(shape, dtype, "zeros")
-        self.allocations.append(("zeros", result, None))
-        return result
 
     def full(self, shape, value, dtype):
         result = _Array(shape, dtype, f"full({value})")
@@ -176,7 +170,6 @@ class CallCutedslAdapterTest(unittest.TestCase):
                     (4,),
                     "bf16",
                     tensor_spec=output_tensor_spec,
-                    initialization=BufferInitialization.VALUE,
                     fill_value=float("-inf"),
                 ),
             ),
@@ -186,7 +179,7 @@ class CallCutedslAdapterTest(unittest.TestCase):
                     (32,),
                     "u8",
                     tensor_spec=workspace_tensor_spec,
-                    initialization=BufferInitialization.ZERO,
+                    fill_value=0,
                 ),
             ),
         )
@@ -204,7 +197,8 @@ class CallCutedslAdapterTest(unittest.TestCase):
         self.assertIs(seen[0][0], fake_jnp.allocations[0][1])
         self.assertIs(seen[0][1], fake_jnp.allocations[1][1])
         self.assertEqual(fake_jnp.allocations[0][0], "full")
-        self.assertEqual(fake_jnp.allocations[1][0], "zeros")
+        self.assertEqual(fake_jnp.allocations[1][0], "full")
+        self.assertEqual(fake_jnp.allocations[1][2], 0)
 
     def test_user_alias_is_reconstructed_in_canonical_output_position(self):
         seen = []
@@ -338,6 +332,14 @@ class CallCutedslAdapterTest(unittest.TestCase):
                 lambda stream, x, y: None,
                 (_Array((2,), "f32", "x"),),
                 outputs=(BufferSpec("output", (1,), "f32"),),
+                input_output_aliases={0: 0},
+            )
+
+        with self.assertRaisesRegex(ValueError, "cannot both alias.*initialization"):
+            self._call(
+                lambda stream, x, y: None,
+                (_Array((2,), "f32", "x"),),
+                outputs=(BufferSpec("output", (2,), "f32", fill_value=0),),
                 input_output_aliases={0: 0},
             )
 

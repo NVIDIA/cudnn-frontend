@@ -429,7 +429,7 @@ The two DSA POCs model both nontrivial cases in wrappers around real kernels:
   invocation gets XLA-managed temporary storage.
 
 These examples justify keeping one small internal record that groups a
-buffer's abstract shape/dtype, native `TensorSpec`, initialization policy, and
+buffer's abstract shape/dtype, native `TensorSpec`, optional fill value, and
 visibility while constructing the custom call. They do not justify a second
 public tensor metadata model: layout remains `cutlass.jax.TensorSpec`, and
 ordinary public results remain JAX abstract values. `BufferSpec` should stay an

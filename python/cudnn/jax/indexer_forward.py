@@ -8,11 +8,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, NamedTuple, Optional
 
-from .cutedsl import (
-    BufferInitialization,
-    BufferSpec,
-    call_cutedsl,
-)
+from .cutedsl import BufferSpec, call_cutedsl
 from .utils import (
     optional_static_int,
     require_concrete_dims,
@@ -262,7 +258,6 @@ def indexer_forward_wrapper(
                 (batch, seqlen_q, seqlen_k_padded),
                 jnp.float32,
                 tensor_spec=scores_spec,
-                initialization=BufferInitialization.VALUE,
                 fill_value=float("-inf"),
             ),
         ),

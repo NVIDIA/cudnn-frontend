@@ -153,7 +153,6 @@ class JaxDsaContractTest(unittest.TestCase):
         self.assertEqual(output.name, "scores")
         self.assertEqual(output.shape, (1, 4, 8))
         self.assertEqual(output.dtype, self.float32)
-        self.assertEqual(output.initialization.value, "value")
         self.assertEqual(output.fill_value, float("-inf"))
         self.assertEqual(output.tensor_spec.layout, (2, 1, 0))
         self.assertEqual(output.tensor_spec.mode, (0, 1, 2))
@@ -205,7 +204,7 @@ class JaxDsaContractTest(unittest.TestCase):
         self.assertEqual(workspace.name, "extra_buffer")
         self.assertEqual(workspace.shape, (2, 2, 64))
         self.assertEqual(workspace.dtype, self.int32)
-        self.assertEqual(workspace.initialization.value, "uninitialized")
+        self.assertIsNone(workspace.fill_value)
         self.assertEqual(make_launcher.call_args.args[:2], ("cutlass.float32", 32))
 
     def test_indexer_top_k_rejects_unsupported_result_mode(self):
