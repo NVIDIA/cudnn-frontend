@@ -117,6 +117,10 @@ def test_thd_zero_seqlen(seq_len_q, seq_len_kv, request, cudnn_handle):
 
 
 @pytest.mark.L0
+@pytest.mark.skipif(
+    cudnn.backend_version() < 92400,
+    reason="cu_seq_len_q/cu_seq_len_kv require cuDNN >= 9.24.0",
+)
 @pytest.mark.parametrize(
     ("seq_len_q", "seq_len_kv"),
     ZERO_SEQLEN_CASES,
