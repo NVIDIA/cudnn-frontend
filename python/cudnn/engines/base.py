@@ -2,8 +2,8 @@
 
 This module defines the abstract interface every execution backend must
 implement. A backend is one of the interchangeable implementations the Router
-dispatches to (QDSL, CTM/CUTLASS, Triton, a naive reference, the cuDNN Graph
-backend, ...) — see ``docs/python_native_graph_router.md``.
+dispatches to (Python DSLs, a naive reference, the cuDNN Graph backend, ...) —
+see ``docs/python_native_graph_router.md``.
 
 Create a custom backend by subclassing ``BaseEngine`` and implementing
 ``execute()``; override ``check_support()`` so the Router can decide whether
@@ -34,8 +34,8 @@ class BaseEngine(ABC):
     """Abstract base class for graph execution backends.
 
     A backend executes the operations defined in a NativeGraph. Different
-    backends use different implementations (PyTorch reference, cuTile, CUTLASS,
-    Triton, a CuTe-DSL fusion engine, ...). The Router picks one at
+    backends use different implementations (PyTorch reference, cuTile, other
+    Python-DSL fusion engines, ...). The Router picks one at
     ``create_execution_plans()`` time by trying each candidate's
     ``check_support()`` in ascending ``priority`` order.
 

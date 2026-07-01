@@ -3,7 +3,7 @@
 Implements the dispatch stage of the Python API unification proposal:
 
     Python Graph API -> create_execution_plans() -> Router -> selected backend
-                                                             (QDSL / CTM / Triton /
+                                                             (python DSLs /
                                                               reference / cuDNN Graph)
 
 Routing happens at ``create_execution_plans()`` time, NOT at graph

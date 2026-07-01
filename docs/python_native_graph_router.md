@@ -7,7 +7,7 @@ API Unification Proposal* (Frontend v1 sync-up).
 
 ```
 Python Graph API  ->  create_execution_plans()  ->  Router  ->  Selected backend
- (build ops, no                (route here,                     (QDSL / CTM / Triton /
+ (build ops, no                (route here,                     (python DSLs /
   backend commit)              lazy lowering)                    reference / cuDNN Graph)
 ```
 
