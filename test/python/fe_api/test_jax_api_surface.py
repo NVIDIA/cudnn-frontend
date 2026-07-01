@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 import re
 import sys
@@ -38,6 +39,7 @@ class JaxApiSurfaceTest(unittest.TestCase):
         fake_jnp = types.ModuleType("jax.numpy")
         fake_jax = types.ModuleType("jax")
         fake_jax.__path__ = []
+        fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         fake_jax.numpy = fake_jnp
 
         fake_cutlass_jax = types.ModuleType("cutlass.jax")
@@ -54,6 +56,7 @@ class JaxApiSurfaceTest(unittest.TestCase):
                 "jax.numpy": fake_jnp,
                 "cutlass": fake_cutlass,
                 "cutlass.jax": fake_cutlass_jax,
+                "torch": None,
             },
         )
 
@@ -63,9 +66,20 @@ class JaxApiSurfaceTest(unittest.TestCase):
         parent.__package__ = _TEST_PACKAGE
         sys.modules[_TEST_PACKAGE] = parent
 
-        torch_before = {name for name in sys.modules if name.split(".", 1)[0] == "torch"}
+        torch_before = {
+            name
+            for name, module in sys.modules.items()
+            if name.split(".", 1)[0] == "torch" and module is not None
+        }
         with self._optional_modules():
             jax_namespace = importlib.import_module(f"{_TEST_PACKAGE}.jax")
+            colocated_modules = (
+                f"{_TEST_PACKAGE}.rmsnorm_rht_amax.jax",
+                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_forward.jax",
+                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_top_k.jax",
+            )
+            for module_name in colocated_modules:
+                self.assertNotIn(module_name, sys.modules)
 
             self.assertTrue(callable(jax_namespace.rmsnorm_rht_amax_sm100))
             self.assertTrue(callable(jax_namespace.indexer_forward_wrapper))
@@ -78,6 +92,22 @@ class JaxApiSurfaceTest(unittest.TestCase):
             self.assertEqual(jax_namespace.RmsNormRhtAmaxResult._fields, ("output", "amax"))
             self.assertEqual(jax_namespace.IndexerForwardResult._fields, ("scores",))
             self.assertEqual(jax_namespace.IndexerTopKResult._fields, ("indices", "values"))
+            default_rmsnorm = importlib.import_module(f"{_TEST_PACKAGE}.rmsnorm_rht_amax")
+            default_dsa = importlib.import_module(f"{_TEST_PACKAGE}.deepseek_sparse_attention").DSA
+            self.assertIs(
+                default_rmsnorm.rmsnorm_rht_amax_sm100,
+                jax_namespace.rmsnorm_rht_amax_sm100,
+            )
+            self.assertIs(
+                default_dsa.indexer_forward_wrapper,
+                jax_namespace.indexer_forward_wrapper,
+            )
+            self.assertIs(
+                default_dsa.indexer_top_k_wrapper,
+                jax_namespace.indexer_top_k_wrapper,
+            )
+            for module_name in colocated_modules:
+                self.assertIn(module_name, sys.modules)
             self.assertEqual(
                 jax_namespace.__all__,
                 [
@@ -91,36 +121,149 @@ class JaxApiSurfaceTest(unittest.TestCase):
                 ],
             )
 
-            torch_after = {name for name in sys.modules if name.split(".", 1)[0] == "torch"}
+            torch_after = {
+                name
+                for name, module in sys.modules.items()
+                if name.split(".", 1)[0] == "torch" and module is not None
+            }
             self.assertEqual(torch_after - torch_before, set())
 
-    def test_missing_dependency_reports_optional_extra(self):
-        missing_modules = {
-            "jax": {"jax": None},
-            "cutlass": {
-                "jax": types.ModuleType("jax"),
-                "cutlass": None,
-                "cutlass.jax": None,
-            },
-        }
-        for dependency, blocked_modules in missing_modules.items():
-            with self.subTest(dependency=dependency):
-                package_name = f"{_TEST_PACKAGE}_missing_{dependency}"
+    def test_missing_jax_reports_optional_extra(self):
+        package_name = f"{_TEST_PACKAGE}_missing_jax"
+        parent = types.ModuleType(package_name)
+        parent.__path__ = [str(_CUDNN_ROOT)]
+        parent.__package__ = package_name
+        sys.modules[package_name] = parent
+
+        try:
+            with (
+                mock.patch.dict(sys.modules, {"jax": None}),
+                self.assertRaisesRegex(ImportError, r"nvidia-cudnn-frontend\[jax\]"),
+            ):
+                importlib.import_module(f"{package_name}.jax")
+        finally:
+            for module_name in tuple(sys.modules):
+                if module_name == package_name or module_name.startswith(f"{package_name}."):
+                    sys.modules.pop(module_name, None)
+
+    def test_jax_namespace_does_not_probe_cutedsl(self):
+        package_name = f"{_TEST_PACKAGE}_no_cutlass"
+        parent = types.ModuleType(package_name)
+        parent.__path__ = [str(_CUDNN_ROOT)]
+        parent.__package__ = package_name
+        sys.modules[package_name] = parent
+        fake_jax = types.ModuleType("jax")
+        fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
+
+        try:
+            with mock.patch.dict(
+                sys.modules,
+                {"jax": fake_jax, "cutlass": None, "cutlass.jax": None},
+            ):
+                namespace = importlib.import_module(f"{package_name}.jax")
+                self.assertIn("rmsnorm_rht_amax_sm100", namespace.__all__)
+        finally:
+            for module_name in tuple(sys.modules):
+                if module_name == package_name or module_name.startswith(f"{package_name}."):
+                    sys.modules.pop(module_name, None)
+
+    def test_operation_package_uses_torch_first_availability_fallback(self):
+        cases = (
+            ("both", {"torch", "jax"}, "torch"),
+            ("torch_only", {"torch"}, "torch"),
+            ("jax_only", {"jax"}, "jax"),
+            ("neither", set(), None),
+        )
+        for label, available, expected in cases:
+            with self.subTest(label=label):
+                package_name = f"{_TEST_PACKAGE}_{label}"
+                operation_name = f"{package_name}.rmsnorm_rht_amax"
                 parent = types.ModuleType(package_name)
                 parent.__path__ = [str(_CUDNN_ROOT)]
                 parent.__package__ = package_name
                 sys.modules[package_name] = parent
 
+                torch_function = object()
+                jax_function = object()
+                torch_api = types.ModuleType(f"{operation_name}.api")
+                torch_api.rmsnorm_rht_amax_sm100 = torch_function
+                jax_api = types.ModuleType(f"{operation_name}.jax")
+                jax_api.rmsnorm_rht_amax_sm100 = jax_function
+
+                def fake_find_spec(name):
+                    return ModuleSpec(name, loader=None) if name in available else None
+
                 try:
                     with (
-                        mock.patch.dict(sys.modules, blocked_modules),
-                        self.assertRaisesRegex(ImportError, r"nvidia-cudnn-frontend\[jax\]"),
+                        mock.patch("importlib.util.find_spec", side_effect=fake_find_spec),
+                        mock.patch.dict(
+                            sys.modules,
+                            {
+                                torch_api.__name__: torch_api,
+                                jax_api.__name__: jax_api,
+                            },
+                        ),
                     ):
-                        importlib.import_module(f"{package_name}.jax")
+                        operation = importlib.import_module(operation_name)
+                        if expected is None:
+                            self.assertEqual(operation.__all__, [])
+                            with self.assertRaises(AttributeError):
+                                operation.rmsnorm_rht_amax_sm100
+                        else:
+                            expected_function = torch_function if expected == "torch" else jax_function
+                            self.assertIs(operation.rmsnorm_rht_amax_sm100, expected_function)
+
+                        self.assertIs(operation.api, torch_api)
+                        self.assertIs(operation.jax, jax_api)
                 finally:
                     for module_name in tuple(sys.modules):
                         if module_name == package_name or module_name.startswith(f"{package_name}."):
                             sys.modules.pop(module_name, None)
+
+    def test_broken_torch_import_does_not_fall_back_to_jax(self):
+        package_name = f"{_TEST_PACKAGE}_broken_torch"
+        operation_name = f"{package_name}.rmsnorm_rht_amax"
+        parent = types.ModuleType(package_name)
+        parent.__path__ = [str(_CUDNN_ROOT)]
+        parent.__package__ = package_name
+        sys.modules[package_name] = parent
+
+        jax_api = types.ModuleType(f"{operation_name}.jax")
+        jax_api.rmsnorm_rht_amax_sm100 = object()
+
+        try:
+            with (
+                mock.patch(
+                    "importlib.util.find_spec",
+                    side_effect=lambda name: ModuleSpec(name, loader=None),
+                ),
+                mock.patch.dict(
+                    sys.modules,
+                    {"torch": None, jax_api.__name__: jax_api},
+                ),
+            ):
+                operation = importlib.import_module(operation_name)
+                with self.assertRaises(ModuleNotFoundError):
+                    operation.rmsnorm_rht_amax_sm100
+        finally:
+            for module_name in tuple(sys.modules):
+                if module_name == package_name or module_name.startswith(f"{package_name}."):
+                    sys.modules.pop(module_name, None)
+
+    def test_jax_implementations_are_colocated_with_torch_apis(self):
+        operation_dirs = (
+            _CUDNN_ROOT / "rmsnorm_rht_amax",
+            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_forward",
+            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_top_k",
+        )
+        for operation_dir in operation_dirs:
+            with self.subTest(operation=operation_dir.name):
+                self.assertTrue((operation_dir / "api.py").is_file())
+                self.assertTrue((operation_dir / "jax.py").is_file())
+
+        for old_module in ("rmsnorm_rht_amax.py", "indexer_forward.py", "indexer_top_k.py"):
+            with self.subTest(old_module=old_module):
+                self.assertFalse((_CUDNN_ROOT / "jax" / old_module).exists())
 
     def test_torch_function_remains_a_lazy_top_level_export(self):
         top_level_tree = ast.parse(
@@ -158,8 +301,10 @@ class JaxApiSurfaceTest(unittest.TestCase):
     def test_shared_dsa_kernel_import_paths_do_not_import_torch(self):
         shared_files = (
             _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_forward" / "__init__.py",
+            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_forward" / "jax.py",
             _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_forward" / "indexer_fwd_sm100.py",
             _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_top_k" / "__init__.py",
+            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_top_k" / "jax.py",
             _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_top_k" / "indexer_top_k_decode_varlen.py",
             _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_top_k" / "indexer_top_k_varlen_util.py",
         )

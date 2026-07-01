@@ -1,4 +1,4 @@
-"""APIBase wrapper for the DSA indexer top-K CuTe DSL kernel."""
+"""PyTorch APIBase wrapper for the DSA indexer top-K CuTe DSL kernel."""
 
 from __future__ import annotations
 

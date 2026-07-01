@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 import sys
 import types
@@ -89,6 +90,7 @@ class JaxDsaContractTest(unittest.TestCase):
 
         cls.fake_jax = types.ModuleType("jax")
         cls.fake_jax.__path__ = []
+        cls.fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         cls.fake_jax.numpy = cls.fake_jnp
 
         cls.fake_cutlass = types.ModuleType("cutlass")
@@ -112,8 +114,12 @@ class JaxDsaContractTest(unittest.TestCase):
             },
         ):
             importlib.import_module(f"{_TEST_PACKAGE}.jax")
-            cls.forward = importlib.import_module(f"{_TEST_PACKAGE}.jax.indexer_forward")
-            cls.top_k = importlib.import_module(f"{_TEST_PACKAGE}.jax.indexer_top_k")
+            cls.forward = importlib.import_module(
+                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_forward.jax"
+            )
+            cls.top_k = importlib.import_module(
+                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_top_k.jax"
+            )
 
     @classmethod
     def tearDownClass(cls):

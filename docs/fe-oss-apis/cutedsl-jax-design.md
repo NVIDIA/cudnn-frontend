@@ -31,9 +31,17 @@ abstract value, not a device buffer:
 | Cache | Python object and compiled callable | JAX executable cache plus CUTLASS function/spec cache |
 
 The proof of concept implements this split for three real FE-OSS operations:
-RMSNorm + RHT + amax, DSA Indexer Forward, and DSA Indexer Top-K. The existing
-Torch APIs remain unchanged. JAX support is reviewed per operation rather than
-required for every new or modified PyTorch API or physical CuTe kernel.
+RMSNorm + RHT + amax, DSA Indexer Forward, and DSA Indexer Top-K. When Torch is
+installed, the existing Torch APIs remain unchanged. JAX support is reviewed
+per operation rather than required for every new or modified PyTorch API or
+physical CuTe kernel.
+
+This source-layout variant co-locates the bindings for each implemented
+operation: `api.py` is always Torch and a sibling `jax.py` is always JAX. The
+operation package selects Torch when it is installed and otherwise exposes the
+JAX symbols in a JAX-only installation. When both are installed, Torch wins;
+`cudnn.jax` remains the unambiguous way to request JAX. This is import-time
+selection, not array-type dispatch.
 
 ## Scope
 
@@ -172,6 +180,17 @@ jax_scores = DSA.indexer_forward_wrapper(...)
 jax_topk = DSA.indexer_top_k_wrapper(...)
 ```
 
+The implementations are co-located with the kernels:
+
+```text
+cudnn/
+  jax/                                      shared facade and cutedsl.py
+  rmsnorm_rht_amax/{api.py,jax.py,kernel.py}
+  deepseek_sparse_attention/
+    indexer_forward/{api.py,jax.py,...}
+    indexer_top_k/{api.py,jax.py,...}
+```
+
 Implicit array-type dispatch is deliberately rejected. JAX tracers, Torch fake
 tensors/proxies, mixed operands, and optional framework installations make it
 ambiguous and brittle. A `target=` argument inside the call would also become
@@ -283,9 +302,9 @@ Each wrapper:
 5. Returns a standard tuple, named tuple, or registered pytree.
 
 Do not dispatch implicitly by checking whether an argument is a Torch tensor or
-a JAX tracer. Namespace selection happens before tracing, and imports inside the
-JAX namespace keep optional dependencies off the base/Torch path. Importing
-`cudnn.jax` loads JAX and `cutlass.jax` once; configuration-specific kernel
+a JAX tracer. Namespace selection happens before tracing. `cudnn.jax` checks
+that JAX is discoverable, then lazily imports each co-located `jax.py`; those
+modules assume the JAX extra supplied CuTe DSL. Configuration-specific kernel
 implementations remain deferred until an operation is traced.
 
 ### 4. Future C++ graph adapter
@@ -591,8 +610,9 @@ jax_result = run(x_jax, weight_jax)
   compatibility contracts.
 - Use related, discoverable names across frameworks where practical; exact
   symbol matching is not required.
-- JAX is explicitly selected by importing `cudnn.jax`; installing the base or
-  PyTorch extras does not require JAX.
+- JAX is explicitly selected by importing `cudnn.jax`; a JAX-only installation
+  may also receive JAX from an operation package's Torch-first availability
+  fallback. Installing the base or PyTorch extras does not require JAX.
 - JAX operations use functional inputs/outputs and standard named tuples or
   registered pytrees. They do not emulate PyTorch output buffers or streams.
 - Document how logical operands, options, and results correspond. Parameter
@@ -638,19 +658,19 @@ sides of that boundary.
   - passes native `cutlass.jax.TensorSpec` objects through for compact
     layout/mode/divisibility/alignment metadata;
   - memoizes launcher adapters for stable CUTLASS cache identity.
-- [`cudnn.jax.rmsnorm_rht_amax_sm100`](../../python/cudnn/jax/rmsnorm_rht_amax.py)
+- [`cudnn.jax.rmsnorm_rht_amax_sm100`](../../python/cudnn/rmsnorm_rht_amax/jax.py)
   - validates abstract rank, shape, and BF16 dtype;
   - uses comparable PyTorch option concepts and launch heuristics;
   - declares `(M, N)` BF16 and `(M / rows_per_cta,)` FP32 outputs;
   - lowers the existing CuTe kernel through `cutlass_call`.
-- [`cudnn.jax.DSA.indexer_forward_wrapper`](../../python/cudnn/jax/indexer_forward.py)
+- [`cudnn.jax.DSA.indexer_forward_wrapper`](../../python/cudnn/deepseek_sparse_attention/indexer_forward/jax.py)
   - preserves the existing DSA wrapper name while accepting fixed BSHD JAX
     arrays;
   - declares a TMA-padded FP32 result initialized to `-inf` and returns its
     unpadded logical slice;
   - supports the SM100 `head_dim=128` domain with concrete shapes and static
     launch configuration.
-- [`cudnn.jax.DSA.indexer_top_k_wrapper`](../../python/cudnn/jax/indexer_top_k.py)
+- [`cudnn.jax.DSA.indexer_top_k_wrapper`](../../python/cudnn/deepseek_sparse_attention/indexer_top_k/jax.py)
   - preserves the existing DSA wrapper name for FP32/FP16/BF16 score rows;
   - returns INT32 indices and selected values while hiding the radix kernel's
     per-call INT32 workspace from the public result;

@@ -1,4 +1,4 @@
-"""APIBase wrapper and dispatcher for indexer forward CuTe DSL score kernels.
+"""PyTorch APIBase wrapper and dispatcher for indexer-forward score kernels.
 
 Produces dense indexer scores Q @ K^T with per-head ReLU, weighted head
 reduction, and a ratio causal mask. Does NOT fuse top-K — pair with

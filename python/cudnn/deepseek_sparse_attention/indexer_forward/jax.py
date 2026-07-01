@@ -11,7 +11,7 @@ from typing import Any, NamedTuple, Optional
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from .cutedsl import BufferSpec, call_cutedsl
+from ...jax.cutedsl import BufferSpec, call_cutedsl
 
 _TMA_ALIGN_ELEMENTS = 4
 
@@ -40,9 +40,7 @@ def _make_launcher(
     # Load the configuration-specific kernel only when tracing the operation.
     from cutlass import Float32, Int32
 
-    from ..deepseek_sparse_attention.indexer_forward.indexer_fwd_sm100 import (
-        IndexerForwardSm100,
-    )
+    from .indexer_fwd_sm100 import IndexerForwardSm100
 
     kernel = IndexerForwardSm100(
         head_dim=head_dim,

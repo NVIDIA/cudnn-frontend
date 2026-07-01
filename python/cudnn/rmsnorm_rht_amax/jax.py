@@ -13,7 +13,7 @@ from cutlass.jax import TensorSpec
 
 from .._rmsnorm_rht_amax_config import resolve_launch_config
 
-from .cutedsl import BufferSpec, call_cutedsl
+from ..jax.cutedsl import BufferSpec, call_cutedsl
 
 
 class RmsNormRhtAmaxResult(NamedTuple):
@@ -32,7 +32,7 @@ def _make_launcher(
 ):
     # Load the configuration-specific kernel only when tracing the operation.
     from cutlass import Float32
-    from ..rmsnorm_rht_amax.kernel import RMSNormRHTAmaxKernel
+    from .kernel import RMSNormRHTAmaxKernel
 
     kernel = RMSNormRHTAmaxKernel(
         n=n,

@@ -14,14 +14,15 @@ A simplified view of package structure:
 pyproject.toml                       # Project metadata and dependencies. Optional dependencies for frontend-only APIs are registered here.
 python/cudnn/
 ├── __init__.py                     # Top-level exports (Graph, graph, jit, wrappers, kernels)
-├── jax/                            # Optional functional JAX APIs
+├── jax/                            # Lazy JAX facade and shared CuTe/JAX adapter
 ├── graph.py                        # Low-level graph helpers (graph, jit, graph_cache)
 ├── wrapper.py                      # High-level Graph wrapper class
 ├── datatypes.py                    # Data type conversions and helpers
 ├── api_base.py                     # Abstract API base class for frontend-only APIs
 ├── {frontend-only-api-name}/
-│   ├── __init__.py                 # Frontend-only API class
-│   └── api.py                      # High-level API implementation
+│   ├── __init__.py                 # Torch-first lazy framework selection
+│   ├── api.py                      # PyTorch API implementation
+│   ├── jax.py                      # Optional JAX functional API
 │   └── {kernel_name}.py            # Kernel implementation, i.e CuteDSL
 test/python/                        # Test files
 └── fe_api/                         # Test files for frontend-only APIs
@@ -63,10 +64,11 @@ To add a new frontend-only API:
 6. During review, consider whether a new or modified PyTorch operation should
    update JAX. Static lint or LLM review may report likely gaps or drift, but is
    advisory rather than a public API contract or merge gate.
-7. Keep PyTorch exports in `cudnn` and expose JAX only from `cudnn.jax`.
-   Register JAX dependencies only in the optional extra. The explicit
-   `cudnn.jax` import is the dependency boundary; individual operator calls do
-   not probe dependency availability.
+7. Keep `api.py` as the PyTorch implementation and place an optional JAX
+   implementation in `jax.py` beside it. The operation package selects Torch
+   when available and falls back to JAX only in a JAX-only installation;
+   `cudnn.jax` remains the deterministic JAX facade. Register JAX dependencies
+   only in the optional extra.
 
 Do not use tensor-type dispatch or a traced `target=` argument. JAX does not
 emulate the mutable `APIBase.compile()` / `execute()` lifecycle, and adding or

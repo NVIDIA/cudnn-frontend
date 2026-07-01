@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""FE API for fused RMSNorm + RHT + per-CTA amax."""
+"""PyTorch FE API for fused RMSNorm + RHT + per-CTA amax."""
 
 import logging
 from typing import Optional

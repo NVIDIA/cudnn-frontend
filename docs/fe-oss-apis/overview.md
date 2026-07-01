@@ -48,8 +48,9 @@ CUDA package requirement; the base frontend package retains its broader Python
 support.
 
 Importing `cudnn` does not load JAX or CuTe DSL. Importing `cudnn.jax` is the
-explicit opt-in boundary and loads the dependencies supplied by the `jax`
-extra.
+explicit JAX opt-in; its operation modules and CuTe DSL bridge load lazily on
+first symbol access. Each implemented operation keeps `api.py` as its Torch
+binding and a sibling `jax.py` as its JAX binding.
 
 ## API Usage
 

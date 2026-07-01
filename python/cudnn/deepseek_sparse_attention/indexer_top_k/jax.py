@@ -11,7 +11,7 @@ from typing import Any, NamedTuple
 import jax.numpy as jnp
 from cutlass.jax import jax_to_cutlass_dtype
 
-from .cutedsl import BufferSpec, call_cutedsl
+from ...jax.cutedsl import BufferSpec, call_cutedsl
 
 _INT32_MAX = (1 << 31) - 1
 
@@ -34,7 +34,7 @@ def _make_launcher(
     large_occupancy: bool,
 ):
     # Load the configuration-specific kernel only when tracing the operation.
-    from ..deepseek_sparse_attention.indexer_top_k.indexer_top_k_decode_varlen import (
+    from .indexer_top_k_decode_varlen import (
         IndexerTopKKernelVarlenDecode,
         _bucket_num_cols,
     )
