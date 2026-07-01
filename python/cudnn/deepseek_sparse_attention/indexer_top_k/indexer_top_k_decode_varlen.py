@@ -22,8 +22,6 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass.utils.distributed import atomicAdd
 
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-
 from .block_scan import block_prefix_sum_kernel
 from .indexer_top_k_varlen_util import IndexerTopKKernelVarlen
 
@@ -598,6 +596,7 @@ def cute_dsl_topk_wrapper(
     # Keep Torch out of the framework-neutral kernel import path.  The JAX
     # frontend imports ``IndexerTopKKernelVarlenDecode`` from this module.
     import torch
+    from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 
     torch_to_cutlass_dtype = {
         torch.float16: cutlass.Float16,
