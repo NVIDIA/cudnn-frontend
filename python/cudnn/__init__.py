@@ -263,6 +263,9 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "BSA": (".block_sparse_attention", "BSA"),
+    "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
+    "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
     "DSA": (".deepseek_sparse_attention", "DSA"),
     "NSA": (".native_sparse_attention", "NSA"),
     "GemmSwigluSm100": (".gemm_swiglu", "GemmSwigluSm100"),
