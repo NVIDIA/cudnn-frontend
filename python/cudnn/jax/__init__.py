@@ -1,71 +1,80 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Lazy JAX facade for co-located frontend-only operation APIs."""
+"""JAX facade for co-located frontend-only operation APIs.
+
+Importing :mod:`cudnn.jax` is the explicit dependency boundary for JAX and
+CuTe DSL. Dependencies are validated once here, public wrapper modules are then
+imported, and architecture-specific kernel modules remain deferred until an
+operation is traced.
+"""
 
 from importlib import import_module
-from importlib.util import find_spec
-from typing import Any
+from types import SimpleNamespace
 
 
-if find_spec("jax") is None:
+_INSTALL_HINT = "pip install 'nvidia-cudnn-frontend[jax]'"
+
+
+def _require_dependencies(module_names: list[str]) -> None:
+    for module_name in module_names:
+        try:
+            import_module(module_name)
+        except ModuleNotFoundError as error:
+            missing_name = error.name
+            if missing_name is None or not (
+                module_name == missing_name or module_name.startswith(f"{missing_name}.")
+            ):
+                raise
+            raise ImportError(
+                f"cudnn.jax requires the {module_name!r} module. Install the "
+                f"JAX integration with `{_INSTALL_HINT}`."
+            ) from error
+
+
+_require_dependencies(["jax", "cutlass"])
+
+import cutlass.jax
+import jax
+
+if not cutlass.jax.is_available():
+    minimum_version_info = tuple(cutlass.jax.CUTE_DSL_MIN_SUPPORTED_JAX_VERSION)
+    minimum_version = ".".join(str(part) for part in minimum_version_info)
+    installed_version = getattr(jax, "__version__", "unknown")
+    reason = (
+        f"CUTLASS JAX support is unavailable with JAX {installed_version}; "
+        f"the minimum supported JAX version is {minimum_version}."
+    )
     raise ImportError(
-        "cudnn.jax requires JAX; install it with "
-        "'pip install nvidia-cudnn-frontend[jax]'"
+        f"cudnn.jax cannot be imported because {reason} Install the JAX "
+        f"integration with `{_INSTALL_HINT}`."
     )
 
-_SYMBOLS = {
-    "IndexerForwardResult": (
-        "..deepseek_sparse_attention.indexer_forward.jax",
-        "IndexerForwardResult",
-    ),
-    "IndexerTopKResult": (
-        "..deepseek_sparse_attention.indexer_top_k.jax",
-        "IndexerTopKResult",
-    ),
-    "RmsNormRhtAmaxResult": (
-        "..rmsnorm_rht_amax.jax",
-        "RmsNormRhtAmaxResult",
-    ),
-    "indexer_forward_wrapper": (
-        "..deepseek_sparse_attention.indexer_forward.jax",
-        "indexer_forward_wrapper",
-    ),
-    "indexer_top_k_wrapper": (
-        "..deepseek_sparse_attention.indexer_top_k.jax",
-        "indexer_top_k_wrapper",
-    ),
-    "rmsnorm_rht_amax_sm100": (
-        "..rmsnorm_rht_amax.jax",
-        "rmsnorm_rht_amax_sm100",
-    ),
-}
-_DSA_SYMBOLS = frozenset(("indexer_forward_wrapper", "indexer_top_k_wrapper"))
+from ..deepseek_sparse_attention.indexer_forward.jax import (
+    IndexerForwardResult,
+    indexer_forward_wrapper,
+)
+from ..deepseek_sparse_attention.indexer_top_k.jax import (
+    IndexerTopKResult,
+    indexer_top_k_wrapper,
+)
+from ..rmsnorm_rht_amax.jax import (
+    RmsNormRhtAmaxResult,
+    rmsnorm_rht_amax_sm100,
+)
 
 
-def _load_symbol(name: str) -> Any:
-    module_name, symbol_name = _SYMBOLS[name]
-    module = import_module(module_name, package=__name__)
-    symbol = getattr(module, symbol_name)
-    globals()[name] = symbol
-    return symbol
+DSA = SimpleNamespace(
+    indexer_forward_wrapper=indexer_forward_wrapper,
+    indexer_top_k_wrapper=indexer_top_k_wrapper,
+)
 
-
-def __getattr__(name: str) -> Any:
-    if name in _SYMBOLS:
-        return _load_symbol(name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-class _DSANamespace:
-    """JAX counterparts of the existing ``cudnn.DSA`` wrapper names."""
-
-    def __getattr__(self, name: str) -> Any:
-        if name in _DSA_SYMBOLS:
-            return _load_symbol(name)
-        raise AttributeError(f"JAX DSA has no attribute {name!r}")
-
-
-DSA = _DSANamespace()
-
-__all__ = ["DSA", *_SYMBOLS]
+__all__ = [
+    "DSA",
+    "IndexerForwardResult",
+    "IndexerTopKResult",
+    "RmsNormRhtAmaxResult",
+    "indexer_forward_wrapper",
+    "indexer_top_k_wrapper",
+    "rmsnorm_rht_amax_sm100",
+]

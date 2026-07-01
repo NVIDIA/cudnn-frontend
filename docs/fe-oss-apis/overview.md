@@ -47,10 +47,15 @@ This optional dependency set requires Python 3.11 or newer, matching the JAX
 CUDA package requirement; the base frontend package retains its broader Python
 support.
 
-Importing `cudnn` does not load JAX or CuTe DSL. Importing `cudnn.jax` is the
-explicit JAX opt-in; its operation modules and CuTe DSL bridge load lazily on
-first symbol access. Each implemented operation keeps `api.py` as its Torch
-binding and a sibling `jax.py` as its JAX binding.
+Importing `cudnn` does not load JAX or CuTe DSL. Importing `cudnn.jax`, or
+accessing `cudnn.jax` after importing `cudnn`, is the explicit JAX opt-in. It
+validates JAX and CuTe DSL availability and points missing installations to the
+`jax` extra, including checking `cutlass.jax.is_available()` and reporting
+CUTLASS's minimum supported JAX version when unavailable. It then loads the JAX
+operation wrappers and shared CuTe DSL bridge. Architecture-specific kernel
+modules remain deferred until an operation is traced. Each implemented
+operation keeps `api.py` as its Torch binding and a sibling `jax.py` as its JAX
+binding.
 
 ## API Usage
 

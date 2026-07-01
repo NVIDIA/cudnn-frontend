@@ -15,7 +15,7 @@ pyproject.toml                       # Project metadata and dependencies. Option
 python/cudnn/
 ├── __init__.py                     # Top-level exports (Graph, graph, jit, wrappers, kernels)
 ├── _operation_api.py               # Shared lazy operation API exports
-├── jax/                            # Lazy JAX facade and shared CuTe/JAX adapter
+├── jax/                            # Explicit JAX facade and shared CuTe/JAX adapter
 ├── graph.py                        # Low-level graph helpers (graph, jit, graph_cache)
 ├── wrapper.py                      # High-level Graph wrapper class
 ├── datatypes.py                    # Data type conversions and helpers

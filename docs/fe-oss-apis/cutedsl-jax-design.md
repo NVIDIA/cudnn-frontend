@@ -41,8 +41,10 @@ operation: `api.py` is always Torch and a sibling `jax.py` is always JAX. The
 operation package's unqualified symbols always resolve from `api.py`; JAX is
 requested explicitly through `<operation>.jax` or `cudnn.jax`. Installed
 dependencies never change a symbol's framework. A shared `_operation_api.py`
-helper applies this lazy routing without importing either framework, while each
-`jax.py` owns its JAX export list.
+helper keeps operation-level Torch and JAX selection lazy without importing
+either framework. The root package also resolves its `jax` attribute lazily.
+The explicit `cudnn.jax` facade imports and re-exports the lightweight JAX
+wrappers, while configuration-specific kernels remain deferred until tracing.
 
 ## Scope
 
@@ -304,10 +306,12 @@ Each wrapper:
 5. Returns a standard tuple, named tuple, or registered pytree.
 
 Do not dispatch implicitly by checking whether an argument is a Torch tensor or
-a JAX tracer. Namespace selection happens before tracing. `cudnn.jax` checks
-that JAX is discoverable, then lazily imports each co-located `jax.py`; those
-modules assume the JAX extra supplied CuTe DSL. Configuration-specific kernel
-implementations remain deferred until an operation is traced.
+a JAX tracer. Namespace selection happens before tracing. `cudnn.jax` validates
+JAX and CuTe DSL once, including `cutlass.jax.is_available()`, and reports the
+installed and CUTLASS-minimum JAX versions when unavailable. It then imports
+each co-located JAX wrapper directly; those wrappers assume the dependencies
+are available. Configuration-specific kernel implementations remain deferred
+until an operation is traced.
 
 ### 4. Future C++ graph adapter
 
@@ -348,9 +352,9 @@ The adapter uses `cutlass.jax.TensorSpec` directly rather than maintaining a
 cuDNN-specific shadow layout type. `input_specs` contains one native
 `TensorSpec` or `None` per input, and `BufferSpec.tensor_spec` carries the same
 metadata for an output or workspace. `None` selects CUTLASS's default tensor
-specification. The native type is constructed only in the lazily loaded JAX
-path, so this choice does not make JAX or CUTLASS an import-time dependency of
-the base package. Any additional FE validation should inspect a `TensorSpec`
+specification. The native type is constructed only in the explicitly imported
+JAX path, so this choice does not make JAX or CUTLASS an import-time dependency
+of the base package. Any additional FE validation should inspect a `TensorSpec`
 without copying its fields into another public data model.
 
 This differs from Torch, where wrappers can allocate an arbitrary

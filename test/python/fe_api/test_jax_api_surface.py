@@ -43,6 +43,7 @@ class JaxApiSurfaceTest(unittest.TestCase):
         fake_jax.numpy = fake_jnp
 
         fake_cutlass_jax = types.ModuleType("cutlass.jax")
+        fake_cutlass_jax.is_available = lambda: True
         fake_cutlass_jax.TensorSpec = type("TensorSpec", (), {})
         fake_cutlass_jax.jax_to_cutlass_dtype = lambda dtype: dtype
         fake_cutlass = types.ModuleType("cutlass")
@@ -79,6 +80,15 @@ class JaxApiSurfaceTest(unittest.TestCase):
                 f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_top_k.jax",
             )
             for module_name in colocated_modules:
+                self.assertIn(module_name, sys.modules)
+            self.assertIn(f"{_TEST_PACKAGE}.jax.cutedsl", sys.modules)
+
+            kernel_modules = (
+                f"{_TEST_PACKAGE}.rmsnorm_rht_amax.kernel",
+                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_forward.indexer_fwd_sm100",
+                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_top_k.indexer_top_k_decode_varlen",
+            )
+            for module_name in kernel_modules:
                 self.assertNotIn(module_name, sys.modules)
 
             self.assertTrue(callable(jax_namespace.rmsnorm_rht_amax_sm100))
@@ -92,6 +102,8 @@ class JaxApiSurfaceTest(unittest.TestCase):
             self.assertEqual(jax_namespace.RmsNormRhtAmaxResult._fields, ("output", "amax"))
             self.assertEqual(jax_namespace.IndexerForwardResult._fields, ("scores",))
             self.assertEqual(jax_namespace.IndexerTopKResult._fields, ("indices", "values"))
+            for module_name in kernel_modules:
+                self.assertNotIn(module_name, sys.modules)
             rmsnorm_package = importlib.import_module(f"{_TEST_PACKAGE}.rmsnorm_rht_amax")
             indexer_forward_package = importlib.import_module(
                 f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_forward"
@@ -114,8 +126,6 @@ class JaxApiSurfaceTest(unittest.TestCase):
                 indexer_top_k_package.jax.indexer_top_k_wrapper,
                 jax_namespace.indexer_top_k_wrapper,
             )
-            for module_name in colocated_modules:
-                self.assertIn(module_name, sys.modules)
             self.assertEqual(
                 jax_namespace.__all__,
                 [
@@ -144,32 +154,81 @@ class JaxApiSurfaceTest(unittest.TestCase):
         sys.modules[package_name] = parent
 
         try:
-            with (
-                mock.patch.dict(sys.modules, {"jax": None}),
-                self.assertRaisesRegex(ImportError, r"nvidia-cudnn-frontend\[jax\]"),
-            ):
-                importlib.import_module(f"{package_name}.jax")
+            with mock.patch.dict(sys.modules, {"jax": None, "jax.numpy": None}):
+                with self.assertRaisesRegex(
+                    ImportError,
+                    r"requires the 'jax' module.*nvidia-cudnn-frontend\[jax\]",
+                ):
+                    importlib.import_module(f"{package_name}.jax")
         finally:
             for module_name in tuple(sys.modules):
                 if module_name == package_name or module_name.startswith(f"{package_name}."):
                     sys.modules.pop(module_name, None)
 
-    def test_jax_namespace_does_not_probe_cutedsl(self):
+    def test_missing_cutedsl_reports_optional_extra(self):
         package_name = f"{_TEST_PACKAGE}_no_cutlass"
         parent = types.ModuleType(package_name)
         parent.__path__ = [str(_CUDNN_ROOT)]
         parent.__package__ = package_name
         sys.modules[package_name] = parent
         fake_jax = types.ModuleType("jax")
+        fake_jnp = types.ModuleType("jax.numpy")
+        fake_jax.__path__ = []
         fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
+        fake_jax.numpy = fake_jnp
 
         try:
             with mock.patch.dict(
                 sys.modules,
-                {"jax": fake_jax, "cutlass": None, "cutlass.jax": None},
+                {
+                    "jax": fake_jax,
+                    "jax.numpy": fake_jnp,
+                    "cutlass": None,
+                    "cutlass.jax": None,
+                },
             ):
-                namespace = importlib.import_module(f"{package_name}.jax")
-                self.assertIn("rmsnorm_rht_amax_sm100", namespace.__all__)
+                with self.assertRaisesRegex(
+                    ImportError,
+                    r"requires the 'cutlass' module.*nvidia-cudnn-frontend\[jax\]",
+                ):
+                    importlib.import_module(f"{package_name}.jax")
+        finally:
+            for module_name in tuple(sys.modules):
+                if module_name == package_name or module_name.startswith(f"{package_name}."):
+                    sys.modules.pop(module_name, None)
+
+    def test_unavailable_cutlass_jax_reports_minimum_version(self):
+        package_name = f"{_TEST_PACKAGE}_unavailable_cutlass_jax"
+        parent = types.ModuleType(package_name)
+        parent.__path__ = [str(_CUDNN_ROOT)]
+        parent.__package__ = package_name
+        sys.modules[package_name] = parent
+
+        fake_jax = types.ModuleType("jax")
+        fake_jax.__version__ = "0.4.0"
+        fake_jax.version = types.SimpleNamespace(__version_info__=(0, 4, 0))
+        fake_cutlass = types.ModuleType("cutlass")
+        fake_cutlass.__path__ = []
+        fake_cutlass_jax = types.ModuleType("cutlass.jax")
+        fake_cutlass_jax.CUTE_DSL_MIN_SUPPORTED_JAX_VERSION = (0, 5, 0)
+        fake_cutlass_jax.is_available = lambda: False
+        fake_cutlass.jax = fake_cutlass_jax
+
+        try:
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "jax": fake_jax,
+                    "cutlass": fake_cutlass,
+                    "cutlass.jax": fake_cutlass_jax,
+                },
+            ):
+                with self.assertRaisesRegex(
+                    ImportError,
+                    r"CUTLASS JAX support is unavailable with JAX 0\.4\.0; "
+                    r"the minimum supported JAX version is 0\.5\.0.*nvidia-cudnn-frontend\[jax\]",
+                ):
+                    importlib.import_module(f"{package_name}.jax")
         finally:
             for module_name in tuple(sys.modules):
                 if module_name == package_name or module_name.startswith(f"{package_name}."):
@@ -323,6 +382,38 @@ class JaxApiSurfaceTest(unittest.TestCase):
             (".rmsnorm_rht_amax", "rmsnorm_rht_amax_sm100"),
         )
         self.assertEqual(lazy_imports["DSA"], (".deepseek_sparse_attention", "DSA"))
+
+    def test_root_lazily_imports_explicit_jax_namespace(self):
+        top_level_tree = ast.parse(
+            (_CUDNN_ROOT / "__init__.py").read_text(),
+            filename=str(_CUDNN_ROOT / "__init__.py"),
+        )
+        getattr_node = next(
+            node
+            for node in top_level_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__getattr__"
+        )
+        jax_branch = next(
+            node
+            for node in getattr_node.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "name"
+            and len(node.test.comparators) == 1
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value == "jax"
+        )
+        imported_modules = {
+            call.args[0].value
+            for call in ast.walk(jax_branch)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "import_module"
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+        }
+        self.assertEqual(imported_modules, {".jax"})
 
     def test_dsa_operator_names_match_torch_namespace(self):
         dsa_tree = ast.parse(

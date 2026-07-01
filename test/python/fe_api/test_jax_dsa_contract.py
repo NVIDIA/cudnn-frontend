@@ -96,6 +96,7 @@ class JaxDsaContractTest(unittest.TestCase):
         cls.fake_cutlass = types.ModuleType("cutlass")
         cls.fake_cutlass.__path__ = []
         cls.fake_cutlass_jax = types.ModuleType("cutlass.jax")
+        cls.fake_cutlass_jax.is_available = lambda: True
         cls.fake_cutlass_jax.TensorSpec = _TensorSpec
         cls.fake_cutlass_jax.jax_to_cutlass_dtype = lambda dtype: f"cutlass.{dtype.name}"
         cls.fake_cutlass.jax = cls.fake_cutlass_jax

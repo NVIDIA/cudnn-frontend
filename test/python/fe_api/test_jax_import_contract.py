@@ -202,7 +202,7 @@ class JaxImportContractTest(unittest.TestCase):
         )
         self.assertTrue(
             any(path.name != "__init__.py" and path not in roots for path in visited),
-            "JAX import graph did not discover lazy kernel dependencies",
+            "JAX import graph did not discover deferred kernel dependencies",
         )
         self.assertEqual(
             violations,
