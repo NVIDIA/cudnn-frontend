@@ -167,54 +167,103 @@ class JaxApiSurfaceTest(unittest.TestCase):
                 if module_name == package_name or module_name.startswith(f"{package_name}."):
                     sys.modules.pop(module_name, None)
 
-    def test_operation_package_uses_torch_first_availability_fallback(self):
+    def test_operation_packages_use_torch_first_availability_fallback(self):
         cases = (
             ("both", {"torch", "jax"}, "torch"),
             ("torch_only", {"torch"}, "torch"),
             ("jax_only", {"jax"}, "jax"),
             ("neither", set(), None),
         )
+        operations = (
+            ("rmsnorm_rht_amax", "rmsnorm_rht_amax_sm100"),
+            (
+                "deepseek_sparse_attention.indexer_forward",
+                "indexer_forward_wrapper",
+            ),
+            (
+                "deepseek_sparse_attention.indexer_top_k",
+                "indexer_top_k_wrapper",
+            ),
+        )
         for label, available, expected in cases:
             with self.subTest(label=label):
                 package_name = f"{_TEST_PACKAGE}_{label}"
-                operation_name = f"{package_name}.rmsnorm_rht_amax"
                 parent = types.ModuleType(package_name)
                 parent.__path__ = [str(_CUDNN_ROOT)]
                 parent.__package__ = package_name
                 sys.modules[package_name] = parent
 
-                torch_function = object()
-                jax_function = object()
-                torch_api = types.ModuleType(f"{operation_name}.api")
-                torch_api.rmsnorm_rht_amax_sm100 = torch_function
-                jax_api = types.ModuleType(f"{operation_name}.jax")
-                jax_api.rmsnorm_rht_amax_sm100 = jax_function
+                operation_apis = {}
+                for operation_path, symbol_name in operations:
+                    operation_name = f"{package_name}.{operation_path}"
+                    torch_function = object()
+                    jax_function = object()
+                    torch_api = types.ModuleType(f"{operation_name}.api")
+                    setattr(torch_api, symbol_name, torch_function)
+                    jax_api = types.ModuleType(f"{operation_name}.jax")
+                    setattr(jax_api, symbol_name, jax_function)
+                    operation_apis[operation_path] = (
+                        symbol_name,
+                        torch_function,
+                        jax_function,
+                        torch_api,
+                        jax_api,
+                    )
 
                 def fake_find_spec(name):
                     return ModuleSpec(name, loader=None) if name in available else None
 
                 try:
-                    with (
-                        mock.patch("importlib.util.find_spec", side_effect=fake_find_spec),
-                        mock.patch.dict(
-                            sys.modules,
-                            {
-                                torch_api.__name__: torch_api,
-                                jax_api.__name__: jax_api,
-                            },
-                        ),
-                    ):
-                        operation = importlib.import_module(operation_name)
-                        if expected is None:
-                            self.assertEqual(operation.__all__, [])
-                            with self.assertRaises(AttributeError):
-                                operation.rmsnorm_rht_amax_sm100
-                        else:
-                            expected_function = torch_function if expected == "torch" else jax_function
-                            self.assertIs(operation.rmsnorm_rht_amax_sm100, expected_function)
+                    with mock.patch("importlib.util.find_spec", side_effect=fake_find_spec):
+                        for operation_path, _ in operations:
+                            with self.subTest(operation=operation_path):
+                                operation_name = f"{package_name}.{operation_path}"
+                                operation = importlib.import_module(operation_name)
+                                (
+                                    symbol_name,
+                                    torch_function,
+                                    jax_function,
+                                    torch_api,
+                                    jax_api,
+                                ) = operation_apis[operation_path]
+                                self.assertNotIn(torch_api.__name__, sys.modules)
+                                self.assertNotIn(jax_api.__name__, sys.modules)
 
-                        self.assertIs(operation.api, torch_api)
-                        self.assertIs(operation.jax, jax_api)
+                                with mock.patch.dict(
+                                    sys.modules,
+                                    {
+                                        torch_api.__name__: torch_api,
+                                        jax_api.__name__: jax_api,
+                                    },
+                                ):
+                                    if expected is None:
+                                        self.assertEqual(operation.__all__, [])
+                                        with self.assertRaises(AttributeError):
+                                            getattr(operation, symbol_name)
+                                    else:
+                                        expected_exports = getattr(
+                                            operation,
+                                            f"_{expected.upper()}_EXPORTS",
+                                        )
+                                        self.assertEqual(
+                                            operation.__all__,
+                                            list(expected_exports),
+                                        )
+                                        expected_function = (
+                                            torch_function if expected == "torch" else jax_function
+                                        )
+                                        self.assertIs(
+                                            getattr(operation, symbol_name),
+                                            expected_function,
+                                        )
+                                        self.assertIn(symbol_name, vars(operation))
+                                        self.assertIs(
+                                            getattr(operation, symbol_name),
+                                            expected_function,
+                                        )
+
+                                    self.assertIs(operation.api, torch_api)
+                                    self.assertIs(operation.jax, jax_api)
                 finally:
                     for module_name in tuple(sys.modules):
                         if module_name == package_name or module_name.startswith(f"{package_name}."):

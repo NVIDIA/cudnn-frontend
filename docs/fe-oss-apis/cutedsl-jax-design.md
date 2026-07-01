@@ -41,7 +41,9 @@ operation: `api.py` is always Torch and a sibling `jax.py` is always JAX. The
 operation package selects Torch when it is installed and otherwise exposes the
 JAX symbols in a JAX-only installation. When both are installed, Torch wins;
 `cudnn.jax` remains the unambiguous way to request JAX. This is import-time
-selection, not array-type dispatch.
+selection, not array-type dispatch. A shared `_framework_api.py` helper applies
+that policy without importing either framework; each operation retains its own
+Torch and JAX export lists.
 
 ## Scope
 
@@ -184,6 +186,7 @@ The implementations are co-located with the kernels:
 
 ```text
 cudnn/
+  _framework_api.py                         shared lazy API selection
   jax/                                      shared facade and cutedsl.py
   rmsnorm_rht_amax/{api.py,jax.py,config.py,kernel.py}
   deepseek_sparse_attention/

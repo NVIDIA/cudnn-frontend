@@ -14,6 +14,7 @@ A simplified view of package structure:
 pyproject.toml                       # Project metadata and dependencies. Optional dependencies for frontend-only APIs are registered here.
 python/cudnn/
 ├── __init__.py                     # Top-level exports (Graph, graph, jit, wrappers, kernels)
+├── _framework_api.py               # Shared Torch-first lazy API selector
 ├── jax/                            # Lazy JAX facade and shared CuTe/JAX adapter
 ├── graph.py                        # Low-level graph helpers (graph, jit, graph_cache)
 ├── wrapper.py                      # High-level Graph wrapper class

@@ -6,6 +6,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+import types
 import unittest
 
 try:
@@ -28,7 +29,12 @@ _SPEC.loader.exec_module(_MODULE)
 class RmsNormRhtAmaxLaunchConfigTest(unittest.TestCase):
     def test_package_does_not_eagerly_import_torch_api(self):
         package_dir = _MODULE_PATH.parent
-        module_name = "cudnn_rmsnorm_rht_amax_lazy_import_test"
+        root_name = "cudnn_frontend_rmsnorm_lazy_import_test"
+        module_name = f"{root_name}.rmsnorm_rht_amax"
+        root = types.ModuleType(root_name)
+        root.__path__ = [str(package_dir.parent)]
+        root.__package__ = root_name
+        sys.modules[root_name] = root
         package_spec = importlib.util.spec_from_file_location(
             module_name,
             package_dir / "__init__.py",
@@ -41,7 +47,9 @@ class RmsNormRhtAmaxLaunchConfigTest(unittest.TestCase):
             package_spec.loader.exec_module(package)
             self.assertNotIn(f"{module_name}.api", sys.modules)
         finally:
-            sys.modules.pop(module_name, None)
+            for loaded_name in tuple(sys.modules):
+                if loaded_name == root_name or loaded_name.startswith(f"{root_name}."):
+                    sys.modules.pop(loaded_name, None)
 
     def test_resolves_tuned_defaults(self):
         self.assertEqual(
