@@ -653,7 +653,7 @@ def _sdpa_impl(
     use_d256_oss_fwd = can_use_d256_oss_fwd and device_supports_d256_oss and not cudnn_backend_supports_d256
     if can_use_d256_oss_fwd and not use_d256_oss_fwd:
         _logger.debug(
-            "Routing d=256 forward through the cuDNN backend " "(cuDNN backend version %d, backend support=%s, OSS device support=%s, device=%s)",
+            "Routing d=256 forward through the cuDNN backend (cuDNN backend version %d, backend support=%s, OSS device support=%s, device=%s)",
             cudnn.backend_version(),
             cudnn_backend_supports_d256,
             device_supports_d256_oss,

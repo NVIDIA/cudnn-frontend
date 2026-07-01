@@ -7,9 +7,11 @@ numerical correctness against a PyTorch reference for both O and dQ/dK/dV.
 All tensors use BHSD layout (batch, num_heads, seq_len, head_dim).
 """
 
+import importlib
+import math
+
 import pytest
 import torch
-import math
 
 import cudnn
 from cudnn.experimental.ops import sdpa as sdpa_module
@@ -157,8 +159,6 @@ def _skip_if_unsupported_d256(D):
     if major < 10:
         pytest.skip("d=256 backward path requires SM100+")
     try:
-        import importlib
-
         importlib.import_module("cudnn.sdpa")
     except ImportError:
         pytest.skip("d=256 OSS SDPA path requires optional cutedsl dependencies in this environment")
@@ -204,8 +204,6 @@ class TestCudnnSdpa:
             pytest.skip(f"cuDNN backend {cudnn.backend_version()} handles d=256 itself; OSS path is intentionally bypassed")
         _skip_if_unsupported_d256(256)
         try:
-            import importlib
-
             importlib.import_module("cudnn.sdpa")
         except ImportError:
             pytest.skip("OSS SDPA d=256 optional dependencies are not installed in this environment")
