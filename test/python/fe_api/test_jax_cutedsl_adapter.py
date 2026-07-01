@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import importlib.util
 from pathlib import Path
 import sys
@@ -28,7 +29,6 @@ _SPEC.loader.exec_module(_MODULE)
 
 BufferInitialization = _MODULE.BufferInitialization
 BufferSpec = _MODULE.BufferSpec
-TensorLayout = _MODULE.TensorLayout
 _call_cutedsl_with_modules = _MODULE._call_cutedsl_with_modules
 
 
@@ -67,21 +67,15 @@ class _FakeJaxNumpy:
         return result
 
 
+@dataclass(frozen=True)
 class _FakeCutlassTensorSpec:
-    def __init__(
-        self,
-        *,
-        layout,
-        mode,
-        static,
-        ptr_assumed_align,
-        divisibility,
-    ):
-        self.layout = layout
-        self.mode = mode
-        self.static = static
-        self.ptr_assumed_align = ptr_assumed_align
-        self.divisibility = divisibility
+    """Dependency-free stand-in with CUTLASS 4.5's TensorSpec fields."""
+
+    layout: object = None
+    mode: object = None
+    static: object = None
+    ptr_assumed_align: object = 256
+    divisibility: object = None
 
 
 class _FakeCutlassJax:
@@ -171,6 +165,8 @@ class CallCutedslAdapterTest(unittest.TestCase):
             seen.append((output, workspace))
 
         x = _Array((4,), "bf16", "x")
+        output_tensor_spec = _FakeCutlassTensorSpec(divisibility=(4,))
+        workspace_tensor_spec = _FakeCutlassTensorSpec(ptr_assumed_align=128)
         result, fake_jnp, bridge = self._call(
             kernel,
             (x,),
@@ -179,6 +175,7 @@ class CallCutedslAdapterTest(unittest.TestCase):
                     "output",
                     (4,),
                     "bf16",
+                    tensor_spec=output_tensor_spec,
                     initialization=BufferInitialization.VALUE,
                     fill_value=float("-inf"),
                 ),
@@ -188,6 +185,7 @@ class CallCutedslAdapterTest(unittest.TestCase):
                     "workspace",
                     (32,),
                     "u8",
+                    tensor_spec=workspace_tensor_spec,
                     initialization=BufferInitialization.ZERO,
                 ),
             ),
@@ -195,8 +193,13 @@ class CallCutedslAdapterTest(unittest.TestCase):
 
         aliases = bridge.calls[0][1]["input_output_aliases"]
         self.assertEqual(aliases, {1: 0, 2: 1})
-        self.assertEqual(bridge.calls[0][1]["input_spec"], (None, None, None))
-        self.assertEqual(bridge.calls[0][1]["output_spec"], (None, None))
+        input_specs = bridge.calls[0][1]["input_spec"]
+        output_specs = bridge.calls[0][1]["output_spec"]
+        self.assertIsNone(input_specs[0])
+        self.assertIs(input_specs[1], output_tensor_spec)
+        self.assertIs(input_specs[2], workspace_tensor_spec)
+        self.assertIs(output_specs[0], output_tensor_spec)
+        self.assertIs(output_specs[1], workspace_tensor_spec)
         self.assertIs(result[0], fake_jnp.allocations[0][1])
         self.assertIs(seen[0][0], fake_jnp.allocations[0][1])
         self.assertIs(seen[0][1], fake_jnp.allocations[1][1])
@@ -249,8 +252,15 @@ class CallCutedslAdapterTest(unittest.TestCase):
             ["result-0", "x", "result-2", "result-3"],
         )
 
-    def test_layout_metadata_is_forwarded(self):
-        layout = TensorLayout(
+    def test_native_tensor_specs_are_forwarded_without_conversion(self):
+        input_spec = _FakeCutlassTensorSpec(
+            layout=(1, 0),
+            mode=(1, 0),
+            static=True,
+            ptr_assumed_align=128,
+            divisibility=(16, 8),
+        )
+        output_spec = _FakeCutlassTensorSpec(
             layout=(1, 0),
             mode=(1, 0),
             static=True,
@@ -261,8 +271,15 @@ class CallCutedslAdapterTest(unittest.TestCase):
         result, _, bridge = self._call(
             lambda stream, x, output: None,
             (_Array((8, 16), "f32", "x"),),
-            outputs=(BufferSpec("output", (8, 16), "f32", layout),),
-            input_layouts=(layout,),
+            outputs=(
+                BufferSpec(
+                    "output",
+                    (8, 16),
+                    "f32",
+                    tensor_spec=output_spec,
+                ),
+            ),
+            input_specs=(input_spec,),
             allow_cuda_graph=False,
             compile_options="--example-option",
             use_static_tensors=True,
@@ -270,19 +287,13 @@ class CallCutedslAdapterTest(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         options = bridge.calls[0][1]
-        input_spec = options["input_spec"][0]
-        output_spec = options["output_spec"][0]
-        for spec in (input_spec, output_spec):
-            self.assertEqual(spec.layout, (1, 0))
-            self.assertEqual(spec.mode, (1, 0))
-            self.assertTrue(spec.static)
-            self.assertEqual(spec.ptr_assumed_align, 128)
-            self.assertEqual(spec.divisibility, (16, 8))
+        self.assertIs(options["input_spec"][0], input_spec)
+        self.assertIs(options["output_spec"][0], output_spec)
         self.assertFalse(options["allow_cuda_graph"])
         self.assertEqual(options["compile_options"], "--example-option")
         self.assertTrue(options["use_static_tensors"])
 
-    def test_default_result_layout_uses_cutlass_inference(self):
+    def test_default_result_spec_uses_cutlass_inference(self):
         _, _, bridge = self._call(
             lambda stream, x, output: None,
             (_Array((8,), "f32", "x"),),
@@ -290,6 +301,84 @@ class CallCutedslAdapterTest(unittest.TestCase):
         )
 
         self.assertIsNone(bridge.calls[0][1]["output_spec"][0])
+
+    def test_native_tensor_spec_metadata_is_validated(self):
+        invalid_specs = (
+            (
+                "layout permutation",
+                _FakeCutlassTensorSpec(layout=(0, 0)),
+                ValueError,
+                "layout.*permutation",
+            ),
+            (
+                "mode rank",
+                _FakeCutlassTensorSpec(mode=(0,)),
+                ValueError,
+                "mode.*permutation",
+            ),
+            (
+                "mode element type",
+                _FakeCutlassTensorSpec(mode=(False, True)),
+                TypeError,
+                "mode entries.*integers",
+            ),
+            (
+                "static type",
+                _FakeCutlassTensorSpec(static="yes"),
+                TypeError,
+                "static.*bool",
+            ),
+            (
+                "pointer alignment",
+                _FakeCutlassTensorSpec(ptr_assumed_align=3),
+                ValueError,
+                "ptr_assumed_align.*power of two",
+            ),
+            (
+                "divisibility value",
+                _FakeCutlassTensorSpec(divisibility=(16, 0)),
+                ValueError,
+                "divisibility.*positive",
+            ),
+            (
+                "divisibility rank",
+                _FakeCutlassTensorSpec(divisibility=(16,)),
+                ValueError,
+                "divisibility.*rank 2",
+            ),
+        )
+
+        for label, tensor_spec, error_type, message in invalid_specs:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(error_type, message):
+                    self._call(
+                        lambda stream, x, output: None,
+                        (_Array((8, 16), "f32", "x"),),
+                        outputs=(BufferSpec("output", (8, 16), "f32"),),
+                        input_specs=(tensor_spec,),
+                    )
+
+        with self.assertRaisesRegex(TypeError, "TensorSpec or None"):
+            self._call(
+                lambda stream, x, output: None,
+                (_Array((8, 16), "f32", "x"),),
+                outputs=(BufferSpec("output", (8, 16), "f32"),),
+                input_specs=(object(),),
+            )
+
+        with self.assertRaisesRegex(ValueError, "output.*layout.*permutation"):
+            self._call(
+                lambda stream, x, output: None,
+                (_Array((8, 16), "f32", "x"),),
+                outputs=(
+                    BufferSpec(
+                        "output",
+                        (8, 16),
+                        "f32",
+                        tensor_spec=_FakeCutlassTensorSpec(layout=(0, 0)),
+                    ),
+                ),
+            )
 
     def test_rejects_invalid_specs_and_aliases(self):
         with self.assertRaisesRegex(ValueError, "at least one public output"):
@@ -312,12 +401,12 @@ class CallCutedslAdapterTest(unittest.TestCase):
                 input_output_aliases={0: 1},
             )
 
-        with self.assertRaisesRegex(ValueError, "Expected 1 input layout"):
+        with self.assertRaisesRegex(ValueError, "Expected 1 input tensor spec"):
             self._call(
                 lambda stream, x, y: None,
                 (_Array((1,), "f32", "x"),),
                 outputs=(BufferSpec("output", (1,), "f32"),),
-                input_layouts=(),
+                input_specs=(),
             )
 
         with self.assertRaisesRegex(ValueError, "shape/dtype"):
@@ -328,12 +417,12 @@ class CallCutedslAdapterTest(unittest.TestCase):
                 input_output_aliases={0: 0},
             )
 
-        with self.assertRaisesRegex(ValueError, "identical TensorLayout"):
+        with self.assertRaisesRegex(ValueError, "identical TensorSpec"):
             self._call(
                 lambda stream, x, y: None,
                 (_Array((2, 2), "f32", "x"),),
                 outputs=(BufferSpec("output", (2, 2), "f32"),),
-                input_layouts=(TensorLayout(mode=(1, 0)),),
+                input_specs=(_FakeCutlassTensorSpec(mode=(1, 0)),),
                 input_output_aliases={0: 0},
             )
 
@@ -357,7 +446,7 @@ class CallCutedslAdapterTest(unittest.TestCase):
                 lambda stream, x, y: None,
                 (_Array((1, 1), "f32", "x"),),
                 outputs=(BufferSpec("output", (1, 1), "f32"),),
-                input_layouts=(TensorLayout(layout=(0, 0)),),
+                input_specs=(_FakeCutlassTensorSpec(layout=(0, 0)),),
             )
 
 

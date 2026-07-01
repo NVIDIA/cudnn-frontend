@@ -305,6 +305,15 @@ runtime stride vectors. The JAX binding must therefore:
 - reject overlapping, broadcast-stride, and non-compact layouts unless the
   kernel is explicitly adapted.
 
+The adapter uses `cutlass.jax.TensorSpec` directly rather than maintaining a
+cuDNN-specific shadow layout type. `input_specs` contains one native
+`TensorSpec` or `None` per input, and `BufferSpec.tensor_spec` carries the same
+metadata for an output or workspace. `None` selects CUTLASS's default tensor
+specification. The native type is constructed only in the lazily loaded JAX
+path, so this choice does not make JAX or CUTLASS an import-time dependency of
+the base package. Any additional FE validation should inspect a `TensorSpec`
+without copying its fields into another public data model.
+
 This differs from Torch, where wrappers can allocate an arbitrary
 `empty_strided` result. Layout should be an operator contract, not inferred from
 a fictitious JAX stride API.
@@ -585,7 +594,8 @@ sides of that boundary.
   - reconstructs canonical launcher order when results alias inputs;
   - requires identical input/output metadata for an alias and rejects nested
     low-level input pytrees;
-  - forwards compact layout/mode/divisibility/alignment metadata;
+  - passes native `cutlass.jax.TensorSpec` objects through for compact
+    layout/mode/divisibility/alignment metadata;
   - memoizes launcher adapters for stable CUTLASS cache identity.
 - [`cudnn.jax.rmsnorm_rht_amax_sm100`](../../python/cudnn/jax/rmsnorm_rht_amax.py)
   - validates abstract rank, shape, and BF16 dtype;

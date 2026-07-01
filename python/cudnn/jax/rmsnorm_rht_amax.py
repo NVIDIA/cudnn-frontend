@@ -10,7 +10,7 @@ from typing import Any, NamedTuple, Optional
 
 from .._rmsnorm_rht_amax_config import resolve_launch_config
 
-from .cutedsl import BufferSpec, TensorLayout, call_cutedsl
+from .cutedsl import BufferSpec, call_cutedsl
 from .utils import optional_static_int, require_concrete_dims, require_static_float
 
 
@@ -70,8 +70,9 @@ def rmsnorm_rht_amax_sm100(
 
     try:
         import jax.numpy as jnp
+        from cutlass.jax import TensorSpec
     except ImportError as exc:
-        raise ImportError("rmsnorm_rht_amax_sm100 requires JAX; install the 'jax' " "optional dependencies") from exc
+        raise ImportError("rmsnorm_rht_amax_sm100 requires JAX and the CuTe DSL JAX " "integration; install the 'jax' optional dependencies") from exc
 
     if x.ndim != 2:
         raise ValueError(f"x must have rank 2, got shape {x.shape}")
@@ -95,9 +96,8 @@ def rmsnorm_rht_amax_sm100(
     )
     # JAX/XLA owns physical buffers. These specs constrain ordinary row-major
     # storage while providing the divisibility facts used by the CuTe kernel.
-    x_layout = TensorLayout(divisibility=(resolved_rows_per_cta, 16))
-    weight_layout = TensorLayout(divisibility=(16,))
-    amax_layout = TensorLayout()
+    x_spec = TensorSpec(divisibility=(resolved_rows_per_cta, 16))
+    weight_spec = TensorSpec(divisibility=(16,))
 
     output, amax = call_cutedsl(
         _make_launcher(n, resolved_num_threads, resolved_rows_per_cta, eps),
@@ -107,16 +107,15 @@ def rmsnorm_rht_amax_sm100(
                 "output",
                 (m, n),
                 jnp.bfloat16,
-                tensor_layout=x_layout,
+                tensor_spec=x_spec,
             ),
             BufferSpec(
                 "amax",
                 (m // resolved_rows_per_cta,),
                 jnp.float32,
-                tensor_layout=amax_layout,
             ),
         ),
-        input_layouts=(x_layout, weight_layout),
+        input_specs=(x_spec, weight_spec),
         use_static_tensors=True,
     )
     return RmsNormRhtAmaxResult(output=output, amax=amax)

@@ -21,10 +21,13 @@ dtype, layout, and support inference before they can use this adapter.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:
+    from cutlass.jax import TensorSpec
 
 
 class BufferInitialization(str, Enum):
@@ -36,71 +39,26 @@ class BufferInitialization(str, Enum):
 
 
 @dataclass(frozen=True)
-class TensorLayout:
-    """CuTe/JAX layout metadata for one tensor.
-
-    ``layout`` and ``mode`` follow ``cutlass.jax.TensorSpec`` conventions.  In
-    particular, ``layout`` is CuTe's minor-to-major stride-rank permutation,
-    while ``mode`` changes the logical mode order seen by the kernel without
-    requesting a physical transpose.
-    """
-
-    layout: Optional[Tuple[int, ...]] = None
-    mode: Optional[Tuple[int, ...]] = None
-    static: Optional[bool] = None
-    ptr_assumed_align: int = 256
-    divisibility: Optional[Tuple[Optional[int], ...] | int] = None
-
-    def __post_init__(self) -> None:
-        if self.layout is not None:
-            object.__setattr__(self, "layout", tuple(self.layout))
-        if self.mode is not None:
-            object.__setattr__(self, "mode", tuple(self.mode))
-        if isinstance(self.divisibility, list):
-            object.__setattr__(self, "divisibility", tuple(self.divisibility))
-        if self.static is not None and not isinstance(self.static, bool):
-            raise TypeError("static must be bool or None")
-        if not isinstance(self.ptr_assumed_align, int) or isinstance(self.ptr_assumed_align, bool):
-            raise TypeError("ptr_assumed_align must be an integer")
-        if self.ptr_assumed_align <= 0 or (self.ptr_assumed_align & (self.ptr_assumed_align - 1)):
-            raise ValueError("ptr_assumed_align must be a positive power of two")
-        divisibility_values = self.divisibility if isinstance(self.divisibility, tuple) else (self.divisibility,)
-        if any(value is not None and (not isinstance(value, int) or isinstance(value, bool) or value <= 0) for value in divisibility_values):
-            raise ValueError("divisibility entries must be positive integers or None, " f"got {self.divisibility}")
-
-    def validate_rank(self, rank: int, *, name: str) -> None:
-        for field_name in ("layout", "mode"):
-            value = getattr(self, field_name)
-            if value is None:
-                continue
-            if len(value) != rank or tuple(sorted(value)) != tuple(range(rank)):
-                raise ValueError(f"{name} {field_name} must be a permutation of range({rank}), " f"got {value}")
-
-        if isinstance(self.divisibility, tuple) and len(self.divisibility) != rank:
-            raise ValueError(f"{name} divisibility must have rank {rank}, " f"got {self.divisibility}")
-
-
-@dataclass(frozen=True)
 class BufferSpec:
-    """Shape, dtype, layout, and initialization for a custom-call result.
+    """Shape, dtype, tensor metadata, and initialization for a result.
 
     A spec passed through ``outputs`` is returned to the caller.  A spec passed
     through ``workspaces`` is supplied to the CuTe launcher after the public
-    outputs and then omitted from the JAX-visible result.
+    outputs and then omitted from the JAX-visible result. ``tensor_spec`` is a
+    native :class:`cutlass.jax.TensorSpec`; ``None`` asks CUTLASS to infer its
+    default from the shape and dtype.
     """
 
     name: str
     shape: Tuple[Any, ...]
     dtype: Any
-    tensor_layout: TensorLayout = field(default_factory=TensorLayout)
+    tensor_spec: TensorSpec | None = None
     initialization: BufferInitialization = BufferInitialization.UNINITIALIZED
     fill_value: Any = None
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("BufferSpec.name must not be empty")
-        if not isinstance(self.tensor_layout, TensorLayout):
-            raise TypeError("BufferSpec.tensor_layout must be a TensorLayout, " f"got {type(self.tensor_layout).__name__}")
         object.__setattr__(self, "shape", tuple(self.shape))
         if not isinstance(self.initialization, BufferInitialization):
             object.__setattr__(
@@ -108,8 +66,6 @@ class BufferSpec:
                 "initialization",
                 BufferInitialization(self.initialization),
             )
-        self.tensor_layout.validate_rank(len(self.shape), name=self.name)
-
         if self.initialization is BufferInitialization.VALUE:
             if self.fill_value is None:
                 raise ValueError(f"{self.name} uses VALUE initialization but has no fill_value")
@@ -261,18 +217,48 @@ def _make_launch_adapter(fn: Callable[..., None], plan: _CallPlan) -> Callable[.
         )
 
 
-def _to_cutlass_tensor_spec(layout: TensorLayout, cutlass_jax: Any) -> Any:
-    return cutlass_jax.TensorSpec(
-        layout=layout.layout,
-        mode=layout.mode,
-        static=layout.static,
-        ptr_assumed_align=layout.ptr_assumed_align,
-        divisibility=layout.divisibility,
-    )
+def _validate_tensor_spec(
+    spec: Any,
+    rank: int,
+    *,
+    name: str,
+    tensor_spec_type: type,
+) -> None:
+    """Validate native CUTLASS tensor metadata before JAX lowering."""
 
+    if spec is None:
+        return
+    if not isinstance(spec, tensor_spec_type):
+        raise TypeError(f"{name} tensor_spec must be cutlass.jax.TensorSpec or None, " f"got {type(spec).__name__}")
 
-def _is_default_tensor_layout(layout: TensorLayout) -> bool:
-    return layout == TensorLayout()
+    for field_name in ("layout", "mode"):
+        value = getattr(spec, field_name)
+        if value is None:
+            continue
+        if not isinstance(value, tuple):
+            raise TypeError(f"{name} tensor_spec.{field_name} must be a tuple or None")
+        if any(not isinstance(item, int) or isinstance(item, bool) for item in value):
+            raise TypeError(f"{name} tensor_spec.{field_name} entries must be integers")
+        if len(value) != rank or tuple(sorted(value)) != tuple(range(rank)):
+            raise ValueError(f"{name} tensor_spec.{field_name} must be a permutation of " f"range({rank}), got {value}")
+
+    if spec.static is not None and not isinstance(spec.static, bool):
+        raise TypeError(f"{name} tensor_spec.static must be bool or None")
+
+    alignment = spec.ptr_assumed_align
+    if not isinstance(alignment, int) or isinstance(alignment, bool):
+        raise TypeError(f"{name} tensor_spec.ptr_assumed_align must be an integer")
+    if alignment <= 0 or (alignment & (alignment - 1)):
+        raise ValueError(f"{name} tensor_spec.ptr_assumed_align must be a positive power of two")
+
+    divisibility = spec.divisibility
+    if isinstance(divisibility, tuple) and len(divisibility) != rank:
+        raise ValueError(f"{name} tensor_spec.divisibility must have rank {rank}, " f"got {divisibility}")
+    if divisibility is not None and not isinstance(divisibility, (int, tuple)):
+        raise TypeError(f"{name} tensor_spec.divisibility must be an integer, tuple, or None")
+    divisibility_values = divisibility if isinstance(divisibility, tuple) else (divisibility,)
+    if any(value is not None and (not isinstance(value, int) or isinstance(value, bool) or value <= 0) for value in divisibility_values):
+        raise ValueError(f"{name} tensor_spec.divisibility entries must be positive integers " f"or None, got {divisibility}")
 
 
 def _make_initialized_buffer(spec: BufferSpec, jax_numpy: Any) -> Any:
@@ -289,7 +275,7 @@ def _call_cutedsl_with_modules(
     *,
     outputs: Sequence[BufferSpec],
     workspaces: Sequence[BufferSpec] = (),
-    input_layouts: Optional[Sequence[Optional[TensorLayout]]] = None,
+    input_specs: Optional[Sequence[Optional[TensorSpec]]] = None,
     input_output_aliases: Optional[Mapping[int, int]] = None,
     static_args: Optional[Mapping[str, Any]] = None,
     allow_cuda_graph: bool = True,
@@ -325,12 +311,13 @@ def _call_cutedsl_with_modules(
         input_output_aliases=input_output_aliases,
     )
 
-    if input_layouts is None:
-        normalized_input_layouts: Tuple[Optional[TensorLayout], ...] = (None,) * len(inputs)
+    if input_specs is None:
+        normalized_input_specs: Tuple[Optional[TensorSpec], ...] = (None,) * len(inputs)
     else:
-        normalized_input_layouts = tuple(input_layouts)
-        if len(normalized_input_layouts) != len(inputs):
-            raise ValueError(f"Expected {len(inputs)} input layout specs, got " f"{len(normalized_input_layouts)}")
+        normalized_input_specs = tuple(input_specs)
+        if len(normalized_input_specs) != len(inputs):
+            spec_label = "spec" if len(inputs) == 1 else "specs"
+            raise ValueError(f"Expected {len(inputs)} input tensor {spec_label}, got " f"{len(normalized_input_specs)}")
 
     for input_idx, value in enumerate(inputs):
         if not hasattr(value, "shape") or not hasattr(value, "dtype"):
@@ -340,16 +327,22 @@ def _call_cutedsl_with_modules(
                 f"is {type(value).__name__}"
             )
 
-    for input_idx, layout in enumerate(normalized_input_layouts):
-        if layout is None:
-            continue
-        if not isinstance(layout, TensorLayout):
-            raise TypeError(f"Input layout #{input_idx} must be TensorLayout or None, " f"got {type(layout).__name__}")
-        try:
-            input_rank = len(inputs[input_idx].shape)
-        except AttributeError as exc:
-            raise TypeError(f"Input #{input_idx} must expose shape and dtype metadata") from exc
-        layout.validate_rank(input_rank, name=f"input #{input_idx}")
+    tensor_spec_type = cutlass_jax_module.TensorSpec
+    for input_idx, spec in enumerate(normalized_input_specs):
+        _validate_tensor_spec(
+            spec,
+            len(inputs[input_idx].shape),
+            name=f"input #{input_idx}",
+            tensor_spec_type=tensor_spec_type,
+        )
+
+    for result in plan.all_results:
+        _validate_tensor_spec(
+            result.tensor_spec,
+            len(result.shape),
+            name=result.name,
+            tensor_spec_type=tensor_spec_type,
+        )
 
     # Fail before lowering when a requested alias cannot describe the same
     # logical buffer. XLA may still insert a protective copy unless the caller
@@ -371,28 +364,23 @@ def _call_cutedsl_with_modules(
                 f"{output_spec.name} requires "
                 f"{output_spec.shape}/{output_spec.dtype}"
             )
-        input_layout = normalized_input_layouts[input_idx]
-        effective_input_layout = input_layout or TensorLayout()
-        if effective_input_layout != output_spec.tensor_layout:
+        input_spec = normalized_input_specs[input_idx]
+        if input_spec != output_spec.tensor_spec:
             raise ValueError(
                 f"Aliased input #{input_idx} and output {output_spec.name} must "
-                "use identical TensorLayout metadata; CUTLASS compiles the "
+                "use identical TensorSpec metadata; CUTLASS compiles the "
                 "aliased buffer from the input spec"
             )
 
     initialized_buffers = []
-    initialized_layouts = []
+    initialized_specs = []
     for result_idx in plan.initialized_result_indices:
         spec = plan.all_results[result_idx]
         initialized_buffers.append(_make_initialized_buffer(spec, jax_numpy_module))
-        initialized_layouts.append(spec.tensor_layout)
+        initialized_specs.append(spec.tensor_spec)
 
-    def convert_layout(layout: Optional[TensorLayout]) -> Any:
-        return None if layout is None or _is_default_tensor_layout(layout) else _to_cutlass_tensor_spec(layout, cutlass_jax_module)
-
-    cutlass_input_specs = tuple(convert_layout(x) for x in normalized_input_layouts)
-    cutlass_input_specs += tuple(convert_layout(x) for x in initialized_layouts)
-    cutlass_output_specs = tuple(convert_layout(x.tensor_layout) for x in plan.all_results)
+    cutlass_input_specs = normalized_input_specs + tuple(initialized_specs)
+    cutlass_output_specs = tuple(x.tensor_spec for x in plan.all_results)
     result_shape_dtypes = tuple(jax_module.ShapeDtypeStruct(x.shape, x.dtype) for x in plan.all_results)
 
     launcher = _make_launch_adapter(fn, plan)
@@ -425,7 +413,7 @@ def call_cutedsl(
     *,
     outputs: Sequence[BufferSpec],
     workspaces: Sequence[BufferSpec] = (),
-    input_layouts: Optional[Sequence[Optional[TensorLayout]]] = None,
+    input_specs: Optional[Sequence[Optional[TensorSpec]]] = None,
     input_output_aliases: Optional[Mapping[int, int]] = None,
     static_args: Optional[Mapping[str, Any]] = None,
     allow_cuda_graph: bool = True,
@@ -446,8 +434,9 @@ def call_cutedsl(
     ``input_output_aliases`` uses CUTLASS/JAX's ``{input_index: output_index}``
     convention and only addresses public outputs. Inputs must be a flat
     sequence of array-like values; nested pytrees are intentionally outside the
-    FE ABI. An aliased input and output must use identical ``TensorLayout``
-    metadata. The JAX function remains functional: callers should use
+    FE ABI. ``input_specs`` and ``BufferSpec.tensor_spec`` accept native
+    ``cutlass.jax.TensorSpec`` objects. An aliased input and output must use
+    identical tensor metadata. The JAX function remains functional: callers should use
     ``donate_argnums`` when they want XLA to reuse aliased input storage without
     a copy.
     """
@@ -464,7 +453,7 @@ def call_cutedsl(
         inputs,
         outputs=outputs,
         workspaces=workspaces,
-        input_layouts=input_layouts,
+        input_specs=input_specs,
         input_output_aliases=input_output_aliases,
         static_args=static_args,
         allow_cuda_graph=allow_cuda_graph,
@@ -479,6 +468,5 @@ def call_cutedsl(
 __all__ = [
     "BufferInitialization",
     "BufferSpec",
-    "TensorLayout",
     "call_cutedsl",
 ]
