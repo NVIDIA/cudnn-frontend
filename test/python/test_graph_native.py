@@ -78,10 +78,10 @@ class TestNode:
         assert node.outputs["C"] is c
 
     def test_node_params(self):
-        node = Node("conv1", NodeType.CONV_FPROP)
-        node.params["padding"] = [1, 1]
-        node.params["stride"] = [2, 2]
-        assert node.params["padding"] == [1, 1]
+        node = Node("mm1", NodeType.MATMUL)
+        node.params["padding"] = 0.0
+        node.params["alpha"] = 2.0
+        assert node.params["padding"] == 0.0
 
     def test_node_repr(self):
         node = Node("mm1", NodeType.MATMUL)
@@ -274,16 +274,6 @@ class TestNativeGraph:
         node = g.get_node("mm1")
         assert node.name == "mm1"
         assert g.get_node("nonexistent") is None
-
-    def test_conv_fprop(self):
-        g = NativeGraph()
-        X = g.tensor(dim=[1, 3, 32, 32], name="X")
-        W = g.tensor(dim=[16, 3, 3, 3], name="W")
-        Y = g.conv_fprop(X, W, padding=[1, 1], stride=[1, 1], dilation=[1, 1], name="conv1")
-
-        assert g.nodes[0].node_type == NodeType.CONV_FPROP
-        assert g.nodes[0].params["pre_padding"] == [1, 1]
-        assert g.nodes[0].params["stride"] == [1, 1]
 
     def test_sdpa_inference(self):
         """Test SDPA forward inference mode."""

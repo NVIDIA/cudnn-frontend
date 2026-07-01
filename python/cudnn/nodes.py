@@ -19,7 +19,7 @@ class Node:
 
     Attributes:
         name: Operation name
-        node_type: Type of operation (MATMUL, CONV_FPROP, POINTWISE, etc.)
+        node_type: Type of operation (MATMUL, POINTWISE, SDPA, etc.)
         inputs: Dict mapping port names to input Tensor
         outputs: Dict mapping port names to output Tensor
         params: Dict of operation-specific parameters (padding, stride, mode, etc.)
@@ -65,10 +65,6 @@ class Node:
         # Operation-specific inference
         if self.node_type == NodeType.MATMUL:
             self._infer_matmul()
-        elif self.node_type == NodeType.CONV_FPROP:
-            self._infer_conv_fprop()
-        elif self.node_type == NodeType.CONV_DGRAD:
-            self._infer_conv_dgrad()
         elif self.node_type == NodeType.POINTWISE:
             self._infer_pointwise()
         elif self.node_type == NodeType.SDPA:
@@ -117,66 +113,6 @@ class Node:
 
         if not c.stride and c.dim:
             c.stride = _row_major_stride(c.dim)
-
-    def _infer_conv_fprop(self) -> None:
-        """Infer output dims for convolution."""
-        x = self.inputs.get("X")
-        w = self.inputs.get("W")
-        y = self.outputs.get("Y")
-
-        if not (x and w and y):
-            return
-
-        if not y.dim and x.dim and w.dim:
-            pre_pad = self.params.get("pre_padding", [0] * (len(x.dim) - 2))
-            post_pad = self.params.get("post_padding", [0] * (len(x.dim) - 2))
-            stride = self.params.get("stride", [1] * (len(x.dim) - 2))
-            dilation = self.params.get("dilation", [1] * (len(x.dim) - 2))
-
-            y_dim = [0] * len(x.dim)
-            y_dim[0] = x.dim[0]  # N
-            y_dim[1] = w.dim[0]  # K
-
-            for i in range(2, len(x.dim)):
-                idx = i - 2
-                eff_filter = (w.dim[i] - 1) * dilation[idx] + 1
-                y_dim[i] = (x.dim[i] + pre_pad[idx] + post_pad[idx] - eff_filter) // stride[idx] + 1
-
-            y.dim = y_dim
-
-        if not y.stride and y.dim:
-            y.stride = _row_major_stride(y.dim)
-
-    def _infer_conv_dgrad(self) -> None:
-        """Infer output dims for conv data gradient."""
-        dy = self.inputs.get("DY")
-        w = self.inputs.get("W")
-        dx = self.outputs.get("DX")
-
-        if not (dy and w and dx):
-            return
-
-        if not dx.dim and dy.dim and w.dim:
-            pre_pad = self.params.get("pre_padding", [0] * (len(dy.dim) - 2))
-            post_pad = self.params.get("post_padding", [0] * (len(dy.dim) - 2))
-            stride = self.params.get("stride", [1] * (len(dy.dim) - 2))
-            dilation = self.params.get("dilation", [1] * (len(dy.dim) - 2))
-
-            # Reverse of conv_fprop: compute input size from output size
-            dx_dim = [0] * len(dy.dim)
-            dx_dim[0] = dy.dim[0]  # N
-            dx_dim[1] = w.dim[1]  # C (input channels from filter)
-
-            for i in range(2, len(dy.dim)):
-                idx = i - 2
-                eff_filter = (w.dim[i] - 1) * dilation[idx] + 1
-                # x_dim[i] = (y_dim[i] - 1) * stride + eff_filter - pre_pad - post_pad
-                dx_dim[i] = (dy.dim[i] - 1) * stride[idx] + eff_filter - pre_pad[idx] - post_pad[idx]
-
-            dx.dim = dx_dim
-
-        if not dx.stride and dx.dim:
-            dx.stride = _row_major_stride(dx.dim)
 
     def _infer_pointwise(self) -> None:
         """Infer output dims for pointwise (broadcast inputs)."""

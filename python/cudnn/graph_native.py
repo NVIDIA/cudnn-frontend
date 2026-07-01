@@ -240,76 +240,6 @@ class NativeGraph:
         self._nodes.append(node)
         return C
 
-    def conv_fprop(
-        self,
-        X: Any,
-        W: Any,
-        padding: Optional[List[int]] = None,
-        pre_padding: Optional[List[int]] = None,
-        post_padding: Optional[List[int]] = None,
-        stride: Optional[List[int]] = None,
-        dilation: Optional[List[int]] = None,
-        compute_data_type: Any = None,
-        name: str = "",
-    ) -> Tensor:
-        """Convolution: Y = conv(X, W)."""
-        name = self._get_name("conv_fprop", name)
-        X = self._ensure_tensor(X, name=f"{name}::X")
-        W = self._ensure_tensor(W, name=f"{name}::W")
-        ndim = len(X.dim) - 2 if X.dim else 2
-
-        if padding is not None:
-            pre_padding = post_padding = padding
-        pre_padding = pre_padding or [0] * ndim
-        post_padding = post_padding or [0] * ndim
-        stride = stride or [1] * ndim
-        dilation = dilation or [1] * ndim
-
-        node = Node(name, NodeType.CONV_FPROP, compute_data_type or self._context.compute_data_type)
-        node.inputs["X"] = X
-        node.inputs["W"] = W
-        node.params.update(pre_padding=pre_padding, post_padding=post_padding, stride=stride, dilation=dilation)
-
-        Y = self._make_output(f"{name}::Y")
-        node.outputs["Y"] = Y
-        self._register_tensor(Y)
-
-        self._nodes.append(node)
-        return Y
-
-    def conv_dgrad(
-        self,
-        DY: Any,
-        W: Any,
-        padding: Optional[List[int]] = None,
-        stride: Optional[List[int]] = None,
-        dilation: Optional[List[int]] = None,
-        compute_data_type: Any = None,
-        name: str = "",
-    ) -> Tensor:
-        """Convolution data gradient."""
-        name = self._get_name("conv_dgrad", name)
-        DY = self._ensure_tensor(DY, name=f"{name}::DY")
-        W = self._ensure_tensor(W, name=f"{name}::W")
-        ndim = len(DY.dim) - 2 if DY.dim else 2
-
-        node = Node(name, NodeType.CONV_DGRAD, compute_data_type or self._context.compute_data_type)
-        node.inputs["DY"] = DY
-        node.inputs["W"] = W
-        node.params.update(
-            pre_padding=padding or [0] * ndim,
-            post_padding=padding or [0] * ndim,
-            stride=stride or [1] * ndim,
-            dilation=dilation or [1] * ndim,
-        )
-
-        DX = self._make_output(f"{name}::DX")
-        node.outputs["DX"] = DX
-        self._register_tensor(DX)
-
-        self._nodes.append(node)
-        return DX
-
     def _pointwise(self, mode: Any, inputs: list, name: str, compute_data_type: Any = None) -> Tensor:
         """Internal helper for pointwise ops."""
         inputs = [self._ensure_tensor(t, name=f"{name}::IN_{i}") for i, t in enumerate(inputs)]
@@ -1001,28 +931,6 @@ class NativeGraph:
                     B=tensor_map[node.inputs["B"].uid],
                     compute_data_type=node.compute_data_type,
                     padding=node.params.get("padding", 0.0),
-                    name=node.name,
-                )
-            elif node.node_type == NodeType.CONV_FPROP:
-                cpp_out = graph.conv_fprop(
-                    image=tensor_map[node.inputs["X"].uid],
-                    weight=tensor_map[node.inputs["W"].uid],
-                    pre_padding=node.params["pre_padding"],
-                    post_padding=node.params["post_padding"],
-                    stride=node.params["stride"],
-                    dilation=node.params["dilation"],
-                    compute_data_type=node.compute_data_type,
-                    name=node.name,
-                )
-            elif node.node_type == NodeType.CONV_DGRAD:
-                cpp_out = graph.conv_dgrad(
-                    loss=tensor_map[node.inputs["DY"].uid],
-                    filter=tensor_map[node.inputs["W"].uid],
-                    pre_padding=node.params["pre_padding"],
-                    post_padding=node.params["post_padding"],
-                    stride=node.params["stride"],
-                    dilation=node.params["dilation"],
-                    compute_data_type=node.compute_data_type,
                     name=node.name,
                 )
             elif node.node_type == NodeType.POINTWISE:

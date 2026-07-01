@@ -16,9 +16,6 @@ class NodeType(Enum):
     # needed, following the block-scale / MoE / reduction examples (enum entry
     # here + a builder in graph_native + inference in nodes + lowering).
     COMPOSITE = auto()
-    CONV_DGRAD = auto()
-    CONV_FPROP = auto()
-    CONV_WGRAD = auto()
     MATMUL = auto()
     MATMUL_FP8 = auto()
     POINTWISE = auto()
