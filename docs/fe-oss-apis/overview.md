@@ -47,6 +47,10 @@ This optional dependency set requires Python 3.11 or newer, matching the JAX
 CUDA package requirement; the base frontend package retains its broader Python
 support.
 
+Importing `cudnn` does not load JAX or CuTe DSL. Importing `cudnn.jax` is the
+explicit opt-in boundary and loads the dependencies supplied by the `jax`
+extra.
+
 ## API Usage
 
 PyTorch remains the default FE-OSS interface and preserves its existing

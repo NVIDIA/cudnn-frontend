@@ -1,45 +1,43 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Optional JAX integration for frontend-only CuTe DSL operations."""
+"""Optional JAX integration for frontend-only CuTe DSL operations.
+
+Importing this namespace is the explicit opt-in boundary for the JAX optional
+dependencies. The base :mod:`cudnn` package does not import JAX or CuTe DSL.
+"""
 
 from importlib import import_module
-from typing import Any
-
-_SYMBOLS = {
-    "IndexerForwardResult": (".indexer_forward", "IndexerForwardResult"),
-    "IndexerTopKResult": (".indexer_top_k", "IndexerTopKResult"),
-    "RmsNormRhtAmaxResult": (".rmsnorm_rht_amax", "RmsNormRhtAmaxResult"),
-    "indexer_forward_wrapper": (".indexer_forward", "indexer_forward_wrapper"),
-    "indexer_top_k_wrapper": (".indexer_top_k", "indexer_top_k_wrapper"),
-    "rmsnorm_rht_amax_sm100": (".rmsnorm_rht_amax", "rmsnorm_rht_amax_sm100"),
-}
-_DSA_SYMBOLS = frozenset(("indexer_forward_wrapper", "indexer_top_k_wrapper"))
+from types import SimpleNamespace
 
 
-def _load_symbol(name: str) -> Any:
-    module_name, symbol_name = _SYMBOLS[name]
-    module = import_module(module_name, package=__name__)
-    symbol = getattr(module, symbol_name)
-    globals()[name] = symbol
-    return symbol
+try:
+    import_module("jax")
+    import_module("cutlass.jax")
+except ModuleNotFoundError as exc:
+    if exc.name in {"jax", "cutlass", "cutlass.jax"}:
+        raise ImportError(
+            "cudnn.jax requires the JAX optional dependencies; install them "
+            "with 'pip install nvidia-cudnn-frontend[jax]'"
+        ) from exc
+    raise
+
+from .indexer_forward import IndexerForwardResult, indexer_forward_wrapper
+from .indexer_top_k import IndexerTopKResult, indexer_top_k_wrapper
+from .rmsnorm_rht_amax import RmsNormRhtAmaxResult, rmsnorm_rht_amax_sm100
 
 
-def __getattr__(name: str) -> Any:
-    if name in _SYMBOLS:
-        return _load_symbol(name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+DSA = SimpleNamespace(
+    indexer_forward_wrapper=indexer_forward_wrapper,
+    indexer_top_k_wrapper=indexer_top_k_wrapper,
+)
 
-
-class _DSANamespace:
-    """JAX counterparts of the existing ``cudnn.DSA`` wrapper names."""
-
-    def __getattr__(self, name: str) -> Any:
-        if name in _DSA_SYMBOLS:
-            return _load_symbol(name)
-        raise AttributeError(f"JAX DSA has no attribute {name!r}")
-
-
-DSA = _DSANamespace()
-
-__all__ = ["DSA", *_SYMBOLS]
+__all__ = [
+    "DSA",
+    "IndexerForwardResult",
+    "IndexerTopKResult",
+    "RmsNormRhtAmaxResult",
+    "indexer_forward_wrapper",
+    "indexer_top_k_wrapper",
+    "rmsnorm_rht_amax_sm100",
+]

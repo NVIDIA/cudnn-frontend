@@ -12,6 +12,7 @@ import re
 import sys
 import types
 import unittest
+from unittest import mock
 
 try:
     import pytest
@@ -33,45 +34,93 @@ class JaxApiSurfaceTest(unittest.TestCase):
             if module_name == _TEST_PACKAGE or module_name.startswith(f"{_TEST_PACKAGE}."):
                 sys.modules.pop(module_name, None)
 
-    def test_optional_namespace_does_not_import_frameworks(self):
+    def _optional_modules(self):
+        fake_jnp = types.ModuleType("jax.numpy")
+        fake_jax = types.ModuleType("jax")
+        fake_jax.__path__ = []
+        fake_jax.numpy = fake_jnp
+
+        fake_cutlass_jax = types.ModuleType("cutlass.jax")
+        fake_cutlass_jax.TensorSpec = type("TensorSpec", (), {})
+        fake_cutlass_jax.jax_to_cutlass_dtype = lambda dtype: dtype
+        fake_cutlass = types.ModuleType("cutlass")
+        fake_cutlass.__path__ = []
+        fake_cutlass.jax = fake_cutlass_jax
+
+        return mock.patch.dict(
+            sys.modules,
+            {
+                "jax": fake_jax,
+                "jax.numpy": fake_jnp,
+                "cutlass": fake_cutlass,
+                "cutlass.jax": fake_cutlass_jax,
+            },
+        )
+
+    def test_explicit_namespace_loads_jax_without_torch(self):
         parent = types.ModuleType(_TEST_PACKAGE)
         parent.__path__ = [str(_CUDNN_ROOT)]
         parent.__package__ = _TEST_PACKAGE
         sys.modules[_TEST_PACKAGE] = parent
 
-        optional_roots = ("jax", "cutlass", "torch")
-        before = {name for name in sys.modules if name.split(".", 1)[0] in optional_roots}
+        torch_before = {name for name in sys.modules if name.split(".", 1)[0] == "torch"}
+        with self._optional_modules():
+            jax_namespace = importlib.import_module(f"{_TEST_PACKAGE}.jax")
 
-        jax_namespace = importlib.import_module(f"{_TEST_PACKAGE}.jax")
+            self.assertTrue(callable(jax_namespace.rmsnorm_rht_amax_sm100))
+            self.assertTrue(callable(jax_namespace.indexer_forward_wrapper))
+            self.assertTrue(callable(jax_namespace.indexer_top_k_wrapper))
+            self.assertIs(
+                jax_namespace.DSA.indexer_forward_wrapper,
+                jax_namespace.indexer_forward_wrapper,
+            )
+            self.assertIs(jax_namespace.DSA.indexer_top_k_wrapper, jax_namespace.indexer_top_k_wrapper)
+            self.assertEqual(jax_namespace.RmsNormRhtAmaxResult._fields, ("output", "amax"))
+            self.assertEqual(jax_namespace.IndexerForwardResult._fields, ("scores",))
+            self.assertEqual(jax_namespace.IndexerTopKResult._fields, ("indices", "values"))
+            self.assertEqual(
+                jax_namespace.__all__,
+                [
+                    "DSA",
+                    "IndexerForwardResult",
+                    "IndexerTopKResult",
+                    "RmsNormRhtAmaxResult",
+                    "indexer_forward_wrapper",
+                    "indexer_top_k_wrapper",
+                    "rmsnorm_rht_amax_sm100",
+                ],
+            )
 
-        after = {name for name in sys.modules if name.split(".", 1)[0] in optional_roots}
-        self.assertEqual(after - before, set())
-        self.assertTrue(callable(jax_namespace.rmsnorm_rht_amax_sm100))
-        self.assertTrue(callable(jax_namespace.indexer_forward_wrapper))
-        self.assertTrue(callable(jax_namespace.indexer_top_k_wrapper))
-        self.assertIs(
-            jax_namespace.DSA.indexer_forward_wrapper,
-            jax_namespace.indexer_forward_wrapper,
-        )
-        self.assertIs(jax_namespace.DSA.indexer_top_k_wrapper, jax_namespace.indexer_top_k_wrapper)
-        self.assertEqual(jax_namespace.RmsNormRhtAmaxResult._fields, ("output", "amax"))
-        self.assertEqual(jax_namespace.IndexerForwardResult._fields, ("scores",))
-        self.assertEqual(jax_namespace.IndexerTopKResult._fields, ("indices", "values"))
-        self.assertEqual(
-            jax_namespace.__all__,
-            [
-                "DSA",
-                "IndexerForwardResult",
-                "IndexerTopKResult",
-                "RmsNormRhtAmaxResult",
-                "indexer_forward_wrapper",
-                "indexer_top_k_wrapper",
-                "rmsnorm_rht_amax_sm100",
-            ],
-        )
+            torch_after = {name for name in sys.modules if name.split(".", 1)[0] == "torch"}
+            self.assertEqual(torch_after - torch_before, set())
 
-        after_symbol_load = {name for name in sys.modules if name.split(".", 1)[0] in optional_roots}
-        self.assertEqual(after_symbol_load - before, set())
+    def test_missing_dependency_reports_optional_extra(self):
+        missing_modules = {
+            "jax": {"jax": None},
+            "cutlass": {
+                "jax": types.ModuleType("jax"),
+                "cutlass": None,
+                "cutlass.jax": None,
+            },
+        }
+        for dependency, blocked_modules in missing_modules.items():
+            with self.subTest(dependency=dependency):
+                package_name = f"{_TEST_PACKAGE}_missing_{dependency}"
+                parent = types.ModuleType(package_name)
+                parent.__path__ = [str(_CUDNN_ROOT)]
+                parent.__package__ = package_name
+                sys.modules[package_name] = parent
+
+                try:
+                    with (
+                        mock.patch.dict(sys.modules, blocked_modules),
+                        self.assertRaisesRegex(ImportError, r"nvidia-cudnn-frontend\[jax\]"),
+                    ):
+                        importlib.import_module(f"{package_name}.jax")
+                finally:
+                    for module_name in tuple(sys.modules):
+                        if module_name == package_name or module_name.startswith(f"{package_name}."):
+                            sys.modules.pop(module_name, None)
 
     def test_torch_function_remains_a_lazy_top_level_export(self):
         top_level_tree = ast.parse(

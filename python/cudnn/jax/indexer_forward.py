@@ -8,6 +8,9 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, NamedTuple, Optional
 
+import jax.numpy as jnp
+from cutlass.jax import TensorSpec
+
 from .cutedsl import BufferSpec, call_cutedsl
 
 _TMA_ALIGN_ELEMENTS = 4
@@ -34,7 +37,7 @@ def _make_launcher(
     max_seqlen_k: int,
     sm_scale: float,
 ):
-    # Keep optional CuTe DSL and kernel imports off the cudnn.jax import path.
+    # Load the configuration-specific kernel only when tracing the operation.
     from cutlass import Float32, Int32
 
     from ..deepseek_sparse_attention.indexer_forward.indexer_fwd_sm100 import (
@@ -122,15 +125,6 @@ def indexer_forward_wrapper(
     wrapper therefore initializes its XLA-owned output storage to ``-inf``
     before launching the kernel.
     """
-
-    try:
-        import jax.numpy as jnp
-        from cutlass.jax import TensorSpec
-    except ImportError as exc:
-        raise ImportError(
-            "indexer_forward_wrapper requires JAX and the CuTe DSL JAX "
-            "integration; install the 'jax' optional dependencies"
-        ) from exc
 
     if q.ndim != 4:
         raise ValueError(f"q must have rank 4 (B, S_q, H_q, D), got {q.shape}")

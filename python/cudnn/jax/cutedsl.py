@@ -23,10 +23,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
-if TYPE_CHECKING:
-    from cutlass.jax import TensorSpec
+import jax
+import jax.numpy as jnp
+import cutlass.jax as cutlass_jax
+from cutlass.jax import TensorSpec
 
 
 @dataclass(frozen=True)
@@ -301,13 +303,6 @@ def call_cutedsl(
     passed as internal aliased inputs so the public JAX function remains
     functional.
     """
-
-    try:
-        import jax
-        import jax.numpy as jnp
-        import cutlass.jax as cutlass_jax
-    except ImportError as exc:
-        raise ImportError("cudnn.jax requires JAX and the CuTe DSL JAX integration; install " "the 'jax' optional dependencies") from exc
 
     return _call_cutedsl_with_modules(
         fn,

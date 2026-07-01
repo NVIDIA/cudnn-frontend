@@ -75,13 +75,6 @@ class _TensorSpec:
 class JaxDsaContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        parent = types.ModuleType(_TEST_PACKAGE)
-        parent.__path__ = [str(_CUDNN_ROOT)]
-        parent.__package__ = _TEST_PACKAGE
-        sys.modules[_TEST_PACKAGE] = parent
-        cls.forward = importlib.import_module(f"{_TEST_PACKAGE}.jax.indexer_forward")
-        cls.top_k = importlib.import_module(f"{_TEST_PACKAGE}.jax.indexer_top_k")
-
         cls.bfloat16 = _DType("bfloat16", 2)
         cls.float16 = _DType("float16", 2)
         cls.float32 = _DType("float32", 4)
@@ -103,6 +96,24 @@ class JaxDsaContractTest(unittest.TestCase):
         cls.fake_cutlass_jax = types.ModuleType("cutlass.jax")
         cls.fake_cutlass_jax.TensorSpec = _TensorSpec
         cls.fake_cutlass_jax.jax_to_cutlass_dtype = lambda dtype: f"cutlass.{dtype.name}"
+        cls.fake_cutlass.jax = cls.fake_cutlass_jax
+
+        parent = types.ModuleType(_TEST_PACKAGE)
+        parent.__path__ = [str(_CUDNN_ROOT)]
+        parent.__package__ = _TEST_PACKAGE
+        sys.modules[_TEST_PACKAGE] = parent
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "jax": cls.fake_jax,
+                "jax.numpy": cls.fake_jnp,
+                "cutlass": cls.fake_cutlass,
+                "cutlass.jax": cls.fake_cutlass_jax,
+            },
+        ):
+            importlib.import_module(f"{_TEST_PACKAGE}.jax")
+            cls.forward = importlib.import_module(f"{_TEST_PACKAGE}.jax.indexer_forward")
+            cls.top_k = importlib.import_module(f"{_TEST_PACKAGE}.jax.indexer_top_k")
 
     @classmethod
     def tearDownClass(cls):

@@ -64,7 +64,9 @@ To add a new frontend-only API:
    update JAX. Static lint or LLM review may report likely gaps or drift, but is
    advisory rather than a public API contract or merge gate.
 7. Keep PyTorch exports in `cudnn` and expose JAX only from `cudnn.jax`.
-   Register JAX dependencies only in the optional extra.
+   Register JAX dependencies only in the optional extra. The explicit
+   `cudnn.jax` import is the dependency boundary; individual operator calls do
+   not probe dependency availability.
 
 Do not use tensor-type dispatch or a traced `target=` argument. JAX does not
 emulate the mutable `APIBase.compile()` / `execute()` lifecycle, and adding or

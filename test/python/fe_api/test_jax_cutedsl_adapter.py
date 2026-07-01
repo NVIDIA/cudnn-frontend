@@ -9,7 +9,9 @@ from dataclasses import dataclass
 import importlib.util
 from pathlib import Path
 import sys
+import types
 import unittest
+from unittest import mock
 
 try:
     import pytest
@@ -25,7 +27,26 @@ _SPEC = importlib.util.spec_from_file_location("cudnn_jax_cutedsl_poc", _MODULE_
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
-_SPEC.loader.exec_module(_MODULE)
+
+_bootstrap_jnp = types.ModuleType("jax.numpy")
+_bootstrap_jax = types.ModuleType("jax")
+_bootstrap_jax.__path__ = []
+_bootstrap_jax.numpy = _bootstrap_jnp
+_bootstrap_cutlass_jax = types.ModuleType("cutlass.jax")
+_bootstrap_cutlass_jax.TensorSpec = type("TensorSpec", (), {})
+_bootstrap_cutlass = types.ModuleType("cutlass")
+_bootstrap_cutlass.__path__ = []
+_bootstrap_cutlass.jax = _bootstrap_cutlass_jax
+with mock.patch.dict(
+    sys.modules,
+    {
+        "jax": _bootstrap_jax,
+        "jax.numpy": _bootstrap_jnp,
+        "cutlass": _bootstrap_cutlass,
+        "cutlass.jax": _bootstrap_cutlass_jax,
+    },
+):
+    _SPEC.loader.exec_module(_MODULE)
 
 BufferSpec = _MODULE.BufferSpec
 _call_cutedsl_with_modules = _MODULE._call_cutedsl_with_modules

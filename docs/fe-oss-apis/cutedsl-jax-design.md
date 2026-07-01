@@ -284,7 +284,9 @@ Each wrapper:
 
 Do not dispatch implicitly by checking whether an argument is a Torch tensor or
 a JAX tracer. Namespace selection happens before tracing, and imports inside the
-JAX implementation keep optional dependencies off the base/Torch path.
+JAX namespace keep optional dependencies off the base/Torch path. Importing
+`cudnn.jax` loads JAX and `cutlass.jax` once; configuration-specific kernel
+implementations remain deferred until an operation is traced.
 
 ### 4. Future C++ graph adapter
 
@@ -656,8 +658,9 @@ sides of that boundary.
     above the kernel's INT32 indexing limit rather than host-chunking the call.
 - CPU-only adapter contract tests cover hidden workspace, initialization,
   layout passthrough, and invalid call plans.
-- Dependency-free smoke tests cover the optional JAX namespace, lazy framework
-  imports, the PyTorch functional export, and packaging metadata.
+- Dependency-free contract tests use lightweight module stand-ins to cover the
+  explicit JAX namespace dependency boundary, the PyTorch functional export,
+  and packaging metadata without importing PyTorch.
 - The RMSNorm and DSA tests cover `eval_shape`; their GPU cases inspect
   StableHLO custom calls and compare numerical JAX references when JAX, CuTe
   DSL, CUDA, and SM100 are available. The RMSNorm and Indexer Forward cases

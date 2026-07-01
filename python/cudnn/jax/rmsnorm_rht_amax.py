@@ -8,6 +8,9 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, NamedTuple, Optional
 
+import jax.numpy as jnp
+from cutlass.jax import TensorSpec
+
 from .._rmsnorm_rht_amax_config import resolve_launch_config
 
 from .cutedsl import BufferSpec, call_cutedsl
@@ -27,7 +30,7 @@ def _make_launcher(
     rows_per_cta: int,
     eps: float,
 ):
-    # Keep optional CuTe DSL imports off the cudnn.jax import path.
+    # Load the configuration-specific kernel only when tracing the operation.
     from cutlass import Float32
     from ..rmsnorm_rht_amax.kernel import RMSNormRHTAmaxKernel
 
@@ -66,12 +69,6 @@ def rmsnorm_rht_amax_sm100(
     Returns ``(output, amax)`` with shapes ``(M, N)`` and
     ``(M // rows_per_cta,)`` respectively.
     """
-
-    try:
-        import jax.numpy as jnp
-        from cutlass.jax import TensorSpec
-    except ImportError as exc:
-        raise ImportError("rmsnorm_rht_amax_sm100 requires JAX and the CuTe DSL JAX " "integration; install the 'jax' optional dependencies") from exc
 
     if x.ndim != 2:
         raise ValueError(f"x must have rank 2, got shape {x.shape}")

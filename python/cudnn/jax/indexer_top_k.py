@@ -8,6 +8,9 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, NamedTuple
 
+import jax.numpy as jnp
+from cutlass.jax import jax_to_cutlass_dtype
+
 from .cutedsl import BufferSpec, call_cutedsl
 
 _INT32_MAX = (1 << 31) - 1
@@ -30,7 +33,7 @@ def _make_launcher(
     num_copy_bits: int,
     large_occupancy: bool,
 ):
-    # Keep the optional kernel import off the cudnn.jax import path.
+    # Load the configuration-specific kernel only when tracing the operation.
     from ..deepseek_sparse_attention.indexer_top_k.indexer_top_k_decode_varlen import (
         IndexerTopKKernelVarlenDecode,
         _bucket_num_cols,
@@ -116,15 +119,6 @@ def indexer_top_k_wrapper(
     proof of concept supports the kernel's single-launch path and always
     returns both indices and values.
     """
-
-    try:
-        import jax.numpy as jnp
-        from cutlass.jax import jax_to_cutlass_dtype
-    except ImportError as exc:
-        raise ImportError(
-            "indexer_top_k_wrapper requires JAX and the CuTe DSL JAX "
-            "integration; install the 'jax' optional dependencies"
-        ) from exc
 
     if not return_val:
         raise NotImplementedError(
