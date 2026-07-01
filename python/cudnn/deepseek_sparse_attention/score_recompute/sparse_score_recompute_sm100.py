@@ -1,5 +1,5 @@
 """
-Sparse Score Recompute Kernel — SM100 Cute-DSL Implementation.
+Sparse Backward Score Kernel — SM100 Cute-DSL Implementation.
 
 Dual-mode kernel controlled by score_type ("indexer" or "attention"):
 
@@ -50,7 +50,7 @@ from cutlass.utils.blackwell_helpers import (
 )
 
 from cudnn.deepseek_sparse_attention.utils.sm100.gemm import gemm_ptx_partial as _gemm_ptx_partial
-from cudnn.deepseek_sparse_attention.utils import copy as copy_ops
+from cudnn.deepseek_sparse_attention.utils import copy as copy_utils
 
 mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
 add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd="rn")
@@ -206,7 +206,7 @@ class SparseScoreRecomputeSm100:
         self,
         mQ: cute.Tensor,  # (bs, seqlen_q, n_heads_q, head_dim) BF16
         mK: cute.Tensor,  # (bs, seqlen_k, head_dim) BF16
-        mPerHead: cute.Tensor,  # (bs, seqlen_q, n_heads_q) — W (BF16) or scaled_LSE (FP32)
+        mPerHead: cute.Tensor,  # (bs, seqlen_q, n_heads_q) — W (BF16) or LSE (FP32)
         mTopkIdx: cute.Tensor,  # (bs, seqlen_q, topk) INT32
         mOut: cute.Tensor,  # (bs, seqlen_q, topk) FP32
         mTopkLength: cute.Tensor,  # (bs, seqlen_q) INT32 (dummy when unused)
@@ -352,6 +352,7 @@ class SparseScoreRecomputeSm100:
         seqlen_k = cute.size(mK.shape[0])
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx = cute.arch.thread_idx()[0]
+        neg_log2_e = Float32(-math.log2(math.e))
 
         # --- TMA descriptor prefetch ---
         if warp_idx == 0:
@@ -520,7 +521,11 @@ class SparseScoreRecomputeSm100:
                             m_idx = m_packed_idx // self.qhead_per_kvhead
                             h_idx = m_packed_idx - m_idx * self.qhead_per_kvhead
                             if m_idx < seqlen_q_load:
-                                sPerHead[per_head_buf_off + row] = mPerHead[m_idx, h_idx, batch_idx]
+                                per_head_value = mPerHead[m_idx, h_idx, batch_idx]
+                                if cutlass.const_expr(self.score_type == "attention"):
+                                    sPerHead[per_head_buf_off + row] = Float32(per_head_value) * neg_log2_e
+                                else:
+                                    sPerHead[per_head_buf_off + row] = per_head_value
                             else:
                                 sPerHead[per_head_buf_off + row] = self.per_head_dtype(0)
 
@@ -547,7 +552,7 @@ class SparseScoreRecomputeSm100:
                             (m_block, _kc),
                         )
                         sQ_cur = sQ[None, None, None, _kc]
-                        load_Q_fn, _, _ = copy_ops.tma_get_copy_fn(
+                        load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
                             tma_atom_Q,
                             0,
                             cute.make_layout(1),
@@ -952,7 +957,7 @@ class SparseScoreRecomputeSm100:
         public global KV ids (``b * seqlen_k + local``); we decode back to
         local-per-batch before indexing into mK ``(seqlen_k, head_dim, bs)``.
         With the flag False, ids are already local (legacy callers — e.g.
-        ``indexer_backward``'s grad path that still expects local).
+        ``indexer_bwd``'s grad path that still expects local).
         """
         NUM_GROUPS = const_expr(self.WARPGROUP_SIZE // 8)
         ROWS_PER_GROUP = const_expr(self.n_block_size // NUM_GROUPS)
@@ -1387,6 +1392,7 @@ class SparseScoreRecomputeSm100:
         for _ri in cutlass.range_constexpr(self.num_n_blocks):
             n_blk = self.num_n_blocks - 1 - _ri
             _slot = const_expr(n_blk % self.num_tmem_slots)
+
             cute.arch.mbarrier_wait(S_mbar_ptr + 2 * _slot, s_full_phase)
             if const_expr(_ri == 0):
                 cute.autovec_copy(sLSE_1d, rLSE_all)
@@ -1563,6 +1569,7 @@ class SparseScoreRecomputeSm100:
         for _ri in cutlass.range_constexpr(self.num_n_blocks):
             n_blk = self.num_n_blocks - 1 - _ri
             _slot = const_expr(n_blk % self.num_tmem_slots)
+
             cute.arch.mbarrier_wait(S_mbar_ptr + 2 * _slot, s_full_phase)
             if const_expr(_ri == 0):
                 cute.autovec_copy(tSsLSE, tSrLSE)

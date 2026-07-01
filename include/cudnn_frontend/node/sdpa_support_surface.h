@@ -459,6 +459,16 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 allowed_input_msg += ", CU_SEQ_LEN_Q, CU_SEQ_LEN_KV";
             }
 
+            if (effective_cudnn_ver >= 93000) {
+                allowed_input_names.insert({input_names::Descale_Q,
+                                            input_names::Descale_K,
+                                            input_names::Descale_V,
+                                            input_names::Descale_S,
+                                            input_names::Scale_S,
+                                            input_names::Scale_O});
+                allowed_input_msg += ", Descale_Q, Descale_K, Descale_V, Descale_S, Scale_S, Scale_O";
+            }
+
             for (const auto& [key, value] : inputs) {
                 if (allowed_input_names.find(key) == allowed_input_names.end() && value != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED, allowed_input_msg};
@@ -472,6 +482,11 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
             if (effective_cudnn_ver >= 92100) {
                 allowed_output_names.insert({output_names::RNG_DUMP, output_names::Max, output_names::Sum_exp});
                 allowed_output_msg += ", RNG_DUMP, Max, Sum_exp";
+            }
+
+            if (effective_cudnn_ver >= 93000) {
+                allowed_output_names.insert({output_names::Amax_S, output_names::Amax_O});
+                allowed_output_msg += ", Amax_S, Amax_O";
             }
 
             for (const auto& [key, value] : outputs) {
@@ -521,15 +536,13 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                         "Attention score modifier for unified SDPA node requires cuDNN 9.21.0 or above"};
             }
 
-            if (mma_core_mode != DataType_t::HALF) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA node doesn't yet support a data type other than fp16/bf16"};
-            }
-
-            if ((compute_data_type != DataType_t::NOT_SET && compute_data_type != DataType_t::FLOAT) ||
-                context.get_compute_data_type() != DataType_t::FLOAT) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA node doesn't yet support compute data type other than float"};
+            if (mma_core_mode == DataType_t::FP8_E4M3 || mma_core_mode == DataType_t::FP8_E5M2) {
+                // Per-tensor FP8 and MXFP8 (block-scaled, E8M0 descales) are supported by the
+                // unified node starting from cuDNN 9.30.0.
+                if (effective_cudnn_ver < 93000) {
+                    return {error_code_t::GRAPH_NOT_SUPPORTED,
+                            "FP8/MXFP8 for the unified SDPA node requires cuDNN 9.30.0 or above"};
+                }
             }
         } break;
     }

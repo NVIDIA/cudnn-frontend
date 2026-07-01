@@ -2641,6 +2641,53 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
 #endif
         }
 
+        // FP8 per-tensor scaling attributes (descale Q/K/V/S, scale S/O inputs; amax S/O outputs).
+        if (attributes.mma_core_mode == DataType_t::FP8_E4M3 || attributes.mma_core_mode == DataType_t::FP8_E5M2) {
+            auto fp8_cudnn_ver_error =
+                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "FP8/MXFP8 for the unified SDPA node requires cuDNN 9.30.0"};
+#if (CUDNN_VERSION >= 93000)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(93000, fp8_cudnn_ver_error);
+
+            // Wire an optional FP8 scaling/descaling tensor (from either the input or output map) to
+            // its backend descriptor, no-op if the caller did not provide it.
+            auto set_fp8_desc = [&](auto const& tensor_map, auto name, cudnnBackendAttributeName_t attr) -> error_t {
+                auto it = tensor_map.find(name);
+                if (it != tensor_map.end() && it->second != nullptr) {
+                    auto backend_desc = tensors[it->second->get_uid()]->get_desc()->get_backend_descriptor();
+                    _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                                   attr,
+                                                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                                   1,
+                                                                   &backend_desc));
+                }
+                return {error_code_t::OK, ""};
+            };
+
+            CHECK_CUDNN_FRONTEND_ERROR(set_fp8_desc(attributes.inputs,
+                                                    SDPA_attributes::input_names::Descale_Q,
+                                                    CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_QDESC));
+            CHECK_CUDNN_FRONTEND_ERROR(set_fp8_desc(attributes.inputs,
+                                                    SDPA_attributes::input_names::Descale_K,
+                                                    CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_KDESC));
+            CHECK_CUDNN_FRONTEND_ERROR(set_fp8_desc(attributes.inputs,
+                                                    SDPA_attributes::input_names::Descale_V,
+                                                    CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_VDESC));
+            CHECK_CUDNN_FRONTEND_ERROR(set_fp8_desc(attributes.inputs,
+                                                    SDPA_attributes::input_names::Descale_S,
+                                                    CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_SDESC));
+            CHECK_CUDNN_FRONTEND_ERROR(set_fp8_desc(
+                attributes.inputs, SDPA_attributes::input_names::Scale_S, CUDNN_ATTR_OPERATION_SDPA_FWD_SCALE_SDESC));
+            CHECK_CUDNN_FRONTEND_ERROR(set_fp8_desc(
+                attributes.inputs, SDPA_attributes::input_names::Scale_O, CUDNN_ATTR_OPERATION_SDPA_FWD_SCALE_ODESC));
+            CHECK_CUDNN_FRONTEND_ERROR(set_fp8_desc(
+                attributes.outputs, SDPA_attributes::output_names::Amax_S, CUDNN_ATTR_OPERATION_SDPA_FWD_AMAX_SDESC));
+            CHECK_CUDNN_FRONTEND_ERROR(set_fp8_desc(
+                attributes.outputs, SDPA_attributes::output_names::Amax_O, CUDNN_ATTR_OPERATION_SDPA_FWD_AMAX_ODESC));
+#else
+            return fp8_cudnn_ver_error;
+#endif  // CUDNN_VERSION >= 93000
+        }
+
         _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(unified_sdpa_operation->get_backend_descriptor()));
 
         raw_operations.push_back(unified_sdpa_operation);

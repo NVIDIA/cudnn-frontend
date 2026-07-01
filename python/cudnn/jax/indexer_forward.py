@@ -67,6 +67,7 @@ def _make_launcher(
             Float32(sm_scale),
             None,
             None,
+            None,
             stream,
         )
 

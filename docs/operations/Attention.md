@@ -687,14 +687,14 @@ dV.set_output(True).set_dim(v_gpu.shape).set_stride(v_gpu.stride())
 (sdpa-forward-fe-oss-sm100-d256)=
 ### SDPA Forward FE OSS API (SM100, D=256)
 
-This experimental FE OSS API provides a CUTE DSL implementation of the SDPA forward pass for head dimension `256` on NVIDIA Blackwell GPUs (`SM100+`). It computes the attention output `O` plus `LSE` statistics. Available through a standalone API (see [sdpa_fwd_d256.md](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-forward-fe-oss-sm100-d256) for details) and used by the experimental [SDPA Pytorch custom operator](scaled-dot-product-attention-pytorch-op) for supported plain-BHSD `D=256` cases.
+This experimental FE OSS API provides a CUTE DSL implementation of the SDPA forward pass for head dimension `256` on NVIDIA Blackwell GPUs (`SM100+`). It computes the attention output `O` plus `LSE` statistics. Available through a standalone API (see [sdpa_fwd_d256.md](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-forward-fe-oss-sm100-d256) for details) and used by the experimental [SDPA Pytorch custom operator](#scaled-dot-product-attention-pytorch-op) for supported plain-BHSD `D=256` cases.
 
 Note: SDPA Forward D256 is also supported by the cudnn graph/backend API.
 
 (sdpa-backward-fe-oss-sm100-d256)=
 ### SDPA Backward FE OSS API (SM100, D=256)
 
-This experimental FE OSS API provides a CUTE DSL implementation of the SDPA backward pass for head dimension `256` on NVIDIA Blackwell GPUs (`SM100+`). It computes `dQ`, `dK`, and `dV` from the forward tensors plus `dO` and `LSE`. Available through a standalone API (see [sdpa_bwd_d256.md](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-backward-fe-oss-sm100-d256) for details) or as part of the experimental [SDPA Pytorch custom operator](scaled-dot-product-attention-pytorch-op).
+This experimental FE OSS API provides a CUTE DSL implementation of the SDPA backward pass for head dimension `256` on NVIDIA Blackwell GPUs (`SM100+`). It computes `dQ`, `dK`, and `dV` from the forward tensors plus `dO` and `LSE`. Available through a standalone API (see [sdpa_bwd_d256.md](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-backward-fe-oss-sm100-d256) for details) or as part of the experimental [SDPA Pytorch custom operator](#scaled-dot-product-attention-pytorch-op).
 
 
 (scaled-dot-product-attention-pytorch-op)=
