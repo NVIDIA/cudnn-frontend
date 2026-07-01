@@ -11,7 +11,7 @@ from typing import Any, NamedTuple, Optional
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from ..jax.cutedsl import BufferSpec, call_cutedsl
+from .._jax.cutedsl import BufferSpec, call_cutedsl
 from .config import resolve_launch_config
 
 
@@ -58,8 +58,8 @@ def rmsnorm_rht_amax_sm100(
 
     This functional API is intended for use inside ``jax.jit``. ``x`` must be
     a row-major ``bfloat16`` array of shape ``(M, N)`` and ``weight`` a
-    ``bfloat16`` array of shape ``(N,)``. ``M`` and ``N`` are concrete in this
-    proof of concept; shape-polymorphic export is a follow-up.
+    ``bfloat16`` array of shape ``(N,)``. ``M`` and ``N`` must be concrete;
+    shape-polymorphic export is unsupported.
 
     ``eps``, ``num_threads``, and ``rows_per_cta`` are compile-time
     configuration. Close them over a jitted function or list them in

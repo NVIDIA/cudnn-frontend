@@ -28,6 +28,25 @@ _CUDNN_ROOT = _REPO_ROOT / "python" / "cudnn"
 _TEST_PACKAGE = "cudnn_frontend_jax_surface_test"
 
 
+def _colocated_jax_files():
+    """Discover operation-local JAX APIs without maintaining an inventory."""
+
+    facade_dir = _CUDNN_ROOT / "jax"
+    return tuple(path for path in sorted(_CUDNN_ROOT.rglob("jax.py")) if path.parent != facade_dir)
+
+
+def _operation_path(jax_file):
+    return ".".join(jax_file.parent.relative_to(_CUDNN_ROOT).parts)
+
+
+def _literal_assignment(path, name):
+    tree = ast.parse(path.read_text(), filename=str(path))
+    value = next(
+        node.value for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+    )
+    return ast.literal_eval(value)
+
+
 class JaxApiSurfaceTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
@@ -67,84 +86,82 @@ class JaxApiSurfaceTest(unittest.TestCase):
         parent.__package__ = _TEST_PACKAGE
         sys.modules[_TEST_PACKAGE] = parent
 
-        torch_before = {
-            name
-            for name, module in sys.modules.items()
-            if name.split(".", 1)[0] == "torch" and module is not None
-        }
+        torch_before = {name for name, module in sys.modules.items() if name.split(".", 1)[0] == "torch" and module is not None}
         with self._optional_modules():
             jax_namespace = importlib.import_module(f"{_TEST_PACKAGE}.jax")
-            colocated_modules = (
-                f"{_TEST_PACKAGE}.rmsnorm_rht_amax.jax",
-                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_forward.jax",
-                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_top_k.jax",
-            )
-            for module_name in colocated_modules:
+            operation_modules = {}
+            for jax_file in _colocated_jax_files():
+                operation_path = _operation_path(jax_file)
+                module_name = f"{_TEST_PACKAGE}.{operation_path}.jax"
                 self.assertIn(module_name, sys.modules)
-            self.assertIn(f"{_TEST_PACKAGE}.jax.cutedsl", sys.modules)
+                operation_modules[operation_path] = sys.modules[module_name]
+            self.assertIn(f"{_TEST_PACKAGE}._jax.cutedsl", sys.modules)
 
-            kernel_modules = (
-                f"{_TEST_PACKAGE}.rmsnorm_rht_amax.kernel",
-                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_forward.indexer_fwd_sm100",
-                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_top_k.indexer_top_k_decode_varlen",
+            expected_exports = {"DSA"}
+            expected_dsa_exports = set()
+            torch_dsa_exports = set(
+                _literal_assignment(
+                    _CUDNN_ROOT / "deepseek_sparse_attention" / "__init__.py",
+                    "_SYMBOLS",
+                )
             )
-            for module_name in kernel_modules:
-                self.assertNotIn(module_name, sys.modules)
+            for operation_path, operation_module in operation_modules.items():
+                expected_exports.update(operation_module.__all__)
+                operation_package = importlib.import_module(f"{_TEST_PACKAGE}.{operation_path}")
+                torch_exports = set(operation_package._API_EXPORTS)
+                shared_exports = torch_exports.intersection(operation_module.__all__)
+                for name in shared_exports:
+                    self.assertNotIn(name, vars(operation_package))
+                    self.assertIs(getattr(operation_package.jax, name), getattr(jax_namespace, name))
+                    self.assertTrue(callable(getattr(jax_namespace, name)))
+                    if name in torch_dsa_exports:
+                        expected_dsa_exports.add(name)
 
-            self.assertTrue(callable(jax_namespace.rmsnorm_rht_amax_sm100))
-            self.assertTrue(callable(jax_namespace.indexer_forward_wrapper))
-            self.assertTrue(callable(jax_namespace.indexer_top_k_wrapper))
-            self.assertIs(
-                jax_namespace.DSA.indexer_forward_wrapper,
-                jax_namespace.indexer_forward_wrapper,
-            )
-            self.assertIs(jax_namespace.DSA.indexer_top_k_wrapper, jax_namespace.indexer_top_k_wrapper)
-            self.assertEqual(jax_namespace.RmsNormRhtAmaxResult._fields, ("output", "amax"))
-            self.assertEqual(jax_namespace.IndexerForwardResult._fields, ("scores",))
-            self.assertEqual(jax_namespace.IndexerTopKResult._fields, ("indices", "values"))
-            for module_name in kernel_modules:
-                self.assertNotIn(module_name, sys.modules)
-            rmsnorm_package = importlib.import_module(f"{_TEST_PACKAGE}.rmsnorm_rht_amax")
-            indexer_forward_package = importlib.import_module(
-                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_forward"
-            )
-            indexer_top_k_package = importlib.import_module(
-                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_top_k"
-            )
-            self.assertNotIn("rmsnorm_rht_amax_sm100", vars(rmsnorm_package))
-            self.assertNotIn("indexer_forward_wrapper", vars(indexer_forward_package))
-            self.assertNotIn("indexer_top_k_wrapper", vars(indexer_top_k_package))
-            self.assertIs(
-                rmsnorm_package.jax.rmsnorm_rht_amax_sm100,
-                jax_namespace.rmsnorm_rht_amax_sm100,
-            )
-            self.assertIs(
-                indexer_forward_package.jax.indexer_forward_wrapper,
-                jax_namespace.indexer_forward_wrapper,
-            )
-            self.assertIs(
-                indexer_top_k_package.jax.indexer_top_k_wrapper,
-                jax_namespace.indexer_top_k_wrapper,
-            )
-            self.assertEqual(
-                jax_namespace.__all__,
-                [
-                    "DSA",
-                    "IndexerForwardResult",
-                    "IndexerTopKResult",
-                    "RmsNormRhtAmaxResult",
-                    "indexer_forward_wrapper",
-                    "indexer_top_k_wrapper",
-                    "rmsnorm_rht_amax_sm100",
-                ],
-            )
+                loaded_descendants = {name for name in sys.modules if name.startswith(f"{_TEST_PACKAGE}.{operation_path}.")}
+                self.assertLessEqual(
+                    loaded_descendants,
+                    {
+                        f"{_TEST_PACKAGE}.{operation_path}.config",
+                        f"{_TEST_PACKAGE}.{operation_path}.jax",
+                    },
+                )
 
-            torch_after = {
-                name
-                for name, module in sys.modules.items()
-                if name.split(".", 1)[0] == "torch" and module is not None
-            }
+            self.assertEqual(set(jax_namespace.__all__), expected_exports)
+            self.assertEqual(set(vars(jax_namespace.DSA)), expected_dsa_exports)
+            for name in expected_dsa_exports:
+                self.assertIs(getattr(jax_namespace.DSA, name), getattr(jax_namespace, name))
+
+            torch_after = {name for name, module in sys.modules.items() if name.split(".", 1)[0] == "torch" and module is not None}
             self.assertEqual(torch_after - torch_before, set())
+
+    def test_colocated_jax_modules_can_load_before_facade(self):
+        package_name = f"{_TEST_PACKAGE}_direct_first"
+        parent = types.ModuleType(package_name)
+        parent.__path__ = [str(_CUDNN_ROOT)]
+        parent.__package__ = package_name
+        sys.modules[package_name] = parent
+
+        try:
+            with self._optional_modules():
+                operation_modules = []
+                for jax_file in _colocated_jax_files():
+                    module = importlib.import_module(f"{package_name}.{_operation_path(jax_file)}.jax")
+                    operation_modules.append(module)
+                    self.assertNotIn(f"{package_name}.jax", sys.modules)
+
+                facade = importlib.import_module(f"{package_name}.jax")
+                compatibility_adapter = importlib.import_module(f"{package_name}.jax.cutedsl")
+                internal_adapter = importlib.import_module(f"{package_name}._jax.cutedsl")
+                self.assertIs(compatibility_adapter.BufferSpec, internal_adapter.BufferSpec)
+                self.assertIs(compatibility_adapter.call_cutedsl, internal_adapter.call_cutedsl)
+
+                for operation_module in operation_modules:
+                    for name in operation_module.__all__:
+                        self.assertIs(getattr(facade, name), getattr(operation_module, name))
+        finally:
+            for module_name in tuple(sys.modules):
+                if module_name == package_name or module_name.startswith(f"{package_name}."):
+                    sys.modules.pop(module_name, None)
 
     def test_missing_jax_reports_optional_extra(self):
         package_name = f"{_TEST_PACKAGE}_missing_jax"
@@ -225,8 +242,7 @@ class JaxApiSurfaceTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     ImportError,
-                    r"CUTLASS JAX support is unavailable with JAX 0\.4\.0; "
-                    r"the minimum supported JAX version is 0\.5\.0.*nvidia-cudnn-frontend\[jax\]",
+                    r"CUTLASS JAX support is unavailable with JAX 0\.4\.0; " r"the minimum supported JAX version is 0\.5\.0.*nvidia-cudnn-frontend\[jax\]",
                 ):
                     importlib.import_module(f"{package_name}.jax")
         finally:
@@ -235,23 +251,19 @@ class JaxApiSurfaceTest(unittest.TestCase):
                     sys.modules.pop(module_name, None)
 
     def test_operation_packages_use_explicit_jax_namespaces(self):
-        operations = (
-            (
-                "rmsnorm_rht_amax",
-                "rmsnorm_rht_amax_sm100",
-                "RmsNormRhtAmaxResult",
-            ),
-            (
-                "deepseek_sparse_attention.indexer_forward",
-                "indexer_forward_wrapper",
-                "IndexerForwardResult",
-            ),
-            (
-                "deepseek_sparse_attention.indexer_top_k",
-                "indexer_top_k_wrapper",
-                "IndexerTopKResult",
-            ),
-        )
+        operations = []
+        for jax_file in _colocated_jax_files():
+            operation_path = _operation_path(jax_file)
+            torch_exports = set(_literal_assignment(jax_file.parent / "__init__.py", "_API_EXPORTS"))
+            jax_exports = set(_literal_assignment(jax_file, "__all__"))
+            operations.append(
+                (
+                    operation_path,
+                    sorted(torch_exports.intersection(jax_exports)),
+                    sorted(jax_exports.difference(torch_exports)),
+                )
+            )
+
         package_name = f"{_TEST_PACKAGE}_explicit_jax"
         parent = types.ModuleType(package_name)
         parent.__path__ = [str(_CUDNN_ROOT)]
@@ -259,22 +271,23 @@ class JaxApiSurfaceTest(unittest.TestCase):
         sys.modules[package_name] = parent
 
         operation_apis = {}
-        for operation_path, symbol_name, jax_only_name in operations:
+        for operation_path, shared_names, jax_only_names in operations:
+            self.assertTrue(shared_names, f"{operation_path} has no aligned Torch/JAX symbol")
+            self.assertTrue(jax_only_names, f"{operation_path} has no JAX-specific result type")
             operation_name = f"{package_name}.{operation_path}"
-            torch_function = object()
-            jax_function = object()
-            jax_only_value = object()
             torch_api = types.ModuleType(f"{operation_name}.api")
-            setattr(torch_api, symbol_name, torch_function)
             jax_api = types.ModuleType(f"{operation_name}.jax")
-            setattr(jax_api, symbol_name, jax_function)
-            setattr(jax_api, jax_only_name, jax_only_value)
+            torch_values = {name: object() for name in shared_names}
+            jax_values = {name: object() for name in (*shared_names, *jax_only_names)}
+            for name, value in torch_values.items():
+                setattr(torch_api, name, value)
+            for name, value in jax_values.items():
+                setattr(jax_api, name, value)
             operation_apis[operation_path] = (
-                symbol_name,
-                jax_only_name,
-                torch_function,
-                jax_function,
-                jax_only_value,
+                shared_names,
+                jax_only_names,
+                torch_values,
+                jax_values,
                 torch_api,
                 jax_api,
             )
@@ -289,11 +302,10 @@ class JaxApiSurfaceTest(unittest.TestCase):
                         operation_name = f"{package_name}.{operation_path}"
                         operation = importlib.import_module(operation_name)
                         (
-                            symbol_name,
-                            jax_only_name,
-                            torch_function,
-                            jax_function,
-                            jax_only_value,
+                            shared_names,
+                            jax_only_names,
+                            torch_values,
+                            jax_values,
                             torch_api,
                             jax_api,
                         ) = operation_apis[operation_path]
@@ -308,16 +320,17 @@ class JaxApiSurfaceTest(unittest.TestCase):
                                 jax_api.__name__: jax_api,
                             },
                         ):
-                            self.assertIs(getattr(operation, symbol_name), torch_function)
-                            self.assertIn(symbol_name, vars(operation))
-                            self.assertIs(getattr(operation, symbol_name), torch_function)
-                            with self.assertRaises(AttributeError):
-                                getattr(operation, jax_only_name)
+                            for name in shared_names:
+                                self.assertIs(getattr(operation, name), torch_values[name])
+                                self.assertIn(name, vars(operation))
+                            for name in jax_only_names:
+                                with self.assertRaises(AttributeError):
+                                    getattr(operation, name)
 
                             self.assertIs(operation.api, torch_api)
                             self.assertIs(operation.jax, jax_api)
-                            self.assertIs(getattr(operation.jax, symbol_name), jax_function)
-                            self.assertIs(getattr(operation.jax, jax_only_name), jax_only_value)
+                            for name, value in jax_values.items():
+                                self.assertIs(getattr(operation.jax, name), value)
         finally:
             for module_name in tuple(sys.modules):
                 if module_name == package_name or module_name.startswith(f"{package_name}."):
@@ -352,19 +365,18 @@ class JaxApiSurfaceTest(unittest.TestCase):
                     sys.modules.pop(module_name, None)
 
     def test_jax_implementations_are_colocated_with_torch_apis(self):
-        operation_dirs = (
-            _CUDNN_ROOT / "rmsnorm_rht_amax",
-            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_forward",
-            _CUDNN_ROOT / "deepseek_sparse_attention" / "indexer_top_k",
-        )
-        for operation_dir in operation_dirs:
+        jax_files = _colocated_jax_files()
+        self.assertTrue(jax_files)
+        for jax_file in jax_files:
+            operation_dir = jax_file.parent
             with self.subTest(operation=operation_dir.name):
                 self.assertTrue((operation_dir / "api.py").is_file())
-                self.assertTrue((operation_dir / "jax.py").is_file())
+                self.assertTrue((operation_dir / "__init__.py").is_file())
 
-        for old_module in ("rmsnorm_rht_amax.py", "indexer_forward.py", "indexer_top_k.py"):
-            with self.subTest(old_module=old_module):
-                self.assertFalse((_CUDNN_ROOT / "jax" / old_module).exists())
+        self.assertEqual(
+            {path.name for path in (_CUDNN_ROOT / "jax").glob("*.py")},
+            {"__init__.py", "cutedsl.py"},
+        )
 
     def test_torch_function_remains_a_lazy_top_level_export(self):
         top_level_tree = ast.parse(
@@ -388,11 +400,7 @@ class JaxApiSurfaceTest(unittest.TestCase):
             (_CUDNN_ROOT / "__init__.py").read_text(),
             filename=str(_CUDNN_ROOT / "__init__.py"),
         )
-        getattr_node = next(
-            node
-            for node in top_level_tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "__getattr__"
-        )
+        getattr_node = next(node for node in top_level_tree.body if isinstance(node, ast.FunctionDef) and node.name == "__getattr__")
         jax_branch = next(
             node
             for node in getattr_node.body
@@ -423,13 +431,21 @@ class JaxApiSurfaceTest(unittest.TestCase):
         symbols_node = next(
             node.value
             for node in dsa_tree.body
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id == "_SYMBOLS" for target in node.targets)
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "_SYMBOLS" for target in node.targets)
         )
         torch_symbols = ast.literal_eval(symbols_node)
-        for name in ("indexer_forward_wrapper", "indexer_top_k_wrapper"):
-            with self.subTest(name=name):
-                self.assertIn(name, torch_symbols)
+        facade_tree = ast.parse(
+            (_CUDNN_ROOT / "jax" / "__init__.py").read_text(),
+            filename=str(_CUDNN_ROOT / "jax" / "__init__.py"),
+        )
+        dsa_assignment = next(
+            node
+            for node in facade_tree.body
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "DSA" for target in node.targets)
+        )
+        jax_dsa_symbols = {keyword.arg for keyword in dsa_assignment.value.keywords}
+        self.assertTrue(jax_dsa_symbols)
+        self.assertLessEqual(jax_dsa_symbols, set(torch_symbols))
 
     def test_jax_optional_extra_does_not_install_torch(self):
         pyproject = (_REPO_ROOT / "pyproject.toml").read_text()

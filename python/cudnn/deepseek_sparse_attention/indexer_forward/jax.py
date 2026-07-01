@@ -11,7 +11,7 @@ from typing import Any, NamedTuple, Optional
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from ...jax.cutedsl import BufferSpec, call_cutedsl
+from ..._jax.cutedsl import BufferSpec, call_cutedsl
 
 _TMA_ALIGN_ELEMENTS = 4
 
@@ -85,14 +85,9 @@ def _require_supported_config(
         "q_stage": (q_stage, 2),
         "kv_stage": (kv_stage, 4),
     }
-    unsupported = [
-        f"{name}={actual} (expected {expected})" for name, (actual, expected) in supported.items() if actual != expected
-    ]
+    unsupported = [f"{name}={actual} (expected {expected})" for name, (actual, expected) in supported.items() if actual != expected]
     if unsupported:
-        raise ValueError(
-            "The JAX indexer-forward POC supports only the validated SM100 "
-            "kernel configuration: " + ", ".join(unsupported)
-        )
+        raise ValueError("The JAX indexer-forward API supports only the validated SM100 " "kernel configuration: " + ", ".join(unsupported))
 
 
 def indexer_forward_wrapper(
@@ -114,7 +109,7 @@ def indexer_forward_wrapper(
     ``(B, S_k, H_kv, 128)``. ``w`` must have shape ``(B, S_q, H_q)``.
     All three inputs use ``bfloat16`` and the returned scores use ``float32``.
 
-    This proof of concept supports fixed-shape BSHD inputs on SM100 only.
+    This API supports fixed-shape BSHD inputs on SM100 only.
     Variable-length THD inputs and the SM90 implementation remain available
     only through the existing PyTorch API. All configuration arguments are
     compile-time values; close them over a jitted function or mark them static
@@ -156,9 +151,7 @@ def indexer_forward_wrapper(
         raise ValueError(f"head dimension must be 128, got {head_dim}")
     if (w_seqlen_q, w_num_query_heads) != (seqlen_q, num_query_heads):
         raise ValueError(
-            "w shape must match q's batch, sequence, and query-head "
-            f"dimensions; expected {(batch, seqlen_q, num_query_heads)}, "
-            f"got {tuple(w.shape)}"
+            "w shape must match q's batch, sequence, and query-head " f"dimensions; expected {(batch, seqlen_q, num_query_heads)}, " f"got {tuple(w.shape)}"
         )
 
     if q.dtype != jnp.bfloat16 or k.dtype != jnp.bfloat16 or w.dtype != jnp.bfloat16:
@@ -174,9 +167,7 @@ def indexer_forward_wrapper(
             raise ValueError(f"H_q ({num_query_heads}) must be divisible by H_kv " f"({num_kv_heads})")
         qhead_per_kv_head = num_query_heads // num_kv_heads
     if qhead_per_kv_head * num_kv_heads != num_query_heads:
-        raise ValueError(
-            "qhead_per_kv_head * H_kv must equal H_q, got " f"{qhead_per_kv_head} * {num_kv_heads} != {num_query_heads}"
-        )
+        raise ValueError("qhead_per_kv_head * H_kv must equal H_q, got " f"{qhead_per_kv_head} * {num_kv_heads} != {num_query_heads}")
     if qhead_per_kv_head not in (32, 64):
         raise ValueError("qhead_per_kv_head must be 32 or 64, " f"got {qhead_per_kv_head}")
 

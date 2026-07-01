@@ -92,8 +92,8 @@ The JAX optional dependency set requires Python 3.11 or newer.
 ### DSA Namespace
 
 PyTorch remains the default and exposes every DSA class and wrapper below.
-The optional JAX namespace currently implements the two score-selection
-wrappers described in sections 2 and 3.
+The optional JAX namespace implements the two score-selection wrappers in
+sections 2 and 3 and the sparse score-recompute pair in sections 4 and 5.
 
 ```python
 from cudnn import DSA
@@ -124,6 +124,17 @@ DSA.indexer_backward_wrapper
 
 DSA.DenseIndexerBackward
 DSA.dense_indexer_backward_wrapper
+```
+
+The explicit JAX facade exposes its implemented functional subset:
+
+```python
+from cudnn.jax import DSA
+
+DSA.indexer_forward_wrapper
+DSA.indexer_top_k_wrapper
+DSA.sparse_indexer_score_recompute_wrapper
+DSA.sparse_attn_score_recompute_wrapper
 ```
 
 ---
@@ -221,10 +232,10 @@ initialized to `-inf`, aliased into the custom call, and sliced back to `S_k`;
 the initialization preserves positions that the causal kernel deliberately
 does not write.
 
-The proof of concept supports concrete, compact BSHD inputs only. THD inputs,
-`cu_seqlens_*`, `q_causal_offsets`, and shape-polymorphic export are not yet
-supported. Tuning options and `sm_scale` are Python-static compilation state,
-and XLA supplies the runtime stream.
+The JAX wrapper supports concrete, compact BSHD inputs only. THD inputs,
+`cu_seqlens_*`, `q_causal_offsets`, and shape-polymorphic export are
+unsupported. Tuning options and `sm_scale` are Python-static compilation
+state, and XLA supplies the runtime stream.
 
 `````
 
@@ -283,8 +294,8 @@ indices, values = result.indices, result.values
 ```
 
 The JAX wrapper returns `IndexerTopKResult(indices=..., values=...)`, with both
-arrays shaped `(n_rows, top_k)`. The JAX proof of concept currently requires
-`return_val=True`; the PyTorch wrapper retains its `return_val=False` mode. The
+arrays shaped `(n_rows, top_k)`. The JAX API requires `return_val=True`; the
+PyTorch wrapper retains its `return_val=False` mode. The
 radix kernel needs an INT32 temporary of shape
 `(n_rows, buffer_count, num_cols)`, where `buffer_count` is two for FP32 input
 and one for FP16/BF16. The adapter declares that temporary as an uninitialized
@@ -303,9 +314,9 @@ are trusted kernel inputs:
 every `seq_lens[b]` must satisfy
 `top_k + next_n - 1 <= seq_lens[b] <= num_cols`, which keeps every staggered
 row at least `top_k` elements long and prevents out-of-range reads. JAX tracing
-does not copy those values to the host for validation. The JAX proof of concept
-rejects workspace sizes above the INT32 indexing limit instead of implementing
-the PyTorch path's row-chunked fallback, and it does not expose the persistent
+does not copy those values to the host for validation. The JAX wrapper rejects
+workspace sizes above the INT32 indexing limit instead of implementing the
+PyTorch path's row-chunked fallback, and it does not expose the persistent
 global-counter path.
 
 `````
@@ -323,6 +334,68 @@ Computes softmax over top-K entries of the indexer score:
   `batch_idx * S_k + local_idx`.
 - **Output** — `predict`: `(B, S_q, topk)` FP32.
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
+```python
+from cudnn import DSA
+
+result = DSA.sparse_indexer_score_recompute_wrapper(
+    q_indexer,
+    k_indexer,
+    weights,
+    topk_indices,
+    topk_length=topk_length,
+)
+predict = result["predict"]
+```
+
+The PyTorch wrapper returns a `TupleDict`, supports SM90 and SM100+, and retains
+optional output-buffer and stream controls.
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+from cudnn.jax import DSA
+
+@jax.jit
+def recompute_predict(q_indexer, k_indexer, weights, topk_indices, topk_length):
+    return DSA.sparse_indexer_score_recompute_wrapper(
+        q_indexer,
+        k_indexer,
+        weights,
+        topk_indices,
+        topk_length=topk_length,
+    )
+
+predict = recompute_predict(
+    q_indexer, k_indexer, weights, topk_indices, topk_length
+).predict
+```
+
+The JAX wrapper returns
+`SparseIndexerScoreRecomputeResult(predict=...)`. It supports the SM100 fixed
+batched MQA layout: BF16 `q_indexer` has shape `(B, S_q, H_q, D)`, BF16
+`k_indexer` has shape `(B, S_k, D)`, BF16 `weights` has shape
+`(B, S_q, H_q)`, and INT32 `topk_indices` has shape `(B, S_q, topk)`. The
+optional INT32 `topk_length` has shape `(B, S_q)`. The FP32 result has the same
+shape as `topk_indices` and is fully overwritten by the kernel, so it needs no
+initialized alias or algorithmic scratch workspace. When `topk_length` is
+omitted, the adapter supplies one hidden `(1, 1)` INT32 placeholder required by
+the native launch ABI; the non-compact kernel does not read it.
+
+`````
+
+``````
+
 ### 5. Sparse Attn Score Recompute
 
 L1-normalised head-summed softmax over top-K entries:
@@ -335,12 +408,89 @@ L1-normalised head-summed softmax over top-K entries:
 - **Output** — `target`: `(B, S_q, topk)` FP32.
 - Note: the wrapper handles the `-log2(e) * lse` preprocessing internally.
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
+```python
+from cudnn import DSA
+
+result = DSA.sparse_attn_score_recompute_wrapper(
+    q_attn,
+    k_attn,
+    lse,
+    topk_indices,
+    softmax_scale,
+    topk_length=topk_length,
+)
+target = result["target"]
+```
+
+The PyTorch wrapper returns a `TupleDict`, supports SM90 and SM100+, and retains
+optional output-buffer and stream controls.
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import math
+
+import jax
+from cudnn.jax import DSA
+
+softmax_scale = 1.0 / math.sqrt(D)
+
+@jax.jit
+def recompute_target(q_attn, k_attn, lse, topk_indices, topk_length):
+    return DSA.sparse_attn_score_recompute_wrapper(
+        q_attn,
+        k_attn,
+        lse,
+        topk_indices,
+        softmax_scale,
+        topk_length=topk_length,
+    )
+
+target = recompute_target(
+    q_attn, k_attn, lse, topk_indices, topk_length
+).target
+```
+
+The JAX wrapper returns `SparseAttnScoreRecomputeResult(target=...)`. It uses
+the same SM100 fixed batched MQA shapes as the indexer variant, with BF16
+`q_attn` and `k_attn`, FP32 `lse` shaped `(B, S_q, H_q)`, INT32 indices and
+optional lengths, and an FP32 `(B, S_q, topk)` result. The kernel fully
+overwrites the result and needs no algorithmic scratch workspace. As in the
+indexer variant, omitting `topk_length` creates only the unused hidden ABI
+placeholder.
+
+`````
+
+``````
+
+For both JAX sparse score wrappers, shapes must be concrete and compact. THD
+inputs and the SM90 kernels remain PyTorch-only. The sparse MQA kernel requires
+`qhead_per_kv_head == H_q`, with `H_q` in `{32, 64, 128}`, and a positive head
+dimension divisible by 64. The indexer variant requires `topk` to be divisible
+by 128; the attention variant requires divisibility by its selected 64- or
+128-column tile. `qhead_per_kv_head`, `topk_indices_global`, and
+`softmax_scale` (for the attention variant) are Python-static compilation
+state; whether `topk_length` is present selects a static kernel variant. Runtime
+index and length values are trusted: valid entries must identify KV rows in the
+selected local or global index space, and each `topk_length` must be between
+zero and `topk`. Positions at or beyond that length are returned as zero.
+
 ### 6. Dense Indexer / Dense Attn Score Recompute
 
 Full-KV (no top-K) analogues of §4 and §5. Each returns `{'out', 'denom'}`.
 They apply the same ratio-causal mask as Indexer Forward; masked positions are
-written as zero and excluded from `denom`. Pass the same `q_causal_offsets` to
-all dense score tensors that feed the same loss path.
+written as zero and excluded from `denom`. Pass the same `q_causal_offsets`
+to all dense score tensors that feed the same loss path.
 
 ### 7. Indexer Backward
 
@@ -418,7 +568,8 @@ result = DSA.dense_indexer_backward_wrapper(
   `qhead_per_kv_head ∈ {32, 64}`.
 - **Top-K only up to 2048**; `top_k > 2048` is not supported by the
   underlying radix top-K kernel.
-- **JAX coverage is currently limited to Indexer Forward and Indexer Top-K.**
-  Both require concrete compact shapes and do not define autodiff, `vmap`, or
-  automatic sharding rules. Indexer Forward currently supports only fixed BSHD
-  inputs; its broader PyTorch wrapper remains unchanged.
+- **JAX coverage includes Indexer Forward, Indexer Top-K, and the
+  sparse indexer/attention score-recompute pair.** All require concrete compact
+  shapes and do not define autodiff, `vmap`, or automatic sharding rules.
+  Indexer Forward and both score-recompute wrappers support only their fixed
+  batched SM100 domains; their broader SM90/THD PyTorch paths remain unchanged.

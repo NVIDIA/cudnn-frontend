@@ -22,7 +22,7 @@ else:
     pytestmark = pytest.mark.L0
 
 
-_MODULE_PATH = Path(__file__).resolve().parents[3] / "python" / "cudnn" / "jax" / "cutedsl.py"
+_MODULE_PATH = Path(__file__).resolve().parents[3] / "python" / "cudnn" / "_jax" / "cutedsl.py"
 _SPEC = importlib.util.spec_from_file_location("cudnn_jax_cutedsl_poc", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)

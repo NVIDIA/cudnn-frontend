@@ -101,6 +101,7 @@ dependencies.
 - `Grouped Gemm + Wgrad`
 - `SDPA Forward (SM100, D=256)`
 - `SDPA Backward (SM100, D=256)`
+- `DeepSeek Sparse Attention (DSA) stages`
 
 **In progress frontend-only APIs**:
 - GEMM + Dswiglu

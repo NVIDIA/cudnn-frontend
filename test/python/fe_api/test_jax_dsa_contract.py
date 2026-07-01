@@ -45,13 +45,7 @@ class _Array:
         return len(self.shape)
 
     def __getitem__(self, key):
-        if not (
-            isinstance(key, tuple)
-            and key[:-1] == (Ellipsis,)
-            and isinstance(key[-1], slice)
-            and key[-1].start is None
-            and key[-1].step is None
-        ):
+        if not (isinstance(key, tuple) and key[:-1] == (Ellipsis,) and isinstance(key[-1], slice) and key[-1].start is None and key[-1].step is None):
             raise AssertionError(f"Unexpected test slice {key!r}")
         return _Array((*self.shape[:-1], key[-1].stop), self.dtype)
 
@@ -115,12 +109,10 @@ class JaxDsaContractTest(unittest.TestCase):
             },
         ):
             importlib.import_module(f"{_TEST_PACKAGE}.jax")
-            cls.forward = importlib.import_module(
-                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_forward.jax"
-            )
-            cls.top_k = importlib.import_module(
-                f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_top_k.jax"
-            )
+            cls.forward = importlib.import_module(f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_forward.jax")
+            cls.top_k = importlib.import_module(f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_top_k.jax")
+            cls.score = importlib.import_module(f"{_TEST_PACKAGE}.deepseek_sparse_attention.score_recompute.jax")
+            cls.score_config = importlib.import_module(f"{_TEST_PACKAGE}.deepseek_sparse_attention.score_recompute.config")
 
     @classmethod
     def tearDownClass(cls):
@@ -258,6 +250,216 @@ class JaxDsaContractTest(unittest.TestCase):
             num_copy_bits=256,
             dtype_bits=32,
         )
+
+    def test_sparse_score_wrappers_declare_functional_results(self):
+        captured = []
+
+        def fake_call(launcher, inputs, **options):
+            captured.append(dict(launcher=launcher, inputs=inputs, **options))
+            return tuple(_Array(spec.shape, spec.dtype) for spec in options["outputs"])
+
+        q = _Array((2, 4, 32, 128), self.bfloat16)
+        k = _Array((2, 256, 128), self.bfloat16)
+        weights = _Array((2, 4, 32), self.bfloat16)
+        lse = _Array((2, 4, 32), self.float32)
+        indices = _Array((2, 4, 128), self.int32)
+        lengths = _Array((2, 4), self.int32)
+        indexer_launcher = object()
+        attention_launcher = object()
+
+        with (
+            self._optional_modules(),
+            mock.patch.object(
+                self.score,
+                "_make_launcher",
+                side_effect=(indexer_launcher, attention_launcher),
+            ) as make_launcher,
+            mock.patch.object(self.score, "call_cutedsl", side_effect=fake_call),
+        ):
+            predict = self.score.sparse_indexer_score_recompute_wrapper(
+                q,
+                k,
+                weights,
+                indices,
+            ).predict
+            target = self.score.sparse_attn_score_recompute_wrapper(
+                q,
+                k,
+                lse,
+                indices,
+                0.125,
+                topk_length=lengths,
+            ).target
+
+        self.assertEqual((predict.shape, predict.dtype), ((2, 4, 128), self.float32))
+        self.assertEqual((target.shape, target.dtype), ((2, 4, 128), self.float32))
+
+        indexer_call, attention_call = captured
+        self.assertIs(indexer_call["launcher"], indexer_launcher)
+        self.assertEqual(indexer_call["inputs"], (q, k, weights, indices))
+        self.assertEqual(len(indexer_call["outputs"]), 1)
+        self.assertEqual(indexer_call["outputs"][0].name, "predict")
+        self.assertEqual(len(indexer_call["workspaces"]), 1)
+        self.assertEqual(
+            (
+                indexer_call["workspaces"][0].name,
+                indexer_call["workspaces"][0].shape,
+                indexer_call["workspaces"][0].dtype,
+            ),
+            ("topk_length_workspace", (1, 1), self.int32),
+        )
+
+        self.assertIs(attention_call["launcher"], attention_launcher)
+        self.assertEqual(attention_call["inputs"], (q, k, lse, indices, lengths))
+        self.assertEqual(attention_call["outputs"][0].name, "target")
+        self.assertEqual(attention_call["workspaces"], ())
+        self.assertTrue(indexer_call["use_static_tensors"])
+        self.assertTrue(attention_call["use_static_tensors"])
+
+        indexer_config = make_launcher.call_args_list[0].kwargs
+        self.assertEqual(indexer_config["score_type"], "indexer")
+        self.assertEqual(indexer_config["n_block_size"], 128)
+        self.assertFalse(indexer_config["have_topk_length"])
+        attention_config = make_launcher.call_args_list[1].kwargs
+        self.assertEqual(attention_config["score_type"], "attention")
+        self.assertEqual(attention_config["n_block_size"], 64)
+        self.assertTrue(attention_config["have_topk_length"])
+        self.assertEqual(attention_config["softmax_scale"], 0.125)
+
+    def test_sparse_score_launcher_preserves_native_argument_order(self):
+        calls = []
+
+        class FakeKernel:
+            def __init__(self, **options):
+                self.options = options
+
+            def __call__(self, *args):
+                calls.append(args)
+
+        kernel_module_name = f"{_TEST_PACKAGE}.deepseek_sparse_attention.score_recompute." "sparse_score_recompute_sm100"
+        kernel_module = types.ModuleType(kernel_module_name)
+        kernel_module.SparseScoreRecomputeSm100 = FakeKernel
+        float32 = lambda value: ("Float32", value)
+
+        common = dict(
+            score_type="indexer",
+            head_dim=128,
+            qhead_per_kv_head=32,
+            topk=128,
+            m_block_size=32,
+            n_block_size=128,
+            k_block_size=None,
+            kv_stage=4,
+            topk_in_smem=True,
+            topk_indices_global=False,
+            softmax_scale=1.0,
+        )
+        with (
+            self._optional_modules(),
+            mock.patch.dict(sys.modules, {kernel_module_name: kernel_module}),
+            mock.patch.object(self.fake_cutlass, "Float32", float32, create=True),
+        ):
+            self.score._make_launcher.cache_clear()
+            with_length = self.score._make_launcher(
+                **common,
+                have_topk_length=True,
+            )
+            without_length = self.score._make_launcher(
+                **common,
+                have_topk_length=False,
+            )
+            with_length("stream", "q", "k", "aux", "indices", "length", "out")
+            without_length(
+                "stream",
+                "q",
+                "k",
+                "aux",
+                "indices",
+                "out",
+                "dummy_length",
+            )
+            self.score._make_launcher.cache_clear()
+
+        self.assertEqual(
+            calls,
+            [
+                ("q", "k", "aux", "indices", "out", "length", ("Float32", 1.0), "stream"),
+                (
+                    "q",
+                    "k",
+                    "aux",
+                    "indices",
+                    "out",
+                    "dummy_length",
+                    ("Float32", 1.0),
+                    "stream",
+                ),
+            ],
+        )
+
+    def test_sparse_score_config_matches_sm100_dispatch(self):
+        indexer = self.score_config.resolve_sparse_score_kernel_config(
+            score_type="indexer",
+            head_dim=128,
+            qhead_per_kv_head=32,
+            topk=128,
+            have_topk_length=False,
+        )
+        self.assertEqual(
+            (indexer.m_block_size, indexer.n_block_size, indexer.k_block_size),
+            (32, 128, None),
+        )
+        self.assertEqual(indexer.kv_stage, 4)
+        self.assertTrue(indexer.topk_in_smem)
+
+        large_topk = self.score_config.resolve_sparse_score_kernel_config(
+            score_type="indexer",
+            head_dim=128,
+            qhead_per_kv_head=32,
+            topk=32768,
+            have_topk_length=False,
+        )
+        self.assertFalse(large_topk.topk_in_smem)
+
+        compact_attention = self.score_config.resolve_sparse_score_kernel_config(
+            score_type="attention",
+            head_dim=512,
+            qhead_per_kv_head=64,
+            topk=512,
+            have_topk_length=True,
+        )
+        full_attention = self.score_config.resolve_sparse_score_kernel_config(
+            score_type="attention",
+            head_dim=512,
+            qhead_per_kv_head=64,
+            topk=512,
+            have_topk_length=False,
+        )
+        self.assertEqual(
+            (
+                compact_attention.m_block_size,
+                compact_attention.n_block_size,
+                compact_attention.k_block_size,
+            ),
+            (64, 64, None),
+        )
+        self.assertEqual(
+            (
+                full_attention.m_block_size,
+                full_attention.n_block_size,
+                full_attention.k_block_size,
+            ),
+            (64, 128, 256),
+        )
+
+        with self.assertRaisesRegex(ValueError, "multiple of the selected n_block_size"):
+            self.score_config.resolve_sparse_score_kernel_config(
+                score_type="indexer",
+                head_dim=128,
+                qhead_per_kv_head=32,
+                topk=64,
+                have_topk_length=False,
+            )
 
     def test_wrapper_validation_fails_before_launch(self):
         bad_q = _Array((1, 4, 32, 128), self.float16)

@@ -30,11 +30,11 @@ abstract value, not a device buffer:
 | Mutation | Preallocated outputs are mutated | Public API remains functional; legal aliases are declared |
 | Cache | Python object and compiled callable | JAX executable cache plus CUTLASS function/spec cache |
 
-The proof of concept implements this split for three real FE-OSS operations:
-RMSNorm + RHT + amax, DSA Indexer Forward, and DSA Indexer Top-K. When Torch is
-installed, the existing Torch APIs remain unchanged. JAX support is reviewed
-per operation rather than required for every new or modified PyTorch API or
-physical CuTe kernel.
+The proof of concept implements this split for five real FE-OSS operations:
+RMSNorm + RHT + amax, DSA Indexer Forward, DSA Indexer Top-K, and the sparse
+indexer/attention score-recompute pair. When Torch is installed, the existing
+Torch APIs remain unchanged. JAX support is reviewed per operation rather than
+required for every new or modified PyTorch API or physical CuTe kernel.
 
 This source-layout variant co-locates the bindings for each implemented
 operation: `api.py` is always Torch and a sibling `jax.py` is always JAX. The
@@ -175,12 +175,16 @@ from cudnn import DSA
 
 torch_scores = DSA.indexer_forward_wrapper(...)
 torch_topk = DSA.indexer_top_k_wrapper(...)
+torch_predict = DSA.sparse_indexer_score_recompute_wrapper(...)
+torch_target = DSA.sparse_attn_score_recompute_wrapper(...)
 
 # JAX is an explicit optional namespace.
 from cudnn.jax import DSA
 
 jax_scores = DSA.indexer_forward_wrapper(...)
 jax_topk = DSA.indexer_top_k_wrapper(...)
+jax_predict = DSA.sparse_indexer_score_recompute_wrapper(...)
+jax_target = DSA.sparse_attn_score_recompute_wrapper(...)
 ```
 
 The implementations are co-located with the kernels:
@@ -188,11 +192,13 @@ The implementations are co-located with the kernels:
 ```text
 cudnn/
   _operation_api.py                         shared lazy operation exports
-  jax/                                      shared facade and cutedsl.py
+  _jax/cutedsl.py                          import-order-neutral adapter implementation
+  jax/                                      shared facade and cutedsl.py compatibility export
   rmsnorm_rht_amax/{api.py,jax.py,config.py,kernel.py}
   deepseek_sparse_attention/
     indexer_forward/{api.py,jax.py,...}
     indexer_top_k/{api.py,jax.py,...}
+    score_recompute/{api.py,jax.py,...}
 ```
 
 Implicit array-type dispatch is deliberately rejected. JAX tracers, Torch fake
@@ -223,8 +229,8 @@ The current wrapper inventory makes the functional gap concrete:
 | Discrete grouped GEMM | 2 | 0 |
 | SDPA | 2 | 0 |
 | Native sparse attention | 4 | 0 |
-| DeepSeek sparse attention stages | 11 | 2 |
-| **Total** | **33** | **3** |
+| DeepSeek sparse attention stages | 11 | 4 |
+| **Total** | **33** | **5** |
 
 The table is a point-in-time review aid, not a coverage requirement or promise
 that every helper wrapper needs a JAX equivalent.
@@ -425,8 +431,9 @@ OpenXLA documents unused tuple results as
 This lets XLA account for the memory, reuse it according to liveness, preserve
 asynchronous lifetime, and avoid runtime allocation during CUDA-graph capture.
 
-The POC's [`call_cutedsl`](../../python/cudnn/jax/cutedsl.py) supports these
-categories:
+The POC's internal
+[`call_cutedsl`](../../python/cudnn/_jax/cutedsl.py), also available from the
+compatibility module `cudnn.jax.cutedsl`, supports these categories:
 
 | Buffer requirement | JAX representation |
 | --- | --- |
@@ -442,7 +449,8 @@ initialized. The POC generates this alias internally. Caller-provided in-place
 aliases and donation policy should be added only when a real operator requires
 them.
 
-The two DSA POCs model both nontrivial cases in wrappers around real kernels:
+The DSA POCs exercise the initialized-output, hidden-workspace, and ordinary
+fully-overwritten result paths in wrappers around real kernels:
 
 - Indexer Forward declares an internal FP32 result with `S_k` rounded up to a
   multiple of four for TMA, initializes it to `-inf`, aliases that initialized
@@ -455,6 +463,11 @@ The two DSA POCs model both nontrivial cases in wrappers around real kernels:
   column count exceeds the in-CTA candidate capacity. The workspace is a
   custom-call result but is not returned by the Python wrapper, so every
   invocation gets XLA-managed temporary storage.
+- Sparse Indexer Score Recompute and Sparse Attention Score Recompute each
+  declare one ordinary FP32 result that the kernel fully overwrites. They need
+  neither a persistent Python allocation nor an initialized custom-call alias.
+  When `topk_length` is omitted, the adapter supplies an unused hidden `(1, 1)`
+  INT32 placeholder required by the native kernel signature.
 
 These examples justify keeping one small internal record that groups a
 buffer's abstract shape/dtype, native `TensorSpec`, optional fill value, and
@@ -500,7 +513,7 @@ a thread-safe stateful runtime design.
 | SDPA backward | Per-call zeroed workspace, multi-kernel ordering, residual contract, and `custom_vjp`. |
 | Grouped GEMM | Per-call descriptor/scheduler workspace, helper launches, counters, and metadata validation without host reads. |
 | Discrete grouped GEMM | Current device-address tensors are not traceable. Pass expert buffers as real operands and build pointer tables in device workspace, or defer this mode. |
-| DSA/NSA orchestration | DSA Indexer Forward and Indexer Top-K POCs implemented for concrete fixed-shape inputs, including initialized padded output and real hidden workspace. GPU validation and the remaining host-value/multi-kernel audits are pending. |
+| DSA/NSA orchestration | DSA Indexer Forward, Indexer Top-K, and sparse indexer/attention score-recompute POCs implemented for concrete fixed-shape inputs, covering initialized padded output, real hidden workspace, and fully-overwritten results. GPU validation and the remaining host-value/multi-kernel audits are pending. |
 | Distributed kernels | Replace `torch.distributed` assumptions with explicit JAX collectives/partitioning; do not hide cross-replica state in a CuTe call. |
 
 Optional tensors alter call arity and are therefore static graph variants.
@@ -653,9 +666,11 @@ removes the legacy FFI branch from the supported integration surface.
 
 ### Implemented pieces
 
-- [`cudnn.jax.cutedsl`](../../python/cudnn/jax/cutedsl.py)
-  - remains an internal POC seam rather than a top-level public export; DSA
-    Indexer Top-K now consumes its workspace path from a real-kernel wrapper;
+- [`cudnn._jax.cutedsl`](../../python/cudnn/_jax/cutedsl.py)
+  - remains an internal POC seam rather than a top-level public export;
+    `cudnn.jax.cutedsl` is a compatibility re-export, while operation-local
+    modules import the neutral path so they can load before the facade;
+  - DSA Indexer Top-K consumes its workspace path from a real-kernel wrapper;
   - translates output/workspace metadata to `cutlass_call`;
   - appends hidden workspaces and drops them from public results;
   - supports uninitialized, zeroed, and constant-filled buffers;
@@ -682,6 +697,18 @@ removes the legacy FFI branch from the supported integration surface.
     per-call INT32 workspace from the public result;
   - supports concrete shapes and `return_val=True`; it rejects workspace sizes
     above the kernel's INT32 indexing limit rather than host-chunking the call.
+- [`cudnn.jax.DSA.sparse_indexer_score_recompute_wrapper`](../../python/cudnn/deepseek_sparse_attention/score_recompute/jax.py)
+  - preserves the existing DSA wrapper name for the sparse indexer training
+    scores and returns one FP32 `predict` array;
+  - lowers the existing SM100 sparse score kernel without Torch allocation,
+    mutation, or algorithmic scratch workspace;
+  - shares the framework-neutral attention tile dispatch and SMEM-budget
+    resolver with the existing Torch interface.
+- [`cudnn.jax.DSA.sparse_attn_score_recompute_wrapper`](../../python/cudnn/deepseek_sparse_attention/score_recompute/jax.py)
+  - shares the same fixed BSHD lowering path for sparse attention targets and
+    returns one FP32 `target` array;
+  - keeps the attention scale and compile-affecting kernel configuration static
+    while XLA supplies arrays, result storage, and the runtime stream.
 - CPU-only adapter contract tests cover hidden workspace, initialization,
   layout passthrough, and invalid call plans.
 - Dependency-free contract tests use lightweight module stand-ins to cover the
@@ -694,15 +721,16 @@ removes the legacy FFI branch from the supported integration surface.
 
 ### POC limitations
 
-- Three operations are exposed: RMSNorm + RHT + amax, DSA Indexer Forward, and
-  DSA Indexer Top-K.
+- Five operations are exposed: RMSNorm + RHT + amax, DSA Indexer Forward,
+  DSA Indexer Top-K, and the sparse indexer/attention score-recompute pair.
 - Shapes must be concrete during tracing.
 - RMSNorm accepts its rank-2/rank-1 core domain. DSA Indexer Forward currently
-  accepts fixed BSHD only, and DSA Indexer Top-K requires `return_val=True` and
-  a workspace within the INT32 indexing limit. The top-K wrapper also rejects
-  configurations where `top_k` is not divisible by the native kernel's
-  selected output vector width. The broader Torch compatibility domains remain
-  unchanged.
+  accepts fixed BSHD only. The sparse score-recompute wrappers likewise expose
+  only their fixed BSHD SM100 domains; they do not expose the Torch SM90 or THD
+  paths. DSA Indexer Top-K requires `return_val=True` and a workspace within the
+  INT32 indexing limit. The top-K wrapper also rejects configurations where
+  `top_k` is not divisible by the native kernel's selected output vector width.
+  The broader Torch compatibility domains remain unchanged.
 - No custom gradient, batching, or partitioning rule.
 - The POC relies on CUTLASS 4.5 target auto-detection and assumes all visible
   GPUs have one architecture. Heterogeneous-architecture processes remain
@@ -727,15 +755,17 @@ pending.
 - Extract one framework-neutral launch config.
 - Port RMSNorm + RHT + amax.
 - Port DSA Indexer Forward and Indexer Top-K to exercise a constant-initialized
-  padded result and a real hidden workspace.
+  padded result and a real hidden workspace, then port the sparse
+  indexer/attention score-recompute pair as fully-overwritten results.
 - Add CPU contract tests plus `eval_shape`, lowering, and GPU numerical tests
-  for the three wrappers.
+  for the five wrappers.
 - Enforce the Torch-independent JAX import boundary with an automatically
   discovered local import graph rather than per-kernel path lists.
 
-Review checkpoint: run all three wrappers on SM100, inspect lowered StableHLO
-for one custom call per wrapper, verify initialized output reset across repeated
-Indexer Forward calls, and confirm the Top-K workspace is not user-visible.
+Review checkpoint: run all five wrappers on SM100, inspect lowered StableHLO for
+one custom call per wrapper, verify initialized output reset across repeated
+Indexer Forward calls, confirm the Top-K workspace is not user-visible, and
+compare both sparse score-recompute results against their JAX references.
 
 ### Phase 1: neutral metadata core
 

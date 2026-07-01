@@ -11,7 +11,7 @@ from typing import Any, NamedTuple
 import jax.numpy as jnp
 from cutlass.jax import jax_to_cutlass_dtype
 
-from ...jax.cutedsl import BufferSpec, call_cutedsl
+from ..._jax.cutedsl import BufferSpec, call_cutedsl
 
 _INT32_MAX = (1 << 31) - 1
 
@@ -88,10 +88,7 @@ def require_supported_top_k_output(
         2,
     )
     if top_k % vector_size:
-        raise ValueError(
-            f"top_k ({top_k}) must be divisible by the selected output vector "
-            f"width ({vector_size}); adjust top_k or num_copy_bits"
-        )
+        raise ValueError(f"top_k ({top_k}) must be divisible by the selected output vector " f"width ({vector_size}); adjust top_k or num_copy_bits")
 
 
 def indexer_top_k_wrapper(
@@ -116,14 +113,12 @@ def indexer_top_k_wrapper(
     during tracing.
 
     Shapes and configuration arguments must be concrete while tracing. The
-    proof of concept supports the kernel's single-launch path and always
-    returns both indices and values.
+    API supports the kernel's single-launch path and always returns both
+    indices and values.
     """
 
     if not return_val:
-        raise NotImplementedError(
-            "The JAX indexer_top_k_wrapper proof of concept currently requires " "return_val=True"
-        )
+        raise NotImplementedError("The JAX indexer_top_k_wrapper requires return_val=True")
 
     if not hasattr(input_values, "shape") or not hasattr(input_values, "dtype"):
         raise TypeError("input_values must be a JAX array with shape and dtype metadata")
@@ -144,20 +139,14 @@ def indexer_top_k_wrapper(
     if next_n <= 0:
         raise ValueError(f"next_n must be positive, got {next_n}")
     if num_rows != batch_size * next_n:
-        raise ValueError(
-            f"num_rows ({num_rows}) must equal seq_lens.size * next_n "
-            f"({batch_size} * {next_n} = {batch_size * next_n})"
-        )
+        raise ValueError(f"num_rows ({num_rows}) must equal seq_lens.size * next_n " f"({batch_size} * {next_n} = {batch_size * next_n})")
     if top_k <= 0 or top_k > min(2048, num_cols):
         raise ValueError(f"top_k must be in (0, min(2048, num_cols={num_cols})], got {top_k}")
     if num_copy_bits <= 0 or num_copy_bits % 8:
         raise ValueError(f"num_copy_bits must be a positive whole-byte width, got {num_copy_bits}")
     copy_bytes = num_copy_bits // 8
     if copy_bytes & (copy_bytes - 1):
-        raise ValueError(
-            "num_copy_bits must describe a power-of-two byte alignment, "
-            f"got {num_copy_bits} bits ({copy_bytes} bytes)"
-        )
+        raise ValueError("num_copy_bits must describe a power-of-two byte alignment, " f"got {num_copy_bits} bits ({copy_bytes} bytes)")
 
     input_dtype = jnp.dtype(input_values.dtype)
     supported_dtypes = {
@@ -173,16 +162,14 @@ def indexer_top_k_wrapper(
 
     dtype_bits = input_dtype.itemsize * 8
     if num_copy_bits % dtype_bits != 0:
-        raise ValueError(
-            f"num_copy_bits ({num_copy_bits}) must be divisible by the " f"input dtype width ({dtype_bits})"
-        )
+        raise ValueError(f"num_copy_bits ({num_copy_bits}) must be divisible by the " f"input dtype width ({dtype_bits})")
 
     workspace_buffers = 2 if input_dtype == jnp.dtype(jnp.float32) else 1
     workspace_elements = num_rows * workspace_buffers * num_cols
     if workspace_elements > _INT32_MAX:
         raise NotImplementedError(
-            "The JAX indexer_top_k_wrapper does not yet implement the Torch "
-            "row-chunking fallback required when the int32 workspace contains "
+            "The JAX indexer_top_k_wrapper does not support the Torch "
+            "row-chunking fallback used when the int32 workspace contains "
             f"more than {_INT32_MAX} elements (requested {workspace_elements})"
         )
 
