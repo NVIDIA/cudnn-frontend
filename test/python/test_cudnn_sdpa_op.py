@@ -149,9 +149,11 @@ def sdpa_reference_fwd_bwd(
 def _skip_if_unsupported_d256(D):
     if D != 256:
         return
+    major, _ = torch.cuda.get_device_capability()
     if cudnn.backend_version() >= _CUDNN_BACKEND_D256_VERSION:
+        if major < 9:
+            pytest.skip("d=256 backward path requires SM90+")
         return
-    major, minor = torch.cuda.get_device_capability()
     if major < 10:
         pytest.skip("d=256 backward path requires SM100+")
     try:
@@ -237,6 +239,7 @@ class TestCudnnSdpa:
             pytest.skip(
                 f"cuDNN backend {cudnn.backend_version()} < {_CUDNN_BACKEND_D256_VERSION}; " "the cuDNN backend d=256 path is not available in this build"
             )
+        _skip_if_unsupported_d256(256)
 
         oss_calls = []
 
