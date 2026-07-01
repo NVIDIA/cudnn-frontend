@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free tests for JAX wrapper host-static values."""
+"""Tests for reusable JAX wrapper utilities."""
 
 from __future__ import annotations
 
@@ -12,10 +12,10 @@ from pathlib import Path
 import sys
 import unittest
 
-_MODULE_PATH = Path(__file__).resolve().parents[3] / "python" / "cudnn" / "jax" / "_static_values.py"
+_MODULE_PATH = Path(__file__).resolve().parents[3] / "python" / "cudnn" / "jax" / "utils.py"
 _OPTIONAL_ROOTS = ("jax", "numpy", "torch", "cutlass")
 _OPTIONAL_MODULES_BEFORE = {name for name in sys.modules if name.split(".", 1)[0] in _OPTIONAL_ROOTS}
-_SPEC = importlib.util.spec_from_file_location("cudnn_jax_static_values_test", _MODULE_PATH)
+_SPEC = importlib.util.spec_from_file_location("cudnn_jax_utils_test", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE

@@ -10,8 +10,8 @@ from typing import Any, NamedTuple, Optional
 
 from .._rmsnorm_rht_amax_config import resolve_launch_config
 
-from ._static_values import optional_static_int, require_concrete_dims, require_static_float
 from .cutedsl import BufferSpec, TensorLayout, call_cutedsl
+from .utils import optional_static_int, require_concrete_dims, require_static_float
 
 
 class RmsNormRhtAmaxResult(NamedTuple):

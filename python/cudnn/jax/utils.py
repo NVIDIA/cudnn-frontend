@@ -1,10 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Host-static scalar normalization shared by optional JAX wrappers.
+"""Shared utilities for optional JAX wrappers.
 
-The helpers use Python numeric protocols so they reject JAX arrays and tracers
-without importing JAX or attempting device-to-host scalar conversion.
+Static-value helpers use Python numeric protocols so they reject JAX arrays and
+tracers without importing JAX or attempting device-to-host scalar conversion.
 """
 
 from __future__ import annotations
