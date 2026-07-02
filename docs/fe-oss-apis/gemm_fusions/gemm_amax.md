@@ -64,6 +64,14 @@ A (MxKxL), SFA                   B (NxKxL), SFB
 ## API Usage
 
 ### High-level wrapper
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 result = gemm_amax_wrapper_sm100(
     a_tensor,
@@ -81,6 +89,47 @@ result = gemm_amax_wrapper_sm100(
 c, amax = result
 # Key access: result["c_tensor"], result["amax_tensor"]
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import gemm_amax_wrapper_sm100
+
+@jax.jit
+def run(a, b, sfa, sfb):
+    return gemm_amax_wrapper_sm100(
+        a,
+        b,
+        sfa,
+        sfb,
+        c_major="n",
+        c_dtype=jnp.float32,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        sf_vec_size=32,
+        a_major="k",
+        b_major="k",
+    )
+
+c, amax = run(a, b, sfa, sfb)
+```
+
+The JAX API supports FP8 A/B, E8M0 scale factors, `sf_vec_size=32`, and
+float32/float16/bfloat16 C. It preserves the logical Torch tensor shapes while
+using `a_major`, `b_major`, and `c_major` to constrain physical XLA layouts.
+Packed FP4x2 is not exposed because JAX's scalar FP4 type has a different
+storage ABI. JAX initializes the amax reduction on every invocation.
+
+`````
+
+``````
 
 ### Class API
 ```python
@@ -157,6 +206,9 @@ Returns a `TupleDict` with keys:
 - `amax_tensor`: Max-abs reduction output
 
 Tuple unpacking order is: `(c_tensor, amax_tensor)`.
+
+The JAX API returns `GemmAmaxResult`, a named tuple with the same field names
+and unpacking order.
 
 ### Class-specific parameters: `GemmAmaxSm100`
 

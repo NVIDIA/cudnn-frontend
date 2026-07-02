@@ -75,6 +75,13 @@ A (MxKxL), SFA                   B (NxKxL), SFB
 
 ### High-level wrapper
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import gemm_dsrelu_wrapper_sm100
 
@@ -99,6 +106,52 @@ result = gemm_dsrelu_wrapper_sm100(
 
 d, dprob, amax, sfd = result
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import gemm_dsrelu_wrapper_sm100
+
+@jax.jit
+def run(a, b, c, sfa, sfb, prob):
+    return gemm_dsrelu_wrapper_sm100(
+        a,
+        b,
+        c,
+        sfa,
+        sfb,
+        prob,
+        alpha=1.0,
+        d_major="n",
+        d_dtype=jnp.bfloat16,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        a_major="k",
+        b_major="k",
+    )
+
+d, dprob, amax, sfd = run(a, b, c, sfa, sfb, prob)
+```
+
+The JAX API supports FP8 A/B with E8M0 scale factors and
+`sf_vec_size=32`. C and D may be float32, float16, or bfloat16. The API
+creates and zero-initializes `dprob` for each invocation. Output quantization
+is not exposed, so `amax` and `sfd` are `None`. `M` must be divisible by 128
+because the native probability load is not predicated for a partial final M
+tile. For `TILE_M=256`, `M` must instead be divisible by 256 so both CTAs in
+each MMA pair are present.
+
+`````
+
+``````
 
 ### Class API
 
@@ -218,6 +271,9 @@ Returns a `TupleDict` with keys:
 - `sfd_tensor`
 
 Tuple unpacking order is: `(d_tensor, dprob_tensor, amax_tensor, sfd_tensor)`.
+
+The JAX API returns `GemmDsreluResult`, a named tuple with the same field names
+and unpacking order.
 
 ---
 

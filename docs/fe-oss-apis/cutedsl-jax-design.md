@@ -30,11 +30,12 @@ abstract value, not a device buffer:
 | Mutation | Preallocated outputs are mutated | Public API remains functional; legal aliases are declared |
 | Cache | Python object and compiled callable | JAX executable cache plus CUTLASS function/spec cache |
 
-The proof of concept implements this split for five real FE-OSS operations:
-RMSNorm + RHT + amax, DSA Indexer Forward, DSA Indexer Top-K, and the sparse
-indexer/attention score-recompute pair. When Torch is installed, the existing
-Torch APIs remain unchanged. JAX support is reviewed per operation rather than
-required for every new or modified PyTorch API or physical CuTe kernel.
+The current implementation applies this split to nine FE-OSS operations:
+RMSNorm + RHT + amax; all four dense GEMM fusions; DSA Indexer Forward and
+Indexer Top-K; and the sparse indexer/attention score-recompute pair. When
+Torch is installed, the existing Torch APIs remain unchanged. JAX support is
+reviewed per operation rather than required for every new or modified PyTorch
+API or physical CuTe kernel.
 
 This source-layout variant co-locates the bindings for each implemented
 operation: `api.py` is always Torch and a sibling `jax.py` is always JAX. The
@@ -167,7 +168,7 @@ from cudnn.jax import rmsnorm_rht_amax_sm100
 jax_result = rmsnorm_rht_amax_sm100(...)
 ```
 
-The DSA POCs preserve the existing wrapper names and namespace shape:
+The DSA bindings preserve the existing wrapper names and namespace shape:
 
 ```python
 # Existing unqualified names remain PyTorch.
@@ -193,8 +194,11 @@ The implementations are co-located with the kernels:
 cudnn/
   _operation_api.py                         shared lazy operation exports
   _jax/cutedsl.py                          import-order-neutral adapter implementation
+  _jax/validation.py                       shared JAX metadata validation
+  _jax/gemm.py                             shared GEMM layout and metadata helpers
   jax/                                      shared facade and cutedsl.py compatibility export
   rmsnorm_rht_amax/{api.py,jax.py,config.py,kernel.py}
+  gemm_{swiglu,amax,srelu,dsrelu}/{api.py,jax.py,...}
   deepseek_sparse_attention/
     indexer_forward/{api.py,jax.py,...}
     indexer_top_k/{api.py,jax.py,...}
@@ -224,13 +228,13 @@ The current wrapper inventory makes the functional gap concrete:
 | Family | Public Torch wrapper entry points | Available JAX bindings |
 | --- | ---: | ---: |
 | RMSNorm + RHT + amax | 1 | 1 |
-| Dense GEMM fusions | 4 | 0 |
+| Dense GEMM fusions | 4 | 4 |
 | Grouped GEMM | 9 | 0 |
 | Discrete grouped GEMM | 2 | 0 |
 | SDPA | 2 | 0 |
 | Native sparse attention | 4 | 0 |
 | DeepSeek sparse attention stages | 11 | 4 |
-| **Total** | **33** | **5** |
+| **Total** | **33** | **9** |
 
 The table is a point-in-time review aid, not a coverage requirement or promise
 that every helper wrapper needs a JAX equivalent.
@@ -507,8 +511,8 @@ a thread-safe stateful runtime design.
 
 | Family | Main JAX work |
 | --- | --- |
-| RMSNorm + RHT + amax | Static output inference, BF16 validation, per-CTA amax shape. POC complete. |
-| Dense GEMM fusions | Map M/N-major compact layouts, FP4/FP8 storage, multiple auxiliary outputs, and initialized amax buffers. |
+| RMSNorm + RHT + amax | Static output inference, BF16 validation, and per-CTA amax shape are implemented. |
+| Dense GEMM fusions | All four wrappers have JAX bindings with explicit compact layouts. SwiGLU covers the unquantized path; amax, sReLU, and dsReLU cover MXFP8 with E8M0 scales. Initialized amax/dprob results are functional. Packed FP4 and output quantization remain future work. |
 | SDPA forward | Make max sequence bounds static; remove `.item()` inference; model optional varlen operands and output layouts. |
 | SDPA backward | Per-call zeroed workspace, multi-kernel ordering, residual contract, and `custom_vjp`. |
 | Grouped GEMM | Per-call descriptor/scheduler workspace, helper launches, counters, and metadata validation without host reads. |
@@ -719,10 +723,11 @@ removes the legacy FFI branch from the supported integration surface.
   DSL, CUDA, and SM100 are available. The RMSNorm and Indexer Forward cases
   also execute one compiled program twice to check reuse and output reset.
 
-### POC limitations
+### Current limitations
 
-- Five operations are exposed: RMSNorm + RHT + amax, DSA Indexer Forward,
-  DSA Indexer Top-K, and the sparse indexer/attention score-recompute pair.
+- Nine operations are exposed: RMSNorm + RHT + amax, the four dense GEMM
+  fusions, DSA Indexer Forward, DSA Indexer Top-K, and the sparse
+  indexer/attention score-recompute pair.
 - Shapes must be concrete during tracing.
 - RMSNorm accepts its rank-2/rank-1 core domain. DSA Indexer Forward currently
   accepts fixed BSHD only. The sparse score-recompute wrappers likewise expose
@@ -730,14 +735,18 @@ removes the legacy FFI branch from the supported integration surface.
   paths. DSA Indexer Top-K requires `return_val=True` and a workspace within the
   INT32 indexing limit. The top-K wrapper also rejects configurations where
   `top_k` is not divisible by the native kernel's selected output vector width.
+  Dense SwiGLU exposes its unquantized path. Dense amax, sReLU, and dsReLU
+  expose FP8 A/B with E8M0 scale factors and `sf_vec_size=32`; packed FP4,
+  FP8 outputs, and their auxiliary output-scale paths remain Torch-only.
   The broader Torch compatibility domains remain unchanged.
 - No custom gradient, batching, or partitioning rule.
-- The POC relies on CUTLASS 4.5 target auto-detection and assumes all visible
+- The integration relies on CUTLASS 4.5 target auto-detection and assumes all visible
   GPUs have one architecture. Heterogeneous-architecture processes remain
   unsupported until CUTLASS includes the lowering target in its compile-cache
   key (or the API adds an explicit static target override).
 - No local SM100 GPU was available for execution in the development
-  environment. The RMSNorm and DSA GPU tests are present but must run in CI.
+  environment. The RMSNorm, DSA, and dense GEMM GPU tests are present but must
+  run in CI.
 - CPU contract tests still use a fake CUTLASS bridge for deterministic edge
   cases. DSA Indexer Top-K now connects the hidden-workspace path to a real
   kernel wrapper and has a GPU test, but that test was not executable locally.
@@ -746,7 +755,7 @@ removes the legacy FFI branch from the supported integration surface.
 
 ## Rollout plan and validation milestones
 
-### Phase 0: vertical-slice POC
+### Phase 0: vertical slice
 
 Status: wrapper implementation complete in this change; DSA GPU validation is
 pending.
@@ -757,15 +766,19 @@ pending.
 - Port DSA Indexer Forward and Indexer Top-K to exercise a constant-initialized
   padded result and a real hidden workspace, then port the sparse
   indexer/attention score-recompute pair as fully-overwritten results.
-- Add CPU contract tests plus `eval_shape`, lowering, and GPU numerical tests
-  for the five wrappers.
+- Port the four dense GEMM wrappers with explicit input/output layouts and
+  initialized reduction outputs.
+- Add CPU contract and `eval_shape` coverage for all nine wrappers, with
+  targeted lowering and GPU numerical tests for representative output,
+  initialization, and workspace contracts.
 - Enforce the Torch-independent JAX import boundary with an automatically
   discovered local import graph rather than per-kernel path lists.
 
-Review checkpoint: run all five wrappers on SM100, inspect lowered StableHLO for
-one custom call per wrapper, verify initialized output reset across repeated
-Indexer Forward calls, confirm the Top-K workspace is not user-visible, and
-compare both sparse score-recompute results against their JAX references.
+Review checkpoint: run all nine wrappers on SM100, inspect lowered StableHLO
+for one custom call per wrapper, verify initialized output reset across
+repeated Indexer Forward, GEMM amax, and dsReLU calls, confirm the Top-K
+workspace is not user-visible, and compare numerical results against JAX
+references.
 
 ### Phase 1: neutral metadata core
 

@@ -12,6 +12,7 @@ import jax.numpy as jnp
 from cutlass.jax import jax_to_cutlass_dtype
 
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
+from ..._jax.validation import require_dtype
 
 _INT32_MAX = (1 << 31) - 1
 
@@ -148,17 +149,12 @@ def indexer_top_k_wrapper(
     if copy_bytes & (copy_bytes - 1):
         raise ValueError("num_copy_bits must describe a power-of-two byte alignment, " f"got {num_copy_bits} bits ({copy_bytes} bytes)")
 
-    input_dtype = jnp.dtype(input_values.dtype)
-    supported_dtypes = {
-        jnp.dtype(jnp.float16),
-        jnp.dtype(jnp.bfloat16),
-        jnp.dtype(jnp.float32),
-    }
-    if input_dtype not in supported_dtypes:
-        supported = "float16, bfloat16, or float32"
-        raise TypeError(f"input_values must have dtype {supported}, got {input_dtype}")
-    if jnp.dtype(seq_lens.dtype) != jnp.dtype(jnp.int32):
-        raise TypeError(f"seq_lens must have dtype int32, got {seq_lens.dtype}")
+    input_dtype = require_dtype(
+        "input_values.dtype",
+        input_values,
+        (jnp.float16, jnp.bfloat16, jnp.float32),
+    )
+    require_dtype("seq_lens.dtype", seq_lens, (jnp.int32,))
 
     dtype_bits = input_dtype.itemsize * 8
     if num_copy_bits % dtype_bits != 0:

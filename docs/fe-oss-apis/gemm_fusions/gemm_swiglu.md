@@ -68,6 +68,13 @@ Notes:
 
 ### High-level wrapper (Standard Mode)
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 result = gemm_swiglu_wrapper_sm100(
     a_tensor,
@@ -86,9 +93,53 @@ ab12, c, sfc, amax = result
 # Key access: result["ab12_tensor"], result["c_tensor"]
 ```
 
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import gemm_swiglu_wrapper_sm100
+
+@jax.jit
+def run(a, b):
+    return gemm_swiglu_wrapper_sm100(
+        a,
+        b,
+        alpha=1.0,
+        c_major="m",
+        ab12_dtype=jnp.float32,
+        c_dtype=jnp.float16,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        a_major="k",
+        b_major="k",
+    )
+
+ab12, c, sfc, amax = run(a, b)
+```
+
+The JAX API supports the standard mode. It uses the same logical
+`(M, K, L)`, `(N, K, L)`, and `(M, N, L)` shapes while explicit major-mode
+arguments constrain the compact XLA layouts. `TILE_N` must be one of
+`{64, 128, 192, 256}` because the epilogue consumes 32-column subtiles in
+pairs. With `TILE_M=256`, `M` must be divisible by 256 so both CTAs in each
+MMA pair are present. `sfc` and `amax` are `None`.
+
+`````
+
+``````
+
 ### High-level wrapper (Quantized Mode)
 
 When scale factor tensors are provided, the wrapper uses the block-scaled quantized kernel.
+
+This mode is currently available through the PyTorch API. The JAX API rejects
+the quantization arguments rather than silently selecting a different kernel.
 
 ```python
 result = gemm_swiglu_wrapper_sm100(
@@ -285,6 +336,10 @@ Tuple unpacking order is always:
 
 - **Standard mode**: `sfc_tensor is None` and `amax_tensor is None`
 - **Quantized mode**: `sfc_tensor` and/or `amax_tensor` are populated based on dtype/configuration
+
+The JAX API returns `GemmSwigluResult`, a named tuple with the same four field
+names and unpacking order. Its supported standard mode returns `None` for the
+last two fields.
 
 ### Class-specific parameters
 

@@ -37,7 +37,7 @@ pip install nvidia-cudnn-frontend[cutedsl]
 
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
 
-The experimental JAX proof of concept uses a separate optional dependency set:
+The JAX integration uses a separate optional dependency set:
 
 ```bash
 pip install nvidia-cudnn-frontend[jax]
@@ -61,12 +61,15 @@ binding.
 
 PyTorch remains the default FE-OSS interface and preserves its existing
 wrappers and classes. Some operations also provide a functional JAX API under
-`cudnn.jax`. For example, RMSNorm + RHT + amax currently uses the same
-functional name in both namespaces:
+`cudnn.jax`. RMSNorm + RHT + amax and the dense GEMM fusions retain aligned
+functional names across the two namespaces:
 
 ```python
 from cudnn import rmsnorm_rht_amax_sm100
 from cudnn.jax import rmsnorm_rht_amax_sm100
+
+from cudnn import gemm_swiglu_wrapper_sm100
+from cudnn.jax import gemm_swiglu_wrapper_sm100
 ```
 
 Where both bindings exist, they should offer comparable operation semantics and

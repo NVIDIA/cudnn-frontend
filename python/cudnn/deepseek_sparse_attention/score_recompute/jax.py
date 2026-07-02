@@ -11,6 +11,7 @@ from typing import Any, NamedTuple, Optional
 import jax.numpy as jnp
 
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
+from ..._jax.validation import require_dtype
 from .config import resolve_sparse_score_kernel_config
 
 
@@ -24,11 +25,6 @@ class SparseAttnScoreRecomputeResult(NamedTuple):
     """Normalized sparse attention scores."""
 
     target: Any
-
-
-def _require_dtype(name: str, value: Any, expected: Any) -> None:
-    if jnp.dtype(value.dtype) != jnp.dtype(expected):
-        raise ValueError(f"{name} must have dtype {jnp.dtype(expected)}, got {value.dtype}")
 
 
 @lru_cache(maxsize=None)
@@ -129,10 +125,10 @@ def _sparse_score_recompute(
     per_head_shape = tuple(per_head.shape)
     topk_shape = tuple(topk_indices.shape)
 
-    _require_dtype("q", q, jnp.bfloat16)
-    _require_dtype("k", k, jnp.bfloat16)
-    _require_dtype(per_head_name, per_head, per_head_dtype)
-    _require_dtype("topk_indices", topk_indices, jnp.int32)
+    require_dtype("q.dtype", q, (jnp.bfloat16,))
+    require_dtype("k.dtype", k, (jnp.bfloat16,))
+    require_dtype(f"{per_head_name}.dtype", per_head, (per_head_dtype,))
+    require_dtype("topk_indices.dtype", topk_indices, (jnp.int32,))
 
     batch, seqlen_q, num_query_heads, head_dim = q_shape
     k_batch, seqlen_k, k_head_dim = k_shape
@@ -170,7 +166,7 @@ def _sparse_score_recompute(
         if len(topk_length.shape) != 2:
             raise ValueError(f"topk_length must have rank 2, got shape {topk_length.shape}")
         topk_length_shape = tuple(topk_length.shape)
-        _require_dtype("topk_length", topk_length, jnp.int32)
+        require_dtype("topk_length.dtype", topk_length, (jnp.int32,))
         if topk_length_shape != (batch, seqlen_q):
             raise ValueError(f"topk_length shape must be {(batch, seqlen_q)}, " f"got {topk_length_shape}")
 

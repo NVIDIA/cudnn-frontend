@@ -52,6 +52,10 @@ from ..deepseek_sparse_attention.score_recompute.jax import (
     sparse_attn_score_recompute_wrapper,
     sparse_indexer_score_recompute_wrapper,
 )
+from ..gemm_amax.jax import GemmAmaxResult, gemm_amax_wrapper_sm100
+from ..gemm_dsrelu.jax import GemmDsreluResult, gemm_dsrelu_wrapper_sm100
+from ..gemm_srelu.jax import GemmSreluResult, gemm_srelu_wrapper_sm100
+from ..gemm_swiglu.jax import GemmSwigluResult, gemm_swiglu_wrapper_sm100
 from ..rmsnorm_rht_amax.jax import (
     RmsNormRhtAmaxResult,
     rmsnorm_rht_amax_sm100,
@@ -66,6 +70,10 @@ DSA = SimpleNamespace(
 
 __all__ = [
     "DSA",
+    "GemmAmaxResult",
+    "GemmDsreluResult",
+    "GemmSreluResult",
+    "GemmSwigluResult",
     "IndexerForwardResult",
     "IndexerTopKResult",
     "RmsNormRhtAmaxResult",
@@ -73,6 +81,10 @@ __all__ = [
     "SparseIndexerScoreRecomputeResult",
     "indexer_forward_wrapper",
     "indexer_top_k_wrapper",
+    "gemm_amax_wrapper_sm100",
+    "gemm_dsrelu_wrapper_sm100",
+    "gemm_srelu_wrapper_sm100",
+    "gemm_swiglu_wrapper_sm100",
     "rmsnorm_rht_amax_sm100",
     "sparse_attn_score_recompute_wrapper",
     "sparse_indexer_score_recompute_wrapper",
