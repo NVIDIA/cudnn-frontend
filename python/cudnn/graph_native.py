@@ -275,11 +275,76 @@ class NativeGraph:
         self._nodes.append(node)
         return C
 
-    def _pointwise(self, mode: Any, inputs: list, name: str, compute_data_type: Any = None) -> Tensor:
-        """Internal helper for pointwise ops."""
+    # ---- Pointwise ops ------------------------------------------------------
+    # ``params["mode"]`` is the op kind == the C++ pygraph method name (the
+    # pointwise_mode enum is not exposed to Python, and the method name IS the
+    # canonical semantic name), so lowering is a direct getattr dispatch — no
+    # mode<->method mapping table to maintain. Extra scalar attributes
+    # (negative_slope / clips / swish_beta / axis) live in params and are
+    # forwarded at lowering; ops that take them get explicit builders below,
+    # the uniform rest are generated from _POINTWISE_TENSOR_ARGS (the table
+    # mirrors the pybind signatures — tensor-argument names per op — so both
+    # positional and the classic keyword call styles work).
+
+    _POINTWISE_TENSOR_ARGS: "dict[str, tuple]" = {
+        # unary
+        **{
+            op: ("input",)
+            for op in (
+                "abs",
+                "ceil",
+                "cos",
+                "elu",
+                "erf",
+                "exp",
+                "floor",
+                "gelu",
+                "gelu_approx_tanh",
+                "identity",
+                "log",
+                "logical_not",
+                "neg",
+                "reciprocal",
+                "rsqrt",
+                "sigmoid",
+                "sin",
+                "softplus",
+                "sqrt",
+                "tan",
+                "tanh",
+            )
+        },
+        # binary
+        **{op: ("a", "b") for op in ("add", "add_square", "div", "logical_and", "logical_or", "mul", "sub")},
+        **{op: ("input0", "input1") for op in ("max", "min", "mod", "pow")},
+        **{op: ("input", "comparison") for op in ("cmp_eq", "cmp_ge", "cmp_gt", "cmp_le", "cmp_lt", "cmp_neq")},
+        "bias": ("input", "bias"),
+        "scale": ("input", "scale"),
+        # backward (loss, input) -> dinput
+        **{
+            op: ("loss", "input")
+            for op in (
+                "elu_backward",
+                "gelu_approx_tanh_backward",
+                "gelu_backward",
+                "sigmoid_backward",
+                "softplus_backward",
+                "tanh_backward",
+            )
+        },
+        # ternary
+        "binary_select": ("input0", "input1", "mask"),
+    }
+    # scalar attributes forwarded from params to the C++ call at lowering
+    _POINTWISE_EXTRA_PARAMS = ("negative_slope", "lower_clip", "upper_clip", "swish_beta", "axis")
+
+    def _pointwise(self, mode: str, inputs: list, name: str, compute_data_type: Any = None, extra_params: Optional[dict] = None) -> Tensor:
+        """Internal helper for pointwise ops. ``mode`` == C++ pygraph method name."""
         inputs = [self._ensure_tensor(t, name=f"{name}::IN_{i}") for i, t in enumerate(inputs)]
         node = Node(name, NodeType.POINTWISE, compute_data_type or self._context.compute_data_type)
         node.params["mode"] = mode
+        if extra_params:
+            node.params.update({k: v for k, v in extra_params.items() if v is not None})
         for i, t in enumerate(inputs):
             node.inputs[f"IN_{i}"] = t
 
@@ -290,73 +355,49 @@ class NativeGraph:
         self._nodes.append(node)
         return out
 
-    def add(self, a: Tensor, b: Tensor, name: str = "", compute_data_type: Any = None) -> Tensor:
-        """Element-wise add."""
-        try:
-            import cudnn
+    # Pointwise ops with extra scalar attributes: explicit builders.
 
-            mode = cudnn._pybind_module.pointwise_mode.ADD
-        except Exception:
-            mode = "ADD"
-        return self._pointwise(mode, [a, b], self._get_name("add", name), compute_data_type)
+    def relu(
+        self, input: Any, negative_slope: Any = None, lower_clip: Any = None, upper_clip: Any = None, name: str = "", compute_data_type: Any = None
+    ) -> Tensor:
+        """ReLU (optionally leaky via negative_slope, and/or clipped)."""
+        return self._pointwise(
+            "relu", [input], self._get_name("relu", name), compute_data_type, dict(negative_slope=negative_slope, lower_clip=lower_clip, upper_clip=upper_clip)
+        )
 
-    def mul(self, a: Tensor, b: Tensor, name: str = "", compute_data_type: Any = None) -> Tensor:
-        """Element-wise multiply."""
-        try:
-            import cudnn
+    def leaky_relu(self, input: Any, negative_slope: Any, name: str = "", compute_data_type: Any = None) -> Tensor:
+        """Leaky ReLU."""
+        return self._pointwise("leaky_relu", [input], self._get_name("leaky_relu", name), compute_data_type, dict(negative_slope=negative_slope))
 
-            mode = cudnn._pybind_module.pointwise_mode.MUL
-        except Exception:
-            mode = "MUL"
-        return self._pointwise(mode, [a, b], self._get_name("mul", name), compute_data_type)
+    def swish(self, input: Any, swish_beta: Any = None, name: str = "", compute_data_type: Any = None) -> Tensor:
+        """Swish / SiLU."""
+        return self._pointwise("swish", [input], self._get_name("swish", name), compute_data_type, dict(swish_beta=swish_beta))
 
-    def relu(self, x: Tensor, name: str = "", compute_data_type: Any = None) -> Tensor:
-        """ReLU activation."""
-        try:
-            import cudnn
+    def gen_index(self, input: Any, axis: int, name: str = "", compute_data_type: Any = None) -> Tensor:
+        """Generate index along an axis."""
+        return self._pointwise("gen_index", [input], self._get_name("gen_index", name), compute_data_type, dict(axis=axis))
 
-            mode = cudnn._pybind_module.pointwise_mode.RELU_FWD
-        except Exception:
-            mode = "RELU_FWD"
-        return self._pointwise(mode, [x], self._get_name("relu", name), compute_data_type)
+    def relu_backward(
+        self, loss: Any, input: Any, negative_slope: Any = None, lower_clip: Any = None, upper_clip: Any = None, name: str = "", compute_data_type: Any = None
+    ) -> Tensor:
+        """ReLU backward."""
+        return self._pointwise(
+            "relu_backward",
+            [loss, input],
+            self._get_name("relu_backward", name),
+            compute_data_type,
+            dict(negative_slope=negative_slope, lower_clip=lower_clip, upper_clip=upper_clip),
+        )
 
-    def gelu(self, x: Tensor, name: str = "", compute_data_type: Any = None) -> Tensor:
-        """GELU activation."""
-        try:
-            import cudnn
+    def leaky_relu_backward(self, loss: Any, input: Any, negative_slope: Any, name: str = "", compute_data_type: Any = None) -> Tensor:
+        """Leaky ReLU backward."""
+        return self._pointwise(
+            "leaky_relu_backward", [loss, input], self._get_name("leaky_relu_backward", name), compute_data_type, dict(negative_slope=negative_slope)
+        )
 
-            mode = cudnn._pybind_module.pointwise_mode.GELU_FWD
-        except Exception:
-            mode = "GELU_FWD"
-        return self._pointwise(mode, [x], self._get_name("gelu", name), compute_data_type)
-
-    def sigmoid(self, x: Tensor, name: str = "", compute_data_type: Any = None) -> Tensor:
-        """Sigmoid activation."""
-        try:
-            import cudnn
-
-            mode = cudnn._pybind_module.pointwise_mode.SIGMOID_FWD
-        except Exception:
-            mode = "SIGMOID_FWD"
-        return self._pointwise(mode, [x], self._get_name("sigmoid", name), compute_data_type)
-
-    def tanh(self, x: Tensor, name: str = "", compute_data_type: Any = None) -> Tensor:
-        """Tanh activation."""
-        try:
-            import cudnn
-
-            mode = cudnn._pybind_module.pointwise_mode.TANH_FWD
-        except Exception:
-            mode = "TANH_FWD"
-        return self._pointwise(mode, [x], self._get_name("tanh", name), compute_data_type)
-
-    def bias(self, x: Tensor, b: Tensor, name: str = "", compute_data_type: Any = None) -> Tensor:
-        """Add bias."""
-        return self.add(x, b, name or "bias", compute_data_type)
-
-    def scale(self, x: Tensor, s: Tensor, name: str = "", compute_data_type: Any = None) -> Tensor:
-        """Scale."""
-        return self.mul(x, s, name or "scale", compute_data_type)
+    def swish_backward(self, loss: Any, input: Any, swish_beta: Any = None, name: str = "", compute_data_type: Any = None) -> Tensor:
+        """Swish backward."""
+        return self._pointwise("swish_backward", [loss, input], self._get_name("swish_backward", name), compute_data_type, dict(swish_beta=swish_beta))
 
     # -------------------------------------------------------------------------
     # Block-scale / MoE / reduction op builders.
@@ -1055,23 +1096,13 @@ class NativeGraph:
                     name=node.name,
                 )
             elif node.node_type == NodeType.POINTWISE:
-                # The C++ pygraph exposes named pointwise ops (relu/add/...), not a
-                # generic pointwise(). Dispatch on the mode. add/mul cover bias/scale
-                # too (broadcast add/mul), so no need to distinguish here.
+                # params["mode"] IS the C++ pygraph method name — direct
+                # dispatch; scalar attributes (clips/negative_slope/...) are
+                # forwarded as keywords, tensors positionally (they lead every
+                # pointwise signature).
                 inputs = [tensor_map[t.uid] for t in node.inputs.values()]
-                mode_name = getattr(node.params["mode"], "name", str(node.params["mode"])).upper()
-                _PW_UNARY = {"RELU_FWD": "relu", "GELU_FWD": "gelu", "SIGMOID_FWD": "sigmoid", "TANH_FWD": "tanh"}
-                _PW_BINARY = {"ADD": "add", "MUL": "mul", "SUB": "sub", "DIV": "div"}
-                if len(inputs) == 1:
-                    method = _PW_UNARY.get(mode_name)
-                    if method is None:
-                        raise NotImplementedError(f"pointwise lowering: unary mode {mode_name} not mapped")
-                    cpp_out = getattr(graph, method)(inputs[0], compute_data_type=node.compute_data_type, name=node.name)
-                else:
-                    method = _PW_BINARY.get(mode_name)
-                    if method is None:
-                        raise NotImplementedError(f"pointwise lowering: binary mode {mode_name} not mapped")
-                    cpp_out = getattr(graph, method)(inputs[0], inputs[1], compute_data_type=node.compute_data_type, name=node.name)
+                extra = {k: node.params[k] for k in self._POINTWISE_EXTRA_PARAMS if k in node.params}
+                cpp_out = getattr(graph, node.params["mode"])(*inputs, compute_data_type=node.compute_data_type, name=node.name, **extra)
             elif node.node_type == NodeType.SDPA:
                 sdpa_kwargs = {
                     "q": tensor_map[node.inputs["Q"].uid],
@@ -1294,3 +1325,38 @@ class NativeGraph:
 
         self._cpp_tensors = tensor_map
         return graph
+
+
+def _install_pointwise_builders() -> None:
+    """Generate the uniform pointwise builders from _POINTWISE_TENSOR_ARGS.
+
+    Each builder accepts its tensors positionally OR by the classic pybind
+    keyword names (e.g. ``g.bias(input=x, bias=b)``, ``g.max(input0=a,
+    input1=b)``), matching the C++ pygraph API surface exactly. Ops with extra
+    scalar attributes (relu / leaky_relu / swish / gen_index + backwards) have
+    explicit builders on the class instead.
+    """
+
+    def make(op: str, argnames: tuple):
+        def builder(self, *args, name: str = "", compute_data_type: Any = None, **kwargs):
+            tensors = list(args)
+            for an in argnames[len(args) :]:
+                if an not in kwargs:
+                    raise TypeError(f"{op}() missing tensor argument {an!r}")
+                tensors.append(kwargs.pop(an))
+            if len(tensors) != len(argnames) or kwargs:
+                bad = kwargs or f"{len(tensors)} tensors"
+                raise TypeError(f"{op}() expects tensor arguments {argnames}; got unexpected {bad}")
+            return self._pointwise(op, tensors, self._get_name(op, name), compute_data_type)
+
+        builder.__name__ = op
+        builder.__qualname__ = f"NativeGraph.{op}"
+        builder.__doc__ = f"Element-wise {op}({', '.join(argnames)})."
+        return builder
+
+    for op, argnames in NativeGraph._POINTWISE_TENSOR_ARGS.items():
+        if not hasattr(NativeGraph, op):  # explicit builders (relu, ...) win
+            setattr(NativeGraph, op, make(op, argnames))
+
+
+_install_pointwise_builders()

@@ -265,6 +265,37 @@ class TestNativeGraph:
         Y = g.relu(X)
         assert g.nodes[0].node_type == NodeType.POINTWISE
 
+    def test_all_pointwise_builders(self):
+        """Every op in _POINTWISE_TENSOR_ARGS has a builder: positional AND the
+        classic pybind keyword call styles both produce a first-class node."""
+        for op, argnames in NativeGraph._POINTWISE_TENSOR_ARGS.items():
+            for style in ("positional", "keyword"):
+                g = NativeGraph()
+                tensors = [g.tensor(dim=[4, 8], name=f"t{i}") for i in range(len(argnames))]
+                builder = getattr(g, op)
+                out = builder(*tensors) if style == "positional" else builder(**dict(zip(argnames, tensors)))
+                (node,) = g.nodes
+                assert node.node_type == NodeType.POINTWISE, op
+                assert node.params["mode"] == op
+                assert len(node.inputs) == len(argnames), op
+                assert out.dim == [] or out.dim == [4, 8]  # inferred at validate
+                g.validate()
+                assert node.outputs["OUT_0"].dim == [4, 8], op
+
+    def test_pointwise_scalar_attrs(self):
+        """Ops with scalar attributes store them in params (introspectable)."""
+        g = NativeGraph()
+        X = g.tensor(dim=[4, 8], name="X")
+        g.relu(X, lower_clip=0.1, upper_clip=6.0)
+        g.leaky_relu(X, negative_slope=0.01)
+        g.swish(X, swish_beta=1.5)
+        g.gen_index(X, axis=1)
+        r, lr, sw, gi = g.nodes
+        assert r.params == {"mode": "relu", "lower_clip": 0.1, "upper_clip": 6.0}
+        assert lr.params == {"mode": "leaky_relu", "negative_slope": 0.01}
+        assert sw.params == {"mode": "swish", "swish_beta": 1.5}
+        assert gi.params == {"mode": "gen_index", "axis": 1}
+
     def test_chaining(self):
         g = NativeGraph()
         A = g.tensor(dim=[8, 64, 128], name="A")

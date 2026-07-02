@@ -23,25 +23,28 @@ from ..graph_types import NodeType
 if TYPE_CHECKING:
     from ..graph_native import NativeGraph
 
-# POINTWISE modes this reference understands, keyed by cuDNN pointwise_mode name.
+# POINTWISE ops this reference understands, keyed by the op kind
+# (params["mode"] == the pygraph method name).
 _UNARY = {
-    "RELU_FWD": lambda x: x.clamp_min(0),
-    "GELU_FWD": lambda x: torch.nn.functional.gelu(x),
-    "SIGMOID_FWD": lambda x: torch.sigmoid(x),
-    "TANH_FWD": lambda x: torch.tanh(x),
-    "EXP": lambda x: torch.exp(x),
-    "IDENTITY": lambda x: x,
+    "relu": lambda x: x.clamp_min(0),
+    "gelu": lambda x: torch.nn.functional.gelu(x),
+    "sigmoid": lambda x: torch.sigmoid(x),
+    "tanh": lambda x: torch.tanh(x),
+    "exp": lambda x: torch.exp(x),
+    "identity": lambda x: x,
 }
 _BINARY = {
-    "ADD": lambda a, b: a + b,
-    "MUL": lambda a, b: a * b,
-    "SUB": lambda a, b: a - b,
-    "DIV": lambda a, b: a / b,
+    "add": lambda a, b: a + b,
+    "mul": lambda a, b: a * b,
+    "sub": lambda a, b: a - b,
+    "div": lambda a, b: a / b,
+    "bias": lambda a, b: a + b,
+    "scale": lambda a, b: a * b,
 }
 
 
 def _mode_name(mode: Any) -> str:
-    return getattr(mode, "name", str(mode)).upper()
+    return getattr(mode, "name", str(mode)).lower()
 
 
 class ReferenceMatmulEngine(BaseEngine):
@@ -60,6 +63,9 @@ class ReferenceMatmulEngine(BaseEngine):
                 mode = _mode_name(node.params.get("mode"))
                 if mode not in _UNARY and mode not in _BINARY:
                     raise NotImplementedError(f"ReferenceMatmulEngine: unsupported pointwise mode {mode!r}")
+                if any(k != "mode" for k in node.params):
+                    # scalar attributes (clips / negative_slope / ...) not implemented
+                    raise NotImplementedError("ReferenceMatmulEngine: pointwise scalar attributes not supported")
                 continue
             raise NotImplementedError(f"ReferenceMatmulEngine only supports MATMUL / basic POINTWISE, got {node.node_type.name}")
 

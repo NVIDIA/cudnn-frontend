@@ -168,6 +168,14 @@ def _make_pointwise_wrap(name, ir_method, arity):
         out = _ORIG[name](self, *args, **kwargs)
         st = _state(self)
         try:
+            # Scalar attributes (negative_slope / clips / ...) are not carried
+            # by this mirror — routing a graph that uses them to a python
+            # engine would silently compute the wrong thing. Go opaque instead.
+            extras = [v for k, v in kwargs.items() if k not in ("name", "compute_data_type") and not _is_cudnn_tensor(v) and v is not None]
+            extras += [v for v in args if not _is_cudnn_tensor(v)]
+            if extras:
+                st["opaque"] = True
+                return out
             ins = _tensor_inputs(st, args, kwargs)
             if ins is None or len(ins) != arity:
                 st["opaque"] = True

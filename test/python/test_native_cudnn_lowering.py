@@ -156,6 +156,33 @@ def test_native_moe_grouped_matmul_lowers_to_cudnn():
     torch.testing.assert_close(out_d.view(T, Wt).float(), ref.cuda(), rtol=5e-2, atol=5e-2)
 
 
+def test_native_pointwise_batch_lowers_to_cudnn():
+    """Generated pointwise builders through real cuDNN: sqrt(abs(A@B)) clamped
+    via binary max/min (keyword call style, input0/input1)."""
+    h = _handle()
+    a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
+    b = torch.randn(1, K, N, device="cuda", dtype=torch.float16)
+    lo = torch.full((1, 1, 1), 0.5, device="cuda", dtype=torch.float32)
+    hi = torch.full((1, 1, 1), 2.0, device="cuda", dtype=torch.float32)
+    c = torch.empty(1, M, N, device="cuda", dtype=torch.float16)
+
+    g = NativeGraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(dim=[1, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.HALF)
+    B = g.tensor(dim=[1, K, N], stride=[K * N, N, 1], data_type=cudnn.data_type.HALF)
+    Lo = g.tensor(dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
+    Hi = g.tensor(dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
+    Y = g.min(input0=g.max(input0=g.sqrt(g.abs(g.matmul(A, B))), input1=Lo), input1=Hi)
+    Y.set_output(True).set_data_type(cudnn.data_type.HALF)
+
+    g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({A: a, B: b, Lo: lo, Hi: hi, Y: c}, ws, handle=h)
+    torch.cuda.synchronize()
+
+    ref = (a.float() @ b.float()).abs().sqrt().clamp(0.5, 2.0)
+    torch.testing.assert_close(c.float(), ref, atol=2e-2, rtol=2e-2)
+
+
 def test_native_rmsnorm_lowers_to_cudnn():
     """rmsnorm (multi-output: Y + inv_var, pass-by-value epsilon) -> cuDNN parity.
 
