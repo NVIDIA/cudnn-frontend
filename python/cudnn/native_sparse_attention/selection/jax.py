@@ -12,6 +12,7 @@ from typing import Any, NamedTuple
 import jax.numpy as jnp
 from cutlass.jax import jax_to_cutlass_dtype
 
+from ..._jax.api_base import ApiBaseJax
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 from ..._jax.validation import require_dtype
 
@@ -102,7 +103,7 @@ def _make_launcher(
     return launch
 
 
-def selection_attention_wrapper(
+def _selection_attention_impl(
     q_tensor: Any,
     k_tensor: Any,
     v_tensor: Any,
@@ -117,6 +118,7 @@ def selection_attention_wrapper(
     scale_softmax: float | None = None,
     o_dtype: Any = None,
     acc_dtype: Any = None,
+    _validate_only: bool = False,
 ) -> SelectionAttentionResult:
     """Compute packed THD selection attention with the SM90 CuTe kernel.
 
@@ -219,6 +221,8 @@ def selection_attention_wrapper(
     )
     require_dtype("acc_dtype", acc_dtype, (jnp.float32,), default=jnp.float32)
     resolved_scale = 1.0 / math.sqrt(head_dim) if scale_softmax is None else float(scale_softmax)
+    if _validate_only:
+        return None
 
     # The native kernel consumes the same singleton-batch views produced by
     # Torch's unsqueeze(0). These reshapes are storage-preserving XLA bitcasts.
@@ -274,4 +278,162 @@ def selection_attention_wrapper(
     )
 
 
-__all__ = ["SelectionAttentionResult", "selection_attention_wrapper"]
+class SelectionAttention(ApiBaseJax):
+    """Sample-signature-bound JAX callable for SM90 selection attention."""
+
+    def __init__(
+        self,
+        sample_q: Any,
+        sample_k: Any,
+        sample_v: Any,
+        sample_block_indices: Any,
+        sample_block_counts: Any,
+        sample_cum_seqlen_q: Any,
+        sample_cum_seqlen_k: Any,
+        *,
+        max_s_q: int,
+        max_s_k: int,
+        block_size: int = 64,
+        scale_softmax: float | None = None,
+        o_dtype: Any = None,
+        acc_dtype: Any = None,
+    ) -> None:
+        super().__init__()
+        self.q_desc = self.make_tensor_desc(sample_q, name="sample_q")
+        self.k_desc = self.make_tensor_desc(sample_k, name="sample_k")
+        self.v_desc = self.make_tensor_desc(sample_v, name="sample_v")
+        self.block_indices_desc = self.make_tensor_desc(sample_block_indices, name="sample_block_indices")
+        self.block_counts_desc = self.make_tensor_desc(sample_block_counts, name="sample_block_counts")
+        self.cum_q_desc = self.make_tensor_desc(sample_cum_seqlen_q, name="sample_cum_seqlen_q")
+        self.cum_k_desc = self.make_tensor_desc(sample_cum_seqlen_k, name="sample_cum_seqlen_k")
+        self.max_s_q = max_s_q
+        self.max_s_k = max_s_k
+        self.block_size = block_size
+        self.scale_softmax = scale_softmax
+        self.o_dtype = self.as_optional_dtype(o_dtype)
+        self.acc_dtype = self.as_optional_dtype(acc_dtype)
+
+    def _check_support(self) -> bool:
+        _selection_attention_impl(
+            self.q_desc,
+            self.k_desc,
+            self.v_desc,
+            self.block_indices_desc,
+            self.block_counts_desc,
+            self.cum_q_desc,
+            self.cum_k_desc,
+            max_s_q=self.max_s_q,
+            max_s_k=self.max_s_k,
+            block_size=self.block_size,
+            scale_softmax=self.scale_softmax,
+            o_dtype=self.o_dtype,
+            acc_dtype=self.acc_dtype,
+            _validate_only=True,
+        )
+        return True
+
+    def __call__(
+        self,
+        q_tensor: Any,
+        k_tensor: Any,
+        v_tensor: Any,
+        block_indices_tensor: Any,
+        block_counts_tensor: Any,
+        cum_seqlen_q_tensor: Any,
+        cum_seqlen_k_tensor: Any,
+    ) -> SelectionAttentionResult:
+        return super().__call__(
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            block_indices_tensor,
+            block_counts_tensor,
+            cum_seqlen_q_tensor,
+            cum_seqlen_k_tensor,
+        )
+
+    def _call_impl(
+        self,
+        q_tensor: Any,
+        k_tensor: Any,
+        v_tensor: Any,
+        block_indices_tensor: Any,
+        block_counts_tensor: Any,
+        cum_seqlen_q_tensor: Any,
+        cum_seqlen_k_tensor: Any,
+    ) -> SelectionAttentionResult:
+        for value, expected, name in (
+            (q_tensor, self.q_desc, "Q"),
+            (k_tensor, self.k_desc, "K"),
+            (v_tensor, self.v_desc, "V"),
+            (block_indices_tensor, self.block_indices_desc, "block_indices"),
+            (block_counts_tensor, self.block_counts_desc, "block_counts"),
+            (cum_seqlen_q_tensor, self.cum_q_desc, "cum_seqlen_q"),
+            (cum_seqlen_k_tensor, self.cum_k_desc, "cum_seqlen_k"),
+        ):
+            self.check_tensor_signature(value, expected, name=name)
+        return _selection_attention_impl(
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            block_indices_tensor,
+            block_counts_tensor,
+            cum_seqlen_q_tensor,
+            cum_seqlen_k_tensor,
+            max_s_q=self.max_s_q,
+            max_s_k=self.max_s_k,
+            block_size=self.block_size,
+            scale_softmax=self.scale_softmax,
+            o_dtype=self.o_dtype,
+            acc_dtype=self.acc_dtype,
+        )
+
+
+def selection_attention_wrapper(
+    q_tensor: Any,
+    k_tensor: Any,
+    v_tensor: Any,
+    block_indices_tensor: Any,
+    block_counts_tensor: Any,
+    cum_seqlen_q_tensor: Any,
+    cum_seqlen_k_tensor: Any,
+    *,
+    max_s_q: int,
+    max_s_k: int,
+    block_size: int = 64,
+    scale_softmax: float | None = None,
+    o_dtype: Any = None,
+    acc_dtype: Any = None,
+) -> SelectionAttentionResult:
+    """Compute packed THD selection attention with the SM90 CuTe kernel."""
+
+    return SelectionAttention(
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        block_indices_tensor,
+        block_counts_tensor,
+        cum_seqlen_q_tensor,
+        cum_seqlen_k_tensor,
+        max_s_q=max_s_q,
+        max_s_k=max_s_k,
+        block_size=block_size,
+        scale_softmax=scale_softmax,
+        o_dtype=o_dtype,
+        acc_dtype=acc_dtype,
+    )(
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        block_indices_tensor,
+        block_counts_tensor,
+        cum_seqlen_q_tensor,
+        cum_seqlen_k_tensor,
+    )
+
+
+__all__ = [
+    "SelectionAttention",
+    "SelectionAttentionResult",
+    "selection_attention_wrapper",
+]

@@ -12,43 +12,17 @@ import torch
 from cutlass import Float32
 from cutlass.cute.runtime import make_fake_stream
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import ApiBaseTorch, TensorDesc, TupleDict
 
+from .config import (
+    best_num_threads,
+    pick_rows_per_cta,
+    validate_rmsnorm_rht_amax,
+)
 from .kernel import RMSNormRHTAmaxKernel
 
-DEFAULT_NUM_THREADS_BY_N = {
-    2048: 128,
-    4096: 256,
-    7168: 128,
-    8192: 512,
-    16384: 1024,
-    32768: 512,
-}
-RPC_CANDIDATES = (2, 4, 8)
-TARGET_MIN_CTAS = 148
 
-
-def best_num_threads(n: int) -> Optional[int]:
-    for num_threads in (1024, 512, 256, 128, 64):
-        if n % num_threads != 0:
-            continue
-        ept = n // num_threads
-        if ept >= 8 and ept % 8 == 0:
-            return num_threads
-    return None
-
-
-def pick_rows_per_cta(m: int) -> int:
-    for rows_per_cta in reversed(RPC_CANDIDATES):
-        if m % rows_per_cta != 0:
-            continue
-        num_ctas = m // rows_per_cta
-        if num_ctas >= TARGET_MIN_CTAS:
-            return rows_per_cta
-    return RPC_CANDIDATES[0]
-
-
-class RmsNormRhtAmaxSm100(APIBase):
+class RmsNormRhtAmaxSm100(ApiBaseTorch):
     """Class API for the RMSNorm + RHT + amax kernel."""
 
     def __init__(
@@ -78,52 +52,28 @@ class RmsNormRhtAmaxSm100(APIBase):
         self.n = None
 
     def check_support(self) -> bool:
-        m, n = self._tensor_shape(self.x_desc, name="sample_x")
-        w_n = self._tensor_shape(self.w_desc, name="sample_w")[0]
-        o_m, o_n = self._tensor_shape(self.o_desc, name="sample_o")
+        plan = validate_rmsnorm_rht_amax(
+            self.x_desc,
+            self.w_desc,
+            output=self.o_desc,
+            amax=self.amax_desc,
+            num_threads=self.requested_num_threads,
+            rows_per_cta=self.requested_rows_per_cta,
+        )
 
-        self._check_tensor_shape(self.x_desc, (m, n), "X")
-        self._check_tensor_shape(self.w_desc, (n,), "W")
-        self._check_tensor_shape(self.o_desc, (m, n), "O")
-        self._value_error_if(w_n != n, f"W length must match X hidden dimension, got {w_n} and {n}")
-        self._value_error_if((n % 16) != 0, f"N must be divisible by 16 for the Hadamard block size, got {n}")
-        self._value_error_if(o_m != m or o_n != n, f"O shape must match X shape, got {(o_m, o_n)} and {(m, n)}")
-
-        self._check_tensor_stride(self.x_desc, stride=(n, 1), name="X", extra_error_msg="X must be row-major contiguous")
+        self._check_tensor_stride(
+            self.x_desc,
+            stride=(plan.n, 1),
+            name="X",
+            extra_error_msg="X must be row-major contiguous",
+        )
         self._check_tensor_stride(self.w_desc, stride=(1,), name="W", extra_error_msg="W must be contiguous")
-        self._check_tensor_stride(self.o_desc, stride=(n, 1), name="O", extra_error_msg="O must be row-major contiguous")
-
-        self._check_dtype(self.x_desc, dtype=torch.bfloat16, name="X")
-        self._check_dtype(self.w_desc, dtype=torch.bfloat16, name="W")
-        self._check_dtype(self.o_desc, dtype=torch.bfloat16, name="O")
-        self._check_dtype(self.amax_desc, dtype=torch.float32, name="Amax")
-
-        resolved_num_threads = self.requested_num_threads
-        if resolved_num_threads is None:
-            resolved_num_threads = DEFAULT_NUM_THREADS_BY_N.get(n, best_num_threads(n))
-        self._value_error_if(resolved_num_threads is None, f"No valid num_threads found for N={n}")
-        self._value_error_if(resolved_num_threads <= 0, f"num_threads must be positive, got {resolved_num_threads}")
-        self._value_error_if(
-            (resolved_num_threads % 32) != 0,
-            f"num_threads must be warp-aligned, got {resolved_num_threads}",
+        self._check_tensor_stride(
+            self.o_desc,
+            stride=(plan.n, 1),
+            name="O",
+            extra_error_msg="O must be row-major contiguous",
         )
-        self._value_error_if(
-            resolved_num_threads > 1024,
-            f"num_threads must not exceed the CUDA block size limit, got {resolved_num_threads}",
-        )
-
-        resolved_rows_per_cta = self.requested_rows_per_cta
-        if resolved_rows_per_cta is None:
-            resolved_rows_per_cta = pick_rows_per_cta(m)
-
-        self._value_error_if(m % resolved_rows_per_cta != 0, f"M must be divisible by rows_per_cta, got M={m}, rows_per_cta={resolved_rows_per_cta}")
-        self._value_error_if(n % resolved_num_threads != 0, f"N={n} must be divisible by num_threads={resolved_num_threads}")
-
-        ept = n // resolved_num_threads
-        self._value_error_if(ept < 8 or ept % 8 != 0, f"EPT={ept} must be >= 8 and divisible by 8")
-
-        expected_num_ctas = m // resolved_rows_per_cta
-        self._check_tensor_shape(self.amax_desc, (expected_num_ctas,), "Amax")
 
         self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
         major, minor = torch.cuda.get_device_capability(self.x_desc.device)
@@ -133,9 +83,9 @@ class RmsNormRhtAmaxSm100(APIBase):
             f"RmsNormRhtAmaxSm100 requires SM100+, found SM{compute_capability}",
         )
 
-        self.num_threads = resolved_num_threads
-        self.rows_per_cta = resolved_rows_per_cta
-        self.n = n
+        self.num_threads = plan.num_threads
+        self.rows_per_cta = plan.rows_per_cta
+        self.n = plan.n
         self._is_supported = True
         return True
 
@@ -214,7 +164,10 @@ class RmsNormRhtAmaxSm100(APIBase):
         amax_tensor: torch.Tensor,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
-        self._runtime_error_if(self._compiled_kernel is None, "RmsNormRhtAmaxSm100 kernel not compiled; call compile() first")
+        self._runtime_error_if(
+            self._compiled_kernel is None,
+            "RmsNormRhtAmaxSm100 kernel not compiled; call compile() first",
+        )
 
         x_tensor = self._unpad_tensor_to_ndim(x_tensor, 2, "x_tensor")
         w_tensor = self._unpad_tensor_to_ndim(w_tensor, 1, "w_tensor")
@@ -250,19 +203,18 @@ def rmsnorm_rht_amax_wrapper_sm100(
     x_tensor = x_tensor.squeeze(-1) if x_tensor.ndim == 3 and x_tensor.shape[-1] == 1 else x_tensor
     w_tensor = w_tensor.squeeze(-1) if w_tensor.ndim == 2 and w_tensor.shape[-1] == 1 else w_tensor
 
-    m, n = x_tensor.shape
-    resolved_num_threads = num_threads if num_threads is not None else DEFAULT_NUM_THREADS_BY_N.get(n, best_num_threads(n))
-    if resolved_num_threads is None:
-        raise ValueError(f"No valid num_threads found for N={n}")
-    resolved_rows_per_cta = rows_per_cta if rows_per_cta is not None else pick_rows_per_cta(m)
-    if m % resolved_rows_per_cta != 0:
-        raise ValueError(f"M must be divisible by rows_per_cta, got M={m}, rows_per_cta={resolved_rows_per_cta}")
+    plan = validate_rmsnorm_rht_amax(
+        TensorDesc(dtype=x_tensor.dtype, shape=tuple(x_tensor.shape), name="X"),
+        TensorDesc(dtype=w_tensor.dtype, shape=tuple(w_tensor.shape), name="W"),
+        num_threads=num_threads,
+        rows_per_cta=rows_per_cta,
+    )
 
     o_tensor = torch.empty_like(x_tensor)
-    amax_tensor = torch.full((m // resolved_rows_per_cta,), float("-inf"), dtype=torch.float32, device=x_tensor.device)
+    amax_tensor = torch.full(plan.amax_shape, float("-inf"), dtype=torch.float32, device=x_tensor.device)
 
     cache_key = (
-        n,
+        plan.n,
         x_tensor.dtype,
         w_tensor.dtype,
         o_tensor.dtype,
@@ -270,8 +222,8 @@ def rmsnorm_rht_amax_wrapper_sm100(
         tuple(w_tensor.stride()),
         tuple(o_tensor.stride()),
         eps,
-        resolved_num_threads,
-        resolved_rows_per_cta,
+        plan.num_threads,
+        plan.rows_per_cta,
     )
 
     if cache_key in _cache_of_RmsNormRhtAmaxSm100Objects:
@@ -283,8 +235,8 @@ def rmsnorm_rht_amax_wrapper_sm100(
             sample_o=o_tensor,
             sample_amax=amax_tensor,
             eps=eps,
-            num_threads=resolved_num_threads,
-            rows_per_cta=resolved_rows_per_cta,
+            num_threads=plan.num_threads,
+            rows_per_cta=plan.rows_per_cta,
         )
         assert api.check_support(), "Unsupported configuration"
         api.compile()
@@ -326,3 +278,12 @@ def rmsnorm_rht_amax_sm100(
         current_stream=current_stream,
     )
     return TupleDict(output=result["o_tensor"], amax=result["amax_tensor"])
+
+
+__all__ = [
+    "RmsNormRhtAmaxSm100",
+    "best_num_threads",
+    "pick_rows_per_cta",
+    "rmsnorm_rht_amax_sm100",
+    "rmsnorm_rht_amax_wrapper_sm100",
+]

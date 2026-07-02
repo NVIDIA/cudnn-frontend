@@ -100,6 +100,9 @@ class JaxValidationTest(unittest.TestCase):
             self.validation.require_dtype("value", value, (_Float16, _Float32)),
             self.float16,
         )
+        self.assertIs(self.validation.as_dtype(value), self.float16)
+        self.assertIs(self.validation.as_optional_dtype(value), self.float16)
+        self.assertIsNone(self.validation.as_optional_dtype(None))
 
     def test_does_not_unwrap_scalar_dtype_classes(self):
         self.assertIs(

@@ -13,7 +13,7 @@ import torch
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import make_fake_stream
 
-from cudnn.api_base import APIBase, TupleDict, ceil_div
+from cudnn.api_base import ApiBaseTorch, TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm_validation import (
     block_scale_shape,
@@ -36,7 +36,7 @@ def _major_from_stride_order(stride_order: Tuple[int, ...], mode0_label: str, mo
     raise ValueError(f"Unsupported stride order {stride_order}")
 
 
-class GemmSreluSm100(APIBase):
+class GemmSreluSm100(ApiBaseTorch):
     def __init__(
         self,
         sample_a: torch.Tensor,

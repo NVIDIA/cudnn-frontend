@@ -11,6 +11,7 @@ from typing import Any, NamedTuple, Optional
 
 import jax.numpy as jnp
 
+from ..._jax.api_base import ApiBaseJax
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 from ..._jax.gemm import (
     block_scale_tensor_spec,
@@ -34,6 +35,7 @@ from ...gemm_validation import (
     require_shape,
     resolve_max_active_clusters,
 )
+from .._jax_api import check_call_signatures, immutable_mapping
 
 
 class GroupedGemmQuantResult(NamedTuple):
@@ -141,7 +143,7 @@ def _make_launcher(
     return launch
 
 
-def grouped_gemm_quant_wrapper_sm100(
+def _grouped_gemm_quant_impl(
     a_tensor: Any,
     sfa_tensor: Any,
     padded_offsets: Any,
@@ -164,7 +166,8 @@ def grouped_gemm_quant_wrapper_sm100(
     use_dynamic_sched: bool = False,
     *,
     b_major: str = "k",
-) -> GroupedGemmQuantResult:
+    _validate_only: bool = False,
+) -> GroupedGemmQuantResult | dict[str, Any]:
     """Compute an MXFP8 dense-weight grouped GEMM with optional quantization.
 
     The grouped dimension is represented by B's final dimension and by the
@@ -237,6 +240,14 @@ def grouped_gemm_quant_wrapper_sm100(
     require_16_byte_extent("a_tensor", k, ab_dtype)
     require_16_byte_extent("b_tensor", n if b_major == "n" else k, ab_dtype)
     require_16_byte_extent("d_tensor", n, d_dtype)
+
+    if _validate_only:
+        return {
+            "acc_dtype": acc_dtype,
+            "d_dtype": d_dtype,
+            "mma_tiler_mn": mma_tiler_mn,
+            "cluster_shape_mn": cluster_shape_mn,
+        }
 
     inputs = [
         a_tensor,
@@ -334,4 +345,202 @@ def grouped_gemm_quant_wrapper_sm100(
     )
 
 
-__all__ = ["GroupedGemmQuantResult", "grouped_gemm_quant_wrapper_sm100"]
+class GroupedGemmQuantSm100(ApiBaseJax):
+    """Sample-signature-bound JAX callable for grouped GEMM quantization."""
+
+    def __init__(
+        self,
+        sample_a_tensor: Any,
+        sample_sfa_tensor: Any,
+        sample_padded_offsets: Any,
+        sample_alpha_tensor: Any,
+        sample_b_tensor: Any,
+        sample_sfb_tensor: Any,
+        sample_bias_tensor: Optional[Any] = None,
+        sample_norm_const_tensor: Optional[Any] = None,
+        sample_prob_tensor: Optional[Any] = None,
+        sample_row_scale_tensor: Optional[Any] = None,
+        acc_dtype: Any = None,
+        d_dtype: Any = None,
+        cd_major: str = "n",
+        mma_tiler_mn: tuple[int, int] = (256, 256),
+        cluster_shape_mn: Optional[tuple[int, int]] = None,
+        sf_vec_size: int = 32,
+        vector_f32: bool = False,
+        m_aligned: int = 256,
+        discrete_col_sfd: bool = False,
+        use_dynamic_sched: bool = False,
+        *,
+        b_major: str = "k",
+    ) -> None:
+        super().__init__()
+        self._sample_descs = {
+            "a_tensor": self.make_tensor_desc(sample_a_tensor, name="sample_a_tensor"),
+            "sfa_tensor": self.make_tensor_desc(sample_sfa_tensor, name="sample_sfa_tensor"),
+            "padded_offsets": self.make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets"),
+            "alpha_tensor": self.make_tensor_desc(sample_alpha_tensor, name="sample_alpha_tensor"),
+            "b_tensor": self.make_tensor_desc(sample_b_tensor, name="sample_b_tensor"),
+            "sfb_tensor": self.make_tensor_desc(sample_sfb_tensor, name="sample_sfb_tensor"),
+            "bias_tensor": self.make_optional_tensor_desc(sample_bias_tensor, name="sample_bias_tensor"),
+            "norm_const_tensor": self.make_optional_tensor_desc(sample_norm_const_tensor, name="sample_norm_const_tensor"),
+            "prob_tensor": self.make_optional_tensor_desc(sample_prob_tensor, name="sample_prob_tensor"),
+            "row_scale_tensor": self.make_optional_tensor_desc(sample_row_scale_tensor, name="sample_row_scale_tensor"),
+        }
+        self._config = {
+            "acc_dtype": self.as_optional_dtype(acc_dtype),
+            "d_dtype": self.as_optional_dtype(d_dtype),
+            "cd_major": cd_major,
+            "mma_tiler_mn": tuple(mma_tiler_mn),
+            "cluster_shape_mn": (None if cluster_shape_mn is None else tuple(cluster_shape_mn)),
+            "sf_vec_size": sf_vec_size,
+            "vector_f32": vector_f32,
+            "m_aligned": m_aligned,
+            "discrete_col_sfd": discrete_col_sfd,
+            "use_dynamic_sched": use_dynamic_sched,
+            "b_major": b_major,
+        }
+
+        self._sample_descs = immutable_mapping(self._sample_descs)
+        self._config = immutable_mapping(self._config)
+
+    def _check_support(self) -> bool:
+        resolved = _grouped_gemm_quant_impl(
+            self._sample_descs["a_tensor"],
+            self._sample_descs["sfa_tensor"],
+            self._sample_descs["padded_offsets"],
+            self._sample_descs["alpha_tensor"],
+            self._sample_descs["b_tensor"],
+            self._sample_descs["sfb_tensor"],
+            self._sample_descs["bias_tensor"],
+            self._sample_descs["norm_const_tensor"],
+            self._sample_descs["prob_tensor"],
+            self._sample_descs["row_scale_tensor"],
+            **self._config,
+            _validate_only=True,
+        )
+        self._config = immutable_mapping({**self._config, **resolved})
+        return True
+
+    def __call__(
+        self,
+        a_tensor: Any,
+        sfa_tensor: Any,
+        padded_offsets: Any,
+        alpha_tensor: Any,
+        b_tensor: Any,
+        sfb_tensor: Any,
+        bias_tensor: Optional[Any] = None,
+        norm_const_tensor: Optional[Any] = None,
+        prob_tensor: Optional[Any] = None,
+        row_scale_tensor: Optional[Any] = None,
+    ) -> GroupedGemmQuantResult:
+        return super().__call__(
+            a_tensor,
+            sfa_tensor,
+            padded_offsets,
+            alpha_tensor,
+            b_tensor,
+            sfb_tensor,
+            bias_tensor,
+            norm_const_tensor,
+            prob_tensor,
+            row_scale_tensor,
+        )
+
+    def _call_impl(
+        self,
+        a_tensor: Any,
+        sfa_tensor: Any,
+        padded_offsets: Any,
+        alpha_tensor: Any,
+        b_tensor: Any,
+        sfb_tensor: Any,
+        bias_tensor: Optional[Any] = None,
+        norm_const_tensor: Optional[Any] = None,
+        prob_tensor: Optional[Any] = None,
+        row_scale_tensor: Optional[Any] = None,
+    ) -> GroupedGemmQuantResult:
+        values = {
+            "a_tensor": a_tensor,
+            "sfa_tensor": sfa_tensor,
+            "padded_offsets": padded_offsets,
+            "alpha_tensor": alpha_tensor,
+            "b_tensor": b_tensor,
+            "sfb_tensor": sfb_tensor,
+            "bias_tensor": bias_tensor,
+            "norm_const_tensor": norm_const_tensor,
+            "prob_tensor": prob_tensor,
+            "row_scale_tensor": row_scale_tensor,
+        }
+        check_call_signatures(self, self._sample_descs, values)
+        return _grouped_gemm_quant_impl(**values, **self._config)
+
+
+def grouped_gemm_quant_wrapper_sm100(
+    a_tensor: Any,
+    sfa_tensor: Any,
+    padded_offsets: Any,
+    alpha_tensor: Any,
+    b_tensor: Any,
+    sfb_tensor: Any,
+    bias_tensor: Optional[Any] = None,
+    norm_const_tensor: Optional[Any] = None,
+    prob_tensor: Optional[Any] = None,
+    row_scale_tensor: Optional[Any] = None,
+    acc_dtype: Any = None,
+    d_dtype: Any = None,
+    cd_major: str = "n",
+    mma_tiler_mn: tuple[int, int] = (256, 256),
+    cluster_shape_mn: Optional[tuple[int, int]] = None,
+    sf_vec_size: int = 32,
+    vector_f32: bool = False,
+    m_aligned: int = 256,
+    discrete_col_sfd: bool = False,
+    use_dynamic_sched: bool = False,
+    *,
+    b_major: str = "k",
+) -> GroupedGemmQuantResult:
+    """Compute an MXFP8 dense-weight grouped GEMM with optional quantization."""
+
+    op = GroupedGemmQuantSm100(
+        a_tensor,
+        sfa_tensor,
+        padded_offsets,
+        alpha_tensor,
+        b_tensor,
+        sfb_tensor,
+        bias_tensor,
+        norm_const_tensor,
+        prob_tensor,
+        row_scale_tensor,
+        acc_dtype=acc_dtype,
+        d_dtype=d_dtype,
+        cd_major=cd_major,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=sf_vec_size,
+        vector_f32=vector_f32,
+        m_aligned=m_aligned,
+        discrete_col_sfd=discrete_col_sfd,
+        use_dynamic_sched=use_dynamic_sched,
+        b_major=b_major,
+    )
+    return op(
+        a_tensor,
+        sfa_tensor,
+        padded_offsets,
+        alpha_tensor,
+        b_tensor,
+        sfb_tensor,
+        bias_tensor,
+        norm_const_tensor,
+        prob_tensor,
+        row_scale_tensor,
+    )
+
+
+__all__ = [
+    "GroupedGemmQuantResult",
+    "GroupedGemmQuantSm100",
+    "grouped_gemm_quant_wrapper_sm100",
+]

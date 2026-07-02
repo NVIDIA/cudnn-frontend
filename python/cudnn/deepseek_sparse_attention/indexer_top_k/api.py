@@ -1,4 +1,4 @@
-"""PyTorch APIBase wrapper for the DSA indexer top-K CuTe DSL kernel."""
+"""PyTorch ApiBaseTorch wrapper for the DSA indexer top-K CuTe DSL kernel."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 import torch
 import cuda.bindings.driver as cuda
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import ApiBaseTorch, TupleDict
 
 from .local_to_global_dsl import local_to_global as _local_to_global
 from .compactify import compactify as _compactify
@@ -21,7 +21,7 @@ def _get_cute_dsl_topk_wrapper():
     return cute_dsl_topk_wrapper
 
 
-class IndexerTopK(APIBase):
+class IndexerTopK(ApiBaseTorch):
     """Top-K filter using the SM90+ CuTe-DSL radix kernel.
 
     Selects the ``top_k`` largest entries from each row of ``input_values``.
@@ -121,7 +121,7 @@ class IndexerTopK(APIBase):
         self._ensure_support_checked()
         # cute_dsl_topk_wrapper compiles lazily on first call and caches
         # internally; nothing to do here. Keep the _compiled_kernel sentinel
-        # non-None so APIBase.__call__() skips a second compile() attempt.
+        # non-None so ApiBaseTorch.__call__() skips a second compile() attempt.
         self._compiled_kernel = _get_cute_dsl_topk_wrapper()
 
     def execute(

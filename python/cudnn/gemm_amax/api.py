@@ -3,6 +3,7 @@ from .dense_blockscaled_gemm_persistent_amax import (
 )
 
 from cuda.bindings import driver as cuda
+import logging
 import os
 import torch
 from typing import Tuple, Optional
@@ -11,17 +12,13 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 
-from cudnn.api_base import APIBase, TupleDict
-from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.gemm_validation import (
-    block_scale_shape,
-    require_contiguous_alignment,
-    require_gemm_shapes,
-    resolve_max_active_clusters,
-)
+from cudnn.api_base import ApiBaseTorch, TupleDict
+from cudnn.gemm_validation import resolve_max_active_clusters
+
+from .validation import validate_gemm_amax
 
 
-class GemmAmaxSm100(APIBase):
+class GemmAmaxSm100(ApiBaseTorch):
     def __init__(
         self,
         sample_a: torch.Tensor,
@@ -64,144 +61,35 @@ class GemmAmaxSm100(APIBase):
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
 
-        self._logger.debug("Checking dtypes and sf_vec_size")
-        ab_dtype = self._check_dtype(
-            self.a_desc,
-            dtype=[torch.float4_e2m1fn_x2, torch.uint8, torch.float8_e5m2, torch.float8_e4m3fn],
-            name="A",
-        )
-        self._check_dtype(
-            self.b_desc,
-            dtype=ab_dtype,
-            name="B",
-            extra_error_msg="A and B tensor dtypes must match",
-        )
-        if ab_dtype == torch.uint8:
-            self._logger.warning("Uint8 ab_dtype will be interpreted as packed fp4, not as native uint8")
-
-        self._value_error_if(
-            self.sf_vec_size not in self._kernel.SF_VEC_SIZES,
-            f"Unsupported sf_vec_size: received {self.sf_vec_size}, expected {self._kernel.SF_VEC_SIZES}",
-        )
-
-        sf_dtype = self._check_dtype(
-            self.sfa_desc,
-            dtype=[torch.float8_e8m0fnu, torch.float8_e4m3fn, torch.int8],
-            name="sfa",
-        )
-        self._check_dtype(
-            self.sfb_desc,
-            dtype=sf_dtype,
-            name="sfb",
-            extra_error_msg="sfa and sfb tensor dtypes must match",
-        )
-        if sf_dtype == torch.int8:
-            self._logger.warning("Int8 sf_dtype will be interpreted as float8_e8m0fnu, not as native int8")
-
-        self._value_error_if(
-            sf_dtype == torch.float8_e4m3fn and self.sf_vec_size == 32,
-            "Unsupported sf_dtype and sf_vec_size combination: float8_e4m3fn and 32 is not supported",
-        )
-        self._value_error_if(
-            ab_dtype in {torch.float8_e5m2, torch.float8_e4m3fn} and self.sf_vec_size == 16,
-            f"Unsupported ab_dtype and sf_vec_size combination: {{float8_e5m2, float8_e4m3fn}} and 16 is not supported",
-        )
-
-        c_dtype = self._check_dtype(
-            self.c_desc,
-            dtype=[torch.float32, torch.float16, torch.bfloat16, torch.float8_e5m2, torch.float8_e4m3fn, torch.float4_e2m1fn_x2, torch.uint8],
-            name="C",
-        )
-        self._value_error_if(
-            self._is_fp4x2(c_dtype) and not self._is_fp4x2(ab_dtype),
-            f"Unsupported c_dtype and ab_dtype combination: fp4 c_dtype requires fp4 ab_dtype, got {ab_dtype}",
-        )
-        self._not_implemented_error_if(
-            self._is_fp8(c_dtype) and self._is_fp8(ab_dtype),
-            "Unsupported c_dtype and ab_dtype combination: fp8 ab_dtype and fp8 c_dtype (fails to launch)",
-        )
-        self._check_dtype(
-            self.acc_dtype,
-            dtype=torch.float32,
-            name="Accumulator",
-            extra_error_msg="Accumulator must be float32",
-        )
-
-        self.ab_dtype = ab_dtype
-        self.c_dtype = c_dtype
-
-        self._logger.debug("Checking tensor layout")
-        m, n, k, l = require_gemm_shapes(
-            self._tensor_shape(self.a_desc, name="sample_a"),
-            self._tensor_shape(self.b_desc, name="sample_b"),
-        )
-        self._check_tensor_shape(self.c_desc, (m, n, l), "C")
-        self._check_tensor_shape(self.sfa_desc, block_scale_shape(m, k, l, self.sf_vec_size), "sfa")
-        self._check_tensor_shape(self.sfb_desc, block_scale_shape(n, k, l, self.sf_vec_size), "sfb")
+        self._logger.debug("Resolving kernel configuration")
         self.amax_desc = self._pad_tensor_to_ndim(self.amax_desc, 3, "amax")
-        self._check_tensor_shape(self.amax_desc, (1, 1, 1), "amax")
-
-        # Check tensor strides
-        _ = self._check_tensor_stride(
-            self.a_desc,
-            stride=[(1, m, m * k), (k, 1, m * k)],
-            name="A",
-        )
-        _ = self._check_tensor_stride(
-            self.b_desc,
-            stride=[(1, n, n * k), (k, 1, n * k)],
-            name="B",
-        )
-        _ = self._check_tensor_stride(
-            self.c_desc,
-            stride=[(1, m, m * n), (n, 1, m * n)],
-            name="C",
-        )
-
-        # Derive major mode from stride order
-        self.a_major = "m" if self.a_desc.stride_order == (0, 1, 2) else "k"
-        self.b_major = "n" if self.b_desc.stride_order == (0, 1, 2) else "k"
-        self.c_major = "m" if self.c_desc.stride_order == (0, 1, 2) else "n"
-
-        self._value_error_if(
-            self._is_fp4x2(ab_dtype) and not (self.a_major == "k" and self.b_major == "k"),
-            f"Unsupported A or B tensor stride: Float4 tensors require k-major layout for hardware efficiency, got {self.a_major} and {self.b_major}",
-        )
-        self._value_error_if(
-            self._is_fp4x2(c_dtype) and self.c_major == "m",
-            f"Unsupported C tensor stride: Float4 tensors require n-major layout for hardware efficiency, got {self.c_major}",
-        )
-
-        self._logger.debug("Checking mma tiler and cluster shape")
         self.mma_tiler_mn = self._kernel.require_mma_tiler(self.mma_tiler_mn)
-        self._value_error_if(
-            self._is_fp4x2(self.ab_dtype) and self.mma_tiler_mn[1] == 256 and k <= 128,
-            f"mma_tiler_mn (X, 256) requires k > 128 (packed x2), got {k}",
-        )
-        self._not_implemented_error_if(
-            self.mma_tiler_mn == (128, 256) and self.sf_vec_size == 16 and c_dtype in {torch.float32, torch.float16, torch.bfloat16},
-            "mma_tiler_mn (128, 256), sf_vec_size 16, c_dtype {torch.float32, torch.float16, torch.bfloat16} fails to launch",
-        )
-
-        # Special cluster shape check for scale factor multicasts.
-        # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
         self.cluster_shape_mn = self._kernel.require_cluster_shape(
             self.cluster_shape_mn,
             mma_tiler_mn=self.mma_tiler_mn,
         )
 
-        self._logger.debug("Checking tensor alignment")
-        ab_bits = _convert_to_cutlass_data_type(
-            ab_dtype,
-            interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2,
-        ).width
-        c_bits = _convert_to_cutlass_data_type(
-            c_dtype,
-            interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2,
-        ).width
-        require_contiguous_alignment("A", m if self.a_major == "m" else k, ab_bits)
-        require_contiguous_alignment("B", n if self.b_major == "n" else k, ab_bits)
-        require_contiguous_alignment("C", m if self.c_major == "m" else n, c_bits)
+        self._logger.debug("Checking shared tensor and configuration contract")
+        plan = validate_gemm_amax(
+            self.a_desc,
+            self.b_desc,
+            self.sfa_desc,
+            self.sfb_desc,
+            self.c_desc,
+            self.amax_desc,
+            acc_dtype=self.acc_dtype,
+            sf_vec_size=self.sf_vec_size,
+            supported_sf_vec_sizes=self._kernel.SF_VEC_SIZES,
+            mma_tiler_mn=self.mma_tiler_mn,
+        )
+        self.ab_dtype = self.a_desc.dtype
+        self.c_dtype = self.c_desc.dtype
+        self.a_major = plan.a_major
+        self.b_major = plan.b_major
+        self.c_major = plan.c_major
+
+        if self.a_desc.dtype == torch.uint8:
+            self._logger.warning("Uint8 ab_dtype will be interpreted as packed fp4, not as native uint8")
 
         self._logger.debug("Checking environment")
         self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
@@ -317,8 +205,6 @@ class GemmAmaxSm100(APIBase):
         self._logger.debug("Executed with compiled kernel successfully")
 
 
-import logging
-
 _logger = logging.getLogger(__name__)
 _cache_of_GemmAmaxSm100Objects = {}
 
@@ -339,13 +225,13 @@ def gemm_amax_wrapper_sm100(
 
     _logger.debug("gemm_amax_wrapper_sm100: Creating empty output tensors c and amax")
 
-    m, _, l = a_tensor.shape
-    n, _, l = b_tensor.shape
+    m, _, batch = a_tensor.shape
+    n, _, _b_batch = b_tensor.shape
     c_tensor = None
     if c_major == "m":
-        c_tensor = torch.empty_strided((m, n, l), (1, m, m * n), dtype=c_dtype, device=a_tensor.device)
+        c_tensor = torch.empty_strided((m, n, batch), (1, m, m * n), dtype=c_dtype, device=a_tensor.device)
     elif c_major == "n":
-        c_tensor = torch.empty_strided((m, n, l), (n, 1, m * n), dtype=c_dtype, device=a_tensor.device)
+        c_tensor = torch.empty_strided((m, n, batch), (n, 1, m * n), dtype=c_dtype, device=a_tensor.device)
     else:
         raise ValueError(f"c_major must be either 'm' or 'n', got {c_major}")
     amax_tensor = torch.full((1, 1, 1), -float("inf"), device=a_tensor.device, dtype=torch.float32)

@@ -1,6 +1,6 @@
 from .NSA_select_attn_fwd_hmma import HopperSelectAttentionFwd
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import ApiBaseTorch, TupleDict
 
 import cutlass
 import cutlass.cute as cute
@@ -11,7 +11,7 @@ from typing import Tuple, Optional
 import math
 
 
-class SelectionAttention(APIBase):
+class SelectionAttention(ApiBaseTorch):
     def __init__(
         self,
         sample_q: torch.Tensor,

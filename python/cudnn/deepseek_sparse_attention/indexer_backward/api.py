@@ -1,4 +1,4 @@
-"""APIBase wrappers for sparse and dense indexer backward.
+"""ApiBaseTorch wrappers for sparse and dense indexer backward.
 
 Combines backend-specific CuTe-DSL kernels:
 
@@ -17,7 +17,7 @@ from typing import Optional, Union
 import torch
 import cuda.bindings.driver as cuda
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import ApiBaseTorch, TupleDict
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     torch_stream_context as _torch_stream_context,
     validate_q_causal_offsets,
@@ -121,7 +121,7 @@ def _dense_shapes(
     return False, batch, batch * seqlen_q, batch * seqlen_k, heads, head_dim, seqlen_q, seqlen_k
 
 
-class IndexerBackward(APIBase):
+class IndexerBackward(ApiBaseTorch):
     """End-to-end indexer backward (3 fused stages).
 
     Given the forward-computed ``AttnScore`` (target distribution) and
@@ -249,7 +249,7 @@ class IndexerBackward(APIBase):
         )
 
 
-class DenseIndexerBackward(APIBase):
+class DenseIndexerBackward(ApiBaseTorch):
     """Dense full-KV indexer backward.
 
     Consumes raw dense attention/indexer score tensors and their denominators,

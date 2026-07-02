@@ -13,6 +13,22 @@ import jax.numpy as jnp
 _NO_DEFAULT = object()
 
 
+def as_dtype(value: Any) -> Any:
+    """Return a JAX dtype without retaining a dtype-bearing value."""
+
+    # Scalar dtype classes such as numpy.float32 expose an instance-level
+    # dtype descriptor, so only unwrap dtype-bearing values, not classes.
+    if not isinstance(value, type) and hasattr(value, "dtype"):
+        value = value.dtype
+    return jnp.dtype(value)
+
+
+def as_optional_dtype(value: Any | None) -> Any | None:
+    """Return ``None`` or a JAX dtype without retaining the source value."""
+
+    return None if value is None else as_dtype(value)
+
+
 def require_dtype(
     name: str,
     value: Any,
@@ -27,13 +43,6 @@ def require_dtype(
             raise ValueError(f"{name} must not be None")
         value = default
 
-    def as_dtype(item: Any) -> Any:
-        # Scalar dtype classes such as numpy.float32 expose an instance-level
-        # dtype descriptor, so only unwrap dtype-bearing values, not classes.
-        if not isinstance(item, type) and hasattr(item, "dtype"):
-            item = item.dtype
-        return jnp.dtype(item)
-
     dtype = as_dtype(value)
     valid_dtypes = tuple(as_dtype(item) for item in valid_dtypes)
     if dtype not in valid_dtypes:
@@ -42,4 +51,4 @@ def require_dtype(
     return dtype
 
 
-__all__ = ["require_dtype"]
+__all__ = ["as_dtype", "as_optional_dtype", "require_dtype"]

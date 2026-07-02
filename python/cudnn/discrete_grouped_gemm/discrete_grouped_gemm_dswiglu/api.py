@@ -48,11 +48,11 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
+from cudnn.api_base import ApiBaseTorch, TupleDict, ceil_div, is_power_of_2
 from cudnn.discrete_grouped_gemm.discrete_kernel_utils import _require_pointer_tensor
 
 
-class DiscreteGroupedGemmDswigluSm100(APIBase):
+class DiscreteGroupedGemmDswigluSm100(ApiBaseTorch):
     """API class for discrete-weight grouped GEMM dGLU backward operation on SM100+ GPUs.
 
     This kernel performs the backward pass of the discrete-weight grouped GEMM

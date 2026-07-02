@@ -11,6 +11,7 @@ from typing import Any, NamedTuple
 import jax.numpy as jnp
 from cutlass.jax import jax_to_cutlass_dtype
 
+from ..._jax.api_base import ApiBaseJax
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 from ..._jax.validation import require_dtype
 
@@ -160,13 +161,14 @@ def require_supported_top_k_output(
         raise ValueError(f"top_k ({top_k}) must be divisible by the selected output vector " f"width ({vector_size}); adjust top_k or num_copy_bits")
 
 
-def indexer_top_k_wrapper(
+def _indexer_top_k_impl(
     input_values: Any,
     seq_lens: Any,
     top_k: int,
     next_n: int = 1,
     return_val: bool = True,
     num_copy_bits: int = 256,
+    _validate_only: bool = False,
 ) -> IndexerTopKResult:
     """Select the largest values from each row with variable valid lengths.
 
@@ -236,6 +238,8 @@ def indexer_top_k_wrapper(
             "row-chunking fallback used when the int32 workspace contains "
             f"more than {_INT32_MAX} elements (requested {workspace_elements})"
         )
+    if _validate_only:
+        return None
 
     output_shape = (num_rows, top_k)
     output_indices, output_values = call_cutedsl(
@@ -263,6 +267,74 @@ def indexer_top_k_wrapper(
         use_static_tensors=True,
     )
     return IndexerTopKResult(indices=output_indices, values=output_values)
+
+
+class IndexerTopK(ApiBaseJax):
+    """Sample-signature-bound JAX callable for the DSA indexer top-K kernel."""
+
+    def __init__(
+        self,
+        sample_input_values: Any,
+        sample_seq_lens: Any,
+        top_k: int,
+        next_n: int = 1,
+        return_val: bool = True,
+        num_copy_bits: int = 256,
+    ) -> None:
+        super().__init__()
+        self.input_desc = self.make_tensor_desc(sample_input_values, name="sample_input_values")
+        self.seq_lens_desc = self.make_tensor_desc(sample_seq_lens, name="sample_seq_lens")
+        self.top_k = top_k
+        self.next_n = next_n
+        self.return_val = return_val
+        self.num_copy_bits = num_copy_bits
+
+    def _check_support(self) -> bool:
+        _indexer_top_k_impl(
+            self.input_desc,
+            self.seq_lens_desc,
+            self.top_k,
+            self.next_n,
+            self.return_val,
+            self.num_copy_bits,
+            _validate_only=True,
+        )
+        return True
+
+    def __call__(self, input_values: Any, seq_lens: Any) -> IndexerTopKResult:
+        return super().__call__(input_values, seq_lens)
+
+    def _call_impl(self, input_values: Any, seq_lens: Any) -> IndexerTopKResult:
+        self.check_tensor_signature(input_values, self.input_desc, name="input_values")
+        self.check_tensor_signature(seq_lens, self.seq_lens_desc, name="seq_lens")
+        return _indexer_top_k_impl(
+            input_values,
+            seq_lens,
+            self.top_k,
+            self.next_n,
+            self.return_val,
+            self.num_copy_bits,
+        )
+
+
+def indexer_top_k_wrapper(
+    input_values: Any,
+    seq_lens: Any,
+    top_k: int,
+    next_n: int = 1,
+    return_val: bool = True,
+    num_copy_bits: int = 256,
+) -> IndexerTopKResult:
+    """Select the largest values from each row with variable valid lengths."""
+
+    return IndexerTopK(
+        input_values,
+        seq_lens,
+        top_k,
+        next_n=next_n,
+        return_val=return_val,
+        num_copy_bits=num_copy_bits,
+    )(input_values, seq_lens)
 
 
 def local_to_global_wrapper(
@@ -371,6 +443,7 @@ def compactify_wrapper(indices: Any) -> CompactifyResult:
 
 __all__ = [
     "CompactifyResult",
+    "IndexerTopK",
     "IndexerTopKResult",
     "LocalToGlobalResult",
     "compactify_wrapper",

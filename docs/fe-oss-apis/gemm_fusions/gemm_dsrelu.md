@@ -155,6 +155,13 @@ two-CTA `TILE_M=256` mode.
 
 ### Class API
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import GemmDsreluSm100
 
@@ -194,6 +201,42 @@ op.execute(
     current_stream=None,
 )
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import GemmDsreluSm100
+
+op = GemmDsreluSm100(
+    sample_a=jax.ShapeDtypeStruct(a.shape, a.dtype),
+    sample_b=jax.ShapeDtypeStruct(b.shape, b.dtype),
+    sample_c=jax.ShapeDtypeStruct(c.shape, c.dtype),
+    sample_sfa=jax.ShapeDtypeStruct(sfa.shape, sfa.dtype),
+    sample_sfb=jax.ShapeDtypeStruct(sfb.shape, sfb.dtype),
+    sample_prob=jax.ShapeDtypeStruct(prob.shape, prob.dtype),
+    alpha=1.0,
+    d_major="n",
+    d_dtype=jnp.bfloat16,
+    acc_dtype=jnp.float32,
+    mma_tiler_mn=(256, 256),
+    cluster_shape_mn=(2, 1),
+    sf_vec_size=32,
+)
+assert op.check_support()
+d, dprob, amax, sfd = jax.jit(op)(a, b, c, sfa, sfb, prob)
+```
+
+The constructor retains only the input descriptors. Outputs are allocated by
+the JAX call; `amax` and `sfd` are `None` in the supported output modes.
+
+`````
+
+``````
 
 ---
 

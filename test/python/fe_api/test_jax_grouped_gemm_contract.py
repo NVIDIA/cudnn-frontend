@@ -365,6 +365,39 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
         self.assertTrue(options["use_static_tensors"])
         self.assertEqual(_KernelSurface.calls[-1][0]["expert_cnt"], 4)
 
+    def test_class_configuration_and_sample_descriptors_are_immutable(self):
+        values = self._inputs()
+        with self._modules():
+            operation = self.swiglu.GroupedGemmSwigluSm100(
+                values["a"],
+                values["b"],
+                values["sfa"],
+                values["sfb"],
+                values["offsets"],
+                values["alpha"],
+                values["norm"],
+                values["prob"],
+            )
+            with self.assertRaises(TypeError):
+                operation._config["mma_tiler_mn"] = (128, 128)
+            with self.assertRaises(TypeError):
+                operation._sample_descs["a_tensor"] = None
+
+            self.assertTrue(operation.check_support())
+            operation(
+                values["a"],
+                values["b"],
+                values["sfa"],
+                values["sfb"],
+                values["offsets"],
+                values["alpha"],
+                values["norm"],
+                values["prob"],
+            )
+            self.assertTrue(operation.check_support())
+            with self.assertRaisesRegex(AttributeError, "immutable after its first call"):
+                operation._config = {}
+
     def test_backward_zero_initializes_dprob(self):
         values = self._inputs()
         c_tensor = _Array((256, 512, 1), self.bfloat16)

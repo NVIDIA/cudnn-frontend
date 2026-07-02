@@ -60,6 +60,9 @@ class JaxApiSurfaceTest(unittest.TestCase):
 
     def _optional_modules(self):
         fake_jnp = types.ModuleType("jax.numpy")
+        fake_jnp.dtype = lambda value: value
+        fake_jnp.bfloat16 = types.SimpleNamespace(name="bfloat16", itemsize=2)
+        fake_jnp.float32 = types.SimpleNamespace(name="float32", itemsize=4)
         fake_jax = types.ModuleType("jax")
         fake_jax.__path__ = []
         fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
@@ -67,7 +70,12 @@ class JaxApiSurfaceTest(unittest.TestCase):
 
         fake_cutlass_jax = types.ModuleType("cutlass.jax")
         fake_cutlass_jax.is_available = lambda: True
-        fake_cutlass_jax.TensorSpec = type("TensorSpec", (), {})
+
+        class TensorSpec:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        fake_cutlass_jax.TensorSpec = TensorSpec
         fake_cutlass_jax.jax_to_cutlass_dtype = lambda dtype: dtype
         fake_cutlass = types.ModuleType("cutlass")
         fake_cutlass.__path__ = []
@@ -106,7 +114,7 @@ class JaxApiSurfaceTest(unittest.TestCase):
                 operation_modules[operation_path] = sys.modules[module_name]
             self.assertIn(f"{_TEST_PACKAGE}._jax.cutedsl", sys.modules)
 
-            expected_exports = {"DSA", "NSA"}
+            expected_exports = {"ApiBaseJax", "DSA", "JaxTensorDesc", "NSA"}
             expected_dsa_exports = set()
             expected_nsa_exports = set()
             torch_dsa_exports = set(
@@ -128,8 +136,11 @@ class JaxApiSurfaceTest(unittest.TestCase):
                 shared_exports = torch_exports.intersection(operation_module.__all__)
                 for name in shared_exports:
                     self.assertNotIn(name, vars(operation_package))
-                    self.assertIs(getattr(operation_package.jax, name), getattr(jax_namespace, name))
-                    self.assertTrue(callable(getattr(jax_namespace, name)))
+                    jax_export = getattr(jax_namespace, name)
+                    self.assertIs(getattr(operation_package.jax, name), jax_export)
+                    self.assertTrue(callable(jax_export))
+                    if isinstance(jax_export, type):
+                        self.assertTrue(issubclass(jax_export, jax_namespace.ApiBaseJax))
                     if name in torch_dsa_exports:
                         expected_dsa_exports.add(name)
                     if name in torch_nsa_exports:
@@ -141,6 +152,7 @@ class JaxApiSurfaceTest(unittest.TestCase):
                     {
                         f"{_TEST_PACKAGE}.{operation_path}.config",
                         f"{_TEST_PACKAGE}.{operation_path}.jax",
+                        f"{_TEST_PACKAGE}.{operation_path}.validation",
                     },
                 )
 
@@ -151,6 +163,37 @@ class JaxApiSurfaceTest(unittest.TestCase):
                 self.assertIs(getattr(jax_namespace.DSA, name), getattr(jax_namespace, name))
             for name in expected_nsa_exports:
                 self.assertIs(getattr(jax_namespace.NSA, name), getattr(jax_namespace, name))
+
+            dtype = types.SimpleNamespace(name="bfloat16", itemsize=2)
+            sample_x = types.SimpleNamespace(shape=(256, 2048), dtype=dtype)
+            sample_w = types.SimpleNamespace(shape=(2048,), dtype=dtype)
+            rmsnorm_api = jax_namespace.RmsNormRhtAmaxSm100(sample_x, sample_w)
+            self.assertFalse(hasattr(rmsnorm_api, "sample_x"))
+            self.assertFalse(hasattr(rmsnorm_api, "sample_w"))
+            self.assertTrue(all(value is not sample_x and value is not sample_w for value in vars(rmsnorm_api).values()))
+            self.assertTrue(rmsnorm_api.check_support())
+            self.assertEqual(rmsnorm_api.num_threads, 128)
+            self.assertEqual(rmsnorm_api.rows_per_cta, 2)
+            self.assertIs(rmsnorm_api.get_jax_callable(), rmsnorm_api)
+
+            rmsnorm_module = operation_modules["rmsnorm_rht_amax"]
+            captured = {}
+
+            def fake_call(launcher, inputs, **options):
+                captured.update(launcher=launcher, inputs=inputs, **options)
+                return "output", "amax"
+
+            with (
+                mock.patch.object(rmsnorm_module, "_make_launcher", return_value="launcher"),
+                mock.patch.object(rmsnorm_module, "call_cutedsl", side_effect=fake_call),
+            ):
+                result = rmsnorm_api(sample_x, sample_w)
+            self.assertEqual(result, ("output", "amax"))
+            self.assertEqual(captured["inputs"], (sample_x, sample_w))
+            self.assertEqual(
+                [(spec.name, spec.shape) for spec in captured["outputs"]],
+                [("output", (256, 2048)), ("amax", (128,))],
+            )
 
             torch_after = {name for name, module in sys.modules.items() if name.split(".", 1)[0] == "torch" and module is not None}
             self.assertEqual(torch_after - torch_before, set())

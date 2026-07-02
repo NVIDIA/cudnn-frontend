@@ -5,13 +5,13 @@ import torch
 
 from cuda.bindings import driver as cuda
 from cudnn.datatypes import _torch_to_cudnn_data_type
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import ApiBaseTorch, TupleDict
 from typing import Optional
 
 from ..utils import make_tensor_strided_like
 
 
-class SlidingWindowAttention(APIBase):
+class SlidingWindowAttention(ApiBaseTorch):
     def __init__(
         self,
         sample_q: torch.Tensor,

@@ -11,6 +11,7 @@ from typing import Any, NamedTuple
 
 import jax.numpy as jnp
 
+from ..._jax.api_base import ApiBaseJax
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 from ..._jax.validation import require_dtype
 from ..jax_utils import bhsd_tensor_spec, require_bhsd_qkv, resolve_sdpa_config
@@ -88,7 +89,7 @@ def _make_launcher(
     return launch
 
 
-def sdpa_fwd_wrapper_sm100_d256(
+def _sdpa_fwd_impl(
     q_tensor: Any,
     k_tensor: Any,
     v_tensor: Any,
@@ -99,6 +100,8 @@ def sdpa_fwd_wrapper_sm100_d256(
     window_size: tuple[int, int] = (-1, -1),
     scale_softmax: float | None = None,
     scale_output: float = 1.0,
+    *,
+    _validate_only: bool = False,
 ) -> SdpaFwdResult:
     """Compute fixed-shape BHSD SDPA forward with the SM100 d=256 kernel.
 
@@ -135,6 +138,9 @@ def sdpa_fwd_wrapper_sm100_d256(
         scale_softmax=scale_softmax,
     )
     scale_output = float(scale_output)
+    if _validate_only:
+        return None
+
     bhsd_spec = bhsd_tensor_spec()
 
     o_tensor, lse_tensor = call_cutedsl(
@@ -170,4 +176,97 @@ def sdpa_fwd_wrapper_sm100_d256(
     return SdpaFwdResult(o_tensor=o_tensor, lse_tensor=lse_tensor)
 
 
-__all__ = ["SdpaFwdResult", "sdpa_fwd_wrapper_sm100_d256"]
+class SdpafwdSm100D256(ApiBaseJax):
+    """Sample-signature-bound JAX callable for SM100 d=256 SDPA forward."""
+
+    def __init__(
+        self,
+        sample_q: Any,
+        sample_k: Any,
+        sample_v: Any,
+        qk_acc_dtype: Any = None,
+        pv_acc_dtype: Any = None,
+        mma_tiler_mn: tuple[int, int] = (128, 128),
+        is_causal: bool = False,
+        window_size: tuple[int, int] = (-1, -1),
+        scale_softmax: float | None = None,
+        scale_output: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.q_desc = self.make_tensor_desc(sample_q, name="sample_q")
+        self.k_desc = self.make_tensor_desc(sample_k, name="sample_k")
+        self.v_desc = self.make_tensor_desc(sample_v, name="sample_v")
+        self.qk_acc_dtype = self.as_optional_dtype(qk_acc_dtype)
+        self.pv_acc_dtype = self.as_optional_dtype(pv_acc_dtype)
+        self.mma_tiler_mn = tuple(mma_tiler_mn)
+        self.is_causal = is_causal
+        self.window_size = tuple(window_size)
+        self.scale_softmax = scale_softmax
+        self.scale_output = scale_output
+
+    def _check_support(self) -> bool:
+        _sdpa_fwd_impl(
+            self.q_desc,
+            self.k_desc,
+            self.v_desc,
+            self.qk_acc_dtype,
+            self.pv_acc_dtype,
+            self.mma_tiler_mn,
+            self.is_causal,
+            self.window_size,
+            self.scale_softmax,
+            self.scale_output,
+            _validate_only=True,
+        )
+        return True
+
+    def __call__(self, q_tensor: Any, k_tensor: Any, v_tensor: Any) -> SdpaFwdResult:
+        return super().__call__(q_tensor, k_tensor, v_tensor)
+
+    def _call_impl(self, q_tensor: Any, k_tensor: Any, v_tensor: Any) -> SdpaFwdResult:
+        self.check_tensor_signature(q_tensor, self.q_desc, name="Q")
+        self.check_tensor_signature(k_tensor, self.k_desc, name="K")
+        self.check_tensor_signature(v_tensor, self.v_desc, name="V")
+        return _sdpa_fwd_impl(
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            self.qk_acc_dtype,
+            self.pv_acc_dtype,
+            self.mma_tiler_mn,
+            self.is_causal,
+            self.window_size,
+            self.scale_softmax,
+            self.scale_output,
+        )
+
+
+def sdpa_fwd_wrapper_sm100_d256(
+    q_tensor: Any,
+    k_tensor: Any,
+    v_tensor: Any,
+    qk_acc_dtype: Any = None,
+    pv_acc_dtype: Any = None,
+    mma_tiler_mn: tuple[int, int] = (128, 128),
+    is_causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
+    scale_softmax: float | None = None,
+    scale_output: float = 1.0,
+) -> SdpaFwdResult:
+    """Compute fixed-shape BHSD SDPA forward with the SM100 d=256 kernel."""
+
+    return SdpafwdSm100D256(
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        qk_acc_dtype=qk_acc_dtype,
+        pv_acc_dtype=pv_acc_dtype,
+        mma_tiler_mn=mma_tiler_mn,
+        is_causal=is_causal,
+        window_size=window_size,
+        scale_softmax=scale_softmax,
+        scale_output=scale_output,
+    )(q_tensor, k_tensor, v_tensor)
+
+
+__all__ = ["SdpaFwdResult", "SdpafwdSm100D256", "sdpa_fwd_wrapper_sm100_d256"]

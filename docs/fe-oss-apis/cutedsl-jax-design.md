@@ -6,16 +6,20 @@ below.
 
 ## Executive decision
 
-Do not make the existing `APIBase.compile()` / `execute()` lifecycle accept JAX
-arrays, and do not introduce a second replacement Torch API. The existing
-top-level Torch classes and wrappers remain canonical and backward compatible.
-Add JAX as an optional functional namespace under `cudnn.jax`, lowering CuTe DSL
-launchers through `cutlass.jax.cutlass_call`.
+Do not make the existing Torch `ApiBaseTorch.compile()` / `execute()` lifecycle accept JAX
+arrays, and do not introduce a replacement Torch API. Split framework-neutral
+tensor metadata and validation into `TensorDesc` and `ApiBase`; retain the
+existing `APIBase` spelling as a backward-compatible alias; and add
+`ApiBaseJax` for stable, un-jitted callable objects specialized from abstract
+sample metadata.
+The existing top-level Torch classes and wrappers remain canonical. JAX remains
+an optional functional namespace under `cudnn.jax`, lowering CuTe DSL launchers
+through `cutlass.jax.cutlass_call`.
 
-No framework-neutral public API or mandatory cross-framework contract layer is
-needed. Each binding should follow its framework's conventions while reusing
-kernel code and framework-neutral implementation helpers where that reduces
-real duplication.
+The shared layer is not a mandatory exact cross-framework contract. Each
+binding follows its framework's conventions while per-operation validators
+share rank, shape, logical dtype, layout, and configuration rules where that
+removes real duplication.
 
 The distinction matters because a JAX value encountered during tracing is an
 abstract value, not a device buffer:
@@ -35,6 +39,9 @@ The current implementation applies this split to 29 public FE-OSS wrapper entry
 points: RMSNorm + RHT + amax; all four dense GEMM fusions; all nine grouped GEMM
 wrappers; SDPA forward and backward; Native Sparse Attention compression,
 selection, and top-k; and ten DeepSeek Sparse Attention stages and helpers.
+Twenty-seven operation-backed entry points also expose a JAX class aligned with
+the corresponding Torch class name. The two DSA layout helpers remain plain
+functions because they do not have corresponding Torch operation classes.
 When Torch is installed, the existing Torch APIs remain unchanged. JAX support
 is reviewed per operation rather than required for every new or modified
 PyTorch API or physical CuTe kernel.
@@ -65,7 +72,7 @@ wrappers, while configuration-specific kernels remain deferred until tracing.
 
 ### Non-goals for the first production increment
 
-- Making the existing class API traceable.
+- Making the existing Torch class API traceable.
 - Supporting every FE-OSS operator immediately.
 - Arbitrary Torch-style strided JAX views.
 - Data-dependent output or workspace sizes.
@@ -82,9 +89,10 @@ and covered the local implementation under `python/cudnn`, its tests, and
 representative operators with and without workspace. The main coupling points
 are:
 
-- [`api_base.py`](../../python/cudnn/api_base.py): `TensorDesc` stores
-  `torch.dtype` and `torch.device`; dtype checks and tensor conversion are
-  Torch-specific.
+- [`api_base.py`](../../python/cudnn/api_base.py): framework-neutral
+  `TensorDesc` and `ApiBase`, including canonical logical dtype and packing.
+- [`api_base_torch.py`](../../python/cudnn/api_base_torch.py): observed Torch
+  strides/devices plus the existing compile/execute lifecycle.
 - [`datatypes.py`](../../python/cudnn/datatypes.py): framework mappings only
   cover Torch today.
 - [`gemm_amax/api.py`](../../python/cudnn/gemm_amax/api.py) and
@@ -299,11 +307,11 @@ OperatorDefinition
 The core must not allocate tensors, inspect device values, access data pointers,
 or choose a framework stream.
 
-The implementation starts this extraction with
-[`rmsnorm_rht_amax/config.py`](../../python/cudnn/rmsnorm_rht_amax/config.py),
-which mirrors the canonical Torch launch rules for JAX without modifying the
-Torch implementation. Moving both targets onto one neutral implementation is a
-Phase 1 change gated by Torch compatibility snapshots.
+The implementation starts this extraction with shared validators for
+[`rmsnorm_rht_amax/config.py`](../../python/cudnn/rmsnorm_rht_amax/config.py)
+and [`gemm_amax/validation.py`](../../python/cudnn/gemm_amax/validation.py).
+Both targets consume immutable validated plans while allocation, device checks,
+and lowering remain framework-specific.
 
 ### 2. Torch adapter
 
@@ -314,10 +322,17 @@ Keep existing class and wrapper APIs stable and first class:
 - Compile through the existing TVM-FFI path.
 - Invoke on the explicit/current Torch stream.
 
-As operator cores are extracted, `APIBase` remains the canonical Torch binding
-rather than becoming a framework-generic abstraction. There is no second
-`.torch` wrapper, shared result container, or forced signature migration. This
-avoids a risky flag day across all existing APIs.
+Torch wrappers inherit `ApiBaseTorch` explicitly. `ApiBaseTorch` owns support
+state, compilation, execution, streams, and fake CuTe tensors. The legacy
+`APIBase` spelling remains an alias for downstream source compatibility. The
+new `ApiBase` contains only framework-neutral metadata validation.
+There is no second `.torch` wrapper, shared result container, or forced
+signature migration.
+
+Existing downstream `APIBase` subclasses and functional Torch shims remain compatible.
+Code that directly constructed the former Torch-specific `TensorDesc` should
+use `TorchTensorDesc`; `TensorDesc` is now intentionally limited to neutral
+logical metadata.
 
 ### 3. JAX adapter
 
@@ -340,6 +355,22 @@ Each wrapper:
 4. Binds a canonical launcher through `call_cutedsl`.
 5. Returns a standard tuple, named tuple, or registered pytree.
 
+Each `ApiBaseJax` instance is specialized from sample array-like metadata and
+is itself a stable traceable callable. Construction immediately converts
+samples to `JaxTensorDesc`; sample arrays and tracers are not retained. Calling
+the object accepts the real JAX operands and verifies that they match the
+validated sample signature. `check_support()` resolves static configuration,
+but checks only the abstract signature and kernel configuration; final device
+capability is determined during JAX lowering. `get_jax_callable()` returns the
+same instance for callers that need an explicit callable accessor. None of
+these paths calls `jax.jit`; applications retain control over JIT, sharding,
+donation, and device-placement policy. JAX API objects retain only descriptors
+and static configuration, never input arrays or tracers, workspaces,
+streams, or compiled executables.
+Treat an instance's configuration as immutable after construction; create a
+new instance when compile-time options change so JAX receives a distinct
+callable and cache identity.
+
 Do not dispatch implicitly by checking whether an argument is a Torch tensor or
 a JAX tracer. Namespace selection happens before tracing. `cudnn.jax` validates
 JAX and CuTe DSL once, including `cutlass.jax.is_available()`, and reports the
@@ -361,8 +392,15 @@ stream. This work is independent of the FE-OSS CuTe DSL integration.
 
 ## Tensor metadata and layout
 
-The current `TensorDesc` combines logical tensor metadata with Torch-specific
-storage and device types. The production refactor should separate:
+`TensorDesc` contains the common logical metadata. `TorchTensorDesc` and
+`JaxTensorDesc` are sibling specializations: Torch records observed storage and
+device metadata, while JAX records the compact layout and mode contract passed
+to `TensorSpec`. The neutral `shape`, `stride`, and `stride_order` are always in
+the mode order presented to the kernel. Torch starts with identity mode order
+and can transform a descriptor explicitly; JAX applies `TensorSpec.mode` while
+constructing its descriptor. This gives shared validators one axis convention
+even when the JAX array's public axis order differs from the kernel ABI. The
+model separates:
 
 - canonical scalar type;
 - logical shape;
@@ -383,14 +421,15 @@ runtime stride vectors. The JAX binding must therefore:
 - reject overlapping, broadcast-stride, and non-compact layouts unless the
   kernel is explicitly adapted.
 
-The adapter uses `cutlass.jax.TensorSpec` directly rather than maintaining a
-cuDNN-specific shadow layout type. `input_specs` contains one native
-`TensorSpec` or `None` per input, and `BufferSpec.tensor_spec` carries the same
-metadata for an output or workspace. `None` selects CUTLASS's default tensor
-specification. The native type is constructed only in the explicitly imported
-JAX path, so this choice does not make JAX or CUTLASS an import-time dependency
-of the base package. Any additional FE validation should inspect a `TensorSpec`
-without copying its fields into another public data model.
+`cutlass.jax.TensorSpec` remains the lowering source of truth. `input_specs`
+contains one native `TensorSpec` or `None` per input, and
+`BufferSpec.tensor_spec` carries the same metadata for an output or workspace.
+`None` selects CUTLASS's default tensor specification. `JaxTensorDesc` copies
+only the normalized logical shape, dtype, layout, and mode needed by shared FE
+validation; it is not passed to CUTLASS and does not replace `TensorSpec`. The
+native CUTLASS type is constructed only in the explicitly imported JAX path,
+so this choice does not make JAX or CUTLASS an import-time dependency of the
+base package.
 
 This differs from Torch, where wrappers can allocate an arbitrary
 `empty_strided` result. Layout should be an operator contract, not inferred from
@@ -638,7 +677,7 @@ legacy_torch_result = rmsnorm_rht_amax_wrapper_sm100(
 
 # JAX is a separate optional install and namespace.
 import jax
-from cudnn.jax import rmsnorm_rht_amax_sm100
+from cudnn.jax import RmsNormRhtAmaxSm100, rmsnorm_rht_amax_sm100
 
 eps = 1e-5
 num_threads = 128
@@ -655,6 +694,18 @@ def run(x, weight):
     )
 
 jax_result = run(x_jax, weight_jax)
+
+# The class API specializes from metadata without retaining sample arrays.
+api = RmsNormRhtAmaxSm100(
+    jax.ShapeDtypeStruct(x_jax.shape, x_jax.dtype),
+    jax.ShapeDtypeStruct(weight_jax.shape, weight_jax.dtype),
+    eps=eps,
+    num_threads=num_threads,
+    rows_per_cta=rows_per_cta,
+)
+api.check_support()
+jitted_api = jax.jit(api)
+jax_result = jitted_api(x_jax, weight_jax)
 ```
 
 - The existing PyTorch API remains first class. Its class lifecycle, wrapper
@@ -741,6 +792,9 @@ removes the legacy FFI branch from the supported integration surface.
   [top-k plus two helpers](../../python/cudnn/deepseek_sparse_attention/indexer_top_k/jax.py),
   [all four score-recompute variants](../../python/cudnn/deepseek_sparse_attention/score_recompute/jax.py),
   and [sparse-attention backward](../../python/cudnn/deepseek_sparse_attention/sparse_attention_backward/jax.py).
+- Every operation-backed JAX wrapper above also exports an `ApiBaseJax`
+  callable class with the aligned Torch class name. Only the two DSA layout
+  helpers omit a class because their Torch surface is functional-only.
 - CPU-only adapter contract tests cover hidden workspace, initialization,
   layout passthrough, and invalid call plans.
 - Dependency-free contract tests use lightweight module stand-ins to cover the

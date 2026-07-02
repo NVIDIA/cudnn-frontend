@@ -14,7 +14,7 @@ import torch
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
+from cudnn.api_base import ApiBaseTorch, TupleDict, ceil_div, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
 
 from ..moe_utils import MoEWeightMode
@@ -30,7 +30,7 @@ def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-class GroupedGemmGluHadamardSm100(APIBase):
+class GroupedGemmGluHadamardSm100(ApiBaseTorch):
     """Grouped GEMM GLU forward kernel with fused Hadamard transform."""
 
     def __init__(

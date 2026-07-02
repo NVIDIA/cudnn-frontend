@@ -11,6 +11,7 @@ from typing import Any, NamedTuple, Optional
 
 import jax.numpy as jnp
 
+from ..._jax.api_base import ApiBaseJax
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 from ..._jax.gemm import (
     block_scale_tensor_spec,
@@ -32,6 +33,7 @@ from ...gemm_validation import (
     require_shape,
     resolve_max_active_clusters,
 )
+from .._jax_api import check_call_signatures, immutable_mapping
 
 
 class GroupedGemmDswigluResult(NamedTuple):
@@ -137,7 +139,7 @@ def _make_launcher(
     return launch
 
 
-def grouped_gemm_dswiglu_wrapper_sm100(
+def _grouped_gemm_dswiglu_impl(
     a_tensor: Any,
     b_tensor: Any,
     c_tensor: Any,
@@ -158,7 +160,9 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     m_aligned: int = 256,
     discrete_col_sfd: bool = False,
     epilogue_op: Optional[str] = None,
-) -> GroupedGemmDswigluResult:
+    *,
+    _validate_only: bool = False,
+) -> GroupedGemmDswigluResult | dict[str, Any]:
     """Compute the MXFP8 contiguous grouped dSwiGLU fusion.
 
     ``dprob_tensor`` is modeled as a fresh zero-initialized JAX result instead
@@ -207,7 +211,8 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     require_grouped_probability("prob_tensor", prob_tensor, m=m)
     require_grouped_vector("norm_const_tensor", norm_const_tensor, length=1)
     if beta_tensor is None:
-        beta_tensor = jnp.ones((experts,), dtype=jnp.float32)
+        if not _validate_only:
+            beta_tensor = jnp.ones((experts,), dtype=jnp.float32)
     else:
         require_grouped_vector("beta_tensor", beta_tensor, length=experts)
 
@@ -237,6 +242,15 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     require_16_byte_extent("b_tensor", k, ab_dtype)
     require_16_byte_extent("c_tensor", output_n, c_dtype)
     require_16_byte_extent("d_tensor", output_n, d_dtype)
+
+    if _validate_only:
+        return {
+            "acc_dtype": acc_dtype,
+            "d_dtype": d_dtype,
+            "mma_tiler_mn": mma_tiler_mn,
+            "cluster_shape_mn": cluster_shape_mn,
+            "epilogue_op": normalized_epilogue,
+        }
 
     d_row_tensor, d_col_tensor, dprob_tensor, sfd_row_tensor, sfd_col_tensor = call_cutedsl(
         _make_launcher(
@@ -303,4 +317,196 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     )
 
 
-__all__ = ["GroupedGemmDswigluResult", "grouped_gemm_dswiglu_wrapper_sm100"]
+class GroupedGemmDswigluSm100(ApiBaseJax):
+    """Sample-signature-bound JAX callable for grouped GEMM + dSwiGLU."""
+
+    def __init__(
+        self,
+        sample_a_tensor: Any,
+        sample_b_tensor: Any,
+        sample_c_tensor: Any,
+        sample_sfa_tensor: Any,
+        sample_sfb_tensor: Any,
+        sample_padded_offsets: Any,
+        sample_alpha_tensor: Any,
+        sample_beta_tensor: Optional[Any],
+        sample_prob_tensor: Any,
+        sample_norm_const_tensor: Any,
+        acc_dtype: Any = None,
+        d_dtype: Any = None,
+        cd_major: str = "n",
+        mma_tiler_mn: tuple[int, int] = (256, 256),
+        cluster_shape_mn: Optional[tuple[int, int]] = None,
+        sf_vec_size: int = 32,
+        vector_f32: bool = False,
+        m_aligned: int = 256,
+        discrete_col_sfd: bool = False,
+        epilogue_op: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        self._sample_descs = {
+            "a_tensor": self.make_tensor_desc(sample_a_tensor, name="sample_a_tensor"),
+            "b_tensor": self.make_tensor_desc(sample_b_tensor, name="sample_b_tensor"),
+            "c_tensor": self.make_tensor_desc(sample_c_tensor, name="sample_c_tensor"),
+            "sfa_tensor": self.make_tensor_desc(sample_sfa_tensor, name="sample_sfa_tensor"),
+            "sfb_tensor": self.make_tensor_desc(sample_sfb_tensor, name="sample_sfb_tensor"),
+            "padded_offsets": self.make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets"),
+            "alpha_tensor": self.make_tensor_desc(sample_alpha_tensor, name="sample_alpha_tensor"),
+            "beta_tensor": self.make_optional_tensor_desc(sample_beta_tensor, name="sample_beta_tensor"),
+            "prob_tensor": self.make_tensor_desc(sample_prob_tensor, name="sample_prob_tensor"),
+            "norm_const_tensor": self.make_tensor_desc(sample_norm_const_tensor, name="sample_norm_const_tensor"),
+        }
+        self._config = {
+            "acc_dtype": self.as_optional_dtype(acc_dtype),
+            "d_dtype": self.as_optional_dtype(d_dtype),
+            "cd_major": cd_major,
+            "mma_tiler_mn": tuple(mma_tiler_mn),
+            "cluster_shape_mn": (None if cluster_shape_mn is None else tuple(cluster_shape_mn)),
+            "sf_vec_size": sf_vec_size,
+            "vector_f32": vector_f32,
+            "m_aligned": m_aligned,
+            "discrete_col_sfd": discrete_col_sfd,
+            "epilogue_op": epilogue_op,
+        }
+
+        self._sample_descs = immutable_mapping(self._sample_descs)
+        self._config = immutable_mapping(self._config)
+
+    def _check_support(self) -> bool:
+        resolved = _grouped_gemm_dswiglu_impl(
+            self._sample_descs["a_tensor"],
+            self._sample_descs["b_tensor"],
+            self._sample_descs["c_tensor"],
+            self._sample_descs["sfa_tensor"],
+            self._sample_descs["sfb_tensor"],
+            self._sample_descs["padded_offsets"],
+            self._sample_descs["alpha_tensor"],
+            self._sample_descs["beta_tensor"],
+            self._sample_descs["prob_tensor"],
+            self._sample_descs["norm_const_tensor"],
+            **self._config,
+            _validate_only=True,
+        )
+        self._config = immutable_mapping({**self._config, **resolved})
+        return True
+
+    def __call__(
+        self,
+        a_tensor: Any,
+        b_tensor: Any,
+        c_tensor: Any,
+        sfa_tensor: Any,
+        sfb_tensor: Any,
+        padded_offsets: Any,
+        alpha_tensor: Any,
+        beta_tensor: Optional[Any],
+        prob_tensor: Any,
+        norm_const_tensor: Any,
+    ) -> GroupedGemmDswigluResult:
+        return super().__call__(
+            a_tensor,
+            b_tensor,
+            c_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            padded_offsets,
+            alpha_tensor,
+            beta_tensor,
+            prob_tensor,
+            norm_const_tensor,
+        )
+
+    def _call_impl(
+        self,
+        a_tensor: Any,
+        b_tensor: Any,
+        c_tensor: Any,
+        sfa_tensor: Any,
+        sfb_tensor: Any,
+        padded_offsets: Any,
+        alpha_tensor: Any,
+        beta_tensor: Optional[Any],
+        prob_tensor: Any,
+        norm_const_tensor: Any,
+    ) -> GroupedGemmDswigluResult:
+        values = {
+            "a_tensor": a_tensor,
+            "b_tensor": b_tensor,
+            "c_tensor": c_tensor,
+            "sfa_tensor": sfa_tensor,
+            "sfb_tensor": sfb_tensor,
+            "padded_offsets": padded_offsets,
+            "alpha_tensor": alpha_tensor,
+            "beta_tensor": beta_tensor,
+            "prob_tensor": prob_tensor,
+            "norm_const_tensor": norm_const_tensor,
+        }
+        check_call_signatures(self, self._sample_descs, values)
+        return _grouped_gemm_dswiglu_impl(**values, **self._config)
+
+
+def grouped_gemm_dswiglu_wrapper_sm100(
+    a_tensor: Any,
+    b_tensor: Any,
+    c_tensor: Any,
+    sfa_tensor: Any,
+    sfb_tensor: Any,
+    padded_offsets: Any,
+    alpha_tensor: Any,
+    beta_tensor: Optional[Any],
+    prob_tensor: Any,
+    norm_const_tensor: Any,
+    acc_dtype: Any = None,
+    d_dtype: Any = None,
+    cd_major: str = "n",
+    mma_tiler_mn: tuple[int, int] = (256, 256),
+    cluster_shape_mn: Optional[tuple[int, int]] = None,
+    sf_vec_size: int = 32,
+    vector_f32: bool = False,
+    m_aligned: int = 256,
+    discrete_col_sfd: bool = False,
+    epilogue_op: Optional[str] = None,
+) -> GroupedGemmDswigluResult:
+    """Compute the MXFP8 contiguous grouped dSwiGLU fusion."""
+
+    op = GroupedGemmDswigluSm100(
+        a_tensor,
+        b_tensor,
+        c_tensor,
+        sfa_tensor,
+        sfb_tensor,
+        padded_offsets,
+        alpha_tensor,
+        beta_tensor,
+        prob_tensor,
+        norm_const_tensor,
+        acc_dtype=acc_dtype,
+        d_dtype=d_dtype,
+        cd_major=cd_major,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=sf_vec_size,
+        vector_f32=vector_f32,
+        m_aligned=m_aligned,
+        discrete_col_sfd=discrete_col_sfd,
+        epilogue_op=epilogue_op,
+    )
+    return op(
+        a_tensor,
+        b_tensor,
+        c_tensor,
+        sfa_tensor,
+        sfb_tensor,
+        padded_offsets,
+        alpha_tensor,
+        beta_tensor,
+        prob_tensor,
+        norm_const_tensor,
+    )
+
+
+__all__ = [
+    "GroupedGemmDswigluResult",
+    "GroupedGemmDswigluSm100",
+    "grouped_gemm_dswiglu_wrapper_sm100",
+]

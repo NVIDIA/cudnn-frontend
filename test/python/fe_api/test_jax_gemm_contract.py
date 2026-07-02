@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import ast
 import importlib
-from importlib.machinery import ModuleSpec
-from pathlib import Path
 import sys
 import types
 import unittest
+from importlib.machinery import ModuleSpec
+from pathlib import Path
 from unittest import mock
 
 try:
@@ -180,7 +180,12 @@ class JaxGemmContractTest(unittest.TestCase):
         cls.swiglu_capabilities = _kernel_capabilities(
             _CUDNN_ROOT / "gemm_swiglu" / "dense_gemm_persistent_swiglu.py",
             "PersistentDenseGemmKernel",
-            _COMMON_KERNEL_CAPABILITIES | {"SINGLE_CTA_CLUSTER_SHAPE", "SWIGLU_BLOCK_COLUMNS", "SWIGLU_BLOCKS_PER_PAIR"},
+            _COMMON_KERNEL_CAPABILITIES
+            | {
+                "SINGLE_CTA_CLUSTER_SHAPE",
+                "SWIGLU_BLOCK_COLUMNS",
+                "SWIGLU_BLOCKS_PER_PAIR",
+            },
             _COMMON_KERNEL_METHODS | {"get_output_n"},
         )
         cls.quantized_swiglu_capabilities = _kernel_capabilities(
@@ -204,7 +209,7 @@ class JaxGemmContractTest(unittest.TestCase):
         cls.amax_capabilities = _kernel_capabilities(
             _CUDNN_ROOT / "gemm_amax" / "dense_blockscaled_gemm_persistent_amax.py",
             "Sm100BlockScaledPersistentDenseGemmKernel",
-            _COMMON_KERNEL_CAPABILITIES | {"KNOWN_HANG_MMA_TILER_M"},
+            _COMMON_KERNEL_CAPABILITIES | {"KNOWN_HANG_MMA_TILER_M", "SF_VEC_SIZES"},
             _COMMON_KERNEL_METHODS,
         )
         cls.fake_kernel_modules = {}
@@ -529,13 +534,62 @@ class JaxGemmContractTest(unittest.TestCase):
                     (self.srelu, (a, b, sfa, sfb, prob)),
                     (self.dsrelu, (a, b, c, sfa, sfb, prob)),
                 ):
+                    wrapper_name = "gemm_srelu_wrapper_sm100" if module is self.srelu else "gemm_dsrelu_wrapper_sm100"
                     with (
                         self.subTest(module=module.__name__, mma_tiler_mn=mma_tiler_mn),
                         self.assertRaisesRegex(ValueError, f"TILE_M={mma_tiler_mn[0]}"),
                         mock.patch.object(module, "_make_launcher") as make_launcher,
                     ):
-                        getattr(module, module.__all__[1])(*call_args, mma_tiler_mn=mma_tiler_mn)
+                        getattr(module, wrapper_name)(*call_args, mma_tiler_mn=mma_tiler_mn)
                     make_launcher.assert_not_called()
+
+    def test_dense_class_uses_sample_metadata_without_retaining_arrays(self):
+        sample_a = _Array((128, 128, 1), self.float8_e4m3fn)
+        sample_b = _Array((128, 128, 1), self.float8_e4m3fn)
+        sample_sfa = _Array((32, 4, 1, 4, 1, 1), self.float8_e8m0fnu)
+        sample_sfb = _Array((32, 4, 1, 4, 1, 1), self.float8_e8m0fnu)
+        samples = (sample_a, sample_b, sample_sfa, sample_sfb)
+        dtype_carrier = _Array((1,), self.float32)
+
+        with self._optional_modules():
+            operation = self.amax.GemmAmaxSm100(*samples, c_dtype=dtype_carrier)
+            self.assertTrue(operation.check_support())
+
+        self.assertIs(operation.get_jax_callable(), operation)
+        self.assertEqual(operation.a_desc.shape, sample_a.shape)
+        self.assertEqual(operation.sfa_desc.shape, sample_sfa.shape)
+        self.assertTrue(all(stored is not sample for stored in vars(operation).values() for sample in samples))
+        self.assertTrue(all(stored is not dtype_carrier for stored in vars(operation).values()))
+
+        actual_a = _Array(sample_a.shape, sample_a.dtype)
+        actual_b = _Array(sample_b.shape, sample_b.dtype)
+        actual_sfa = _Array(sample_sfa.shape, sample_sfa.dtype)
+        actual_sfb = _Array(sample_sfb.shape, sample_sfb.dtype)
+        captured = {}
+        with (
+            self._optional_modules(),
+            mock.patch.object(self.amax, "_make_launcher", return_value="amax"),
+            mock.patch.object(
+                self.amax,
+                "call_cutedsl",
+                side_effect=self._fake_call(captured),
+            ),
+        ):
+            operation(actual_a, actual_b, actual_sfa, actual_sfb)
+        self.assertEqual(captured["inputs"], (actual_a, actual_b, actual_sfa, actual_sfb))
+
+        with (
+            self._optional_modules(),
+            self.assertRaisesRegex(ValueError, "A tensor shape mismatch"),
+            mock.patch.object(self.amax, "call_cutedsl") as lower,
+        ):
+            operation(
+                _Array((64, 128, 1), self.float8_e4m3fn),
+                actual_b,
+                actual_sfa,
+                actual_sfb,
+            )
+        lower.assert_not_called()
 
     def test_launchers_preserve_native_argument_order(self):
         swiglu_calls = []

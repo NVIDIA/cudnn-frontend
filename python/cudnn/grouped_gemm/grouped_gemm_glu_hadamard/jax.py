@@ -11,6 +11,7 @@ from typing import Any, NamedTuple, Optional
 
 import jax.numpy as jnp
 
+from ..._jax.api_base import ApiBaseJax
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 from ..._jax.gemm import (
     block_scale_tensor_spec,
@@ -33,6 +34,7 @@ from ...gemm_validation import (
     require_shape,
     resolve_max_active_clusters,
 )
+from .._jax_api import check_call_signatures, immutable_mapping
 
 
 class GroupedGemmGluHadamardResult(NamedTuple):
@@ -77,7 +79,9 @@ def _make_launcher(
         from cutlass.jax import jax_to_cutlass_dtype
 
         from ..moe_utils import MoEWeightMode
-        from .moe_blockscaled_grouped_gemm_glu_hadamard import BlockScaledMoEGroupedGemmGluHadamardKernel
+        from .moe_blockscaled_grouped_gemm_glu_hadamard import (
+            BlockScaledMoEGroupedGemmGluHadamardKernel,
+        )
 
         arg_idx = 0
 
@@ -149,7 +153,7 @@ def _make_launcher(
     return launch
 
 
-def grouped_gemm_glu_hadamard_wrapper_sm100(
+def _grouped_gemm_glu_hadamard_impl(
     a_tensor: Any,
     b_tensor: Any,
     sfa_tensor: Any,
@@ -173,7 +177,8 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     use_tmem_post_rht_amax: bool = False,
     *,
     b_major: str = "k",
-) -> GroupedGemmGluHadamardResult:
+    _validate_only: bool = False,
+) -> GroupedGemmGluHadamardResult | dict[str, Any]:
     """Compute dense native-FP4 grouped GEMM with GLU and Hadamard amax.
 
     A and B use JAX's native ``float4_e2m1fn`` dtype with logical shapes
@@ -190,7 +195,9 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     from cutlass import Float32
     from cutlass.jax import jax_to_cutlass_dtype
 
-    from .moe_blockscaled_grouped_gemm_glu_hadamard import BlockScaledMoEGroupedGemmGluHadamardKernel
+    from .moe_blockscaled_grouped_gemm_glu_hadamard import (
+        BlockScaledMoEGroupedGemmGluHadamardKernel,
+    )
 
     kernel = BlockScaledMoEGroupedGemmGluHadamardKernel
     m, n, k, experts, ab_dtype = require_grouped_gemm_inputs(
@@ -272,6 +279,27 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     ):
         raise ValueError("Unsupported grouped GEMM GLU Hadamard configuration")
 
+    has_hadamard = bool(use_tmem_post_rht_amax)
+    if has_hadamard and hadamard_tensor is not None:
+        hadamard_shape = require_array("hadamard_tensor", hadamard_tensor, 2)
+        require_shape(
+            "hadamard_tensor",
+            hadamard_shape,
+            (kernel.HADAMARD_SIZE, kernel.HADAMARD_SIZE),
+        )
+        require_dtype("hadamard_tensor.dtype", hadamard_tensor, (jnp.bfloat16,))
+    elif not has_hadamard and hadamard_tensor is not None:
+        raise ValueError("hadamard_tensor is used only when use_tmem_post_rht_amax=True")
+
+    if _validate_only:
+        return {
+            "acc_dtype": acc_dtype,
+            "c_dtype": c_dtype,
+            "d_dtype": d_dtype,
+            "mma_tiler_mn": mma_tiler_mn,
+            "cluster_shape_mn": cluster_shape_mn,
+        }
+
     a_spec = gemm_a_tensor_spec("k")
     b_spec = gemm_b_tensor_spec("k")
     output_spec = gemm_c_tensor_spec("n")
@@ -295,18 +323,11 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         probability_tensor_spec(),
     ]
 
-    has_hadamard = bool(use_tmem_post_rht_amax)
     if has_hadamard:
         if hadamard_tensor is None:
             hadamard_tensor = jnp.asarray(hadamard_values(kernel.HADAMARD_SIZE), dtype=jnp.bfloat16)
-        else:
-            hadamard_shape = require_array("hadamard_tensor", hadamard_tensor, 2)
-            require_shape("hadamard_tensor", hadamard_shape, (kernel.HADAMARD_SIZE, kernel.HADAMARD_SIZE))
-            require_dtype("hadamard_tensor.dtype", hadamard_tensor, (jnp.bfloat16,))
         inputs.append(hadamard_tensor)
         input_specs.append(None)
-    elif hadamard_tensor is not None:
-        raise ValueError("hadamard_tensor is used only when use_tmem_post_rht_amax=True")
 
     if bias_tensor is not None:
         inputs.append(bias_tensor)
@@ -331,7 +352,13 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         inputs,
         outputs=(
             BufferSpec("c_tensor", (m, n, 1), c_dtype, tensor_spec=output_spec, fill_value=0),
-            BufferSpec("d_tensor", (m, output_n, 1), d_dtype, tensor_spec=output_spec, fill_value=0),
+            BufferSpec(
+                "d_tensor",
+                (m, output_n, 1),
+                d_dtype,
+                tensor_spec=output_spec,
+                fill_value=0,
+            ),
             BufferSpec("amax_tensor", (experts, 1), jnp.float32, fill_value=0.0),
             BufferSpec("post_rht_amax_tensor", (experts, 1), jnp.float32, fill_value=0.0),
         ),
@@ -355,4 +382,200 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     )
 
 
-__all__ = ["GroupedGemmGluHadamardResult", "grouped_gemm_glu_hadamard_wrapper_sm100"]
+class GroupedGemmGluHadamardSm100(ApiBaseJax):
+    """Sample-signature-bound JAX callable for grouped GEMM + GLU + Hadamard."""
+
+    def __init__(
+        self,
+        sample_a_tensor: Any,
+        sample_b_tensor: Any,
+        sample_sfa_tensor: Any,
+        sample_sfb_tensor: Any,
+        sample_padded_offsets: Any,
+        sample_alpha_tensor: Any,
+        sample_prob_tensor: Any,
+        sample_bias_tensor: Optional[Any] = None,
+        sample_hadamard_tensor: Optional[Any] = None,
+        acc_dtype: Any = None,
+        c_dtype: Any = None,
+        d_dtype: Any = None,
+        cd_major: str = "n",
+        mma_tiler_mn: tuple[int, int] = (256, 256),
+        cluster_shape_mn: Optional[tuple[int, int]] = None,
+        sf_vec_size: int = 16,
+        vector_f32: bool = False,
+        m_aligned: int = 256,
+        act_func: str = "swiglu",
+        use_dynamic_sched: bool = False,
+        use_tmem_post_rht_amax: bool = False,
+        *,
+        b_major: str = "k",
+    ) -> None:
+        super().__init__()
+        self._sample_descs = {
+            "a_tensor": self.make_tensor_desc(sample_a_tensor, name="sample_a_tensor"),
+            "b_tensor": self.make_tensor_desc(sample_b_tensor, name="sample_b_tensor"),
+            "sfa_tensor": self.make_tensor_desc(sample_sfa_tensor, name="sample_sfa_tensor"),
+            "sfb_tensor": self.make_tensor_desc(sample_sfb_tensor, name="sample_sfb_tensor"),
+            "padded_offsets": self.make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets"),
+            "alpha_tensor": self.make_tensor_desc(sample_alpha_tensor, name="sample_alpha_tensor"),
+            "prob_tensor": self.make_tensor_desc(sample_prob_tensor, name="sample_prob_tensor"),
+            "bias_tensor": self.make_optional_tensor_desc(sample_bias_tensor, name="sample_bias_tensor"),
+            "hadamard_tensor": self.make_optional_tensor_desc(sample_hadamard_tensor, name="sample_hadamard_tensor"),
+        }
+        self._config = {
+            "acc_dtype": self.as_optional_dtype(acc_dtype),
+            "c_dtype": self.as_optional_dtype(c_dtype),
+            "d_dtype": self.as_optional_dtype(d_dtype),
+            "cd_major": cd_major,
+            "mma_tiler_mn": tuple(mma_tiler_mn),
+            "cluster_shape_mn": (None if cluster_shape_mn is None else tuple(cluster_shape_mn)),
+            "sf_vec_size": sf_vec_size,
+            "vector_f32": vector_f32,
+            "m_aligned": m_aligned,
+            "act_func": act_func,
+            "use_dynamic_sched": use_dynamic_sched,
+            "use_tmem_post_rht_amax": use_tmem_post_rht_amax,
+            "b_major": b_major,
+        }
+
+        self._sample_descs = immutable_mapping(self._sample_descs)
+        self._config = immutable_mapping(self._config)
+
+    def _check_support(self) -> bool:
+        resolved = _grouped_gemm_glu_hadamard_impl(
+            self._sample_descs["a_tensor"],
+            self._sample_descs["b_tensor"],
+            self._sample_descs["sfa_tensor"],
+            self._sample_descs["sfb_tensor"],
+            self._sample_descs["padded_offsets"],
+            self._sample_descs["alpha_tensor"],
+            self._sample_descs["prob_tensor"],
+            self._sample_descs["bias_tensor"],
+            self._sample_descs["hadamard_tensor"],
+            **self._config,
+            _validate_only=True,
+        )
+        self._config = immutable_mapping({**self._config, **resolved})
+        return True
+
+    def __call__(
+        self,
+        a_tensor: Any,
+        b_tensor: Any,
+        sfa_tensor: Any,
+        sfb_tensor: Any,
+        padded_offsets: Any,
+        alpha_tensor: Any,
+        prob_tensor: Any,
+        bias_tensor: Optional[Any] = None,
+        hadamard_tensor: Optional[Any] = None,
+    ) -> GroupedGemmGluHadamardResult:
+        return super().__call__(
+            a_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            padded_offsets,
+            alpha_tensor,
+            prob_tensor,
+            bias_tensor,
+            hadamard_tensor,
+        )
+
+    def _call_impl(
+        self,
+        a_tensor: Any,
+        b_tensor: Any,
+        sfa_tensor: Any,
+        sfb_tensor: Any,
+        padded_offsets: Any,
+        alpha_tensor: Any,
+        prob_tensor: Any,
+        bias_tensor: Optional[Any] = None,
+        hadamard_tensor: Optional[Any] = None,
+    ) -> GroupedGemmGluHadamardResult:
+        values = {
+            "a_tensor": a_tensor,
+            "b_tensor": b_tensor,
+            "sfa_tensor": sfa_tensor,
+            "sfb_tensor": sfb_tensor,
+            "padded_offsets": padded_offsets,
+            "alpha_tensor": alpha_tensor,
+            "prob_tensor": prob_tensor,
+            "bias_tensor": bias_tensor,
+            "hadamard_tensor": hadamard_tensor,
+        }
+        check_call_signatures(self, self._sample_descs, values)
+        return _grouped_gemm_glu_hadamard_impl(**values, **self._config)
+
+
+def grouped_gemm_glu_hadamard_wrapper_sm100(
+    a_tensor: Any,
+    b_tensor: Any,
+    sfa_tensor: Any,
+    sfb_tensor: Any,
+    padded_offsets: Any,
+    alpha_tensor: Any,
+    prob_tensor: Any,
+    bias_tensor: Optional[Any] = None,
+    hadamard_tensor: Optional[Any] = None,
+    acc_dtype: Any = None,
+    c_dtype: Any = None,
+    d_dtype: Any = None,
+    cd_major: str = "n",
+    mma_tiler_mn: tuple[int, int] = (256, 256),
+    cluster_shape_mn: Optional[tuple[int, int]] = None,
+    sf_vec_size: int = 16,
+    vector_f32: bool = False,
+    m_aligned: int = 256,
+    act_func: str = "swiglu",
+    use_dynamic_sched: bool = False,
+    use_tmem_post_rht_amax: bool = False,
+    *,
+    b_major: str = "k",
+) -> GroupedGemmGluHadamardResult:
+    """Compute dense native-FP4 grouped GEMM with GLU and Hadamard amax."""
+
+    op = GroupedGemmGluHadamardSm100(
+        a_tensor,
+        b_tensor,
+        sfa_tensor,
+        sfb_tensor,
+        padded_offsets,
+        alpha_tensor,
+        prob_tensor,
+        bias_tensor,
+        hadamard_tensor,
+        acc_dtype=acc_dtype,
+        c_dtype=c_dtype,
+        d_dtype=d_dtype,
+        cd_major=cd_major,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=sf_vec_size,
+        vector_f32=vector_f32,
+        m_aligned=m_aligned,
+        act_func=act_func,
+        use_dynamic_sched=use_dynamic_sched,
+        use_tmem_post_rht_amax=use_tmem_post_rht_amax,
+        b_major=b_major,
+    )
+    return op(
+        a_tensor,
+        b_tensor,
+        sfa_tensor,
+        sfb_tensor,
+        padded_offsets,
+        alpha_tensor,
+        prob_tensor,
+        bias_tensor,
+        hadamard_tensor,
+    )
+
+
+__all__ = [
+    "GroupedGemmGluHadamardResult",
+    "GroupedGemmGluHadamardSm100",
+    "grouped_gemm_glu_hadamard_wrapper_sm100",
+]

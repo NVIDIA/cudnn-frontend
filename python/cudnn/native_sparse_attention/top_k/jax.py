@@ -12,6 +12,7 @@ from typing import Any, NamedTuple
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec, jax_to_cutlass_dtype
 
+from ..._jax.api_base import ApiBaseJax
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 from ..._jax.validation import require_dtype
 from ..jax_utils import bhsd_storage_spec, require_bhsd_qkv
@@ -103,7 +104,7 @@ def _require_topk_config(
         raise ValueError("k_value must be a positive multiple of 4 no greater than the " f"per-tile candidate count ({candidate_count}), got {k_value}")
 
 
-def topk_reduction_wrapper(
+def _topk_reduction_impl(
     q_tensor: Any,
     k_tensor: Any,
     lse_tensor: Any,
@@ -114,6 +115,8 @@ def topk_reduction_wrapper(
     is_causal: bool = True,
     mma_tiler_mn: tuple[int, int] = (128, 128),
     scale_softmax: float | None = None,
+    *,
+    _validate_only: bool = False,
 ) -> TopKReductionResult:
     """Select top compressed-KV blocks for fixed-shape BHSD inputs on SM100.
 
@@ -149,6 +152,9 @@ def topk_reduction_wrapper(
     )
 
     resolved_scale = 1.0 / math.sqrt(head_dim) if scale_softmax is None else float(scale_softmax)
+    if _validate_only:
+        return None
+
     bhsd_spec = bhsd_storage_spec(present_as_bshd=False)
     lse_spec = TensorSpec(layout=(2, 1, 0), mode=(0, 1, 2))
     output_shape = (batch, num_kv_heads, seqlen_q, int(k_value))
@@ -193,4 +199,97 @@ def topk_reduction_wrapper(
     )
 
 
-__all__ = ["TopKReductionResult", "topk_reduction_wrapper"]
+class TopKReduction(ApiBaseJax):
+    """Sample-signature-bound JAX callable for SM100 NSA top-K reduction."""
+
+    def __init__(
+        self,
+        sample_q: Any,
+        sample_k: Any,
+        sample_lse: Any,
+        acc_dtype: Any = None,
+        k_value: int = 16,
+        selection_block_size: int = 64,
+        compress_stride: int = 32,
+        is_causal: bool = True,
+        mma_tiler_mn: tuple[int, int] = (128, 128),
+        scale_softmax: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.q_desc = self.make_tensor_desc(sample_q, name="sample_q")
+        self.k_desc = self.make_tensor_desc(sample_k, name="sample_k")
+        self.lse_desc = self.make_tensor_desc(sample_lse, name="sample_lse")
+        self.acc_dtype = self.as_optional_dtype(acc_dtype)
+        self.k_value = k_value
+        self.selection_block_size = selection_block_size
+        self.compress_stride = compress_stride
+        self.is_causal = is_causal
+        self.mma_tiler_mn = tuple(mma_tiler_mn)
+        self.scale_softmax = scale_softmax
+
+    def _check_support(self) -> bool:
+        _topk_reduction_impl(
+            self.q_desc,
+            self.k_desc,
+            self.lse_desc,
+            self.acc_dtype,
+            self.k_value,
+            self.selection_block_size,
+            self.compress_stride,
+            self.is_causal,
+            self.mma_tiler_mn,
+            self.scale_softmax,
+            _validate_only=True,
+        )
+        return True
+
+    def __call__(self, q_tensor: Any, k_tensor: Any, lse_tensor: Any) -> TopKReductionResult:
+        return super().__call__(q_tensor, k_tensor, lse_tensor)
+
+    def _call_impl(self, q_tensor: Any, k_tensor: Any, lse_tensor: Any) -> TopKReductionResult:
+        self.check_tensor_signature(q_tensor, self.q_desc, name="Q")
+        self.check_tensor_signature(k_tensor, self.k_desc, name="K")
+        self.check_tensor_signature(lse_tensor, self.lse_desc, name="LSE")
+        return _topk_reduction_impl(
+            q_tensor,
+            k_tensor,
+            lse_tensor,
+            self.acc_dtype,
+            self.k_value,
+            self.selection_block_size,
+            self.compress_stride,
+            self.is_causal,
+            self.mma_tiler_mn,
+            self.scale_softmax,
+        )
+
+
+def topk_reduction_wrapper(
+    q_tensor: Any,
+    k_tensor: Any,
+    lse_tensor: Any,
+    acc_dtype: Any = None,
+    k_value: int = 16,
+    selection_block_size: int = 64,
+    compress_stride: int = 32,
+    is_causal: bool = True,
+    mma_tiler_mn: tuple[int, int] = (128, 128),
+    scale_softmax: float | None = None,
+) -> TopKReductionResult:
+    """Select top compressed-KV blocks for fixed-shape BHSD inputs on SM100."""
+
+    return TopKReduction(
+        q_tensor,
+        k_tensor,
+        lse_tensor,
+        acc_dtype=acc_dtype,
+        k_value=k_value,
+        selection_block_size=selection_block_size,
+        compress_stride=compress_stride,
+        is_causal=is_causal,
+        mma_tiler_mn=mma_tiler_mn,
+        scale_softmax=scale_softmax,
+    )(q_tensor, k_tensor, lse_tensor)
+
+
+__all__ = ["TopKReduction", "TopKReductionResult", "topk_reduction_wrapper"]

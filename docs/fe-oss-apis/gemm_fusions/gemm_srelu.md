@@ -148,6 +148,13 @@ final CTA tile. That extent is 128 rows for both `TILE_M=128` and the two-CTA
 
 ### Class API
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import GemmSreluSm100
 
@@ -185,6 +192,42 @@ op.execute(
     current_stream=None,
 )
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import GemmSreluSm100
+
+op = GemmSreluSm100(
+    sample_a=jax.ShapeDtypeStruct(a.shape, a.dtype),
+    sample_b=jax.ShapeDtypeStruct(b.shape, b.dtype),
+    sample_sfa=jax.ShapeDtypeStruct(sfa.shape, sfa.dtype),
+    sample_sfb=jax.ShapeDtypeStruct(sfb.shape, sfb.dtype),
+    sample_prob=jax.ShapeDtypeStruct(prob.shape, prob.dtype),
+    alpha=1.0,
+    c_major="n",
+    c_dtype=jnp.bfloat16,
+    d_dtype=jnp.bfloat16,
+    acc_dtype=jnp.float32,
+    mma_tiler_mn=(256, 256),
+    cluster_shape_mn=(2, 1),
+    sf_vec_size=32,
+)
+assert op.check_support()
+c, d, amax, sfd = jax.jit(op)(a, b, sfa, sfb, prob)
+```
+
+The constructor retains only the input descriptors. Outputs are allocated by
+the JAX call; `amax` and `sfd` are `None` in the supported output modes.
+
+`````
+
+``````
 
 ---
 

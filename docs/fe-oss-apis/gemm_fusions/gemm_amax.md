@@ -132,6 +132,14 @@ storage ABI. JAX initializes the amax reduction on every invocation.
 ``````
 
 ### Class API
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cuda.bindings import driver as cuda
 
@@ -151,6 +159,39 @@ assert op.check_support()
 op.compile()
 op.execute(a, b, sfa, sfb, c, amax, current_stream=None)
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import GemmAmaxSm100
+
+op = GemmAmaxSm100(
+    sample_a=jax.ShapeDtypeStruct(a.shape, a.dtype),
+    sample_b=jax.ShapeDtypeStruct(b.shape, b.dtype),
+    sample_sfa=jax.ShapeDtypeStruct(sfa.shape, sfa.dtype),
+    sample_sfb=jax.ShapeDtypeStruct(sfb.shape, sfb.dtype),
+    c_major="n",
+    c_dtype=jnp.float32,
+    acc_dtype=jnp.float32,
+    mma_tiler_mn=(128, 128),
+    cluster_shape_mn=(1, 1),
+    sf_vec_size=32,
+)
+assert op.check_support()
+c, amax = jax.jit(op)(a, b, sfa, sfb)
+```
+
+The constructor retains only the input descriptors. Outputs are allocated by
+the JAX call.
+
+`````
+
+``````
 
 ---
 

@@ -61,8 +61,10 @@ binding.
 
 PyTorch remains the default FE-OSS interface and preserves its existing
 wrappers and classes. Some operations also provide a functional JAX API under
-`cudnn.jax`. RMSNorm + RHT + amax and the dense GEMM fusions retain aligned
-functional names across the two namespaces:
+`cudnn.jax`. Each operation-backed JAX wrapper has a callable class with the
+aligned Torch class name; the two DSA layout helpers remain functional-only.
+Supported bindings also retain aligned functional names across the two
+namespaces:
 
 ```python
 from cudnn import rmsnorm_rht_amax_sm100
@@ -71,6 +73,27 @@ from cudnn.jax import rmsnorm_rht_amax_sm100
 from cudnn import gemm_swiglu_wrapper_sm100
 from cudnn.jax import gemm_swiglu_wrapper_sm100
 ```
+
+JAX class constructors accept array-like samples, immediately reduce them to
+shape/dtype descriptors, and do not retain the sample arrays. Actual arrays are
+passed when the object is called. The object is intentionally not pre-jitted,
+so applications retain control over JIT, sharding, donation, and placement:
+
+```python
+import jax
+from cudnn.jax import RmsNormRhtAmaxSm100
+
+op = RmsNormRhtAmaxSm100(
+    jax.ShapeDtypeStruct(x.shape, x.dtype),
+    jax.ShapeDtypeStruct(weight.shape, weight.dtype),
+)
+op.check_support()
+output, amax = jax.jit(op)(x, weight)
+```
+
+Compile-time configuration becomes immutable on the first call because JAX
+caches by callable identity. Construct a new operation object to change static
+options after tracing.
 
 Where both bindings exist, they should offer comparable operation semantics and
 recognizable inputs, options, and results. Exact names, signatures, defaults,

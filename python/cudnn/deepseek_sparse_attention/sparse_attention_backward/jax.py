@@ -12,6 +12,7 @@ from typing import Any, NamedTuple, Optional
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
+from ..._jax.api_base import ApiBaseJax
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 from ..._jax.validation import require_dtype
 
@@ -152,7 +153,7 @@ def _make_launcher(
     return launch
 
 
-def sparse_attention_backward_wrapper(
+def _sparse_attention_backward_impl(
     q: Any,
     kv: Any,
     out: Any,
@@ -163,6 +164,7 @@ def sparse_attention_backward_wrapper(
     softmax_scale: Optional[float] = None,
     topk_length: Optional[Any] = None,
     block_tile: int = 64,
+    _validate_only: bool = False,
 ) -> SparseAttentionBackwardResult:
     """Compute fixed-shape DSA sparse-attention gradients on SM100.
 
@@ -236,6 +238,8 @@ def sparse_attention_backward_wrapper(
         )
 
     resolved_scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None or softmax_scale == 0.0 else float(softmax_scale)
+    if _validate_only:
+        return None
 
     from cutlass import Float32
 
@@ -312,4 +316,129 @@ def sparse_attention_backward_wrapper(
     return SparseAttentionBackwardResult(dq=dq, dkv=dkv, d_sink=d_sink)
 
 
-__all__ = ["SparseAttentionBackwardResult", "sparse_attention_backward_wrapper"]
+class SparseAttentionBackward(ApiBaseJax):
+    """Sample-signature-bound JAX callable for SM100 sparse-attention backward."""
+
+    def __init__(
+        self,
+        sample_q: Any,
+        sample_kv: Any,
+        sample_out: Any,
+        sample_dout: Any,
+        sample_lse: Any,
+        sample_attn_sink: Any,
+        sample_topk_idxs: Any,
+        softmax_scale: Optional[float] = None,
+        sample_topk_length: Optional[Any] = None,
+        block_tile: int = 64,
+    ) -> None:
+        super().__init__()
+        self.q_desc = self.make_tensor_desc(sample_q, name="sample_q")
+        self.kv_desc = self.make_tensor_desc(sample_kv, name="sample_kv")
+        self.out_desc = self.make_tensor_desc(sample_out, name="sample_out")
+        self.dout_desc = self.make_tensor_desc(sample_dout, name="sample_dout")
+        self.lse_desc = self.make_tensor_desc(sample_lse, name="sample_lse")
+        self.attn_sink_desc = self.make_tensor_desc(sample_attn_sink, name="sample_attn_sink")
+        self.topk_idxs_desc = self.make_tensor_desc(sample_topk_idxs, name="sample_topk_idxs")
+        self.topk_length_desc = self.make_optional_tensor_desc(sample_topk_length, name="sample_topk_length")
+        self.softmax_scale = softmax_scale
+        self.block_tile = block_tile
+
+    def _check_support(self) -> bool:
+        _sparse_attention_backward_impl(
+            self.q_desc,
+            self.kv_desc,
+            self.out_desc,
+            self.dout_desc,
+            self.lse_desc,
+            self.attn_sink_desc,
+            self.topk_idxs_desc,
+            self.softmax_scale,
+            self.topk_length_desc,
+            self.block_tile,
+            _validate_only=True,
+        )
+        return True
+
+    def __call__(
+        self,
+        q: Any,
+        kv: Any,
+        out: Any,
+        dout: Any,
+        lse: Any,
+        attn_sink: Any,
+        topk_idxs: Any,
+        topk_length: Optional[Any] = None,
+    ) -> SparseAttentionBackwardResult:
+        return super().__call__(q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length)
+
+    def _call_impl(
+        self,
+        q: Any,
+        kv: Any,
+        out: Any,
+        dout: Any,
+        lse: Any,
+        attn_sink: Any,
+        topk_idxs: Any,
+        topk_length: Optional[Any] = None,
+    ) -> SparseAttentionBackwardResult:
+        for value, expected, name in (
+            (q, self.q_desc, "Q"),
+            (kv, self.kv_desc, "KV"),
+            (out, self.out_desc, "O"),
+            (dout, self.dout_desc, "dO"),
+            (lse, self.lse_desc, "LSE"),
+            (attn_sink, self.attn_sink_desc, "attn_sink"),
+            (topk_idxs, self.topk_idxs_desc, "topk_idxs"),
+        ):
+            self.check_tensor_signature(value, expected, name=name)
+        self.check_optional_tensor_signature(topk_length, self.topk_length_desc, name="topk_length")
+        return _sparse_attention_backward_impl(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            self.softmax_scale,
+            topk_length,
+            self.block_tile,
+        )
+
+
+def sparse_attention_backward_wrapper(
+    q: Any,
+    kv: Any,
+    out: Any,
+    dout: Any,
+    lse: Any,
+    attn_sink: Any,
+    topk_idxs: Any,
+    softmax_scale: Optional[float] = None,
+    topk_length: Optional[Any] = None,
+    block_tile: int = 64,
+) -> SparseAttentionBackwardResult:
+    """Compute fixed-shape DSA sparse-attention gradients on SM100."""
+
+    return SparseAttentionBackward(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+        sample_topk_length=topk_length,
+        block_tile=block_tile,
+    )(q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length)
+
+
+__all__ = [
+    "SparseAttentionBackward",
+    "SparseAttentionBackwardResult",
+    "sparse_attention_backward_wrapper",
+]

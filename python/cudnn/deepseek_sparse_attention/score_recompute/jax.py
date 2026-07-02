@@ -10,6 +10,7 @@ from typing import Any, NamedTuple, Optional
 
 import jax.numpy as jnp
 
+from ..._jax.api_base import ApiBaseJax
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 from ..._jax.validation import require_dtype
 from .config import (
@@ -186,6 +187,7 @@ def _dense_score_recompute(
     qhead_per_kv_head: Optional[int],
     ratio: int,
     q_causal_offsets: Any | None,
+    _validate_only: bool = False,
 ) -> DenseScoreRecomputeResult:
     arrays = (
         ("q", q, 4),
@@ -246,6 +248,9 @@ def _dense_score_recompute(
         inputs += (q_causal_offsets,)
 
     resolved_scale = float(scale)
+    if _validate_only:
+        return None
+
     out, denom = call_cutedsl(
         _make_dense_launcher(
             score_type=score_type,
@@ -286,6 +291,7 @@ def _sparse_score_recompute(
     qhead_per_kv_head: Optional[int],
     topk_length: Optional[Any],
     topk_indices_global: bool,
+    _validate_only: bool = False,
 ) -> Any:
     arrays = (
         ("q", q, 4),
@@ -359,6 +365,8 @@ def _sparse_score_recompute(
         topk=topk,
         have_topk_length=topk_length is not None,
     )
+    if _validate_only:
+        return None
 
     launcher = _make_launcher(
         score_type=score_type,
@@ -394,6 +402,294 @@ def _sparse_score_recompute(
     return out
 
 
+class SparseIndexerScoreRecompute(ApiBaseJax):
+    """Sample-signature-bound JAX callable for sparse indexer score recompute."""
+
+    def __init__(
+        self,
+        sample_q_indexer: Any,
+        sample_k_indexer: Any,
+        sample_weights: Any,
+        sample_topk_indices: Any,
+        qhead_per_kv_head: Optional[int] = None,
+        sample_topk_length: Optional[Any] = None,
+        topk_indices_global: bool = False,
+    ) -> None:
+        super().__init__()
+        self.q_desc = self.make_tensor_desc(sample_q_indexer, name="sample_q_indexer")
+        self.k_desc = self.make_tensor_desc(sample_k_indexer, name="sample_k_indexer")
+        self.weights_desc = self.make_tensor_desc(sample_weights, name="sample_weights")
+        self.topk_indices_desc = self.make_tensor_desc(sample_topk_indices, name="sample_topk_indices")
+        self.topk_length_desc = self.make_optional_tensor_desc(sample_topk_length, name="sample_topk_length")
+        self.qhead_per_kv_head = qhead_per_kv_head
+        self.topk_indices_global = topk_indices_global
+
+    def _check_support(self) -> bool:
+        _sparse_score_recompute(
+            self.q_desc,
+            self.k_desc,
+            self.weights_desc,
+            self.topk_indices_desc,
+            score_type="indexer",
+            output_name="predict",
+            per_head_name="weights",
+            per_head_dtype=jnp.bfloat16,
+            softmax_scale=1.0,
+            qhead_per_kv_head=self.qhead_per_kv_head,
+            topk_length=self.topk_length_desc,
+            topk_indices_global=self.topk_indices_global,
+            _validate_only=True,
+        )
+        return True
+
+    def __call__(
+        self,
+        q_indexer: Any,
+        k_indexer: Any,
+        weights: Any,
+        topk_indices: Any,
+        topk_length: Optional[Any] = None,
+    ) -> SparseIndexerScoreRecomputeResult:
+        return super().__call__(q_indexer, k_indexer, weights, topk_indices, topk_length)
+
+    def _call_impl(
+        self,
+        q_indexer: Any,
+        k_indexer: Any,
+        weights: Any,
+        topk_indices: Any,
+        topk_length: Optional[Any] = None,
+    ) -> SparseIndexerScoreRecomputeResult:
+        for value, expected, name in (
+            (q_indexer, self.q_desc, "Q"),
+            (k_indexer, self.k_desc, "K"),
+            (weights, self.weights_desc, "weights"),
+            (topk_indices, self.topk_indices_desc, "topk_indices"),
+        ):
+            self.check_tensor_signature(value, expected, name=name)
+        self.check_optional_tensor_signature(topk_length, self.topk_length_desc, name="topk_length")
+        predict = _sparse_score_recompute(
+            q_indexer,
+            k_indexer,
+            weights,
+            topk_indices,
+            score_type="indexer",
+            output_name="predict",
+            per_head_name="weights",
+            per_head_dtype=jnp.bfloat16,
+            softmax_scale=1.0,
+            qhead_per_kv_head=self.qhead_per_kv_head,
+            topk_length=topk_length,
+            topk_indices_global=self.topk_indices_global,
+        )
+        return SparseIndexerScoreRecomputeResult(predict=predict)
+
+
+class SparseAttnScoreRecompute(ApiBaseJax):
+    """Sample-signature-bound JAX callable for sparse attention score recompute."""
+
+    def __init__(
+        self,
+        sample_q_attn: Any,
+        sample_k_attn: Any,
+        sample_lse: Any,
+        sample_topk_indices: Any,
+        softmax_scale: float,
+        qhead_per_kv_head: Optional[int] = None,
+        sample_topk_length: Optional[Any] = None,
+        topk_indices_global: bool = False,
+    ) -> None:
+        super().__init__()
+        self.q_desc = self.make_tensor_desc(sample_q_attn, name="sample_q_attn")
+        self.k_desc = self.make_tensor_desc(sample_k_attn, name="sample_k_attn")
+        self.lse_desc = self.make_tensor_desc(sample_lse, name="sample_lse")
+        self.topk_indices_desc = self.make_tensor_desc(sample_topk_indices, name="sample_topk_indices")
+        self.topk_length_desc = self.make_optional_tensor_desc(sample_topk_length, name="sample_topk_length")
+        self.softmax_scale = softmax_scale
+        self.qhead_per_kv_head = qhead_per_kv_head
+        self.topk_indices_global = topk_indices_global
+
+    def _check_support(self) -> bool:
+        _sparse_score_recompute(
+            self.q_desc,
+            self.k_desc,
+            self.lse_desc,
+            self.topk_indices_desc,
+            score_type="attention",
+            output_name="target",
+            per_head_name="lse",
+            per_head_dtype=jnp.float32,
+            softmax_scale=self.softmax_scale,
+            qhead_per_kv_head=self.qhead_per_kv_head,
+            topk_length=self.topk_length_desc,
+            topk_indices_global=self.topk_indices_global,
+            _validate_only=True,
+        )
+        return True
+
+    def __call__(
+        self,
+        q_attn: Any,
+        k_attn: Any,
+        lse: Any,
+        topk_indices: Any,
+        topk_length: Optional[Any] = None,
+    ) -> SparseAttnScoreRecomputeResult:
+        return super().__call__(q_attn, k_attn, lse, topk_indices, topk_length)
+
+    def _call_impl(
+        self,
+        q_attn: Any,
+        k_attn: Any,
+        lse: Any,
+        topk_indices: Any,
+        topk_length: Optional[Any] = None,
+    ) -> SparseAttnScoreRecomputeResult:
+        for value, expected, name in (
+            (q_attn, self.q_desc, "Q"),
+            (k_attn, self.k_desc, "K"),
+            (lse, self.lse_desc, "LSE"),
+            (topk_indices, self.topk_indices_desc, "topk_indices"),
+        ):
+            self.check_tensor_signature(value, expected, name=name)
+        self.check_optional_tensor_signature(topk_length, self.topk_length_desc, name="topk_length")
+        target = _sparse_score_recompute(
+            q_attn,
+            k_attn,
+            lse,
+            topk_indices,
+            score_type="attention",
+            output_name="target",
+            per_head_name="lse",
+            per_head_dtype=jnp.float32,
+            softmax_scale=self.softmax_scale,
+            qhead_per_kv_head=self.qhead_per_kv_head,
+            topk_length=topk_length,
+            topk_indices_global=self.topk_indices_global,
+        )
+        return SparseAttnScoreRecomputeResult(target=target)
+
+
+class DenseIndexerScoreRecompute(ApiBaseJax):
+    """Sample-signature-bound JAX callable for dense indexer score recompute."""
+
+    def __init__(
+        self,
+        sample_q: Any,
+        sample_k: Any,
+        sample_weights: Any,
+        qhead_per_kv_head: Optional[int] = None,
+        sm_scale: float = 1.0,
+        ratio: int = 1,
+        sample_q_causal_offsets: Any | None = None,
+    ) -> None:
+        super().__init__()
+        self.q_desc = self.make_tensor_desc(sample_q, name="sample_q")
+        self.k_desc = self.make_tensor_desc(sample_k, name="sample_k")
+        self.weights_desc = self.make_tensor_desc(sample_weights, name="sample_weights")
+        self.q_causal_offsets_desc = self.make_optional_tensor_desc(sample_q_causal_offsets, name="sample_q_causal_offsets")
+        self.qhead_per_kv_head = qhead_per_kv_head
+        self.sm_scale = sm_scale
+        self.ratio = ratio
+
+    def _check_support(self) -> bool:
+        _dense_score_recompute(
+            self.q_desc,
+            self.k_desc,
+            self.weights_desc,
+            score_type="indexer",
+            per_head_name="weights",
+            per_head_dtype=jnp.bfloat16,
+            scale=self.sm_scale,
+            qhead_per_kv_head=self.qhead_per_kv_head,
+            ratio=self.ratio,
+            q_causal_offsets=self.q_causal_offsets_desc,
+            _validate_only=True,
+        )
+        return True
+
+    def __call__(self, q: Any, k: Any, weights: Any, q_causal_offsets: Any | None = None) -> DenseScoreRecomputeResult:
+        return super().__call__(q, k, weights, q_causal_offsets)
+
+    def _call_impl(self, q: Any, k: Any, weights: Any, q_causal_offsets: Any | None = None) -> DenseScoreRecomputeResult:
+        self.check_tensor_signature(q, self.q_desc, name="Q")
+        self.check_tensor_signature(k, self.k_desc, name="K")
+        self.check_tensor_signature(weights, self.weights_desc, name="weights")
+        self.check_optional_tensor_signature(q_causal_offsets, self.q_causal_offsets_desc, name="q_causal_offsets")
+        return _dense_score_recompute(
+            q,
+            k,
+            weights,
+            score_type="indexer",
+            per_head_name="weights",
+            per_head_dtype=jnp.bfloat16,
+            scale=self.sm_scale,
+            qhead_per_kv_head=self.qhead_per_kv_head,
+            ratio=self.ratio,
+            q_causal_offsets=q_causal_offsets,
+        )
+
+
+class DenseAttnScoreRecompute(ApiBaseJax):
+    """Sample-signature-bound JAX callable for dense attention score recompute."""
+
+    def __init__(
+        self,
+        sample_q: Any,
+        sample_k: Any,
+        sample_lse: Any,
+        softmax_scale: float,
+        qhead_per_kv_head: Optional[int] = None,
+        ratio: int = 1,
+        sample_q_causal_offsets: Any | None = None,
+    ) -> None:
+        super().__init__()
+        self.q_desc = self.make_tensor_desc(sample_q, name="sample_q")
+        self.k_desc = self.make_tensor_desc(sample_k, name="sample_k")
+        self.lse_desc = self.make_tensor_desc(sample_lse, name="sample_lse")
+        self.q_causal_offsets_desc = self.make_optional_tensor_desc(sample_q_causal_offsets, name="sample_q_causal_offsets")
+        self.softmax_scale = softmax_scale
+        self.qhead_per_kv_head = qhead_per_kv_head
+        self.ratio = ratio
+
+    def _check_support(self) -> bool:
+        _dense_score_recompute(
+            self.q_desc,
+            self.k_desc,
+            self.lse_desc,
+            score_type="attention",
+            per_head_name="lse",
+            per_head_dtype=jnp.float32,
+            scale=self.softmax_scale,
+            qhead_per_kv_head=self.qhead_per_kv_head,
+            ratio=self.ratio,
+            q_causal_offsets=self.q_causal_offsets_desc,
+            _validate_only=True,
+        )
+        return True
+
+    def __call__(self, q: Any, k: Any, lse: Any, q_causal_offsets: Any | None = None) -> DenseScoreRecomputeResult:
+        return super().__call__(q, k, lse, q_causal_offsets)
+
+    def _call_impl(self, q: Any, k: Any, lse: Any, q_causal_offsets: Any | None = None) -> DenseScoreRecomputeResult:
+        self.check_tensor_signature(q, self.q_desc, name="Q")
+        self.check_tensor_signature(k, self.k_desc, name="K")
+        self.check_tensor_signature(lse, self.lse_desc, name="LSE")
+        self.check_optional_tensor_signature(q_causal_offsets, self.q_causal_offsets_desc, name="q_causal_offsets")
+        return _dense_score_recompute(
+            q,
+            k,
+            lse,
+            score_type="attention",
+            per_head_name="lse",
+            per_head_dtype=jnp.float32,
+            scale=self.softmax_scale,
+            qhead_per_kv_head=self.qhead_per_kv_head,
+            ratio=self.ratio,
+            q_causal_offsets=q_causal_offsets,
+        )
+
+
 def sparse_indexer_score_recompute_wrapper(
     q_indexer: Any,
     k_indexer: Any,
@@ -415,21 +711,15 @@ def sparse_indexer_score_recompute_wrapper(
     ``topk_indices_global`` are compile-time values.
     """
 
-    predict = _sparse_score_recompute(
+    return SparseIndexerScoreRecompute(
         q_indexer,
         k_indexer,
         weights,
         topk_indices,
-        score_type="indexer",
-        output_name="predict",
-        per_head_name="weights",
-        per_head_dtype=jnp.bfloat16,
-        softmax_scale=1.0,
         qhead_per_kv_head=qhead_per_kv_head,
-        topk_length=topk_length,
+        sample_topk_length=topk_length,
         topk_indices_global=topk_indices_global,
-    )
-    return SparseIndexerScoreRecomputeResult(predict=predict)
+    )(q_indexer, k_indexer, weights, topk_indices, topk_length)
 
 
 def sparse_attn_score_recompute_wrapper(
@@ -451,21 +741,16 @@ def sparse_attn_score_recompute_wrapper(
     values are compile-time values.
     """
 
-    target = _sparse_score_recompute(
+    return SparseAttnScoreRecompute(
         q_attn,
         k_attn,
         lse,
         topk_indices,
-        score_type="attention",
-        output_name="target",
-        per_head_name="lse",
-        per_head_dtype=jnp.float32,
         softmax_scale=softmax_scale,
         qhead_per_kv_head=qhead_per_kv_head,
-        topk_length=topk_length,
+        sample_topk_length=topk_length,
         topk_indices_global=topk_indices_global,
-    )
-    return SparseAttnScoreRecomputeResult(target=target)
+    )(q_attn, k_attn, lse, topk_indices, topk_length)
 
 
 def dense_indexer_score_recompute_wrapper(
@@ -486,18 +771,15 @@ def dense_indexer_score_recompute_wrapper(
     ``(B, S_q, S_k)`` and ``(B, S_q)``.
     """
 
-    return _dense_score_recompute(
+    return DenseIndexerScoreRecompute(
         q,
         k,
         weights,
-        score_type="indexer",
-        per_head_name="weights",
-        per_head_dtype=jnp.bfloat16,
-        scale=sm_scale,
         qhead_per_kv_head=qhead_per_kv_head,
+        sm_scale=sm_scale,
         ratio=ratio,
-        q_causal_offsets=q_causal_offsets,
-    )
+        sample_q_causal_offsets=q_causal_offsets,
+    )(q, k, weights, q_causal_offsets)
 
 
 def dense_attn_score_recompute_wrapper(
@@ -517,23 +799,24 @@ def dense_attn_score_recompute_wrapper(
     ``(B, S_q)``.
     """
 
-    return _dense_score_recompute(
+    return DenseAttnScoreRecompute(
         q,
         k,
         lse,
-        score_type="attention",
-        per_head_name="lse",
-        per_head_dtype=jnp.float32,
-        scale=softmax_scale,
+        softmax_scale=softmax_scale,
         qhead_per_kv_head=qhead_per_kv_head,
         ratio=ratio,
-        q_causal_offsets=q_causal_offsets,
-    )
+        sample_q_causal_offsets=q_causal_offsets,
+    )(q, k, lse, q_causal_offsets)
 
 
 __all__ = [
+    "DenseAttnScoreRecompute",
+    "DenseIndexerScoreRecompute",
     "DenseScoreRecomputeResult",
+    "SparseAttnScoreRecompute",
     "SparseAttnScoreRecomputeResult",
+    "SparseIndexerScoreRecompute",
     "SparseIndexerScoreRecomputeResult",
     "dense_attn_score_recompute_wrapper",
     "dense_indexer_score_recompute_wrapper",

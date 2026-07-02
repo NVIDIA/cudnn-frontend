@@ -26,6 +26,15 @@ sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
 
+def _desc(shape, dtype_name):
+    shape = tuple(shape)
+    return types.SimpleNamespace(
+        shape=shape,
+        ndim=len(shape),
+        dtype_name=dtype_name,
+    )
+
+
 class RmsNormRhtAmaxLaunchConfigTest(unittest.TestCase):
     def test_package_does_not_eagerly_import_torch_api(self):
         package_dir = _MODULE_PATH.parent
@@ -67,6 +76,79 @@ class RmsNormRhtAmaxLaunchConfigTest(unittest.TestCase):
             ),
             (256, 4),
         )
+
+    def test_validates_tensor_metadata_and_infers_outputs(self):
+        plan = _MODULE.validate_rmsnorm_rht_amax(
+            _desc((256, 2048), "bfloat16"),
+            _desc((2048,), "bfloat16"),
+            output=_desc((256, 2048), "bfloat16"),
+            amax=_desc((64,), "float32"),
+            num_threads=128,
+            rows_per_cta=4,
+        )
+
+        self.assertEqual(plan.m, 256)
+        self.assertEqual(plan.n, 2048)
+        self.assertEqual(plan.num_threads, 128)
+        self.assertEqual(plan.rows_per_cta, 4)
+        self.assertEqual(plan.output_shape, (256, 2048))
+        self.assertEqual(plan.amax_shape, (64,))
+
+    def test_rejects_invalid_tensor_metadata(self):
+        valid_x = _desc((256, 2048), "bfloat16")
+        valid_weight = _desc((2048,), "bfloat16")
+        cases = (
+            (
+                (_desc((256, 2048, 1), "bfloat16"), valid_weight),
+                {},
+                "X must have rank 2",
+            ),
+            (
+                (valid_x, _desc((2048, 1), "bfloat16")),
+                {},
+                "W must have rank 1",
+            ),
+            (
+                (_desc((256, 2048), "float16"), valid_weight),
+                {},
+                "X must have dtype bfloat16",
+            ),
+            (
+                (valid_x, _desc((2048,), "float32")),
+                {},
+                "W must have dtype bfloat16",
+            ),
+            (
+                (valid_x, _desc((1024,), "bfloat16")),
+                {},
+                r"W must have shape \(2048,\)",
+            ),
+            (
+                (valid_x, valid_weight),
+                {"output": _desc((256, 1024), "bfloat16")},
+                "O must have shape",
+            ),
+            (
+                (valid_x, valid_weight),
+                {"output": _desc((256, 2048), "float16")},
+                "O must have dtype bfloat16",
+            ),
+            (
+                (valid_x, valid_weight),
+                {"amax": _desc((128,), "float32"), "rows_per_cta": 4},
+                "Amax must have shape",
+            ),
+            (
+                (valid_x, valid_weight),
+                {"amax": _desc((64,), "bfloat16"), "rows_per_cta": 4},
+                "Amax must have dtype float32",
+            ),
+        )
+
+        for args, kwargs, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    _MODULE.validate_rmsnorm_rht_amax(*args, **kwargs)
 
     def test_rejects_invalid_dimensions_and_launch_parameters(self):
         cases = (

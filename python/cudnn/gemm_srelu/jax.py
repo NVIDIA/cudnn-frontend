@@ -5,12 +5,13 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import os
+from functools import lru_cache
 from typing import Any, NamedTuple, Optional
 
 import jax.numpy as jnp
 
+from .._jax.api_base import ApiBaseJax
 from .._jax.cutedsl import BufferSpec, call_cutedsl
 from .._jax.gemm import (
     block_scale_tensor_spec,
@@ -23,7 +24,6 @@ from .._jax.gemm import (
     require_fp8_block_scales,
     require_gemm_inputs,
 )
-from .._jax.validation import require_dtype
 from ..gemm_validation import (
     require_full_mma_rows,
     require_shape,
@@ -93,6 +93,177 @@ def _make_launcher(
     return launch
 
 
+class GemmSreluSm100(ApiBaseJax):
+    """JAX GEMM + squared-ReLU callable specialized from sample metadata."""
+
+    def __init__(
+        self,
+        sample_a: Any,
+        sample_b: Any,
+        sample_sfa: Any,
+        sample_sfb: Any,
+        sample_prob: Any,
+        alpha: float = 1.0,
+        c_major: str = "n",
+        c_dtype: Any = None,
+        d_dtype: Any = None,
+        acc_dtype: Any = None,
+        mma_tiler_mn: tuple[int, int] = (256, 256),
+        cluster_shape_mn: Optional[tuple[int, int]] = None,
+        sample_norm_const: Optional[Any] = None,
+        sf_vec_size: int = 32,
+        vector_f32: bool = False,
+        *,
+        a_major: str = "k",
+        b_major: str = "k",
+    ) -> None:
+        super().__init__()
+        self.a_major = a_major
+        self.b_major = b_major
+        self.c_major = c_major
+        self.a_spec = gemm_a_tensor_spec(a_major)
+        self.b_spec = gemm_b_tensor_spec(b_major)
+        self.output_spec = gemm_c_tensor_spec(c_major)
+        self.scale_spec = block_scale_tensor_spec()
+        self.prob_spec = probability_tensor_spec()
+
+        self.a_desc = self.make_tensor_desc(sample_a, layout=self.a_spec.layout, name="sample_a")
+        self.b_desc = self.make_tensor_desc(sample_b, layout=self.b_spec.layout, name="sample_b")
+        self.sfa_desc = self.make_tensor_desc(sample_sfa, layout=self.scale_spec.layout, name="sample_sfa")
+        self.sfb_desc = self.make_tensor_desc(sample_sfb, layout=self.scale_spec.layout, name="sample_sfb")
+        self.prob_desc = self.make_tensor_desc(sample_prob, layout=self.prob_spec.layout, name="sample_prob")
+        self.norm_const_desc = self.make_optional_tensor_desc(sample_norm_const, name="sample_norm_const")
+
+        self.alpha = alpha
+        self._c_dtype = self.as_optional_dtype(c_dtype)
+        self._d_dtype = self.as_optional_dtype(d_dtype)
+        self._acc_dtype = self.as_optional_dtype(acc_dtype)
+        self.mma_tiler_mn = tuple(mma_tiler_mn)
+        self.cluster_shape_mn = None if cluster_shape_mn is None else tuple(cluster_shape_mn)
+        self.sf_vec_size = sf_vec_size
+        self.vector_f32 = vector_f32
+        self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
+
+    def _check_support(self) -> bool:
+        if self.norm_const_desc is not None:
+            raise NotImplementedError("sample_norm_const is used by the FP8 output path, which is not available in the JAX GEMM + squared-ReLU API")
+
+        from .dense_blockscaled_gemm_persistent_srelu_quant import (
+            Sm100BlockScaledPersistentDenseGemmKernel,
+        )
+
+        kernel = Sm100BlockScaledPersistentDenseGemmKernel
+        self.m, self.n, self.k, self.batch, self.ab_dtype = require_gemm_inputs(self.a_desc, self.b_desc)
+        supported_inputs = {jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float8_e5m2)}
+        if self.ab_dtype not in supported_inputs:
+            raise NotImplementedError("The JAX GEMM + squared-ReLU API supports float8_e4m3fn and " f"float8_e5m2 inputs, got {self.ab_dtype}")
+        require_fp8_block_scales(
+            self.sfa_desc,
+            self.sfb_desc,
+            m=self.m,
+            n=self.n,
+            k=self.k,
+            batch=self.batch,
+            sf_vec_size=self.sf_vec_size,
+        )
+        prob_shape = require_array("sample_prob", self.prob_desc, 3)
+        require_shape("sample_prob", prob_shape, (self.m, 1, self.batch))
+        self.require_dtype("sample_prob.dtype", self.prob_desc, (jnp.float32,))
+
+        supported_outputs = (jnp.float16, jnp.bfloat16, jnp.float32)
+        self.c_dtype = self.require_dtype("c_dtype", self._c_dtype, supported_outputs, default=jnp.bfloat16)
+        self.d_dtype = self.require_dtype("d_dtype", self._d_dtype, supported_outputs, default=jnp.bfloat16)
+        self.acc_dtype = self.require_dtype("acc_dtype", self._acc_dtype, (jnp.float32,), default=jnp.float32)
+
+        self.mma_tiler_mn = kernel.require_mma_tiler(self.mma_tiler_mn)
+        require_full_mma_rows(
+            self.m,
+            self.mma_tiler_mn[0],
+            cta_group_size=(2 if self.mma_tiler_mn[0] == kernel.TWO_CTA_MMA_TILER_M else 1),
+            reason="the probability load is not predicated",
+        )
+        if self.cluster_shape_mn is None:
+            self.cluster_shape_mn = (2, 1) if self.mma_tiler_mn[0] == kernel.TWO_CTA_MMA_TILER_M else (1, 1)
+        self.cluster_shape_mn = kernel.require_cluster_shape(
+            self.cluster_shape_mn,
+            mma_tiler_mn=self.mma_tiler_mn,
+        )
+
+        require_16_byte_extent("sample_a", self.m if self.a_major == "m" else self.k, self.ab_dtype)
+        require_16_byte_extent("sample_b", self.n if self.b_major == "n" else self.k, self.ab_dtype)
+        require_16_byte_extent("c_tensor", self.m if self.c_major == "m" else self.n, self.c_dtype)
+        require_16_byte_extent("d_tensor", self.m if self.c_major == "m" else self.n, self.d_dtype)
+        return True
+
+    def __call__(
+        self,
+        a_tensor: Any,
+        b_tensor: Any,
+        sfa_tensor: Any,
+        sfb_tensor: Any,
+        prob_tensor: Any,
+        norm_const_tensor: Optional[Any] = None,
+    ) -> GemmSreluResult:
+        return super().__call__(a_tensor, b_tensor, sfa_tensor, sfb_tensor, prob_tensor, norm_const_tensor)
+
+    def _call_impl(
+        self,
+        a_tensor: Any,
+        b_tensor: Any,
+        sfa_tensor: Any,
+        sfb_tensor: Any,
+        prob_tensor: Any,
+        norm_const_tensor: Optional[Any],
+    ) -> GemmSreluResult:
+        self.check_tensor_signature(a_tensor, self.a_desc, name="A")
+        self.check_tensor_signature(b_tensor, self.b_desc, name="B")
+        self.check_tensor_signature(sfa_tensor, self.sfa_desc, name="SFA")
+        self.check_tensor_signature(sfb_tensor, self.sfb_desc, name="SFB")
+        self.check_tensor_signature(prob_tensor, self.prob_desc, name="prob")
+        self.check_optional_tensor_signature(norm_const_tensor, self.norm_const_desc, name="norm_const")
+
+        launcher = _make_launcher(
+            alpha=float(self.alpha),
+            sf_vec_size=self.sf_vec_size,
+            mma_tiler_mn=self.mma_tiler_mn,
+            cluster_shape_mn=self.cluster_shape_mn,
+            vector_f32=bool(self.vector_f32),
+            cluster_overlap_margin=self.num_cluster_overlap_margin,
+        )
+        c_tensor, d_tensor = call_cutedsl(
+            launcher,
+            (a_tensor, b_tensor, sfa_tensor, sfb_tensor, prob_tensor),
+            outputs=(
+                BufferSpec(
+                    "c_tensor",
+                    (self.m, self.n, self.batch),
+                    self.c_dtype,
+                    tensor_spec=self.output_spec,
+                ),
+                BufferSpec(
+                    "d_tensor",
+                    (self.m, self.n, self.batch),
+                    self.d_dtype,
+                    tensor_spec=self.output_spec,
+                ),
+            ),
+            input_specs=(
+                self.a_spec,
+                self.b_spec,
+                self.scale_spec,
+                self.scale_spec,
+                self.prob_spec,
+            ),
+            use_static_tensors=True,
+        )
+        return GemmSreluResult(
+            c_tensor=c_tensor,
+            d_tensor=d_tensor,
+            amax_tensor=None,
+            sfd_tensor=None,
+        )
+
+
 def gemm_srelu_wrapper_sm100(
     a_tensor: Any,
     b_tensor: Any,
@@ -113,99 +284,27 @@ def gemm_srelu_wrapper_sm100(
     a_major: str = "k",
     b_major: str = "k",
 ) -> GemmSreluResult:
-    """Compute MXFP8 GEMM and ``D = relu(C)**2 * prob``.
+    """Compute MXFP8 GEMM and ``D = relu(C)**2 * prob``."""
 
-    A and B use logical shapes ``(M, K, L)`` and ``(N, K, L)``. The E8M0
-    scale tensors use the six-dimensional atom layout shared with the Torch
-    API, and ``prob_tensor`` has shape ``(M, 1, L)``. C and D both have shape
-    ``(M, N, L)`` and share ``c_major``.
-
-    The JAX binding supports FP8 inputs, E8M0 scales with ``sf_vec_size=32``,
-    and non-quantized C/D outputs. Configuration values must be static under
-    ``jax.jit``. JAX owns the output buffers and supplies the CUDA stream.
-    """
-
-    if norm_const_tensor is not None:
-        raise NotImplementedError("norm_const_tensor is used by the FP8 output path, which is not " "available in the JAX GEMM + squared-ReLU API")
-
-    from .dense_blockscaled_gemm_persistent_srelu_quant import (
-        Sm100BlockScaledPersistentDenseGemmKernel,
-    )
-
-    kernel = Sm100BlockScaledPersistentDenseGemmKernel
-    m, n, k, batch, ab_dtype = require_gemm_inputs(a_tensor, b_tensor)
-    supported_inputs = {
-        jnp.dtype(jnp.float8_e4m3fn),
-        jnp.dtype(jnp.float8_e5m2),
-    }
-    if ab_dtype not in supported_inputs:
-        raise NotImplementedError("The JAX GEMM + squared-ReLU API supports float8_e4m3fn and " f"float8_e5m2 inputs, got {ab_dtype}")
-    require_fp8_block_scales(
+    return GemmSreluSm100(
+        a_tensor,
+        b_tensor,
         sfa_tensor,
         sfb_tensor,
-        m=m,
-        n=n,
-        k=k,
-        batch=batch,
-        sf_vec_size=sf_vec_size,
-    )
-    prob_shape = require_array("prob_tensor", prob_tensor, 3)
-    require_shape("prob_tensor", prob_shape, (m, 1, batch))
-    require_dtype("prob_tensor.dtype", prob_tensor, (jnp.float32,))
-
-    supported_outputs = (jnp.float16, jnp.bfloat16, jnp.float32)
-    c_dtype = require_dtype("c_dtype", c_dtype, supported_outputs, default=jnp.bfloat16)
-    d_dtype = require_dtype("d_dtype", d_dtype, supported_outputs, default=jnp.bfloat16)
-    acc_dtype = require_dtype("acc_dtype", acc_dtype, (jnp.float32,), default=jnp.float32)
-
-    mma_tiler_mn = kernel.require_mma_tiler(mma_tiler_mn)
-    require_full_mma_rows(
-        m,
-        mma_tiler_mn[0],
-        cta_group_size=2 if mma_tiler_mn[0] == kernel.TWO_CTA_MMA_TILER_M else 1,
-        reason="the probability load is not predicated",
-    )
-    if cluster_shape_mn is None:
-        cluster_shape_mn = (2, 1) if mma_tiler_mn[0] == kernel.TWO_CTA_MMA_TILER_M else (1, 1)
-    cluster_shape_mn = kernel.require_cluster_shape(
-        cluster_shape_mn,
-        mma_tiler_mn=mma_tiler_mn,
-    )
-
-    a_spec = gemm_a_tensor_spec(a_major)
-    b_spec = gemm_b_tensor_spec(b_major)
-    output_spec = gemm_c_tensor_spec(c_major)
-    scale_spec = block_scale_tensor_spec()
-    prob_spec = probability_tensor_spec()
-    require_16_byte_extent("a_tensor", m if a_major == "m" else k, ab_dtype)
-    require_16_byte_extent("b_tensor", n if b_major == "n" else k, ab_dtype)
-    require_16_byte_extent("c_tensor", m if c_major == "m" else n, c_dtype)
-    require_16_byte_extent("d_tensor", m if c_major == "m" else n, d_dtype)
-
-    launcher = _make_launcher(
-        alpha=float(alpha),
-        sf_vec_size=sf_vec_size,
+        prob_tensor,
+        alpha=alpha,
+        c_major=c_major,
+        c_dtype=c_dtype,
+        d_dtype=d_dtype,
+        acc_dtype=acc_dtype,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
-        vector_f32=bool(vector_f32),
-        cluster_overlap_margin=int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
-    )
-    c_tensor, d_tensor = call_cutedsl(
-        launcher,
-        (a_tensor, b_tensor, sfa_tensor, sfb_tensor, prob_tensor),
-        outputs=(
-            BufferSpec("c_tensor", (m, n, batch), c_dtype, tensor_spec=output_spec),
-            BufferSpec("d_tensor", (m, n, batch), d_dtype, tensor_spec=output_spec),
-        ),
-        input_specs=(a_spec, b_spec, scale_spec, scale_spec, prob_spec),
-        use_static_tensors=True,
-    )
-    return GemmSreluResult(
-        c_tensor=c_tensor,
-        d_tensor=d_tensor,
-        amax_tensor=None,
-        sfd_tensor=None,
-    )
+        sample_norm_const=norm_const_tensor,
+        sf_vec_size=sf_vec_size,
+        vector_f32=vector_f32,
+        a_major=a_major,
+        b_major=b_major,
+    )(a_tensor, b_tensor, sfa_tensor, sfb_tensor, prob_tensor, norm_const_tensor)
 
 
-__all__ = ["GemmSreluResult", "gemm_srelu_wrapper_sm100"]
+__all__ = ["GemmSreluResult", "GemmSreluSm100", "gemm_srelu_wrapper_sm100"]

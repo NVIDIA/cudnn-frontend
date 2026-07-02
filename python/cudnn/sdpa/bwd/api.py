@@ -11,14 +11,14 @@ import torch
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import ApiBaseTorch, TupleDict
 from cudnn.datatypes import _convert_to_cutlass_data_type
 
 from .fmha_backward_sm100_2kernel import BlackwellFusedMultiHeadAttentionBackward
 from ..fmha_utils import MaskEnum
 
 
-class SdpabwdSm100D256(APIBase):
+class SdpabwdSm100D256(ApiBaseTorch):
     """API class for d=256 SDPA backward (SM100+) using 2-kernel implementation.
 
     Input/output layout follows the kernel contract:

@@ -17,6 +17,7 @@ from typing import Any, NamedTuple
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
+from ..._jax.api_base import ApiBaseJax
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 from ..._jax.validation import require_dtype
 
@@ -123,7 +124,7 @@ def _make_launcher(
     return launch
 
 
-def indexer_backward_wrapper(
+def _indexer_backward_impl(
     index_q: Any,
     weights: Any,
     index_k: Any,
@@ -135,6 +136,7 @@ def indexer_backward_wrapper(
     grad_loss: Any = 1.0,
     block_I: int = 128,
     topk_indices_global: bool = False,
+    _validate_only: bool = False,
 ) -> IndexerBackwardResult:
     """Compute sparse indexer gradients with fixed-shape SM100 kernels.
 
@@ -192,6 +194,9 @@ def indexer_backward_wrapper(
     grad_loss_operand = as_grad_loss_operand(grad_loss)
     sm_scale = float(sm_scale)
     grad_scale = float(loss_coeff) / (batch * seqlen_q)
+    if _validate_only:
+        return None
+
     tensor_spec = TensorSpec(divisibility=head_dim)
 
     d_index_q, d_weights, d_index_k_accum = call_cutedsl(
@@ -235,4 +240,129 @@ def indexer_backward_wrapper(
     )
 
 
-__all__ = ["IndexerBackwardResult", "indexer_backward_wrapper"]
+class IndexerBackward(ApiBaseJax):
+    """Sample-signature-bound JAX callable for SM100 sparse indexer backward."""
+
+    def __init__(
+        self,
+        sample_index_q: Any,
+        sample_weights: Any,
+        sample_index_k: Any,
+        sample_attn_score: Any,
+        sample_index_score: Any,
+        sample_topk_indices: Any,
+        sm_scale: float = 1.0,
+        loss_coeff: float = 1.0,
+        sample_grad_loss: Any = 1.0,
+        block_I: int = 128,
+        topk_indices_global: bool = False,
+    ) -> None:
+        super().__init__()
+        self.index_q_desc = self.make_tensor_desc(sample_index_q, name="sample_index_q")
+        self.weights_desc = self.make_tensor_desc(sample_weights, name="sample_weights")
+        self.index_k_desc = self.make_tensor_desc(sample_index_k, name="sample_index_k")
+        self.attn_score_desc = self.make_tensor_desc(sample_attn_score, name="sample_attn_score")
+        self.index_score_desc = self.make_tensor_desc(sample_index_score, name="sample_index_score")
+        self.topk_indices_desc = self.make_tensor_desc(sample_topk_indices, name="sample_topk_indices")
+        self.grad_loss_desc = self.make_tensor_desc(as_grad_loss_operand(sample_grad_loss), name="sample_grad_loss")
+        self.sm_scale = sm_scale
+        self.loss_coeff = loss_coeff
+        self.block_I = block_I
+        self.topk_indices_global = topk_indices_global
+
+    def _check_support(self) -> bool:
+        _indexer_backward_impl(
+            self.index_q_desc,
+            self.weights_desc,
+            self.index_k_desc,
+            self.attn_score_desc,
+            self.index_score_desc,
+            self.topk_indices_desc,
+            self.sm_scale,
+            self.loss_coeff,
+            self.grad_loss_desc,
+            self.block_I,
+            self.topk_indices_global,
+            _validate_only=True,
+        )
+        return True
+
+    def __call__(
+        self,
+        index_q: Any,
+        weights: Any,
+        index_k: Any,
+        attn_score: Any,
+        index_score: Any,
+        topk_indices: Any,
+        grad_loss: Any = 1.0,
+    ) -> IndexerBackwardResult:
+        return super().__call__(index_q, weights, index_k, attn_score, index_score, topk_indices, grad_loss)
+
+    def _call_impl(
+        self,
+        index_q: Any,
+        weights: Any,
+        index_k: Any,
+        attn_score: Any,
+        index_score: Any,
+        topk_indices: Any,
+        grad_loss: Any = 1.0,
+    ) -> IndexerBackwardResult:
+        for value, expected, name in (
+            (index_q, self.index_q_desc, "index_q"),
+            (weights, self.weights_desc, "weights"),
+            (index_k, self.index_k_desc, "index_k"),
+            (attn_score, self.attn_score_desc, "attn_score"),
+            (index_score, self.index_score_desc, "index_score"),
+            (topk_indices, self.topk_indices_desc, "topk_indices"),
+        ):
+            self.check_tensor_signature(value, expected, name=name)
+        grad_loss_operand = as_grad_loss_operand(grad_loss)
+        self.check_tensor_signature(grad_loss_operand, self.grad_loss_desc, name="grad_loss")
+        return _indexer_backward_impl(
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            index_score,
+            topk_indices,
+            self.sm_scale,
+            self.loss_coeff,
+            grad_loss_operand,
+            self.block_I,
+            self.topk_indices_global,
+        )
+
+
+def indexer_backward_wrapper(
+    index_q: Any,
+    weights: Any,
+    index_k: Any,
+    attn_score: Any,
+    index_score: Any,
+    topk_indices: Any,
+    sm_scale: float = 1.0,
+    loss_coeff: float = 1.0,
+    grad_loss: Any = 1.0,
+    block_I: int = 128,
+    topk_indices_global: bool = False,
+) -> IndexerBackwardResult:
+    """Compute sparse indexer gradients with fixed-shape SM100 kernels."""
+
+    return IndexerBackward(
+        index_q,
+        weights,
+        index_k,
+        attn_score,
+        index_score,
+        topk_indices,
+        sm_scale=sm_scale,
+        loss_coeff=loss_coeff,
+        sample_grad_loss=grad_loss,
+        block_I=block_I,
+        topk_indices_global=topk_indices_global,
+    )(index_q, weights, index_k, attn_score, index_score, topk_indices, grad_loss)
+
+
+__all__ = ["IndexerBackward", "IndexerBackwardResult", "indexer_backward_wrapper"]

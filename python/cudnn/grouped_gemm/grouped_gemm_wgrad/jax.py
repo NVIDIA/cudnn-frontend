@@ -12,11 +12,13 @@ from typing import Any, NamedTuple, Optional
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
+from ..._jax.api_base import ApiBaseJax
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 from ..._jax.gemm import require_16_byte_extent, require_array
 from ..._jax.grouped_gemm import grouped_workspace_tensor_spec
 from ..._jax.validation import require_dtype
 from ...gemm_validation import ceil_div, require_shape, resolve_max_active_clusters
+from .._jax_api import check_call_signatures, immutable_mapping
 
 
 class GroupedGemmWgradResult(NamedTuple):
@@ -137,7 +139,7 @@ def _make_launcher(
     return launch
 
 
-def grouped_gemm_wgrad_wrapper_sm100(
+def _grouped_gemm_wgrad_impl(
     a_tensor: Any,
     b_tensor: Any,
     sfa_tensor: Any,
@@ -152,7 +154,9 @@ def grouped_gemm_wgrad_wrapper_sm100(
     sf_vec_size: int = 32,
     accumulate_on_output: bool = False,
     input_order: str = "tensor2d",
-) -> GroupedGemmWgradResult:
+    *,
+    _validate_only: bool = False,
+) -> GroupedGemmWgradResult | dict[str, Any]:
     """Compute dense expert weight gradients using the SM100 grouped kernel.
 
     ``a_tensor`` has shape ``(hidden,tokens)`` and ``b_tensor`` has shape
@@ -268,6 +272,14 @@ def grouped_gemm_wgrad_wrapper_sm100(
     require_16_byte_extent("b_tensor", tokens, ab_dtype)
     require_16_byte_extent("wgrad_tensor", intermediate, wgrad_dtype)
 
+    if _validate_only:
+        return {
+            "acc_dtype": acc_dtype,
+            "wgrad_dtype": wgrad_dtype,
+            "mma_tiler_mn": mma_tiler_mn,
+            "cluster_shape_mn": cluster_shape_mn,
+        }
+
     inputs = [a_tensor, b_tensor, sfa_tensor, sfb_tensor, offsets_tensor]
     input_specs = [
         wgrad_a_tensor_spec(),
@@ -322,4 +334,154 @@ def grouped_gemm_wgrad_wrapper_sm100(
     return GroupedGemmWgradResult(wgrad_tensor=wgrad_tensor)
 
 
-__all__ = ["GroupedGemmWgradResult", "grouped_gemm_wgrad_wrapper_sm100"]
+class GroupedGemmWgradSm100(ApiBaseJax):
+    """Sample-signature-bound JAX callable for grouped GEMM weight gradients."""
+
+    def __init__(
+        self,
+        sample_a_tensor: Any,
+        sample_b_tensor: Any,
+        sample_sfa_tensor: Any,
+        sample_sfb_tensor: Any,
+        sample_offsets_tensor: Any,
+        sample_global_scale_a: Optional[Any] = None,
+        sample_global_scale_b: Optional[Any] = None,
+        acc_dtype: Any = None,
+        wgrad_dtype: Any = None,
+        mma_tiler_mn: tuple[int, int] = (256, 256),
+        cluster_shape_mn: Optional[tuple[int, int]] = None,
+        sf_vec_size: int = 32,
+        accumulate_on_output: bool = False,
+        input_order: str = "tensor2d",
+    ) -> None:
+        super().__init__()
+        self._sample_descs = {
+            "a_tensor": self.make_tensor_desc(sample_a_tensor, name="sample_a_tensor"),
+            "b_tensor": self.make_tensor_desc(sample_b_tensor, name="sample_b_tensor"),
+            "sfa_tensor": self.make_tensor_desc(sample_sfa_tensor, name="sample_sfa_tensor"),
+            "sfb_tensor": self.make_tensor_desc(sample_sfb_tensor, name="sample_sfb_tensor"),
+            "offsets_tensor": self.make_tensor_desc(sample_offsets_tensor, name="sample_offsets_tensor"),
+            "global_scale_a": self.make_optional_tensor_desc(sample_global_scale_a, name="sample_global_scale_a"),
+            "global_scale_b": self.make_optional_tensor_desc(sample_global_scale_b, name="sample_global_scale_b"),
+        }
+        self._config = {
+            "acc_dtype": self.as_optional_dtype(acc_dtype),
+            "wgrad_dtype": self.as_optional_dtype(wgrad_dtype),
+            "mma_tiler_mn": tuple(mma_tiler_mn),
+            "cluster_shape_mn": (None if cluster_shape_mn is None else tuple(cluster_shape_mn)),
+            "sf_vec_size": sf_vec_size,
+            "accumulate_on_output": accumulate_on_output,
+            "input_order": input_order,
+        }
+
+        self._sample_descs = immutable_mapping(self._sample_descs)
+        self._config = immutable_mapping(self._config)
+
+    def _check_support(self) -> bool:
+        resolved = _grouped_gemm_wgrad_impl(
+            self._sample_descs["a_tensor"],
+            self._sample_descs["b_tensor"],
+            self._sample_descs["sfa_tensor"],
+            self._sample_descs["sfb_tensor"],
+            self._sample_descs["offsets_tensor"],
+            self._sample_descs["global_scale_a"],
+            self._sample_descs["global_scale_b"],
+            **self._config,
+            _validate_only=True,
+        )
+        self._config = immutable_mapping({**self._config, **resolved})
+        return True
+
+    def __call__(
+        self,
+        a_tensor: Any,
+        b_tensor: Any,
+        sfa_tensor: Any,
+        sfb_tensor: Any,
+        offsets_tensor: Any,
+        global_scale_a: Optional[Any] = None,
+        global_scale_b: Optional[Any] = None,
+    ) -> GroupedGemmWgradResult:
+        return super().__call__(
+            a_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            offsets_tensor,
+            global_scale_a,
+            global_scale_b,
+        )
+
+    def _call_impl(
+        self,
+        a_tensor: Any,
+        b_tensor: Any,
+        sfa_tensor: Any,
+        sfb_tensor: Any,
+        offsets_tensor: Any,
+        global_scale_a: Optional[Any] = None,
+        global_scale_b: Optional[Any] = None,
+    ) -> GroupedGemmWgradResult:
+        values = {
+            "a_tensor": a_tensor,
+            "b_tensor": b_tensor,
+            "sfa_tensor": sfa_tensor,
+            "sfb_tensor": sfb_tensor,
+            "offsets_tensor": offsets_tensor,
+            "global_scale_a": global_scale_a,
+            "global_scale_b": global_scale_b,
+        }
+        check_call_signatures(self, self._sample_descs, values)
+        return _grouped_gemm_wgrad_impl(**values, **self._config)
+
+
+def grouped_gemm_wgrad_wrapper_sm100(
+    a_tensor: Any,
+    b_tensor: Any,
+    sfa_tensor: Any,
+    sfb_tensor: Any,
+    offsets_tensor: Any,
+    global_scale_a: Optional[Any] = None,
+    global_scale_b: Optional[Any] = None,
+    acc_dtype: Any = None,
+    wgrad_dtype: Any = None,
+    mma_tiler_mn: tuple[int, int] = (256, 256),
+    cluster_shape_mn: Optional[tuple[int, int]] = None,
+    sf_vec_size: int = 32,
+    accumulate_on_output: bool = False,
+    input_order: str = "tensor2d",
+) -> GroupedGemmWgradResult:
+    """Compute dense expert weight gradients using the SM100 grouped kernel."""
+
+    op = GroupedGemmWgradSm100(
+        a_tensor,
+        b_tensor,
+        sfa_tensor,
+        sfb_tensor,
+        offsets_tensor,
+        global_scale_a,
+        global_scale_b,
+        acc_dtype=acc_dtype,
+        wgrad_dtype=wgrad_dtype,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=sf_vec_size,
+        accumulate_on_output=accumulate_on_output,
+        input_order=input_order,
+    )
+    return op(
+        a_tensor,
+        b_tensor,
+        sfa_tensor,
+        sfb_tensor,
+        offsets_tensor,
+        global_scale_a,
+        global_scale_b,
+    )
+
+
+__all__ = [
+    "GroupedGemmWgradResult",
+    "GroupedGemmWgradSm100",
+    "grouped_gemm_wgrad_wrapper_sm100",
+]

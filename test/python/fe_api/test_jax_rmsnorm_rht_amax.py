@@ -32,6 +32,40 @@ def test_jax_rmsnorm_rht_amax_abstract_shape():
 
 
 @pytest.mark.L0
+def test_jax_rmsnorm_rht_amax_class_uses_sample_metadata_only():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    pytest.importorskip("cutlass.jax")
+
+    from cudnn.jax import RmsNormRhtAmaxSm100
+
+    sample_x = jax.ShapeDtypeStruct((256, 2048), jnp.bfloat16)
+    sample_weight = jax.ShapeDtypeStruct((2048,), jnp.bfloat16)
+    api = RmsNormRhtAmaxSm100(sample_x, sample_weight)
+
+    assert not hasattr(api, "sample_x")
+    assert not hasattr(api, "sample_w")
+    assert all(value is not sample_x and value is not sample_weight for value in vars(api).values())
+    assert api.check_support()
+    assert api.num_threads == 128
+    assert api.rows_per_cta == 2
+
+    output, amax = jax.eval_shape(api, sample_x, sample_weight)
+    assert output.shape == (256, 2048)
+    assert output.dtype == jnp.bfloat16
+    assert amax.shape == (128,)
+    assert amax.dtype == jnp.float32
+
+    wrong_x = jax.ShapeDtypeStruct((128, 2048), jnp.bfloat16)
+    with pytest.raises(ValueError, match="X tensor shape mismatch"):
+        jax.eval_shape(api, wrong_x, sample_weight)
+
+    wrong_dtype_x = jax.ShapeDtypeStruct((256, 2048), jnp.float16)
+    with pytest.raises(ValueError, match="X dtype mismatch"):
+        jax.eval_shape(api, wrong_dtype_x, sample_weight)
+
+
+@pytest.mark.L0
 def test_jax_rmsnorm_rht_amax_jit():
     jax = pytest.importorskip("jax")
     jnp = pytest.importorskip("jax.numpy")
@@ -56,7 +90,7 @@ def test_jax_rmsnorm_rht_amax_jit():
         pytest.skip(f"RMSNorm + RHT requires SM100+; local GPUs report {reported}")
     device = capable_devices[0]
 
-    from cudnn.jax import rmsnorm_rht_amax_sm100
+    from cudnn.jax import RmsNormRhtAmaxSm100
 
     m, n = 256, 2048
     rows_per_cta = 2
@@ -70,15 +104,15 @@ def test_jax_rmsnorm_rht_amax_jit():
         device,
     )
 
-    @jax.jit
-    def run(x, weight):
-        return rmsnorm_rht_amax_sm100(
-            x,
-            weight,
-            eps=eps,
-            num_threads=128,
-            rows_per_cta=rows_per_cta,
-        )
+    api = RmsNormRhtAmaxSm100(
+        jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
+        jax.ShapeDtypeStruct((n,), jnp.bfloat16),
+        eps=eps,
+        num_threads=128,
+        rows_per_cta=rows_per_cta,
+    )
+    assert api.check_support()
+    run = jax.jit(api)
 
     lowered = run.lower(x, weight)
     stablehlo = lowered.as_text("stablehlo")

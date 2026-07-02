@@ -14,7 +14,7 @@ import cutlass.cute as cute
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from cudnn.api_base import APIBase, TensorDesc, TupleDict, ceil_div, is_power_of_2
+from cudnn.api_base import ApiBaseTorch, TorchTensorDesc, TupleDict, ceil_div, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.discrete_grouped_gemm.discrete_kernel_utils import _require_pointer_tensor
 
@@ -32,7 +32,7 @@ def _normalize_input_order(input_order: WGradInputOrder | str) -> WGradInputOrde
     return WGradInputOrder(input_order)
 
 
-class GroupedGemmWgradSm100(APIBase):
+class GroupedGemmWgradSm100(ApiBaseTorch):
     """Unified grouped GEMM wgrad FE API for SM100+ GPUs."""
 
     def __init__(
@@ -94,12 +94,13 @@ class GroupedGemmWgradSm100(APIBase):
             self.expert_cnt = self.wgrad_desc.shape[0]
             self.wgrad_shape = self.wgrad_desc.shape[1:]
             self.wgrad_dtype = self.wgrad_desc.dtype
-            self.single_expert_wgrad_desc = TensorDesc(
+            self.single_expert_wgrad_desc = TorchTensorDesc(
                 dtype=self.wgrad_desc.dtype,
                 shape=self.wgrad_desc.shape[1:],
                 stride=self.wgrad_desc.stride[1:],
                 stride_order=tuple(i for i, s in sorted(enumerate(self.wgrad_desc.stride[1:]), key=lambda x: x[1])),
                 device=self.wgrad_desc.device,
+                packing=self.wgrad_desc.packing,
                 name="single_expert_wgrad",
             )
         else:  # MoEWeightMode.DISCRETE
@@ -113,7 +114,7 @@ class GroupedGemmWgradSm100(APIBase):
                     name="sample_wgrad_expert",
                 )
             else:
-                self.single_expert_wgrad_desc = TensorDesc(
+                self.single_expert_wgrad_desc = TorchTensorDesc(
                     dtype=wgrad_dtype,
                     shape=self.wgrad_shape,
                     stride=(self.wgrad_shape[1], 1),

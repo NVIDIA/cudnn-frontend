@@ -1,9 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Framework-neutral launch configuration for RMSNorm + RHT + amax."""
+"""Framework-neutral validation for RMSNorm + RHT + amax."""
 
-from typing import Optional, Tuple
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional, Tuple
+
+if TYPE_CHECKING:
+    from cudnn.api_base import TensorDesc
 
 DEFAULT_NUM_THREADS_BY_N = {
     2048: 128,
@@ -15,6 +21,18 @@ DEFAULT_NUM_THREADS_BY_N = {
 }
 RPC_CANDIDATES = (2, 4, 8)
 TARGET_MIN_CTAS = 148
+
+
+@dataclass(frozen=True)
+class RmsNormRhtAmaxPlan:
+    """Validated, framework-independent operation metadata."""
+
+    m: int
+    n: int
+    num_threads: int
+    rows_per_cta: int
+    output_shape: tuple[int, int]
+    amax_shape: tuple[int]
 
 
 def best_num_threads(n: int) -> Optional[int]:
@@ -82,11 +100,77 @@ def resolve_launch_config(
     return resolved_num_threads, resolved_rows_per_cta
 
 
+def _require_rank(tensor: TensorDesc, rank: int, name: str) -> None:
+    if tensor.ndim != rank:
+        raise ValueError(f"{name} must have rank {rank}, got shape {tensor.shape}")
+
+
+def _require_shape(tensor: TensorDesc, shape: tuple[int, ...], name: str) -> None:
+    if tensor.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {tensor.shape}")
+
+
+def _require_dtype(tensor: TensorDesc, dtype_name: str, name: str) -> None:
+    if tensor.dtype_name != dtype_name:
+        raise ValueError(f"{name} must have dtype {dtype_name}, got {tensor.dtype_name}")
+
+
+def validate_rmsnorm_rht_amax(
+    x: TensorDesc,
+    weight: TensorDesc,
+    *,
+    output: Optional[TensorDesc] = None,
+    amax: Optional[TensorDesc] = None,
+    num_threads: Optional[int] = None,
+    rows_per_cta: Optional[int] = None,
+) -> RmsNormRhtAmaxPlan:
+    """Validate logical tensor metadata and infer the operation outputs.
+
+    Physical layout and device capability remain adapter responsibilities:
+    Torch validates observed strides and its CUDA device, while JAX declares a
+    compact custom-call layout with ``cutlass.jax.TensorSpec``.
+    """
+
+    _require_rank(x, 2, "X")
+    _require_rank(weight, 1, "W")
+    _require_dtype(x, "bfloat16", "X")
+    _require_dtype(weight, "bfloat16", "W")
+
+    m, n = x.shape
+    _require_shape(weight, (n,), "W")
+    resolved_num_threads, resolved_rows_per_cta = resolve_launch_config(
+        m,
+        n,
+        num_threads=num_threads,
+        rows_per_cta=rows_per_cta,
+    )
+
+    output_shape = (m, n)
+    amax_shape = (m // resolved_rows_per_cta,)
+    if output is not None:
+        _require_shape(output, output_shape, "O")
+        _require_dtype(output, "bfloat16", "O")
+    if amax is not None:
+        _require_shape(amax, amax_shape, "Amax")
+        _require_dtype(amax, "float32", "Amax")
+
+    return RmsNormRhtAmaxPlan(
+        m=m,
+        n=n,
+        num_threads=resolved_num_threads,
+        rows_per_cta=resolved_rows_per_cta,
+        output_shape=output_shape,
+        amax_shape=amax_shape,
+    )
+
+
 __all__ = [
     "DEFAULT_NUM_THREADS_BY_N",
     "RPC_CANDIDATES",
+    "RmsNormRhtAmaxPlan",
     "TARGET_MIN_CTAS",
     "best_num_threads",
     "pick_rows_per_cta",
     "resolve_launch_config",
+    "validate_rmsnorm_rht_amax",
 ]

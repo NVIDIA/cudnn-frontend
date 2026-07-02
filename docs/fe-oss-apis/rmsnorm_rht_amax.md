@@ -10,6 +10,7 @@ This frontend integration exposes the kernel as a standard FE-OSS Python API wit
 - a class API (`RmsNormRhtAmaxSm100`)
 - a PyTorch functional API (`cudnn.rmsnorm_rht_amax_sm100`)
 - the existing wrapper API (`rmsnorm_rht_amax_wrapper_sm100`)
+- a JAX class API (`cudnn.jax.RmsNormRhtAmaxSm100`)
 - a JAX functional API (`cudnn.jax.rmsnorm_rht_amax_sm100`)
 - grouped-gemm-style regression coverage for compile/execute, wrapper use, and cache reuse
 
@@ -129,6 +130,28 @@ output, amax = run(x, weight)
 The JAX function returns
 `RmsNormRhtAmaxResult(output=..., amax=...)`, a standard named tuple and JAX
 pytree.
+
+The JAX class API mirrors the sample-signature style without retaining sample
+arrays:
+
+```python
+from cudnn.jax import RmsNormRhtAmaxSm100
+
+op = RmsNormRhtAmaxSm100(
+    jax.ShapeDtypeStruct(x.shape, x.dtype),
+    jax.ShapeDtypeStruct(weight.shape, weight.dtype),
+    eps=eps,
+    num_threads=num_threads,
+    rows_per_cta=rows_per_cta,
+)
+assert op.check_support()
+run = jax.jit(op)
+output, amax = run(x, weight)
+```
+
+JAX `check_support()` validates sample shape, dtype, and static launch
+configuration. The final SM100 device check belongs to lowering/runtime because
+abstract samples such as `ShapeDtypeStruct` do not have a device placement.
 
 `````
 

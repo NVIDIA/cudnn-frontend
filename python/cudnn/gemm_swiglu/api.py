@@ -41,7 +41,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 
-from cudnn.api_base import APIBase, TupleDict, ceil_div
+from cudnn.api_base import ApiBaseTorch, TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm_validation import (
     block_scale_shape,
@@ -52,7 +52,7 @@ from cudnn.gemm_validation import (
 import os
 
 
-class GemmSwigluSm100(APIBase):
+class GemmSwigluSm100(ApiBaseTorch):
     def __init__(
         self,
         sample_a: torch.Tensor,

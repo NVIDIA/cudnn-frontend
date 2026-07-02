@@ -167,6 +167,13 @@ ab12, c, sfc, amax = result
 
 ### Class API (Standard Mode)
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 gemm = GemmSwigluSm100(
     sample_a,
@@ -190,7 +197,46 @@ gemm.execute(
 )
 ```
 
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import GemmSwigluSm100
+
+gemm = GemmSwigluSm100(
+    sample_a=jax.ShapeDtypeStruct(a.shape, a.dtype),
+    sample_b=jax.ShapeDtypeStruct(b.shape, b.dtype),
+    alpha=1.0,
+    c_major="m",
+    ab12_dtype=jnp.float32,
+    c_dtype=jnp.float16,
+    acc_dtype=jnp.float32,
+    mma_tiler_mn=(128, 128),
+    cluster_shape_mn=(1, 1),
+)
+assert gemm.check_support()
+ab12, c, sfc, amax = jax.jit(gemm)(a, b)
+```
+
+The constructor retains only the input descriptors. Outputs are allocated by
+the JAX call; `sfc` and `amax` are `None` in standard mode.
+
+`````
+
+``````
+
 ### Class API (Quantized Mode)
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
 
 ```python
 gemm = GemmSwigluSm100(
@@ -228,6 +274,19 @@ gemm.execute(
     current_stream=None,
 )
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+The quantized class path is not available in the JAX API. Passing
+`sample_sfa`, `sample_sfb`, or `sample_norm_const` causes `check_support()` to
+raise `NotImplementedError`.
+
+`````
+
+``````
 
 ---
 

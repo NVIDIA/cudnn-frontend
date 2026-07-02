@@ -11,6 +11,7 @@ from typing import Any, NamedTuple
 import jax.numpy as jnp
 from cutlass.jax import jax_to_cutlass_dtype
 
+from ..._jax.api_base import ApiBaseJax
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 from ..._jax.validation import require_dtype
 from ..jax_utils import (
@@ -96,7 +97,7 @@ def _make_launcher(
     return launch
 
 
-def sdpa_bwd_wrapper_sm100_d256(
+def _sdpa_bwd_impl(
     q_tensor: Any,
     k_tensor: Any,
     v_tensor: Any,
@@ -109,6 +110,8 @@ def sdpa_bwd_wrapper_sm100_d256(
     is_causal: bool = False,
     window_size: tuple[int, int] = (-1, -1),
     scale_softmax: float | None = None,
+    *,
+    _validate_only: bool = False,
 ) -> SdpaBwdResult:
     """Compute fixed-shape BHSD SDPA gradients with the SM100 d=256 kernel.
 
@@ -152,6 +155,8 @@ def sdpa_bwd_wrapper_sm100_d256(
         window_size=window_size,
         scale_softmax=scale_softmax,
     )
+    if _validate_only:
+        return None
 
     from cutlass import Float32
 
@@ -218,4 +223,131 @@ def sdpa_bwd_wrapper_sm100_d256(
     )
 
 
-__all__ = ["SdpaBwdResult", "sdpa_bwd_wrapper_sm100_d256"]
+class SdpabwdSm100D256(ApiBaseJax):
+    """Sample-signature-bound JAX callable for SM100 d=256 SDPA backward."""
+
+    def __init__(
+        self,
+        sample_q: Any,
+        sample_k: Any,
+        sample_v: Any,
+        sample_o: Any,
+        sample_do: Any,
+        sample_lse: Any,
+        acc_dtype: Any = None,
+        mma_tiler_mn: tuple[int, int] = (128, 128),
+        dkdv_mma_tiler_mn: tuple[int, int] = (128, 64),
+        is_causal: bool = False,
+        window_size: tuple[int, int] = (-1, -1),
+        scale_softmax: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.q_desc = self.make_tensor_desc(sample_q, name="sample_q")
+        self.k_desc = self.make_tensor_desc(sample_k, name="sample_k")
+        self.v_desc = self.make_tensor_desc(sample_v, name="sample_v")
+        self.o_desc = self.make_tensor_desc(sample_o, name="sample_o")
+        self.do_desc = self.make_tensor_desc(sample_do, name="sample_do")
+        self.lse_desc = self.make_tensor_desc(sample_lse, name="sample_lse")
+        self.acc_dtype = self.as_optional_dtype(acc_dtype)
+        self.mma_tiler_mn = tuple(mma_tiler_mn)
+        self.dkdv_mma_tiler_mn = tuple(dkdv_mma_tiler_mn)
+        self.is_causal = is_causal
+        self.window_size = tuple(window_size)
+        self.scale_softmax = scale_softmax
+
+    def _check_support(self) -> bool:
+        _sdpa_bwd_impl(
+            self.q_desc,
+            self.k_desc,
+            self.v_desc,
+            self.o_desc,
+            self.do_desc,
+            self.lse_desc,
+            self.acc_dtype,
+            self.mma_tiler_mn,
+            self.dkdv_mma_tiler_mn,
+            self.is_causal,
+            self.window_size,
+            self.scale_softmax,
+            _validate_only=True,
+        )
+        return True
+
+    def __call__(
+        self,
+        q_tensor: Any,
+        k_tensor: Any,
+        v_tensor: Any,
+        o_tensor: Any,
+        do_tensor: Any,
+        lse_tensor: Any,
+    ) -> SdpaBwdResult:
+        return super().__call__(q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, lse_tensor)
+
+    def _call_impl(
+        self,
+        q_tensor: Any,
+        k_tensor: Any,
+        v_tensor: Any,
+        o_tensor: Any,
+        do_tensor: Any,
+        lse_tensor: Any,
+    ) -> SdpaBwdResult:
+        for value, expected, name in (
+            (q_tensor, self.q_desc, "Q"),
+            (k_tensor, self.k_desc, "K"),
+            (v_tensor, self.v_desc, "V"),
+            (o_tensor, self.o_desc, "O"),
+            (do_tensor, self.do_desc, "dO"),
+            (lse_tensor, self.lse_desc, "LSE"),
+        ):
+            self.check_tensor_signature(value, expected, name=name)
+        return _sdpa_bwd_impl(
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            do_tensor,
+            lse_tensor,
+            self.acc_dtype,
+            self.mma_tiler_mn,
+            self.dkdv_mma_tiler_mn,
+            self.is_causal,
+            self.window_size,
+            self.scale_softmax,
+        )
+
+
+def sdpa_bwd_wrapper_sm100_d256(
+    q_tensor: Any,
+    k_tensor: Any,
+    v_tensor: Any,
+    o_tensor: Any,
+    do_tensor: Any,
+    lse_tensor: Any,
+    acc_dtype: Any = None,
+    mma_tiler_mn: tuple[int, int] = (128, 128),
+    dkdv_mma_tiler_mn: tuple[int, int] = (128, 64),
+    is_causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
+    scale_softmax: float | None = None,
+) -> SdpaBwdResult:
+    """Compute fixed-shape BHSD SDPA gradients with the SM100 d=256 kernel."""
+
+    return SdpabwdSm100D256(
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        do_tensor,
+        lse_tensor,
+        acc_dtype=acc_dtype,
+        mma_tiler_mn=mma_tiler_mn,
+        dkdv_mma_tiler_mn=dkdv_mma_tiler_mn,
+        is_causal=is_causal,
+        window_size=window_size,
+        scale_softmax=scale_softmax,
+    )(q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, lse_tensor)
+
+
+__all__ = ["SdpaBwdResult", "SdpabwdSm100D256", "sdpa_bwd_wrapper_sm100_d256"]

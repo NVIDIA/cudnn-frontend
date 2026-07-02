@@ -11,6 +11,7 @@ from typing import Any, NamedTuple, Optional
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
+from ..._jax.api_base import ApiBaseJax
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 
 _TMA_ALIGN_ELEMENTS = 4
@@ -90,7 +91,7 @@ def _require_supported_config(
         raise ValueError("The JAX indexer-forward API supports only the validated SM100 " "kernel configuration: " + ", ".join(unsupported))
 
 
-def indexer_forward_wrapper(
+def _indexer_forward_impl(
     q: Any,
     k: Any,
     w: Any,
@@ -102,6 +103,7 @@ def indexer_forward_wrapper(
     q_stage: int = 2,
     kv_stage: int = 4,
     sm_scale: float = 1.0,
+    _validate_only: bool = False,
 ) -> IndexerForwardResult:
     """Compute fixed-shape BSHD indexer scores with the SM100 CuTe kernel.
 
@@ -179,6 +181,8 @@ def indexer_forward_wrapper(
     )
 
     seqlen_k_padded = ((seqlen_k + _TMA_ALIGN_ELEMENTS - 1) // _TMA_ALIGN_ELEMENTS) * _TMA_ALIGN_ELEMENTS
+    if _validate_only:
+        return None
 
     # Constrain the initialized physical result to the compact row-major ABI
     # expected by the TMA store. CUTLASS infers equivalent defaults for inputs.
@@ -217,4 +221,99 @@ def indexer_forward_wrapper(
     return IndexerForwardResult(scores=scores_padded[..., :seqlen_k])
 
 
-__all__ = ["IndexerForwardResult", "indexer_forward_wrapper"]
+class IndexerForward(ApiBaseJax):
+    """Sample-signature-bound JAX callable for SM100 indexer forward."""
+
+    def __init__(
+        self,
+        sample_q: Any,
+        sample_k: Any,
+        sample_w: Any,
+        *,
+        ratio: int = 4,
+        qhead_per_kv_head: Optional[int] = None,
+        m_block_size: int = 128,
+        n_block_size: int = 128,
+        q_stage: int = 2,
+        kv_stage: int = 4,
+        sm_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.q_desc = self.make_tensor_desc(sample_q, name="sample_q")
+        self.k_desc = self.make_tensor_desc(sample_k, name="sample_k")
+        self.w_desc = self.make_tensor_desc(sample_w, name="sample_w")
+        self.ratio = ratio
+        self.qhead_per_kv_head = qhead_per_kv_head
+        self.m_block_size = m_block_size
+        self.n_block_size = n_block_size
+        self.q_stage = q_stage
+        self.kv_stage = kv_stage
+        self.sm_scale = sm_scale
+
+    def _check_support(self) -> bool:
+        _indexer_forward_impl(
+            self.q_desc,
+            self.k_desc,
+            self.w_desc,
+            ratio=self.ratio,
+            qhead_per_kv_head=self.qhead_per_kv_head,
+            m_block_size=self.m_block_size,
+            n_block_size=self.n_block_size,
+            q_stage=self.q_stage,
+            kv_stage=self.kv_stage,
+            sm_scale=self.sm_scale,
+            _validate_only=True,
+        )
+        return True
+
+    def __call__(self, q: Any, k: Any, w: Any) -> IndexerForwardResult:
+        return super().__call__(q, k, w)
+
+    def _call_impl(self, q: Any, k: Any, w: Any) -> IndexerForwardResult:
+        self.check_tensor_signature(q, self.q_desc, name="Q")
+        self.check_tensor_signature(k, self.k_desc, name="K")
+        self.check_tensor_signature(w, self.w_desc, name="W")
+        return _indexer_forward_impl(
+            q,
+            k,
+            w,
+            ratio=self.ratio,
+            qhead_per_kv_head=self.qhead_per_kv_head,
+            m_block_size=self.m_block_size,
+            n_block_size=self.n_block_size,
+            q_stage=self.q_stage,
+            kv_stage=self.kv_stage,
+            sm_scale=self.sm_scale,
+        )
+
+
+def indexer_forward_wrapper(
+    q: Any,
+    k: Any,
+    w: Any,
+    *,
+    ratio: int = 4,
+    qhead_per_kv_head: Optional[int] = None,
+    m_block_size: int = 128,
+    n_block_size: int = 128,
+    q_stage: int = 2,
+    kv_stage: int = 4,
+    sm_scale: float = 1.0,
+) -> IndexerForwardResult:
+    """Compute fixed-shape BSHD indexer scores with the SM100 CuTe kernel."""
+
+    return IndexerForward(
+        q,
+        k,
+        w,
+        ratio=ratio,
+        qhead_per_kv_head=qhead_per_kv_head,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        q_stage=q_stage,
+        kv_stage=kv_stage,
+        sm_scale=sm_scale,
+    )(q, k, w)
+
+
+__all__ = ["IndexerForward", "IndexerForwardResult", "indexer_forward_wrapper"]
