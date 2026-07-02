@@ -85,6 +85,94 @@ def test_reference_matmul_bias_relu_fusion_cpu():
     torch.testing.assert_close(c, ref)
 
 
+def test_select_plan_survives_build_and_execute():
+    """Regression (review item 2): select_plan(i) must not be reset by the
+    implicit build() inside execute()."""
+
+    class EngA(BaseEngine):
+        name = "a"
+        engine_id = PYTHON_ENGINE_ID_BASE + 10
+        ran = 0
+
+        def execute(self, graph, tensor_data):
+            type(self).ran += 1
+
+    class EngB(BaseEngine):
+        name = "b"
+        engine_id = PYTHON_ENGINE_ID_BASE + 11
+        ran = 0
+
+        def execute(self, graph, tensor_data):
+            type(self).ran += 1
+
+    g = NativeGraph()
+    g.register_backend(EngA()).register_backend(EngB())
+    a = torch.randn(2, 2)
+    C = g.matmul(a, torch.randn(2, 2))
+    g.create_execution_plans()
+    assert g.selected_engine.name == "a"
+    g.select_plan(1)  # pin engine B
+    assert g.selected_engine.name == "b"
+    g.execute({C: torch.empty(2, 2)})  # implicit build() must preserve the pin
+    assert EngB.ran == 1 and EngA.ran == 0
+
+
+def test_register_backend_validation():
+    """Regression (review item 6): duplicate/invalid ids rejected at
+    registration; registration after planning rejected."""
+
+    class NoId(BaseEngine):
+        name = "noid"  # forgets to declare engine_id (base default is None)
+
+        def execute(self, graph, tensor_data):
+            pass
+
+    class E1(BaseEngine):
+        name = "e1"
+        engine_id = PYTHON_ENGINE_ID_BASE + 20
+
+        def execute(self, graph, tensor_data):
+            pass
+
+    g = NativeGraph()
+    with pytest.raises(ValueError, match="engine_id"):
+        g.register_backend(NoId())
+    g.register_backend(E1())
+    with pytest.raises(ValueError, match="already registered"):
+        g.register_backend(E1())
+    a = g.tensor(dim=[2, 2], name="A")
+    g.matmul(a, g.tensor(dim=[2, 2], name="B"))
+    g.create_execution_plans()
+    with pytest.raises(RuntimeError, match="after create_execution_plans"):
+
+        class E2(E1):
+            engine_id = PYTHON_ENGINE_ID_BASE + 21
+
+        g.register_backend(E2())
+
+
+def test_unexpected_engine_exception_propagates():
+    """Regression (review item 6): only NotImplementedError /
+    cudnnGraphNotSupportedError decline; other exceptions are engine bugs."""
+
+    class Buggy(BaseEngine):
+        name = "buggy"
+        engine_id = PYTHON_ENGINE_ID_BASE + 30
+
+        def check_support(self, graph):
+            raise RuntimeError("driver exploded")
+
+        def execute(self, graph, tensor_data):
+            pass
+
+    g = NativeGraph()
+    a = g.tensor(dim=[2, 2], name="A")
+    g.matmul(a, g.tensor(dim=[2, 2], name="B"))
+    g.register_backend(Buggy())
+    with pytest.raises(RuntimeError, match="driver exploded"):
+        g.create_execution_plans()
+
+
 def test_no_backend_plan_list_is_cudnn_only():
     """With no python engine, the plan list is just the cuDNN entry (selected=None)."""
     g = NativeGraph()

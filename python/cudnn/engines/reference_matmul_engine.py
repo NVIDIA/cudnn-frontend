@@ -55,7 +55,7 @@ class ReferenceMatmulEngine(BaseEngine):
 
     def check_support(self, graph: "NativeGraph") -> None:
         if torch is None:
-            raise RuntimeError("ReferenceMatmulEngine requires PyTorch")
+            raise NotImplementedError("ReferenceMatmulEngine requires PyTorch")
         for node in graph.nodes:
             if node.node_type == NodeType.MATMUL:
                 continue

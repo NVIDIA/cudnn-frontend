@@ -67,15 +67,19 @@ class Router:
         """Return the ranked candidate plan list for ``graph``.
 
         Python engines are included (by ascending ``engine_id``, a stable order)
-        when their ``check_support(graph)`` does not raise; the cuDNN side is
-        appended as a single heuristics entry. A backend declines by raising
-        ``NotImplementedError`` / ``ValueError`` / ``RuntimeError``.
+        when their ``check_support(graph)`` does not raise. A backend DECLINES
+        only via ``NotImplementedError`` or ``cudnn.cudnnGraphNotSupportedError``
+        (the classic unsupported-graph signal); any other exception is a bug in
+        the engine and propagates to the caller instead of silently falling back.
         """
+        import cudnn
+
+        decline = (NotImplementedError, cudnn.cudnnGraphNotSupportedError)
         plans: List[PlanConfig] = []
         for engine in sorted(backends, key=lambda e: e.engine_id):
             try:
                 engine.check_support(graph)
-            except (NotImplementedError, ValueError, RuntimeError):
+            except decline:
                 continue
             plans.append(PlanConfig(engine.engine_id, getattr(engine, "default_knobs", None)))
 

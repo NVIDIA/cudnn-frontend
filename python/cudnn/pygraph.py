@@ -105,7 +105,20 @@ class pygraph:
 
     def register_backend(self, engine: "BaseEngine") -> "pygraph":
         """Add a candidate python execution engine. It joins the plan list at
-        create_execution_plans() time when its check_support() accepts the graph."""
+        create_execution_plans() time when its check_support() accepts the graph.
+
+        Validated at registration (not at failure time): the engine must declare
+        a stable engine_id in the reserved python region, ids must be unique per
+        graph, and registration after planning is rejected (re-plan explicitly)."""
+        from .engines.engine_ids import is_python_engine
+
+        eid = getattr(engine, "engine_id", None)
+        if not isinstance(eid, int) or not is_python_engine(eid):
+            raise ValueError(f"engine {engine!r} must declare a stable integer engine_id >= PYTHON_ENGINE_ID_BASE (got {eid!r})")
+        if any(e.engine_id == eid for e in self._backends):
+            raise ValueError(f"engine_id {eid} is already registered on this graph")
+        if self._plans:
+            raise RuntimeError("cannot register a backend after create_execution_plans(); re-plan explicitly")
         self._backends.append(engine)
         return self
 
@@ -134,12 +147,19 @@ class pygraph:
     def selected_engine(self) -> Optional["BaseEngine"]:
         """The python engine for the currently selected plan, or None for the
         cuDNN path. Populated after create_execution_plans()."""
-        if not self._plans:
+        if not self._plans or self._plan_index >= self._n_python_plans():
             return None
-        from .engines.engine_ids import is_python_engine
+        return self._engine_by_id(self._plans[self._plan_index].engine_id)
 
-        eid = self._plans[self._plan_index].engine_id
-        return self._engine_by_id(eid) if is_python_engine(eid) else None
+    @property
+    def _cpp_plan_index(self) -> Optional[int]:
+        """Backend sub-index for a selected backend plan (None = python plan or
+        classic default). Sub-index 0 == the backend's top-ranked plan == the
+        classic default execution path."""
+        if not self._plans or self.selected_engine is not None:
+            return None
+        idx = self._plan_index - self._n_python_plans()
+        return idx if idx > 0 else None
 
     # =========================================================================
     # Tensor Creation
@@ -593,24 +613,37 @@ class pygraph:
         if self.selected_engine is None and self._lowered_graph is not None:
             self._lower_cudnn_plan()
 
-    def get_execution_plan_count(self) -> int:
-        """Number of candidate plans: python engines + the backend's own count.
-
-        The backend's plan count is queried dynamically from the lowered graph
-        (never statically known to the frontend). With no python engines
-        registered this is exactly the classic semantic.
-        """
+    def _n_python_plans(self) -> int:
         from .engines.engine_ids import is_python_engine
 
-        n_python = sum(1 for p in self._plans if is_python_engine(p.engine_id))
+        return sum(1 for p in self._plans if is_python_engine(p.engine_id))
+
+    def get_execution_plan_count(self) -> int:
+        """Number of candidate plans, in ONE index space: indices
+        [0, n_python) are python plans; [n_python, ...) are the backend's own
+        plans (count queried dynamically from the lowered graph — never
+        statically known to the frontend). Every index in this range is valid
+        for select_plan(). With no python engines this is exactly the classic
+        semantic."""
+        n_python = self._n_python_plans()
         if self._lowered_graph is not None and self._cpp_plans_created:
             return n_python + self._lowered_graph.get_execution_plan_count()
         return len(self._plans)
 
     def select_plan(self, index: int) -> "pygraph":
-        """Pick which plan in the ranked list to build/execute (for autotune)."""
-        if not 0 <= index < len(self._plans):
-            raise IndexError(f"plan index {index} out of range for {len(self._plans)} plan(s)")
+        """Pick a plan by index in the unified space (see
+        get_execution_plan_count): python plans first, then the backend's plans
+        (backend sub-index = index - n_python). Selecting a backend sub-index
+        lowers on demand so the backend's plan list exists to validate against."""
+        if not self._plans:
+            raise RuntimeError("call create_execution_plans() before select_plan()")
+        n_python = self._n_python_plans()
+        if index >= n_python:
+            # backend range: make sure the backend plan list exists
+            self._lower_cudnn_plan()
+        total = self.get_execution_plan_count()
+        if not 0 <= index < total:
+            raise IndexError(f"plan index {index} out of range for {total} plan(s)")
         self._plan_index = index
         self._is_built = False
         return self
@@ -662,7 +695,10 @@ class pygraph:
         if self.selected_engine is None:
             if self._lowered_graph is None or not self._cpp_plans_created:
                 self._lower_cudnn_plan()
-            self._lowered_graph.build_plans(*args)
+            if self._cpp_plan_index is not None:  # explicit backend sub-plan
+                self._lowered_graph.build_plan_at_index(self._cpp_plan_index)
+            else:
+                self._lowered_graph.build_plans(*args)
         self._is_built = True
 
     def build(self, heuristics: Optional[List] = None) -> None:
@@ -672,7 +708,8 @@ class pygraph:
             self.validate()
 
         self.build_operation_graph()
-        self.create_execution_plans(heuristics)
+        if not self._plans:  # never silently re-plan: preserves select_plan()
+            self.create_execution_plans(heuristics)
         self.check_support()
         self.build_plans()
 
@@ -748,7 +785,10 @@ class pygraph:
 
         var_pack = {uid: _ptr(d) for uid, d in uid_to_data.items()}
         ws_ptr = _ptr(workspace) if workspace is not None else 0
-        self._lowered_graph._execute(var_pack, ws_ptr, handle, override_uids, override_shapes, override_strides)
+        if self._cpp_plan_index is not None:  # explicit backend sub-plan
+            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, self._cpp_plan_index, handle, override_uids, override_shapes, override_strides)
+        else:
+            self._lowered_graph._execute(var_pack, ws_ptr, handle, override_uids, override_shapes, override_strides)
 
     def __getattr__(self, name: str):
         # Plan-configuration and query methods (deselect_engines,

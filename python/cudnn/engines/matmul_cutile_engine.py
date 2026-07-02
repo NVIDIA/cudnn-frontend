@@ -160,14 +160,14 @@ class MatmulCuTileEngine(BaseEngine):
         err, props = cudart.cudaGetDeviceProperties(device_id)
         cc_int = props.major * 10 + props.minor
         if cc_int < 100:
-            raise RuntimeError(f"MatmulCuTileEngine requires Blackwell GPU (SM100+), " f"got SM{cc_int}")
+            raise NotImplementedError(f"MatmulCuTileEngine requires Blackwell GPU (SM100+), got SM{cc_int}")
 
         # Check driver version (need r580+)
         err, driver_version = cudart.cudaDriverGetVersion()
         # Driver version format: 1000 * major + 10 * minor
         # r580 corresponds to CUDA 13.1 which is driver version 13010
         if driver_version < 13010:
-            raise RuntimeError(f"MatmulCuTileEngine requires NVIDIA driver r580+ (CUDA 13.1+), " f"got driver version {driver_version}")
+            raise NotImplementedError(f"MatmulCuTileEngine requires NVIDIA driver r580+ (CUDA 13.1+), got driver version {driver_version}")
 
         # Check graph operations and tensor layouts
         for node in graph.nodes:
@@ -181,7 +181,9 @@ class MatmulCuTileEngine(BaseEngine):
             # cuTile kernels require row-major contiguous layout
             for name, desc in [("A", a_desc), ("B", b_desc), ("C", c_desc)]:
                 if not _is_row_major(desc.dim, desc.stride):
-                    raise ValueError(f"MatmulCuTileEngine requires row-major contiguous layout for tensor '{name}' " f"(dim={desc.dim}, stride={desc.stride})")
+                    raise NotImplementedError(
+                        f"MatmulCuTileEngine requires row-major contiguous layout for tensor '{name}' (dim={desc.dim}, stride={desc.stride})"
+                    )
 
     def execute(
         self,

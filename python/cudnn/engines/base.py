@@ -45,12 +45,16 @@ class BaseEngine(ABC):
     Attributes:
         name: Human-readable identifier.
         engine_id: Stable id in the shared flat engine-id space, in the reserved
-            Python region (>= PYTHON_ENGINE_ID_BASE). Subclasses MUST override.
+            Python region (>= PYTHON_ENGINE_ID_BASE). Subclasses MUST declare it;
+            the base default (None) is rejected at register_backend().
         default_knobs: Optional default tuning knobs for this engine's plan.
     """
 
     name: str = "base"
-    engine_id: int = PYTHON_ENGINE_ID_BASE
+    # Subclasses MUST declare a stable id in the reserved python region; the
+    # base intentionally has none so a forgotten override fails at registration
+    # instead of silently colliding with another engine.
+    engine_id: Any = None
     default_knobs: Any = None
 
     def __init__(self):
