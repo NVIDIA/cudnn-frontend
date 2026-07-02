@@ -61,12 +61,12 @@ class PipelineStateSimple:
 
     @property
     def phase(self) -> Int32:
-        # PTX docs say that the phase parity needs to be 0 or 1, so by right we need to
-        # take modulo 2. But in practice just passing the phase in without modulo works fine.
+        # PTX requires the phase parity to be 0 or 1, so reduce the wrap count to a
+        # single parity bit instead of returning the unbounded number of wraps.
         if const_expr(self._stages == 1):
             return self._phase_index
         else:
-            return self._phase_index // self._stages
+            return (self._phase_index // self._stages) & 1
 
     def advance(self):
         if const_expr(self._stages == 1):

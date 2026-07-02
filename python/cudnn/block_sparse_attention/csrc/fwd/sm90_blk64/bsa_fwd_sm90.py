@@ -50,6 +50,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         has_block_sizes: bool = True,
         num_splits: cutlass.Constexpr[int] = 1,
+        allow_empty_block_nums: bool = False,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
@@ -60,9 +61,6 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
 
         assert blocksparse_blocksize_q == 64, "Only block_size_m=64 is supported in this kernel."
         assert blocksparse_blocksize_k in [64], "block_size_n should be one of [64]"
-        self.threads_per_warp_group = 128
-        self.mma_warp_groups = 1
-
         assert gqa_ratio >= 1
         assert head_dim in (64, 96, 128), "SM90 blk64 fwd supports QK dim 64, 96, or 128"
         assert value_dim in (64, 96, 128), "SM90 blk64 fwd supports value dim 64, 96, or 128"
@@ -72,12 +70,13 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         self.tile_shape_qk = (self.tile_size, self.tile_size, self.qk_dim)
         self.tile_shape_pv = (self.tile_size, self.value_dim, self.tile_size)
 
-        self.scheduler = None
-
         assert num_splits >= 1, "num_splits must be >= 1"
         self.num_splits = num_splits
         self.use_tma_o = self.value_dim <= head_dim and self.num_splits == 1
         self.has_block_sizes = has_block_sizes
+        # Compile-time specialization: only the empty-enabled variant pays for the
+        # runtime num_n_tiles > 0 guard in the non-split kernel.
+        self.allow_empty_block_nums = allow_empty_block_nums
 
     def check_dim(self, tensor: cute.Tensor | list[cute.Tensor], mode: int):
         if isinstance(tensor, list):
@@ -155,9 +154,6 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         if cutlass.const_expr(self.has_block_sizes):
             gBSZ = blocksparse_varblk[None, work_desc.qo_head_idx, work_desc.batch_idx]
 
-        n_tile_ind_ = num_n_tiles - 1  # indirect tile index (logical), needs to be looked up
-        n_tile_idx_ = gIndices[n_tile_ind_]  # direct tile index (physical)
-
         cta_coord_layout = (0, cute.make_layout(1))  # CTA coord layout for TMA multicasting, effectively no multicast
         tQsQ, tQgQ = cute.nvgpu.cpasync.tma_partition(tma_atom_Q, *cta_coord_layout, cute.group_modes(sQ, 0, 2), cute.group_modes(gQ, 0, 2))
         tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(tma_atom_K, *cta_coord_layout, cute.group_modes(sK, 0, 2), cute.group_modes(gK, 0, 2))
@@ -183,61 +179,75 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         max_m.store(cute.full_like(max_m, float("-inf"), cutlass.Float32))
         sum_m.store(cute.full_like(sum_m, 0.0, cutlass.Float32))
 
-        if warp_idx == 0:
-            Q_barrier[0].arrive_and_expect_tx(index=0, tx_count=cute.size_in_bytes(self.Q_dtype, Q_smem_layout))
-            cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=Q_barrier[0].get_barrier(0))
+        if cutlass.const_expr(self.allow_empty_block_nums):
+            # Variable counts may contain empty rows. Keep the branch CTA-uniform
+            # and avoid reading gIndices[-1]. Empty rows fall through to the
+            # empty-safe finalizer and produce O=0, LSE=-inf.
+            process_tile = num_n_tiles > 0
+        else:
+            process_tile = True
+        if process_tile:
+            n_tile_ind_ = num_n_tiles - 1  # indirect tile index (logical), needs to be looked up
+            n_tile_idx_ = gIndices[n_tile_ind_]  # direct tile index (physical)
 
-            K_barrier[0].arrive_and_expect_tx(index=0, tx_count=cute.size_in_bytes(self.K_dtype, K_smem_layout))
-            cute.copy(tma_atom_K, tKgK[None, n_tile_idx_], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
-
-        cute.arch.sync_threads()
-
-        Q_barrier[0].wait(index=0, phase=0)
-        n_tile_idx_next = n_tile_idx_
-        for n_tile_ind in cutlass.range(num_n_tiles - 1, -1, -1):
-            n_tile_idx = n_tile_idx_next
-            n_tile_idx_next = -1
-            if n_tile_ind > 0:
-                n_tile_idx_next = gIndices[n_tile_ind - 1]
-            if cutlass.const_expr(self.has_block_sizes):
-                varblk = gBSZ[n_tile_idx]
-            else:
-                varblk = cutlass.Int32(self.tile_size)
-                if n_tile_idx == num_compute_tiles - 1:
-                    varblk = seqlen - n_tile_idx * self.tile_size
-
-            # load this V block
             if warp_idx == 0:
-                V_barrier[0].arrive_and_expect_tx(index=0, tx_count=cute.size_in_bytes(self.V_dtype, V_smem_layout))
-                cute.copy(tma_atom_V, tVgV[None, n_tile_idx], tVsV, tma_bar_ptr=V_barrier[0].get_barrier(0))
+                Q_barrier[0].arrive_and_expect_tx(index=0, tx_count=cute.size_in_bytes(self.Q_dtype, Q_smem_layout))
+                cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=Q_barrier[0].get_barrier(0))
 
-            # compute Q@K
-            K_barrier[0].wait(index=0, phase=(num_n_tiles - n_tile_ind - 1) % 2)
-            cute.nvgpu.warpgroup.fence()  # implicit sync WG
-            gemm_zero_acc(tiled_mma_qk, tSrQ, tSrK, tSrS)
-            cute.nvgpu.warpgroup.commit_group()
-            cute.nvgpu.warpgroup.wait_group(0)
-
-            # load next K block
-            if warp_idx == 0 and n_tile_idx_next >= 0:
                 K_barrier[0].arrive_and_expect_tx(index=0, tx_count=cute.size_in_bytes(self.K_dtype, K_smem_layout))
-                cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
+                cute.copy(tma_atom_K, tKgK[None, n_tile_idx_], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
 
-            mask(tiled_mma_qk, tSrS, tScS, varblk)
-            prev_ratio = get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e, is_first_iter=False)
-            inc_softmax(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e, is_first_iter=False)
+            cute.arch.sync_threads()
 
-            # compute P@V
-            rescale_o_for_next_acc(tiled_mma_pv, tOrO, prev_ratio)
-            tOrP = make_acc_into_op(tSrS, tiled_mma_pv.tv_layout_A, self.K_dtype)
-            V_barrier[0].wait(index=0, phase=(num_n_tiles - n_tile_ind - 1) % 2)
-            cute.nvgpu.warpgroup.fence()  # implicit sync WG
-            tiled_mma_pv.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-            cute.gemm(tiled_mma_pv, tOrO, tOrP, tOrV, tOrO)
-            cute.nvgpu.warpgroup.commit_group()
-            cute.nvgpu.warpgroup.wait_group(0)
+            Q_barrier[0].wait(index=0, phase=0)
+            n_tile_idx_next = n_tile_idx_
+            for n_tile_ind in cutlass.range(num_n_tiles - 1, -1, -1):
+                n_tile_idx = n_tile_idx_next
+                n_tile_idx_next = -1
+                if n_tile_ind > 0:
+                    n_tile_idx_next = gIndices[n_tile_ind - 1]
+                if cutlass.const_expr(self.has_block_sizes):
+                    varblk = gBSZ[n_tile_idx]
+                else:
+                    varblk = cutlass.Int32(self.tile_size)
+                    if n_tile_idx == num_compute_tiles - 1:
+                        varblk = seqlen - n_tile_idx * self.tile_size
 
-        final_ratio, lse = get_final_ratio_and_lse(max_m, sum_m, scale_softmax_log2e)
+                # load this V block
+                if warp_idx == 0:
+                    V_barrier[0].arrive_and_expect_tx(index=0, tx_count=cute.size_in_bytes(self.V_dtype, V_smem_layout))
+                    cute.copy(tma_atom_V, tVgV[None, n_tile_idx], tVsV, tma_bar_ptr=V_barrier[0].get_barrier(0))
+
+                # compute Q@K
+                K_barrier[0].wait(index=0, phase=(num_n_tiles - n_tile_ind - 1) % 2)
+                cute.nvgpu.warpgroup.fence()  # implicit sync WG
+                gemm_zero_acc(tiled_mma_qk, tSrQ, tSrK, tSrS)
+                cute.nvgpu.warpgroup.commit_group()
+                cute.nvgpu.warpgroup.wait_group(0)
+
+                # load next K block
+                if warp_idx == 0 and n_tile_idx_next >= 0:
+                    K_barrier[0].arrive_and_expect_tx(index=0, tx_count=cute.size_in_bytes(self.K_dtype, K_smem_layout))
+                    cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
+
+                mask(tiled_mma_qk, tSrS, tScS, varblk)
+                prev_ratio = get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
+                inc_softmax(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
+
+                # compute P@V
+                rescale_o_for_next_acc(tiled_mma_pv, tOrO, prev_ratio)
+                tOrP = make_acc_into_op(tSrS, tiled_mma_pv.tv_layout_A, self.K_dtype)
+                V_barrier[0].wait(index=0, phase=(num_n_tiles - n_tile_ind - 1) % 2)
+                cute.nvgpu.warpgroup.fence()  # implicit sync WG
+                tiled_mma_pv.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+                cute.gemm(tiled_mma_pv, tOrO, tOrP, tOrV, tOrO)
+                cute.nvgpu.warpgroup.commit_group()
+                cute.nvgpu.warpgroup.wait_group(0)
+
+        if cutlass.const_expr(self.allow_empty_block_nums):
+            final_ratio, lse = get_final_ratio_and_lse_empty_safe(max_m, sum_m, scale_softmax_log2e)
+        else:
+            final_ratio, lse = get_final_ratio_and_lse(max_m, sum_m, scale_softmax_log2e)
         rescale_o_for_next_acc(tiled_mma_pv, tOrO, final_ratio)
         tScS_mn = cute.make_tensor(tScS.iterator, layout_acc_mn(tiled_mma_qk, tScS.layout))
         for m in cutlass.range_constexpr(cute.size(lse)):
@@ -288,9 +298,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
-        tma_atom_O: cute.CopyAtom,
         blocksparse_indices_q2k: cute.Tensor,
-        blocksparse_num_blocks_q2k: cute.Tensor,
         blocksparse_varblk: cute.Tensor,
         blocksparse_split_offsets: cute.Tensor,
         tiled_mma_qk: cute.TiledMma,
@@ -298,7 +306,6 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         Q_smem_layout: cute.ComposedLayout,
         K_smem_layout: cute.ComposedLayout,
         V_smem_layout: cute.ComposedLayout,
-        O_smem_layout: cute.ComposedLayout,
         scale_softmax_log2e: cutlass.Float32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -314,9 +321,6 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_Q)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_K)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_V)
-
-            if cutlass.const_expr(self.use_tma_o):
-                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_O)
 
         op = pipeline.PipelineOp.TmaLoad
         cg = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -344,7 +348,6 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         gV = cute.local_tile(mV_slice, (self.tile_shape_pv[1], self.tile_shape_pv[2]), coord=(0, None))
 
         gIndices = blocksparse_indices_q2k[None, work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx]
-        num_n_tiles = blocksparse_num_blocks_q2k[work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx]
         split_start = blocksparse_split_offsets[
             work_desc.split_idx,
             work_desc.qo_tile_idx,
@@ -434,8 +437,8 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                     cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
 
                 mask(tiled_mma_qk, tSrS, tScS, varblk)
-                prev_ratio = get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e, is_first_iter=False)
-                inc_softmax(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e, is_first_iter=False)
+                prev_ratio = get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
+                inc_softmax(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
 
                 # compute P@V
                 rescale_o_for_next_acc(tiled_mma_pv, tOrO, prev_ratio)
@@ -458,28 +461,13 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         tOrO_cvt = cute.make_rmem_tensor_like(tOrO, self.O_dtype)
         tOrO_cvt.store(tOrO.load().to(self.O_dtype))
 
-        if cutlass.const_expr(self.use_tma_o):
-            # R2S
-            sO = shared_storage.Q_smem.get_tensor(O_smem_layout.outer, swizzle=O_smem_layout.inner)
-            tiled_copy_o_r2s = cute.make_tiled_copy_C(
-                cute.make_copy_atom(cute.nvgpu.warp.StMatrix8x8x16bOp(num_matrices=4), self.O_dtype),
-                tiled_mma_pv,
-            )
-            tOrO_cv = tiled_copy_o_r2s.retile(tOrO_cvt)
-            tOsO = tiled_copy_o_r2s.get_slice(tidx).partition_D(sO)
-            cute.copy(tiled_copy_o_r2s, tOrO_cv, tOsO)
-
-            # S2G
-            tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(tma_atom_O, *cta_coord_layout, cute.group_modes(sO, 0, 2), cute.group_modes(gO, 0, 2))
-            cute.copy(tma_atom_O, tOsO, tOgO)
-        else:
-            tiled_copy_o_r2g = cute.make_tiled_copy_C(
-                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.O_dtype, num_bits_per_copy=32),
-                tiled_mma_pv,
-            )
-            tOrO_cv = tiled_copy_o_r2g.retile(tOrO_cvt)
-            tOgO = tiled_copy_o_r2g.get_slice(tidx).partition_D(gO)
-            cute.autovec_copy(tOrO_cv, tOgO)
+        tiled_copy_o_r2g = cute.make_tiled_copy_C(
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.O_dtype, num_bits_per_copy=32),
+            tiled_mma_pv,
+        )
+        tOrO_cv = tiled_copy_o_r2g.retile(tOrO_cvt)
+        tOgO = tiled_copy_o_r2g.get_slice(tidx).partition_D(gO)
+        cute.autovec_copy(tOrO_cv, tOgO)
 
     @cute.jit
     def __call__(
@@ -674,9 +662,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                 tma_atom_Q,
                 tma_atom_K,
                 tma_atom_V,
-                tma_atom_O,
                 blocksparse_indices_q2k,
-                blocksparse_num_blocks_q2k,
                 blocksparse_varblk,
                 blocksparse_split_offsets,
                 tiled_mma_qk,
@@ -684,7 +670,6 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                 self.Q_smem_layout,
                 self.K_smem_layout,
                 self.V_smem_layout,
-                self.O_smem_layout,
                 softmax_scale * log2_e,
             ).launch(
                 grid=grid_config,
@@ -804,18 +789,10 @@ def gemm_zero_acc(tiled_mma, A, B, C):
 def reduce_max(
     tSrS_mn: cute.Tensor,
     max_m: cute.Tensor,
-    is_first_iter: bool = False,
 ):
-    if cutlass.const_expr(is_first_iter):
+    for n in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[1])):
         for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
-            max_m[m] = tSrS_mn[m, 0]
-        for n in cutlass.range_constexpr(1, cute.size(tSrS_mn, mode=[1])):
-            for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
-                max_m[m] = cute.arch.fmax(max_m[m], tSrS_mn[m, n])
-    else:
-        for n in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[1])):
-            for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
-                max_m[m] = cute.arch.fmax(max_m[m], tSrS_mn[m, n])
+            max_m[m] = cute.arch.fmax(max_m[m], tSrS_mn[m, n])
 
     for m in cutlass.range_constexpr(cute.size(max_m, mode=[0])):
         max_m[m] = cute.arch.warp_reduction_max(max_m[m], threads_in_group=4)
@@ -825,18 +802,10 @@ def reduce_max(
 def thread_reduce_sum(
     tSrS_mn: cute.Tensor,
     sum_m: cute.Tensor,
-    is_first_iter: bool = False,
 ):
-    if cutlass.const_expr(is_first_iter):
+    for n in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[1])):
         for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
-            sum_m[m] = tSrS_mn[m, 0]
-        for n in cutlass.range_constexpr(1, cute.size(tSrS_mn, mode=[1])):
-            for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
-                sum_m[m] += tSrS_mn[m, n]
-    else:
-        for n in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[1])):
-            for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
-                sum_m[m] += tSrS_mn[m, n]
+            sum_m[m] += tSrS_mn[m, n]
 
 
 @cute.jit
@@ -868,27 +837,22 @@ def get_prev_ratio_and_update_max_and_rescale_sum(
     max_m: cute.Tensor,
     sum_m: cute.Tensor,
     softmax_scale_log2e: cutlass.Float32,
-    is_first_iter: bool = False,
 ) -> cute.Tensor:
     tSrS_mn = cute.make_tensor(tSrS.iterator, layout_acc_mn(qk_tiled_mma, tSrS.layout))
 
     prev_ratio_m = cute.make_rmem_tensor_like(max_m, cutlass.Float32)
-    if cutlass.const_expr(is_first_iter):
-        reduce_max(tSrS_mn, max_m, is_first_iter=True)
-        prev_ratio_m.fill(cutlass.Float32(1.0))
-    else:
-        prev_max_m = cute.make_rmem_tensor_like(max_m, max_m._dtype)
-        cute.autovec_copy(max_m, prev_max_m)
-        reduce_max(tSrS_mn, max_m)
-        for m in cutlass.range_constexpr(cute.size(max_m, mode=[0])):
-            prev_max = prev_max_m[m]
-            new_max = max_m[m]
-            if new_max == -cutlass.Float32.inf:
-                new_max = 0.0
+    prev_max_m = cute.make_rmem_tensor_like(max_m, max_m._dtype)
+    cute.autovec_copy(max_m, prev_max_m)
+    reduce_max(tSrS_mn, max_m)
+    for m in cutlass.range_constexpr(cute.size(max_m, mode=[0])):
+        prev_max = prev_max_m[m]
+        new_max = max_m[m]
+        if new_max == -cutlass.Float32.inf:
+            new_max = 0.0
 
-            prev_ratio = cute.math.exp2((prev_max - new_max) * softmax_scale_log2e, fastmath=True)
-            prev_ratio_m[m] = prev_ratio
-            sum_m[m] *= prev_ratio
+        prev_ratio = cute.math.exp2((prev_max - new_max) * softmax_scale_log2e, fastmath=True)
+        prev_ratio_m[m] = prev_ratio
+        sum_m[m] *= prev_ratio
 
     return prev_ratio_m
 
@@ -900,7 +864,6 @@ def inc_softmax(
     max_m: cute.Tensor,
     sum_m: cute.Tensor,
     softmax_scale_log2e: cutlass.Float32,
-    is_first_iter: bool = False,
 ):
     tSrS_mn = cute.make_tensor(tSrS.iterator, layout_acc_mn(tiled_mma_qk, tSrS.layout))
 
@@ -912,7 +875,7 @@ def inc_softmax(
         for n in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[1])):
             tSrS_mn[m, n] = cute.math.exp2((tSrS_mn[m, n] - new_max) * softmax_scale_log2e, fastmath=True)
 
-    thread_reduce_sum(tSrS_mn, sum_m, is_first_iter)
+    thread_reduce_sum(tSrS_mn, sum_m)
 
 
 @cute.jit

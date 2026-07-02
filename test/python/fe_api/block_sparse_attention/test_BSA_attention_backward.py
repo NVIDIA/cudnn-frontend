@@ -147,3 +147,64 @@ def test_bsa_attention_backward_sm100_blk64():
     torch.testing.assert_close(backward["dq_tensor"].float(), dq_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(backward["dk_tensor"].float(), dk_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(backward["dv_tensor"].float(), dv_ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=8)
+@pytest.mark.parametrize("num_q_blocks", [1, 4])
+def test_bsa_attention_backward_blk128_dk_zero_init_accumulate_transition(num_q_blocks):
+    """dK zero-init on the first Q block and accumulate on later Q blocks.
+
+    num_q_blocks=1 exercises pure zero-initialization; num_q_blocks=4 makes
+    several Q blocks write the same K blocks, exercising the runtime
+    initialize-to-accumulate transition of the dK MMA predicate.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major not in {10, 11}:
+        pytest.skip("blk128 backward is specific to SM100/SM110")
+
+    BSA = _import_bsa()
+    block_size = 128
+    batch, heads, dim = 1, 1, 128
+    seqlen_q = num_q_blocks * block_size
+    seqlen_k = 4 * block_size
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    do = torch.randn_like(q)
+
+    # Every Q block attends to the same two K blocks.
+    num_kv_blocks = seqlen_k // block_size
+    selected = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+    q2k = selected.view(1, 1, 1, 2).expand(batch, heads, num_q_blocks, 2).contiguous()
+    block_sparse_num = 2
+    full_block_sizes = torch.full((num_kv_blocks,), block_size, dtype=torch.int32, device="cuda")
+    mask = block_sparse_mask(q2k, block_sparse_num, full_block_sizes, seqlen_q, seqlen_k, block_size)
+    _, _, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask)
+
+    forward = BSA.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        block_sparse_num,
+        None,
+        sparse_block_size=block_size,
+    )
+    backward = BSA.block_sparse_attention_backward(
+        do,
+        q,
+        k,
+        v,
+        forward["o_tensor"],
+        forward["lse_tensor"],
+        q2k,
+        block_sparse_num,
+        None,
+        sparse_block_size=block_size,
+    )
+    torch.testing.assert_close(backward["dk_tensor"].float(), dk_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(backward["dq_tensor"].float(), dq_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(backward["dv_tensor"].float(), dv_ref, atol=3e-2, rtol=3e-2)

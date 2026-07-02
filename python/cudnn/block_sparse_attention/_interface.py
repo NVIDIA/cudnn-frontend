@@ -358,42 +358,6 @@ def _sm100_blk64_auto_kv_splits(
     return max(1, min(int(splits), int(max_kv_splits), kv_blocks))
 
 
-def _sm90_blk64_auto_kv_splits(
-    q: torch.Tensor,
-    q2k_block_index: torch.Tensor,
-    fixed_block_sparse_num: int,
-    max_kv_splits: int = 16,
-) -> int:
-    """Apply the measured SM90 policy without changing SM100 auto tuning."""
-    splits = _sm100_blk64_auto_kv_splits(
-        q,
-        q2k_block_index,
-        fixed_block_sparse_num,
-        max_kv_splits,
-    )
-    # At this working-set size, a single-head SM90 launch already has enough
-    # Q tiles and does not amortize the combine kernel.
-    return 1 if splits == 2 and q.shape[1] == 1 else splits
-
-
-def _validate_no_empty_kv_splits(
-    q2k_block_nums: Optional[torch.Tensor],
-    fixed_block_sparse_num: int,
-    kv_splits: int,
-) -> None:
-    """Reject split-KV configurations that would create an empty split."""
-    kv_splits = int(kv_splits)
-    if kv_splits <= 1:
-        return
-
-    if q2k_block_nums is None or q2k_block_nums.numel() == 0:
-        min_block_count = int(fixed_block_sparse_num)
-    else:
-        min_block_count = int(q2k_block_nums.min().item())
-    if min_block_count < kv_splits:
-        raise ValueError(f"kv_splits={kv_splits} would create an empty split because the minimum " f"sparse block count is {min_block_count}; reduce kv_splits")
-
-
 def _build_sm100_blk64_kv_split_offsets(
     q2k_block_nums: Optional[torch.Tensor],
     uniform_block_sparse_num: int,
@@ -545,6 +509,13 @@ def _empty_bwd_workspace_with_zeroed_accum(
         dtype=torch.float32,
         device=device,
     )
+    # The (B, H, elems_per_bh) allocation shape is NOT how the kernels read this
+    # buffer. They split the raw pointer field-major across all N = B * H entries:
+    #   [all N dPsum][all N LSE][all N dQ accum][all N dK accum][all N dV accum]
+    # so the flat start of each field is N * (per-BH elements of the preceding
+    # fields), and the accumulator tail must be zeroed on the flattened view.
+    # Rewriting this as workspace[..., accum_offset:].zero_() (per-(B,H) rows)
+    # would zero the wrong bytes for B * H > 1.
     accum_offset = 2 * q_rounded
     if not zero_dq_accum:
         accum_offset += q_rounded * d_rounded
@@ -564,6 +535,7 @@ def _bsa_attn_fwd_sm90_blk64(
     softmax_scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     kv_splits: int = 1,
+    allow_empty_block_nums: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Launch the SM90 blk64 sparse forward kernel on BHSD tensors."""
     assert q.dtype in (torch.float16, torch.bfloat16), "SM90 blk64 fwd supports fp16/bf16"
@@ -581,7 +553,9 @@ def _bsa_attn_fwd_sm90_blk64(
     kv_splits = int(kv_splits)
     assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
     is_split_kv = kv_splits > 1
-    _validate_no_empty_kv_splits(q2k_block_nums, block_sparse_num, kv_splits)
+    # Empty rows only exist with variable counts; keep the fixed-count and split
+    # specializations on the branch-free non-empty kernel.
+    allow_empty_block_nums = bool(allow_empty_block_nums) and q2k_block_nums is not None and not is_split_kv
     assert seqlen_q % SM90_FWD_BLOCK_SIZE == 0, "SM90 blk64 fwd requires seqlen_q to be a multiple of 64"
     assert num_q_heads % num_kv_heads == 0, "num_q_heads must be divisible by num_kv_heads"
 
@@ -701,6 +675,7 @@ def _bsa_attn_fwd_sm90_blk64(
         acc_dtype=cutlass.Float32,
         has_block_sizes=has_block_sizes,
         num_splits=kv_splits,
+        allow_empty_block_nums=allow_empty_block_nums,
     )
 
     compile_key = _dynamic_tensors_compile_key(
@@ -714,6 +689,7 @@ def _bsa_attn_fwd_sm90_blk64(
             SM90_FWD_BLOCK_SIZE,
             has_block_sizes,
             kv_splits,
+            allow_empty_block_nums,
         ),
         (
             q_t,
@@ -1175,18 +1151,12 @@ def bsa_attn_fwd_blk64_cutedsl(
     qhead_per_kvhead = 1
     tile_m = 64
     tile_n = 256
-    use_2cta_instrs = False
     if auto_kv_splits:
         kv_splits_i = _sm100_blk64_auto_kv_splits(
             q_bhsd,
             q2k_block_index,
             uniform_block_sparse_num,
         )
-    _validate_no_empty_kv_splits(
-        q2k_block_nums if has_variable_block_nums else None,
-        uniform_block_sparse_num,
-        kv_splits_i,
-    )
     kv_splits_i = _resolve_blk64_split_workspace(
         q_bhsd,
         head_dim_v,
@@ -1297,12 +1267,10 @@ def bsa_attn_fwd_blk64_cutedsl(
             n_block_size=tile_n,
             sparse_block_size=sparse_block_size,
             is_persistent=is_persistent,
-            use_2cta_instrs=use_2cta_instrs,
             use_clc_scheduler=use_clc_scheduler,
             allow_empty_block_nums=allow_empty_block_nums,
             has_block_sizes=has_block_sizes,
             num_splits=kv_splits_i,
-            use_raw_ws_epilogue=True,
             use_int64_kv_strides=use_int64_kv_strides,
         )
 
@@ -1491,6 +1459,7 @@ def bsa_attn_fwd(
             softmax_scale=softmax_scale,
             out=out_bhsd,
             kv_splits=kv_splits,
+            allow_empty_block_nums=allow_empty_block_nums,
         )
         if sm90_is_split_kv:
             out = _out_bhsd if layout == "bhsd" else _out_bhsd.transpose(1, 2).contiguous()
@@ -1607,7 +1576,6 @@ def bsa_attn_fwd(
             bsa_fwd_kernel.n_block_size,
             bsa_fwd_kernel.pack_gqa,
             arch,
-            bsa_fwd_kernel.use_2cta_instrs,
             bsa_fwd_kernel.use_clc_scheduler,
             bsa_fwd_kernel.is_persistent,
             has_variable_block_nums,
@@ -2167,7 +2135,6 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         bwd_kernel = BlockSparseAttnBackwardSm100Blk64(
             sparse_block_size=sparse_block_size,
             has_block_sizes=has_block_sizes,
-            full_kv_blocks=False,
         )
 
         _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(

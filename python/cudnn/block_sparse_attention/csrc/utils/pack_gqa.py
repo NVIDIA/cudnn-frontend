@@ -4,7 +4,6 @@
 import cutlass
 import cutlass.cute as cute
 
-from cudnn.block_sparse_attention.csrc.utils import layout_utils
 from . import kernel_utils as utils
 
 
@@ -106,39 +105,6 @@ class PackGQA:
                         pred=tQpQ[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
                     )
             # We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
-
-    @cute.jit
-    def store_LSE(
-        self,
-        mLSE: cute.Tensor,  # (qhead_per_kvhead, seqlen_q)
-        tLSErLSE: cute.Tensor,  # (m_block_size, head_dim_padded)
-        tiled_mma: cute.TiledMma,
-        tidx: cutlass.Int32,
-        block: cutlass.Int32,
-        seqlen: cutlass.Int32,
-    ):
-        thr_mma = tiled_mma.get_slice(tidx)
-        caccO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
-        taccOcO = thr_mma.partition_C(caccO)
-        taccOcO_row = layout_utils.reshape_acc_to_mn(taccOcO)[None, 0]
-        assert cute.size(tLSErLSE) == cute.size(taccOcO_row)
-        threads_per_row = tiled_mma.tv_layout_C.shape[0][0]
-        assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
-        assert cute.size(tLSErLSE) <= threads_per_row
-        num_threads = tiled_mma.size
-        tPrLSEPtr = self.compute_ptr(mLSE, taccOcO_row, tidx, block, threads_per_row, num_threads)
-        for m in cutlass.range_constexpr(cute.size(tLSErLSE)):
-            lse_ptr_i64 = utils.shuffle_sync(
-                tPrLSEPtr[m // threads_per_row],
-                m % threads_per_row,
-                width=threads_per_row,
-            )
-            lse_gmem_ptr = cute.make_ptr(mLSE.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4)
-            row = block * self.m_block_size + taccOcO_row[m][0]
-            # Only the thread corresponding to column 0 writes out the lse to gmem
-            if taccOcO[0][1] == 0 and row < seqlen * self.qhead_per_kvhead:
-                mLSE_copy = cute.make_tensor(lse_gmem_ptr, (1,))
-                mLSE_copy[0] = tLSErLSE[m]
 
     @cute.jit
     def store_O(

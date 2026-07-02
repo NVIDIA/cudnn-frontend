@@ -30,13 +30,12 @@ class TileSchedulerProtocol(Protocol):
 class BlockSparsePersistentTileScheduler:
     @dataclass
     class Params(ParamsBase):
-        num_block_cluster_divmod: FastDivmodDivisor
+        num_block_divmod: FastDivmodDivisor
         num_head_divmod: FastDivmodDivisor
-        total_blocks_cluster: Int32
+        total_blocks: Int32
         num_block: Int32
         num_head: Int32
         num_batch: Int32
-        cluster_shape_m: cutlass.Constexpr[int] = 1
         scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
 
         @staticmethod
@@ -47,16 +46,14 @@ class BlockSparsePersistentTileScheduler:
             loc=None,
             ip=None,
         ) -> "BlockSparsePersistentTileScheduler.Params":
-            num_block_cluster = cute.ceil_div(args.num_block, cute.size(args.cluster_shape_mn))
-            total_blocks_cluster = num_block_cluster * args.num_head * args.num_batch
+            total_blocks = args.num_block * args.num_head * args.num_batch
             return BlockSparsePersistentTileScheduler.Params(
-                FastDivmodDivisor(num_block_cluster),
+                FastDivmodDivisor(args.num_block),
                 FastDivmodDivisor(args.num_head),
-                total_blocks_cluster,
+                total_blocks,
                 args.num_block,
                 args.num_head,
                 args.num_batch,
-                cluster_shape_m=args.cluster_shape_mn[0],
                 scheduling_mode=scheduling_mode,
             )
 
@@ -100,11 +97,11 @@ class BlockSparsePersistentTileScheduler:
 
             cutlass_params = ClcDynamicPersistentTileSchedulerParams(
                 problem_shape_ntile_mnl=(
-                    cute.round_up(params.num_block, params.cluster_shape_m),
+                    params.num_block,
                     params.num_head,
                     params.num_batch,
                 ),
-                cluster_shape_mnk=(params.cluster_shape_m, 1, 1),
+                cluster_shape_mnk=(1, 1, 1),
             )
             block_idx = cute.arch.block_idx()
             grid_dim = cute.arch.grid_dim()
@@ -116,11 +113,7 @@ class BlockSparsePersistentTileScheduler:
             )
             return BlockSparsePersistentTileScheduler(params, block_idx[0], clc_scheduler, loc=loc, ip=ip)
         # Static path
-        if const_expr(cute.size(params.cluster_shape_m) == 1):
-            tile_idx = cute.arch.block_idx()[0]
-        else:
-            tile_idx = cute.arch.cluster_idx()[0]
-        return BlockSparsePersistentTileScheduler(params, tile_idx, loc=loc, ip=ip)
+        return BlockSparsePersistentTileScheduler(params, cute.arch.block_idx()[0], loc=loc, ip=ip)
 
     # called by host
     @staticmethod
@@ -132,26 +125,21 @@ class BlockSparsePersistentTileScheduler:
     ) -> Tuple[Int32, Int32, Int32]:
         if const_expr(params.scheduling_mode == SchedulingMode.CLC):
             return (
-                cute.round_up(params.num_block, params.cluster_shape_m),
+                params.num_block,
                 params.num_head,
                 params.num_batch,
             )
         hardware_info = cutlass.utils.HardwareInfo()
         sm_count = hardware_info.get_device_multiprocessor_count()
-        # Grid must be a multiple of cluster_shape_m for CUDA cluster launch.
-        max_ctas = (sm_count // params.cluster_shape_m) * params.cluster_shape_m
-        grid_x = cutlass.min(max_ctas, params.total_blocks_cluster * params.cluster_shape_m)
+        grid_x = cutlass.min(sm_count, params.total_blocks)
         return (grid_x, Int32(1), Int32(1))
 
     @cute.jit
     def _clc_work_to_coords(self, work) -> WorkTileInfo:
         """Convert CLC response (block, head, batch) to WorkTileInfo."""
-        block_idx = work.tile_idx[0]
-        if const_expr(self.params.cluster_shape_m > 1):
-            block_idx = block_idx // self.params.cluster_shape_m
         batch_idx = work.tile_idx[2]
         return WorkTileInfo(
-            (Int32(block_idx), Int32(work.tile_idx[1]), Int32(batch_idx), Int32(0)),
+            (Int32(work.tile_idx[0]), Int32(work.tile_idx[1]), Int32(batch_idx), Int32(0)),
             work.is_valid_tile,
         )
 
@@ -161,9 +149,9 @@ class BlockSparsePersistentTileScheduler:
             work = self._clc_scheduler.get_current_work()
             self._tile_idx = work.tile_idx[0]
             return self._clc_work_to_coords(work)
-        hn_idx, block_idx = divmod(self._tile_idx, self.params.num_block_cluster_divmod)
+        hn_idx, block_idx = divmod(self._tile_idx, self.params.num_block_divmod)
         batch_idx, head_idx = divmod(hn_idx, self.params.num_head_divmod)
-        is_valid = self._tile_idx < self.params.total_blocks_cluster
+        is_valid = self._tile_idx < self.params.total_blocks
         return WorkTileInfo((Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid)
 
     @cute.jit
@@ -183,10 +171,7 @@ class BlockSparsePersistentTileScheduler:
             self._clc_scheduler.advance_to_next_work(mbarrier_addr)
         else:
             assert mbarrier_addr is None
-            if const_expr(self.params.cluster_shape_m == 1):
-                self._tile_idx += cute.arch.grid_dim()[0]
-            else:
-                self._tile_idx += cute.arch.cluster_dim()[0]
+            self._tile_idx += cute.arch.grid_dim()[0]
 
     def consumer_advance(self, *, loc=None, ip=None):
         if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):

@@ -51,31 +51,6 @@ class BlockSparseAttnForwardCombine:
         self.is_even_k = head_dim % k_block_size == 0
         self.stages = stages
 
-    @staticmethod
-    def can_implement(
-        dtype,
-        head_dim,
-        tile_m,
-        k_block_size,
-        log_max_splits,
-        num_threads,
-    ) -> bool:
-        """Check if the kernel can be implemented with the given parameters."""
-        if dtype not in [cutlass.Float16, cutlass.BFloat16, cutlass.Float32]:
-            return False
-        if head_dim % 8 != 0:
-            return False
-        if num_threads % 32 != 0:
-            return False
-        if tile_m % 8 != 0:
-            return False
-        max_splits = 1 << log_max_splits
-        if max_splits > 256:
-            return False
-        if (tile_m * max_splits) % num_threads != 0:
-            return False
-        return True
-
     def _setup_attributes(self):
         # GMEM copy setup for O partial
         universal_copy_bits = 128
@@ -240,7 +215,6 @@ class BlockSparseAttnForwardCombine:
 
         # Create FastDivmodDivisor objects for efficient division
         seqlen_divmod = FastDivmodDivisor(seqlen)
-        head_divmod = FastDivmodDivisor(num_head)
 
         grid_dim = (
             cute.ceil_div(seqlen * num_head, self.tile_m),
@@ -266,7 +240,6 @@ class BlockSparseAttnForwardCombine:
             self.gmem_tiled_copy_LSE,
             self.s2r_tiled_copy_LSE,
             seqlen_divmod,
-            head_divmod,
             varlen,
         ).launch(
             grid=grid_dim,
@@ -295,7 +268,6 @@ class BlockSparseAttnForwardCombine:
         gmem_tiled_copy_LSE: cute.TiledCopy,
         s2r_tiled_copy_LSE: cute.TiledCopy,
         seqlen_divmod: FastDivmodDivisor,
-        head_divmod: FastDivmodDivisor,
         varlen: cutlass.Constexpr[bool],
     ):
         # Thread and block indices
@@ -382,7 +354,13 @@ class BlockSparseAttnForwardCombine:
                             )
                         else:
                             tLSEsLSE[None, s, m].fill(-Float32.inf)
-                # Don't need to zero out the rest of the LSEs, as we will not write the output to gmem
+                else:
+                    # Rows past max_idx never write O/LSE to gmem, but their sLSE slots
+                    # still feed the max-valid-split reduction, which bounds the
+                    # partial-O accumulation loop. Fill them with -inf so such a row
+                    # yields max_valid_split == -1 instead of reading garbage.
+                    for s in cutlass.range(cute.size(tLSEcLSE, mode=[1]), unroll_full=True):
+                        tLSEsLSE[None, s, m].fill(-Float32.inf)
             cute.arch.cp_async_commit_group()
 
             # ===============================

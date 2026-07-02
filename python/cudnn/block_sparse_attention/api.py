@@ -167,6 +167,9 @@ def block_sparse_attention_forward(
     The sparse pattern is supplied as a list of KV block ids for every query
     block.  This wrapper only dispatches to Python CuTe DSL kernels; the former
     SM100 C++/AOT extension is intentionally not part of this package.
+
+    Sparse metadata values are a caller contract; see the "Sparse metadata"
+    section of ``docs/fe-oss-apis/bsa.md`` for the required value ranges.
     """
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)
@@ -206,8 +209,6 @@ def block_sparse_attention_forward(
         raise NotImplementedError("pack_gqa is available only on the SM100/SM110 blk128 path")
     if pack_gqa is True and 128 % gqa_ratio:
         raise ValueError("pack_gqa=True requires the GQA ratio to divide 128")
-    if q2k_block_nums is not None and allow_empty_block_nums and arch_family == 9:
-        raise NotImplementedError("SM90 forward does not support empty query-block rows")
     pack_gqa_effective = (
         arch_family in {10, 11} and sparse_block_size == 128 and (gqa_ratio > 1 if pack_gqa is None else bool(pack_gqa)) and 128 % gqa_ratio == 0
     )
@@ -302,7 +303,11 @@ def block_sparse_attention_backward(
     sparse_block_size: Optional[int] = None,
     layout: str = "bhsd",
 ) -> TupleDict:
-    """Compute explicit dQ, dK, and dV for block-sparse attention."""
+    """Compute explicit dQ, dK, and dV for block-sparse attention.
+
+    Sparse metadata values are a caller contract; see the "Sparse metadata"
+    section of ``docs/fe-oss-apis/bsa.md`` for the required value ranges.
+    """
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)
     arch = _device_arch(q_tensor)

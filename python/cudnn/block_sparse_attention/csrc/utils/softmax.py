@@ -1,7 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
 
-import math
-import operator
 from typing import Tuple
 from dataclasses import dataclass
 
@@ -101,47 +99,6 @@ class Softmax(ParamsBase):
 
         return row_scale
 
-    @cute.jit
-    def finalize(self, final_scale: Float32 = 1.0, sink_val: Float32 | cute.Tensor | None = None) -> cute.Tensor:
-        """Finalize the online softmax by computing the scale and logsumexp."""
-        if cutlass.const_expr(sink_val is not None and isinstance(sink_val, cute.Tensor)):
-            assert cute.size(sink_val) == cute.size(self.row_sum)
-        row_sum = self.row_sum
-        row_max = self.row_max
-        scale_log2 = self.scale_log2
-
-        # quad reduction for row_sum as we didn't do it during each iteration of online softmax
-        row_sum.store(utils.warp_reduce(row_sum.load(), operator.add, width=4))
-        row_scale = cute.make_rmem_tensor_like(row_max, Float32)
-
-        for r in cutlass.range(cute.size(row_sum), unroll_full=True):
-            if cutlass.const_expr(sink_val is not None):
-                sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
-                LOG2_E = math.log2(math.e)
-                row_sum[r] += cute.math.exp2(sink_val_cur * LOG2_E - row_max[r] * scale_log2, fastmath=True)
-
-            # if row_sum is zero or nan, set acc_O_mn_row to 1.0
-            acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
-            row_scale[r] = (cute.arch.rcp_approx(row_sum[r] if not acc_O_mn_row_is_zero_or_nan else 1.0)) * final_scale
-            row_sum_cur = row_sum[r]
-            LN2 = math.log(2.0)
-            row_sum[r] = (row_max[r] * scale_log2 + cute.math.log2(row_sum_cur, fastmath=True)) * LN2 if not acc_O_mn_row_is_zero_or_nan else -Float32.inf
-        return row_scale
-
-    @cute.jit
-    def rescale_O(self, acc_O: cute.Tensor, row_scale: cute.Tensor) -> None:
-        """Scale each row of acc_O by the given scale tensor.
-        :param acc_O: input tensor
-        :type acc_O: cute.Tensor
-        :param row_scale: row_scale tensor
-        :type row_scale: cute.Tensor
-        """
-        acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
-        assert cute.size(row_scale) == cute.size(acc_O_mn, mode=[0])
-        for r in cutlass.range(cute.size(row_scale), unroll_full=True):
-            acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
-
-
 @dataclass
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
@@ -232,32 +189,4 @@ class SoftmaxSm100(Softmax):
                         acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
                     else:
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
-            acc_S_row_converted_frg[None, j].store(acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type))
-
-    @cute.jit
-    def scale_apply_exp2_convert(
-        self,
-        acc_S_row: cute.Tensor,
-        row_max: Float32,
-        acc_S_row_converted: cute.Tensor,
-    ):
-        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
-        minus_row_max_scaled = -row_max * self.scale_log2
-        for i in cutlass.range_constexpr(0, cute.size(acc_S_row.shape), 2):
-            acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
-                (acc_S_row[i], acc_S_row[i + 1]),
-                (self.scale_log2, self.scale_log2),
-                (minus_row_max_scaled, minus_row_max_scaled),
-            )
-
-        frg_tile = 32
-        assert frg_tile % 2 == 0
-        frg_cnt = cute.size(acc_S_row) // frg_tile
-        assert cute.size(acc_S_row) % frg_tile == 0
-        acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
-        acc_S_row_converted_frg = cute.logical_divide(acc_S_row_converted, cute.make_layout(frg_tile))
-        for j in cutlass.range_constexpr(frg_cnt):
-            for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
-                acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
-                acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
             acc_S_row_converted_frg[None, j].store(acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type))

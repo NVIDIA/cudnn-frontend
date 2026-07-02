@@ -107,7 +107,7 @@ def test_bsa_attention_forward_variable_blocks_and_layout():
     torch.testing.assert_close(result_bshd["lse_tensor"], result["lse_tensor"], atol=0, rtol=0)
 
     major, _ = torch.cuda.get_device_capability()
-    if major in {10, 11, 12}:
+    if major in {9, 10, 11, 12}:
         empty_block_nums = block_nums.clone()
         empty_block_nums[..., 0] = 0
         empty_result = BSA.block_sparse_attention_forward(
@@ -253,55 +253,57 @@ def test_bsa_attention_forward_sm100_blk64():
 
 
 @pytest.mark.L0
-def test_bsa_attention_forward_sm100_blk64_rejects_empty_splits(monkeypatch):
+@torch_fork_set_rng(seed=6)
+@pytest.mark.parametrize("seqlen_q", [1, 63, 65])
+def test_bsa_attention_forward_sm100_blk64_combine_partial_tail_rows(seqlen_q):
+    """Exercise a partial Q tile through both the producer and split combine.
+
+    A non-multiple-of-64 sequence makes the blk64 producer's final tile partial
+    and leaves invalid rows in the split-combine tile. The former must keep every
+    correction warp converged through its exchange barriers; the latter must
+    initialize invalid shared-LSE rows to ``-inf``.
+    """
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
     if major not in {10, 11}:
-        pytest.skip("empty split validation is specific to SM100/SM110 blk64")
+        pytest.skip("blk64 split combine is specific to SM100/SM110")
 
     BSA = _import_bsa()
     block_size = 64
-    batch, heads, seqlen_q, seqlen_k, dim = 1, 1, block_size, 4 * block_size, 128
-    q = torch.empty((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
-    k = torch.empty((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
-    v = torch.empty_like(k)
-    block_sizes = torch.full((seqlen_k // block_size,), block_size, device="cuda", dtype=torch.int32)
-    empty_split_error = r"(?i)(empty.*split|split.*empty)"
+    batch, heads, seqlen_k, dim = 1, 1, 256, 128
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k, block_sparse_num, block_sizes = make_fixed_metadata(batch, heads, seqlen_q, seqlen_k, block_size)
+    mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
 
-    fixed_q2k = torch.zeros((batch, heads, 1, 1), device="cuda", dtype=torch.int32)
-    with pytest.raises(ValueError, match=empty_split_error):
-        BSA.block_sparse_attention_forward(
-            q,
-            k,
-            v,
-            fixed_q2k,
-            block_sparse_num=1,
-            block_sizes=block_sizes,
-            sparse_block_size=block_size,
-            use_clc=False,
-            kv_splits=2,
-        )
+    result = BSA.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        block_sparse_num,
+        block_sizes,
+        sparse_block_size=block_size,
+        use_clc=False,
+    )
+    split_result = BSA.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        block_sparse_num,
+        block_sizes,
+        sparse_block_size=block_size,
+        use_clc=False,
+        kv_splits=2,
+    )
 
-    # Auto split selection uses the metadata capacity. A capacity of 256 selects
-    # two splits, while the per-row count of one would leave one split empty.
-    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
-    monkeypatch.setattr(interface, "_resolve_blk64_split_workspace", lambda q, value_dim, kv_splits, allow_fallback: kv_splits)
-    variable_q2k = torch.zeros((batch, heads, 1, 256), device="cuda", dtype=torch.int32)
-    block_nums = torch.ones((batch, heads, 1), device="cuda", dtype=torch.int32)
-    with pytest.raises(ValueError, match=empty_split_error):
-        BSA.block_sparse_attention_forward(
-            q,
-            k,
-            v,
-            variable_q2k,
-            block_sparse_num=0,
-            block_sizes=block_sizes,
-            q2k_block_nums=block_nums,
-            sparse_block_size=block_size,
-            use_clc=False,
-            kv_splits="auto",
-        )
+    for actual in (result, split_result):
+        torch.testing.assert_close(actual["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(actual["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
 
 
 @pytest.mark.L0

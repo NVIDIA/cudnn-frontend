@@ -67,32 +67,6 @@ class BlockSparseAttnBackwardPreprocess:
         self.num_threads = num_threads
         self.use_padded_offsets = use_padded_offsets
 
-    @staticmethod
-    def can_implement(dtype, head_dim, tile_m, num_threads) -> bool:
-        """Check if the kernel can be implemented with the given parameters.
-
-        :param dtype: data type
-        :type dtype: cutlass.Numeric
-        :param head_dim: head dimension
-        :type head_dim: int
-        :param tile_m: m block size
-        :type tile_m: int
-        :param num_threads: number of threads
-        :type num_threads: int
-
-        :return: True if the kernel can be implemented, False otherwise
-        :rtype: bool
-        """
-        if dtype not in [cutlass.Float16, cutlass.BFloat16]:
-            return False
-        if head_dim % 8 != 0:
-            return False
-        if num_threads % 32 != 0:
-            return False
-        if num_threads < tile_m:  # For multiplying lse with log2
-            return False
-        return True
-
     def _setup_attributes(self):
         # ///////////////////////////////////////////////////////////////////////////////
         # GMEM Tiled copy:

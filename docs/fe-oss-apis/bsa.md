@@ -78,10 +78,33 @@ natural-log log-sum-exp with shape `(B, H_q, S_q)`.
 
 Here `N_q = ceil(S_q / sparse_block_size)` and
 `N_kv = ceil(S_kv / sparse_block_size)`. Except for packed GQA described below,
-metadata is per query head. Every valid prefix must contain unique IDs in
-`[0, N_kv)`, every count must be in `[0, K_max]`, and every block size must be
-in `[0, sparse_block_size]`. The metadata tensors must reside on the same CUDA
-device as `q`, `k`, and `v`.
+metadata is per query head. The metadata tensors must reside on the same CUDA
+device as `q`, `k`, and `v`. The value ranges below are a hard caller contract.
+
+#### Value ranges (caller contract)
+
+Let `K_max = q2k_block_index.shape[-1]`. Only the active prefix of each
+`q2k_block_index` row — the first `q2k_block_nums[b, h, m]` entries with
+variable counts, or the first `block_sparse_num` entries with a fixed count —
+is consumed. Values in the inactive suffix are ignored.
+
+- Within each row, active `q2k_block_index` values must be unique integers in
+  `[0, N_kv)`.
+- For forward with variable counts, every `q2k_block_nums` value must be in
+  `[0, K_max]` when `allow_empty_block_nums=True`, and in `[1, K_max]`
+  otherwise. Backward variable counts may be in `[0, K_max]`.
+- With fixed counts, `block_sparse_num` must be in `[1, K_max]`. The
+  SM100/SM110 blk128 path additionally requires an even value, i.e. an even
+  `block_sparse_num` in `[2, K_max]`.
+- The `block_sizes` entry for every physical KV block referenced by an active
+  `q2k_block_index` value must be in `[1, sparse_block_size]`. Entries for
+  unreferenced physical KV blocks are ignored. A zero-sized referenced block is
+  not supported; use `q2k_block_nums` (or the sparse index prefix) to drop the
+  block instead.
+
+Tensor value ranges and per-row uniqueness are not validated at runtime.
+Violating the contract is unsupported and may produce invalid results or
+invalid device memory accesses.
 
 On the SM100/SM110 blk128 path, `pack_gqa=None` automatically packs GQA when
 the GQA ratio `r = H_q / H_kv` divides 128. Packed metadata has shape
@@ -103,9 +126,11 @@ explicit Blackwell blk64 path.
 workspace growing linearly in the split count. SM90 accepts an explicit integer
 split count. The SM100/SM110 blk64 path also accepts `kv_splits="auto"`; CLC is
 disabled for split execution, and an explicit `use_clc=True` is incompatible
-with `kv_splits>1`. Every sparse row must contain at least `kv_splits` valid KV
-blocks so that every split is non-empty; unsupported combinations raise
-`ValueError`. Automatic split selection falls back to a smaller split count when
+with `kv_splits>1`. Every sparse row must contain at least the selected number
+of valid KV blocks so that every split is non-empty; this caller contract is not
+validated at runtime. Automatic split selection uses metadata capacity rather
+than per-row count values, so variable-count callers must also satisfy the
+automatically selected split count. It falls back to a smaller split count when
 the estimated live workspace does not fit the available CUDA allocator budget;
 an explicit split count that exceeds that budget raises `RuntimeError`.
 
@@ -157,7 +182,10 @@ SM90 currently requires `S_q` to be a multiple of 64. Its fixed count may be
 any positive value. The SM100/SM110 blk128 fixed count must be even and at
 least two; SM120 and the explicit Blackwell blk64 path accept any positive
 fixed count. Variable counts use `q2k_block_nums`. `allow_empty_block_nums`
-defaults to `False`; SM90 does not support empty rows.
+defaults to `False`; when it is `True`, empty rows (`q2k_block_nums == 0`)
+produce `O = 0` and `LSE = -inf`. SM90 selects the empty-row handling as a
+compile-time specialization, so the default non-empty configuration keeps its
+branch-free fast path. Split-KV execution therefore excludes empty rows.
 
 ### Backward
 

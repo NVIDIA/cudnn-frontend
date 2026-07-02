@@ -182,13 +182,9 @@ def _compile_bwd_postprocess(
     dtype,
     hdim,
     block_size,
-    num_threads,
-    atom_layout,
     swap_ab,
     has_cuseqlens_q,
     has_seqused_q,
-    use_2cta_instrs,
-    cluster_size,
     arch,
 ):
     """Compile bwd postprocess kernel using fake tensors."""
@@ -202,11 +198,7 @@ def _compile_bwd_postprocess(
         hdim,
         arch,
         block_size,
-        num_threads,
-        atom_layout,
         swap_ab,
-        use_2cta_instrs=use_2cta_instrs,
-        cluster_size=cluster_size,
     )
     return cute.compile(
         bsa_bwd_post,
@@ -230,24 +222,16 @@ def _bwd_postprocess_convert(
     dtype,
     hdim,
     block_size,
-    num_threads,
-    atom_layout,
     swap_ab,
-    use_2cta_instrs=False,
-    cluster_size=1,
 ):
     """Convert float32 backward accumulator to final output dtype."""
     compile_key = (
         dtype,
         hdim,
         block_size,
-        num_threads,
-        atom_layout,
         swap_ab,
         cu_seqlens is not None,
         seqused is not None,
-        use_2cta_instrs,
-        cluster_size,
         arch,
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:

@@ -40,10 +40,8 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         assert blocksparse_blocksize_q == 64, "Only block_size_m=64 is supported in this kernel."
         assert blocksparse_blocksize_k in [64], "block_size_n should be one of [64]"
         self.num_threads = 128
-        self.num_mma_warps = 4
         self.kv_stage = 1
         self.q_stage = 1
-        self.q_in_regs = True
 
         assert gqa_ratio >= 1
         assert head_dim == 128, "SM120 blk64 fwd currently requires QK dim 128"
@@ -54,9 +52,6 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         self.tile_shape_qk = (self.tile_size, self.tile_size, self.qk_dim)
         self.tile_shape_pv = (self.tile_size, self.value_dim, self.tile_size)
 
-        self.scheduler = None
-
-        self.use_tma_o = True
         self.has_block_sizes = has_block_sizes
         self.has_block_nums = has_block_nums
         self.block_sizes_mode = block_sizes_mode
@@ -106,9 +101,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_Q)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_K)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_V)
-
-            if cutlass.const_expr(self.use_tma_o):
-                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_O)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_O)
 
         cg = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
@@ -300,14 +293,13 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 
         Q_wait_status = Q_pipeline.consumer_try_wait(Q_consumer_state)
         Q_pipeline.consumer_wait(Q_consumer_state, Q_wait_status)
-        if cutlass.const_expr(self.q_in_regs):
-            tQsQ_p = tSsQ_copy[None, None, None, 0]
-            for k_block_idx in cutlass.range_constexpr(cute.size(tSrQ, mode=[2])):
-                cute.copy(
-                    smem_tiled_copy_Q,
-                    tQsQ_p[None, None, k_block_idx],
-                    tSrQ_copy[None, None, k_block_idx],
-                )
+        tQsQ_p = tSsQ_copy[None, None, None, 0]
+        for k_block_idx in cutlass.range_constexpr(cute.size(tSrQ, mode=[2])):
+            cute.copy(
+                smem_tiled_copy_Q,
+                tQsQ_p[None, None, k_block_idx],
+                tSrQ_copy[None, None, k_block_idx],
+            )
         Q_pipeline.consumer_release(Q_consumer_state)
         Q_consumer_state.advance()
 
@@ -332,11 +324,8 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 tSrS,
                 tSrQ,
                 tSrK,
-                tSsQ_copy[None, None, None, 0],
                 tSsK_copy[None, None, None, k_stage],
-                smem_tiled_copy_Q,
                 smem_tiled_copy_K,
-                A_in_regs=self.q_in_regs,
             )
 
             K_pipeline.consumer_release(K_consumer_state)
@@ -359,11 +348,11 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 
             if cutlass.const_expr(self.need_k_mask):
                 if varblk < self.tile_size:
-                    mask(tiled_mma_qk, tSrS, tScS, varblk)
-            row_scale = online_softmax(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
+                    mask(tSrS, tScS, varblk)
+            row_scale = online_softmax(tSrS, max_m, sum_m, scale_softmax_log2e)
 
             # Compute P @ V.
-            rescale_o_for_next_acc(tiled_mma_pv, tOrO, row_scale)
+            rescale_o_for_next_acc(tOrO, row_scale)
             tOrP_frg = cute.make_rmem_tensor_like(tSrS, self.K_dtype)
             tOrP_frg.store(tSrS.load().to(self.K_dtype))
             tOrP = layout_utils.reshape_acc_to_frgA(tOrP_frg)
@@ -396,7 +385,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 V_producer_state.advance()
 
         final_ratio, lse = finalize_softmax(max_m, sum_m, scale_softmax_log2e)
-        rescale_o_for_next_acc(tiled_mma_pv, tOrO, final_ratio)
+        rescale_o_for_next_acc(tOrO, final_ratio)
         tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
         for m in cutlass.range_constexpr(cute.size(lse)):
             row_idx = work_desc.qo_tile_idx * self.tile_size + tScS_mn[m, 0][0]
@@ -611,26 +600,14 @@ def gemm_smem_zero_acc(
     acc: cute.Tensor,
     tCrA: cute.Tensor,
     tCrB: cute.Tensor,
-    tCsA: cute.Tensor,
     tCsB: cute.Tensor,
-    smem_tiled_copy_A: cute.TiledCopy,
     smem_tiled_copy_B: cute.TiledCopy,
-    A_in_regs: bool = False,
 ) -> None:
     acc.fill(0.0)
-    tCrA_copy_view = smem_tiled_copy_A.retile(tCrA)
     tCrB_copy_view = smem_tiled_copy_B.retile(tCrB)
-    if cutlass.const_expr(not A_in_regs):
-        cute.copy(smem_tiled_copy_A, tCsA[None, None, 0], tCrA_copy_view[None, None, 0])
     cute.copy(smem_tiled_copy_B, tCsB[None, None, 0], tCrB_copy_view[None, None, 0])
     for k_block_idx in cutlass.range_constexpr(cute.size(tCsB.shape[2])):
         if k_block_idx < cute.size(tCsB.shape[2]) - 1:
-            if cutlass.const_expr(not A_in_regs):
-                cute.copy(
-                    smem_tiled_copy_A,
-                    tCsA[None, None, k_block_idx + 1],
-                    tCrA_copy_view[None, None, k_block_idx + 1],
-                )
             cute.copy(
                 smem_tiled_copy_B,
                 tCsB[None, None, k_block_idx + 1],
@@ -674,7 +651,6 @@ def gemm_rs_smem(
 
 @cute.jit
 def mask(
-    qk_tiled_mma: cute.TiledMma,
     tSrS: cute.ThrMma,
     tScS: cute.Tensor,
     varblk: cutlass.Int32,
@@ -690,7 +666,6 @@ def mask(
 
 @cute.jit
 def online_softmax(
-    tiled_mma_qk: cute.TiledMma,
     tSrS: cute.ThrMma,
     row_max: cute.Tensor,
     row_sum: cute.Tensor,
@@ -754,7 +729,6 @@ def finalize_softmax(
 
 @cute.jit
 def rescale_o_for_next_acc(
-    pv_tiled_mma: cute.TiledMma,
     tOrO: cute.ThrMma,
     prev_ratio_m: cute.Tensor,
 ):

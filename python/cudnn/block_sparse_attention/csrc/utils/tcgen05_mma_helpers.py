@@ -36,10 +36,13 @@ def gemm_w_idx(
     tCrB: cute.Tensor,
     A_idx: Optional[Int32] = None,
     B_idx: Optional[Int32] = None,
-    zero_init: bool | Boolean = False,
+    zero_init: bool = False,
     swap_AB: bool = False,
     num_unroll_groups: int = 1,
 ) -> None:
+    # `not zero_init` below is a Python-level negation, which would silently bake a
+    # constant predicate for a runtime Boolean; use gemm_ptx_w_idx for dynamic flags.
+    assert isinstance(zero_init, bool), "gemm_w_idx only supports a compile-time bool zero_init"
     if const_expr(swap_AB):
         return gemm_w_idx(tiled_mma, acc, tCrB, tCrA, B_idx, A_idx, zero_init=zero_init, swap_AB=False)
     else:
@@ -63,7 +66,6 @@ def gemm_ptx_w_idx(
     A_idx: Optional[Int32] = None,
     B_idx: Optional[Int32] = None,
     zero_init: bool | Boolean = False,
-    cta_group: int = 1,
     **kwargs,
 ) -> None:
     rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
@@ -82,7 +84,6 @@ def gemm_ptx_w_idx(
         sA_cur,
         sB_cur,
         zero_init=zero_init,
-        cta_group=cta_group,
         **kwargs,
     )
 
@@ -105,7 +106,6 @@ def gemm_ptx_partial(
     split_arrive: Optional[int] = None,
     zero_init: bool | Boolean = False,
     tA_addr: Optional[Int32] = None,
-    cta_group: int = 1,
 ) -> None:
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if const_expr(not is_ts):
@@ -152,7 +152,13 @@ def gemm_ptx_partial(
     else:
         smem_desc_start_a_lo = None
     smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator))
-    pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
+    # zero_init may be a runtime Boolean (e.g. loop-carried accumulate flags); Python
+    # `not` on it would bake a wrong constant predicate at trace time, so pass the raw
+    # value through and flip the setp comparison instead.
+    zero_init_is_dynamic = isinstance(zero_init, Boolean)
+    pred_str = "p" if zero_init_is_dynamic else "0" if zero_init else "1"
+    pred_input = zero_init if zero_init_is_dynamic else not zero_init
+    pred_setp = "setp.eq.b32" if zero_init_is_dynamic else "setp.ne.b32"
     if const_expr(not is_ts):
         assert mbar_ptr is None, "mbar_ptr must be None when a_src is not TMEM"
         llvm.inline_asm(
@@ -160,7 +166,7 @@ def gemm_ptx_partial(
             [
                 Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
                 Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
-                Int32(not zero_init).ir_value(),
+                Int32(pred_input).ir_value(),
                 Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
             ],
             "{\n\t"
@@ -181,15 +187,15 @@ def gemm_ptx_partial(
             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
             f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
-            "setp.ne.b32 p, $2, 0;\n\t"
-            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
+            f"{pred_setp} p, $2, 0;\n\t"
+            f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
             + "".join(
                 (
                     f"add.u32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[k])};\n\t"
                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
+                    f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
                 )
                 for k in range(1, cute.size(tCrA.shape[2]))
             )
@@ -206,13 +212,15 @@ def gemm_ptx_partial(
         input_args = [
             Int32(cute.arch.make_warp_uniform(tA_addr)).ir_value(),
             Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
-            Int32(not zero_init).ir_value(),
+            Int32(pred_input).ir_value(),
             Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
         ]
         if const_expr(mbar_ptr is not None):
             assert mbar_phase is not None, "mbar_phase must be provided when mbar_ptr is not None"
             assert split_arrive is not None, "split_arrive must be provided when mbar_ptr is not None"
+            assert split_arrive % op.shape_mnk[2] == 0, "split_arrive must be a multiple of the MMA K extent"
             split_arrive_idx = split_arrive // op.shape_mnk[2]
+            assert 1 <= split_arrive_idx <= cute.size(tCrA.shape[2]), "split_arrive must map to a K-tile index within [1, num_k_tiles]"
             input_args.append(mbar_ptr.toint().ir_value())
             input_args.append(Int32(mbar_phase).ir_value())
             mbar_wait_str = (
@@ -243,15 +251,18 @@ def gemm_ptx_partial(
             f"mov.b32 tmem_acc, $3;\n\t"
             f"mov.b32 tmem_a, $0;\n\t"
             f"mov.b32 smem_desc_b_lo_start, $1;\n\t"
-            f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+            # The post-wait loop below updates smem_desc_b_lo incrementally, and the
+            # pre-wait loop that would otherwise seed it is empty when
+            # split_arrive_idx == 1, so initialize it from the base descriptor.
+            + ("mov.b32 smem_desc_b_lo, smem_desc_b_lo_start;\n\t" if mbar_ptr is not None else "") + f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
-            "setp.ne.b32 p, $2, 0;\n\t"
-            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
+            f"{pred_setp} p, $2, 0;\n\t"
+            f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
             + "".join(
                 (
                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                    f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                 )
                 for k in range(
                     1,
@@ -264,7 +275,7 @@ def gemm_ptx_partial(
                     (
                         f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
                         f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                        f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                        f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                     )
                     for k in range(split_arrive_idx, cute.size(tCrA.shape[2]))
                 )
