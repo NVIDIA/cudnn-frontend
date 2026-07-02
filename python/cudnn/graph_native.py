@@ -59,6 +59,7 @@ class NativeGraph:
         io_data_type: Any = None,
         intermediate_data_type: Any = None,
         compute_data_type: Any = None,
+        handle: Any = None,
         use_native: bool = False,
         backends: Optional[List["BaseEngine"]] = None,
         router: Any = None,
@@ -69,6 +70,7 @@ class NativeGraph:
             intermediate_data_type=intermediate_data_type or io_data_type,
             compute_data_type=compute_data_type or io_data_type,
         )
+        self._handle = handle  # cuDNN handle for the cuDNN lowering path
         self._nodes: List[Node] = []
         self._tensors: Dict[str, Tensor] = {}
         self._tensor_by_uid: Dict[int, Tensor] = {}
@@ -349,8 +351,9 @@ class NativeGraph:
     # These represent the ops the CuTe-DSL GEMM fusion backend consumes (block
     # scaling, MoE grouped matmul, epilogue reductions). They populate the Node
     # IR so a backend's analyze(graph.nodes) pass can read them directly — no
-    # monkey-patch recorder needed. NOTE: cuDNN lowering (_lower_to_cpp) for
-    # these node types is not wired yet; they are backend-path ops for now.
+    # monkey-patch recorder needed. cuDNN lowering (_lower_to_cpp) is wired for
+    # all of them; per-op output-shape inference (e.g. reduced dims) is still
+    # being filled in, so set output dims explicitly for now where cuDNN needs them.
     # -------------------------------------------------------------------------
 
     def block_scale_dequantize(self, input: Any, descale: Any, block_size: List[int], is_negative_scale: bool = False, name: str = "") -> Tensor:
@@ -933,11 +936,14 @@ class NativeGraph:
         """Lower Python graph to C++."""
         import cudnn
 
-        graph = cudnn.pygraph(
+        pg_kwargs = dict(
             io_data_type=self._context.io_data_type,
             intermediate_data_type=self._context.intermediate_data_type,
             compute_data_type=self._context.compute_data_type,
         )
+        if self._handle is not None:
+            pg_kwargs["handle"] = self._handle
+        graph = cudnn.pygraph(**pg_kwargs)
 
         tensor_map: Dict[int, Any] = {}
 
@@ -951,7 +957,10 @@ class NativeGraph:
                 is_virtual=t.is_virtual,
                 is_pass_by_value=t.is_pass_by_value,
                 name=t.name,
-                uid=t.uid if t.uid_assigned else -1,
+                # Always propagate the IR uid so execute()'s variant pack (keyed
+                # by IR uid) matches; otherwise cuDNN assigns its own and the
+                # buffers never bind. IR uids are unique and positive.
+                uid=t.uid,
             )
             tensor_map[t.uid] = cpp
             return cpp
@@ -970,11 +979,23 @@ class NativeGraph:
                     name=node.name,
                 )
             elif node.node_type == NodeType.POINTWISE:
+                # The C++ pygraph exposes named pointwise ops (relu/add/...), not a
+                # generic pointwise(). Dispatch on the mode. add/mul cover bias/scale
+                # too (broadcast add/mul), so no need to distinguish here.
                 inputs = [tensor_map[t.uid] for t in node.inputs.values()]
+                mode_name = getattr(node.params["mode"], "name", str(node.params["mode"])).upper()
+                _PW_UNARY = {"RELU_FWD": "relu", "GELU_FWD": "gelu", "SIGMOID_FWD": "sigmoid", "TANH_FWD": "tanh"}
+                _PW_BINARY = {"ADD": "add", "MUL": "mul", "SUB": "sub", "DIV": "div"}
                 if len(inputs) == 1:
-                    cpp_out = graph.pointwise(input=inputs[0], mode=node.params["mode"], compute_data_type=node.compute_data_type, name=node.name)
+                    method = _PW_UNARY.get(mode_name)
+                    if method is None:
+                        raise NotImplementedError(f"pointwise lowering: unary mode {mode_name} not mapped")
+                    cpp_out = getattr(graph, method)(inputs[0], compute_data_type=node.compute_data_type, name=node.name)
                 else:
-                    cpp_out = graph.pointwise(a=inputs[0], b=inputs[1], mode=node.params["mode"], compute_data_type=node.compute_data_type, name=node.name)
+                    method = _PW_BINARY.get(mode_name)
+                    if method is None:
+                        raise NotImplementedError(f"pointwise lowering: binary mode {mode_name} not mapped")
+                    cpp_out = getattr(graph, method)(inputs[0], inputs[1], compute_data_type=node.compute_data_type, name=node.name)
             elif node.node_type == NodeType.SDPA:
                 sdpa_kwargs = {
                     "q": tensor_map[node.inputs["Q"].uid],
@@ -1094,6 +1115,54 @@ class NativeGraph:
                             cpp_tensor.set_output(True)
                         if out_t.data_type:
                             cpp_tensor.set_data_type(out_t.data_type)
+                continue
+            elif node.node_type == NodeType.REDUCTION:
+                red_kwargs = {
+                    "input": tensor_map[node.inputs["input"].uid],
+                    "mode": node.params["mode"],
+                    "compute_data_type": node.compute_data_type,
+                    "name": node.name,
+                }
+                if "group_offset" in node.inputs:
+                    red_kwargs["group_offset"] = tensor_map[node.inputs["group_offset"].uid]
+                cpp_out = graph.reduction(**red_kwargs)
+            elif node.node_type == NodeType.BLOCK_SCALE_DEQUANTIZE:
+                cpp_out = graph.block_scale_dequantize(
+                    input=tensor_map[node.inputs["input"].uid],
+                    descale=tensor_map[node.inputs["descale"].uid],
+                    block_size=node.params["block_size"],
+                    is_negative_scale=node.params.get("is_negative_scale", False),
+                    compute_data_type=node.compute_data_type,
+                    name=node.name,
+                )
+            elif node.node_type == NodeType.MOE_GROUPED_MATMUL:
+                cpp_out = graph.moe_grouped_matmul(
+                    token=tensor_map[node.inputs["token"].uid],
+                    weight=tensor_map[node.inputs["weight"].uid],
+                    first_token_offset=tensor_map[node.inputs["first_token_offset"].uid],
+                    mode=node.params.get("mode"),
+                    name=node.name,
+                )
+            elif node.node_type == NodeType.BLOCK_SCALE_QUANTIZE:
+                q_kwargs = {
+                    "input": tensor_map[node.inputs["input"].uid],
+                    "block_size": node.params["block_size"],
+                    "transpose": node.params.get("transpose", False),
+                    "compute_data_type": node.compute_data_type,
+                    "name": node.name,
+                }
+                if node.params.get("axis") is not None:
+                    q_kwargs["axis"] = node.params["axis"]
+                quantized, scale = graph.block_scale_quantize(**q_kwargs)
+                # two outputs: OUT_0 quantized, OUT_1 scale
+                for out_t, cpp_t in ((node.outputs.get("OUT_0"), quantized), (node.outputs.get("OUT_1"), scale)):
+                    if out_t is None:
+                        continue
+                    tensor_map[out_t.uid] = cpp_t
+                    if not out_t.is_virtual:
+                        cpp_t.set_output(True)
+                    if out_t.data_type:
+                        cpp_t.set_data_type(out_t.data_type)
                 continue
             else:
                 continue
