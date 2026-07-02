@@ -22,6 +22,7 @@ from .._jax.gemm import (
     require_gemm_inputs,
 )
 from .._jax.validation import require_dtype
+from ..gemm_validation import require_cluster_shape, require_mma_tiler, resolve_max_active_clusters
 
 
 class GemmAmaxResult(NamedTuple):
@@ -29,11 +30,6 @@ class GemmAmaxResult(NamedTuple):
 
     c_tensor: Any
     amax_tensor: Any
-
-
-def _require_power_of_two_at_most_four(value: int, name: str) -> None:
-    if value not in (1, 2, 4):
-        raise ValueError(f"{name} must be one of {{1, 2, 4}}, got {value}")
 
 
 @lru_cache(maxsize=None)
@@ -57,10 +53,10 @@ def _make_launcher(
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
         )
-        max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1])
-        max_active_clusters -= cluster_overlap_margin
-        if max_active_clusters <= 0:
-            raise ValueError("max_active_clusters must be positive after applying " "CUDNNFE_CLUSTER_OVERLAP_MARGIN")
+        max_active_clusters = resolve_max_active_clusters(
+            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+            cluster_overlap_margin,
+        )
         kernel(
             a,
             b,
@@ -129,14 +125,18 @@ def gemm_amax_wrapper_sm100(
     )
     acc_dtype = require_dtype("acc_dtype", acc_dtype, (jnp.float32,), default=jnp.float32)
 
-    mma_tiler_mn = tuple(mma_tiler_mn)
-    if mma_tiler_mn not in {(128, 128), (128, 256)}:
-        raise ValueError("mma_tiler_mn must be (128, 128) or (128, 256) for the " f"supported FP8 path, got {mma_tiler_mn}")
-    cluster_shape_mn = tuple(cluster_shape_mn)
-    if len(cluster_shape_mn) != 2:
-        raise ValueError(f"cluster_shape_mn must have two dimensions, got {cluster_shape_mn}")
-    _require_power_of_two_at_most_four(cluster_shape_mn[0], "cluster_shape_mn[0]")
-    _require_power_of_two_at_most_four(cluster_shape_mn[1], "cluster_shape_mn[1]")
+    mma_tiler_mn = require_mma_tiler(
+        mma_tiler_mn,
+        allowed_m=(128, 256),
+        allowed_n=(128, 256),
+    )
+    if mma_tiler_mn[0] == 256:
+        raise NotImplementedError("mma_tiler_mn[0] == 256 currently hangs")
+    cluster_shape_mn = require_cluster_shape(
+        cluster_shape_mn,
+        mma_m=mma_tiler_mn[0],
+        max_dimension=4,
+    )
 
     a_spec = gemm_a_tensor_spec(a_major)
     b_spec = gemm_b_tensor_spec(b_major)

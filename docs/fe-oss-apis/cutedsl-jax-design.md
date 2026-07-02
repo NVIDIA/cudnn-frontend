@@ -193,9 +193,10 @@ The implementations are co-located with the kernels:
 ```text
 cudnn/
   _operation_api.py                         shared lazy operation exports
+  gemm_validation.py                       framework-neutral dense GEMM rules
   _jax/cutedsl.py                          import-order-neutral adapter implementation
   _jax/validation.py                       shared JAX metadata validation
-  _jax/gemm.py                             shared GEMM layout and metadata helpers
+  _jax/gemm.py                             JAX GEMM layout and metadata adapters
   jax/                                      shared facade and cutedsl.py compatibility export
   rmsnorm_rht_amax/{api.py,jax.py,config.py,kernel.py}
   gemm_{swiglu,amax,srelu,dsrelu}/{api.py,jax.py,...}

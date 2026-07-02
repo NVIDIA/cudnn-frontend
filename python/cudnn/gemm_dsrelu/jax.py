@@ -24,6 +24,13 @@ from .._jax.gemm import (
     require_gemm_inputs,
 )
 from .._jax.validation import require_dtype
+from ..gemm_validation import (
+    require_cluster_shape,
+    require_full_mma_rows,
+    require_mma_tiler,
+    require_shape,
+    resolve_max_active_clusters,
+)
 
 
 class GemmDsreluResult(NamedTuple):
@@ -60,10 +67,10 @@ def _make_launcher(
             cluster_shape_mn=cluster_shape_mn,
             vector_f32=vector_f32,
         )
-        max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1])
-        max_active_clusters -= cluster_overlap_margin
-        if max_active_clusters <= 0:
-            raise ValueError("max_active_clusters must be positive after applying " "CUDNNFE_CLUSTER_OVERLAP_MARGIN")
+        max_active_clusters = resolve_max_active_clusters(
+            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+            cluster_overlap_margin,
+        )
 
         def squared_relu_backward(x, upstream):
             return cute.where(x > 0, x, cute.full_like(x, 0)) * 2 * upstream
@@ -143,11 +150,9 @@ def gemm_dsrelu_wrapper_sm100(
     )
 
     c_shape = require_array("c_tensor", c_tensor, 3)
-    if c_shape != (m, n, batch):
-        raise ValueError(f"c_tensor must have shape {(m, n, batch)}, got {c_shape}")
+    require_shape("c_tensor", c_shape, (m, n, batch))
     prob_shape = require_array("prob_tensor", prob_tensor, 3)
-    if prob_shape != (m, 1, batch):
-        raise ValueError(f"prob_tensor must have shape {(m, 1, batch)}, got {prob_shape}")
+    require_shape("prob_tensor", prob_shape, (m, 1, batch))
     require_dtype("prob_tensor.dtype", prob_tensor, (jnp.float32,))
 
     supported_outputs = (jnp.float16, jnp.bfloat16, jnp.float32)
@@ -155,23 +160,24 @@ def gemm_dsrelu_wrapper_sm100(
     d_dtype = require_dtype("d_dtype", d_dtype, supported_outputs, default=jnp.bfloat16)
     acc_dtype = require_dtype("acc_dtype", acc_dtype, (jnp.float32,), default=jnp.float32)
 
-    mma_tiler_mn = tuple(mma_tiler_mn)
-    if len(mma_tiler_mn) != 2 or mma_tiler_mn[0] not in (128, 256) or mma_tiler_mn[1] not in (64, 128, 192, 256):
-        raise ValueError("mma_tiler_mn must have M in {128, 256} and N in " f"{{64, 128, 192, 256}}, got {mma_tiler_mn}")
-    if m % mma_tiler_mn[0]:
-        raise ValueError(f"M must be divisible by TILE_M={mma_tiler_mn[0]} because the probability load is not predicated, got {m}")
+    mma_tiler_mn = require_mma_tiler(
+        mma_tiler_mn,
+        allowed_m=(128, 256),
+        allowed_n=(64, 128, 192, 256),
+    )
+    require_full_mma_rows(
+        m,
+        mma_tiler_mn[0],
+        cta_group_size=2 if mma_tiler_mn[0] == 256 else 1,
+        reason="the probability load is not predicated",
+    )
     if cluster_shape_mn is None:
         cluster_shape_mn = (2, 1) if mma_tiler_mn[0] == 256 else (1, 1)
-    cluster_shape_mn = tuple(cluster_shape_mn)
-    if (
-        len(cluster_shape_mn) != 2
-        or cluster_shape_mn[0] not in (1, 2, 4)
-        or cluster_shape_mn[1] not in (1, 2, 4)
-        or cluster_shape_mn[0] * cluster_shape_mn[1] > 16
-    ):
-        raise ValueError("cluster_shape_mn dimensions must be in {1, 2, 4} with product " f"at most 16, got {cluster_shape_mn}")
-    if mma_tiler_mn[0] == 256 and cluster_shape_mn[0] % 2:
-        raise ValueError("cluster_shape_mn[0] must be divisible by 2 with a 256-wide M tile")
+    cluster_shape_mn = require_cluster_shape(
+        cluster_shape_mn,
+        mma_m=mma_tiler_mn[0],
+        max_dimension=4,
+    )
 
     a_spec = gemm_a_tensor_spec(a_major)
     b_spec = gemm_b_tensor_spec(b_major)

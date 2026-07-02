@@ -78,7 +78,7 @@ Constraints are same as dense_gemm.py:
   see detailed valid dtype combinations in below PersistentDenseGemmKernel class documentation
 * A/B tensor must have the same data type
 * Mma tiler M must be 64/128 (use_2cta_instrs=False) or 128/256 (use_2cta_instrs=True)
-* Mma tiler N must be 32-256, step 32
+* Mma tiler N must be 64/128/192/256
 * Cluster shape M/N must be positive and power of 2, total cluster size <= 16
 * Cluster shape M must be multiple of 2 if use_2cta_instrs=True
 * The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
@@ -125,7 +125,7 @@ class PersistentDenseGemmKernel:
 
     :note: Constraints:
         - MMA tiler M must be 64/128 (use_2cta_instrs=False) or 128/256 (use_2cta_instrs=True)
-        - MMA tiler N must be 32-256, step 32
+        - MMA tiler N must be 64/128/192/256
         - Cluster shape M must be multiple of 2 if use_2cta_instrs=True
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
 

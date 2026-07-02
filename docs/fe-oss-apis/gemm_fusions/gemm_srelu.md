@@ -137,10 +137,10 @@ c, d, amax, sfd = run(a, b, sfa, sfb, prob)
 The JAX API supports FP8 A/B with E8M0 scale factors and
 `sf_vec_size=32`. C and D may be float32, float16, or bfloat16; output
 quantization (`sfd`, `amax`, and `norm_const_tensor`) is not exposed in this
-surface, so `amax` and `sfd` are `None`. `M` must be divisible by 128 because
-the native probability load is not predicated for a partial final M tile. For
-`TILE_M=256`, `M` must instead be divisible by 256 so both CTAs in each MMA
-pair are present.
+surface, so `amax` and `sfd` are `None`. `M` must be divisible by the per-CTA
+M extent because the native probability load is not predicated for a partial
+final CTA tile. That extent is 128 rows for both `TILE_M=128` and the two-CTA
+`TILE_M=256` mode.
 
 `````
 

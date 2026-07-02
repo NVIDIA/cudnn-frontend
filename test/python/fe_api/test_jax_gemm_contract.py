@@ -267,12 +267,12 @@ class JaxGemmContractTest(unittest.TestCase):
         make_launcher.assert_not_called()
 
     def test_srelu_and_dsrelu_declare_functional_outputs(self):
-        a = _Array((256, 512, 2), self.float8_e4m3fn)
+        a = _Array((384, 512, 2), self.float8_e4m3fn)
         b = _Array((256, 512, 2), self.float8_e4m3fn)
-        c = _Array((256, 256, 2), self.bfloat16)
-        sfa = _Array((32, 4, 2, 4, 4, 2), self.float8_e8m0fnu)
+        c = _Array((384, 256, 2), self.bfloat16)
+        sfa = _Array((32, 4, 3, 4, 4, 2), self.float8_e8m0fnu)
         sfb = _Array((32, 4, 2, 4, 4, 2), self.float8_e8m0fnu)
-        prob = _Array((256, 1, 2), self.float32)
+        prob = _Array((384, 1, 2), self.float32)
         srelu_captured = {}
         dsrelu_captured = {}
 
@@ -311,8 +311,8 @@ class JaxGemmContractTest(unittest.TestCase):
         self.assertEqual(
             [(spec.name, spec.shape, spec.dtype, spec.fill_value) for spec in srelu_captured["outputs"]],
             [
-                ("c_tensor", (256, 256, 2), self.bfloat16, None),
-                ("d_tensor", (256, 256, 2), self.bfloat16, None),
+                ("c_tensor", (384, 256, 2), self.bfloat16, None),
+                ("d_tensor", (384, 256, 2), self.bfloat16, None),
             ],
         )
         self.assertEqual(
@@ -332,7 +332,7 @@ class JaxGemmContractTest(unittest.TestCase):
         d_spec, dprob_spec = dsrelu_captured["outputs"]
         self.assertEqual(
             (d_spec.name, d_spec.shape, d_spec.dtype),
-            ("d_tensor", (256, 256, 2), self.bfloat16),
+            ("d_tensor", (384, 256, 2), self.bfloat16),
         )
         self.assertEqual(
             (
@@ -341,7 +341,7 @@ class JaxGemmContractTest(unittest.TestCase):
                 dprob_spec.dtype,
                 dprob_spec.fill_value,
             ),
-            ("dprob_tensor", (256, 1, 2), self.float32, 0.0),
+            ("dprob_tensor", (384, 1, 2), self.float32, 0.0),
         )
         self.assertIsNone(dsrelu_result.amax_tensor)
         self.assertIsNone(dsrelu_result.sfd_tensor)
@@ -350,7 +350,7 @@ class JaxGemmContractTest(unittest.TestCase):
 
     def test_relu_wrappers_reject_unpredicated_partial_mma_tile(self):
         with self._optional_modules():
-            for m, mma_tiler_mn in ((129, (128, 128)), (128, (256, 256))):
+            for m, mma_tiler_mn in ((129, (128, 128)), (130, (256, 256))):
                 a = _Array((m, 512, 1), self.float8_e4m3fn)
                 b = _Array((256, 512, 1), self.float8_e4m3fn)
                 c = _Array((m, 256, 1), self.bfloat16)

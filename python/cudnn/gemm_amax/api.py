@@ -11,8 +11,16 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 
+from cudnn.api_base import APIBase, TupleDict
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.api_base import APIBase, TensorDesc, TupleDict, is_power_of_2, ceil_div
+from cudnn.gemm_validation import (
+    block_scale_shape,
+    require_cluster_shape,
+    require_contiguous_alignment,
+    require_gemm_shapes,
+    require_mma_tiler,
+    resolve_max_active_clusters,
+)
 
 
 class GemmAmaxSm100(APIBase):
@@ -30,6 +38,7 @@ class GemmAmaxSm100(APIBase):
         sf_vec_size: int = 32,
     ):
         super().__init__()
+        self._interpret_uint8_as_fp4x2 = True
 
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")
@@ -49,11 +58,6 @@ class GemmAmaxSm100(APIBase):
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
 
-        # used to reshape sfa/sfb tensors to atom layout
-        self.atom_m = (32, 4)
-        self.atom_k = 4
-
-        self._interpret_uint8_as_fp4x2 = True
         self._logger.debug(
             f"__init__ completed with args: sample_a {self.a_desc.shape}, sample_b {self.b_desc.shape}, sample_sfa {self.sfa_desc.shape}, sample_sfb {self.sfb_desc.shape}, sample_c {self.c_desc.shape}, sample_amax {self.amax_desc.shape}, acc_dtype {acc_dtype}, mma_tiler_mn {mma_tiler_mn}, cluster_shape_mn {cluster_shape_mn}, sf_vec_size {sf_vec_size}"
         )
@@ -128,37 +132,15 @@ class GemmAmaxSm100(APIBase):
         self.c_dtype = c_dtype
 
         self._logger.debug("Checking tensor layout")
-        m, k, l = self.a_desc.shape
-        n, _, _ = self.b_desc.shape
-        _, _, m_div_atom_m0_m1, _, sf_k_div_atom_k, _ = self.sfa_desc.shape
-        _, _, n_div_atom_m0_m1, _, sf_k_div_atom_k, _ = self.sfb_desc.shape
-
-        self._check_tensor_shape(self.a_desc, (m, k, l), "A")
-        self._check_tensor_shape(self.b_desc, (n, k, l), "B")
+        m, n, k, l = require_gemm_shapes(
+            self._tensor_shape(self.a_desc, name="sample_a"),
+            self._tensor_shape(self.b_desc, name="sample_b"),
+        )
         self._check_tensor_shape(self.c_desc, (m, n, l), "C")
-        self._check_tensor_shape(
-            self.sfa_desc,
-            (self.atom_m[0], self.atom_m[1], m_div_atom_m0_m1, self.atom_k, sf_k_div_atom_k, l),
-            "sfa",
-        )
-        self._check_tensor_shape(
-            self.sfb_desc,
-            (self.atom_m[0], self.atom_m[1], n_div_atom_m0_m1, self.atom_k, sf_k_div_atom_k, l),
-            "sfb",
-        )
+        self._check_tensor_shape(self.sfa_desc, block_scale_shape(m, k, l, self.sf_vec_size), "sfa")
+        self._check_tensor_shape(self.sfb_desc, block_scale_shape(n, k, l, self.sf_vec_size), "sfb")
         self.amax_desc = self._pad_tensor_to_ndim(self.amax_desc, 3, "amax")
         self._check_tensor_shape(self.amax_desc, (1, 1, 1), "amax")
-
-        expected_m_div_atom = ceil_div(m, self.atom_m[0] * self.atom_m[1])
-        expected_n_div_atom = ceil_div(n, self.atom_m[0] * self.atom_m[1])
-        self._value_error_if(
-            m_div_atom_m0_m1 != expected_m_div_atom,
-            f"Input/Output shape mismatch: expected m_div_atom_m0_m1 (sfa.shape[2]) = {expected_m_div_atom}, got {m_div_atom_m0_m1}",
-        )
-        self._value_error_if(
-            n_div_atom_m0_m1 != expected_n_div_atom,
-            f"Input/Output shape mismatch: expected n_div_atom_m0_m1 (sfb.shape[2]) = {expected_n_div_atom}, got {n_div_atom_m0_m1}",
-        )
 
         # Check tensor strides
         _ = self._check_tensor_stride(
@@ -192,13 +174,10 @@ class GemmAmaxSm100(APIBase):
         )
 
         self._logger.debug("Checking mma tiler and cluster shape")
-        self._value_error_if(
-            self.mma_tiler_mn[0] not in [128, 256],
-            f"Unsupported mma_tiler_mn[0]: expected {{128, 256}}, got {self.mma_tiler_mn[0]}",
-        )
-        self._value_error_if(
-            self.mma_tiler_mn[1] not in [128, 256],
-            f"Unsupported mma_tiler_mn[1]: expected {{128, 256}}, got {self.mma_tiler_mn[1]}",
+        self.mma_tiler_mn = require_mma_tiler(
+            self.mma_tiler_mn,
+            allowed_m=(128, 256),
+            allowed_n=(128, 256),
         )
         self._not_implemented_error_if(
             self.mma_tiler_mn[0] == 256,
@@ -208,10 +187,6 @@ class GemmAmaxSm100(APIBase):
             self._is_fp4x2(self.ab_dtype) and self.mma_tiler_mn[1] == 256 and k <= 128,
             f"mma_tiler_mn (X, 256) requires k > 128 (packed x2), got {k}",
         )
-        self._value_error_if(
-            not (self.cluster_shape_mn[0] % (2 if self.mma_tiler_mn[0] == 256 else 1) == 0),
-            "Illegal cluster shape",
-        )
         self._not_implemented_error_if(
             self.mma_tiler_mn == (128, 256) and self.sf_vec_size == 16 and c_dtype in {torch.float32, torch.float16, torch.bfloat16},
             "mma_tiler_mn (128, 256), sf_vec_size 16, c_dtype {torch.float32, torch.float16, torch.bfloat16} fails to launch",
@@ -219,34 +194,24 @@ class GemmAmaxSm100(APIBase):
 
         # Special cluster shape check for scale factor multicasts.
         # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
-        self._value_error_if(
-            not (
-                self.cluster_shape_mn[0] <= 4
-                and self.cluster_shape_mn[1] <= 4
-                and self.cluster_shape_mn[0] > 0
-                and self.cluster_shape_mn[1] > 0
-                and is_power_of_2(self.cluster_shape_mn[0])
-                and is_power_of_2(self.cluster_shape_mn[1])
-            ),
-            f"Invalid cluster shape: expected cluster_shape_mn values in {{1, 2, 4}}, got {self.cluster_shape_mn}",
+        self.cluster_shape_mn = require_cluster_shape(
+            self.cluster_shape_mn,
+            mma_m=self.mma_tiler_mn[0],
+            max_dimension=4,
         )
 
         self._logger.debug("Checking tensor alignment")
-
-        def check_contigous_16B_alignment(dtype, is_mode0_major, tensor_shape):
-            major_mode_idx = 0 if is_mode0_major else 1
-            num_major_elements = tensor_shape[major_mode_idx]
-            num_contiguous_elements = 16 * 8 // (_convert_to_cutlass_data_type(dtype).width)
-            return num_major_elements % num_contiguous_elements == 0
-
-        self._value_error_if(
-            not (
-                check_contigous_16B_alignment(ab_dtype, self.a_major == "m", (m, k, l))
-                and check_contigous_16B_alignment(ab_dtype, self.b_major == "n", (n, k, l))
-                and check_contigous_16B_alignment(c_dtype, self.c_major == "m", (m, n, l))
-            ),
-            "Unsupported tensor alignment: tensors must be 16B aligned",
-        )
+        ab_bits = _convert_to_cutlass_data_type(
+            ab_dtype,
+            interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2,
+        ).width
+        c_bits = _convert_to_cutlass_data_type(
+            c_dtype,
+            interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2,
+        ).width
+        require_contiguous_alignment("A", m if self.a_major == "m" else k, ab_bits)
+        require_contiguous_alignment("B", n if self.b_major == "n" else k, ab_bits)
+        require_contiguous_alignment("C", m if self.c_major == "m" else n, c_bits)
 
         self._logger.debug("Checking environment")
         self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
@@ -277,11 +242,9 @@ class GemmAmaxSm100(APIBase):
             cluster_shape_mn=self.cluster_shape_mn,
         )
         hardware_info = cutlass.utils.HardwareInfo()
-        max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
-        max_active_clusters -= self.num_cluster_overlap_margin
-        self._value_error_if(
-            max_active_clusters <= 0,
-            "max_active_clusters must be > 0 after applying overlap margin; reduce CUDNNFE_CLUSTER_OVERLAP_MARGIN",
+        max_active_clusters = resolve_max_active_clusters(
+            hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]),
+            self.num_cluster_overlap_margin,
         )
 
         self._logger.debug("Compiling gemm_amax")

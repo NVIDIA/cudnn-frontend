@@ -13,8 +13,17 @@ import torch
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import make_fake_stream
 
-from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
+from cudnn.api_base import APIBase, TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.gemm_validation import (
+    block_scale_shape,
+    require_cluster_shape,
+    require_contiguous_alignment,
+    require_full_mma_rows,
+    require_gemm_shapes,
+    require_mma_tiler,
+    resolve_max_active_clusters,
+)
 
 from .dense_blockscaled_gemm_persistent_dsrelu_quant import (
     Sm100BlockScaledPersistentDenseGemmKernel,
@@ -51,6 +60,7 @@ class GemmDsreluSm100(APIBase):
         vector_f32: bool = False,
     ):
         super().__init__()
+        self._interpret_uint8_as_fp4x2 = True
 
         self._warn_experimental_api()
 
@@ -78,26 +88,23 @@ class GemmDsreluSm100(APIBase):
         self.vector_f32 = vector_f32
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
 
-        self._interpret_uint8_as_fp4x2 = True
         self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
 
     def check_support(self) -> bool:
-        m, k, l = self._tensor_shape(self.a_desc, name="sample_a")
-        n, b_k, b_l = self._tensor_shape(self.b_desc, name="sample_b")
-
-        self._value_error_if((b_k, b_l) != (k, l), f"B shape mismatch: expected (*, {k}, {l}), got {(n, b_k, b_l)}")
+        m, n, k, l = require_gemm_shapes(
+            self._tensor_shape(self.a_desc, name="sample_a"),
+            self._tensor_shape(self.b_desc, name="sample_b"),
+        )
         self._check_tensor_shape(self.c_desc, (m, n, l), "C")
         self._check_tensor_shape(self.d_desc, (m, n, l), "D")
         self._check_tensor_shape(self.prob_desc, (m, 1, l), "prob")
         self._check_tensor_shape(self.dprob_desc, (m, 1, l), "dprob")
 
-        rest_k = ceil_div(ceil_div(k, self.sf_vec_size), 4)
-        self._check_tensor_shape(self.sfa_desc, (32, 4, ceil_div(m, 128), 4, rest_k, l), "SFA")
-        self._check_tensor_shape(self.sfb_desc, (32, 4, ceil_div(n, 128), 4, rest_k, l), "SFB")
+        self._check_tensor_shape(self.sfa_desc, block_scale_shape(m, k, l, self.sf_vec_size), "SFA")
+        self._check_tensor_shape(self.sfb_desc, block_scale_shape(n, k, l, self.sf_vec_size), "SFB")
 
         if self.sfd_desc is not None:
-            rest_n = ceil_div(ceil_div(n, self.sf_vec_size), 4)
-            self._check_tensor_shape(self.sfd_desc, (32, 4, ceil_div(m, 128), 4, rest_n, l), "SFD")
+            self._check_tensor_shape(self.sfd_desc, block_scale_shape(m, n, l, self.sf_vec_size), "SFD")
 
         self._check_tensor_shape(self.amax_desc, (1,), "amax")
         self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
@@ -141,20 +148,33 @@ class GemmDsreluSm100(APIBase):
         d_major = _major_from_stride_order(self.d_desc.stride_order, "m", "n")
         self._value_error_if(c_major != d_major, f"C and D must share the same layout, got {c_major} and {d_major}")
 
-        self._value_error_if(
-            self.mma_tiler_mn[0] not in {128, 256} or self.mma_tiler_mn[1] not in {64, 128, 192, 256},
-            f"Unsupported mma_tiler_mn {self.mma_tiler_mn}",
+        self.mma_tiler_mn = require_mma_tiler(
+            self.mma_tiler_mn,
+            allowed_m=(128, 256),
+            allowed_n=(64, 128, 192, 256),
         )
-        self._value_error_if(
-            not (
-                self.cluster_shape_mn[0] > 0
-                and self.cluster_shape_mn[1] > 0
-                and self.cluster_shape_mn[0] * self.cluster_shape_mn[1] <= 16
-                and is_power_of_2(self.cluster_shape_mn[0])
-                and is_power_of_2(self.cluster_shape_mn[1])
-            ),
-            f"Invalid cluster shape {self.cluster_shape_mn}",
+        require_full_mma_rows(
+            m,
+            self.mma_tiler_mn[0],
+            cta_group_size=2 if self.mma_tiler_mn[0] == 256 else 1,
+            reason="the probability load is not predicated",
         )
+        self.cluster_shape_mn = require_cluster_shape(
+            self.cluster_shape_mn,
+            mma_m=self.mma_tiler_mn[0],
+            max_dimension=4,
+        )
+
+        ab_bits = _convert_to_cutlass_data_type(
+            self.ab_dtype,
+            interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2,
+        ).width
+        c_bits = _convert_to_cutlass_data_type(self.c_dtype).width
+        d_bits = _convert_to_cutlass_data_type(self.d_dtype).width
+        require_contiguous_alignment("A", m if a_major == "m" else k, ab_bits)
+        require_contiguous_alignment("B", n if b_major == "n" else k, ab_bits)
+        require_contiguous_alignment("C", m if c_major == "m" else n, c_bits)
+        require_contiguous_alignment("D", m if d_major == "m" else n, d_bits)
 
         self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
         major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
@@ -195,9 +215,10 @@ class GemmDsreluSm100(APIBase):
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
-        max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
-        max_active_clusters -= self.num_cluster_overlap_margin
-        self._value_error_if(max_active_clusters <= 0, "max_active_clusters must be > 0 after overlap margin")
+        max_active_clusters = resolve_max_active_clusters(
+            hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]),
+            self.num_cluster_overlap_margin,
+        )
 
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
         epilogue_op = lambda x, y: cute.where(x > 0, x, cute.full_like(x, 0)) * 2 * y

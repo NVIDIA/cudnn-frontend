@@ -20,6 +20,13 @@ from .._jax.gemm import (
     require_gemm_inputs,
 )
 from .._jax.validation import require_dtype
+from ..gemm_validation import (
+    require_cluster_shape,
+    require_full_mma_rows,
+    require_mma_tiler,
+    require_swiglu_n,
+    resolve_max_active_clusters,
+)
 
 
 class GemmSwigluResult(NamedTuple):
@@ -29,11 +36,6 @@ class GemmSwigluResult(NamedTuple):
     c_tensor: Any
     sfc_tensor: Any | None
     amax_tensor: Any | None
-
-
-def _require_power_of_two(value: int, name: str) -> None:
-    if value <= 0 or value & (value - 1):
-        raise ValueError(f"{name} must be a positive power of two, got {value}")
 
 
 @lru_cache(maxsize=None)
@@ -58,10 +60,10 @@ def _make_launcher(
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
         )
-        max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1])
-        max_active_clusters -= cluster_overlap_margin
-        if max_active_clusters <= 0:
-            raise ValueError("max_active_clusters must be positive after applying " "CUDNNFE_CLUSTER_OVERLAP_MARGIN")
+        max_active_clusters = resolve_max_active_clusters(
+            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+            cluster_overlap_margin,
+        )
         kernel(
             a,
             b,
@@ -115,8 +117,7 @@ def gemm_swiglu_wrapper_sm100(
         )
 
     m, n, k, batch, a_dtype = require_gemm_inputs(a_tensor, b_tensor)
-    if n % 64:
-        raise ValueError(f"N must be divisible by 64 for 32-column SwiGLU block pairs, got {n}")
+    output_n = require_swiglu_n(n)
 
     a_dtype = require_dtype(
         "a_tensor.dtype",
@@ -137,24 +138,18 @@ def gemm_swiglu_wrapper_sm100(
     ab12_dtype = require_dtype("ab12_dtype", ab12_dtype, supported_ab12, default=jnp.float32)
     c_dtype = require_dtype("c_dtype", c_dtype, (jnp.float16, jnp.bfloat16), default=jnp.float16)
 
-    mma_tiler_mn = tuple(mma_tiler_mn)
-    if len(mma_tiler_mn) != 2 or mma_tiler_mn[0] not in (128, 256) or mma_tiler_mn[1] not in (64, 128, 192, 256):
-        raise ValueError("mma_tiler_mn must have M in {128, 256} and N in " f"{{64, 128, 192, 256}}, got {mma_tiler_mn}")
-    if mma_tiler_mn[0] == 256 and m % 256:
-        raise ValueError(f"M must be divisible by 256 when using 2-CTA MMA, got {m}")
+    mma_tiler_mn = require_mma_tiler(
+        mma_tiler_mn,
+        allowed_m=(128, 256),
+        allowed_n=(64, 128, 192, 256),
+    )
+    if mma_tiler_mn[0] == 256:
+        require_full_mma_rows(m, mma_tiler_mn[0], reason="2-CTA MMA requires a complete CTA pair")
     if cluster_shape_mn is None:
         cluster_shape_mn = (1, 1) if mma_tiler_mn[0] == 128 else (2, 2)
-    cluster_shape_mn = tuple(cluster_shape_mn)
-    if len(cluster_shape_mn) != 2:
-        raise ValueError(f"cluster_shape_mn must have two dimensions, got {cluster_shape_mn}")
-    _require_power_of_two(cluster_shape_mn[0], "cluster_shape_mn[0]")
-    _require_power_of_two(cluster_shape_mn[1], "cluster_shape_mn[1]")
-    if cluster_shape_mn[0] * cluster_shape_mn[1] > 16:
-        raise ValueError(f"cluster_shape_mn product must not exceed 16, got {cluster_shape_mn}")
+    cluster_shape_mn = require_cluster_shape(cluster_shape_mn, mma_m=mma_tiler_mn[0])
     if mma_tiler_mn[0] == 128 and cluster_shape_mn != (1, 1):
         raise ValueError("cluster_shape_mn must be (1, 1) with a 128-wide M tile")
-    if mma_tiler_mn[0] == 256 and cluster_shape_mn[0] % 2:
-        raise ValueError("cluster_shape_mn[0] must be divisible by 2 with a 256-wide M tile")
 
     a_spec = gemm_a_tensor_spec(a_major)
     b_spec = gemm_b_tensor_spec(b_major)
@@ -162,7 +157,7 @@ def gemm_swiglu_wrapper_sm100(
     require_16_byte_extent("a_tensor", m if a_major == "m" else k, a_dtype)
     require_16_byte_extent("b_tensor", n if b_major == "n" else k, a_dtype)
     require_16_byte_extent("ab12_tensor", m if c_major == "m" else n, ab12_dtype)
-    require_16_byte_extent("c_tensor", m if c_major == "m" else n // 2, c_dtype)
+    require_16_byte_extent("c_tensor", m if c_major == "m" else output_n, c_dtype)
 
     cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
     launcher = _make_launcher(
@@ -177,7 +172,7 @@ def gemm_swiglu_wrapper_sm100(
         (a_tensor, b_tensor),
         outputs=(
             BufferSpec("ab12_tensor", (m, n, batch), ab12_dtype, tensor_spec=c_spec),
-            BufferSpec("c_tensor", (m, n // 2, batch), c_dtype, tensor_spec=c_spec),
+            BufferSpec("c_tensor", (m, output_n, batch), c_dtype, tensor_spec=c_spec),
         ),
         input_specs=(a_spec, b_spec),
         use_static_tensors=True,

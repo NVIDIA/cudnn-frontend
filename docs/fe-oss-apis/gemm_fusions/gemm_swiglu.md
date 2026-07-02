@@ -292,7 +292,7 @@ gemm.execute(
 - `mma_tiler_mn: Tuple[int, int]`
   - Kernel tile size `(TILE_M, TILE_N)`. Default: `(128, 128)`
   - `TILE_M ∈ {128, 256}`
-  - Standard mode: `TILE_N ∈ {32, 64, ..., 224, 256}`
+  - Standard mode: `TILE_N ∈ {64, 128, 192, 256}`
   - Quantized mode: `TILE_N ∈ {64, 128, 192, 256}`
 - `cluster_shape_mn: Tuple[int, int] | None`
   - Thread Block cluster shape `(CLUSTER_M, CLUSTER_N)`

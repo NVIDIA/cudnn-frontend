@@ -10,13 +10,12 @@ from typing import Any
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
+from ..gemm_validation import (
+    require_block_scale_shapes,
+    require_contiguous_alignment,
+    require_gemm_shapes,
+)
 from .validation import require_dtype
-
-
-def ceil_div(value: int, divisor: int) -> int:
-    """Return ``ceil(value / divisor)`` for positive integers."""
-
-    return (value + divisor - 1) // divisor
 
 
 def require_array(name: str, value: Any, rank: int) -> tuple[Any, ...]:
@@ -38,14 +37,7 @@ def require_gemm_inputs(
 
     a_shape = require_array("a_tensor", a_tensor, 3)
     b_shape = require_array("b_tensor", b_tensor, 3)
-    m, k, batch = a_shape
-    n, b_k, b_batch = b_shape
-    if b_k != k or b_batch != batch:
-        raise ValueError("a_tensor and b_tensor must have matching K and L dimensions, " f"got {a_shape} and {b_shape}")
-    dimensions = {"M": m, "N": n, "K": k, "L": batch}
-    nonpositive = [f"{name}={value}" for name, value in dimensions.items() if value <= 0]
-    if nonpositive:
-        raise ValueError("GEMM dimensions must be positive, got " + ", ".join(nonpositive))
+    m, n, k, batch = require_gemm_shapes(a_shape, b_shape)
     a_dtype = jnp.dtype(a_tensor.dtype)
     b_dtype = jnp.dtype(b_tensor.dtype)
     if b_dtype != a_dtype:
@@ -69,13 +61,15 @@ def require_fp8_block_scales(
         raise NotImplementedError("The JAX MXFP8 path requires sf_vec_size=32, " f"got {sf_vec_size}")
     sfa_shape = require_array("sfa_tensor", sfa_tensor, 6)
     sfb_shape = require_array("sfb_tensor", sfb_tensor, 6)
-    scale_k_tiles = ceil_div(ceil_div(k, sf_vec_size), 4)
-    expected_sfa_shape = (32, 4, ceil_div(m, 128), 4, scale_k_tiles, batch)
-    expected_sfb_shape = (32, 4, ceil_div(n, 128), 4, scale_k_tiles, batch)
-    if sfa_shape != expected_sfa_shape:
-        raise ValueError(f"sfa_tensor must have shape {expected_sfa_shape}, got {sfa_shape}")
-    if sfb_shape != expected_sfb_shape:
-        raise ValueError(f"sfb_tensor must have shape {expected_sfb_shape}, got {sfb_shape}")
+    require_block_scale_shapes(
+        sfa_shape,
+        sfb_shape,
+        m=m,
+        n=n,
+        k=k,
+        batch=batch,
+        sf_vec_size=sf_vec_size,
+    )
     require_dtype("sfa_tensor.dtype", sfa_tensor, (jnp.float8_e8m0fnu,))
     require_dtype("sfb_tensor.dtype", sfb_tensor, (jnp.float8_e8m0fnu,))
 
@@ -84,8 +78,7 @@ def require_16_byte_extent(name: str, elements: int, dtype: Any) -> None:
     """Require the kernel's contiguous mode to span a multiple of 16 bytes."""
 
     dtype = jnp.dtype(dtype)
-    if elements * dtype.itemsize % 16:
-        raise ValueError(f"{name}'s contiguous extent must be 16-byte aligned, got " f"{elements} elements of dtype {dtype}")
+    require_contiguous_alignment(name, elements, dtype.itemsize * 8)
 
 
 def gemm_a_tensor_spec(major: str) -> TensorSpec:
@@ -135,7 +128,6 @@ def probability_tensor_spec() -> TensorSpec:
 
 __all__ = [
     "block_scale_tensor_spec",
-    "ceil_div",
     "gemm_a_tensor_spec",
     "gemm_b_tensor_spec",
     "gemm_c_tensor_spec",
