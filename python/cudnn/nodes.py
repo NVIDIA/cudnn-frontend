@@ -71,6 +71,20 @@ class Node:
             self._infer_sdpa()
         elif self.node_type == NodeType.SDPA_BWD:
             self._infer_sdpa_backward()
+        elif self.node_type == NodeType.MOE_GROUPED_MATMUL:
+            self._infer_moe_grouped_matmul()
+
+    def _infer_moe_grouped_matmul(self) -> None:
+        """Infer moe output dims: token [1, T, H], weight [E, H, N] -> out [1, T, N]."""
+        token = self.inputs.get("token")
+        weight = self.inputs.get("weight")
+        out = self.outputs.get("OUT_0")
+        if not (token and weight and out):
+            return
+        if not out.dim and token.dim and weight.dim:
+            out.dim = [1, token.dim[-2], weight.dim[-1]]
+        if not out.stride and out.dim:
+            out.stride = _row_major_stride(out.dim)
 
     def _validate_matmul(self) -> None:
         """Validate matmul dimensions: C = A @ B."""

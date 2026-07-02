@@ -119,3 +119,38 @@ def test_native_block_scale_nvfp4_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({At: A, Bt: B, Ad: A_ds, Bd: B_ds, Cc: C}, ws, handle=h)
     torch.cuda.synchronize()  # builds + executes without error (parity harness = repo's fp4 test)
+
+
+def test_native_moe_grouped_matmul_lowers_to_cudnn():
+    """moe_grouped_matmul (mode=NONE) built natively -> cuDNN, parity vs a
+    self-contained per-expert reference."""
+    h = _handle()
+    E, T, Wt, Hd = 8, 256, 64, 128
+    fto = [i * (T // E) for i in range(E)]  # one contiguous token chunk per expert
+
+    g = NativeGraph(handle=h, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tok = g.tensor(dim=[1, T, Hd], stride=[T * Hd, Hd, 1], data_type=cudnn.data_type.BFLOAT16)
+    wt = g.tensor(dim=[E, Hd, Wt], stride=[Hd * Wt, 1, Hd], data_type=cudnn.data_type.BFLOAT16)
+    off = g.tensor(dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    out = g.moe_grouped_matmul(tok, wt, off, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT)
+    out.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
+
+    g.build([cudnn.heur_mode.A])
+    tok_d = torch.randn(T * Hd, dtype=torch.bfloat16, device="cuda")
+    wt_d = torch.randn(E * Hd * Wt, dtype=torch.bfloat16, device="cuda")
+    off_d = torch.tensor(fto, dtype=torch.int32, device="cuda")
+    out_d = torch.empty(T * Wt, dtype=torch.bfloat16, device="cuda")
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    g.execute({tok: tok_d, wt: wt_d, off: off_d, out: out_d}, ws, handle=h)
+    torch.cuda.synchronize()
+
+    # reference: per-expert token-chunk @ weight[e] (weights stored H-contiguous)
+    token = tok_d.view(T, Hd).float()
+    weight = torch.as_strided(wt_d.float(), (E, Hd, Wt), (Hd * Wt, 1, Hd))
+    ref = torch.empty(T, Wt)
+    bounds = fto + [T]
+    for e in range(E):
+        s, en = bounds[e], bounds[e + 1]
+        if en > s:
+            ref[s:en] = token[s:en] @ weight[e]
+    torch.testing.assert_close(out_d.view(T, Wt).float(), ref.cuda(), rtol=5e-2, atol=5e-2)
