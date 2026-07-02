@@ -168,6 +168,19 @@ class TestNativeGraph:
         assert t.stride == [8192, 128, 1]
         assert "my_tensor" in g.tensors
 
+    def test_uid_ownership(self):
+        """The IR owns the uid namespace: user-specified uids are reserved (auto
+        allocation skips them) and duplicates are rejected eagerly."""
+        g = NativeGraph()
+        a = g.tensor(dim=[2, 2], uid=2, name="user_uid")  # reserve 2
+        assert a.uid == 2 and a.uid_assigned
+        b = g.tensor(dim=[2, 2], name="auto1")  # auto: 1
+        c = g.tensor(dim=[2, 2], name="auto2")  # auto: must skip reserved 2 -> 3
+        assert b.uid == 1
+        assert c.uid == 3
+        with pytest.raises(ValueError, match="already used"):
+            g.tensor(dim=[2, 2], uid=3, name="dup")
+
     def test_matmul(self):
         g = NativeGraph()
         A = g.tensor(dim=[8, 64, 128], name="A")

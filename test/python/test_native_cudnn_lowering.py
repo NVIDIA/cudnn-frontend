@@ -159,10 +159,12 @@ def test_native_moe_grouped_matmul_lowers_to_cudnn():
 def test_native_rmsnorm_lowers_to_cudnn():
     """rmsnorm (multi-output: Y + inv_var, pass-by-value epsilon) -> cuDNN parity.
 
-    Regression cover for the IR-uid -> C++-uid translation: multi-output ops get
-    their C++ output uids in FE enumeration order (inv_var before Y here), which
-    does not match IR allocation order — keying the variant pack by raw IR uids
-    bound Y's buffer to inv_var (heap corruption / NaN)."""
+    Regression cover for uid ownership: the Python IR assigns every uid eagerly
+    and lowering pushes them all explicitly (set_uid on op outputs), so the C++
+    FE's build-time auto-assignment never runs. Without this, multi-output ops
+    get C++ uids in FE enumeration order (inv_var before Y here) != IR order —
+    keying the variant pack by IR uids then bound Y's buffer to inv_var
+    (heap corruption / NaN)."""
     h = _handle()
     Nb, C, Hh, W = 4, 8, 4, 4
     eps = 1e-3

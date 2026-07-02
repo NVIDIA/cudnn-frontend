@@ -92,7 +92,7 @@ class NativeGraph:
         self._plan_index: int = 0
         self._cudnn_heuristics: Optional[List] = None  # heur modes for a cuDNN plan
         self._cpp_tensors: Dict[int, Any] = {}  # IR uid -> lowered C++ tensor
-        self._cpp_uid_of: Dict[int, int] = {}  # IR uid -> C++ uid (post-build)
+        self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
 
         # Back-compat: use_native=True registers the default native matmul engine
         # as a candidate (the Router still falls back to cuDNN if it can't run
@@ -166,6 +166,13 @@ class NativeGraph:
         if not name:
             name = f"tensor_{len(self._tensors)}"
 
+        if uid is not None:
+            # User-owned uid: reserve it so _alloc_uid never hands it out, and
+            # reject duplicates eagerly (C++ would only fail at build time).
+            if uid in self._tensor_by_uid:
+                raise ValueError(f"uid {uid} is already used by tensor {self._tensor_by_uid[uid].name!r}")
+            self._reserved_uids.add(uid)
+
         t = Tensor(
             name=name,
             dim=dim,
@@ -196,6 +203,10 @@ class NativeGraph:
         return self.tensor(dim=dim, stride=stride, data_type=data_type, is_virtual=is_virtual, name=name)
 
     def _alloc_uid(self) -> int:
+        # Skip uids the user reserved via tensor(uid=...) — the Python IR owns
+        # the whole uid namespace (see the uid-ownership note in _lower_to_cpp).
+        while self._next_uid in self._reserved_uids:
+            self._next_uid += 1
         uid = self._next_uid
         self._next_uid += 1
         return uid
@@ -780,22 +791,15 @@ class NativeGraph:
             self._lowered_graph = self._lower_to_cpp()
             self._lowered_graph.validate()
             self._lowered_graph.build_operation_graph()
-            # Op-created (output/virtual) C++ tensors get their uids assigned by
-            # the C++ FE during build_operation_graph, in ITS enumeration order —
-            # which need not match IR allocation order (multi-output ops iterate
-            # an unordered map; e.g. rmsnorm assigns inv_var before Y). Build the
-            # explicit IR-uid -> C++-uid translation now; execute() translates
-            # variant-pack keys through it. Relying on order coincidence binds
-            # buffers to the wrong tensors (observed: Y written into the 16-byte
-            # inv_var buffer -> heap corruption / NaN).
-            self._cpp_uid_of = {}
+            # Verify the uid-ownership invariant (see _lower_to_cpp): every C++
+            # tensor must carry exactly its IR uid. An assertion — not a silent
+            # translation — so a lowering path that forgets to push a uid fails
+            # loudly in tests instead of mis-binding buffers (a swapped
+            # multi-output pairing writes past the smaller buffer: corruption).
             for ir_uid, cpp_t in self._cpp_tensors.items():
-                try:
-                    cpp_uid = cpp_t.get_uid()
-                except Exception:  # noqa: BLE001 — defensive; tensor variants differ
-                    continue
-                if isinstance(cpp_uid, int) and cpp_uid > 0:
-                    self._cpp_uid_of[ir_uid] = cpp_uid
+                cpp_uid = cpp_t.get_uid()
+                if cpp_uid != ir_uid:
+                    raise RuntimeError(f"uid ownership violated: IR tensor uid {ir_uid} lowered to C++ uid {cpp_uid} — a lowering path failed to push the uid")
         heur = self._cudnn_heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
         self._lowered_graph.create_execution_plans(heur)
 
@@ -884,10 +888,10 @@ class NativeGraph:
             eng.execute(self, uid_to_data)
             return
 
-        # cuDNN execution path (plan id < PYTHON_ENGINE_ID_BASE). Translate IR
-        # uids to the C++-assigned uids — op-output uids are assigned by the C++
-        # FE at build time and do NOT reliably match IR allocation order.
-        var_pack = {self._cpp_uid_of.get(uid, uid): (d.data_ptr() if hasattr(d, "data_ptr") else d) for uid, d in uid_to_data.items()}
+        # cuDNN execution path (plan id < PYTHON_ENGINE_ID_BASE). Variant-pack
+        # keys are IR uids — identical to the C++ uids by construction (the IR
+        # owns the uid namespace and lowering pushes every uid explicitly).
+        var_pack = {uid: (d.data_ptr() if hasattr(d, "data_ptr") else d) for uid, d in uid_to_data.items()}
         ws_ptr = workspace.data_ptr() if hasattr(workspace, "data_ptr") else workspace
         self._lowered_graph._execute(var_pack, ws_ptr, handle)
 
@@ -1275,5 +1279,18 @@ class NativeGraph:
                 if out_t.data_type:
                     cpp_out.set_data_type(out_t.data_type)
 
-        self._cpp_tensors = tensor_map  # for the IR-uid -> C++-uid translation
+        # ---- uid ownership -------------------------------------------------
+        # The Python IR owns the whole uid namespace: every IR tensor gets a uid
+        # eagerly at creation (_alloc_uid, or user-specified via tensor(uid=)),
+        # and lowering pushes ALL of them explicitly to C++ — inputs via
+        # _make_tensor(uid=), op-created outputs/virtuals via set_uid here. The
+        # C++ FE's build-time auto-assignment therefore NEVER triggers for
+        # graphs built through NativeGraph (its enumeration order is not
+        # deterministic for multi-output ops, so relying on it mis-binds
+        # buffers). Mixed construction — adding ops directly to the lowered C++
+        # graph — is unsupported: a graph is either pure-Python or pure-C++.
+        for ir_uid, cpp_t in tensor_map.items():
+            cpp_t.set_uid(ir_uid)
+
+        self._cpp_tensors = tensor_map
         return graph
