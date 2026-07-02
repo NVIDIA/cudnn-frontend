@@ -1172,6 +1172,7 @@ def grouped_gemm_quant_wrapper_sm100(
     row_scale_tensor: Optional[torch.Tensor] = None,
     acc_dtype: torch.dtype = torch.float32,
     d_dtype: torch.dtype = torch.bfloat16,
+    d_tensor: Optional[torch.Tensor] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -1212,6 +1213,9 @@ def grouped_gemm_quant_wrapper_sm100(
             conversion.
         acc_dtype: Accumulator data type
         d_dtype: Output D tensor data type
+        d_tensor: Optional preallocated output tensor to write into instead of
+            allocating. Must match the internal layout: shape (valid_m, n_out, 1),
+            stride (n_out, 1, valid_m * n_out), dtype d_dtype, on a_tensor.device.
         cd_major: CD major dimension (only "n"-major layout is supported)
         mma_tiler_mn: MMA tiler shape
         cluster_shape_mn: Cluster shape
@@ -1288,7 +1292,21 @@ def grouped_gemm_quant_wrapper_sm100(
     _logger.debug("grouped_gemm_quant_wrapper_sm100: Creating output tensors")
 
     if cd_major == "n":
-        d_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
+        expected_shape = (valid_m, n_out, 1)
+        expected_stride = (n_out, 1, valid_m * n_out)
+        if d_tensor is None:
+            d_tensor = torch.empty_strided(expected_shape, expected_stride, dtype=d_dtype, device=a_tensor.device)
+        elif (
+            tuple(d_tensor.shape) != expected_shape
+            or tuple(d_tensor.stride()) != expected_stride
+            or d_tensor.dtype != d_dtype
+            or d_tensor.device != a_tensor.device
+        ):
+            raise ValueError(
+                f"d_tensor must have shape {expected_shape}, stride {expected_stride}, "
+                f"dtype {d_dtype}, device {a_tensor.device}, but got shape {tuple(d_tensor.shape)}, "
+                f"stride {tuple(d_tensor.stride())}, dtype {d_tensor.dtype}, device {d_tensor.device}."
+            )
         d_col_tensor = (
             torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
             if is_low_precision_output_config
