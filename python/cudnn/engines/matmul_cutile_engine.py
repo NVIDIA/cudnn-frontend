@@ -198,7 +198,14 @@ class MatmulCuTileEngine(BaseEngine):
         Writes results directly into the caller-provided output tensors.
         All output tensor UIDs must be present in tensor_data.
         """
-        stream = ctx.stream if ctx is not None and ctx.stream is not None else 0  # caller's stream
+        if ctx is not None and ctx.stream is not None:
+            stream = ctx.stream  # the caller handle's stream
+        else:
+            # no handle supplied: resolve deterministically from the framework —
+            # never silently the default stream
+            import torch
+
+            stream = torch.cuda.current_stream().cuda_stream
 
         for node in graph.nodes:
             a = tensor_data[node.inputs["A"].uid]

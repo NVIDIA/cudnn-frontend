@@ -176,10 +176,10 @@ class Tensor:
         return self.name
 
     def get_dim(self) -> List[int]:
-        return self.dim
+        return list(self.dim)  # a copy, like the classic pybind getter
 
     def get_stride(self) -> List[int]:
-        return self.stride
+        return list(self.stride)  # a copy, like the classic pybind getter
 
     def get_data_type(self) -> Any:
         return self.data_type

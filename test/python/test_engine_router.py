@@ -315,7 +315,10 @@ def test_mixed_router_ordering_dispatch():
     assert g.selected_engine.name == "e62"
     g.execute({C: torch.empty(2, 2)})
     assert ran[-1] == "B"
-    assert g._plan_slots()[1] == ("cudnn", 0)  # middle slot is the cuDNN entry
+    # the middle top-level entry is the cuDNN delegating one, and top-level
+    # indices are STABLE: python-B stays at index 2 regardless of lowering
+    assert g.plans[1].engine_id == CUDNN_HEURISTIC_ENGINE_ID
+    assert g.selected_engine.name == "e62"
 
 
 def test_constructor_backends_validated_and_proposals_checked():
