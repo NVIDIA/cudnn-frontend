@@ -156,6 +156,32 @@ def test_native_moe_grouped_matmul_lowers_to_cudnn():
     torch.testing.assert_close(out_d.view(T, Wt).float(), ref.cuda(), rtol=5e-2, atol=5e-2)
 
 
+def test_native_sdpa_fwd_lowers_to_cudnn():
+    """sdpa (captured-op family) -> cuDNN execution parity vs torch SDPA."""
+    h = _handle()
+    B, Hh, S, D = 2, 4, 128, 64
+    q = torch.randn(B, Hh, S, D, device="cuda", dtype=torch.float16)
+    k = torch.randn(B, Hh, S, D, device="cuda", dtype=torch.float16)
+    v = torch.randn(B, Hh, S, D, device="cuda", dtype=torch.float16)
+    o = torch.empty(B, Hh, S, D, device="cuda", dtype=torch.float16)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+    g = NativeGraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    Q = g.tensor(dim=[B, Hh, S, D], stride=list(q.stride()), data_type=cudnn.data_type.HALF)
+    K = g.tensor(dim=[B, Hh, S, D], stride=list(k.stride()), data_type=cudnn.data_type.HALF)
+    V = g.tensor(dim=[B, Hh, S, D], stride=list(v.stride()), data_type=cudnn.data_type.HALF)
+    O, stats = g.sdpa(Q, K, V, is_inference=True, use_causal_mask=True, attn_scale=1.0 / (D**0.5))
+    assert stats is None and O.dim == [B, Hh, S, D]
+    O.set_output(True).set_data_type(cudnn.data_type.HALF)
+
+    g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({Q: q, K: k, V: v, O: o}, ws, handle=h)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(o, ref, atol=5e-2, rtol=5e-2)
+
+
 def test_native_conv_fprop_lowers_to_cudnn():
     """conv_fprop (structured-table op) -> cuDNN parity vs torch conv2d (NHWC)."""
     h = _handle()

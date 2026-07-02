@@ -370,13 +370,15 @@ class TestNativeGraph:
         K = g.tensor(dim=[2, 8, 128, 64], name="K")
         V = g.tensor(dim=[2, 8, 128, 64], name="V")
 
-        O = g.sdpa(Q, K, V, is_inference=True, use_causal_mask=True, name="attn")
+        O, stats = g.sdpa(Q, K, V, is_inference=True, use_causal_mask=True, name="attn")
 
         assert len(g.nodes) == 1
         assert g.nodes[0].node_type == NodeType.SDPA
         assert g.nodes[0].params["is_inference"] is True
         assert g.nodes[0].params["use_causal_mask"] is True
         assert "O" in g.nodes[0].outputs
+        assert stats is None  # classic API returns [O, None] in inference mode
+        assert O.dim == [2, 8, 128, 64]  # q dims with v's head dim
 
     def test_sdpa_training(self):
         """Test SDPA forward training mode (returns stats)."""
@@ -391,7 +393,8 @@ class TestNativeGraph:
         assert g.nodes[0].params["is_inference"] is False
         assert g.nodes[0].params["attn_scale"] == 0.125
         assert "O" in g.nodes[0].outputs
-        assert "stats" in g.nodes[0].outputs
+        assert "Stats" in g.nodes[0].outputs
+        assert stats.dim == [2, 8, 128, 1]
 
 
 @pytest.mark.L1
@@ -481,7 +484,7 @@ class TestIntegration:
         K = g.tensor(dim=[2, 8, 128, 64], name="K")
         V = g.tensor(dim=[2, 8, 128, 64], name="V")
 
-        O = g.sdpa(Q, K, V, is_inference=True, use_causal_mask=True, name="attn")
+        O, _ = g.sdpa(Q, K, V, is_inference=True, use_causal_mask=True, name="attn")
         O.set_output(True)
 
         try:

@@ -67,12 +67,8 @@ class Node:
             self._infer_matmul()
         elif self.node_type == NodeType.POINTWISE:
             self._infer_pointwise()
-        elif self.node_type == NodeType.SDPA:
-            self._infer_sdpa()
-        elif self.node_type == NodeType.SDPA_BWD:
-            self._infer_sdpa_backward()
-        # structured ops (norms/conv/moe/...) infer at build time via the
-        # _STRUCTURED_OPS table's per-output lambdas
+        # structured/captured ops (norms/conv/moe/sdpa/...) infer at build time
+        # via their tables' per-output lambdas
 
     def _validate_matmul(self) -> None:
         """Validate matmul dimensions: C = A @ B."""
@@ -136,62 +132,6 @@ class Node:
 
         if not out.stride and out.dim:
             out.stride = _row_major_stride(out.dim)
-
-    def _infer_sdpa(self) -> None:
-        """Infer output dims for scaled dot-product attention.
-
-        O has same shape as V: [B, H, S_kv, D] or [B, S_kv, H, D]
-        stats has shape [B, H, S_q, 1] for softmax stats
-        """
-        q = self.inputs.get("Q")
-        v = self.inputs.get("V")
-        o = self.outputs.get("O")
-        stats = self.outputs.get("stats")
-
-        if not (q and v and o):
-            return
-
-        # Output O has same shape as V
-        if not o.dim and v.dim:
-            o.dim = v.dim.copy()
-        if not o.stride and o.dim:
-            o.stride = _row_major_stride(o.dim)
-
-        # Stats output: [B, H, S_q, 1]
-        if stats and not stats.dim and q.dim:
-            # Assuming [B, H, S_q, D] layout
-            stats.dim = [q.dim[0], q.dim[1], q.dim[2], 1]
-        if stats and not stats.stride and stats.dim:
-            stats.stride = _row_major_stride(stats.dim)
-
-    def _infer_sdpa_backward(self) -> None:
-        """Infer output dims for SDPA backward.
-
-        dQ has same shape as Q
-        dK has same shape as K
-        dV has same shape as V
-        """
-        q = self.inputs.get("Q")
-        k = self.inputs.get("K")
-        v = self.inputs.get("V")
-        dq = self.outputs.get("dQ")
-        dk = self.outputs.get("dK")
-        dv = self.outputs.get("dV")
-
-        if dq and not dq.dim and q and q.dim:
-            dq.dim = q.dim.copy()
-        if dq and not dq.stride and dq.dim:
-            dq.stride = _row_major_stride(dq.dim)
-
-        if dk and not dk.dim and k and k.dim:
-            dk.dim = k.dim.copy()
-        if dk and not dk.stride and dk.dim:
-            dk.stride = _row_major_stride(dk.dim)
-
-        if dv and not dv.dim and v and v.dim:
-            dv.dim = v.dim.copy()
-        if dv and not dv.stride and dv.dim:
-            dv.stride = _row_major_stride(dv.dim)
 
     def __repr__(self) -> str:
         return f"Node({self.name!r}, {self.node_type.name})"

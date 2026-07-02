@@ -404,178 +404,13 @@ class NativeGraph:
     # generic lowering branch. Only ops whose call shape doesn't fit the table
     # (matmul's positional ergonomics, sdpa's conditional kwargs) stay explicit.
 
-    def sdpa(
-        self,
-        q: Any,
-        k: Any,
-        v: Any,
-        is_inference: bool = True,
-        attn_scale: Optional[Union[float, "Tensor"]] = None,
-        bias: Optional[Any] = None,
-        use_alibi_mask: bool = False,
-        use_padding_mask: bool = False,
-        seq_len_q: Optional[Any] = None,
-        seq_len_kv: Optional[Any] = None,
-        use_causal_mask: bool = False,
-        use_causal_mask_bottom_right: bool = False,
-        sliding_window_length: Optional[int] = None,
-        dropout: Optional[tuple] = None,
-        compute_data_type: Any = None,
-        name: str = "",
-    ) -> Union[Tensor, tuple]:
-        """Scaled Dot-Product Attention.
-
-        Computes attention(Q, K, V) = softmax(Q @ K^T / scale) @ V
-
-        Args:
-            q: Query tensor [B, H, S_q, D] or [B, S_q, H, D]
-            k: Key tensor [B, H, S_kv, D] or [B, S_kv, H, D]
-            v: Value tensor [B, H, S_kv, D] or [B, S_kv, H, D]
-            is_inference: If True, don't generate stats for backward pass
-            attn_scale: Attention scale factor (default: 1/sqrt(D))
-            bias: Optional attention bias tensor
-            use_alibi_mask: Use ALiBi positional encoding
-            use_padding_mask: Use padding mask with seq_len tensors
-            seq_len_q: Sequence lengths for queries (for variable length)
-            seq_len_kv: Sequence lengths for keys/values
-            use_causal_mask: Apply causal (triangular) mask
-            use_causal_mask_bottom_right: Causal mask aligned bottom-right
-            sliding_window_length: Sliding window attention length
-            dropout: Tuple of (probability, seed_tensor, offset_tensor)
-            compute_data_type: Compute precision
-            name: Node name
-
-        Returns:
-            Output tensor O, or (O, stats) if is_inference=False
-        """
-        name = self._get_name("sdpa", name)
-        q = self._ensure_tensor(q, name=f"{name}::Q")
-        k = self._ensure_tensor(k, name=f"{name}::K")
-        v = self._ensure_tensor(v, name=f"{name}::V")
-
-        node = Node(name, NodeType.SDPA, compute_data_type or self._context.compute_data_type)
-        node.inputs["Q"] = q
-        node.inputs["K"] = k
-        node.inputs["V"] = v
-
-        if bias is not None:
-            bias = self._ensure_tensor(bias, name=f"{name}::bias")
-            node.inputs["bias"] = bias
-        if seq_len_q is not None:
-            seq_len_q = self._ensure_tensor(seq_len_q, name=f"{name}::seq_len_q")
-            node.inputs["seq_len_q"] = seq_len_q
-        if seq_len_kv is not None:
-            seq_len_kv = self._ensure_tensor(seq_len_kv, name=f"{name}::seq_len_kv")
-            node.inputs["seq_len_kv"] = seq_len_kv
-        if dropout is not None and len(dropout) >= 3:
-            node.inputs["dropout_seed"] = dropout[1]
-            node.inputs["dropout_offset"] = dropout[2]
-            node.params["dropout_probability"] = dropout[0]
-
-        node.params["is_inference"] = is_inference
-        node.params["attn_scale"] = attn_scale
-        node.params["use_alibi_mask"] = use_alibi_mask
-        node.params["use_padding_mask"] = use_padding_mask
-        node.params["use_causal_mask"] = use_causal_mask
-        node.params["use_causal_mask_bottom_right"] = use_causal_mask_bottom_right
-        node.params["sliding_window_length"] = sliding_window_length
-
-        O = self._make_output(f"{name}::O")
-        node.outputs["O"] = O
-        self._register_tensor(O)
-
-        self._nodes.append(node)
-
-        if not is_inference:
-            stats = self._make_output(f"{name}::stats")
-            node.outputs["stats"] = stats
-            self._register_tensor(stats)
-            return O, stats
-
-        return O
-
-    def sdpa_backward(
-        self,
-        q: Any,
-        k: Any,
-        v: Any,
-        o: Any,
-        dO: Any,
-        stats: Any,
-        attn_scale: Optional[Union[float, "Tensor"]] = None,
-        bias: Optional[Any] = None,
-        use_alibi_mask: bool = False,
-        use_padding_mask: bool = False,
-        seq_len_q: Optional[Any] = None,
-        seq_len_kv: Optional[Any] = None,
-        use_causal_mask: bool = False,
-        use_causal_mask_bottom_right: bool = False,
-        sliding_window_length: Optional[int] = None,
-        dropout: Optional[tuple] = None,
-        compute_data_type: Any = None,
-        name: str = "",
-    ) -> tuple:
-        """Scaled Dot-Product Attention Backward.
-
-        Args:
-            q, k, v: Forward pass inputs
-            o: Forward pass output
-            dO: Gradient of output
-            stats: Stats from forward pass
-            (other args same as sdpa)
-
-        Returns:
-            Tuple of (dQ, dK, dV)
-        """
-        name = self._get_name("sdpa_bwd", name)
-        q = self._ensure_tensor(q, name=f"{name}::Q")
-        k = self._ensure_tensor(k, name=f"{name}::K")
-        v = self._ensure_tensor(v, name=f"{name}::V")
-        o = self._ensure_tensor(o, name=f"{name}::O")
-        dO = self._ensure_tensor(dO, name=f"{name}::dO")
-        stats = self._ensure_tensor(stats, name=f"{name}::stats")
-
-        node = Node(name, NodeType.SDPA_BWD, compute_data_type or self._context.compute_data_type)
-        node.inputs["Q"] = q
-        node.inputs["K"] = k
-        node.inputs["V"] = v
-        node.inputs["O"] = o
-        node.inputs["dO"] = dO
-        node.inputs["stats"] = stats
-
-        if bias is not None:
-            bias = self._ensure_tensor(bias, name=f"{name}::bias")
-            node.inputs["bias"] = bias
-        if seq_len_q is not None:
-            seq_len_q = self._ensure_tensor(seq_len_q, name=f"{name}::seq_len_q")
-            node.inputs["seq_len_q"] = seq_len_q
-        if seq_len_kv is not None:
-            seq_len_kv = self._ensure_tensor(seq_len_kv, name=f"{name}::seq_len_kv")
-            node.inputs["seq_len_kv"] = seq_len_kv
-        if dropout is not None and len(dropout) >= 3:
-            node.inputs["dropout_seed"] = dropout[1]
-            node.inputs["dropout_offset"] = dropout[2]
-            node.params["dropout_probability"] = dropout[0]
-
-        node.params["attn_scale"] = attn_scale
-        node.params["use_alibi_mask"] = use_alibi_mask
-        node.params["use_padding_mask"] = use_padding_mask
-        node.params["use_causal_mask"] = use_causal_mask
-        node.params["use_causal_mask_bottom_right"] = use_causal_mask_bottom_right
-        node.params["sliding_window_length"] = sliding_window_length
-
-        dQ = self._make_output(f"{name}::dQ")
-        dK = self._make_output(f"{name}::dK")
-        dV = self._make_output(f"{name}::dV")
-        node.outputs["dQ"] = dQ
-        node.outputs["dK"] = dK
-        node.outputs["dV"] = dV
-        self._register_tensor(dQ)
-        self._register_tensor(dK)
-        self._register_tensor(dV)
-
-        self._nodes.append(node)
-        return dQ, dK, dV
+    # NOTE: the sdpa family (sdpa / sdpa_backward / sdpa_fp8 / sdpa_mxfp8 /
+    # sdpa_fp8_backward / sdpa_mxfp8_backward) is declared in _CAPTURED_OPS
+    # (module tail): kwargs are captured generically — tensors become named
+    # ports (port == C++ kwarg), scalars/enums/callbacks go to params verbatim,
+    # dropout tuples are flattened per element — and lowering forwards them
+    # verbatim, so the full C++ kwarg surface (~130 args across variants) is
+    # supported without hand-mirroring each argument.
 
     # =========================================================================
     # Inspection
@@ -990,125 +825,42 @@ class NativeGraph:
                 inputs = [tensor_map[t.uid] for t in node.inputs.values()]
                 extra = {k: node.params[k] for k in self._POINTWISE_EXTRA_PARAMS if k in node.params}
                 cpp_out = getattr(graph, node.params["mode"])(*inputs, compute_data_type=node.compute_data_type, name=node.name, **extra)
-            elif node.node_type == NodeType.SDPA:
-                sdpa_kwargs = {
-                    "q": tensor_map[node.inputs["Q"].uid],
-                    "k": tensor_map[node.inputs["K"].uid],
-                    "v": tensor_map[node.inputs["V"].uid],
-                    "is_inference": node.params.get("is_inference", True),
-                    "compute_data_type": node.compute_data_type,
-                    "name": node.name,
-                }
-                if node.params.get("attn_scale") is not None:
-                    attn_scale = node.params["attn_scale"]
-                    if isinstance(attn_scale, Tensor):
-                        sdpa_kwargs["attn_scale"] = tensor_map[attn_scale.uid]
-                    else:
-                        sdpa_kwargs["attn_scale"] = attn_scale
-                if "bias" in node.inputs:
-                    sdpa_kwargs["bias"] = tensor_map[node.inputs["bias"].uid]
-                if "seq_len_q" in node.inputs:
-                    sdpa_kwargs["seq_len_q"] = tensor_map[node.inputs["seq_len_q"].uid]
-                if "seq_len_kv" in node.inputs:
-                    sdpa_kwargs["seq_len_kv"] = tensor_map[node.inputs["seq_len_kv"].uid]
-                if node.params.get("use_alibi_mask"):
-                    sdpa_kwargs["use_alibi_mask"] = True
-                if node.params.get("use_padding_mask"):
-                    sdpa_kwargs["use_padding_mask"] = True
-                if node.params.get("use_causal_mask"):
-                    sdpa_kwargs["use_causal_mask"] = True
-                if node.params.get("use_causal_mask_bottom_right"):
-                    sdpa_kwargs["use_causal_mask_bottom_right"] = True
-                if node.params.get("sliding_window_length") is not None:
-                    sdpa_kwargs["sliding_window_length"] = node.params["sliding_window_length"]
-                if "dropout_seed" in node.inputs and "dropout_offset" in node.inputs:
-                    sdpa_kwargs["dropout"] = (
-                        node.params.get("dropout_probability", 0.0),
-                        tensor_map[node.inputs["dropout_seed"].uid],
-                        tensor_map[node.inputs["dropout_offset"].uid],
+            elif node.node_type in _CAPTURED_BY_TYPE:
+                # Captured op (sdpa family): rebuild the original kwargs —
+                # tensor ports (port == C++ kwarg) map through tensor_map,
+                # scalar params forward verbatim, dropout reassembles from its
+                # flattened elements — and call the C++ method once.
+                method, spec = _CAPTURED_BY_TYPE[node.node_type]
+                kw = {"name": node.name, "compute_data_type": node.compute_data_type}
+                for pk, pv in node.params.items():
+                    if not pk.startswith("_") and not pk.startswith("dropout_"):
+                        kw[pk] = pv
+                for port, t in node.inputs.items():
+                    if not port.startswith("dropout_"):
+                        kw[port] = tensor_map[t.uid]
+                n_drop = node.params.get("_dropout_n")
+                if n_drop:
+                    kw["dropout"] = tuple(
+                        tensor_map[node.inputs[f"dropout_{i}"].uid] if f"dropout_{i}" in node.inputs else node.params[f"dropout_{i}"] for i in range(n_drop)
                     )
-
-                result = graph.sdpa(**sdpa_kwargs)
-                # sdpa returns [O, stats] as a list/array
-                if isinstance(result, (list, tuple)) and len(result) >= 2:
-                    cpp_out, cpp_stats = result[0], result[1]
-                    tensor_map[node.outputs["O"].uid] = cpp_out
-                    if "stats" in node.outputs and cpp_stats is not None:
-                        tensor_map[node.outputs["stats"].uid] = cpp_stats
-                else:
-                    cpp_out = result
-                    tensor_map[node.outputs["O"].uid] = cpp_out
-                # Handle output marking and set dims/strides
-                for out_key, out_t in node.outputs.items():
-                    cpp_tensor = tensor_map.get(out_t.uid)
-                    if cpp_tensor is not None:
-                        if out_t.dim:
-                            cpp_tensor.set_dim(out_t.dim)
-                        if out_t.stride:
-                            cpp_tensor.set_stride(out_t.stride)
-                        if not out_t.is_virtual:
-                            cpp_tensor.set_output(True)
-                        if out_t.data_type:
-                            cpp_tensor.set_data_type(out_t.data_type)
-                continue
-            elif node.node_type == NodeType.SDPA_BWD:
-                sdpa_bwd_kwargs = {
-                    "q": tensor_map[node.inputs["Q"].uid],
-                    "k": tensor_map[node.inputs["K"].uid],
-                    "v": tensor_map[node.inputs["V"].uid],
-                    "o": tensor_map[node.inputs["O"].uid],
-                    "dO": tensor_map[node.inputs["dO"].uid],
-                    "stats": tensor_map[node.inputs["stats"].uid],
-                    "compute_data_type": node.compute_data_type,
-                    "name": node.name,
-                }
-                if node.params.get("attn_scale") is not None:
-                    attn_scale = node.params["attn_scale"]
-                    if isinstance(attn_scale, Tensor):
-                        sdpa_bwd_kwargs["attn_scale"] = tensor_map[attn_scale.uid]
-                    else:
-                        sdpa_bwd_kwargs["attn_scale"] = attn_scale
-                if "bias" in node.inputs:
-                    sdpa_bwd_kwargs["bias"] = tensor_map[node.inputs["bias"].uid]
-                if "seq_len_q" in node.inputs:
-                    sdpa_bwd_kwargs["seq_len_q"] = tensor_map[node.inputs["seq_len_q"].uid]
-                if "seq_len_kv" in node.inputs:
-                    sdpa_bwd_kwargs["seq_len_kv"] = tensor_map[node.inputs["seq_len_kv"].uid]
-                if node.params.get("use_alibi_mask"):
-                    sdpa_bwd_kwargs["use_alibi_mask"] = True
-                if node.params.get("use_padding_mask"):
-                    sdpa_bwd_kwargs["use_padding_mask"] = True
-                if node.params.get("use_causal_mask"):
-                    sdpa_bwd_kwargs["use_causal_mask"] = True
-                if node.params.get("use_causal_mask_bottom_right"):
-                    sdpa_bwd_kwargs["use_causal_mask_bottom_right"] = True
-                if node.params.get("sliding_window_length") is not None:
-                    sdpa_bwd_kwargs["sliding_window_length"] = node.params["sliding_window_length"]
-                if "dropout_seed" in node.inputs and "dropout_offset" in node.inputs:
-                    sdpa_bwd_kwargs["dropout"] = (
-                        node.params.get("dropout_probability", 0.0),
-                        tensor_map[node.inputs["dropout_seed"].uid],
-                        tensor_map[node.inputs["dropout_offset"].uid],
-                    )
-
-                result = graph.sdpa_backward(**sdpa_bwd_kwargs)
-                # sdpa_backward returns [dQ, dK, dV] as a list/array
-                dQ, dK, dV = result[0], result[1], result[2]
-                tensor_map[node.outputs["dQ"].uid] = dQ
-                tensor_map[node.outputs["dK"].uid] = dK
-                tensor_map[node.outputs["dV"].uid] = dV
-                # Handle output marking and set dims/strides
-                for out_key, out_t in node.outputs.items():
-                    cpp_tensor = tensor_map.get(out_t.uid)
-                    if cpp_tensor is not None:
-                        if out_t.dim:
-                            cpp_tensor.set_dim(out_t.dim)
-                        if out_t.stride:
-                            cpp_tensor.set_stride(out_t.stride)
-                        if not out_t.is_virtual:
-                            cpp_tensor.set_output(True)
-                        if out_t.data_type:
-                            cpp_tensor.set_data_type(out_t.data_type)
+                result = getattr(graph, method)(**kw)
+                cpp_outs = list(result) if isinstance(result, (list, tuple)) else [result]
+                for oport, cpp_t in zip(spec["outputs"], cpp_outs):
+                    out_t = node.outputs.get(oport)
+                    if out_t is None or cpp_t is None:
+                        continue
+                    tensor_map[out_t.uid] = cpp_t
+                    # sdpa-family output layout is user-chosen: the C++ node
+                    # REQUIRES O's dim/stride before validate (BSHD vs BHSD) —
+                    # push whatever the IR carries (inferred or user-set).
+                    if out_t.dim:
+                        cpp_t.set_dim(out_t.dim)
+                    if out_t.stride:
+                        cpp_t.set_stride(out_t.stride)
+                    if not out_t.is_virtual:
+                        cpp_t.set_output(True)
+                    if out_t.data_type:
+                        cpp_t.set_data_type(out_t.data_type)
                 continue
             elif node.node_type in _STRUCTURED_BY_TYPE:
                 # Generic structured op (norms / reduction / block-scale / MoE /
@@ -1557,3 +1309,142 @@ def _install_structured_builders() -> None:
 
 
 _install_structured_builders()
+
+
+# ---------------------------------------------------------------------------
+# Captured ops (the sdpa family): the kwarg surface is huge (~130 args across
+# the six variants, including tensor-or-float args, dropout tuples, and
+# score_mod callbacks), so builders capture ALL kwargs generically instead of
+# hand-mirroring each one — tensors become named ports (port == C++ kwarg),
+# everything else goes to params verbatim, dropout tuples are flattened per
+# element. Lowering rebuilds the kwargs and makes one C++ call. The node stays
+# first-class: engines read node.inputs["q"] / node.params["use_causal_mask"].
+# ---------------------------------------------------------------------------
+
+
+def _stats_expected(params):
+    if params.get("generate_stats") is not None:
+        return bool(params["generate_stats"])
+    return not params.get("is_inference", True)
+
+
+def _sdpa_o_dims(node):  # O: q dims with v's head dim
+    q, v = node.inputs["q"].dim, node.inputs["v"].dim
+    return list(q[:-1]) + [v[-1]]
+
+
+def _sdpa_stats_dims(node):  # Stats: q dims with last dim 1
+    return list(node.inputs["q"].dim[:-1]) + [1]
+
+
+_AMAX = lambda node: [1, 1, 1, 1]  # noqa: E731 — fp8 amax side outputs
+
+_CAPTURED_OPS = {
+    "sdpa": dict(
+        node_type=NodeType.SDPA,
+        pos=("q", "k", "v"),
+        outputs=("O", "Stats"),
+        maybe={"Stats": _stats_expected},
+        infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims},
+    ),
+    "sdpa_backward": dict(
+        node_type=NodeType.SDPA_BWD,
+        pos=("q", "k", "v", "o", "dO", "stats"),
+        outputs=("dQ", "dK", "dV"),
+        infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v")},
+    ),
+    "sdpa_fp8": dict(
+        node_type=NodeType.SDPA_FP8,
+        pos=("q", "k", "v"),
+        outputs=("O", "Stats", "Amax_S", "Amax_O"),
+        maybe={"Stats": _stats_expected},
+        infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_S": _AMAX, "Amax_O": _AMAX},
+    ),
+    "sdpa_fp8_backward": dict(
+        node_type=NodeType.SDPA_FP8_BWD,
+        pos=("q", "k", "v", "o", "dO", "stats"),
+        outputs=("dQ", "dK", "dV", "amax_dQ", "amax_dK", "amax_dV", "amax_dP"),
+        infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v"), "amax_dQ": _AMAX, "amax_dK": _AMAX, "amax_dV": _AMAX, "amax_dP": _AMAX},
+    ),
+    # mxfp8 variants: outputs are positional (see sdpa.cpp result_array); dims
+    # via out_dims / set_dim where cuDNN needs them.
+    "sdpa_mxfp8": dict(node_type=NodeType.SDPA_MXFP8, pos=("q", "k", "v"), outputs=("OUT_0", "OUT_1", "OUT_2")),
+    "sdpa_mxfp8_backward": dict(
+        node_type=NodeType.SDPA_MXFP8_BWD,
+        pos=("q", "k", "v", "o", "dO", "stats"),
+        outputs=("OUT_0", "OUT_1", "OUT_2", "OUT_3", "OUT_4", "OUT_5"),
+    ),
+}
+
+_CAPTURED_BY_TYPE = {spec["node_type"]: (op, spec) for op, spec in _CAPTURED_OPS.items()}
+
+
+def _install_captured_builders() -> None:
+    """Generate the sdpa-family builders (generic kwarg capture)."""
+
+    def _tensorish(v):
+        return isinstance(v, Tensor) or hasattr(v, "__dlpack__")
+
+    def make(op: str, spec: dict):
+        pos = spec.get("pos", ())
+        infer = spec.get("infer", {})
+        maybe = spec.get("maybe", {})
+
+        def builder(self, *args, name: str = "", compute_data_type: Any = None, out_dims: Any = None, **kwargs):
+            name_ = self._get_name(op, name)
+            node = Node(name_, spec["node_type"], compute_data_type or self._context.compute_data_type)
+            if len(args) > len(pos):
+                raise TypeError(f"{op}() takes at most {len(pos)} positional arguments {pos}")
+            for k, v in zip(pos, args):
+                if k in kwargs:
+                    raise TypeError(f"{op}() got multiple values for {k!r}")
+                kwargs[k] = v
+            drop = kwargs.pop("dropout", None)
+            for k, v in kwargs.items():
+                if v is None:
+                    continue
+                if _tensorish(v):
+                    node.inputs[k] = self._ensure_tensor(v, name=f"{name_}::{k}")
+                else:  # scalar / enum / callback — forwarded verbatim at lowering
+                    node.params[k] = v
+            if drop is not None:
+                node.params["_dropout_n"] = len(drop)
+                for i, e in enumerate(drop):
+                    if _tensorish(e):
+                        node.inputs[f"dropout_{i}"] = self._ensure_tensor(e, name=f"{name_}::dropout_{i}")
+                    else:
+                        node.params[f"dropout_{i}"] = e
+            if out_dims is not None and not isinstance(out_dims, dict):
+                out_dims = {spec["outputs"][0]: out_dims}
+            rets = []
+            for oport in spec["outputs"]:
+                cond = maybe.get(oport)
+                if cond is not None and not cond(node.params):
+                    rets.append(None)  # e.g. Stats in inference mode (classic returns None)
+                    continue
+                o = self._make_output(f"{name_}::{oport}")
+                d = (out_dims or {}).get(oport)
+                if d is None:
+                    try:
+                        d = infer.get(oport, lambda n: None)(node)
+                    except Exception:  # noqa: BLE001
+                        d = None
+                if d:
+                    o.dim = list(d)
+                    o.stride = _row_major_stride(o.dim)
+                node.outputs[oport] = o
+                self._register_tensor(o)
+                rets.append(o)
+            self._nodes.append(node)
+            return tuple(rets)  # always full arity, matching the classic API
+
+        builder.__name__ = op
+        builder.__qualname__ = f"NativeGraph.{op}"
+        builder.__doc__ = f"{op}(...) -> {spec['outputs']} (generic kwarg capture; see _CAPTURED_OPS)."
+        return builder
+
+    for op, spec in _CAPTURED_OPS.items():
+        setattr(NativeGraph, op, make(op, spec))
+
+
+_install_captured_builders()
