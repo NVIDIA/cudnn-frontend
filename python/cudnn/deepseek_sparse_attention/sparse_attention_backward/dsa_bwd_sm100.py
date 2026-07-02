@@ -6,7 +6,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Float32, Int32, BFloat16, Int64
 import cutlass.pipeline as pipeline
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils as utils
 from cutlass._mlir.dialects import arith, llvm, nvvm, vector
@@ -331,8 +331,9 @@ class FlashAttentionDSABackwardSm100:
         # S = Q @ KV
         QK_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.element_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.QK_mma_tiler[:2]
@@ -341,8 +342,9 @@ class FlashAttentionDSABackwardSm100:
         # dP = dO @ KV
         dOV_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.element_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.dOV_mma_tiler[:2]
@@ -351,8 +353,9 @@ class FlashAttentionDSABackwardSm100:
         # dKV = dO^T @ P
         dOP_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.K,
+            self.element_dtype,
+            OperandMajorMode.MN,
+            OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.dOP_mma_tiler[:2]
@@ -360,8 +363,9 @@ class FlashAttentionDSABackwardSm100:
         # dKV = Q^T @ dS
         QdS_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.K,
+            self.element_dtype,
+            OperandMajorMode.MN,
+            OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.QdS_mma_tiler[:2]
@@ -369,8 +373,9 @@ class FlashAttentionDSABackwardSm100:
         # dQ = KV @ dS^T
         KdS_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.MN,
+            self.element_dtype,
+            OperandMajorMode.MN,
+            OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.KdS_mma_tiler[:2]
@@ -380,8 +385,9 @@ class FlashAttentionDSABackwardSm100:
             # dKV4: Q^T[512:575] @ dS -> (64, 64) output
             dKV4_tiled_mma = sm100_utils.make_trivial_tiled_mma(
                 self.element_dtype,
-                tcgen05.OperandMajorMode.MN,
-                tcgen05.OperandMajorMode.K,
+                self.element_dtype,
+                OperandMajorMode.MN,
+                OperandMajorMode.K,
                 self.acc_dtype,
                 cta_group,
                 self.dKV4_mma_tiler[:2]
@@ -389,8 +395,9 @@ class FlashAttentionDSABackwardSm100:
             # dQ4: K[512:575] @ dS^T -> (64, 64) output
             dQ4_tiled_mma = sm100_utils.make_trivial_tiled_mma(
                 self.element_dtype,
-                tcgen05.OperandMajorMode.MN,
-                tcgen05.OperandMajorMode.MN,
+                self.element_dtype,
+                OperandMajorMode.MN,
+                OperandMajorMode.MN,
                 self.acc_dtype,
                 cta_group,
                 self.dQ4_mma_tiler[:2]
@@ -1034,9 +1041,8 @@ class FlashAttentionDSABackwardSm100:
         )
         compute_tmastore_dQ_pipeline = self.make_and_init_compute_tmastore_dQ_pipeline()
 
-        tmem_holding_buf = storage.tmem_holding_buf
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.compute_warp_id[0],
         )
