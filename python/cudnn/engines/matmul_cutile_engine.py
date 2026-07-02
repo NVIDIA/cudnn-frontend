@@ -39,7 +39,7 @@ from .engine_ids import PYTHON_ENGINE_ID_BASE
 from ..graph_types import NodeType
 
 if TYPE_CHECKING:
-    from ..graph_native import NativeGraph
+    from ..pygraph import NativeGraph
 
 
 # Tile sizes for matmul kernel

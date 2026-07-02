@@ -10,7 +10,7 @@ Execution flow (unification proposal):
     (a registered native engine, or the cuDNN Graph backend by lazy lowering)
 
 Example with a native backend (pass torch tensors directly):
-    >>> graph = NativeGraph()
+    >>> graph = pygraph()
     >>> graph.register_backend(MatmulCuTileEngine())
     >>> C = graph.matmul(a_tensor, b_tensor)  # auto-creates descriptors
     >>> graph.execute({C: c_tensor})  # routes to a supporting backend, else cuDNN
@@ -35,14 +35,14 @@ class GraphContext:
     compute_data_type: Any = None
 
 
-class NativeGraph:
+class pygraph:
     """Pure Python graph representation.
 
     All graph structure and attributes are kept in Python. C++ is only
     used for execution via lazy lowering.
 
     Example:
-        >>> graph = NativeGraph(io_data_type=cudnn.data_type.HALF)
+        >>> graph = pygraph(io_data_type=cudnn.data_type.HALF)
         >>> A = graph.tensor(dim=[8, 64, 128], name="A")
         >>> B = graph.tensor(dim=[8, 128, 256], name="B")
         >>> C = graph.matmul(A, B, name="mm1")
@@ -60,7 +60,6 @@ class NativeGraph:
         intermediate_data_type: Any = None,
         compute_data_type: Any = None,
         handle: Any = None,
-        use_native: bool = False,
         backends: Optional[List["BaseEngine"]] = None,
         router: Any = None,
         **kwargs,
@@ -71,6 +70,10 @@ class NativeGraph:
             compute_data_type=compute_data_type or io_data_type,
         )
         self._handle = handle  # cuDNN handle for the cuDNN lowering path
+        # Classic graph-level kwargs (name, sm_count, sm_version, kernel_cache,
+        # device_property, is_dynamic_shape_enabled, ...) forwarded verbatim to
+        # the C++ graph at lowering.
+        self._cpp_graph_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         self._nodes: List[Node] = []
         self._tensors: Dict[str, Tensor] = {}
         self._tensor_by_uid: Dict[int, Tensor] = {}
@@ -91,32 +94,21 @@ class NativeGraph:
         self._plans: List[Any] = []  # list[PlanConfig], populated by create_execution_plans()
         self._plan_index: int = 0
         self._cudnn_heuristics: Optional[List] = None  # heur modes for a cuDNN plan
+        self._cpp_plans_created: bool = False  # C++ create_execution_plans ran
         self._cpp_tensors: Dict[int, Any] = {}  # IR uid -> lowered C++ tensor
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
-
-        # Back-compat: use_native=True registers the default native matmul engine
-        # as a candidate (the Router still falls back to cuDNN if it can't run
-        # this graph / hardware).
-        if use_native:
-            try:
-                from .engines import MatmulCuTileEngine
-
-                if MatmulCuTileEngine is not None:
-                    self._backends.append(MatmulCuTileEngine())
-            except Exception:  # noqa: BLE001 — optional deps; router falls back
-                pass
 
     # =========================================================================
     # Backend registration & routing
     # =========================================================================
 
-    def register_backend(self, engine: "BaseEngine") -> "NativeGraph":
+    def register_backend(self, engine: "BaseEngine") -> "pygraph":
         """Add a candidate python execution engine. It joins the plan list at
         create_execution_plans() time when its check_support() accepts the graph."""
         self._backends.append(engine)
         return self
 
-    def set_router(self, router: Any) -> "NativeGraph":
+    def set_router(self, router: Any) -> "pygraph":
         """Override the plan-list / ranking policy for this graph."""
         self._router = router
         return self
@@ -173,10 +165,11 @@ class NativeGraph:
                 raise ValueError(f"uid {uid} is already used by tensor {self._tensor_by_uid[uid].name!r}")
             self._reserved_uids.add(uid)
 
+        dim = list(dim)  # classic API accepts torch.Size / tuples
         t = Tensor(
             name=name,
             dim=dim,
-            stride=stride or _row_major_stride(dim),
+            stride=list(stride) if stride else _row_major_stride(dim),
             data_type=data_type or (self._context.intermediate_data_type if is_virtual else self._context.io_data_type),
             is_virtual=is_virtual,
             uid=uid if uid is not None else self._alloc_uid(),
@@ -188,7 +181,19 @@ class NativeGraph:
         return t
 
     def tensor_like(self, template: Any, name: str = "", is_virtual: bool = False) -> Tensor:
-        """Create tensor from DLPack object (e.g., torch.Tensor)."""
+        """Create tensor from another IR tensor or a DLPack object (e.g. torch).
+
+        Classic parity: CPU (host) framework tensors become pass-by-value, like
+        the C++ tensor_like (is_pass_by_value = device == CPU)."""
+        if isinstance(template, Tensor):
+            return self.tensor(
+                dim=list(template.dim),
+                stride=list(template.stride),
+                data_type=template.data_type,
+                is_virtual=is_virtual,
+                is_pass_by_value=template.is_pass_by_value,
+                name=name,
+            )
         dim = list(template.shape)
         stride = list(template.stride()) if hasattr(template, "stride") else _row_major_stride(dim)
 
@@ -200,7 +205,25 @@ class NativeGraph:
         except Exception:
             pass
 
-        return self.tensor(dim=dim, stride=stride, data_type=data_type, is_virtual=is_virtual, name=name)
+        is_pbv = bool(getattr(getattr(template, "device", None), "type", None) == "cpu")
+        return self.tensor(dim=dim, stride=stride, data_type=data_type, is_virtual=is_virtual, is_pass_by_value=is_pbv, name=name)
+
+    def tensor_scalar(self, value: Any, scalar_type: Any = None, name: str = "") -> Tensor:
+        """Create a pass-by-value scalar tensor (classic tensor_scalar parity)."""
+        if not name:
+            name = f"scalar_{len(self._tensors)}"
+        t = Tensor(
+            name=name,
+            dim=[1, 1, 1, 1],
+            stride=[1, 1, 1, 1],
+            is_pass_by_value=True,
+            pass_by_value=value,
+            scalar_type=scalar_type,
+            uid=self._alloc_uid(),
+        )
+        self._tensors[name] = t
+        self._tensor_by_uid[t.uid] = t
+        return t
 
     def _alloc_uid(self) -> int:
         # Skip uids the user reserved via tensor(uid=...) — the Python IR owns
@@ -219,12 +242,13 @@ class NativeGraph:
         return f"{op}.{count}"
 
     def _make_output(self, name: str) -> Tensor:
-        """Create a virtual output tensor."""
+        """Create a virtual output tensor. data_type is left unset: validate()'s
+        inference assigns io/intermediate by the FINAL virtual state (classic
+        semantics — a user set_output(True) without set_data_type gets io)."""
         return Tensor(
             name=name,
             is_virtual=True,
             uid=self._alloc_uid(),
-            data_type=self._context.intermediate_data_type,
         )
 
     def _register_tensor(self, t: Tensor) -> None:
@@ -488,28 +512,52 @@ class NativeGraph:
         for node in self._nodes:
             for t in node.outputs.values():
                 if t and t.is_virtual and t.uid not in consumed:
-                    t.set_output(True)
-                    # Fix data_type: _make_output sets intermediate, but outputs need io
-                    if t.data_type == self._context.intermediate_data_type:
-                        t.data_type = self._context.io_data_type
+                    t.set_output(True)  # dtype assigned by infer_properties below
 
         for node in self._nodes:
             node.infer_properties(self._context)
+            # Table-driven shape inference, topologically: builder-time infer
+            # only sees graph-input dims; chained ops (e.g. conv on a virtual
+            # relu output) get their output dims here, once inputs are known.
+            spec_entry = _STRUCTURED_BY_TYPE.get(node.node_type) or _CAPTURED_BY_TYPE.get(node.node_type)
+            if spec_entry:
+                _, spec = spec_entry
+                infer = spec.get("infer", {})
+                for oport, out_t in node.outputs.items():
+                    if out_t is not None and not out_t.dim:
+                        try:
+                            d = infer.get(oport, lambda n: None)(node)
+                        except Exception:  # noqa: BLE001 — best-effort
+                            d = None
+                        if d:
+                            out_t.dim = list(d)
+                            out_t.stride = _row_major_stride(out_t.dim)
             node.validate()
         for t in self._tensors.values():
+            if t.dim and not t.stride:  # classic: stride optional, row-major inferred
+                t.stride = _row_major_stride(t.dim)
             if not t.is_pass_by_value:
                 t.validate()
         self._is_validated = True
 
     def build_operation_graph(self) -> None:
-        """Validate the graph (backend-agnostic).
+        """Validate the graph; lower to C++ when no python engines are registered.
 
         Backend selection is deferred to create_execution_plans() (the Router
-        stage), so this no longer commits to a backend or lowers to C++. It only
-        ensures the Python graph is validated / properties inferred.
+        stage). With python engines registered, nothing is lowered here (a graph
+        routed to a python engine never touches C++). Without them — the classic
+        sequencing — lowering happens now, so plan-configuration and query
+        methods (deselect_engines, get_engine_count, ...) work between
+        build_operation_graph() and create_execution_plans(), exactly as on the
+        classic API (they delegate to the lowered C++ graph via __getattr__).
         """
         if not self._is_validated:
             self.validate()
+        if not self._backends and self._lowered_graph is None:
+            self._lowered_graph = self._lower_to_cpp()
+            self._lowered_graph.validate()
+            self._lowered_graph.build_operation_graph()
+            self._verify_uid_ownership()
 
     def create_execution_plans(self, heuristics: Optional[List] = None) -> None:
         """Build the ranked execution-plan list (the dispatch stage).
@@ -533,12 +581,27 @@ class NativeGraph:
         self._plans = router.plan(self, self._backends)
         self._plan_index = 0
         self._cudnn_heuristics = heuristics  # applied when a cuDNN plan is built
+        # Classic sequencing: if the graph was already lowered (no python
+        # engines -> build_operation_graph lowered eagerly) and the selected
+        # plan is the cuDNN one, create the C++ plans now.
+        if self.selected_engine is None and self._lowered_graph is not None:
+            self._lower_cudnn_plan()
 
     def get_execution_plan_count(self) -> int:
-        """Number of candidate plans (python + cuDNN) in the ranked list."""
+        """Number of candidate plans: python engines + the backend's own count.
+
+        The backend's plan count is queried dynamically from the lowered graph
+        (never statically known to the frontend). With no python engines
+        registered this is exactly the classic semantic.
+        """
+        from .engines.engine_ids import is_python_engine
+
+        n_python = sum(1 for p in self._plans if is_python_engine(p.engine_id))
+        if self._lowered_graph is not None and self._cpp_plans_created:
+            return n_python + self._lowered_graph.get_execution_plan_count()
         return len(self._plans)
 
-    def select_plan(self, index: int) -> "NativeGraph":
+    def select_plan(self, index: int) -> "pygraph":
         """Pick which plan in the ranked list to build/execute (for autotune)."""
         if not 0 <= index < len(self._plans):
             raise IndexError(f"plan index {index} out of range for {len(self._plans)} plan(s)")
@@ -546,25 +609,30 @@ class NativeGraph:
         self._is_built = False
         return self
 
+    def _verify_uid_ownership(self) -> None:
+        # Verify the uid-ownership invariant (see _lower_to_cpp): every C++
+        # tensor must carry exactly its IR uid. An assertion — not a silent
+        # translation — so a lowering path that forgets to push a uid fails
+        # loudly in tests instead of mis-binding buffers (a swapped
+        # multi-output pairing writes past the smaller buffer: corruption).
+        for ir_uid, cpp_t in self._cpp_tensors.items():
+            cpp_uid = cpp_t.get_uid()
+            if cpp_uid != ir_uid:
+                raise RuntimeError(f"uid ownership violated: IR tensor uid {ir_uid} lowered to C++ uid {cpp_uid} — a lowering path failed to push the uid")
+
     def _lower_cudnn_plan(self) -> None:
-        """Lazily lower to C++ and build the cuDNN plan (for a cuDNN-id plan)."""
+        """Lower to C++ (if not already) and create the cuDNN plans (once)."""
         import cudnn
 
         if self._lowered_graph is None:
             self._lowered_graph = self._lower_to_cpp()
             self._lowered_graph.validate()
             self._lowered_graph.build_operation_graph()
-            # Verify the uid-ownership invariant (see _lower_to_cpp): every C++
-            # tensor must carry exactly its IR uid. An assertion — not a silent
-            # translation — so a lowering path that forgets to push a uid fails
-            # loudly in tests instead of mis-binding buffers (a swapped
-            # multi-output pairing writes past the smaller buffer: corruption).
-            for ir_uid, cpp_t in self._cpp_tensors.items():
-                cpp_uid = cpp_t.get_uid()
-                if cpp_uid != ir_uid:
-                    raise RuntimeError(f"uid ownership violated: IR tensor uid {ir_uid} lowered to C++ uid {cpp_uid} — a lowering path failed to push the uid")
-        heur = self._cudnn_heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
-        self._lowered_graph.create_execution_plans(heur)
+            self._verify_uid_ownership()
+        if not self._cpp_plans_created:
+            heur = self._cudnn_heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+            self._lowered_graph.create_execution_plans(heur)
+            self._cpp_plans_created = True
 
     def check_support(self) -> None:
         """Check the selected plan's engine supports the graph.
@@ -580,16 +648,13 @@ class NativeGraph:
             self._lower_cudnn_plan()
         self._lowered_graph.check_support()
 
-    def build_plans(self) -> None:
-        """Finalize the selected plan.
-
-        A python plan is a no-op (its engine executes directly); a cuDNN plan
-        lowers to C++ and builds its plans.
-        """
+    def build_plans(self, *args) -> None:
+        """Finalize the selected plan (classic optional build_plan_policy passes
+        through). A python plan is a no-op (its engine executes directly)."""
         if self.selected_engine is None:
-            if self._lowered_graph is None:
+            if self._lowered_graph is None or not self._cpp_plans_created:
                 self._lower_cudnn_plan()
-            self._lowered_graph.build_plans()
+            self._lowered_graph.build_plans(*args)
         self._is_built = True
 
     def build(self, heuristics: Optional[List] = None) -> None:
@@ -619,6 +684,9 @@ class NativeGraph:
         tensor_dict: Dict[Union[str, int, Tensor], Any],
         workspace: Any = None,
         handle: int = None,
+        override_uids: Any = None,
+        override_shapes: Any = None,
+        override_strides: Any = None,
     ) -> None:
         """Execute the selected plan.
 
@@ -631,6 +699,7 @@ class NativeGraph:
                          Must include both input and output tensors.
             workspace: Workspace buffer (ignored by python engines)
             handle: cuDNN handle (ignored by python engines)
+            override_uids/shapes/strides: dynamic-shape overrides (cuDNN path)
         """
         if not self._is_built:
             self.build()
@@ -638,12 +707,16 @@ class NativeGraph:
         # Start with auto-bound inputs, then overlay user-provided (user wins)
         uid_to_data = dict(self._data_bindings)
         for key, data in tensor_dict.items():
+            if key is None:
+                continue  # classic API tolerates None keys (optional tensors)
             if isinstance(key, Tensor):
                 uid = key.uid
             elif isinstance(key, str):
                 uid = self._tensors[key].uid
-            else:
+            elif isinstance(key, int):
                 uid = key
+            else:  # a lowered C++ tensor (advanced/interop) — trust its uid
+                uid = key.get_uid()
             uid_to_data[uid] = data
 
         eng = self.selected_engine
@@ -654,20 +727,40 @@ class NativeGraph:
         # cuDNN execution path (plan id < PYTHON_ENGINE_ID_BASE). Variant-pack
         # keys are IR uids — identical to the C++ uids by construction (the IR
         # owns the uid namespace and lowering pushes every uid explicitly).
-        var_pack = {uid: (d.data_ptr() if hasattr(d, "data_ptr") else d) for uid, d in uid_to_data.items()}
-        ws_ptr = workspace.data_ptr() if hasattr(workspace, "data_ptr") else workspace
-        self._lowered_graph._execute(var_pack, ws_ptr, handle)
+        from .datatypes import _is_torch_tensor
 
-    @property
-    def use_native(self) -> bool:
-        """True iff the selected plan is a python engine (not the cuDNN path).
+        def _ptr(d):
+            if type(d) is int:
+                return d
+            if _is_torch_tensor(d) or hasattr(d, "data_ptr"):
+                return d.data_ptr()
+            import cudnn
 
-        Meaningful after create_execution_plans()/build(); before routing it
-        reports whether any python engine is registered as a candidate.
-        """
-        if self._plans:
-            return self.selected_engine is not None
-        return bool(self._backends) and self._lowered_graph is None
+            return cudnn._pybind_module._get_data_ptr(d)  # dlpack fallback
+
+        var_pack = {uid: _ptr(d) for uid, d in uid_to_data.items()}
+        ws_ptr = _ptr(workspace) if workspace is not None else 0
+        self._lowered_graph._execute(var_pack, ws_ptr, handle, override_uids, override_shapes, override_strides)
+
+    def __getattr__(self, name: str):
+        # Plan-configuration and query methods (deselect_engines,
+        # get_engine_and_knobs_at_index, key, populate_cuda_graph, ...) operate
+        # on the lowered C++ graph — delegate to it. Only reached when normal
+        # attribute lookup fails, i.e. for names this class doesn't define.
+        lowered = self.__dict__.get("_lowered_graph")
+        if lowered is not None and not name.startswith("_") and hasattr(lowered, name):
+            return getattr(lowered, name)
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+            + ("" if lowered is not None else " (graph not lowered yet — call build_operation_graph() first)")
+        )
+
+    def __repr__(self) -> str:
+        if self._lowered_graph is not None:
+            return repr(self._lowered_graph)  # classic JSON dump
+        import json
+
+        return json.dumps(self.inspect(), default=str, indent=2)
 
     @property
     def engine(self) -> Optional["BaseEngine"]:
@@ -688,52 +781,22 @@ class NativeGraph:
             raise RuntimeError("Call build() first")
         return bytes(self._lowered_graph.serialize())
 
-    def deserialize(self, data: bytes, handle: Optional[int] = None) -> None:
-        """Deserialize graph from bytes.
-
-        This replaces the current graph with the deserialized one.
-        The graph must have been lowered/built first to have a C++ graph to deserialize into.
-
-        Args:
-            data: Serialized graph data (from serialize()).
-            handle: Optional cuDNN handle for AoT compilation.
-        """
+    def deserialize(self, *args, **kwargs) -> None:
+        """Deserialize a graph (classic passthrough: (data) or (handle, data,
+        enforce_precompiled=...)). Replaces this graph's lowered C++ graph."""
         if self._lowered_graph is None:
-            # Need to lower first to have a C++ graph to deserialize into
-            self.validate()
-            self._lowered_graph = self._lower_to_cpp()
+            import cudnn
 
-        if handle is not None:
-            self._lowered_graph.deserialize(handle, data)
-        else:
-            self._lowered_graph.deserialize(data)
+            if self._nodes:  # deserializing into a built-up graph: lower it
+                self.validate()
+                self._lowered_graph = self._lower_to_cpp()
+            else:  # fresh container (classic usage): empty C++ graph
+                self._lowered_graph = cudnn._pybind_module.pygraph()
+        self._lowered_graph.deserialize(*args, **kwargs)
         self._is_built = True
 
     @classmethod
-    def from_pygraph(cls, pygraph: Any, **kwargs) -> "NativeGraph":
-        """Build a NativeGraph (Node/Tensor IR) from an existing ``cudnn.pygraph``.
-
-        This is the second front-door for populating the IR: users who author on
-        the classic ``cudnn.pygraph`` API get a backend-agnostic Node/Tensor
-        graph that any backend can consume via ``graph.nodes`` — replacing the
-        monkey-patch "recorder" approach.
-
-        NOT IMPLEMENTED YET. The pybind ``cudnn.pygraph`` does not expose its
-        node/tensor structure to Python, so this converter needs one of:
-          * a proper C++/pybind reflection API that walks the built op graph, or
-          * (interim) reuse the op-recording hook to emit Node/Tensor directly.
-        Tracked as the 1718<->2163 integration step; see
-        ``docs/python_native_graph_router.md``.
-        """
-        raise NotImplementedError(
-            "NativeGraph.from_pygraph() is not implemented yet — cudnn.pygraph "
-            "does not expose graph structure to Python. See "
-            "docs/python_native_graph_router.md (interim: reuse the op-recording "
-            "hook to emit Node/Tensor; long-term: a C++ reflection API)."
-        )
-
-    @classmethod
-    def from_serialized(cls, data: bytes, handle: Optional[int] = None, **kwargs) -> "NativeGraph":
+    def from_serialized(cls, data: bytes, handle: Optional[int] = None, **kwargs) -> "pygraph":
         """Create a NativeGraph from serialized data.
 
         This is a convenience method that creates a minimal graph and deserializes into it.
@@ -750,7 +813,7 @@ class NativeGraph:
 
         # Create a new NativeGraph with a fresh C++ graph
         graph = cls(**kwargs)
-        graph._lowered_graph = cudnn.pygraph(
+        graph._lowered_graph = cudnn._pybind_module.pygraph(
             io_data_type=graph._context.io_data_type,
             intermediate_data_type=graph._context.intermediate_data_type,
             compute_data_type=graph._context.compute_data_type,
@@ -764,27 +827,33 @@ class NativeGraph:
         return graph
 
     def _lower_to_cpp(self) -> Any:
-        """Lower Python graph to C++."""
+        """Lower Python graph to C++ (the internal ``_pybind_module.pygraph``)."""
         import cudnn
+        from .datatypes import _library_type  # torch dtype -> cudnn enum (classic parity)
 
-        # cudnn.pygraph rejects None (wants the enum). io_data_type may be unset
+        # The C++ graph rejects None (wants the enum). io_data_type may be unset
         # (block-scale tensors carry their own dtypes), but intermediate/compute
         # default to FLOAT — matching cudnn.graph() — so cuDNN can infer virtual
         # (intermediate) tensor dtypes during build.
-        pg_kwargs = {}
+        pg_kwargs = dict(self._cpp_graph_kwargs)
         if self._context.io_data_type is not None:
-            pg_kwargs["io_data_type"] = self._context.io_data_type
-        pg_kwargs["intermediate_data_type"] = self._context.intermediate_data_type or cudnn.data_type.FLOAT
-        pg_kwargs["compute_data_type"] = self._context.compute_data_type or cudnn.data_type.FLOAT
+            pg_kwargs["io_data_type"] = _library_type(self._context.io_data_type)
+        pg_kwargs["intermediate_data_type"] = _library_type(self._context.intermediate_data_type or cudnn.data_type.FLOAT)
+        pg_kwargs["compute_data_type"] = _library_type(self._context.compute_data_type or cudnn.data_type.FLOAT)
         if self._handle is not None:
             pg_kwargs["handle"] = self._handle
-        graph = cudnn.pygraph(**pg_kwargs)
+        graph = cudnn._pybind_module.pygraph(**pg_kwargs)
 
         tensor_map: Dict[int, Any] = {}
 
         def lower_tensor(t: Tensor) -> Any:
             if t.uid in tensor_map:
                 return tensor_map[t.uid]
+            if t.pass_by_value is not None and t.scalar_type is not None:
+                cpp = graph.tensor_scalar(t.pass_by_value, t.scalar_type)
+                cpp.set_uid(t.uid)
+                tensor_map[t.uid] = cpp
+                return cpp
             mk_kwargs = dict(
                 dim=t.dim,
                 stride=t.stride,
@@ -797,9 +866,13 @@ class NativeGraph:
                 uid=t.uid,
             )
             if t.data_type is not None:  # else NOT_SET → cuDNN infers from the
-                mk_kwargs["data_type"] = t.data_type  # graph intermediate_data_type
+                mk_kwargs["data_type"] = _library_type(t.data_type)  # graph intermediate default
             if t.reordering_type is not None:  # e.g. F8_128x4 for block-scale SFs
                 mk_kwargs["reordering_type"] = t.reordering_type
+            if t.ragged_offset is not None:
+                mk_kwargs["ragged_offset"] = lower_tensor(t.ragged_offset)
+                if t.ragged_offset_multiplier not in (None, 1):  # non-default only
+                    mk_kwargs["ragged_offset_multiplier"] = t.ragged_offset_multiplier
             cpp = graph._make_tensor(**mk_kwargs)
             tensor_map[t.uid] = cpp
             return cpp
@@ -857,6 +930,8 @@ class NativeGraph:
                         cpp_t.set_dim(out_t.dim)
                     if out_t.stride:
                         cpp_t.set_stride(out_t.stride)
+                    if out_t.ragged_offset is not None:  # e.g. THD-layout O
+                        cpp_t.set_ragged_offset(lower_tensor(out_t.ragged_offset))
                     if not out_t.is_virtual:
                         cpp_t.set_output(True)
                     if out_t.data_type:
@@ -895,6 +970,8 @@ class NativeGraph:
                         cpp_t.set_dim(out_t.dim)
                         if out_t.stride:
                             cpp_t.set_stride(out_t.stride)
+                    if out_t.ragged_offset is not None:
+                        cpp_t.set_ragged_offset(lower_tensor(out_t.ragged_offset))
                     if not out_t.is_virtual:
                         cpp_t.set_output(True)
                     if out_t.data_type:
@@ -906,6 +983,8 @@ class NativeGraph:
             # Map output
             for out_t in node.outputs.values():
                 tensor_map[out_t.uid] = cpp_out
+                if out_t.ragged_offset is not None:
+                    cpp_out.set_ragged_offset(lower_tensor(out_t.ragged_offset))
                 if not out_t.is_virtual:
                     cpp_out.set_output(True)
                 if out_t.data_type:
@@ -917,7 +996,7 @@ class NativeGraph:
         # and lowering pushes ALL of them explicitly to C++ — inputs via
         # _make_tensor(uid=), op-created outputs/virtuals via set_uid here. The
         # C++ FE's build-time auto-assignment therefore NEVER triggers for
-        # graphs built through NativeGraph (its enumeration order is not
+        # graphs built through the Python pygraph (its enumeration order is not
         # deterministic for multi-output ops, so relying on it mis-binds
         # buffers). Mixed construction — adding ops directly to the lowered C++
         # graph — is unsupported: a graph is either pure-Python or pure-C++.
@@ -951,13 +1030,13 @@ def _install_pointwise_builders() -> None:
             return self._pointwise(op, tensors, self._get_name(op, name), compute_data_type)
 
         builder.__name__ = op
-        builder.__qualname__ = f"NativeGraph.{op}"
+        builder.__qualname__ = f"pygraph.{op}"
         builder.__doc__ = f"Element-wise {op}({', '.join(argnames)})."
         return builder
 
-    for op, argnames in NativeGraph._POINTWISE_TENSOR_ARGS.items():
-        if not hasattr(NativeGraph, op):  # explicit builders (relu, ...) win
-            setattr(NativeGraph, op, make(op, argnames))
+    for op, argnames in pygraph._POINTWISE_TENSOR_ARGS.items():
+        if not hasattr(pygraph, op):  # explicit builders (relu, ...) win
+            setattr(pygraph, op, make(op, argnames))
 
 
 _install_pointwise_builders()
@@ -1047,6 +1126,14 @@ def _block_quant_scale_dims(node):
 _NORM_FWD_INFER = {"Y": _like("input"), "mean": _stats_like("input", (0,)), "inv_var": _stats_like("input", (0,))}
 _NORM_BWD_INFER = {"DX": _like("input"), "DScale": _like("scale"), "DBias": _like("scale")}
 
+
+def _training_phase(node):  # norm stats exist only in TRAINING forward phase
+    phase = node.params.get("norm_forward_phase")
+    return getattr(phase, "name", str(phase)).upper() != "INFERENCE"
+
+
+_NORM_FWD_MAYBE = {"mean": _training_phase, "inv_var": _training_phase}
+
 _STRUCTURED_OPS = {
     # ---- norms --------------------------------------------------------------
     "rmsnorm": dict(
@@ -1054,6 +1141,7 @@ _STRUCTURED_OPS = {
         inputs=("input", "scale", "bias", "epsilon"),
         attrs=("norm_forward_phase",),
         outputs=("Y", "inv_var"),
+        maybe={"inv_var": _training_phase},
         infer={"Y": _like("input"), "inv_var": _stats_like("input", (0,))},
     ),
     "rmsnorm_backward": dict(
@@ -1061,6 +1149,7 @@ _STRUCTURED_OPS = {
         inputs=("grad", "input", "scale", "inv_variance"),
         attrs=("has_dbias",),
         outputs=("DX", "DScale", "DBias"),
+        maybe={"DBias": lambda n: n.params.get("has_dbias", True) is not False},
         infer=_NORM_BWD_INFER,
     ),
     "layernorm": dict(
@@ -1068,6 +1157,7 @@ _STRUCTURED_OPS = {
         inputs=("input", "scale", "bias", "epsilon"),
         attrs=("norm_forward_phase",),
         outputs=("Y", "mean", "inv_var"),
+        maybe=_NORM_FWD_MAYBE,
         infer=_NORM_FWD_INFER,
     ),
     "layernorm_backward": dict(
@@ -1081,6 +1171,7 @@ _STRUCTURED_OPS = {
         inputs=("input", "scale", "bias", "epsilon"),
         attrs=("norm_forward_phase",),
         outputs=("Y", "mean", "inv_var"),
+        maybe=_NORM_FWD_MAYBE,
         infer=_NORM_FWD_INFER,
     ),
     "adalayernorm_backward": dict(
@@ -1094,6 +1185,7 @@ _STRUCTURED_OPS = {
         inputs=("input", "scale", "bias", "epsilon"),
         attrs=("norm_forward_phase",),
         outputs=("Y", "mean", "inv_var"),
+        maybe=_NORM_FWD_MAYBE,
         infer={"Y": _like("input"), "mean": _stats_like("input", (0, 1)), "inv_var": _stats_like("input", (0, 1))},
     ),
     "instancenorm_backward": dict(
@@ -1107,6 +1199,10 @@ _STRUCTURED_OPS = {
         inputs=("input", "scale", "bias", "in_running_mean", "in_running_var", "epsilon", "momentum"),
         list_inputs=("peer_stats",),
         outputs=("Y", "mean", "inv_var", "next_running_mean", "next_running_var"),
+        maybe={
+            "next_running_mean": lambda n: "in_running_mean" in n.inputs,
+            "next_running_var": lambda n: "in_running_var" in n.inputs,
+        },
         infer={
             "Y": _like("input"),
             "mean": _stats_like("input", (1,)),
@@ -1255,6 +1351,7 @@ def _install_structured_builders() -> None:
         list_ports = spec.get("list_inputs", ())
         attr_kws = spec.get("attrs", ())
         infer = spec.get("infer", {})
+        maybe = spec.get("maybe", {})
 
         def builder(self, *args, name: str = "", compute_data_type: Any = None, out_dims: Any = None, **kwargs):
             name_ = self._get_name(op, name)
@@ -1283,6 +1380,10 @@ def _install_structured_builders() -> None:
                 out_dims = {spec["outputs"][0]: out_dims}
             outs = []
             for oport in spec["outputs"]:
+                cond = maybe.get(oport)
+                if cond is not None and not cond(node):
+                    outs.append(None)  # classic returns None for absent outputs
+                    continue
                 o = self._make_output(f"{name_}::{oport}")
                 d = (out_dims or {}).get(oport)
                 if d is None:
@@ -1300,12 +1401,12 @@ def _install_structured_builders() -> None:
             return outs[0] if len(outs) == 1 else tuple(outs)
 
         builder.__name__ = op
-        builder.__qualname__ = f"NativeGraph.{op}"
+        builder.__qualname__ = f"pygraph.{op}"
         builder.__doc__ = f"{op}({', '.join(input_ports)}) -> ({', '.join(spec['outputs'])})."
         return builder
 
     for op, spec in _STRUCTURED_OPS.items():
-        setattr(NativeGraph, op, make(op, spec))
+        setattr(pygraph, op, make(op, spec))
 
 
 _install_structured_builders()
@@ -1439,12 +1540,16 @@ def _install_captured_builders() -> None:
             return tuple(rets)  # always full arity, matching the classic API
 
         builder.__name__ = op
-        builder.__qualname__ = f"NativeGraph.{op}"
+        builder.__qualname__ = f"pygraph.{op}"
         builder.__doc__ = f"{op}(...) -> {spec['outputs']} (generic kwarg capture; see _CAPTURED_OPS)."
         return builder
 
     for op, spec in _CAPTURED_OPS.items():
-        setattr(NativeGraph, op, make(op, spec))
+        setattr(pygraph, op, make(op, spec))
 
 
 _install_captured_builders()
+
+
+# Transitional alias (pre-flip name)
+NativeGraph = pygraph

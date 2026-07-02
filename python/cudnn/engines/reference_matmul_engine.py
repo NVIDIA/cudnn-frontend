@@ -21,7 +21,7 @@ from .engine_ids import PYTHON_ENGINE_ID_BASE
 from ..graph_types import NodeType
 
 if TYPE_CHECKING:
-    from ..graph_native import NativeGraph
+    from ..pygraph import NativeGraph
 
 # POINTWISE ops this reference understands, keyed by the op kind
 # (params["mode"] == the pygraph method name).

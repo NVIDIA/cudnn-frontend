@@ -84,6 +84,8 @@ class Tensor:
     uid_assigned: bool = False
     reordering_type: Any = None
     ragged_offset: Optional["Tensor"] = None
+    ragged_offset_multiplier: int = 1
+    scalar_type: Any = None  # cudnn.scalar_type for tensor_scalar-created scalars
 
     def set_output(self, value: bool) -> "Tensor":
         """Mark this tensor as an output (non-virtual) or intermediate (virtual)."""
@@ -116,6 +118,31 @@ class Tensor:
         self.uid_assigned = True
         return self
 
+    def set_ragged_offset(self, ragged_offset: "Tensor") -> "Tensor":
+        """Set the ragged-offset tensor (variable-length layouts)."""
+        self.ragged_offset = ragged_offset
+        return self
+
+    def set_ragged_offset_multiplier(self, multiplier: int) -> "Tensor":
+        """Set the ragged-offset unit size in tensor elements."""
+        self.ragged_offset_multiplier = multiplier
+        return self
+
+    def set_reordering_type(self, reordering_type: Any) -> "Tensor":
+        """Set the memory reordering layout (e.g. F8_128x4)."""
+        self.reordering_type = reordering_type
+        return self
+
+    def set_is_pass_by_value(self, value: bool) -> "Tensor":
+        """Mark the tensor as a host pass-by-value scalar."""
+        self.is_pass_by_value = value
+        return self
+
+    def set_is_virtual(self, value: bool) -> "Tensor":
+        """Set virtualness directly (classic parity; inverse of set_output)."""
+        self.is_virtual = value
+        return self
+
     def get_uid(self) -> int:
         return self.uid
 
@@ -133,6 +160,15 @@ class Tensor:
 
     def get_is_virtual(self) -> bool:
         return self.is_virtual
+
+    def get_is_pass_by_value(self) -> bool:
+        return self.is_pass_by_value
+
+    def get_reordering_type(self) -> Any:
+        return self.reordering_type
+
+    def get_ragged_offset_multiplier(self) -> int:
+        return self.ragged_offset_multiplier
 
     def validate(self) -> None:
         """Validate tensor configuration."""

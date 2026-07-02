@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Dict
 from .engine_ids import PYTHON_ENGINE_ID_BASE
 
 if TYPE_CHECKING:
-    from ..graph_native import NativeGraph
+    from ..pygraph import NativeGraph
 
 
 class BaseEngine(ABC):

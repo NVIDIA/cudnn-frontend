@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Any
 from .graph_types import NodeType, Tensor
 
 if TYPE_CHECKING:
-    from .graph_native import GraphContext
+    from .pygraph import GraphContext
 
 
 class Node:

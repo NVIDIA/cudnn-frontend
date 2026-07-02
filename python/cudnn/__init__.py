@@ -33,7 +33,6 @@ symbols_to_import = [
     "data_type",
     "tensor_reordering",
     "heur_mode",
-    "pygraph",
     "tensor",
     "knob",
     "cudnnGraphNotSupportedError",
@@ -108,7 +107,7 @@ def _set_data_type(
 
 
 _pybind_module.tensor.set_data_type = _set_data_type
-pygraph.tensor = _tensor
+_pybind_module.pygraph.tensor = _tensor
 
 
 def _library_device_pointer(input_tensor):
@@ -194,8 +193,8 @@ def _execute_plan_at_index(
     )
 
 
-pygraph.execute = _execute
-pygraph.execute_plan_at_index = _execute_plan_at_index
+_pybind_module.pygraph.execute = _execute
+_pybind_module.pygraph.execute_plan_at_index = _execute_plan_at_index
 
 
 def load_cudnn():
@@ -255,20 +254,17 @@ if is_windows():
 else:
     _dlopen_cudnn()
 
-from .graph import graph, jit, graph_cache
-from .wrapper import Graph
-
-# Native Python graph (backend-agnostic IR + pluggable execution backends)
+# The graph API: a Python-native IR with pluggable execution backends. The
+# public ``cudnn.pygraph`` IS the Python class; the C++ graph builder stays
+# internal at ``cudnn._pybind_module.pygraph`` and is reached only through
+# lowering (a graph is pure-Python or pure-C++, never mixed). Imported before
+# .graph/.wrapper, which reference cudnn.pygraph at module load.
 from .graph_types import NodeType, Tensor
-from .graph_native import NativeGraph, GraphContext
+from .pygraph import pygraph, NativeGraph, GraphContext
 from .nodes import Node
 
-# Make cudnn.pygraph engine-aware in place: transparent python-engine routing for
-# represented ops; classic cuDNN behavior is unchanged when no engine is
-# registered (or any op is unrepresented).
-from . import pygraph_engines as _pygraph_engines
-
-_pygraph_engines.install(pygraph)
+from .graph import graph, jit, graph_cache
+from .wrapper import Graph
 
 from typing import Any
 

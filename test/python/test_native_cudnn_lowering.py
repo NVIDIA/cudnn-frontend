@@ -11,7 +11,7 @@ if not torch.cuda.is_available():
     pytest.skip("needs a CUDA GPU", allow_module_level=True)
 
 import cudnn
-from cudnn.graph_native import NativeGraph
+from cudnn.pygraph import NativeGraph
 
 pytestmark = pytest.mark.L0
 

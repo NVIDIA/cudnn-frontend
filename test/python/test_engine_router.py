@@ -9,7 +9,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cudnn.graph_native import NativeGraph
+from cudnn.pygraph import NativeGraph
 from cudnn.engines import BaseEngine, Router, ReferenceMatmulEngine, PYTHON_ENGINE_ID_BASE, is_python_engine
 from cudnn.engines.engine_ids import CUDNN_HEURISTIC_ENGINE_ID
 

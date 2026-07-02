@@ -20,9 +20,10 @@ autotune results and pinned plans stay reproducible across runs.
 # having to know cuDNN's actual maximum.
 PYTHON_ENGINE_ID_BASE = 1 << 20
 
-# Phase-1 placeholder for the cuDNN side of the plan list: "let cuDNN heuristics
-# pick the engine". This single entry is replaced later by the true per-engine
-# cuDNN configs read via get_engine_and_knobs_at_index().
+# The cuDNN side of the plan list: "delegate to the loaded backend's own
+# heuristics". Deliberately ONE entry — the backend's engine set varies by
+# backend version and is only discoverable per graph at plan time, never
+# statically enumerable by the frontend.
 CUDNN_HEURISTIC_ENGINE_ID = -1
 
 

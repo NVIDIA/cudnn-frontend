@@ -4,7 +4,7 @@ import pytest
 
 from cudnn.graph_types import NodeType, Tensor
 from cudnn.nodes import Node, _row_major_stride
-from cudnn.graph_native import NativeGraph, GraphContext
+from cudnn.pygraph import NativeGraph, GraphContext
 
 pytestmark = pytest.mark.L0
 
@@ -286,7 +286,7 @@ class TestNativeGraph:
         """Every op in _STRUCTURED_OPS builds a first-class node: named ports
         (== C++ kwargs), attrs stored verbatim, declared outputs — via both
         keyword and positional-tensor call styles."""
-        from cudnn.graph_native import _STRUCTURED_OPS
+        from cudnn.pygraph import _STRUCTURED_OPS
 
         for op, spec in _STRUCTURED_OPS.items():
             for style in ("keyword", "positional"):

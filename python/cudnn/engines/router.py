@@ -27,7 +27,7 @@ from .base import BaseEngine
 from .engine_ids import CUDNN_HEURISTIC_ENGINE_ID
 
 if TYPE_CHECKING:
-    from ..graph_native import NativeGraph
+    from ..pygraph import NativeGraph
 
 
 @dataclass
@@ -63,8 +63,12 @@ class Router:
                 continue
             plans.append(PlanConfig(engine.engine_id, getattr(engine, "default_knobs", None)))
 
-        # Phase 1: cuDNN as one "heuristics decides" entry. TODO: replace with the
-        # true per-engine cuDNN configs + a real heuristics-driven ranking merge.
+        # The cuDNN side is ONE delegating entry by design: the frontend owns
+        # only its python-engine id segment and must work against any (incl.
+        # future) backend version, so the backend's engine set can never be
+        # statically enumerated here — it is discovered per graph at plan time
+        # via the backend's own heuristics/query API (get_engine_and_knobs_at_
+        # index on the lowered graph) when a caller wants to expand or autotune.
         plans.append(PlanConfig(CUDNN_HEURISTIC_ENGINE_ID))
         return plans
 
