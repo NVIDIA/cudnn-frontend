@@ -263,6 +263,13 @@ from .graph_types import NodeType, Tensor
 from .graph_native import NativeGraph, GraphContext
 from .nodes import Node
 
+# Make cudnn.pygraph engine-aware in place: transparent python-engine routing for
+# represented ops; classic cuDNN behavior is unchanged when no engine is
+# registered (or any op is unrepresented).
+from . import pygraph_engines as _pygraph_engines
+
+_pygraph_engines.install(pygraph)
+
 from typing import Any
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"

@@ -82,21 +82,45 @@ heuristics-driven ranking merge — at which point the list literally contains
 the mixed-list idea: its `heur_mode.TBD` sentinel lives in the same list as
 `heur_mode.A`.
 
-## Usage
+## Front door: `cudnn.pygraph` is engine-aware in place
+
+Users don't switch classes. `__init__.py` augments the pybind `cudnn.pygraph`
+**in place** (`pygraph_engines.install`) — the same sanctioned mechanism it
+already uses (`pygraph.execute = _execute`). So `g = cudnn.pygraph(...)` is
+unchanged for every existing sample, yet transparently routes to a registered
+python engine:
 
 ```python
 import cudnn
-from cudnn import NativeGraph
 from cudnn.engines import ReferenceMatmulEngine
 
-g = NativeGraph()
-g.register_backend(ReferenceMatmulEngine())     # add candidate backend(s)
-C = g.matmul(a, b)                              # torch tensors auto-bound
-g.execute({C: c})                              # Router picks a backend; else cuDNN
-assert g.selected_engine.name == "reference_matmul"
+g = cudnn.pygraph(io_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+A = g.tensor(dim=[M, K], stride=[K, 1], data_type=cudnn.data_type.FLOAT)
+B = g.tensor(dim=[K, N], stride=[N, 1], data_type=cudnn.data_type.FLOAT)
+C = g.matmul(A, B); C.set_output(True)
+g.register_backend(ReferenceMatmulEngine())   # opt-in today; a global registry gives it for free
+g.execute({A: a, B: b, C: c})                 # routed to the python engine
 ```
 
-No registered backend ⇒ the classic cuDNN path is used transparently.
+How it stays safe:
+- A per-graph mirror (WeakKeyDictionary, since pybind instances reject arbitrary
+  attrs) records a `Node`/`Tensor` IR alongside the real C++ calls for a curated
+  *represented* set (matmul + common pointwise, mirrored via the `NativeGraph`
+  builders so the recorded op is exactly what engines consume).
+- Every other op-builder is auto-wrapped to flag the graph **opaque** — the safe
+  direction: it only *disables* the python path, never changes classic output.
+- The lifecycle routes to a python engine iff one is registered AND the whole
+  graph is represented AND it supports the graph; otherwise it delegates to the
+  untouched C++ path (verified byte-identical: a classic matmul runs the same
+  with and without the augmentation).
+
+Current form is **eager** (the C++ graph is still built as ops are added).
+Lazy / pure-python (never touch cuDNN) is the follow-up — it needs a structured
+builder per op, because multi-tensor-return ops (sdpa, norms) can't be mirrored
+generically. Coverage grows op-by-op; a fully-represented graph then skips C++.
+
+`NativeGraph` remains as the equivalent standalone/greenfield authoring object
+(`g = NativeGraph(); g.register_backend(...)`) sharing the same IR + engines.
 
 ## Scope of this PR (foundation only)
 
@@ -104,11 +128,17 @@ Included: the IR, `BaseEngine`, `Router`, the CPU `ReferenceMatmulEngine`
 (CI-testable oracle), the optional `MatmulCuTileEngine`, and node builders for
 block-scale / MoE / reduction so a fusion backend can represent them.
 
+Also included: the in-place `cudnn.pygraph` front-door (`pygraph_engines`) for
+matmul + common pointwise.
+
 Deferred (follow-up MRs):
 
-- **`NativeGraph.from_pygraph()`** — populate the IR from an existing
-  `cudnn.pygraph` (interim: reuse the op-recording hook to emit `Node`/`Tensor`;
-  long-term: a C++/pybind reflection API). Currently raises `NotImplementedError`.
+- **Lazy / pure-python**: structured builders per op so a fully-represented
+  graph never builds the C++ graph (current front-door is eager).
+- **Widen the represented set** on `cudnn.pygraph` (sdpa, block-scale, MoE,
+  reduction) so more graphs are engine-eligible; grows op-by-op.
+- **Global backend registry** so engines apply with zero `register_backend`
+  call (fully transparent benefit).
 - **DSL fusion backend** (e.g. the CuTe GEMM engine) ported to consume
   `graph.nodes` and registered as a `BaseEngine`.
 - **Attention / other DSL backends**.
