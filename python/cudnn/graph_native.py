@@ -80,15 +80,19 @@ class NativeGraph:
         self._data_bindings: Dict[int, Any] = {}  # uid -> tensor data for auto-bound inputs
 
         # Backend routing (see engines/router.py). Graph construction is
-        # backend-agnostic; a backend is chosen at create_execution_plans() time
-        # by the Router. ``_selected`` is that choice; None => cuDNN Graph path.
+        # backend-agnostic. At create_execution_plans() the Router builds a flat
+        # ranked plan list (python engines + cuDNN) in one shared engine-id
+        # space; each plan is dispatched by its id (is_python_engine -> python
+        # registry, else lower to cuDNN). ``_plan_index`` selects the plan to run.
         self._backends: List["BaseEngine"] = list(backends) if backends else []
         self._router = router  # None => engines.router.default_router at route time
-        self._selected: Optional["BaseEngine"] = None
+        self._plans: List[Any] = []  # list[PlanConfig], populated by create_execution_plans()
+        self._plan_index: int = 0
+        self._cudnn_heuristics: Optional[List] = None  # heur modes for a cuDNN plan
 
-        # Back-compat: use_native=True registers the default native matmul
-        # backend as a candidate (the Router still falls back to cuDNN if it
-        # can't run this graph / hardware).
+        # Back-compat: use_native=True registers the default native matmul engine
+        # as a candidate (the Router still falls back to cuDNN if it can't run
+        # this graph / hardware).
         if use_native:
             try:
                 from .engines import MatmulCuTileEngine
@@ -103,26 +107,42 @@ class NativeGraph:
     # =========================================================================
 
     def register_backend(self, engine: "BaseEngine") -> "NativeGraph":
-        """Add a candidate execution backend. The Router picks among registered
-        backends at create_execution_plans() time (ascending priority)."""
+        """Add a candidate python execution engine. It joins the plan list at
+        create_execution_plans() time when its check_support() accepts the graph."""
         self._backends.append(engine)
         return self
 
     def set_router(self, router: Any) -> "NativeGraph":
-        """Override the backend-selection policy for this graph."""
+        """Override the plan-list / ranking policy for this graph."""
         self._router = router
         return self
 
+    def _engine_by_id(self, engine_id: int) -> "BaseEngine":
+        for e in self._backends:
+            if e.engine_id == engine_id:
+                return e
+        raise KeyError(f"no registered python engine with id {engine_id}")
+
     @property
     def backends(self) -> List["BaseEngine"]:
-        """Registered candidate backends (routing order is by priority)."""
+        """Registered candidate python engines."""
         return list(self._backends)
 
     @property
+    def plans(self) -> List[Any]:
+        """The ranked plan list (list[PlanConfig]) from create_execution_plans()."""
+        return list(self._plans)
+
+    @property
     def selected_engine(self) -> Optional["BaseEngine"]:
-        """Backend chosen by the Router, or None if the cuDNN path was selected.
-        Populated by create_execution_plans()."""
-        return self._selected
+        """The python engine for the currently selected plan, or None for the
+        cuDNN path. Populated after create_execution_plans()."""
+        if not self._plans:
+            return None
+        from .engines.engine_ids import is_python_engine
+
+        eid = self._plans[self._plan_index].engine_id
+        return self._engine_by_id(eid) if is_python_engine(eid) else None
 
     # =========================================================================
     # Tensor Creation
@@ -669,15 +689,17 @@ class NativeGraph:
             self.validate()
 
     def create_execution_plans(self, heuristics: Optional[List] = None) -> None:
-        """Route to a backend, then create its execution plans.
+        """Build the ranked execution-plan list (the dispatch stage).
 
-        This is the dispatch stage of the unification proposal: the Router picks
-        the first registered backend whose check_support() accepts this graph
-        (ascending priority). If none accept — or none are registered — the graph
-        falls back to the cuDNN Graph backend via lazy lowering.
+        The Router returns one flat list of PlanConfig(engine_id, knobs) mixing
+        python engines (reserved id region) and the cuDNN side, in one shared
+        engine-id space. Nothing is lowered here — a plan is built lazily when
+        selected. ``_plan_index`` selects which plan runs (default 0, the
+        highest-ranked); cuDNN heuristic modes are carried on the cuDNN plan's
+        knobs.
 
         Args:
-            heuristics: cuDNN heuristic modes, used only on the cuDNN fallback.
+            heuristics: cuDNN heuristic modes, carried to the cuDNN plan.
         """
         if not self._is_validated:
             self.validate()
@@ -685,50 +707,62 @@ class NativeGraph:
         from .engines.router import default_router
 
         router = self._router or default_router
-        self._selected = router.select(self, self._backends) if self._backends else None
+        self._plans = router.plan(self, self._backends)
+        self._plan_index = 0
+        self._cudnn_heuristics = heuristics  # applied when a cuDNN plan is built
 
-        if self._selected is not None:
-            return  # native backend chosen — nothing to lower
+    def get_execution_plan_count(self) -> int:
+        """Number of candidate plans (python + cuDNN) in the ranked list."""
+        return len(self._plans)
 
-        # cuDNN Graph backend: lower lazily and build its plans.
+    def select_plan(self, index: int) -> "NativeGraph":
+        """Pick which plan in the ranked list to build/execute (for autotune)."""
+        if not 0 <= index < len(self._plans):
+            raise IndexError(f"plan index {index} out of range for {len(self._plans)} plan(s)")
+        self._plan_index = index
+        self._is_built = False
+        return self
+
+    def _lower_cudnn_plan(self) -> None:
+        """Lazily lower to C++ and build the cuDNN plan (for a cuDNN-id plan)."""
         import cudnn
 
         if self._lowered_graph is None:
             self._lowered_graph = self._lower_to_cpp()
             self._lowered_graph.validate()
             self._lowered_graph.build_operation_graph()
-        heur = heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+        heur = self._cudnn_heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
         self._lowered_graph.create_execution_plans(heur)
 
     def check_support(self) -> None:
-        """Check the selected backend supports the graph.
+        """Check the selected plan's engine supports the graph.
 
-        For a native backend this re-affirms check_support() (already passed
-        during routing); for the cuDNN path it checks backend support.
+        A python plan re-affirms its engine's check_support() (already passed
+        when the Router included it); a cuDNN plan lowers and checks C++ support.
         """
-        if self._selected is not None:
-            self._selected.check_support(self)
+        eng = self.selected_engine
+        if eng is not None:
+            eng.check_support(self)
             return
         if self._lowered_graph is None:
-            raise RuntimeError("Call create_execution_plans() first")
+            self._lower_cudnn_plan()
         self._lowered_graph.check_support()
 
     def build_plans(self) -> None:
-        """Finalize execution plans.
+        """Finalize the selected plan.
 
-        Native backends are a no-op (already prepared during routing); the cuDNN
-        path builds its plans.
+        A python plan is a no-op (its engine executes directly); a cuDNN plan
+        lowers to C++ and builds its plans.
         """
-        if self._selected is not None:
-            self._is_built = True
-            return
-
-        self._lowered_graph.build_plans()
+        if self.selected_engine is None:
+            if self._lowered_graph is None:
+                self._lower_cudnn_plan()
+            self._lowered_graph.build_plans()
         self._is_built = True
 
     def build(self, heuristics: Optional[List] = None) -> None:
         """Convenience: validate -> build_operation_graph -> create_execution_plans
-        (Router) -> check_support -> build_plans, in sequence."""
+        -> check_support -> build_plans, in sequence."""
         if not self._is_validated:
             self.validate()
 
@@ -738,12 +772,13 @@ class NativeGraph:
         self.build_plans()
 
     def get_workspace_size(self) -> int:
-        """Get workspace size in bytes."""
+        """Get workspace size in bytes for the selected plan."""
         if not self._is_built:
             raise RuntimeError("Call build() first")
 
-        if self._selected is not None:
-            return self._selected.get_workspace_size()
+        eng = self.selected_engine
+        if eng is not None:
+            return eng.get_workspace_size()
 
         return self._lowered_graph.get_workspace_size()
 
@@ -753,17 +788,17 @@ class NativeGraph:
         workspace: Any = None,
         handle: int = None,
     ) -> None:
-        """Execute the graph.
+        """Execute the selected plan.
 
-        Both native backends and the cuDNN path write results directly into the
+        Both python engines and the cuDNN path write results directly into the
         caller-provided output tensors (in-place). Automatically calls build()
-        (which routes to a backend) if it hasn't run yet.
+        if it hasn't run yet. Dispatch is a single check on the plan's engine id.
 
         Args:
             tensor_dict: Dict mapping tensors (by Tensor, name, or uid) to data.
                          Must include both input and output tensors.
-            workspace: Workspace buffer (ignored by native backends)
-            handle: cuDNN handle (ignored by native backends)
+            workspace: Workspace buffer (ignored by python engines)
+            handle: cuDNN handle (ignored by python engines)
         """
         if not self._is_built:
             self.build()
@@ -779,31 +814,32 @@ class NativeGraph:
                 uid = key
             uid_to_data[uid] = data
 
-        if self._selected is not None:
-            self._selected.execute(self, uid_to_data)
+        eng = self.selected_engine
+        if eng is not None:  # python engine (plan id in the reserved region)
+            eng.execute(self, uid_to_data)
             return
 
-        # cuDNN execution path
+        # cuDNN execution path (plan id < PYTHON_ENGINE_ID_BASE)
         var_pack = {uid: (d.data_ptr() if hasattr(d, "data_ptr") else d) for uid, d in uid_to_data.items()}
         ws_ptr = workspace.data_ptr() if hasattr(workspace, "data_ptr") else workspace
         self._lowered_graph._execute(var_pack, ws_ptr, handle)
 
     @property
     def use_native(self) -> bool:
-        """True iff a native backend was selected (i.e. not the cuDNN path).
+        """True iff the selected plan is a python engine (not the cuDNN path).
 
         Meaningful after create_execution_plans()/build(); before routing it
-        reports whether any native backend is registered as a candidate.
+        reports whether any python engine is registered as a candidate.
         """
-        if self._selected is not None:
-            return True
+        if self._plans:
+            return self.selected_engine is not None
         return bool(self._backends) and self._lowered_graph is None
 
     @property
     def engine(self) -> Optional["BaseEngine"]:
-        """The backend selected by the Router, or None for the cuDNN path.
-        Populated by create_execution_plans()."""
-        return self._selected
+        """The python engine for the selected plan, or None for the cuDNN path.
+        Populated after create_execution_plans()."""
+        return self.selected_engine
 
     def serialize(self) -> bytes:
         """Serialize the graph to bytes.

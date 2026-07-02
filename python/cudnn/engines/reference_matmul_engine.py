@@ -17,6 +17,7 @@ except ImportError:
     torch = None
 
 from .base import BaseEngine
+from .engine_ids import PYTHON_ENGINE_ID_BASE
 from ..graph_types import NodeType
 
 if TYPE_CHECKING:
@@ -47,7 +48,7 @@ class ReferenceMatmulEngine(BaseEngine):
     """CPU/GPU PyTorch reference for MATMUL + basic POINTWISE fusions."""
 
     name = "reference_matmul"
-    priority = 1000  # last resort — a correctness oracle, not a fast path
+    engine_id = PYTHON_ENGINE_ID_BASE + 0  # stable id (a correctness oracle)
 
     def check_support(self, graph: "NativeGraph") -> None:
         if torch is None:

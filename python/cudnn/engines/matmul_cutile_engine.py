@@ -35,6 +35,7 @@ except ImportError:
     cudart = None
 
 from .base import BaseEngine
+from .engine_ids import PYTHON_ENGINE_ID_BASE
 from ..graph_types import NodeType
 
 if TYPE_CHECKING:
@@ -137,7 +138,7 @@ class MatmulCuTileEngine(BaseEngine):
     """
 
     name = "matmul_cutile"
-    priority = 50  # preferred over the reference oracle when supported
+    engine_id = PYTHON_ENGINE_ID_BASE + 1  # stable id
 
     def __init__(self, device: str = "cuda"):
         super().__init__()

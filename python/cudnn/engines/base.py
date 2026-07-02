@@ -12,7 +12,7 @@ this backend can run a given graph.
 Example:
     class MyEngine(BaseEngine):
         name = "my_engine"
-        priority = 50  # lower is tried first by the Router
+        engine_id = PYTHON_ENGINE_ID_BASE + 7  # stable id it owns
 
         def check_support(self, graph):
             for node in graph.nodes:
@@ -26,6 +26,8 @@ Example:
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict
 
+from .engine_ids import PYTHON_ENGINE_ID_BASE
+
 if TYPE_CHECKING:
     from ..graph_native import NativeGraph
 
@@ -35,18 +37,21 @@ class BaseEngine(ABC):
 
     A backend executes the operations defined in a NativeGraph. Different
     backends use different implementations (PyTorch reference, cuTile, other
-    Python-DSL fusion engines, ...). The Router picks one at
-    ``create_execution_plans()`` time by trying each candidate's
-    ``check_support()`` in ascending ``priority`` order.
+    Python-DSL fusion engines, ...). Each declares a stable ``engine_id`` in the
+    reserved Python-engine region (see ``engine_ids``); the Router includes it in
+    the plan list at ``create_execution_plans()`` time when ``check_support()``
+    accepts the graph.
 
     Attributes:
         name: Human-readable identifier.
-        priority: Router ordering hint — lower is preferred / tried first.
-            Reference/fallback backends should use a large value.
+        engine_id: Stable id in the shared flat engine-id space, in the reserved
+            Python region (>= PYTHON_ENGINE_ID_BASE). Subclasses MUST override.
+        default_knobs: Optional default tuning knobs for this engine's plan.
     """
 
     name: str = "base"
-    priority: int = 100
+    engine_id: int = PYTHON_ENGINE_ID_BASE
+    default_knobs: Any = None
 
     def __init__(self):
         pass
@@ -82,4 +87,4 @@ class BaseEngine(ABC):
         raise NotImplementedError(f"Engine '{self.name}' must implement execute()")
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(name={self.name!r}, priority={self.priority})"
+        return f"{self.__class__.__name__}(name={self.name!r}, engine_id={self.engine_id})"

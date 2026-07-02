@@ -32,47 +32,55 @@ deleted and every backend consumes `graph.nodes` directly.
    Engine-agnostic op DAG with dim/stride/dtype/reordering and per-op params.
    The shared contract for *all* backends.
 2. **Backend contract** — `engines.BaseEngine`: `check_support()` / `execute()`
-   / `get_workspace_size()` + a `priority`. What every backend implements.
-3. **Router** — `engines.Router`: at `create_execution_plans()` time, picks the
-   first registered backend whose `check_support()` accepts the graph (ascending
-   priority); `None` ⇒ fall back to the cuDNN Graph backend via lazy lowering.
+   / `get_workspace_size()`, plus a stable `engine_id`. What every python engine
+   implements.
+3. **Router** — `engines.Router`: at `create_execution_plans()` time, builds the
+   ranked **plan list** (see below).
 
 A backend's own *lowered IR* (e.g. a GEMM engine's fusion spec) is **private to
 that backend** — it lowers from `graph.nodes` internally. Simple backends (see
 `ReferenceMatmulEngine`) consume `graph.nodes` directly with no lowered IR.
 
+## One flat engine-id space (cuDNN is not one engine)
+
+cuDNN's backend is not a single engine — it's a namespace of engine-configs
+(small ids `0..N`, each with knobs). Python engines join that **same flat id
+space** in a reserved high region (`engine_ids.PYTHON_ENGINE_ID_BASE`, `1<<20`),
+each declaring a **stable** `engine_id` it owns (so ids don't shift with
+registration order — autotune results and pinned plans stay reproducible).
+
+A heuristics query therefore returns one flat ranked list of
+`PlanConfig(engine_id, knobs)` mixing both, e.g. `[(1048576, knobs), (1, knobs),
+(5, knobs), (1048577, knobs), (19, knobs)]`. Dispatch is a single predicate on
+the id — `is_python_engine(engine_id)` → run via the python registry; otherwise
+lower to the cuDNN C++ backend. There is **no** "cuDNN as one BaseEngine" wrapper
+and no `if native else cpp` fork: one plan list, one id-keyed dispatch.
+
+Rule of thumb: distinct algorithm → distinct `engine_id`; tuning within an
+algorithm → knobs.
+
 ## Routing at plan-creation time
 
-Per the proposal (and Anerudhan's feedback), backend selection happens at
+Per the proposal (and Anerudhan's feedback), plan selection happens at
 `create_execution_plans()`, **not** at graph construction:
 
-- `build_operation_graph()` is now backend-agnostic (validate only, no lowering).
-- `create_execution_plans()` runs the Router, then lowers to cuDNN *only if* the
-  cuDNN path was chosen.
+- `build_operation_graph()` is backend-agnostic (validate only, no lowering).
+- `create_execution_plans()` runs the Router → `self._plans` (the ranked list).
+  Nothing is lowered here; a plan is built lazily when selected.
+- `get_execution_plan_count()` / `select_plan(i)` expose the list for autotune.
 - `check_support()` / `build_plans()` / `get_workspace_size()` / `execute()`
-  dispatch on the selected backend (`None` ⇒ cuDNN).
+  dispatch on the selected plan's id: python engine, else lower to cuDNN.
 
-### Target: one mixed candidate list (heuristics == backends)
+### Phasing of the plan list
 
-The heuristics list and the backend list are the *same* list. The end state is
-that `create_execution_plans()` takes a mixed candidate set — native engines and
-cuDNN `heur_mode`s together — and produces a **ranked list of candidate plans
-across backends**, e.g.:
-
-```python
-g.create_execution_plans([PyEngineA, PyEngineB, cudnn.heur_mode.A])
-```
-
-Selection is then heuristic (priority order) or autotune (benchmark) — exactly
-cuDNN FE's existing "multiple plans → deselect / autotune / pick" model, just
-extended across backends. 2163 already prototyped this: its `heur_mode.TBD`
-sentinel lives in the same list as `heur_mode.A`.
-
-This PR ships the **first-supporting-by-priority** version (Router picks one
-backend; `heuristics` is forwarded only to the cuDNN fallback). Generalizing to
-the ranked mixed list is a contained Router change (`select() -> one` becomes
-`plan(sources) -> ranked list` + a pick step) — deferred to when there is a real
-second backend to rank against (MR-B).
+This PR builds the list as **supporting python engines (by `engine_id`) + one
+trailing cuDNN entry** (`CUDNN_HEURISTIC_ENGINE_ID`, "let cuDNN heuristics
+pick"). That concat is a placeholder: it is later replaced by reading the true
+per-engine cuDNN configs via `get_engine_and_knobs_at_index()` and a real
+heuristics-driven ranking merge — at which point the list literally contains
+`eng=1, eng=5, eng=19` interleaved with the python ids. 2163 already prototyped
+the mixed-list idea: its `heur_mode.TBD` sentinel lives in the same list as
+`heur_mode.A`.
 
 ## Usage
 
@@ -106,7 +114,8 @@ Deferred (follow-up MRs):
 - **Attention / other DSL backends**.
 - **cuDNN lowering** (`_lower_to_cpp`) for the block-scale / MoE / reduction node
   types (today they are backend-path ops only).
-- **Cost/benchmark-driven Router** policy beyond first-supporting.
+- **Cost/benchmark-driven Router** ranking (and interleaving the true per-engine
+  cuDNN configs) beyond the current python-engines-then-cuDNN concat.
 
 ## Open question (from the proposal)
 

@@ -1,20 +1,29 @@
 """Execution backends for NativeGraph.
 
-Pluggable execution backends for Python-native graphs. The Router selects one
-at ``create_execution_plans()`` time; graph construction stays backend-agnostic.
+Pluggable execution backends in one flat engine-id space with the cuDNN backend.
+The Router builds a ranked plan list at ``create_execution_plans()`` time; graph
+construction stays backend-agnostic. See ``docs/python_native_graph_router.md``.
 
 Backends:
 - ReferenceMatmulEngine: pure-PyTorch correctness oracle (CPU/GPU, no JIT deps)
 - MatmulCuTileEngine: NVIDIA cuTile matmul (Blackwell SM100+); optional deps
-
-See ``docs/python_native_graph_router.md`` for the architecture.
 """
 
 from .base import BaseEngine
-from .router import Router, default_router
+from .engine_ids import PYTHON_ENGINE_ID_BASE, CUDNN_HEURISTIC_ENGINE_ID, is_python_engine
+from .router import Router, PlanConfig, default_router
 from .reference_matmul_engine import ReferenceMatmulEngine
 
-__all__ = ["BaseEngine", "Router", "default_router", "ReferenceMatmulEngine"]
+__all__ = [
+    "BaseEngine",
+    "Router",
+    "PlanConfig",
+    "default_router",
+    "ReferenceMatmulEngine",
+    "PYTHON_ENGINE_ID_BASE",
+    "CUDNN_HEURISTIC_ENGINE_ID",
+    "is_python_engine",
+]
 
 # cuTile backend has optional native deps (cuda-tile / cuda-python); expose it
 # only when importable so a plain install still gets the reference backend.
