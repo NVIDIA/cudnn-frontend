@@ -117,8 +117,11 @@ class TestGdn:
     ])
     def test_backward_runs(self, B, T, H, K, V):
         q, k, v, g, beta = _rand_inputs(B, T, H, K, V)
-        q.requires_grad_(True); k.requires_grad_(True); v.requires_grad_(True)
-        g.requires_grad_(True); beta.requires_grad_(True)
+        q.requires_grad_(True)
+        k.requires_grad_(True)
+        v.requires_grad_(True)
+        g.requires_grad_(True)
+        beta.requires_grad_(True)
         o, _ = gated_delta_net(q, k, v, g, beta)
         o.sum().backward()
         for name, t in [("q", q), ("k", k), ("v", v), ("g", g), ("beta", beta)]:

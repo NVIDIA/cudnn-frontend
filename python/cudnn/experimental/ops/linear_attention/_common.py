@@ -1,20 +1,18 @@
 """
 Shared utilities for the linear-attention torch custom ops.
 
-Math conventions follow the chunked formulations in the GDN and KDA
-references in ``LinearAttentionRef`` (see also the GDN-2 paper recurrence
-documented in ``gdn2.py``). All reference math runs in fp32 for stability;
-casts back to the original dtype happen at the op boundary.
+All reference math runs in fp32 for stability; casts back to the original
+dtype happen at the op boundary.
 
-Public tensor layout (matching ``flash-linear-attention``):
+Public tensor layout:
 
     q, k:  [B, T, H,  K]
     v:     [B, T, H,  V]
     g/alpha, beta, b, w: see per-variant docstrings.
 
-Internally the reference math operates on the "batch-major" layout
-``(..., S, C)`` from ``LinearAttentionRef`` by permuting ``[B, T, H, *]``
-to ``[B, H, T, *]``. The helpers below keep that conversion in one place.
+Internally the reference math operates on the "batch-major" ``[B, H, T, *]``
+layout by permuting ``[B, T, H, *]``. The helpers below keep that conversion
+in one place.
 """
 
 from __future__ import annotations

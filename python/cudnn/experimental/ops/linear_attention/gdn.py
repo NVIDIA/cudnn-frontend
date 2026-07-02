@@ -49,7 +49,6 @@ def _gdn_fwd(
     g: torch.Tensor,
     beta: torch.Tensor,
     scale: float,
-    chunk_size: int,
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -77,7 +76,7 @@ def _gdn_fwd(
 
 
 @_gdn_fwd.register_fake
-def _gdn_fwd_fake(q, k, v, g, beta, scale, chunk_size, initial_state=None, output_final_state=False):
+def _gdn_fwd_fake(q, k, v, g, beta, scale, initial_state=None, output_final_state=False):
     B, T, H, K = q.shape
     V = v.shape[-1]
     HV = beta.shape[2]
@@ -89,7 +88,7 @@ def _gdn_fwd_fake(q, k, v, g, beta, scale, chunk_size, initial_state=None, outpu
 
 
 def _gdn_setup_context(ctx, inputs, output):
-    q, k, v, g, beta, scale, chunk_size, initial_state, output_final_state = inputs
+    q, k, v, g, beta, scale, initial_state, output_final_state = inputs
     o, final_state, g_cumsum, A = output
     # save_for_backward cannot hold None; keep initial_state as an attribute.
     ctx.save_for_backward(q, k, v, g, beta, g_cumsum, A)
@@ -103,7 +102,7 @@ def _gdn_backward(ctx, dO, dFinal, d_g_cumsum_unused, d_A_unused):
 
     _, _ct_bwd = _get_cutile_fns()
     dht = dFinal if (dFinal is not None and dFinal.numel() > 0) else None
-    dq, dk, dv, db, dg, dh0, _dA_log, _ddt_bias = _ct_bwd(
+    dq, dk, dk2, dv, db, dg, dh0, _dA_log, _ddt_bias = _ct_bwd(
         q=q,
         k=k,
         v=v,
@@ -116,15 +115,15 @@ def _gdn_backward(ctx, dO, dFinal, d_g_cumsum_unused, d_A_unused):
         dht=dht,
         state_v_first=False,
     )
+    dk.add_(dk2)
     dh0_out = dh0 if initial_state is not None else None
-    # q, k, v, g, beta, scale, chunk_size, initial_state, output_final_state
+    # q, k, v, g, beta, scale, initial_state, output_final_state
     return (
         dq.to(q.dtype),
         dk.to(k.dtype),
         dv.to(v.dtype),
         dg.to(g_raw.dtype),
         db.to(beta.dtype),
-        None,
         None,
         dh0_out,
         None,
@@ -147,7 +146,6 @@ def gated_delta_net(
     scale: Optional[float] = None,
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
-    chunk_size: int = 64,
 ):
     """Gated DeltaNet (GDN) linear attention.
 
@@ -161,7 +159,6 @@ def gated_delta_net(
         scale: attention scale applied to ``q``. Defaults to ``1 / sqrt(K)``.
         initial_state: optional recurrent state ``[B, H, K, V]`` (otherwise zero).
         output_final_state: if ``True``, also return the state after the last token.
-        chunk_size: chunk length (cuTile kernel uses 64).
 
     Returns:
         ``(o, final_state)`` where ``o`` is ``[B, T, H, V]``. ``final_state`` is
@@ -176,7 +173,6 @@ def gated_delta_net(
         g.contiguous(),
         beta.contiguous(),
         float(scale),
-        int(chunk_size),
         initial_state=initial_state.contiguous() if initial_state is not None else None,
         output_final_state=bool(output_final_state),
     )
