@@ -74,7 +74,7 @@ def test_native_matmul_reduction_lowers_to_cudnn():
     g = NativeGraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(dim=[1, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.HALF)
     B = g.tensor(dim=[1, K, N], stride=[K * N, N, 1], data_type=cudnn.data_type.HALF)
-    R = g.reduction(g.matmul(A, B), cudnn.reduction_mode.ADD, dim=[1, M, 1])
+    R = g.reduction(g.matmul(A, B), mode=cudnn.reduction_mode.ADD, out_dims=[1, M, 1])
     R.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
     g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -154,6 +154,29 @@ def test_native_moe_grouped_matmul_lowers_to_cudnn():
         if en > s:
             ref[s:en] = token[s:en] @ weight[e]
     torch.testing.assert_close(out_d.view(T, Wt).float(), ref.cuda(), rtol=5e-2, atol=5e-2)
+
+
+def test_native_conv_fprop_lowers_to_cudnn():
+    """conv_fprop (structured-table op) -> cuDNN parity vs torch conv2d (NHWC)."""
+    h = _handle()
+    x = torch.randn(4, 16, 32, 32, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
+    w = torch.randn(32, 16, 3, 3, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
+    ref = torch.nn.functional.conv2d(x, w, padding=[1, 1], stride=[1, 1], dilation=[1, 1])
+    y = torch.empty_like(ref).to(memory_format=torch.channels_last)
+
+    g = NativeGraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    X = g.tensor(dim=list(x.shape), stride=list(x.stride()), data_type=cudnn.data_type.HALF)
+    W = g.tensor(dim=list(w.shape), stride=list(w.stride()), data_type=cudnn.data_type.HALF)
+    Y = g.conv_fprop(image=X, weight=W, padding=[1, 1], stride=[1, 1], dilation=[1, 1])
+    assert Y.dim == list(ref.shape)  # table shape inference
+    Y.set_output(True).set_data_type(cudnn.data_type.HALF)
+
+    g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({X: x, W: w, Y: y}, ws, handle=h)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(y, ref, atol=5e-2, rtol=5e-2)
 
 
 def test_native_layernorm_fwd_bwd_lowers_to_cudnn():

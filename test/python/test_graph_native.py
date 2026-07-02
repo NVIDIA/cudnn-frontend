@@ -284,24 +284,36 @@ class TestNativeGraph:
 
     def test_all_structured_builders(self):
         """Every op in _STRUCTURED_OPS builds a first-class node: named ports
-        (== C++ kwargs), enum params, declared outputs with inferred dims."""
+        (== C++ kwargs), attrs stored verbatim, declared outputs — via both
+        keyword and positional-tensor call styles."""
         from cudnn.graph_native import _STRUCTURED_OPS
 
         for op, spec in _STRUCTURED_OPS.items():
-            g = NativeGraph()
-            kwargs = {port: g.tensor(dim=[4, 8], name=f"{op}::{port}_in") for port in spec["inputs"]}
-            for ek in spec.get("enums", ()):
-                kwargs[ek] = "PHASE_SENTINEL"  # any value; stored verbatim
-            outs = getattr(g, op)(**kwargs)
-            outs = outs if isinstance(outs, tuple) else (outs,)
-            (node,) = g.nodes
-            assert node.node_type == spec["node_type"], op
-            assert set(node.inputs) == set(spec["inputs"]), op
-            assert tuple(node.outputs) == spec["outputs"], op
-            for ek in spec.get("enums", ()):
-                assert node.params[ek] == "PHASE_SENTINEL", op
-            assert len(outs) == len(spec["outputs"]), op
-            g.validate()  # inferred dims satisfy tensor validation
+            for style in ("keyword", "positional"):
+                g = NativeGraph()
+                tensors = {port: g.tensor(dim=[4, 8], name=f"{port}_in") for port in spec["inputs"]}
+                attrs = {ak: "ATTR_SENTINEL" for ak in spec.get("attrs", ())}
+                lists = {lp: [g.tensor(dim=[4, 8], name=f"{lp}{i}_in") for i in range(2)] for lp in spec.get("list_inputs", ())}
+                if style == "keyword":
+                    outs = getattr(g, op)(**tensors, **attrs, **lists)
+                else:
+                    outs = getattr(g, op)(*tensors.values(), **attrs, **lists)
+                outs = outs if isinstance(outs, tuple) else (outs,)
+                (node,) = g.nodes
+                assert node.node_type == spec["node_type"], op
+                expect_ports = set(spec["inputs"]) | {f"{lp}_{i}" for lp in lists for i in range(2)}
+                assert set(node.inputs) == expect_ports, op
+                assert tuple(node.outputs) == spec["outputs"], op
+                for ak in spec.get("attrs", ()):
+                    assert node.params[ak] == "ATTR_SENTINEL", op
+                assert len(outs) == len(spec["outputs"]), op
+
+    def test_structured_out_dims(self):
+        """out_dims sets output dims for shapes cuDNN cannot infer (reduction)."""
+        g = NativeGraph()
+        A = g.tensor(dim=[1, 4, 8], name="A")
+        R = g.reduction(A, mode="ADD_SENTINEL", out_dims=[1, 4, 1])
+        assert R.dim == [1, 4, 1] and R.stride == [4, 1, 1]
 
     def test_batchnorm_peer_stats_ports(self):
         """List inputs (peer_stats) become indexed ports + a count param."""

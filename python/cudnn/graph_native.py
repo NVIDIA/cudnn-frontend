@@ -399,88 +399,10 @@ class NativeGraph:
         """Swish backward."""
         return self._pointwise("swish_backward", [loss, input], self._get_name("swish_backward", name), compute_data_type, dict(swish_beta=swish_beta))
 
-    # -------------------------------------------------------------------------
-    # Block-scale / MoE / reduction op builders.
-    #
-    # These represent the ops the CuTe-DSL GEMM fusion backend consumes (block
-    # scaling, MoE grouped matmul, epilogue reductions). They populate the Node
-    # IR so a backend's analyze(graph.nodes) pass can read them directly — no
-    # monkey-patch recorder needed. cuDNN lowering (_lower_to_cpp) is wired for
-    # all of them; per-op output-shape inference (e.g. reduced dims) is still
-    # being filled in, so set output dims explicitly for now where cuDNN needs them.
-    # -------------------------------------------------------------------------
-
-    def block_scale_dequantize(self, input: Any, descale: Any, block_size: List[int], is_negative_scale: bool = False, name: str = "") -> Tensor:
-        """Dequantize a narrow (FP4/FP8) tensor by a per-block scale factor."""
-        name = self._get_name("block_scale_dequantize", name)
-        input = self._ensure_tensor(input, name=f"{name}::input")
-        descale = self._ensure_tensor(descale, name=f"{name}::descale")
-        node = Node(name, NodeType.BLOCK_SCALE_DEQUANTIZE, self._context.compute_data_type)
-        node.inputs["input"] = input
-        node.inputs["descale"] = descale
-        node.params.update(block_size=list(block_size), is_negative_scale=bool(is_negative_scale))
-        out = self._make_output(f"{name}::OUT_0")
-        out.dim = list(input.dim)
-        out.stride = list(input.stride)
-        node.outputs["OUT_0"] = out
-        self._register_tensor(out)
-        self._nodes.append(node)
-        return out
-
-    def block_scale_quantize(self, input: Any, block_size: int, axis: Optional[int] = None, transpose: bool = False, name: str = ""):
-        """Quantize to a narrow dtype, returning (quantized, scale)."""
-        name = self._get_name("block_scale_quantize", name)
-        input = self._ensure_tensor(input, name=f"{name}::input")
-        node = Node(name, NodeType.BLOCK_SCALE_QUANTIZE, self._context.compute_data_type)
-        node.inputs["input"] = input
-        node.params.update(block_size=int(block_size), axis=axis, transpose=bool(transpose))
-        quantized = self._make_output(f"{name}::OUT_0")
-        scale = self._make_output(f"{name}::OUT_1")
-        node.outputs["OUT_0"] = quantized
-        node.outputs["OUT_1"] = scale
-        self._register_tensor(quantized)
-        self._register_tensor(scale)
-        self._nodes.append(node)
-        return quantized, scale
-
-    def moe_grouped_matmul(self, token: Any, weight: Any, first_token_offset: Any, mode: Any = None, name: str = "", **kwargs) -> Tensor:
-        """MoE grouped matmul: per-group token range @ per-expert weight."""
-        name = self._get_name("moe_grouped_matmul", name)
-        token = self._ensure_tensor(token, name=f"{name}::token")
-        weight = self._ensure_tensor(weight, name=f"{name}::weight")
-        first_token_offset = self._ensure_tensor(first_token_offset, name=f"{name}::first_token_offset")
-        node = Node(name, NodeType.MOE_GROUPED_MATMUL, self._context.compute_data_type)
-        node.inputs.update(token=token, weight=weight, first_token_offset=first_token_offset)
-        node.params["mode"] = mode
-        out = self._make_output(f"{name}::OUT_0")
-        node.outputs["OUT_0"] = out
-        self._register_tensor(out)
-        self._nodes.append(node)
-        return out
-
-    def reduction(
-        self, input: Any, mode: Any, dim: Optional[List[int]] = None, group_offset: Optional[Any] = None, name: str = "", compute_data_type: Any = None
-    ) -> Tensor:
-        """Reduction (add/amax/max/min), optionally grouped by an offset tensor.
-
-        ``dim`` is the reduced output shape (each axis either the input extent or
-        1). cuDNN requires the reduction output dims to be set explicitly, so
-        pass ``dim`` here (row-major stride is inferred)."""
-        name = self._get_name("reduction", name)
-        input = self._ensure_tensor(input, name=f"{name}::input")
-        node = Node(name, NodeType.REDUCTION, compute_data_type or self._context.compute_data_type)
-        node.inputs["input"] = input
-        if group_offset is not None:
-            node.inputs["group_offset"] = self._ensure_tensor(group_offset, name=f"{name}::group_offset")
-        node.params["mode"] = mode
-        out = self._make_output(f"{name}::OUT_0")
-        if dim is not None:
-            out.dim = list(dim)
-            out.stride = _row_major_stride(list(dim))
-        node.outputs["OUT_0"] = out
-        self._register_tensor(out)
-        self._nodes.append(node)
-        return out
+    # NOTE: reduction / block-scale / MoE / conv / norms / structural ops are all
+    # declared in _STRUCTURED_OPS (module tail) — one table entry per op, one
+    # generic lowering branch. Only ops whose call shape doesn't fit the table
+    # (matmul's positional ergonomics, sdpa's conditional kwargs) stay explicit.
 
     def sdpa(
         self,
@@ -1188,30 +1110,15 @@ class NativeGraph:
                         if out_t.data_type:
                             cpp_tensor.set_data_type(out_t.data_type)
                 continue
-            elif node.node_type == NodeType.REDUCTION:
-                red_kwargs = {
-                    "input": tensor_map[node.inputs["input"].uid],
-                    "mode": node.params["mode"],
-                    "compute_data_type": node.compute_data_type,
-                    "name": node.name,
-                }
-                if "group_offset" in node.inputs:
-                    red_kwargs["group_offset"] = tensor_map[node.inputs["group_offset"].uid]
-                cpp_out = graph.reduction(**red_kwargs)
-                # cuDNN needs the reduction output dims set explicitly.
-                _red_out = node.outputs["OUT_0"]
-                if _red_out.dim:
-                    cpp_out.set_dim(_red_out.dim)
-                if _red_out.stride:
-                    cpp_out.set_stride(_red_out.stride)
             elif node.node_type in _STRUCTURED_BY_TYPE:
-                # Generic multi-output structured op (norm family): input ports
-                # are named after the C++ kwargs, so lowering is kwargs assembly
-                # + one call + zipping the returned tuple with the declared
-                # output ports. cuDNN infers output dims on its side; the IR
-                # carries dims for introspection.
+                # Generic structured op (norms / reduction / block-scale / MoE /
+                # conv / structural): input ports are named after the C++
+                # kwargs, so lowering is kwargs assembly + one call + zipping
+                # the returned tuple with the declared output ports.
                 method, spec = _STRUCTURED_BY_TYPE[node.node_type]
-                kw = {"compute_data_type": node.compute_data_type, "name": node.name}
+                kw = {"name": node.name}
+                if not spec.get("no_cdt"):  # a few bindings take no compute_data_type
+                    kw["compute_data_type"] = node.compute_data_type
                 list_ports = spec.get("list_inputs", ())
                 for port, t in node.inputs.items():
                     if any(port.startswith(f"{lp}_") for lp in list_ports):
@@ -1221,54 +1128,21 @@ class NativeGraph:
                     n = node.params.get(f"_n_{lp}", 0)
                     if n:
                         kw[lp] = [tensor_map[node.inputs[f"{lp}_{i}"].uid] for i in range(n)]
-                for ek in spec.get("enums", ()):
-                    if ek in node.params:
-                        kw[ek] = node.params[ek]
+                for ak in spec.get("attrs", ()):
+                    if ak in node.params:
+                        kw[ak] = node.params[ak]
                 result = getattr(graph, method)(**kw)
                 cpp_outs = list(result) if isinstance(result, (list, tuple)) else [result]
+                push_dims = spec.get("push_output_dims", False)
                 for oport, cpp_t in zip(spec["outputs"], cpp_outs):
                     out_t = node.outputs.get(oport)
                     if out_t is None or cpp_t is None:
                         continue
                     tensor_map[out_t.uid] = cpp_t
-                    if not out_t.is_virtual:
-                        cpp_t.set_output(True)
-                    if out_t.data_type:
-                        cpp_t.set_data_type(out_t.data_type)
-                continue
-            elif node.node_type == NodeType.BLOCK_SCALE_DEQUANTIZE:
-                cpp_out = graph.block_scale_dequantize(
-                    input=tensor_map[node.inputs["input"].uid],
-                    descale=tensor_map[node.inputs["descale"].uid],
-                    block_size=node.params["block_size"],
-                    is_negative_scale=node.params.get("is_negative_scale", False),
-                    compute_data_type=node.compute_data_type,
-                    name=node.name,
-                )
-            elif node.node_type == NodeType.MOE_GROUPED_MATMUL:
-                cpp_out = graph.moe_grouped_matmul(
-                    token=tensor_map[node.inputs["token"].uid],
-                    weight=tensor_map[node.inputs["weight"].uid],
-                    first_token_offset=tensor_map[node.inputs["first_token_offset"].uid],
-                    mode=node.params.get("mode"),
-                    name=node.name,
-                )
-            elif node.node_type == NodeType.BLOCK_SCALE_QUANTIZE:
-                q_kwargs = {
-                    "input": tensor_map[node.inputs["input"].uid],
-                    "block_size": node.params["block_size"],
-                    "transpose": node.params.get("transpose", False),
-                    "compute_data_type": node.compute_data_type,
-                    "name": node.name,
-                }
-                if node.params.get("axis") is not None:
-                    q_kwargs["axis"] = node.params["axis"]
-                quantized, scale = graph.block_scale_quantize(**q_kwargs)
-                # two outputs: OUT_0 quantized, OUT_1 scale
-                for out_t, cpp_t in ((node.outputs.get("OUT_0"), quantized), (node.outputs.get("OUT_1"), scale)):
-                    if out_t is None:
-                        continue
-                    tensor_map[out_t.uid] = cpp_t
+                    if push_dims and out_t.dim:  # ops whose output dims cuDNN can't infer
+                        cpp_t.set_dim(out_t.dim)
+                        if out_t.stride:
+                            cpp_t.set_stride(out_t.stride)
                     if not out_t.is_virtual:
                         cpp_t.set_output(True)
                     if out_t.data_type:
@@ -1338,14 +1212,26 @@ _install_pointwise_builders()
 
 
 # ---------------------------------------------------------------------------
-# Structured multi-output ops (the norm family), declaratively.
+# Structured ops, declaratively: norms, reduction, block-scale, MoE, conv, and
+# the structural ops — everything except matmul (positional ergonomics) and
+# sdpa (conditional kwarg assembly), which stay explicit.
 #
-# One table entry per op: its NodeType, the tensor-input ports (== the C++
-# pybind kwarg names), scalar/enum params passed through verbatim, the output
-# ports in C++ return order, and per-output shape inference (IR-side dims for
-# introspection; cuDNN re-infers at build). Builders are generated (keyword
-# call style, matching how these ops are used throughout the repo) and lowering
-# is one generic branch — no per-op code.
+# One table entry per op:
+#   node_type          NodeType member (engines match on this)
+#   inputs             ordered tensor ports == the C++ pybind kwarg names
+#   list_inputs        ports taking a LIST of tensors (indexed ports + count)
+#   attrs              scalar/enum/list params stored in node.params verbatim
+#                      and forwarded as keywords at lowering
+#   outputs            output ports, in C++ return order
+#   infer              per-output IR-side shape inference (introspection; cuDNN
+#                      re-infers at build) — best-effort, None on failure
+#   push_output_dims   True for ops whose output dims cuDNN cannot infer
+#                      (dgrad/wgrad/reduction/reshape/...): IR dims are pushed
+#   no_cdt             True for bindings without a compute_data_type kwarg
+#
+# Builders are generated: tensors positionally or by port name, attrs by
+# keyword, plus a reserved ``out_dims`` kwarg (dims list for a single output,
+# or {port: dims} for several) for the ambiguous-shape ops.
 # ---------------------------------------------------------------------------
 
 
@@ -1361,28 +1247,74 @@ def _stats_like(port, keep_axes):  # input-port dims with all but keep_axes redu
     return infer
 
 
+def _conv_fprop_dims(node):
+    x, w = node.inputs["image"].dim, node.inputs["weight"].dim
+    sp = len(x) - 2
+    sym = node.params.get("padding")
+    pre = node.params.get("pre_padding") or sym or [0] * sp
+    post = node.params.get("post_padding") or sym or [0] * sp
+    stride = node.params.get("stride") or [1] * sp
+    dil = node.params.get("dilation") or [1] * sp
+    out = [x[0], w[0]]
+    for i in range(sp):
+        eff = (w[i + 2] - 1) * dil[i] + 1
+        out.append((x[i + 2] + pre[i] + post[i] - eff) // stride[i] + 1)
+    return out
+
+
+def _conv_dgrad_dims(node):
+    dy, w = node.inputs["loss"].dim, node.inputs["filter"].dim
+    sp = len(dy) - 2
+    sym = node.params.get("padding")
+    pre = node.params.get("pre_padding") or sym or [0] * sp
+    post = node.params.get("post_padding") or sym or [0] * sp
+    stride = node.params.get("stride") or [1] * sp
+    dil = node.params.get("dilation") or [1] * sp
+    # Reverse of fprop — ambiguous for strided conv; out_dims/set_dim overrides.
+    out = [dy[0], w[1]]
+    for i in range(sp):
+        eff = (w[i + 2] - 1) * dil[i] + 1
+        out.append((dy[i + 2] - 1) * stride[i] + eff - pre[i] - post[i])
+    return out
+
+
+def _moe_bwd_dweight_dims(node):
+    do, tok, fto = (node.inputs[p].dim for p in ("doutput", "token", "first_token_offset"))
+    return [fto[0], tok[-1], do[-1]]  # [E, H, N]
+
+
+def _block_quant_scale_dims(node):
+    d = list(node.inputs["input"].dim)
+    bs = node.params.get("block_size")
+    axis = node.params.get("axis")
+    axis = len(d) - 1 if axis in (None, -1) else axis
+    d[axis] = (d[axis] + bs - 1) // bs
+    return d
+
+
 _NORM_FWD_INFER = {"Y": _like("input"), "mean": _stats_like("input", (0,)), "inv_var": _stats_like("input", (0,))}
 _NORM_BWD_INFER = {"DX": _like("input"), "DScale": _like("scale"), "DBias": _like("scale")}
 
 _STRUCTURED_OPS = {
+    # ---- norms --------------------------------------------------------------
     "rmsnorm": dict(
         node_type=NodeType.RMSNORM,
         inputs=("input", "scale", "bias", "epsilon"),
-        enums=("norm_forward_phase",),
+        attrs=("norm_forward_phase",),
         outputs=("Y", "inv_var"),
         infer={"Y": _like("input"), "inv_var": _stats_like("input", (0,))},
     ),
     "rmsnorm_backward": dict(
         node_type=NodeType.RMSNORM_BWD,
         inputs=("grad", "input", "scale", "inv_variance"),
-        enums=("has_dbias",),
+        attrs=("has_dbias",),
         outputs=("DX", "DScale", "DBias"),
         infer=_NORM_BWD_INFER,
     ),
     "layernorm": dict(
         node_type=NodeType.LAYERNORM,
         inputs=("input", "scale", "bias", "epsilon"),
-        enums=("norm_forward_phase",),
+        attrs=("norm_forward_phase",),
         outputs=("Y", "mean", "inv_var"),
         infer=_NORM_FWD_INFER,
     ),
@@ -1395,7 +1327,7 @@ _STRUCTURED_OPS = {
     "adalayernorm": dict(
         node_type=NodeType.ADALAYERNORM,
         inputs=("input", "scale", "bias", "epsilon"),
-        enums=("norm_forward_phase",),
+        attrs=("norm_forward_phase",),
         outputs=("Y", "mean", "inv_var"),
         infer=_NORM_FWD_INFER,
     ),
@@ -1408,7 +1340,7 @@ _STRUCTURED_OPS = {
     "instancenorm": dict(
         node_type=NodeType.INSTANCENORM,
         inputs=("input", "scale", "bias", "epsilon"),
-        enums=("norm_forward_phase",),
+        attrs=("norm_forward_phase",),
         outputs=("Y", "mean", "inv_var"),
         infer={"Y": _like("input"), "mean": _stats_like("input", (0, 1)), "inv_var": _stats_like("input", (0, 1))},
     ),
@@ -1444,6 +1376,115 @@ _STRUCTURED_OPS = {
         outputs=("DX", "DScale", "DBias"),
         infer=_NORM_BWD_INFER,
     ),
+    "genstats": dict(
+        node_type=NodeType.GENSTATS,
+        inputs=("input",),
+        outputs=("SUM", "SQ_SUM"),
+        infer={"SUM": _stats_like("input", (1,)), "SQ_SUM": _stats_like("input", (1,))},
+    ),
+    # ---- reduction / block-scale / MoE --------------------------------------
+    "reduction": dict(
+        node_type=NodeType.REDUCTION,
+        inputs=("input", "group_offset"),
+        attrs=("mode",),
+        outputs=("OUT_0",),
+        push_output_dims=True,  # cuDNN needs the reduced output dims explicitly
+    ),
+    "block_scale_dequantize": dict(
+        node_type=NodeType.BLOCK_SCALE_DEQUANTIZE,
+        inputs=("input", "descale"),
+        attrs=("block_size", "is_negative_scale"),
+        outputs=("OUT_0",),
+        infer={"OUT_0": _like("input")},
+    ),
+    "block_scale_quantize": dict(
+        node_type=NodeType.BLOCK_SCALE_QUANTIZE,
+        inputs=("input",),
+        attrs=("block_size", "axis", "transpose"),
+        outputs=("Y", "scale"),
+        infer={"Y": _like("input"), "scale": _block_quant_scale_dims},
+    ),
+    "moe_grouped_matmul": dict(
+        node_type=NodeType.MOE_GROUPED_MATMUL,
+        inputs=("token", "weight", "first_token_offset"),
+        attrs=("mode",),
+        outputs=("OUT_0",),
+        infer={"OUT_0": lambda n: [1, n.inputs["token"].dim[-2], n.inputs["weight"].dim[-1]]},
+    ),
+    "moe_grouped_matmul_bwd": dict(
+        node_type=NodeType.MOE_GROUPED_MATMUL_BWD,
+        inputs=("doutput", "token", "first_token_offset"),
+        outputs=("dweight",),
+        infer={"dweight": _moe_bwd_dweight_dims},
+        push_output_dims=True,
+    ),
+    # ---- convolution ---------------------------------------------------------
+    "conv_fprop": dict(
+        node_type=NodeType.CONV_FPROP,
+        inputs=("image", "weight"),
+        attrs=("padding", "pre_padding", "post_padding", "stride", "dilation", "convolution_mode"),
+        outputs=("Y",),
+        infer={"Y": _conv_fprop_dims},
+    ),
+    "conv_dgrad": dict(
+        node_type=NodeType.CONV_DGRAD,
+        inputs=("loss", "filter"),
+        attrs=("padding", "pre_padding", "post_padding", "stride", "dilation", "convolution_mode"),
+        outputs=("DX",),
+        infer={"DX": _conv_dgrad_dims},
+        push_output_dims=True,  # dgrad output dims are ambiguous for strided conv
+    ),
+    "conv_wgrad": dict(
+        node_type=NodeType.CONV_WGRAD,
+        inputs=("image", "loss"),
+        attrs=("padding", "pre_padding", "post_padding", "stride", "dilation", "convolution_mode"),
+        outputs=("DW",),
+        push_output_dims=True,  # wgrad output (filter) dims are not inferable
+    ),
+    # ---- structural -----------------------------------------------------------
+    "reshape": dict(
+        node_type=NodeType.RESHAPE,
+        inputs=("input",),
+        attrs=("reshape_mode",),
+        outputs=("OUT_0",),
+        push_output_dims=True,  # target shape comes from out_dims / set_dim
+        no_cdt=True,
+    ),
+    "slice": dict(
+        node_type=NodeType.SLICE,
+        inputs=("input",),
+        attrs=("slices",),
+        outputs=("OUT_0",),
+    ),
+    "transpose": dict(
+        node_type=NodeType.TRANSPOSE,
+        inputs=("input",),
+        attrs=("permutation",),
+        outputs=("OUT_0",),
+        infer={"OUT_0": lambda n: ([n.inputs["input"].dim[i] for i in n.params["permutation"]] if n.inputs["input"].dim else None)},
+    ),
+    "concatenate": dict(
+        node_type=NodeType.CONCATENATE,
+        inputs=(),
+        list_inputs=("inputs",),
+        attrs=("axis", "in_place_index"),
+        outputs=("OUT_0",),
+        no_cdt=True,
+    ),
+    "rope": dict(
+        node_type=NodeType.ROPE,
+        inputs=("input", "freqs"),
+        attrs=("output_scale", "rope_dim"),
+        outputs=("OUT_0",),
+        infer={"OUT_0": _like("input")},
+    ),
+    "rope_backward": dict(
+        node_type=NodeType.ROPE_BWD,
+        inputs=("dY", "freqs"),
+        attrs=("output_scale", "rope_dim"),
+        outputs=("OUT_0",),
+        infer={"OUT_0": _like("dY")},
+    ),
 }
 
 # node_type -> (method name, spec), for the generic lowering branch
@@ -1451,18 +1492,26 @@ _STRUCTURED_BY_TYPE = {spec["node_type"]: (op, spec) for op, spec in _STRUCTURED
 
 
 def _install_structured_builders() -> None:
-    """Generate builders for _STRUCTURED_OPS (keyword call style)."""
+    """Generate builders for _STRUCTURED_OPS.
+
+    Call style: tensors positionally (in declared port order) or by port name;
+    attrs by keyword; ``out_dims`` sets output dims explicitly (a dims list for
+    single-output ops, or {port: dims}) for shapes cuDNN cannot infer."""
 
     def make(op: str, spec: dict):
         input_ports = spec["inputs"]
         list_ports = spec.get("list_inputs", ())
-        enum_kws = spec.get("enums", ())
+        attr_kws = spec.get("attrs", ())
         infer = spec.get("infer", {})
 
-        def builder(self, name: str = "", compute_data_type: Any = None, **kwargs):
+        def builder(self, *args, name: str = "", compute_data_type: Any = None, out_dims: Any = None, **kwargs):
             name_ = self._get_name(op, name)
             node = Node(name_, spec["node_type"], compute_data_type or self._context.compute_data_type)
-            for port in input_ports:
+            if len(args) > len(input_ports):
+                raise TypeError(f"{op}() takes at most {len(input_ports)} positional tensors {input_ports}")
+            for port, v in zip(input_ports, args):
+                node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
+            for port in input_ports[len(args) :]:
                 v = kwargs.pop(port, None)
                 if v is not None:
                     node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
@@ -1472,16 +1521,23 @@ def _install_structured_builders() -> None:
                     node.inputs[f"{lp}_{i}"] = self._ensure_tensor(v, name=f"{name_}::{lp}_{i}")
                 if vs:
                     node.params[f"_n_{lp}"] = len(vs)
-            for ek in enum_kws:
-                v = kwargs.pop(ek, None)
+            for ak in attr_kws:
+                v = kwargs.pop(ak, None)
                 if v is not None:
-                    node.params[ek] = v
+                    node.params[ak] = v
             if kwargs:
-                raise TypeError(f"{op}() got unexpected arguments {sorted(kwargs)}; tensor ports are {input_ports}")
+                raise TypeError(f"{op}() got unexpected arguments {sorted(kwargs)}; tensor ports are {input_ports}, attrs are {attr_kws}")
+            if out_dims is not None and not isinstance(out_dims, dict):
+                out_dims = {spec["outputs"][0]: out_dims}
             outs = []
             for oport in spec["outputs"]:
                 o = self._make_output(f"{name_}::{oport}")
-                d = infer.get(oport, lambda n: None)(node)
+                d = (out_dims or {}).get(oport)
+                if d is None:
+                    try:  # best-effort IR-side inference; C++ validates at build
+                        d = infer.get(oport, lambda n: None)(node)
+                    except Exception:  # noqa: BLE001
+                        d = None
                 if d:
                     o.dim = list(d)
                     o.stride = _row_major_stride(o.dim)
