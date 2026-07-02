@@ -95,6 +95,7 @@ class pygraph:
         self._plan_index: int = 0
         self._cudnn_heuristics: Optional[List] = None  # heur modes for a cuDNN plan
         self._cpp_plans_created: bool = False  # C++ create_execution_plans ran
+        self._cpp_bog_done: bool = False  # C++ build_operation_graph ran
         self._cpp_tensors: Dict[int, Any] = {}  # IR uid -> lowered C++ tensor
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
 
@@ -539,6 +540,13 @@ class pygraph:
             if not t.is_pass_by_value:
                 t.validate()
         self._is_validated = True
+        # Classic parity: with no python engines registered, C++ validation
+        # happens HERE — tests catch cudnnGraphNotSupportedError around
+        # graph.validate() (unsupported configs must skip, not fail later).
+        if not self._backends and self._lowered_graph is None:
+            self._lowered_graph = self._lower_to_cpp()
+            self._lowered_graph.validate()
+            self._verify_uid_ownership()
 
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
@@ -553,11 +561,9 @@ class pygraph:
         """
         if not self._is_validated:
             self.validate()
-        if not self._backends and self._lowered_graph is None:
-            self._lowered_graph = self._lower_to_cpp()
-            self._lowered_graph.validate()
+        if self._lowered_graph is not None and not self._cpp_bog_done:
             self._lowered_graph.build_operation_graph()
-            self._verify_uid_ownership()
+            self._cpp_bog_done = True
 
     def create_execution_plans(self, heuristics: Optional[List] = None) -> None:
         """Build the ranked execution-plan list (the dispatch stage).
@@ -627,8 +633,10 @@ class pygraph:
         if self._lowered_graph is None:
             self._lowered_graph = self._lower_to_cpp()
             self._lowered_graph.validate()
-            self._lowered_graph.build_operation_graph()
             self._verify_uid_ownership()
+        if not self._cpp_bog_done:
+            self._lowered_graph.build_operation_graph()
+            self._cpp_bog_done = True
         if not self._cpp_plans_created:
             heur = self._cudnn_heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
             self._lowered_graph.create_execution_plans(heur)
@@ -883,13 +891,10 @@ class pygraph:
                     lower_tensor(t)
 
             if node.node_type == NodeType.MATMUL:
-                cpp_out = graph.matmul(
-                    A=tensor_map[node.inputs["A"].uid],
-                    B=tensor_map[node.inputs["B"].uid],
-                    compute_data_type=node.compute_data_type,
-                    padding=node.params.get("padding", 0.0),
-                    name=node.name,
-                )
+                mm_kw = dict(A=tensor_map[node.inputs["A"].uid], B=tensor_map[node.inputs["B"].uid], padding=node.params.get("padding", 0.0), name=node.name)
+                if node.compute_data_type is not None:
+                    mm_kw["compute_data_type"] = _library_type(node.compute_data_type)
+                cpp_out = graph.matmul(**mm_kw)
             elif node.node_type == NodeType.POINTWISE:
                 # params["mode"] IS the C++ pygraph method name — direct
                 # dispatch; scalar attributes (clips/negative_slope/...) are
@@ -897,14 +902,18 @@ class pygraph:
                 # pointwise signature).
                 inputs = [tensor_map[t.uid] for t in node.inputs.values()]
                 extra = {k: node.params[k] for k in self._POINTWISE_EXTRA_PARAMS if k in node.params}
-                cpp_out = getattr(graph, node.params["mode"])(*inputs, compute_data_type=node.compute_data_type, name=node.name, **extra)
+                if node.compute_data_type is not None:
+                    extra["compute_data_type"] = _library_type(node.compute_data_type)
+                cpp_out = getattr(graph, node.params["mode"])(*inputs, name=node.name, **extra)
             elif node.node_type in _CAPTURED_BY_TYPE:
                 # Captured op (sdpa family): rebuild the original kwargs —
                 # tensor ports (port == C++ kwarg) map through tensor_map,
                 # scalar params forward verbatim, dropout reassembles from its
                 # flattened elements — and call the C++ method once.
                 method, spec = _CAPTURED_BY_TYPE[node.node_type]
-                kw = {"name": node.name, "compute_data_type": node.compute_data_type}
+                kw = {"name": node.name}
+                if node.compute_data_type is not None:
+                    kw["compute_data_type"] = _library_type(node.compute_data_type)
                 for pk, pv in node.params.items():
                     if not pk.startswith("_") and not pk.startswith("dropout_"):
                         kw[pk] = pv
@@ -944,8 +953,8 @@ class pygraph:
                 # the returned tuple with the declared output ports.
                 method, spec = _STRUCTURED_BY_TYPE[node.node_type]
                 kw = {"name": node.name}
-                if not spec.get("no_cdt"):  # a few bindings take no compute_data_type
-                    kw["compute_data_type"] = node.compute_data_type
+                if not spec.get("no_cdt") and node.compute_data_type is not None:
+                    kw["compute_data_type"] = _library_type(node.compute_data_type)
                 list_ports = spec.get("list_inputs", ())
                 for port, t in node.inputs.items():
                     if any(port.startswith(f"{lp}_") for lp in list_ports):
