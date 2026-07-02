@@ -14,10 +14,26 @@ reserved high region) whose ``check_support()`` accepts the graph, plus the
 cuDNN side. Dispatch on each plan's id (``is_python_engine``) decides whether to
 run via the Python registry or lower to the cuDNN C++ backend.
 
-Phase 1: the cuDNN side is a single "let cuDNN heuristics pick" entry appended
-after the python plans. That entry is later replaced by the true per-engine
-cuDNN configs (read via get_engine_and_knobs_at_index) and the concat becomes a
-real heuristics-driven ranking.
+Contract for the future heuristics MR (ranking policy is intentionally NOT
+decided here — only the flexibility to decide it later):
+
+1. Policy is pluggable at three levels: subclass ``Router`` and override
+   ``plan()``; pass per-graph via ``pygraph(router=...)`` / ``set_router()``;
+   or swap the process-wide ``default_router``.
+2. ``plan()`` may return ANY ordering/mix — python-first, cuDNN-first,
+   conditional on the graph — the lifecycle dispatches purely on each entry's
+   id (``is_python_engine``). The current default is a placeholder concat.
+3. "Query both": the Router receives the graph and may trigger lowering to ask
+   the loaded backend's own heuristics (get_engine_count /
+   get_engine_and_knobs_at_index on the lowered graph). Backend engine sets
+   vary by backend version and MUST be discovered per graph at plan time —
+   never statically enumerated in frontend code.
+4. Specific backend entries: ``PlanConfig(engine_id>=0, knobs)`` can carry a
+   concrete cuDNN engine config in the same list. Honoring it at build time
+   (cpp ``create_execution_plan(engine_id, knobs)`` instead of the heuristics
+   path) is the designated extension point in ``pygraph._lower_cudnn_plan``.
+   ``select_plan(i)`` + ``get_execution_plan_count()`` already expose the
+   ranked list for autotune-style selection.
 """
 
 from dataclasses import dataclass
