@@ -930,14 +930,11 @@ class pygraph:
         Populated after create_execution_plans()."""
         return self.selected_engine
 
-    def serialize(self) -> bytes:
-        """Serialize the graph to bytes.
+    def serialize(self):
+        """Serialize the graph (classic passthrough).
 
-        The graph must be built first. This lowers to the C++ serialization
-        format to ensure compatibility with C++ deserialization.
-
-        Returns:
-            bytes: Serialized graph data.
+        Returns the C++ binding's serialized form unchanged; C++
+        ``deserialize`` accepts exactly this form back.
         """
         if self._lowered_graph is None:
             # Serialization is the cuDNN graph format by definition — lower on
@@ -947,7 +944,7 @@ class pygraph:
                 self._lowered_graph = self._lower_to_cpp()
                 self._lowered_graph.validate()
                 self._verify_uid_ownership()
-        return bytes(self._lowered_graph.serialize())
+        return self._lowered_graph.serialize()
 
     def deserialize(self, *args, **kwargs) -> None:
         """Deserialize a graph (classic passthrough: (data) or (handle, data,
@@ -964,7 +961,7 @@ class pygraph:
         self._is_built = True
 
     @classmethod
-    def from_serialized(cls, data: bytes, handle: Optional[int] = None, **kwargs) -> "pygraph":
+    def from_serialized(cls, data, handle: Optional[int] = None, **kwargs) -> "pygraph":
         """Create a pygraph from serialized data.
 
         This is a convenience method that creates a minimal graph and deserializes into it.
@@ -1075,8 +1072,11 @@ class pygraph:
                 if node.compute_data_type is not None:
                     kw["compute_data_type"] = _library_type(node.compute_data_type)
                 for pk, pv in node.params.items():
-                    if not pk.startswith("_") and not pk.startswith("dropout_"):
-                        kw[pk] = pv
+                    if pk.startswith("_") or pk.startswith("dropout_"):
+                        continue
+                    # user callbacks (score_mod, ...) get a shimmed graph so
+                    # closures over IR tensors keep working (see _CallbackGraphShim)
+                    kw[pk] = _wrap_callback(pv, lower_tensor) if callable(pv) else pv
                 for port, t in node.inputs.items():
                     if not port.startswith("dropout_"):
                         kw[port] = tensor_map[t.uid]
@@ -1614,6 +1614,60 @@ _install_structured_builders()
 # element. Lowering rebuilds the kwargs and makes one C++ call. The node stays
 # first-class: engines read node.inputs["q"] / node.params["use_causal_mask"].
 # ---------------------------------------------------------------------------
+
+
+class _CallbackGraphShim:
+    """Wraps the C++ graph handed to user callbacks (score_mod & co.) during
+    lowering. Classic code passes the SAME object at build and callback time, so
+    closures over user-created tensors just work; post-flip the user's closures
+    capture IR Tensors while the callback receives the C++ graph. The shim
+    translates any IR Tensor argument to its lowered C++ tensor at the call
+    site, so existing callback code runs unchanged."""
+
+    def __init__(self, target, lower_tensor):
+        self._target = target
+        self._lower = lower_tensor
+
+    def _xlate(self, v):
+        if isinstance(v, Tensor):
+            # closure-captured helper tensors may not feed any node: lower on demand
+            return self._lower(v)
+        if isinstance(v, (list, tuple)):
+            return type(v)(self._xlate(x) for x in v)
+        return v
+
+    def __getattr__(self, name):
+        attr = getattr(self._target, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args, **kwargs):
+            return attr(*[self._xlate(a) for a in args], **{k: self._xlate(v) for k, v in kwargs.items()})
+
+        return call
+
+
+def _wrap_callback(fn, lower_tensor):
+    """Wrap a user callback param (e.g. score_mod) so the C++ graph it receives
+    is shimmed (see _CallbackGraphShim) and stray IR-Tensor args translate."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        import cudnn
+
+        cpp_graph_t = cudnn._pybind_module.pygraph
+
+        def conv(v):
+            if isinstance(v, cpp_graph_t):
+                return _CallbackGraphShim(v, lower_tensor)
+            if isinstance(v, Tensor):
+                return lower_tensor(v)
+            return v
+
+        return fn(*[conv(a) for a in args], **{k: conv(v) for k, v in kwargs.items()})
+
+    return wrapped
 
 
 def _stats_expected(params):
