@@ -69,7 +69,7 @@ class ReferenceMatmulEngine(BaseEngine):
                 continue
             raise NotImplementedError(f"ReferenceMatmulEngine only supports MATMUL / basic POINTWISE, got {node.node_type.name}")
 
-    def execute(self, graph: "NativeGraph", tensor_data: Dict[int, Any]) -> None:
+    def execute(self, graph, tensor_data: Dict[int, Any], ctx=None) -> None:
         # Nodes are already in build (topological) order. Compute each node into
         # a scratch map, then copy declared outputs into the caller's buffers.
         values: Dict[int, Any] = dict(tensor_data)

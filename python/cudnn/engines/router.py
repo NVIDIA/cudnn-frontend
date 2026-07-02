@@ -36,28 +36,13 @@ decided here — only the flexibility to decide it later):
    ranked list for autotune-style selection.
 """
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List
+from typing import TYPE_CHECKING, List
 
-from .base import BaseEngine
+from .base import BaseEngine, PlanConfig
 from .engine_ids import CUDNN_HEURISTIC_ENGINE_ID
 
 if TYPE_CHECKING:
     from ..pygraph import NativeGraph
-
-
-@dataclass
-class PlanConfig:
-    """One candidate execution plan: an engine id + its knobs.
-
-    ``engine_id`` lives in the shared flat id space (``engine_ids``); knobs are
-    engine-specific tuning (cuDNN knob dict, or a python engine's config). The
-    plan's source is derived from the id via ``is_python_engine`` — no separate
-    field, so cuDNN and python plans are interchangeable in the ranked list.
-    """
-
-    engine_id: int
-    knobs: Any = None
 
 
 class Router:
@@ -78,10 +63,10 @@ class Router:
         plans: List[PlanConfig] = []
         for engine in sorted(backends, key=lambda e: e.engine_id):
             try:
-                engine.check_support(graph)
+                proposals = engine.propose_plans(graph)
             except decline:
                 continue
-            plans.append(PlanConfig(engine.engine_id, getattr(engine, "default_knobs", None)))
+            plans.extend(proposals)
 
         # The cuDNN side is ONE delegating entry by design: the frontend owns
         # only its python-engine id segment and must work against any (incl.

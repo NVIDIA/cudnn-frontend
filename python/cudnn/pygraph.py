@@ -95,6 +95,7 @@ class pygraph:
         self._plan_index: int = 0
         self._cudnn_heuristics: Optional[List] = None  # heur modes for a cuDNN plan
         self._cpp_plans_created: bool = False  # C++ create_execution_plans ran
+        self._compiled_plans: Dict[int, Any] = {}  # plan_index -> CompiledPlan (python plans)
         self._cpp_bog_done: bool = False  # C++ build_operation_graph ran
         self._cpp_tensors: Dict[int, Any] = {}  # IR uid -> lowered C++ tensor
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
@@ -690,9 +691,15 @@ class pygraph:
         self._lowered_graph.check_support()
 
     def build_plans(self, *args) -> None:
-        """Finalize the selected plan (classic optional build_plan_policy passes
-        through). A python plan is a no-op (its engine executes directly)."""
-        if self.selected_engine is None:
+        """Finalize the selected plan. A python plan compiles HERE (once per
+        graph/plan; the CompiledPlan is cached on the graph and reused across
+        executions). The classic optional build_plan_policy passes through on
+        the cuDNN path."""
+        eng = self.selected_engine
+        if eng is not None:
+            if self._plan_index not in self._compiled_plans:
+                self._compiled_plans[self._plan_index] = eng.build_plan(self, self._plans[self._plan_index])
+        if eng is None:
             if self._lowered_graph is None or not self._cpp_plans_created:
                 self._lower_cudnn_plan()
             if self._cpp_plan_index is not None:  # explicit backend sub-plan
@@ -718,9 +725,8 @@ class pygraph:
         if not self._is_built:
             raise RuntimeError("Call build() first")
 
-        eng = self.selected_engine
-        if eng is not None:
-            return eng.get_workspace_size()
+        if self.selected_engine is not None:
+            return self._compiled_plans[self._plan_index].get_workspace_size()
 
         return self._lowered_graph.get_workspace_size()
 
@@ -766,7 +772,27 @@ class pygraph:
 
         eng = self.selected_engine
         if eng is not None:  # python engine (plan id in the reserved region)
-            eng.execute(self, uid_to_data)
+            import cudnn
+            from .engines.base import ExecutionContext
+
+            h = handle if handle is not None else self._handle
+            stream = None
+            if h is not None:
+                try:
+                    stream = cudnn.get_stream(h)
+                except Exception:  # noqa: BLE001 — stream query is best-effort
+                    stream = None
+            ctx = ExecutionContext(
+                handle=h,
+                stream=stream,
+                workspace=workspace,
+                override_uids=override_uids,
+                override_shapes=override_shapes,
+                override_strides=override_strides,
+            )
+            if self._plan_index not in self._compiled_plans:  # execute() auto-built
+                self._compiled_plans[self._plan_index] = eng.build_plan(self, self._plans[self._plan_index])
+            self._compiled_plans[self._plan_index].execute(self, uid_to_data, ctx)
             return
 
         # cuDNN execution path (plan id < PYTHON_ENGINE_ID_BASE). Variant-pack

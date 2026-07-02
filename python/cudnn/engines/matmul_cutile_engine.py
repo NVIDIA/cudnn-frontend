@@ -185,17 +185,13 @@ class MatmulCuTileEngine(BaseEngine):
                         f"MatmulCuTileEngine requires row-major contiguous layout for tensor '{name}' (dim={desc.dim}, stride={desc.stride})"
                     )
 
-    def execute(
-        self,
-        graph: "NativeGraph",
-        tensor_data: Dict[int, Any],
-    ) -> None:
+    def execute(self, graph, tensor_data: Dict[int, Any], ctx=None) -> None:
         """Execute the graph using cuTile kernels.
 
         Writes results directly into the caller-provided output tensors.
         All output tensor UIDs must be present in tensor_data.
         """
-        stream = 0  # default CUDA stream
+        stream = ctx.stream if ctx is not None and ctx.stream is not None else 0  # caller's stream
 
         for node in graph.nodes:
             a = tensor_data[node.inputs["A"].uid]

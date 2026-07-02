@@ -26,14 +26,14 @@ def test_router_plan_list_includes_supporting_engines_then_cudnn():
         def check_support(self, graph):
             raise NotImplementedError("nope")
 
-        def execute(self, graph, tensor_data):
+        def execute(self, graph, tensor_data, ctx=None):
             raise AssertionError("should not run")
 
     class Accepts(BaseEngine):
         name = "accepts"
         engine_id = PYTHON_ENGINE_ID_BASE + 10
 
-        def execute(self, graph, tensor_data):
+        def execute(self, graph, tensor_data, ctx=None):
             pass
 
     g = NativeGraph()
@@ -94,7 +94,7 @@ def test_select_plan_survives_build_and_execute():
         engine_id = PYTHON_ENGINE_ID_BASE + 10
         ran = 0
 
-        def execute(self, graph, tensor_data):
+        def execute(self, graph, tensor_data, ctx=None):
             type(self).ran += 1
 
     class EngB(BaseEngine):
@@ -102,7 +102,7 @@ def test_select_plan_survives_build_and_execute():
         engine_id = PYTHON_ENGINE_ID_BASE + 11
         ran = 0
 
-        def execute(self, graph, tensor_data):
+        def execute(self, graph, tensor_data, ctx=None):
             type(self).ran += 1
 
     g = NativeGraph()
@@ -124,14 +124,14 @@ def test_register_backend_validation():
     class NoId(BaseEngine):
         name = "noid"  # forgets to declare engine_id (base default is None)
 
-        def execute(self, graph, tensor_data):
+        def execute(self, graph, tensor_data, ctx=None):
             pass
 
     class E1(BaseEngine):
         name = "e1"
         engine_id = PYTHON_ENGINE_ID_BASE + 20
 
-        def execute(self, graph, tensor_data):
+        def execute(self, graph, tensor_data, ctx=None):
             pass
 
     g = NativeGraph()
@@ -162,7 +162,7 @@ def test_unexpected_engine_exception_propagates():
         def check_support(self, graph):
             raise RuntimeError("driver exploded")
 
-        def execute(self, graph, tensor_data):
+        def execute(self, graph, tensor_data, ctx=None):
             pass
 
     g = NativeGraph()
@@ -187,3 +187,60 @@ def test_no_backend_plan_list_is_cudnn_only():
     assert [p.engine_id for p in plans] == [CUDNN_HEURISTIC_ENGINE_ID]
     g._plans = plans
     assert g.selected_engine is None  # cuDNN path
+
+
+def test_compiled_plan_lifecycle_knobs_and_reuse():
+    """Review item 1 acceptance: multiple knob proposals from one engine; the
+    selected plan's knobs reach build_plan; compilation runs once per plan and
+    the artifact is reused; caller workspace + stream context reach execute."""
+    from cudnn.engines import CompiledPlan, ExecutionContext, PlanConfig
+
+    compiled_log = []
+
+    class TunablePlan(CompiledPlan):
+        def __init__(self, knobs):
+            self.knobs = knobs
+            self.executed = []
+
+        def get_workspace_size(self):
+            return 4096
+
+        def execute(self, graph, tensor_data, ctx):
+            self.executed.append((self.knobs, ctx.workspace))
+
+    class Tunable(BaseEngine):
+        name = "tunable"
+        engine_id = PYTHON_ENGINE_ID_BASE + 40
+
+        def propose_plans(self, graph):
+            return [PlanConfig(self.engine_id, {"tile": 128}), PlanConfig(self.engine_id, {"tile": 256})]
+
+        def build_plan(self, graph, plan):
+            compiled_log.append(plan.knobs)
+            return TunablePlan(plan.knobs)
+
+    g = NativeGraph()
+    g.register_backend(Tunable())
+    C = g.matmul(torch.randn(2, 2), torch.randn(2, 2))
+    g.create_execution_plans()
+    assert [p.knobs for p in g.plans[:2]] == [{"tile": 128}, {"tile": 256}]
+
+    ws = torch.empty(4096, dtype=torch.uint8)
+    out = torch.empty(2, 2)
+    g.select_plan(1)  # the tile=256 plan
+    assert g.get_execution_plan_count() >= 2
+    g.build_plans()
+    assert compiled_log == [{"tile": 256}]  # compiled once, correct knobs
+    assert g.get_workspace_size() == 4096  # plan-specific workspace
+    g.execute({C: out}, workspace=ws)
+    g.execute({C: out}, workspace=ws)
+    assert compiled_log == [{"tile": 256}]  # reused, no recompilation
+    plan = g._compiled_plans[g._plan_index]
+    assert plan.executed[0] == ({"tile": 256}, ws)  # knobs + caller workspace observed
+
+    # same engine instance on a second graph: no state collision
+    g2 = NativeGraph()
+    g2.register_backend(Tunable())
+    C2 = g2.matmul(torch.randn(2, 2), torch.randn(2, 2))
+    g2.execute({C2: torch.empty(2, 2)})
+    assert compiled_log == [{"tile": 256}, {"tile": 128}]  # g2 compiled its own plan
